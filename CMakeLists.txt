@@ -49,6 +49,7 @@ set(TEST_SOURCES
     test/local_search_test.cpp
     test/init_strategies_test.cpp
     test/fm_test.cpp
+    test/move_gain_test.cpp
     test/retain_snake_test.cpp
 )
 
