@@ -9,9 +9,17 @@ FMMove best_move_for(const Partition& part, size_t op,
                      double floor, const std::set<size_t>& locked) {
     if (locked.count(op)) return {};
 
+    // Minimum meaningful saving — below this is numerical noise
+    constexpr double EPSILON = 1.0;
+
     FMMove best;
     auto groups_of_x = part.groups_of(op);
     if (groups_of_x.empty()) return {};
+
+    auto accept = [&](double saving) {
+        return (saving > EPSILON || saving < -EPSILON) &&
+               saving > -floor && saving > best.saving;
+    };
 
     // Collect neighbor groups via DAG edges
     // For each group gx containing op, find groups of DAG neighbors
@@ -55,7 +63,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                     if (new_gy_cost < 1e17) {
                         double saving = (part.groups[gx].cost + part.groups[gy].cost)
                                         - (new_gx_cost + new_gy_cost);
-                        if (saving > -floor && saving > best.saving)
+                        if (accept(saving))
                             best = {FMMove::STEAL, op, gx, gy, saving};
                     }
                 }
@@ -69,7 +77,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (merged_cost < 1e17) {
                     double saving = (part.groups[gx].cost + part.groups[gy].cost)
                                     - merged_cost;
-                    if (saving > -floor && saving > best.saving)
+                    if (accept(saving))
                         best = {FMMove::MERGE, op, gx, gy, saving};
                 }
             }
@@ -81,7 +89,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 double new_gy_cost = part.eval_set(new_gy);
                 if (new_gy_cost < 1e17) {
                     double saving = part.groups[gy].cost - new_gy_cost;
-                    if (saving > -floor && saving > best.saving)
+                    if (accept(saving))
                         best = {FMMove::RECOMPUTE, op, gx, gy, saving};
                 }
             }
@@ -89,7 +97,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
         // --- Eject: remove op from gx ---
         auto er = part.eval_eject(op, gx);
-        if (er.feasible && er.saving > -floor && er.saving > best.saving)
+        if (er.feasible && accept(er.saving))
             best = {FMMove::EJECT, op, gx, SIZE_MAX, er.saving};
     }
 

@@ -9,9 +9,9 @@
 // ============================================================================
 
 struct FMConfig {
-    double floor_fraction = 0.02;     // allow moves worsening by up to this % of cost
-    double max_drift_fraction = 0.05; // abort if cumulative gain drops this % below best
-    double init_fraction = 0.5;       // fraction of border ops to activate initially
+    double floor_fraction = 0.20;     // allow moves worsening by up to this % of cost
+    double max_drift_fraction = 0.20; // abort if cumulative gain drops this % below best
+    int init_count = 1;               // number of border ops to activate initially
     unsigned seed = 42;               // RNG seed for random initial subset
 };
 

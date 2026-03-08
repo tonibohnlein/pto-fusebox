@@ -17,18 +17,18 @@ static std::vector<size_t> all_border_ops(const Partition& part) {
 }
 
 // ============================================================================
-// Select a random subset of border ops
+// Select N random border ops
 // ============================================================================
 
-static std::vector<size_t> random_subset(const std::vector<size_t>& ops,
-                                          double fraction, unsigned seed) {
-    if (fraction >= 1.0 || ops.size() <= 3) return ops;
+static std::vector<size_t> random_subset_n(const std::vector<size_t>& ops,
+                                            int count, unsigned seed) {
+    if (count >= (int)ops.size() || ops.size() <= 3) return ops;
 
     std::vector<size_t> shuffled = ops;
     std::mt19937 rng(seed);
     std::shuffle(shuffled.begin(), shuffled.end(), rng);
 
-    size_t n = std::max<size_t>(1, (size_t)(ops.size() * fraction));
+    size_t n = std::max<size_t>(1, (size_t)count);
     shuffled.resize(n);
     return shuffled;
 }
@@ -70,7 +70,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
 
     // Step 1: activate random subset of border ops
     auto borders = all_border_ops(part);
-    auto initial = random_subset(borders, cfg.init_fraction, cfg.seed);
+    auto initial = random_subset_n(borders, cfg.init_count, cfg.seed);
 
     ActiveSet active(part, floor);
     for (auto op : initial)

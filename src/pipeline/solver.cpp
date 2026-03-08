@@ -127,9 +127,9 @@ Solution solve(const Problem& prob) {
     FMOuterConfig fm_cfg;
     fm_cfg.max_passes = 50;
     fm_cfg.max_no_improve = 5;
-    fm_cfg.pass_config.init_fraction = 0.5;
-    fm_cfg.pass_config.floor_fraction = 0.02;
-    fm_cfg.pass_config.max_drift_fraction = 0.05;
+    fm_cfg.pass_config.init_count = 1;
+    fm_cfg.pass_config.floor_fraction = 0.20;
+    fm_cfg.pass_config.max_drift_fraction = 0.20;
     auto fm_result = fm_outer_loop(part, fm_cfg);
 
     // Use whichever is better

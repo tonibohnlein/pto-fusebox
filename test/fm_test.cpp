@@ -651,7 +651,7 @@ void test_fm_pass_improves_trivial() {
     double trivial_cost = part.total_cost();
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;  // activate all border ops
+    cfg.init_count = 999;  // activate all border ops
     auto result = fm_inner_pass(part, cfg);
 
     CHECK("applied some moves", result.moves_applied > 0);
@@ -670,7 +670,7 @@ void test_fm_pass_ops_covered() {
     auto part = Partition::trivial(p, d);
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     auto result = fm_inner_pass(part, cfg);
 
     // All ops must be covered in best_partition
@@ -684,7 +684,7 @@ void test_fm_pass_costs_consistent() {
     auto part = Partition::trivial(p, d);
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     auto result = fm_inner_pass(part, cfg);
 
     // All group costs in best_partition must match eval_set
@@ -706,7 +706,7 @@ void test_fm_pass_already_optimal() {
 
     // First pass to find optimum
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     auto r1 = fm_inner_pass(part, cfg);
 
     // Second pass from optimum: should not worsen
@@ -723,7 +723,7 @@ void test_fm_pass_diamond() {
     double trivial_cost = part.total_cost();
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     auto result = fm_inner_pass(part, cfg);
 
     CHECK("improves diamond", result.best_cost <= trivial_cost + 0.001);
@@ -749,7 +749,7 @@ void test_fm_pass_drift_stops() {
     double start_cost = part.total_cost();
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     cfg.max_drift_fraction = 0.05;
     auto result = fm_inner_pass(part, cfg);
 
@@ -764,14 +764,14 @@ void test_fm_pass_random_subset() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // With init_fraction < 1.0 and different seeds
+    // With init_count=1 and different seeds
     FMConfig cfg1;
-    cfg1.init_fraction = 0.3;
+    cfg1.init_count = 1;
     cfg1.seed = 1;
     auto r1 = fm_inner_pass(part, cfg1);
 
     FMConfig cfg2;
-    cfg2.init_fraction = 0.3;
+    cfg2.init_count = 1;
     cfg2.seed = 999;
     auto r2 = fm_inner_pass(part, cfg2);
 
@@ -797,7 +797,7 @@ void test_fm_pass_negative_moves() {
     double optimal_cost = part.total_cost();
 
     FMConfig cfg;
-    cfg.init_fraction = 1.0;
+    cfg.init_count = 999;
     cfg.floor_fraction = 0.1;  // allow 10% worsening
     auto result = fm_inner_pass(part, cfg);
 
@@ -819,7 +819,7 @@ void test_fm_outer_improves_trivial() {
     FMOuterConfig cfg;
     cfg.max_passes = 20;
     cfg.max_no_improve = 3;
-    cfg.pass_config.init_fraction = 1.0;
+    cfg.pass_config.init_count = 999;
     auto result = fm_outer_loop(part, cfg);
 
     CHECK("improves over trivial", result.best_cost < trivial_cost - 0.01);
@@ -872,7 +872,7 @@ void test_fm_outer_early_termination() {
     FMOuterConfig cfg;
     cfg.max_passes = 100;
     cfg.max_no_improve = 3;
-    cfg.pass_config.init_fraction = 1.0;
+    cfg.pass_config.init_count = 999;
     auto result = fm_outer_loop(part, cfg);
 
     // Should stop well before 100 passes on this tiny problem
@@ -948,11 +948,11 @@ void test_fm_outer_different_seeds_explore() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // Run with init_fraction < 1 so different seeds give different subsets
+    // Run with init_count=1 so different seeds give different subsets
     FMOuterConfig cfg;
     cfg.max_passes = 10;
     cfg.max_no_improve = 3;
-    cfg.pass_config.init_fraction = 0.3;
+    cfg.pass_config.init_count = 1;
     auto result = fm_outer_loop(part, cfg);
 
     // Should still find a good result
