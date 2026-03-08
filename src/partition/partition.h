@@ -83,4 +83,22 @@ struct Partition {
     // Ops in group gi that are on the boundary (have neighbors outside gi)
     // and whose removal leaves a non-empty group. These are eject candidates.
     std::vector<size_t> ejectable_ops(size_t gi) const;
+
+    // All internal ops in group gi (no DAG neighbors outside gi)
+    std::vector<size_t> internal_ops(size_t gi) const;
+
+    // Result of splitting a group at a DAG edge
+    struct SplitResult {
+        bool feasible = false;
+        double saving = -1e18;
+        std::set<size_t> side_a, side_b;
+        double cost_a = 1e18, cost_b = 1e18;
+    };
+
+    // Evaluate splitting group gi at DAG edge (op_a → op_b).
+    // Both must be in gi. If the edge is a bridge, returns the two sides.
+    SplitResult eval_split(size_t op_a, size_t op_b, size_t gi) const;
+
+    // Find all bridge edges within group gi. Returns (op_a, op_b) pairs.
+    std::vector<std::pair<size_t,size_t>> bridge_edges(size_t gi) const;
 };

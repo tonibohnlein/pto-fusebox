@@ -64,7 +64,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                         double saving = (part.groups[gx].cost + part.groups[gy].cost)
                                         - (new_gx_cost + new_gy_cost);
                         if (accept(saving))
-                            best = {FMMove::STEAL, op, gx, gy, saving};
+                            best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
                     }
                 }
             }
@@ -78,7 +78,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                     double saving = (part.groups[gx].cost + part.groups[gy].cost)
                                     - merged_cost;
                     if (accept(saving))
-                        best = {FMMove::MERGE, op, gx, gy, saving};
+                        best = FMMove{FMMove::MERGE, op, gx, gy, SIZE_MAX, saving};
                 }
             }
 
@@ -90,7 +90,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (new_gy_cost < 1e17) {
                     double saving = part.groups[gy].cost - new_gy_cost;
                     if (accept(saving))
-                        best = {FMMove::RECOMPUTE, op, gx, gy, saving};
+                        best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
                 }
             }
         }
@@ -98,7 +98,41 @@ FMMove best_move_for(const Partition& part, size_t op,
         // --- Eject: remove op from gx ---
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving))
-            best = {FMMove::EJECT, op, gx, SIZE_MAX, er.saving};
+            best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+    }
+
+    // --- Internal moves: INTERNAL_EJECT and SPLIT ---
+    // These apply when op is internal (no DAG neighbors outside its group)
+    // Cap at 15 ops to avoid expensive eval_set calls on large groups
+    for (auto gx : groups_of_x) {
+        if (part.is_border_op(op, gx)) continue;  // border ops handled above
+        if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
+
+        // INTERNAL_EJECT: remove op, remainder may split into components
+        auto er = part.eval_eject(op, gx);
+        if (er.feasible && accept(er.saving)) {
+            FMMove candidate;
+            candidate.type = FMMove::INTERNAL_EJECT;
+            candidate.op = op; candidate.ga = gx;
+            candidate.saving = er.saving;
+            if (candidate.saving > best.saving) best = candidate;
+        }
+
+        // SPLIT at each bridge edge incident to op
+        for (auto succ : part.dag->op_succs[op]) {
+            if (!part.groups[gx].ops.count(succ)) continue;
+            auto sr = part.eval_split(op, succ, gx);
+            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
+                best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, succ, sr.saving};
+            }
+        }
+        for (auto pred : part.dag->op_preds[op]) {
+            if (!part.groups[gx].ops.count(pred)) continue;
+            auto sr = part.eval_split(pred, op, gx);
+            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
+                best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, pred, sr.saving};
+            }
+        }
     }
 
     return best;
@@ -195,6 +229,39 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                 size_t new_gi = part.add_group({m.op}, er.singleton_cost);
                 affected.insert(new_gi);
             }
+            break;
+        }
+        case FMMove::INTERNAL_EJECT: {
+            auto er = part.eval_eject(m.op, m.ga);
+            if (!er.feasible) return {};
+
+            part.groups[m.ga].ops = std::move(er.remainder_components[0]);
+            part.groups[m.ga].cost = er.component_costs[0];
+            for (size_t i = 1; i < er.remainder_components.size(); i++) {
+                size_t new_gi = part.add_group(
+                    std::move(er.remainder_components[i]), er.component_costs[i]);
+                affected.insert(new_gi);
+            }
+            part.groups[m.ga].gen++;
+            affected.insert(m.ga);
+
+            if (er.singleton_cost > 0) {
+                size_t new_gi = part.add_group({m.op}, er.singleton_cost);
+                affected.insert(new_gi);
+            }
+            break;
+        }
+        case FMMove::SPLIT: {
+            auto sr = part.eval_split(m.op, m.op2, m.ga);
+            if (!sr.feasible) return {};
+
+            part.groups[m.ga].ops = std::move(sr.side_a);
+            part.groups[m.ga].cost = sr.cost_a;
+            part.groups[m.ga].gen++;
+            affected.insert(m.ga);
+
+            size_t gb = part.add_group(std::move(sr.side_b), sr.cost_b);
+            affected.insert(gb);
             break;
         }
         default:

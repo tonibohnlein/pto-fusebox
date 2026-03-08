@@ -180,3 +180,116 @@ Partition::EjectResult Partition::eval_eject(size_t op, size_t gi) const {
     result.saving = groups[gi].cost - (total_remainder_cost + result.singleton_cost);
     return result;
 }
+
+// ============================================================================
+// Internal ops: ops with ALL DAG neighbors inside the group
+// ============================================================================
+
+std::vector<size_t> Partition::internal_ops(size_t gi) const {
+    if (!groups[gi].alive) return {};
+    std::vector<size_t> result;
+    for (auto op : groups[gi].ops) {
+        bool internal = true;
+        for (auto p : dag->op_preds[op])
+            if (!groups[gi].ops.count(p)) { internal = false; break; }
+        if (internal)
+            for (auto s : dag->op_succs[op])
+                if (!groups[gi].ops.count(s)) { internal = false; break; }
+        if (internal)
+            result.push_back(op);
+    }
+    return result;
+}
+
+// ============================================================================
+// Split evaluation: split group at a DAG edge (bridge detection)
+// ============================================================================
+
+Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi) const {
+    SplitResult result;
+    if (!groups[gi].alive) return result;
+    if (!groups[gi].ops.count(op_a) || !groups[gi].ops.count(op_b)) return result;
+    if (groups[gi].ops.size() < 3) return result;  // need at least 3 ops to split non-trivially
+
+    const auto& ops = groups[gi].ops;
+
+    // BFS from op_a in the undirected DAG of ops, skipping edge a↔b
+    std::set<size_t> visited;
+    std::vector<size_t> queue = {op_a};
+    visited.insert(op_a);
+
+    while (!queue.empty()) {
+        size_t u = queue.back(); queue.pop_back();
+        auto try_add = [&](size_t v) {
+            if (!ops.count(v) || visited.count(v)) return;
+            // Skip the specific edge a↔b
+            if ((u == op_a && v == op_b) || (u == op_b && v == op_a)) return;
+            visited.insert(v);
+            queue.push_back(v);
+        };
+        for (auto v : dag->op_preds[u]) try_add(v);
+        for (auto v : dag->op_succs[u]) try_add(v);
+    }
+
+    // If b is still reachable, edge is not a bridge → no split
+    if (visited.count(op_b)) return result;
+
+    // Split into two sides
+    result.side_a = visited;
+    for (auto op : ops)
+        if (!visited.count(op)) result.side_b.insert(op);
+
+    // Both sides must be non-empty and have at least 1 op
+    if (result.side_a.empty() || result.side_b.empty()) return result;
+
+    // Evaluate both sides
+    result.cost_a = eval_set(result.side_a);
+    if (result.cost_a >= 1e17) return result;
+    result.cost_b = eval_set(result.side_b);
+    if (result.cost_b >= 1e17) return result;
+
+    result.feasible = true;
+    result.saving = groups[gi].cost - (result.cost_a + result.cost_b);
+    return result;
+}
+
+// ============================================================================
+// Find all bridge edges within a group
+// ============================================================================
+
+std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
+    if (!groups[gi].alive || groups[gi].ops.size() < 3) return {};
+
+    std::vector<std::pair<size_t,size_t>> bridges;
+    const auto& ops = groups[gi].ops;
+
+    // For each DAG edge within the group, check if it's a bridge
+    for (auto u : ops) {
+        for (auto v : dag->op_succs[u]) {
+            if (!ops.count(v)) continue;
+
+            // Quick BFS: can we reach v from u without using edge u→v?
+            std::set<size_t> visited;
+            std::vector<size_t> queue = {u};
+            visited.insert(u);
+            bool found = false;
+
+            while (!queue.empty() && !found) {
+                size_t w = queue.back(); queue.pop_back();
+                auto try_add = [&](size_t x) {
+                    if (!ops.count(x) || visited.count(x)) return;
+                    if ((w == u && x == v) || (w == v && x == u)) return;
+                    if (x == v) { found = true; return; }
+                    visited.insert(x);
+                    queue.push_back(x);
+                };
+                for (auto x : dag->op_preds[w]) try_add(x);
+                for (auto x : dag->op_succs[w]) try_add(x);
+            }
+
+            if (!found)
+                bridges.push_back({u, v});
+        }
+    }
+    return bridges;
+}

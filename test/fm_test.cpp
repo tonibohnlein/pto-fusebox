@@ -355,7 +355,7 @@ void test_apply_steal() {
     part.groups[1].alive = false;
 
     double before = part.total_cost();
-    FMMove m{FMMove::STEAL, 1, 0, 2, 0.0};
+    FMMove m = FMMove{FMMove::STEAL, 1, 0, 2, SIZE_MAX, 0.0};
     auto affected = apply_fm_move(part, m);
 
     CHECK("affected non-empty", !affected.empty());
@@ -374,7 +374,7 @@ void test_apply_merge() {
     auto part = Partition::trivial(p, d);
 
     double before = part.total_cost();
-    FMMove m{FMMove::MERGE, 0, 0, 1, 0.0};
+    FMMove m = FMMove{FMMove::MERGE, 0, 0, 1, SIZE_MAX, 0.0};
     auto affected = apply_fm_move(part, m);
 
     CHECK("affected non-empty", !affected.empty());
@@ -387,7 +387,7 @@ void test_apply_recompute() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    FMMove m{FMMove::RECOMPUTE, 1, 0, 2, 0.0};  // Add Op1 to G2
+    FMMove m = FMMove{FMMove::RECOMPUTE, 1, 0, 2, SIZE_MAX, 0.0};  // Add Op1 to G2
     auto affected = apply_fm_move(part, m);
 
     CHECK("G2 affected", affected.count(2));
@@ -409,7 +409,7 @@ void test_apply_eject_with_split() {
     part.groups[3].alive = false;
 
     // Eject Op1: splits into {Op0} and {Op2,Op3} plus singleton {Op1}
-    FMMove m{FMMove::EJECT, 1, 0, SIZE_MAX, 0.0};
+    FMMove m = FMMove{FMMove::EJECT, 1, 0, SIZE_MAX, SIZE_MAX, 0.0};
     auto affected = apply_fm_move(part, m);
 
     CHECK("affected non-empty", !affected.empty());

@@ -1,3 +1,4 @@
+#include "search/verbose.h"
 #include "search/local_search.h"
 #include "init/init_strategies.h"
 #include <iostream>
@@ -122,6 +123,41 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             double saving = part.groups[gi].cost - (remainder_cost + singleton_cost);
             if (saving > -floor)
                 heap.push({Move::EJECT, gi, 0, op, saving, gen_i, 0});
+        }
+    }
+
+    // Move 5: Internal eject — eject an internal op (may split into 3+ components)
+    if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
+        auto internals = part.internal_ops(gi);
+        int gen_i = part.groups[gi].gen;
+        for (auto op : internals) {
+            if (tabu && tabu->is_tabu(op, gi)) continue;
+
+            auto er = part.eval_eject(op, gi);
+            if (!er.feasible) continue;
+            if (er.saving > -floor)
+                heap.push({Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
+        }
+    }
+
+    // Move 6: Split group at a bridge edge into two non-trivial parts
+    if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
+        auto bridges = part.bridge_edges(gi);
+        int gen_i = part.groups[gi].gen;
+        for (auto& [a, b] : bridges) {
+            if (tabu && (tabu->is_tabu(a, gi) || tabu->is_tabu(b, gi))) continue;
+
+            auto sr = part.eval_split(a, b, gi);
+            if (!sr.feasible) continue;
+            if (sr.saving > -floor) {
+                Move m;
+                m.type = Move::SPLIT;
+                m.ga = gi; m.gb = 0; m.op = a;
+                m.saving = sr.saving;
+                m.gen_a = gen_i; m.gen_b = 0;
+                m.op2 = b;
+                heap.push(m);
+            }
         }
     }
 }
@@ -252,6 +288,55 @@ static ApplyResult apply_move(Partition& part, const Move& m) {
             result.dirty.insert(new_gi);
             break;
         }
+        case Move::INTERNAL_EJECT: {
+            auto er = part.eval_eject(m.op, m.ga);
+            if (!er.feasible) return result;
+            if (er.saving < -0.001 && m.saving > 0) return result;
+
+            result.dirty = part.adjacent_groups(m.ga);
+            result.dirty.erase(m.ga);
+
+            // Replace ga with first component, create new groups for rest
+            part.groups[m.ga].ops = er.remainder_components[0];
+            part.groups[m.ga].cost = er.component_costs[0];
+            part.groups[m.ga].gen++;
+            result.dirty.insert(m.ga);
+
+            for (size_t c = 1; c < er.remainder_components.size(); c++) {
+                size_t ng = part.add_group(er.remainder_components[c], er.component_costs[c]);
+                result.dirty.insert(ng);
+            }
+
+            if (er.singleton_cost > 0) {
+                size_t sg = part.add_group({m.op}, er.singleton_cost);
+                result.dirty.insert(sg);
+            }
+
+            result.tabu_entries.push_back({m.op, m.ga});
+            break;
+        }
+        case Move::SPLIT: {
+            auto sr = part.eval_split(m.op, m.op2, m.ga);
+            if (!sr.feasible) return result;
+            if (sr.saving < -0.001 && m.saving > 0) return result;
+
+            result.dirty = part.adjacent_groups(m.ga);
+            result.dirty.erase(m.ga);
+
+            // Replace ga with side_a, create new group for side_b
+            part.groups[m.ga].ops = sr.side_a;
+            part.groups[m.ga].cost = sr.cost_a;
+            part.groups[m.ga].gen++;
+            result.dirty.insert(m.ga);
+
+            size_t gb = part.add_group(sr.side_b, sr.cost_b);
+            result.dirty.insert(gb);
+
+            // Tabu: don't immediately re-merge
+            result.tabu_entries.push_back({m.op, gb});
+            result.tabu_entries.push_back({m.op2, m.ga});
+            break;
+        }
     }
 
     return result;
@@ -343,7 +428,7 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
             best_cost = new_cost;
             best_seen = part;
             no_improve = 0;
-            std::cerr << "      tabu: new best " << best_cost << "\n";
+            if (g_verbose) std::cerr << "      tabu: new best " << best_cost << "\n";
         } else {
             no_improve++;
         }
@@ -365,7 +450,7 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
 Partition local_search_from(Partition part) {
     // Phase 1: greedy descent
     int greedy_moves = greedy_phase(part);
-    std::cerr << "    greedy: " << greedy_moves << " moves, cost="
+    if (g_verbose) std::cerr << "    greedy: " << greedy_moves << " moves, cost="
               << part.total_cost() << "\n";
 
     // Snapshot best after greedy
@@ -377,12 +462,12 @@ Partition local_search_from(Partition part) {
     if (greedy_moves <= 3) {
         int tabu_moves = tabu_phase(part, best_seen, best_cost);
         if (tabu_moves > 0) {
-            std::cerr << "    tabu: " << tabu_moves << " moves, best="
+            if (g_verbose) std::cerr << "    tabu: " << tabu_moves << " moves, best="
                       << best_cost << "\n";
         }
     }
 
-    std::cerr << "    -> " << best_seen.num_alive() << " groups, cost="
+    if (g_verbose) std::cerr << "    -> " << best_seen.num_alive() << " groups, cost="
               << best_seen.total_cost() << "\n";
     return best_seen;
 }
@@ -400,7 +485,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
     for (auto& s : strategies) {
         std::cerr << "  Init " << s.name << "...\n";
         auto init = s.init(prob, dag);
-        std::cerr << "    " << init.num_alive() << " groups, cost="
+        if (g_verbose) std::cerr << "    " << init.num_alive() << " groups, cost="
                   << init.total_cost() << "\n";
 
         auto result = local_search_from(std::move(init));
@@ -408,7 +493,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
         if (result.total_cost() < best_cost - 0.001) {
             best_cost = result.total_cost();
             best = std::move(result);
-            std::cerr << "    * new best\n";
+            if (g_verbose) std::cerr << "    * new best\n";
         }
     }
 

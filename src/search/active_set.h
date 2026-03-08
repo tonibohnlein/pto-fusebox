@@ -30,6 +30,7 @@ public:
 
     // Activate all border ops of a group.
     void activate_border(size_t gi);
+    void activate_group_ops(size_t gi);
 
     // Activate border ops of groups adjacent to the given set of groups.
     void activate_neighbors_of(const std::set<size_t>& affected_groups);

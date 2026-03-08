@@ -12,10 +12,12 @@
 // ============================================================================
 
 struct FMMove {
-    enum Type { NONE = -1, STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3 } type = NONE;
+    enum Type { NONE = -1, STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3,
+                INTERNAL_EJECT = 4, SPLIT = 5 } type = NONE;
     size_t op = SIZE_MAX;     // initiating op
-    size_t ga = SIZE_MAX;     // source group (for steal/eject/merge)
-    size_t gb = SIZE_MAX;     // target group (for steal/recompute/merge)
+    size_t ga = SIZE_MAX;     // source group
+    size_t gb = SIZE_MAX;     // target group
+    size_t op2 = SIZE_MAX;    // second op (for SPLIT)
     double saving = -1e18;    // positive = improvement
 
     bool valid() const { return type != NONE; }

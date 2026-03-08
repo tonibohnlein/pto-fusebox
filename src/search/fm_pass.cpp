@@ -1,19 +1,24 @@
+#include "search/verbose.h"
 #include "search/fm_pass.h"
 #include <algorithm>
 #include <iostream>
 
 // ============================================================================
-// Collect all border ops across all alive groups
+// Collect all activatable ops (border + internal from large groups)
 // ============================================================================
 
-static std::vector<size_t> all_border_ops(const Partition& part) {
-    std::set<size_t> border_set;
+static std::vector<size_t> all_activatable_ops(const Partition& part) {
+    std::set<size_t> ops;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.border_ops(gi))
-            border_set.insert(op);
+            ops.insert(op);
+        if (part.groups[gi].ops.size() >= 3) {
+            for (auto op : part.internal_ops(gi))
+                ops.insert(op);
+        }
     }
-    return {border_set.begin(), border_set.end()};
+    return {ops.begin(), ops.end()};
 }
 
 // ============================================================================
@@ -69,8 +74,8 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     double max_drift = result.start_cost * cfg.max_drift_fraction;
 
     // Step 1: activate random subset of border ops
-    auto borders = all_border_ops(part);
-    auto initial = random_subset_n(borders, cfg.init_count, cfg.seed);
+    auto candidates = all_activatable_ops(part);
+    auto initial = random_subset_n(candidates, cfg.init_count, cfg.seed);
 
     ActiveSet active(part, floor);
     for (auto op : initial)

@@ -66,6 +66,25 @@ static GainCheck verify_heap_move(Partition part, const Move& m) {
             part.add_group({m.op}, sc);
             gc.applied = true; break;
         }
+        case Move::INTERNAL_EJECT: {
+            auto er = part.eval_eject(m.op, m.ga);
+            if (!er.feasible) return gc;
+            part.groups[m.ga].ops = std::move(er.remainder_components[0]);
+            part.groups[m.ga].cost = er.component_costs[0];
+            for (size_t i = 1; i < er.remainder_components.size(); i++)
+                part.add_group(std::move(er.remainder_components[i]), er.component_costs[i]);
+            if (er.singleton_cost > 0)
+                part.add_group({m.op}, er.singleton_cost);
+            gc.applied = true; break;
+        }
+        case Move::SPLIT: {
+            auto sr = part.eval_split(m.op, m.op2, m.ga);
+            if (!sr.feasible) return gc;
+            part.groups[m.ga].ops = std::move(sr.side_a);
+            part.groups[m.ga].cost = sr.cost_a;
+            part.add_group(std::move(sr.side_b), sr.cost_b);
+            gc.applied = true; break;
+        }
     }
     gc.after = part.total_cost();
     return gc;
@@ -75,8 +94,8 @@ static GainCheck verify_heap_move(Partition part, const Move& m) {
 static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
                                             double floor = 1e18) {
     int checked = 0, bad = 0;
-    const char* names[] = {"MERGE", "STEAL", "RECOMPUTE", "EJECT"};
-    int type_counts[4] = {};
+    const char* names[] = {"MERGE", "STEAL", "RECOMPUTE", "EJECT", "INT_EJECT", "SPLIT"};
+    int type_counts[6] = {};
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         MoveHeap heap;
         generate_moves(part, gi, heap, floor, nullptr);
@@ -97,8 +116,13 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
     }
     std::cout << "  " << label << ": " << checked << " moves ("
               << type_counts[0] << "M " << type_counts[1] << "S "
-              << type_counts[2] << "R " << type_counts[3] << "E) "
+              << type_counts[2] << "R " << type_counts[3] << "E "
+              << type_counts[4] << "IE " << type_counts[5] << "SP) "
               << bad << " bad\n";
+
+
+
+
     return {checked, bad};
 }
 
@@ -106,32 +130,41 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
 static std::pair<int,int> verify_all_fm(const char* label, Partition& part,
                                          double floor = 1e18) {
     int checked = 0, bad = 0;
-    const char* names[] = {"STEAL", "EJECT", "RECOMPUTE", "MERGE"};
-    int type_counts[4] = {};
+    const char* names[] = {"STEAL", "EJECT", "RECOMPUTE", "MERGE", "INT_EJECT", "SPLIT"};
+    int type_counts[6] = {};
+
+    // Check both border ops AND internal ops from large groups
+    std::set<size_t> ops_to_check;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
-        for (auto op : part.border_ops(gi)) {
-            auto m = best_move_for(part, op, floor);
-            if (!m.valid()) continue;
-            Partition p2 = part;
-            double before = p2.total_cost();
-            auto affected = apply_fm_move(p2, m);
-            if (affected.empty()) continue;
-            double after = p2.total_cost();
-            checked++;
-            type_counts[m.type]++;
-            double actual = before - after;
-            if (std::abs(m.saving - actual) >= 0.5) {
-                bad++;
-                std::cout << "  FAIL: " << label << " FM " << names[m.type]
-                          << " op=" << m.op << " saving=" << m.saving
-                          << " actual=" << actual << "\n";
-            }
+        for (auto op : part.border_ops(gi)) ops_to_check.insert(op);
+        if (part.groups[gi].ops.size() >= 3)
+            for (auto op : part.internal_ops(gi)) ops_to_check.insert(op);
+    }
+
+    for (auto op : ops_to_check) {
+        auto m = best_move_for(part, op, floor);
+        if (!m.valid()) continue;
+        Partition p2 = part;
+        double before = p2.total_cost();
+        auto affected = apply_fm_move(p2, m);
+        if (affected.empty()) continue;
+        double after = p2.total_cost();
+        checked++;
+        int ti = (int)m.type;
+        if (ti >= 0 && ti < 6) type_counts[ti]++;
+        double actual = before - after;
+        if (std::abs(m.saving - actual) >= 0.5) {
+            bad++;
+            std::cout << "  FAIL: " << label << " FM " << names[ti]
+                      << " op=" << m.op << " saving=" << m.saving
+                      << " actual=" << actual << "\n";
         }
     }
     std::cout << "  " << label << " FM: " << checked << " moves ("
               << type_counts[0] << "S " << type_counts[1] << "E "
-              << type_counts[2] << "R " << type_counts[3] << "M) "
+              << type_counts[2] << "R " << type_counts[3] << "M "
+              << type_counts[4] << "IE " << type_counts[5] << "SP) "
               << bad << " bad\n";
     return {checked, bad};
 }
@@ -619,6 +652,211 @@ void test_mixed_chain_at_optimum() {
     std::cout << "  " << part.num_alive() << " groups at optimum\n";
 }
 
+// ==================== Internal eject and split tests ====================
+
+// 17. Internal eject from a 4-op fused chain: eject middle op → 3 groups
+void test_internal_eject_chain4() {
+    std::cout << "=== test_internal_eject_chain4 ===\n";
+    // {Op0,Op1,Op2,Op3} as single group. Op1 is internal.
+    // Eject Op1 → {Op0} + {Op1} + {Op2,Op3} (3 connected components + singleton)
+    Problem p;
+    for (int i = 0; i <= 4; i++) p.tensors.push_back({256,256});
+    for (int i = 0; i < 4; i++)
+        p.ops.push_back({OpType::Pointwise, {(size_t)i}, {(size_t)(i+1)}, 1000});
+    p.fast_memory_capacity = 50000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2, 3};
+    part.groups[0].cost = part.eval_set({0, 1, 2, 3});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+    part.groups[3].alive = false;
+
+    // Op1 should be internal (pred Op0 inside, succ Op2 inside)
+    auto internals = part.internal_ops(0);
+    bool found_op1 = false, found_op2 = false;
+    for (auto op : internals) {
+        if (op == 1) found_op1 = true;
+        if (op == 2) found_op2 = true;
+    }
+    CHECK("Op1 internal", found_op1);
+    CHECK("Op2 internal", found_op2);
+
+    // Verify heap generates internal eject
+    MoveHeap heap;
+    generate_moves(part, 0, heap, 1e18, nullptr);
+    int ie_count = 0;
+    while (!heap.empty()) {
+        Move m = heap.top(); heap.pop();
+        if (m.type == Move::INTERNAL_EJECT) {
+            ie_count++;
+            auto gc = verify_heap_move(part, m);
+            if (gc.applied) {
+                double actual = gc.before - gc.after;
+                CHECK_EQ("IE gain", m.saving, actual);
+                std::cout << "  INTERNAL_EJECT Op" << m.op << ": saving=" << m.saving << "\n";
+            }
+        }
+    }
+    CHECK("has internal ejects", ie_count > 0);
+    std::cout << "  " << ie_count << " internal ejects generated\n";
+
+    // Verify FM also finds internal eject
+    tally(verify_all_fm("ie_chain4", part));
+}
+
+// 18. Split at bridge edge in a 4-op chain
+void test_split_chain4() {
+    std::cout << "=== test_split_chain4 ===\n";
+    // {Op0,Op1,Op2,Op3} chain. Every internal edge is a bridge.
+    // Split at Op1→Op2 → {Op0,Op1} + {Op2,Op3}
+    Problem p;
+    for (int i = 0; i <= 4; i++) p.tensors.push_back({256,256});
+    for (int i = 0; i < 4; i++)
+        p.ops.push_back({OpType::Pointwise, {(size_t)i}, {(size_t)(i+1)}, 1000});
+    p.fast_memory_capacity = 50000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2, 3};
+    part.groups[0].cost = part.eval_set({0, 1, 2, 3});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+    part.groups[3].alive = false;
+
+    // Check bridge edges
+    auto bridges = part.bridge_edges(0);
+    CHECK("has bridges", bridges.size() >= 3);  // 3 edges in chain of 4
+    std::cout << "  bridges:";
+    for (auto& [a,b] : bridges) std::cout << " (" << a << "→" << b << ")";
+    std::cout << "\n";
+
+    // Verify heap generates SPLIT moves
+    MoveHeap heap;
+    generate_moves(part, 0, heap, 1e18, nullptr);
+    int split_count = 0;
+    while (!heap.empty()) {
+        Move m = heap.top(); heap.pop();
+        if (m.type == Move::SPLIT) {
+            split_count++;
+            auto gc = verify_heap_move(part, m);
+            if (gc.applied) {
+                double actual = gc.before - gc.after;
+                CHECK_EQ("SPLIT gain", m.saving, actual);
+                std::cout << "  SPLIT Op" << m.op << "↔Op" << m.op2
+                          << ": saving=" << m.saving << "\n";
+            }
+        }
+    }
+    CHECK("has splits", split_count > 0);
+    std::cout << "  " << split_count << " split moves generated\n";
+
+    // Verify FM
+    tally(verify_all_fm("split_chain4", part));
+}
+
+// 19. Diamond: internal op in fused group, no bridge
+void test_internal_diamond_fused() {
+    std::cout << "=== test_internal_diamond_fused ===\n";
+    // Diamond: Op0→T1→{Op1→T2, Op2(T1,T2)→T3}
+    // Fuse all 3: {Op0,Op1,Op2}. Op1 has pred Op0, succs Op2 — all internal.
+    // But Op0→Op1→Op2 AND Op0→Op2, so edge Op0→Op2 exists.
+    // Removing Op0→Op1 edge: Op0 can still reach Op1 via Op0→Op2→? No, Op2 is a successor of Op1.
+    // The undirected graph: Op0-Op1, Op0-Op2, Op1-Op2. It's a triangle → no bridges.
+    // So SPLIT won't find anything, but INTERNAL_EJECT should work for Op1.
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128},{128,128}};
+    p.ops = {{OpType::Pointwise,{0},{1},5000},
+             {OpType::Pointwise,{1},{2},5000},
+             {OpType::Pointwise,{1,2},{3},5000}};
+    p.fast_memory_capacity = 50000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2};
+    part.groups[0].cost = part.eval_set({0, 1, 2});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+
+    auto bridges = part.bridge_edges(0);
+    std::cout << "  bridges: " << bridges.size() << " (expect 0 for triangle)\n";
+    // With Op0→Op2 direct edge, it's a triangle → 0 bridges is correct
+
+    // But internal eject should still work
+    MoveHeap heap;
+    generate_moves(part, 0, heap, 1e18, nullptr);
+    int ie=0, sp=0;
+    while (!heap.empty()) {
+        Move m = heap.top(); heap.pop();
+        if (m.type == Move::INTERNAL_EJECT) { ie++; }
+        if (m.type == Move::SPLIT) { sp++; }
+    }
+    // Op0 has no preds outside, succ Op1,Op2 inside → internal
+    // But Op0 also has NO preds → it IS internal if all succs are inside.
+    // Actually Op0 has no op_preds at all (T0 is graph input, no producing op).
+    // And succs Op1,Op2 are inside. So Op0 is internal. ✓
+    std::cout << "  internal ejects=" << ie << " splits=" << sp << "\n";
+    
+    // Verify all moves
+    tally(verify_all_moves("diamond_fused_all", part));
+    tally(verify_all_fm("diamond_fused_all", part));
+}
+
+// 20. 5-op chain with tight memory: internal eject helps (breaks bad fused tiling)
+void test_internal_eject_helps() {
+    std::cout << "=== test_internal_eject_helps ===\n";
+    // 5 PW ops, 512x512 tensors. Fusing all 5 is feasible but needs small tiles.
+    // Ejecting the middle op and splitting 5→2+1+2 might allow better tiling.
+    Problem p;
+    for (int i = 0; i <= 5; i++) p.tensors.push_back({512,512});
+    for (int i = 0; i < 5; i++)
+        p.ops.push_back({OpType::Pointwise, {(size_t)i}, {(size_t)(i+1)}, 1000});
+    p.fast_memory_capacity = 280000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+
+    // Start with all fused
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2, 3, 4};
+    part.groups[0].cost = part.eval_set({0, 1, 2, 3, 4});
+    for (int i = 1; i < 5; i++) part.groups[i].alive = false;
+
+    double fused_cost = part.total_cost();
+    std::cout << "  fused(5) cost=" << fused_cost << "\n";
+
+    // Check what internal moves find
+    MoveHeap heap;
+    generate_moves(part, 0, heap, 1e18, nullptr);
+    int ie=0, sp=0, best_type=-1;
+    double best_saving = -1e18;
+    while (!heap.empty()) {
+        Move m = heap.top(); heap.pop();
+        if (m.type == Move::INTERNAL_EJECT) {
+            ie++;
+            auto gc = verify_heap_move(part, m);
+            if (gc.applied && std::abs(gc.reported - (gc.before-gc.after)) < 0.5)
+                if (m.saving > best_saving) { best_saving = m.saving; best_type = 4; }
+        }
+        if (m.type == Move::SPLIT) {
+            sp++;
+            auto gc = verify_heap_move(part, m);
+            if (gc.applied && std::abs(gc.reported - (gc.before-gc.after)) < 0.5)
+                if (m.saving > best_saving) { best_saving = m.saving; best_type = 5; }
+        }
+    }
+    std::cout << "  internal ejects=" << ie << " splits=" << sp
+              << " best_saving=" << best_saving
+              << " type=" << (best_type==4?"IE":best_type==5?"SPLIT":"none") << "\n";
+    
+    tally(verify_all_moves("ie_helps", part));
+    tally(verify_all_fm("ie_helps", part));
+}
+
 int main() {
     test_asymmetric_chain();
     test_matmul_chain_varied_K();
@@ -636,6 +874,10 @@ int main() {
     test_fm_eject_preferred();
     test_negative_steal_gain();
     test_mixed_chain_at_optimum();
+    test_internal_eject_chain4();
+    test_split_chain4();
+    test_internal_diamond_fused();
+    test_internal_eject_helps();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";

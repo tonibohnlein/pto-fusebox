@@ -22,16 +22,26 @@ void ActiveSet::activate_border(size_t gi) {
         activate(op);
 }
 
+void ActiveSet::activate_group_ops(size_t gi) {
+    if (!part_->groups[gi].alive) return;
+    // Activate border ops (for merge/steal/recompute/eject)
+    for (auto op : part_->border_ops(gi))
+        activate(op);
+    // Also activate internal ops (for internal_eject/split) if group size is 3-15
+    if (part_->groups[gi].ops.size() >= 3 && part_->groups[gi].ops.size() <= 15) {
+        for (auto op : part_->internal_ops(gi))
+            activate(op);
+    }
+}
+
 void ActiveSet::activate_neighbors_of(const std::set<size_t>& affected_groups) {
-    // Activate border ops of groups adjacent to affected groups
+    // Activate all ops of affected groups and their neighbors
     for (auto gi : affected_groups) {
         if (!part_->groups[gi].alive) continue;
-        // Border ops of gi itself
-        activate_border(gi);
-        // Border ops of groups adjacent to gi
+        activate_group_ops(gi);
         auto adj = part_->adjacent_groups(gi);
         for (auto gj : adj)
-            activate_border(gj);
+            activate_group_ops(gj);
     }
 }
 

@@ -10,14 +10,14 @@
 // ============================================================================
 
 struct Move {
-    enum Type { MERGE = 0, STEAL = 1, RECOMPUTE = 2, EJECT = 3 } type;
-    size_t ga, gb;       // groups involved (gb unused for recompute/eject)
-    size_t op;           // op involved (for steal/recompute/eject)
+    enum Type { MERGE = 0, STEAL = 1, RECOMPUTE = 2, EJECT = 3,
+                INTERNAL_EJECT = 4, SPLIT = 5 } type;
+    size_t ga, gb;       // groups involved
+    size_t op;           // op involved (for steal/recompute/eject/internal_eject/split)
     double saving;       // positive = improvement, negative = worsening
     int gen_a, gen_b;    // generation of ga, gb when evaluated
+    size_t op2 = 0;      // second op (for SPLIT: the neighbor)
 
-    // Higher saving first; ties: prefer merge > steal > recompute > eject;
-    // within same type+saving, prefer smaller ga (deterministic).
     bool operator<(const Move& o) const {
         if (std::abs(saving - o.saving) > 0.001) return saving < o.saving;
         if (type != o.type) return type > o.type;
