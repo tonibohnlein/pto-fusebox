@@ -254,18 +254,23 @@ CostResult Subgraph::compute_cost(const TileConfig& cfg,
     auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
     int64_t scale = ceil_div(cfg.w, prob_->native_w)
                   * ceil_div(cfg.h, prob_->native_h);
-    double comp = 0.0;
+
+    // Separate MatMul compute (per k-step) from PW compute (once per tile).
+    // Problem: "For Pointwise operations, k is ignored... executes once per spatial tile."
+    double mm_comp = 0.0;
+    double pw_comp = 0.0;
     for (auto i : ops_) {
         double c = (double)prob_->ops[i].base_cost;
         if (prob_->ops[i].type == OpType::MatMul) {
             int64_t Ki = op_K(i);
-            comp += c * ((double)cfg.k / Ki);
+            mm_comp += c * ((double)cfg.k / Ki);
         } else {
-            comp += c;
+            pw_comp += c;
         }
     }
-    comp *= (double)scale;
-    result.compute_per_step = comp;
+    mm_comp *= (double)scale;
+    pw_comp *= (double)scale;
+    result.compute_per_step = mm_comp;  // per k-step (PW added only at last step)
 
     // Memory transfer costs per tile-step
     double lhs_load = 0, rhs_load = 0, pw_in_load = 0, out_evict = 0;
@@ -299,7 +304,9 @@ CostResult Subgraph::compute_cost(const TileConfig& cfg,
                 mi += pw_in_load;
             }
             double mo = (ks == nk - 1) ? out_evict : 0;
-            lat += std::max(comp, mi + mo);
+            // PW compute only at last k-step (PW runs once per tile)
+            double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
+            lat += std::max(step_comp, mi + mo);
         }
         return lat;
     };

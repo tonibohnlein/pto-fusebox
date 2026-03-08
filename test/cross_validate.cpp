@@ -29,12 +29,18 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
     int64_t scale = ceil_div(cfg.w, prob.native_w)
                   * ceil_div(cfg.h, prob.native_h);
-    double comp = 0;
+
+    // Separate MM compute (per k-step) from PW compute (once per tile)
+    double mm_comp = 0, pw_comp = 0;
     for (auto i : sg.ops()) {
         double c = (double)prob.ops[i].base_cost;
-        comp += (prob.ops[i].type == OpType::MatMul) ? c * ((double)cfg.k / sg.op_K(i)) : c;
+        if (prob.ops[i].type == OpType::MatMul)
+            mm_comp += c * ((double)cfg.k / sg.op_K(i));
+        else
+            pw_comp += c;
     }
-    comp *= (double)scale;
+    mm_comp *= (double)scale;
+    pw_comp *= (double)scale;
 
     bool reuse = (cfg.snake != SnakeDir::None);
     auto tiles = make_traversal(ntw, nth, cfg.snake);
@@ -64,7 +70,8 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
             }
             if (ks == nk - 1 && !rt.count(sg.sink_tensor()))
                 mo += (double)(cfg.h * cfg.w) / B;
-            total += std::max(comp, mi + mo);
+            double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
+            total += std::max(step_comp, mi + mo);
         }
         pr = tr; pc = tc;
     }

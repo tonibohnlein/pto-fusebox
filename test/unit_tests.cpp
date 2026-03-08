@@ -509,8 +509,9 @@ void test_matmul_pw_fusion_K() {
     auto c = sg->compute_cost(N(128,128,64));
     CHECK_EQ_I("fused k_passes", c.num_k_passes, 4);
 
-    // Compute per step: MatMul = 2000*64/256=500, PW = 500 (full)
-    CHECK_EQ("fused comp/step", c.compute_per_step, 1000.0);
+    // Compute per step: MatMul = 2000*64/256=500 per k-step.
+    // PW = 500 but runs once per tile (added at last k-step only).
+    CHECK_EQ("fused comp/step (MM only)", c.compute_per_step, 500.0);
 }
 
 // ==================== Non-power-of-2 tiling ====================
