@@ -1,7 +1,6 @@
 #include "pipeline/solver.h"
 #include "partition/partition.h"
-#include "search/local_search.h"
-#include "search/fm_outer.h"
+#include "search/parallel_search.h"
 #include "postopt/post_opt.h"
 #include <iostream>
 #include <optional>
@@ -120,33 +119,21 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
 Solution solve(const Problem& prob) {
     DAG dag = DAG::build(prob);
 
-    std::cerr << "Phase 1: Greedy local search...\n";
-    auto part = local_search(prob, dag);
+    std::cerr << "Phase 1: Parallel search (init + greedy + FM)...\n";
+    ParallelConfig pcfg;  // auto: threads=hw_concurrency, tasks=~1 per thread
+    auto best_part = parallel_search(prob, dag, pcfg);
 
-    std::cerr << "Phase 2: FM refinement...\n";
-    FMOuterConfig fm_cfg;
-    fm_cfg.max_passes = 50;
-    fm_cfg.max_no_improve = 5;
-    fm_cfg.pass_config.init_count = 1;
-    fm_cfg.pass_config.floor_fraction = 0.20;
-    fm_cfg.pass_config.max_drift_fraction = 0.20;
-    auto fm_result = fm_outer_loop(part, fm_cfg);
-
-    // Use whichever is better
-    Partition& best_part = (fm_result.best_cost < part.total_cost() - 0.001)
-                           ? fm_result.best_partition : part;
-
-    std::cerr << "Phase 3: Build solution...\n";
+    std::cerr << "Phase 2: Build solution...\n";
     auto sol = build_solution(prob, dag, best_part);
     std::cerr << "  " << sol.num_steps() << " steps, lat=" << sol.total_latency() << "\n";
 
     for (int pass = 1; pass <= 3; pass++) {
-        std::cerr << "Phase 4." << pass << ": Retain...\n";
+        std::cerr << "Phase 3." << pass << ": Retain...\n";
         sol = optimize_retain(prob, dag, std::move(sol));
         std::cerr << "  lat=" << sol.total_latency() << "\n";
 
         double before = sol.total_latency();
-        std::cerr << "Phase 4." << pass << ": Recompute...\n";
+        std::cerr << "Phase 3." << pass << ": Recompute...\n";
         sol = optimize_recompute(prob, dag, std::move(sol));
         std::cerr << "  lat=" << sol.total_latency() << "\n";
 

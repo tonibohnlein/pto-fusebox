@@ -9,8 +9,11 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
+
+# Threading support
+find_package(Threads REQUIRED)
 
 # All source files can include from src/
 include_directories(${CMAKE_SOURCE_DIR}/src)
@@ -28,10 +31,11 @@ file(GLOB_RECURSE LIB_SOURCES
 )
 
 add_library(solver_lib STATIC ${LIB_SOURCES})
+target_link_libraries(solver_lib Threads::Threads)
 
 # --- Main executable ---
 add_executable(mlsys src/pipeline/main.cpp)
-target_link_libraries(mlsys solver_lib)
+target_link_libraries(mlsys solver_lib Threads::Threads)
 
 # --- Tests ---
 enable_testing()
