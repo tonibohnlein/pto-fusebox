@@ -173,29 +173,32 @@ static std::vector<size_t> dfs_ordering(const GroupDAGInfo& gd) {
 }
 
 // ============================================================================
-// Beam search ordering (explores K orderings simultaneously)
+// Beam search ordering with true memory state tracking.
 //
-// State: ordered groups so far + accumulated cost (simulating retain).
-// At each step: expand all ready groups for each beam state, compute cost
-// with simulated retain from previous group, keep top K.
+// Each beam state tracks which tensors are currently resident in fast memory.
+// This enables multi-step retention: a tensor produced at step 0 can remain
+// resident through steps 1,2,... and be consumed at step 3 for free.
+//
+// The expansion evaluates each candidate with the actual resident set,
+// decides what to retain, and propagates the memory state forward.
 // ============================================================================
 
-static std::vector<size_t> beam_search_ordering(
-        const GroupDAGInfo& gd, int beam_width) {
+struct BeamResult {
+    std::vector<size_t> order;
+    std::vector<std::set<size_t>> retain_per_step;  // what each step retains
+    double total_latency = 0;
+};
 
+static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
     size_t n = gd.size();
     const Problem& prob = *gd.prob;
 
-    // Beam state: just ordering + accumulated latency.
-    // Retain is handled by post-optimization, not here.
-    // But we simulate retain to score orderings: if the previous group's
-    // sink is a boundary input of the current group and retainable,
-    // we compute cost as-if retained (to prefer retain-friendly orderings).
     struct State {
         std::vector<size_t> order;
         std::vector<int> in_deg;
+        std::set<size_t> resident;   // tensors currently in fast memory
+        std::vector<std::set<size_t>> retain_per_step;
         double total_latency = 0;
-        size_t last = SIZE_MAX;
     };
 
     State init;
@@ -215,26 +218,69 @@ static std::vector<size_t> beam_search_ordering(
                     ready.push_back(i);
 
             for (auto gi : ready) {
-                // Simulate retain from previous step: if prev's sink
-                // is a boundary input of gi and retainable, compute
-                // cost as-if retained. This steers ordering towards
-                // producer→consumer adjacency.
-                std::set<size_t> sim_retained;
-                if (state.last < n) {
-                    size_t prev_sink = gd.groups[state.last].sg.sink_tensor();
-                    if (gd.groups[gi].sg.boundary_inputs().count(prev_sink) &&
-                        prob.retainable_tensors.count(prev_sink)) {
-                        // Check feasibility with retain
-                        auto c_ret = gd.groups[gi].sg.best_cost({prev_sink}, {});
-                        if (c_ret.feasible)
-                            sim_retained.insert(prev_sink);
+                // Mark gi as scheduled for future_needs check
+                scheduled[gi] = true;
+
+                // Step 1: Prune resident set — drop tensors no future step needs
+                std::set<size_t> useful_resident;
+                for (auto t : state.resident)
+                    if (gd.future_needs(t, scheduled))
+                        useful_resident.insert(t);
+
+                // Step 2: Determine what to retain after this step.
+                // Candidate: this group's sink tensor, if future steps need it.
+                std::set<size_t> retain_these;
+                size_t sink = gd.groups[gi].sg.sink_tensor();
+                bool want_retain_sink = prob.retainable_tensors.count(sink) &&
+                                        gd.future_needs(sink, scheduled);
+
+                // Step 3: Evaluate with full resident set + output retain.
+                // Pass ALL useful_resident (including pass-through tensors that
+                // this group doesn't use — working_set counts them at full size).
+                CostResult cost;
+                bool retained_sink = false;
+
+                // Try: all resident + retain output
+                if (want_retain_sink) {
+                    retain_these.insert(sink);
+                    cost = gd.groups[gi].sg.best_cost(useful_resident, retain_these);
+                    if (cost.feasible) {
+                        retained_sink = true;
+                    } else {
+                        retain_these.clear();
                     }
                 }
 
-                auto cost = gd.groups[gi].sg.best_cost(sim_retained, {});
-                if (!cost.feasible)
-                    cost = gd.groups[gi].base_cost;
+                // Fallback 1: all resident, no output retain
+                if (!cost.feasible) {
+                    cost = gd.groups[gi].sg.best_cost(useful_resident, {});
+                }
 
+                // Fallback 2: drop pass-through tensors (only keep what this group uses)
+                if (!cost.feasible) {
+                    std::set<size_t> only_used;
+                    for (auto t : useful_resident)
+                        if (gd.groups[gi].sg.boundary_inputs().count(t))
+                            only_used.insert(t);
+                    useful_resident = only_used;
+                    cost = gd.groups[gi].sg.best_cost(useful_resident, {});
+                }
+
+                // Fallback 3: no retained tensors at all
+                if (!cost.feasible) {
+                    useful_resident.clear();
+                    cost = gd.groups[gi].sg.best_cost({}, {});
+                }
+
+                // Fallback 4: base cost (should always work)
+                if (!cost.feasible) {
+                    cost = gd.groups[gi].base_cost;
+                    useful_resident.clear();
+                    retain_these.clear();
+                    retained_sink = false;
+                }
+
+                // Build next state
                 State next;
                 next.order = state.order;
                 next.order.push_back(gi);
@@ -242,9 +288,31 @@ static std::vector<size_t> beam_search_ordering(
                 for (auto v : gd.succs[gi])
                     next.in_deg[v]--;
                 next.total_latency = state.total_latency + cost.latency;
-                next.last = gi;
+
+                // Propagate memory state: useful pass-through + newly retained output
+                next.resident = useful_resident;
+                if (retained_sink)
+                    next.resident.insert(sink);
+
+                // Record retain decision for this step:
+                // For the solution output, only retain tensors that this step
+                // actually produces or consumes (boundary tensors). Pass-through
+                // tensors are tracked in the beam state for scoring but may not
+                // be supported by the evaluator in tensors_to_retain.
+                std::set<size_t> exportable_retain;
+                for (auto t : next.resident) {
+                    // Keep if it's a boundary output or boundary input of this group
+                    if (gd.groups[gi].sg.boundary_outputs().count(t) ||
+                        gd.groups[gi].sg.boundary_inputs().count(t))
+                        exportable_retain.insert(t);
+                }
+                next.retain_per_step = state.retain_per_step;
+                next.retain_per_step.push_back(exportable_retain);
 
                 candidates.push_back(std::move(next));
+
+                // Restore scheduled flag
+                scheduled[gi] = false;
             }
         }
 
@@ -260,8 +328,17 @@ static std::vector<size_t> beam_search_ordering(
         beam = std::move(candidates);
     }
 
-    if (beam.empty()) return dfs_ordering(gd);
-    return beam[0].order;
+    if (beam.empty()) {
+        BeamResult r;
+        r.order = dfs_ordering(gd);
+        return r;
+    }
+
+    BeamResult r;
+    r.order = beam[0].order;
+    r.retain_per_step = beam[0].retain_per_step;
+    r.total_latency = beam[0].total_latency;
+    return r;
 }
 
 // ============================================================================
@@ -282,25 +359,59 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
         dfs_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
     Solution dfs_sol(prob, dag, std::move(dfs_steps));
 
-    // --- Strategy 2: Beam search ordering (retain-aware scoring) ---
+    // --- Strategy 2: Beam search with true memory state tracking ---
     int beam_width = std::min(20, std::max(5, (int)n));
-    auto beam_order = beam_search_ordering(gd, beam_width);
+    auto beam_result = beam_search_ordering(gd, beam_width);
 
+    // Build solution using beam's ordering AND retain decisions.
+    // beam_result.retain_per_step[i] contains ALL tensors that step i keeps
+    // resident for future steps (both new outputs and pass-through tensors).
     std::vector<ScheduleStep> beam_steps;
-    for (auto idx : beam_order)
-        beam_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
+    std::set<size_t> beam_entering;  // retained from previous step
+
+    for (size_t i = 0; i < beam_result.order.size(); i++) {
+        size_t idx = beam_result.order[i];
+        std::set<size_t> retain_these;
+        if (i < beam_result.retain_per_step.size())
+            retain_these = beam_result.retain_per_step[i];
+
+        // Compute cost with the actual retained state
+        auto cost = gd.groups[idx].sg.best_cost(beam_entering, retain_these);
+        if (!cost.feasible) {
+            // Fallback: try without retain
+            retain_these.clear();
+            cost = gd.groups[idx].sg.best_cost(beam_entering, {});
+        }
+        if (!cost.feasible) {
+            // Fallback: no resident tensors
+            beam_entering.clear();
+            retain_these.clear();
+            cost = gd.groups[idx].base_cost;
+        }
+
+        beam_steps.push_back({Subgraph(gd.groups[idx].sg), cost.config, retain_these});
+        beam_entering = retain_these;  // next step sees our full retain set
+    }
     Solution beam_sol(prob, dag, std::move(beam_steps));
 
-    // Pick the better one
-    double dfs_lat = dfs_sol.total_latency();
-    double beam_lat = beam_sol.total_latency();
+    // Pick the better one AFTER running retain+recompute on both.
+    // Beam has integrated retain but DFS + post-opt may still win.
 
-    std::cerr << "  DFS ordering: " << dfs_lat << ", Beam ordering: " << beam_lat << "\n";
+    // Apply one retain+recompute pass to each strategy, then pick winner
+    auto dfs_opt = optimize_retain(prob, dag, std::move(dfs_sol));
+    dfs_opt = optimize_recompute(prob, dag, std::move(dfs_opt));
+    double dfs_lat = dfs_opt.total_latency();
+
+    auto beam_opt = optimize_retain(prob, dag, std::move(beam_sol));
+    beam_opt = optimize_recompute(prob, dag, std::move(beam_opt));
+    double beam_lat = beam_opt.total_latency();
+
+    std::cerr << "  DFS+opt: " << dfs_lat << ", Beam+opt: " << beam_lat << "\n";
 
     if (beam_lat < dfs_lat - 0.01) {
-        return beam_sol;
+        return beam_opt;
     }
-    return dfs_sol;
+    return dfs_opt;
 }
 
 // ============================================================================
@@ -315,20 +426,17 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     pcfg.fm.deadline = deadline;
     auto best_part = parallel_search(prob, dag, pcfg);
 
-    std::cerr << "Phase 2: Build solution (DFS + beam search)...\n";
+    std::cerr << "Phase 2: Build solution (DFS + beam + retain/recompute)...\n";
     auto sol = build_solution(prob, dag, best_part);
     std::cerr << "  " << sol.num_steps() << " steps, lat=" << sol.total_latency() << "\n";
 
-    for (int pass = 1; pass <= 3; pass++) {
-        std::cerr << "Phase 3." << pass << ": Retain...\n";
-        sol = optimize_retain(prob, dag, std::move(sol));
-        std::cerr << "  lat=" << sol.total_latency() << "\n";
-
+    // Additional retain+recompute passes (may find improvements the first round missed)
+    for (int pass = 1; pass <= 2; pass++) {
         double before = sol.total_latency();
-        std::cerr << "Phase 3." << pass << ": Recompute...\n";
+        sol = optimize_retain(prob, dag, std::move(sol));
         sol = optimize_recompute(prob, dag, std::move(sol));
-        std::cerr << "  lat=" << sol.total_latency() << "\n";
-
+        sol = optimize_retain(prob, dag, std::move(sol));
+        std::cerr << "  Pass " << pass << ": lat=" << sol.total_latency() << "\n";
         if (sol.total_latency() >= before - 0.01) break;
     }
 
