@@ -11,6 +11,12 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
     int no_improve = 0;
 
     for (int pass = 0; pass < cfg.max_passes; pass++) {
+        // Wall-clock cutoff
+        if (SteadyClock::now() >= cfg.deadline) {
+            if (g_verbose) std::cerr << "    FM: deadline reached at pass " << pass << "\n";
+            break;
+        }
+
         // Start each pass from the best known partition
         Partition current = result.best_partition;
 
