@@ -122,7 +122,8 @@ Solution solve(const Problem& prob) {
     DAG dag = DAG::build(prob);
 
     std::cerr << "Phase 1: Parallel search (init + greedy + FM)...\n";
-    ParallelConfig pcfg;  // auto: threads=hw_concurrency, tasks=~1 per thread
+    ParallelConfig pcfg;
+    adapt_fm_budget(pcfg, prob.num_ops());
     auto best_part = parallel_search(prob, dag, pcfg);
 
     std::cerr << "Phase 2: Build solution...\n";

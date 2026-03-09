@@ -8,9 +8,9 @@
 // ============================================================================
 
 struct FMOuterConfig {
-    int max_passes = 100;             // hard cap on outer iterations
-    int max_no_improve = 5;           // early exit after this many passes without improvement
-    FMConfig pass_config;             // per-pass configuration (floor, drift, init_fraction)
+    int max_passes = 50;              // enough to find late improvements (was 100)
+    int max_no_improve = 15;          // transformer-large found improvements at pass 25,32,37
+    FMConfig pass_config;             // per-pass configuration (floor, drift, init_count)
 };
 
 // ============================================================================

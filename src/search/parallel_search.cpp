@@ -28,7 +28,8 @@ struct SearchResult {
 // Run one search task: init → greedy → FM
 static SearchResult run_task(const Problem& prob, const DAG& dag,
                               const InitStrategy& strategy,
-                              unsigned seed_offset, int task_id) {
+                              unsigned seed_offset, int task_id,
+                              const FMOuterConfig& fm_template) {
     SearchResult result;
     result.task_id = task_id;
     result.desc = strategy.name + " (seed=" + std::to_string(seed_offset) + ")";
@@ -39,13 +40,8 @@ static SearchResult run_task(const Problem& prob, const DAG& dag,
     // Phase 2: Greedy local search
     part = local_search_from(std::move(part));
 
-    // Phase 3: FM refinement — reduced budget since we have many tasks
-    FMOuterConfig fm_cfg;
-    fm_cfg.max_passes = 10;
-    fm_cfg.max_no_improve = 3;
-    fm_cfg.pass_config.init_count = 1;
-    fm_cfg.pass_config.floor_fraction = 0.20;
-    fm_cfg.pass_config.max_drift_fraction = 0.20;
+    // Phase 3: FM refinement — use propagated config with per-task seed
+    FMOuterConfig fm_cfg = fm_template;
     fm_cfg.pass_config.seed = seed_offset;
 
     auto fm_result = fm_outer_loop(std::move(part), fm_cfg);
@@ -105,7 +101,8 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
 
             results[task_id] = run_task(prob, dag,
                                          strategies[task.strategy_idx],
-                                         task.seed_offset, task_id);
+                                         task.seed_offset, task_id,
+                                         cfg.fm);
 
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
