@@ -1,5 +1,6 @@
 #include "core/subgraph.h"
 #include <algorithm>
+#include <map>
 #include <cmath>
 
 // ============================================================================
@@ -161,47 +162,54 @@ bool Subgraph::is_valid_tiling(const TileConfig& cfg) const {
 int64_t Subgraph::working_set(const TileConfig& cfg,
                                const std::set<size_t>& retained_from_prev,
                                const std::set<size_t>& retain_these) const {
-    int64_t ws = 0;
-    std::set<size_t> counted;
+    // A boundary tensor may be used by multiple ops with different slice shapes
+    // (e.g., T0 as MM LHS needs h*K, but as PW input needs h*w).
+    // We must use the MAXIMUM size for each tensor.
+    std::map<size_t, int64_t> tensor_ws;
+
+    auto update = [&](size_t t, int64_t size) {
+        auto it = tensor_ws.find(t);
+        if (it == tensor_ws.end()) tensor_ws[t] = size;
+        else it->second = std::max(it->second, size);
+    };
 
     for (auto i : ops_) {
         const auto& op = prob_->ops[i];
         if (op.type == OpType::MatMul) {
             int64_t Ki = op_K(i);
             size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
-            if (boundary_inputs_.count(lhs) && !counted.count(lhs)) {
+            if (boundary_inputs_.count(lhs)) {
                 if (retained_from_prev.count(lhs))
-                    ws += prob_->tensors[lhs].width * prob_->tensors[lhs].height;
+                    update(lhs, prob_->tensors[lhs].width * prob_->tensors[lhs].height);
                 else
-                    ws += cfg.h * Ki;
-                counted.insert(lhs);
+                    update(lhs, cfg.h * Ki);
             }
-            if (boundary_inputs_.count(rhs) && !counted.count(rhs)) {
+            if (boundary_inputs_.count(rhs)) {
                 if (retained_from_prev.count(rhs))
-                    ws += prob_->tensors[rhs].width * prob_->tensors[rhs].height;
+                    update(rhs, prob_->tensors[rhs].width * prob_->tensors[rhs].height);
                 else
-                    ws += cfg.k * cfg.w;
-                counted.insert(rhs);
+                    update(rhs, cfg.k * cfg.w);
             }
-            if (boundary_outputs_.count(out) && !counted.count(out)) {
-                ws += cfg.h * cfg.w;
-                counted.insert(out);
-            }
+            if (boundary_outputs_.count(out))
+                update(out, cfg.h * cfg.w);
         } else {
             for (auto t : op.inputs)
-                if (boundary_inputs_.count(t) && !counted.count(t)) {
+                if (boundary_inputs_.count(t)) {
                     if (retained_from_prev.count(t))
-                        ws += prob_->tensors[t].width * prob_->tensors[t].height;
+                        update(t, prob_->tensors[t].width * prob_->tensors[t].height);
                     else
-                        ws += cfg.h * cfg.w;
-                    counted.insert(t);
+                        update(t, cfg.h * cfg.w);
                 }
         }
     }
 
+    int64_t ws = 0;
+    for (auto& [t, size] : tensor_ws)
+        ws += size;
+
     // Retained-from-prev tensors NOT used as boundary inputs still occupy memory
     for (auto t : retained_from_prev)
-        if (!counted.count(t))
+        if (!tensor_ws.count(t))
             ws += prob_->tensors[t].width * prob_->tensors[t].height;
 
     // Retained output accumulates: at the last tile, (full_size - h*w) of
@@ -272,24 +280,39 @@ CostResult Subgraph::compute_cost(const TileConfig& cfg,
     pw_comp *= (double)scale;
     result.compute_per_step = mm_comp;  // per k-step (PW added only at last step)
 
-    // Memory transfer costs per tile-step
+    // Memory transfer costs per tile-step.
+    // Each boundary input tensor is loaded at most once per tile; use a counted
+    // set to avoid double-charging when multiple ops share the same input.
     double lhs_load = 0, rhs_load = 0, pw_in_load = 0, out_evict = 0;
+    std::set<size_t> xfer_counted;
     for (auto i : ops_) {
         const auto& op = prob_->ops[i];
         if (op.type == OpType::MatMul) {
             int64_t Ki = op_K(i);
-            if (boundary_inputs_.count(op.inputs[0]) && !retained_from_prev.count(op.inputs[0]))
+            if (boundary_inputs_.count(op.inputs[0]) && !retained_from_prev.count(op.inputs[0])
+                && !xfer_counted.count(op.inputs[0])) {
                 lhs_load += (double)(cfg.h * Ki) / B;
-            if (boundary_inputs_.count(op.inputs[1]) && !retained_from_prev.count(op.inputs[1]))
+                xfer_counted.insert(op.inputs[0]);
+            }
+            if (boundary_inputs_.count(op.inputs[1]) && !retained_from_prev.count(op.inputs[1])
+                && !xfer_counted.count(op.inputs[1])) {
                 rhs_load += (double)(cfg.k * cfg.w) / B;
+                xfer_counted.insert(op.inputs[1]);
+            }
         } else {
             for (auto t : op.inputs)
-                if (boundary_inputs_.count(t) && !retained_from_prev.count(t))
+                if (boundary_inputs_.count(t) && !retained_from_prev.count(t)
+                    && !xfer_counted.count(t)) {
                     pw_in_load += (double)(cfg.h * cfg.w) / B;
+                    xfer_counted.insert(t);
+                }
         }
         for (auto t : op.outputs)
-            if (boundary_outputs_.count(t) && !retain_these.count(t))
+            if (boundary_outputs_.count(t) && !retain_these.count(t)
+                && !xfer_counted.count(t)) {
                 out_evict += (double)(cfg.h * cfg.w) / B;
+                xfer_counted.insert(t);
+            }
     }
 
     // Per-tile cost given reuse pattern

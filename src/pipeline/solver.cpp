@@ -3,6 +3,7 @@
 #include "search/parallel_search.h"
 #include "postopt/post_opt.h"
 #include <iostream>
+#include <map>
 #include <optional>
 #include <set>
 
@@ -39,21 +40,22 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
 
     size_t n = infos.size();
 
-    // Map ops to group index for DAG construction
-    std::vector<int> op_to_grp(prob.num_ops(), -1);
+    // Group-level DAG based on TENSOR dependencies (correct with recompute).
+    // Group A depends on Group B if A has a boundary input that is a boundary
+    // output of B. We must NOT use op-level predecessors because recomputed ops
+    // in multiple groups would create false edges/cycles.
+    std::map<size_t, size_t> tensor_producer_grp;  // tensor -> group index that outputs it
     for (size_t i = 0; i < n; i++)
-        for (auto op : infos[i].ops) op_to_grp[op] = (int)i;
+        for (auto t : infos[i].sg->boundary_outputs())
+            tensor_producer_grp[t] = i;
 
-    // Group-level DAG
     std::vector<std::set<size_t>> grp_preds(n), grp_succs(n);
     for (size_t i = 0; i < n; i++) {
-        for (auto op : infos[i].ops) {
-            for (auto pred : dag.op_preds[op]) {
-                int ps = op_to_grp[pred];
-                if (ps >= 0 && (size_t)ps != i) {
-                    grp_preds[i].insert((size_t)ps);
-                    grp_succs[(size_t)ps].insert(i);
-                }
+        for (auto t : infos[i].sg->boundary_inputs()) {
+            auto it = tensor_producer_grp.find(t);
+            if (it != tensor_producer_grp.end() && it->second != i) {
+                grp_preds[i].insert(it->second);
+                grp_succs[it->second].insert(i);
             }
         }
     }

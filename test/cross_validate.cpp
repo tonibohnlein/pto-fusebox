@@ -51,21 +51,25 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
         int tr = tiles[tp] / ntw, tc = tiles[tp] % ntw;
         for (int ks = 0; ks < nk; ks++) {
             double mi = 0, mo = 0;
+            std::set<size_t> xfer_done;  // dedup shared boundary inputs
             for (auto i : sg.ops()) {
                 const auto& op = prob.ops[i];
                 if (op.type == OpType::MatMul) {
                     size_t lhs = op.inputs[0], rhs = op.inputs[1];
-                    if (bi.count(lhs) && !rfp.count(lhs)) {
-                        if (!reuse) { if (ks == 0) mi += (double)(cfg.h * sg.op_K(i)) / B; }
-                        else { if (ks == 0 && (tp == 0 || tr != pr)) mi += (double)(cfg.h * sg.op_K(i)) / B; }
+                    if (bi.count(lhs) && !rfp.count(lhs) && !xfer_done.count(lhs)) {
+                        if (!reuse) { if (ks == 0) { mi += (double)(cfg.h * sg.op_K(i)) / B; xfer_done.insert(lhs); } }
+                        else { if (ks == 0 && (tp == 0 || tr != pr)) { mi += (double)(cfg.h * sg.op_K(i)) / B; xfer_done.insert(lhs); } }
                     }
-                    if (bi.count(rhs) && !rfp.count(rhs)) {
-                        if (!reuse) { mi += (double)(cfg.k * cfg.w) / B; }
-                        else { if (ks > 0 || (ks == 0 && (tp == 0 || tc != pc))) mi += (double)(cfg.k * cfg.w) / B; }
+                    if (bi.count(rhs) && !rfp.count(rhs) && !xfer_done.count(rhs)) {
+                        if (!reuse) { mi += (double)(cfg.k * cfg.w) / B; xfer_done.insert(rhs); }
+                        else { if (ks > 0 || (ks == 0 && (tp == 0 || tc != pc))) { mi += (double)(cfg.k * cfg.w) / B; xfer_done.insert(rhs); } }
                     }
                 } else {
                     if (ks == 0) for (auto t : op.inputs)
-                        if (bi.count(t) && !rfp.count(t)) mi += (double)(cfg.h * cfg.w) / B;
+                        if (bi.count(t) && !rfp.count(t) && !xfer_done.count(t)) {
+                            mi += (double)(cfg.h * cfg.w) / B;
+                            xfer_done.insert(t);
+                        }
                 }
             }
             if (ks == nk - 1 && !rt.count(sg.sink_tensor()))
