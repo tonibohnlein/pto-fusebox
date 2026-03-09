@@ -86,8 +86,9 @@ public:
     CostResult best_cost(const std::set<size_t>& retained_from_prev = {},
                          const std::set<size_t>& retain_these = {}) const;
 
+    Subgraph() = default;  // needed for ScheduleStep in vector ops
+
 private:
-    Subgraph() = default;
 
     const Problem* prob_ = nullptr;
     const DAG* dag_ = nullptr;

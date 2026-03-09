@@ -1,4 +1,7 @@
 #include "postopt/post_opt.h"
+#include "partition/partition.h"
+#include <algorithm>
+#include <map>
 
 Solution optimize_retain(const Problem& prob, const DAG& dag, Solution sol) {
     auto steps = sol.steps();
@@ -92,4 +95,17 @@ Solution optimize_recompute(const Problem& prob, const DAG& dag, Solution sol) {
         }
     }
     return Solution(prob, dag, std::move(steps));
+}
+
+// ============================================================================
+// Solution-level optimizer: delegates to solution_fm_search
+// ============================================================================
+
+#include "search/solution_search.h"
+
+Solution optimize_solution(const Problem& prob, const DAG& dag, Solution sol,
+                            std::chrono::steady_clock::time_point deadline) {
+    SolutionFMConfig cfg;
+    cfg.deadline = deadline;
+    return solution_fm_search(prob, dag, std::move(sol), cfg);
 }

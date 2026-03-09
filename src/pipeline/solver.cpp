@@ -450,18 +450,27 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     for (int pass = 1; pass <= 2; pass++) {
         double before = sol.total_latency();
         sol = optimize_retain(prob, dag, std::move(sol));
-        double after_ret = sol.total_latency();
         sol = optimize_recompute(prob, dag, std::move(sol));
-        double after_rec = sol.total_latency();
         sol = optimize_retain(prob, dag, std::move(sol));
-        double after_ret2 = sol.total_latency();
-        if (after_ret2 < before - 0.01) {
-            std::cerr << "  Pass " << pass << ": retain=" << after_ret
-                      << " recomp=" << after_rec
-                      << " retain2=" << after_ret2 << "\n";
-        }
-        if (after_ret2 >= before - 0.01) break;
+        if (sol.total_latency() >= before - 0.01) break;
     }
+    double after_retain_recomp = sol.total_latency();
+
+    // Phase 3: Solution-level local search (unified partition + retain moves)
+    std::cerr << "Phase 3: Solution-level local search...\n";
+    sol = optimize_solution(prob, dag, std::move(sol), deadline);
+    double after_sol_opt = sol.total_latency();
+    if (after_sol_opt < after_retain_recomp - 0.01)
+        std::cerr << "  Solution opt: " << after_retain_recomp << " → " << after_sol_opt
+                  << " (-" << std::fixed << std::setprecision(1)
+                  << 100.0*(after_retain_recomp - after_sol_opt)/after_retain_recomp << "%)\n";
+    else
+        std::cerr << "  Solution opt: no improvement\n";
+
+    // Final retain+recompute cleanup
+    sol = optimize_retain(prob, dag, std::move(sol));
+    sol = optimize_recompute(prob, dag, std::move(sol));
+    sol = optimize_retain(prob, dag, std::move(sol));
 
     auto vr = sol.validate();
     if (!vr.valid)
@@ -476,6 +485,16 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     if (after_build < partition_cost - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1) 
                   << 100.0*(partition_cost - after_build)/partition_cost << "%)";
+    std::cerr << "\n";
+    std::cerr << "  Retain+rec: " << after_retain_recomp;
+    if (after_retain_recomp < after_build - 0.01)
+        std::cerr << " (-" << std::fixed << std::setprecision(1)
+                  << 100.0*(after_build - after_retain_recomp)/after_build << "%)";
+    std::cerr << "\n";
+    std::cerr << "  Sol-opt:    " << after_sol_opt;
+    if (after_sol_opt < after_retain_recomp - 0.01)
+        std::cerr << " (-" << std::fixed << std::setprecision(1)
+                  << 100.0*(after_retain_recomp - after_sol_opt)/after_retain_recomp << "%)";
     std::cerr << "\n";
     std::cerr << "  Final:      " << final_cost;
     if (final_cost < partition_cost - 0.01)
