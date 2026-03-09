@@ -60,15 +60,10 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     auto strategies = all_init_strategies();
     int num_strategies = (int)strategies.size();
 
-    // Generate tasks: scale to available parallelism
-    int hw_threads = (int)std::thread::hardware_concurrency();
-    if (hw_threads <= 0) hw_threads = 4;
-    int num_threads = cfg.num_threads > 0 ? cfg.num_threads : hw_threads;
-
-    // Target: ~1 task per thread, at least 1 per strategy
-    int tasks_per_init = cfg.tasks_per_init;
-    if (tasks_per_init <= 0)
-        tasks_per_init = std::max(1, num_threads / num_strategies);
+    // Generate tasks: one per strategy. FM's outer loop already varies seeds
+    // internally (100 passes with different seeds), so running duplicate tasks
+    // with different FM seeds is redundant.
+    int tasks_per_init = cfg.tasks_per_init > 0 ? cfg.tasks_per_init : 1;
 
     std::vector<SearchTask> tasks;
     for (int s = 0; s < num_strategies; s++) {
@@ -78,6 +73,9 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     }
 
     int num_tasks = (int)tasks.size();
+    int hw_threads = (int)std::thread::hardware_concurrency();
+    if (hw_threads <= 0) hw_threads = 4;
+    int num_threads = cfg.num_threads > 0 ? cfg.num_threads : hw_threads;
     num_threads = std::min(num_threads, num_tasks);
 
     std::cerr << "  Parallel search: " << num_tasks << " tasks on "

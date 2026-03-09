@@ -48,19 +48,35 @@ struct GroupDAGInfo {
         gd.preds.resize(n);
         gd.succs.resize(n);
 
+        // Build group DAG based on tensor dependencies.
+        // For each boundary input T of group G, find which group contains
+        // the op that produces T (via the op-level DAG). This correctly
+        // handles recomputed ops where T may be ephemeral in its producing
+        // group but still needed as boundary input by another group.
+        
+        // Map: op → group index (for recomputed ops, track all groups)
+        std::vector<std::vector<size_t>> op_groups(prob.num_ops());
         for (size_t i = 0; i < n; i++)
-            for (auto t : gd.groups[i].sg.boundary_outputs())
-                gd.tensor_producer[t] = i;
+            for (auto op : gd.groups[i].ops)
+                op_groups[op].push_back(i);
 
         for (size_t i = 0; i < n; i++) {
             for (auto t : gd.groups[i].sg.boundary_inputs()) {
-                auto it = gd.tensor_producer.find(t);
-                if (it != gd.tensor_producer.end() && it->second != i) {
-                    gd.preds[i].insert(it->second);
-                    gd.succs[it->second].insert(i);
+                int prod_op = dag.tensor_producer[t];
+                if (prod_op < 0) continue;  // graph input, no producer
+                for (auto pg : op_groups[prod_op]) {
+                    if (pg != i) {
+                        gd.preds[i].insert(pg);
+                        gd.succs[pg].insert(i);
+                    }
                 }
             }
         }
+
+        // Also keep tensor_producer map for retain scoring (boundary outputs only)
+        for (size_t i = 0; i < n; i++)
+            for (auto t : gd.groups[i].sg.boundary_outputs())
+                gd.tensor_producer[t] = i;
 
         gd.in_deg.resize(n, 0);
         for (size_t i = 0; i < n; i++)
