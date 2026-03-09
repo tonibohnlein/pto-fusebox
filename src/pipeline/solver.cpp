@@ -396,9 +396,9 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     Solution beam_sol(prob, dag, std::move(beam_steps));
 
     // Pick the better one AFTER running retain+recompute on both.
-    // Beam has integrated retain but DFS + post-opt may still win.
+    double dfs_raw = dfs_sol.total_latency();
+    double beam_raw = beam_sol.total_latency();
 
-    // Apply one retain+recompute pass to each strategy, then pick winner
     auto dfs_opt = optimize_retain(prob, dag, std::move(dfs_sol));
     dfs_opt = optimize_recompute(prob, dag, std::move(dfs_opt));
     double dfs_lat = dfs_opt.total_latency();
@@ -407,7 +407,17 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     beam_opt = optimize_recompute(prob, dag, std::move(beam_opt));
     double beam_lat = beam_opt.total_latency();
 
-    std::cerr << "  DFS+opt: " << dfs_lat << ", Beam+opt: " << beam_lat << "\n";
+    std::cerr << "  DFS:  raw=" << dfs_raw << " → opt=" << dfs_lat;
+    if (dfs_lat < dfs_raw - 0.01) 
+        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+                  << 100.0*(dfs_raw-dfs_lat)/dfs_raw << "%)";
+    std::cerr << "\n";
+    std::cerr << "  Beam: raw=" << beam_raw << " → opt=" << beam_lat;
+    if (beam_lat < beam_raw - 0.01) 
+        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+                  << 100.0*(beam_raw-beam_lat)/beam_raw << "%)";
+    std::cerr << "\n";
+    std::cerr << "  Winner: " << (beam_lat < dfs_lat - 0.01 ? "Beam" : "DFS") << "\n";
 
     if (beam_lat < dfs_lat - 0.01) {
         return beam_opt;

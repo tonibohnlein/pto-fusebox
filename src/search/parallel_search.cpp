@@ -9,6 +9,7 @@
 #include <mutex>
 #include <vector>
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <random>
 #include <algorithm>
@@ -109,18 +110,28 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
 
     // ================================================================
     // Generation 0: init strategies → greedy+tabu+FM
+    // Fill all threads: multiple seeds per strategy if we have spare threads.
     // ================================================================
 
     auto gen0_deadline = deadline;
     if (has_deadline) {
         auto total = deadline - Clock::now();
-        gen0_deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(total * 6 / 10);
+        gen0_deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(total * 5 / 10);
     }
 
     FMOuterConfig gen0_fm = cfg.fm;
     gen0_fm.deadline = gen0_deadline;
 
-    int gen0_tasks = num_strategies;
+    int tasks_per_strategy = std::max(1, num_threads / num_strategies);
+    int gen0_tasks = num_strategies * tasks_per_strategy;
+
+    struct Gen0Task { int strategy_idx; unsigned seed; };
+    std::vector<Gen0Task> gen0_task_list;
+    for (int s = 0; s < num_strategies; s++)
+        for (int t = 0; t < tasks_per_strategy; t++)
+            gen0_task_list.push_back({s, (unsigned)(42 + s * 100 + t * 7)});
+    gen0_tasks = (int)gen0_task_list.size();
+
     std::vector<PoolEntry> gen0_results(gen0_tasks);
     std::atomic<int> next_task{0};
 
@@ -130,26 +141,40 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
             int tid = next_task.fetch_add(1);
             if (tid >= gen0_tasks) break;
             auto start = Clock::now();
+            auto& task = gen0_task_list[tid];
 
-            auto part = strategies[tid].init(prob, dag);
+            auto part = strategies[task.strategy_idx].init(prob, dag);
             part.cache = &shared_cache;
+            double init_cost = part.total_cost();
+
             part = local_search_from(std::move(part));
+            double greedy_cost = part.total_cost();
 
             FMOuterConfig fc = gen0_fm;
-            fc.pass_config.seed = (unsigned)(42 + tid * 100);
+            fc.pass_config.seed = task.seed;
             auto fm = fm_outer_loop(std::move(part), fc);
+            double fm_cost = fm.best_cost;
 
-            gen0_results[tid] = {std::move(fm.best_partition), fm.best_cost,
-                                  strategies[tid].name};
+            gen0_results[tid] = {std::move(fm.best_partition), fm_cost,
+                                  strategies[task.strategy_idx].name};
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - start).count();
             std::lock_guard<std::mutex> lock(log_mutex);
-            std::cerr << "    gen0 [" << gen0_results[tid].origin
-                      << "]: " << gen0_results[tid].cost << " (" << ms << "ms)\n";
+            std::cerr << "    gen0 [" << strategies[task.strategy_idx].name
+                      << " s=" << task.seed << "]: init=" << init_cost
+                      << " → greedy=" << greedy_cost;
+            if (fm_cost < greedy_cost - 0.01)
+                std::cerr << " → FM=" << fm_cost
+                          << " (-" << std::fixed << std::setprecision(1)
+                          << 100.0 * (greedy_cost - fm_cost) / greedy_cost << "%)";
+            else
+                std::cerr << " → FM=same";
+            std::cerr << " (" << ms << "ms)\n";
         }
     };
 
-    std::cerr << "  Gen 0: " << gen0_tasks << " init tasks\n";
+    std::cerr << "  Gen 0: " << gen0_tasks << " tasks on " 
+              << std::min(num_threads, gen0_tasks) << " threads\n";
     {
         std::vector<std::thread> threads;
         int nt = std::min(num_threads, gen0_tasks);
@@ -162,7 +187,8 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
         pool_insert(pool, std::move(r), 8);
     pool_sort(pool);
 
-    std::cerr << "  Pool: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
+    std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
+    double gen0_best = pool[0].cost;
 
     // ================================================================
     // Generation 1+: mutation + crossover → greedy → FM
@@ -179,8 +205,8 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
 
         FMOuterConfig gen_fm = cfg.fm;
         gen_fm.deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(remaining * 8 / 10);
-        gen_fm.max_passes = std::min(gen_fm.max_passes, 30);
-        gen_fm.max_no_improve = std::min(gen_fm.max_no_improve, 10);
+        gen_fm.max_passes = std::min(gen_fm.max_passes, 50);
+        gen_fm.max_no_improve = std::min(gen_fm.max_no_improve, 15);
 
         int mut_tasks = std::min(num_threads, std::max(2, (int)pool.size()));
         std::vector<PoolEntry> mut_results(mut_tasks);
@@ -228,20 +254,25 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
                 }
 
                 // Refine: greedy + FM
+                double after_mutate = child.total_cost();
                 child = greedy_descent(std::move(child));
+                double after_greedy = child.total_cost();
 
                 FMOuterConfig fc = gen_fm;
                 fc.pass_config.seed = (unsigned)(rng());
                 auto fm = fm_outer_loop(std::move(child), fc);
+                double after_fm = fm.best_cost;
 
-                mut_results[tid] = {std::move(fm.best_partition), fm.best_cost, origin};
+                mut_results[tid] = {std::move(fm.best_partition), after_fm, origin};
 
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - start).count();
-                if (mut_results[tid].cost < best_ever - 0.01) {
+                if (after_fm < best_ever - 0.01) {
                     std::lock_guard<std::mutex> lock(log_mutex);
                     std::cerr << "    gen" << gen << " [" << origin
-                              << "]: " << mut_results[tid].cost
+                              << "]: mutated=" << after_mutate
+                              << " → greedy=" << after_greedy
+                              << " → FM=" << after_fm
                               << " (" << ms << "ms) ***NEW BEST***\n";
                 }
             }
@@ -269,7 +300,7 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
             gens_no_improve++;
         }
 
-        if (gens_no_improve >= 15) {
+        if (gens_no_improve >= 25) {
             std::cerr << "  Stopping after " << gen << " generations\n";
             break;
         }
@@ -277,7 +308,11 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     }
 
     std::cerr << "  Final pool: " << pool.size() << " entries, best=" << pool[0].cost
-              << " (" << gen - 1 << " generations)\n";
+              << " (" << gen - 1 << " generations)";
+    if (pool[0].cost < gen0_best - 0.01)
+        std::cerr << "  evo improved by " << std::fixed << std::setprecision(1)
+                  << 100.0 * (gen0_best - pool[0].cost) / gen0_best << "%";
+    std::cerr << "\n";
     std::cerr << "  Cache: " << shared_cache.size() << " entries, "
               << shared_cache.hits() << " hits, " << shared_cache.misses() << " misses\n";
 
