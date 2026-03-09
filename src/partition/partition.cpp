@@ -1,4 +1,5 @@
 #include "partition/partition.h"
+#include "core/cost_cache.h"
 
 Partition Partition::trivial(const Problem& prob, const DAG& dag) {
     Partition p;
@@ -75,6 +76,8 @@ std::set<size_t> Partition::adjacent_groups(size_t gi) const {
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {
+    if (ops.empty()) return 1e18;
+    if (cache) return cache->evaluate(ops, *prob, *dag);
     auto sg = Subgraph::create(*prob, *dag, {ops.begin(), ops.end()});
     if (!sg) return 1e18;
     auto c = sg->best_cost();
@@ -107,28 +110,28 @@ std::vector<size_t> Partition::ejectable_ops(size_t gi) const {
 std::vector<std::set<size_t>> Partition::connected_components(
         const std::set<size_t>& ops) const {
     std::vector<std::set<size_t>> components;
-    std::set<size_t> visited;
+    std::vector<bool> visited(prob->num_ops(), false);
 
     for (auto seed : ops) {
-        if (visited.count(seed)) continue;
+        if (visited[seed]) continue;
 
         // BFS from seed within ops
         std::set<size_t> comp;
         std::vector<size_t> queue = {seed};
-        visited.insert(seed);
+        visited[seed] = true;
 
         while (!queue.empty()) {
             size_t u = queue.back(); queue.pop_back();
             comp.insert(u);
             for (auto v : dag->op_preds[u]) {
-                if (ops.count(v) && !visited.count(v)) {
-                    visited.insert(v);
+                if (ops.count(v) && !visited[v]) {
+                    visited[v] = true;
                     queue.push_back(v);
                 }
             }
             for (auto v : dag->op_succs[u]) {
-                if (ops.count(v) && !visited.count(v)) {
-                    visited.insert(v);
+                if (ops.count(v) && !visited[v]) {
+                    visited[v] = true;
                     queue.push_back(v);
                 }
             }
@@ -214,17 +217,17 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     const auto& ops = groups[gi].ops;
 
     // BFS from op_a in the undirected DAG of ops, skipping edge a↔b
-    std::set<size_t> visited;
+    std::vector<bool> visited(prob->num_ops(), false);
     std::vector<size_t> queue = {op_a};
-    visited.insert(op_a);
+    visited[op_a] = true;
 
     while (!queue.empty()) {
         size_t u = queue.back(); queue.pop_back();
         auto try_add = [&](size_t v) {
-            if (!ops.count(v) || visited.count(v)) return;
+            if (!ops.count(v) || visited[v]) return;
             // Skip the specific edge a↔b
             if ((u == op_a && v == op_b) || (u == op_b && v == op_a)) return;
-            visited.insert(v);
+            visited[v] = true;
             queue.push_back(v);
         };
         for (auto v : dag->op_preds[u]) try_add(v);
@@ -232,12 +235,13 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     }
 
     // If b is still reachable, edge is not a bridge → no split
-    if (visited.count(op_b)) return result;
+    if (visited[op_b]) return result;
 
     // Split into two sides
-    result.side_a = visited;
-    for (auto op : ops)
-        if (!visited.count(op)) result.side_b.insert(op);
+    for (auto op : ops) {
+        if (visited[op]) result.side_a.insert(op);
+        else result.side_b.insert(op);
+    }
 
     // Both sides must be non-empty and have at least 1 op
     if (result.side_a.empty() || result.side_b.empty()) return result;
@@ -262,25 +266,35 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
 
     std::vector<std::pair<size_t,size_t>> bridges;
     const auto& ops = groups[gi].ops;
+    size_t nops = prob->num_ops();
+
+    // Reuse visited vector across iterations to avoid repeated allocation
+    std::vector<bool> visited(nops, false);
+    std::vector<size_t> to_clear;  // track which indices to reset
 
     // For each DAG edge within the group, check if it's a bridge
     for (auto u : ops) {
         for (auto v : dag->op_succs[u]) {
             if (!ops.count(v)) continue;
 
+            // Reset visited from previous iteration
+            for (auto idx : to_clear) visited[idx] = false;
+            to_clear.clear();
+
             // Quick BFS: can we reach v from u without using edge u→v?
-            std::set<size_t> visited;
             std::vector<size_t> queue = {u};
-            visited.insert(u);
+            visited[u] = true;
+            to_clear.push_back(u);
             bool found = false;
 
             while (!queue.empty() && !found) {
                 size_t w = queue.back(); queue.pop_back();
                 auto try_add = [&](size_t x) {
-                    if (!ops.count(x) || visited.count(x)) return;
+                    if (!ops.count(x) || visited[x]) return;
                     if ((w == u && x == v) || (w == v && x == u)) return;
                     if (x == v) { found = true; return; }
-                    visited.insert(x);
+                    visited[x] = true;
+                    to_clear.push_back(x);
                     queue.push_back(x);
                 };
                 for (auto x : dag->op_preds[w]) try_add(x);

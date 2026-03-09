@@ -3,6 +3,7 @@
 #include "init/init_strategies.h"
 #include "search/local_search.h"
 #include "search/fm_outer.h"
+#include "core/cost_cache.h"
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -29,13 +30,15 @@ struct SearchResult {
 static SearchResult run_task(const Problem& prob, const DAG& dag,
                               const InitStrategy& strategy,
                               unsigned seed_offset, int task_id,
-                              const FMOuterConfig& fm_template) {
+                              const FMOuterConfig& fm_template,
+                              CostCache& cache) {
     SearchResult result;
     result.task_id = task_id;
     result.desc = strategy.name + " (seed=" + std::to_string(seed_offset) + ")";
 
     // Phase 1: Initialize
     auto part = strategy.init(prob, dag);
+    part.cache = &cache;
 
     // Phase 2: Greedy local search
     part = local_search_from(std::move(part));
@@ -86,6 +89,9 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     std::vector<SearchResult> results(num_tasks);
     std::mutex log_mutex;
 
+    // Shared cost cache — thread-safe, avoids redundant eval_set across all tasks
+    CostCache shared_cache;
+
     // Task queue
     std::atomic<int> next_task{0};
 
@@ -101,7 +107,7 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
             results[task_id] = run_task(prob, dag,
                                          strategies[task.strategy_idx],
                                          task.seed_offset, task_id,
-                                         cfg.fm);
+                                         cfg.fm, shared_cache);
 
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
@@ -131,6 +137,8 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     std::cerr << "  Best: task " << best_idx << " ["
               << results[best_idx].desc << "] cost="
               << results[best_idx].cost << "\n";
+    std::cerr << "  Cache: " << shared_cache.size() << " entries, "
+              << shared_cache.hits() << " hits, " << shared_cache.misses() << " misses\n";
 
     return std::move(results[best_idx].partition);
 }

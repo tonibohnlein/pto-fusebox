@@ -6,6 +6,8 @@
 #include <set>
 #include <vector>
 
+class CostCache;  // forward declaration
+
 // ============================================================================
 // Partition: mutable representation of op-to-subgraph assignments.
 //
@@ -17,6 +19,7 @@
 struct Partition {
     const Problem* prob = nullptr;
     const DAG* dag = nullptr;
+    CostCache* cache = nullptr;  // shared cost cache (optional, speeds up eval_set)
 
     struct Group {
         std::set<size_t> ops;
