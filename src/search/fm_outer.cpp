@@ -35,27 +35,31 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
                       << ", +" << pass_result.moves_positive
                       << " -" << pass_result.moves_negative << ")\n";
         } else {
-            // FM did NOT improve. Try greedy on the FM result as an escape
-            // mechanism: FM perturbed the partition, greedy may find a new
-            // local minimum in a different basin than where we started.
-            auto greedy_kick = local_search_from(Partition(pass_result.best_partition));
-            if (greedy_kick.total_cost() < result.best_cost - 0.001) {
-                double improvement = result.best_cost - greedy_kick.total_cost();
-                result.best_cost = greedy_kick.total_cost();
-                result.best_partition = std::move(greedy_kick);
-                result.improving_passes++;
-                no_improve = 0;
+            no_improve++;
 
-                if (g_verbose) std::cerr << "    FM pass " << pass
-                          << ": FM+greedy escaped to " << result.best_cost
-                          << " (delta=" << improvement << ")\n";
-            } else {
-                no_improve++;
-                if (no_improve >= cfg.max_no_improve) {
-                    if (g_verbose) std::cerr << "    FM: " << cfg.max_no_improve
-                              << " consecutive passes without improvement, stopping\n";
-                    break;
+            // Greedy-kick: every 5 non-improving passes, try greedy on the
+            // FM-perturbed partition. FM may have moved to a different basin
+            // that greedy can exploit. Only the greedy phase (fast), no tabu.
+            if (no_improve % 5 == 0) {
+                auto greedy_kick = greedy_descent(Partition(pass_result.best_partition));
+                if (greedy_kick.total_cost() < result.best_cost - 0.001) {
+                    double improvement = result.best_cost - greedy_kick.total_cost();
+                    result.best_cost = greedy_kick.total_cost();
+                    result.best_partition = std::move(greedy_kick);
+                    result.improving_passes++;
+                    no_improve = 0;
+
+                    if (g_verbose) std::cerr << "    FM pass " << pass
+                              << ": greedy-kick escaped to " << result.best_cost
+                              << " (delta=" << improvement << ")\n";
+                    continue;  // don't check no_improve limit
                 }
+            }
+
+            if (no_improve >= cfg.max_no_improve) {
+                if (g_verbose) std::cerr << "    FM: " << cfg.max_no_improve
+                          << " consecutive passes without improvement, stopping\n";
+                break;
             }
         }
     }

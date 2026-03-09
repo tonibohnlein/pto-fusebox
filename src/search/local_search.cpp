@@ -381,9 +381,9 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
     int tabu_ttl = std::max(5, (int)part.num_alive() / 3);
     TabuList tabu(tabu_ttl);
 
-    double neg_floor = best_cost * 0.02;
+    double neg_floor = best_cost * 0.10;
 
-    int max_no_improve = std::max(5, (int)part.prob->num_ops() / 5);
+    int max_no_improve = std::max(10, (int)part.prob->num_ops() / 3);
     int no_improve = 0;
     int applied = 0;
 
@@ -443,6 +443,11 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
     return applied;
 }
 
+Partition greedy_descent(Partition part) {
+    greedy_phase(part);
+    return part;
+}
+
 // ============================================================================
 // Two-phase local search from a given partition
 // ============================================================================
@@ -457,9 +462,8 @@ Partition local_search_from(Partition part) {
     Partition best_seen = part;
     double best_cost = part.total_cost();
 
-    // Phase 2: tabu exploration — only if greedy made few moves
-    // (many moves = init was far from optimum, greedy already did the work)
-    if (greedy_moves <= 3) {
+    // Phase 2: tabu exploration — allows worsening moves to escape local optima
+    {
         int tabu_moves = tabu_phase(part, best_seen, best_cost);
         if (tabu_moves > 0) {
             if (g_verbose) std::cerr << "    tabu: " << tabu_moves << " moves, best="

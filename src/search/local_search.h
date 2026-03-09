@@ -71,6 +71,9 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
 
 Partition local_search_from(Partition part);
 
+// Greedy-only descent (no tabu). Faster than local_search_from.
+Partition greedy_descent(Partition part);
+
 // ============================================================================
 // Multi-start: run local_search_from each initialization, return best.
 // ============================================================================

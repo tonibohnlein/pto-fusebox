@@ -25,21 +25,25 @@ struct ParallelConfig {
 // Heuristic: each FM pass costs roughly O(n_ops * n_groups) eval_set calls.
 inline void adapt_fm_budget(ParallelConfig& cfg, size_t n_ops) {
     if (n_ops <= 20) {
-        // Small: FM is cheap, be generous
         cfg.fm.max_passes = 50;
         cfg.fm.max_no_improve = 15;
-    } else if (n_ops <= 50) {
-        // Medium
+        cfg.fm.pass_config.floor_fraction = 0.30;
+        cfg.fm.pass_config.max_drift_fraction = 0.50;
+    } else if (n_ops <= 40) {
         cfg.fm.max_passes = 30;
         cfg.fm.max_no_improve = 10;
-    } else if (n_ops <= 100) {
-        // Large: each pass is expensive
-        cfg.fm.max_passes = 15;
-        cfg.fm.max_no_improve = 6;
+        cfg.fm.pass_config.floor_fraction = 0.30;
+        cfg.fm.pass_config.max_drift_fraction = 0.40;
+    } else if (n_ops <= 70) {
+        cfg.fm.max_passes = 3;
+        cfg.fm.max_no_improve = 2;
+        cfg.fm.pass_config.floor_fraction = 0.20;
+        cfg.fm.pass_config.max_drift_fraction = 0.20;
     } else {
-        // Very large: minimal FM
-        cfg.fm.max_passes = 8;
-        cfg.fm.max_no_improve = 4;
+        cfg.fm.max_passes = 5;
+        cfg.fm.max_no_improve = 3;
+        cfg.fm.pass_config.floor_fraction = 0.15;
+        cfg.fm.pass_config.max_drift_fraction = 0.15;
     }
 }
 
