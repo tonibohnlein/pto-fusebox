@@ -101,10 +101,12 @@ void test_retain_ws_output_accumulation() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // Retain output: ws = input(16384) + full_out - tile_out = 16384 + 65536-16384 = 65536
+    // Retain output: ws = input_tile(16384) + full_retained_out(65536) = 81920
+    // PW output not counted in base ws, so retain adds full tensor size.
     auto c = sg->compute_cost({128,128,1,SnakeDir::None}, {}, {1});
-    CHECK_EQ_I("ret out ws", c.working_set, 65536);
-    CHECK("ret out feasible", c.feasible);
+    CHECK_EQ_I("ret out ws", c.working_set, 81920);
+    // 81920 > 80000 = infeasible at cap=80000
+    CHECK("ret out infeasible at 80000", !c.feasible);
 }
 
 void test_retain_ws_unused_tensor() {
@@ -168,13 +170,14 @@ void test_retain_transfer_output() {
     Problem p;
     p.tensors = {{256,256},{256,256}};
     p.ops = {{OpType::Pointwise,{0},{1},1000}};
-    p.fast_memory_capacity = 80000;
+    p.fast_memory_capacity = 100000;  // must hold input_tile(16384) + full_retained_out(65536) = 81920
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
     // Retain output: 4 tiles × max(1000, 1638.4+0) = 4 × 1638.4 = 6553.6
+    // (no eviction since output is retained, only input transfer)
     CHECK_EQ("ret out lat", sg->compute_cost({128,128,1,SnakeDir::None},{},{1}).latency, 6553.6);
 }
 

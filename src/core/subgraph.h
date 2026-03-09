@@ -104,4 +104,16 @@ private:
     std::vector<int64_t> all_K_values_;      // distinct K values (for k enumeration)
     std::vector<int64_t> all_out_widths_;    // all op output widths (for w validation)
     std::vector<int64_t> all_out_heights_;   // all op output heights (for h validation)
+
+    // Precomputed per-boundary-tensor info for fast working_set/compute_cost.
+    // Avoids std::map allocation on every call.
+    struct BoundaryTensorInfo {
+        size_t id;
+        int64_t max_lhs_K = 0;    // max K among MM ops using this as LHS (0 = not LHS)
+        bool is_mm_rhs = false;
+        bool is_mm_out = false;
+        bool is_pw_in = false;     // used as PW input (or MM out for ws purposes)
+        bool is_boundary_out = false;
+    };
+    std::vector<BoundaryTensorInfo> boundary_tensor_info_;  // built at create() time
 };

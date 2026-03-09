@@ -232,13 +232,33 @@ int64_t Subgraph::working_set(const TileConfig& cfg,
             ws += prob_->tensors[t].width * prob_->tensors[t].height;
     }
 
-    // Retained output accumulates: at the last tile, (full_size - h*w) of
-    // previously-computed tiles are in memory alongside the current tile
+    // Retained output accumulates: at the last tile, the full tensor is resident.
+    // If the current tile is already counted above (MM output: is_mm_out → h×w),
+    // we add full - tile. If NOT counted (PW output: max_size=0), add full.
     for (auto t : retain_these) {
         int64_t full = prob_->tensors[t].width * prob_->tensors[t].height;
         int64_t tile = cfg.h * cfg.w;
-        if (full > tile)
-            ws += full - tile;  // the h×w for current tile is already counted above
+        if (full <= tile) continue;  // single tile, no accumulation overhead
+
+        // Check if this tensor's current tile is already counted in ws
+        bool tile_counted = false;
+        for (auto& info : boundary_tensor_info_) {
+            if (info.id == t) {
+                // Was it counted? Check if any role contributed > 0
+                int64_t sz = 0;
+                if (info.max_lhs_K > 0) sz = std::max(sz, cfg.h * info.max_lhs_K);
+                if (info.is_mm_rhs) sz = std::max(sz, cfg.k * cfg.w);
+                if (info.is_mm_out || info.is_pw_in) sz = std::max(sz, cfg.h * cfg.w);
+                if (retained_from_prev.count(t)) sz = full;  // already fully counted
+                tile_counted = (sz > 0);
+                break;
+            }
+        }
+
+        if (tile_counted)
+            ws += full - tile;  // current tile already in ws
+        else
+            ws += full;         // PW output: current tile NOT in ws, add everything
     }
 
     return ws;

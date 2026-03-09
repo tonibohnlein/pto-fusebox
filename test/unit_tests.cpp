@@ -720,13 +720,13 @@ void test_retain_output_accumulation() {
     auto ws_no = sg->working_set(N(128,128,1));
     std::cout << "    ws no retain: " << ws_no << "\n";
 
-    // With retain T1 (output): tiles accumulate. full T1 = 65536, tile = 16384.
-    // Extra from accumulation: 65536 - 16384 = 49152.
-    // ws = ws_no + 49152. If ws_no=16384: total = 65536.
+    // With retain T1 (output): tiles accumulate. Full T1 = 65536.
+    // PW output NOT counted in base ws, so retain adds full 65536.
+    // ws = ws_no(16384) + full(65536) = 81920.
     auto ws_ret = sg->working_set(N(128,128,1), {}, {1});
     std::cout << "    ws retain output: " << ws_ret << "\n";
-    // Accumulation adds full_size - tile_size
-    CHECK_EQ_I("accumulation cost", ws_ret - ws_no, 256*256 - 128*128);
+    // Retain adds full tensor size for PW output (current tile was not in ws)
+    CHECK_EQ_I("accumulation cost", ws_ret - ws_no, 256*256);
 
     CHECK("retain output infeasible at cap=40000", 
           !sg->is_feasible(N(128,128,1), {}, {1}));
