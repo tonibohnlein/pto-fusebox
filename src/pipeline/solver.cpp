@@ -22,7 +22,6 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
         std::vector<size_t> ops;
         std::optional<Subgraph> sg;
         CostResult cost;
-        std::set<size_t> all_tensors;  // boundary inputs + boundary outputs
     };
 
     std::vector<GroupInfo> infos;
@@ -33,18 +32,13 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
         gi.sg = Subgraph::create(prob, dag, gi.ops);
         if (!gi.sg) continue;
         gi.cost = gi.sg->best_cost();
-        gi.all_tensors = gi.sg->boundary_inputs();
-        gi.all_tensors.insert(gi.sg->sink_tensor());
         infos.push_back(std::move(gi));
     }
 
     size_t n = infos.size();
 
     // Group-level DAG based on TENSOR dependencies (correct with recompute).
-    // Group A depends on Group B if A has a boundary input that is a boundary
-    // output of B. We must NOT use op-level predecessors because recomputed ops
-    // in multiple groups would create false edges/cycles.
-    std::map<size_t, size_t> tensor_producer_grp;  // tensor -> group index that outputs it
+    std::map<size_t, size_t> tensor_producer_grp;
     for (size_t i = 0; i < n; i++)
         for (auto t : infos[i].sg->boundary_outputs())
             tensor_producer_grp[t] = i;
@@ -63,46 +57,99 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     std::vector<int> in_deg(n, 0);
     for (size_t i = 0; i < n; i++) in_deg[i] = (int)grp_preds[i].size();
 
-    // Greedy topological order: at each step pick the ready group sharing the
-    // most retainable tensors with the previously scheduled group.
+    // DFS chain-first topological sort with retain-aware scoring.
+    //
+    // After scheduling group G, prefer its direct successors (chain-first).
+    // Among ready candidates, score by the byte size of retainable tensors
+    // shared with G's output — this maximizes the chance that optimize_retain
+    // can keep data resident.
+    //
+    // If no successor is ready, fall back to any ready group scored by:
+    //   1. retainable overlap with any recently scheduled group
+    //   2. tie-break: prefer groups consuming the largest boundary inputs
+    //      (schedule big consumers early to shorten tensor lifetimes)
+
     std::vector<size_t> order;
     std::vector<bool> scheduled(n, false);
 
-    // Seed ready set
-    std::vector<size_t> ready;
+    // Ready set
+    std::set<size_t> ready;
     for (size_t i = 0; i < n; i++)
-        if (in_deg[i] == 0) ready.push_back(i);
+        if (in_deg[i] == 0) ready.insert(i);
+
+    // Score a candidate group based on retain potential with the previously
+    // scheduled group. Returns the total byte size of retainable shared tensors.
+    auto retain_score = [&](size_t candidate, size_t prev) -> int64_t {
+        if (prev >= n) return 0;  // no previous group
+        int64_t score = 0;
+
+        // Does candidate consume prev's sink tensor?
+        size_t prev_sink = infos[prev].sg->sink_tensor();
+        if (infos[candidate].sg->boundary_inputs().count(prev_sink) &&
+            prob.retainable_tensors.count(prev_sink))
+            score += prob.tensors[prev_sink].width * prob.tensors[prev_sink].height;
+
+        // Shared boundary inputs (both groups load the same tensor)
+        for (auto t : infos[candidate].sg->boundary_inputs())
+            if (infos[prev].sg->boundary_inputs().count(t) &&
+                prob.retainable_tensors.count(t))
+                score += prob.tensors[t].width * prob.tensors[t].height;
+
+        return score;
+    };
+
+    // Total boundary input size (for tie-breaking)
+    auto input_size = [&](size_t gi) -> int64_t {
+        int64_t s = 0;
+        for (auto t : infos[gi].sg->boundary_inputs())
+            s += prob.tensors[t].width * prob.tensors[t].height;
+        return s;
+    };
 
     size_t prev = SIZE_MAX;
-    while (!ready.empty()) {
-        size_t best_idx = 0;
-        int best_shared = -1;
 
-        if (prev != SIZE_MAX && !prob.retainable_tensors.empty()) {
-            // Score each ready group by shared retainable tensors with prev
-            for (size_t ri = 0; ri < ready.size(); ri++) {
-                size_t gi = ready[ri];
-                int shared = 0;
-                for (auto t : infos[gi].all_tensors)
-                    if (prob.retainable_tensors.count(t) &&
-                        infos[prev].all_tensors.count(t))
-                        shared++;
-                if (shared > best_shared) {
-                    best_shared = shared;
-                    best_idx = ri;
+    while (!ready.empty()) {
+        size_t chosen = SIZE_MAX;
+        int64_t best_score = -1;
+        int64_t best_input = -1;
+
+        // DFS priority: if prev has ready successors, strongly prefer them
+        if (prev < n) {
+            for (auto s : grp_succs[prev]) {
+                if (!scheduled[s] && ready.count(s)) {
+                    int64_t sc = retain_score(s, prev);
+                    int64_t inp = input_size(s);
+                    if (sc > best_score || (sc == best_score && inp > best_input)) {
+                        chosen = s;
+                        best_score = sc;
+                        best_input = inp;
+                    }
                 }
             }
         }
 
-        size_t chosen = ready[best_idx];
-        ready.erase(ready.begin() + best_idx);
+        // If no successor is ready, pick best from all ready groups
+        if (chosen == SIZE_MAX) {
+            for (auto gi : ready) {
+                int64_t sc = retain_score(gi, prev);
+                int64_t inp = input_size(gi);
+                if (sc > best_score || (sc == best_score && inp > best_input)) {
+                    chosen = gi;
+                    best_score = sc;
+                    best_input = inp;
+                }
+            }
+        }
+
+        ready.erase(chosen);
         order.push_back(chosen);
         scheduled[chosen] = true;
         prev = chosen;
 
+        // Update in-degrees and ready set
         for (auto v : grp_succs[chosen]) {
             if (--in_deg[v] == 0)
-                ready.push_back(v);
+                ready.insert(v);
         }
     }
 
