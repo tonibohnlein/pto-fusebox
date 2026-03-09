@@ -12,8 +12,8 @@ using TimePoint = SteadyClock::time_point;
 // ============================================================================
 
 struct FMOuterConfig {
-    int max_passes = 100;             // quality-focused: allow many passes
-    int max_no_improve = 30;          // experiment showed improvements at pass 25,32,37
+    int max_passes = 1000;             // quality-focused: allow many passes
+    int max_no_improve = 15;          // experiment showed improvements at pass 25,32,37
     FMConfig pass_config;             // per-pass configuration (floor, drift, init_count)
     TimePoint deadline = TimePoint::max();  // wall-clock cutoff
 };

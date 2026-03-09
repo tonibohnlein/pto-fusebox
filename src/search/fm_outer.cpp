@@ -20,9 +20,10 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         // Start each pass from the best known partition
         Partition current = result.best_partition;
 
-        // Vary seed each pass for different initial active subsets
+        // Vary seed each pass, incorporating the config's base seed
+        // so different tasks explore different FM trajectories
         FMConfig pass_cfg = cfg.pass_config;
-        pass_cfg.seed = (unsigned)(42 + pass * 7);
+        pass_cfg.seed = (unsigned)(pass_cfg.seed + pass * 7);
 
         auto pass_result = fm_inner_pass(std::move(current), pass_cfg);
         result.total_passes++;
