@@ -3,6 +3,7 @@
 #include "search/parallel_search.h"
 #include "postopt/post_opt.h"
 #include <iostream>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <set>
@@ -421,30 +422,56 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
 Solution solve(const Problem& prob, TimePoint deadline) {
     DAG dag = DAG::build(prob);
 
-    std::cerr << "Phase 1: Parallel search (init + greedy + FM)...\n";
+    std::cerr << "Phase 1: Parallel search (init + greedy + FM + evo)...\n";
     ParallelConfig pcfg;
     pcfg.fm.deadline = deadline;
     auto best_part = parallel_search(prob, dag, pcfg);
+    double partition_cost = best_part.total_cost();
+    std::cerr << "  Partition cost: " << partition_cost 
+              << " (" << best_part.num_alive() << " groups)\n";
 
     std::cerr << "Phase 2: Build solution (DFS + beam + retain/recompute)...\n";
     auto sol = build_solution(prob, dag, best_part);
-    std::cerr << "  " << sol.num_steps() << " steps, lat=" << sol.total_latency() << "\n";
+    double after_build = sol.total_latency();
+    std::cerr << "  After build+opt: " << after_build 
+              << " (" << sol.num_steps() << " steps)\n";
 
-    // Additional retain+recompute passes (may find improvements the first round missed)
+    // Additional retain+recompute passes
     for (int pass = 1; pass <= 2; pass++) {
         double before = sol.total_latency();
         sol = optimize_retain(prob, dag, std::move(sol));
+        double after_ret = sol.total_latency();
         sol = optimize_recompute(prob, dag, std::move(sol));
+        double after_rec = sol.total_latency();
         sol = optimize_retain(prob, dag, std::move(sol));
-        std::cerr << "  Pass " << pass << ": lat=" << sol.total_latency() << "\n";
-        if (sol.total_latency() >= before - 0.01) break;
+        double after_ret2 = sol.total_latency();
+        if (after_ret2 < before - 0.01) {
+            std::cerr << "  Pass " << pass << ": retain=" << after_ret
+                      << " recomp=" << after_rec
+                      << " retain2=" << after_ret2 << "\n";
+        }
+        if (after_ret2 >= before - 0.01) break;
     }
 
     auto vr = sol.validate();
     if (!vr.valid)
         std::cerr << "  WARNING: " << vr.error << "\n";
-    std::cerr << "  Final: " << sol.num_steps() << " steps, lat="
-              << sol.total_latency() << "\n";
+
+    // Summary
+    double final_cost = sol.total_latency();
+    double improve_pct = 100.0 * (partition_cost - final_cost) / partition_cost;
+    std::cerr << "  === Summary ===\n";
+    std::cerr << "  Partition:  " << partition_cost << "\n";
+    std::cerr << "  Build+opt:  " << after_build;
+    if (after_build < partition_cost - 0.01)
+        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+                  << 100.0*(partition_cost - after_build)/partition_cost << "%)";
+    std::cerr << "\n";
+    std::cerr << "  Final:      " << final_cost;
+    if (final_cost < partition_cost - 0.01)
+        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+                  << improve_pct << "% total)";
+    std::cerr << "\n";
 
     return sol;
 }

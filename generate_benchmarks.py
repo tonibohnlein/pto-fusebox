@@ -540,46 +540,255 @@ def multi_scale_attention(seq=128, dims=[64, 128, 256, 512],
     return b
 
 
+
+# (main block at end of file)
+
+
+# ============================================================================
+# HARDER BENCHMARKS: designed to challenge evolutionary search
+# ============================================================================
+
+def irregular_dag(n_layers=6, branches_per_layer=[3,2,4,2,3,2],
+                  cap=60000, bw=15, name="irregular-dag"):
+    """
+    Irregular DAG: layers with varying fan-out, shared inputs between branches,
+    and skip connections. No symmetry -> different inits find different basins.
+    """
+    b = BenchmarkBuilder(cap, bw)
+    d_model = 256
+    
+    X = b.tensor(d_model, 128)
+    prev_outputs = [X]
+    
+    for layer in range(n_layers):
+        n_branches = branches_per_layer[layer % len(branches_per_layer)]
+        layer_outputs = []
+        
+        for br in range(n_branches):
+            inp1 = prev_outputs[br % len(prev_outputs)]
+            d_hidden = 128 + 64 * (br % 3)
+            W = b.tensor(d_hidden, d_model)
+            H = b.tensor(d_hidden, 128)
+            bc = max(500, d_model * d_hidden * 128 // 100000)
+            b.matmul(inp1, W, H, bc)
+            
+            A = b.tensor(d_hidden, 128)
+            b.pointwise([H], A, max(100, d_hidden * 128 // 5000))
+            
+            W2 = b.tensor(d_model, d_hidden)
+            O = b.tensor(d_model, 128)
+            b.matmul(A, W2, O, bc)
+            layer_outputs.append(O)
+        
+        combined = layer_outputs[0]
+        for i in range(1, len(layer_outputs)):
+            out = b.tensor(d_model, 128)
+            b.pointwise([combined, layer_outputs[i]], out, max(150, d_model * 128 // 3000))
+            combined = out
+        
+        if layer % 2 == 1 and layer < n_layers - 1:
+            skip = b.tensor(d_model, 128)
+            b.pointwise([combined, X], skip, max(150, d_model * 128 // 3000))
+            combined = skip
+        
+        prev_outputs = layer_outputs + [combined]
+    
+    b.save(f"benchmarks/custom-{name}.json")
+
+
+def shared_weight_network(n_stages=4, d=256, seq=128,
+                           cap=50000, bw=10, name="shared-weights"):
+    """
+    Network where multiple stages share the same weight matrices.
+    Retaining shared weights across groups is highly valuable.
+    """
+    b = BenchmarkBuilder(cap, bw)
+    W_shared = b.tensor(d, d)
+    W_proj = b.tensor(d // 2, d)
+    
+    X = b.tensor(d, seq)
+    prev = X
+    
+    for s in range(n_stages):
+        H = b.tensor(d, seq)
+        bc_main = max(800, d * d * seq // 50000)
+        b.matmul(prev, W_shared, H, bc_main)
+        
+        A = b.tensor(d, seq)
+        b.pointwise([H], A, max(100, d * seq // 5000))
+        
+        O = b.tensor(d // 2, seq)
+        bc_proj = max(400, d * (d//2) * seq // 50000)
+        b.matmul(A, W_proj, O, bc_proj)
+        
+        W_up = b.tensor(d, d // 2)
+        U = b.tensor(d, seq)
+        b.matmul(O, W_up, U, bc_proj)
+        
+        R = b.tensor(d, seq)
+        b.pointwise([prev, U], R, max(200, d * seq // 3000))
+        prev = R
+    
+    b.save(f"benchmarks/custom-{name}.json")
+
+
+def deep_narrow_chain(n_ops=25, dim=128, cap=25000, bw=8, name="deep-narrow"):
+    """
+    Long chain of alternating MM and PW with tight memory.
+    Many valid partition points -> combinatorial explosion.
+    """
+    b = BenchmarkBuilder(cap, bw)
+    prev = b.tensor(dim, dim)
+    
+    for i in range(n_ops):
+        if i % 2 == 0:
+            W = b.tensor(dim, dim)
+            out = b.tensor(dim, dim)
+            bc = max(300, dim * dim * dim // 100000)
+            b.matmul(prev, W, out, bc)
+        else:
+            out = b.tensor(dim, dim)
+            b.pointwise([prev], out, max(100, dim * dim // 1000))
+        prev = out
+    
+    b.save(f"benchmarks/custom-{name}.json")
+
+
+def multi_path_reduction(n_paths=6, depth=3, dim=192, cap=45000, bw=12,
+                          name="multipath-reduce"):
+    """
+    N independent paths that merge at the end.
+    Paths have different depths/costs -> asymmetric.
+    Tests ordering optimization and retain across paths.
+    """
+    b = BenchmarkBuilder(cap, bw)
+    X = b.tensor(dim, dim)
+    path_outputs = []
+    
+    for p in range(n_paths):
+        prev = X
+        path_depth = depth + (p % 3) - 1
+        d_hidden = dim + 32 * (p % 4)
+        bc = max(400, dim * d_hidden * dim // 80000)
+        
+        for d_idx in range(path_depth):
+            in_dim = dim if d_idx == 0 else d_hidden
+            out_dim = d_hidden if d_idx == 0 else dim if d_idx == path_depth - 1 else d_hidden
+            W = b.tensor(out_dim, in_dim)
+            H = b.tensor(out_dim, dim)
+            b.matmul(prev, W, H, bc)
+            
+            A = b.tensor(out_dim, dim)
+            b.pointwise([H], A, max(80, out_dim * dim // 5000))
+            prev = A
+        
+        path_outputs.append(prev)
+    
+    # Reduce all paths with PW chain
+    combined = path_outputs[0]
+    for i in range(1, len(path_outputs)):
+        out = b.tensor(dim, dim)
+        b.pointwise([combined, path_outputs[i]], out, max(150, dim * dim // 3000))
+        combined = out
+    
+    W_final = b.tensor(dim, dim)
+    result = b.tensor(dim, dim)
+    b.matmul(combined, W_final, result, max(500, dim * dim * dim // 60000))
+    
+    b.save(f"benchmarks/custom-{name}.json")
+
+
+def encoder_decoder(enc_layers=3, dec_layers=3, d=256, seq_enc=128, seq_dec=64,
+                    cap=55000, bw=12, name="enc-dec"):
+    """
+    Encoder-decoder with cross-attention.
+    Encoder outputs are shared across all decoder layers -> retain-friendly.
+    """
+    b = BenchmarkBuilder(cap, bw)
+    d_head = d // 4
+    bc_mm = max(500, d * d * max(seq_enc, seq_dec) // 80000)
+    bc_pw = max(100, d * max(seq_enc, seq_dec) // 4000)
+    
+    enc_input = b.tensor(d, seq_enc)
+    prev_enc = enc_input
+    
+    for layer in range(enc_layers):
+        W_Q = b.tensor(d_head, d); W_K = b.tensor(d_head, d); W_V = b.tensor(d_head, d)
+        Q = b.tensor(d_head, seq_enc); K = b.tensor(d_head, seq_enc); V = b.tensor(d_head, seq_enc)
+        b.matmul(prev_enc, W_Q, Q, bc_mm)
+        b.matmul(prev_enc, W_K, K, bc_mm)
+        b.matmul(prev_enc, W_V, V, bc_mm)
+        K_T = b.tensor(seq_enc, d_head); b.pointwise([K], K_T, bc_pw)
+        A = b.tensor(seq_enc, seq_enc); b.matmul(Q, K_T, A, bc_mm)
+        S = b.tensor(seq_enc, seq_enc); b.pointwise([A], S, bc_pw)
+        O = b.tensor(d_head, seq_enc); b.matmul(S, V, O, bc_mm)
+        W_O = b.tensor(d, d_head); P = b.tensor(d, seq_enc); b.matmul(O, W_O, P, bc_mm)
+        R = b.tensor(d, seq_enc); b.pointwise([prev_enc, P], R, bc_pw)
+        prev_enc = R
+    
+    enc_output = prev_enc
+    
+    dec_input = b.tensor(d, seq_dec)
+    prev_dec = dec_input
+    
+    for layer in range(dec_layers):
+        W_Q = b.tensor(d_head, d); W_V = b.tensor(d_head, d)
+        Q = b.tensor(d_head, seq_dec); V_dec = b.tensor(d_head, seq_dec)
+        b.matmul(prev_dec, W_Q, Q, bc_mm)
+        b.matmul(prev_dec, W_V, V_dec, bc_mm)
+        W_K_c = b.tensor(d_head, d); W_V_c = b.tensor(d_head, d)
+        K_c = b.tensor(d_head, seq_enc); V_c = b.tensor(d_head, seq_enc)
+        b.matmul(enc_output, W_K_c, K_c, bc_mm)
+        b.matmul(enc_output, W_V_c, V_c, bc_mm)
+        K_T = b.tensor(seq_enc, d_head); b.pointwise([K_c], K_T, bc_pw)
+        A = b.tensor(seq_enc, seq_dec); b.matmul(Q, K_T, A, bc_mm)
+        S = b.tensor(seq_enc, seq_dec); b.pointwise([A], S, bc_pw)
+        O = b.tensor(d_head, seq_dec); b.matmul(S, V_c, O, bc_mm)
+        W_O = b.tensor(d, d_head); P = b.tensor(d, seq_dec); b.matmul(O, W_O, P, bc_mm)
+        R = b.tensor(d, seq_dec); b.pointwise([prev_dec, P], R, bc_pw)
+        prev_dec = R
+    
+    b.save(f"benchmarks/custom-{name}.json")
+
+
+# ============================================================================
+# Main: generate all benchmarks
+# ============================================================================
+
 if __name__ == "__main__":
     os.makedirs("benchmarks", exist_ok=True)
     
     print("Generating custom benchmarks:\n")
     
-    # 1. Small transformer block (manageable for exhaustive analysis)
+    # Original 10
     transformer_block(seq=128, d_model=256, d_ff=512, n_heads=4,
                       cap=50000, bw=10, name="transformer-small")
-    
-    # 2. Larger transformer with tight memory  
     transformer_block(seq=256, d_model=512, d_ff=2048, n_heads=8,
                       cap=80000, bw=20, name="transformer-large")
-    
-    # 3. Mixture of Experts
     moe_block(seq=128, d_model=256, d_expert=512, n_experts=4,
               cap=40000, bw=10, name="moe-4expert")
-    
-    # 4. Deep residual chain
     deep_residual_chain(n_blocks=8, dim=256, cap=50000, bw=10, name="reschain-8")
-    
-    # 5. Asymmetric bottleneck with varying K
     asymmetric_bottleneck(seq=256, d_in=512, d_bottle=64, d_out=512,
                           n_branches=3, cap=40000, bw=10, name="bottleneck-3br")
-    
-    # 6. Conv-like block
     conv_like_block(h=32, w=32, c_in=128, c_out=256, n_layers=6,
                     cap=50000, bw=15, name="convlike-6layer")
-    
-    # 7. Wide fan-out diamond (tests recompute)
     wide_fan_diamond(n_parallel=8, dim=256, cap=50000, bw=10, name="fandia-8wide")
-    
-    # 8. Tight memory chain (tests split-K)
     tight_memory_chain(n_ops=10, dim=512, cap=35000, bw=5, name="tight-10ops")
-    
-    # 9. Multi-scale attention (varying K)
-    multi_scale_attention(seq=128, dims=[64, 128, 256], 
+    multi_scale_attention(seq=128, dims=[64, 128, 256],
                           cap=40000, bw=10, name="multiscale-3")
-    
-    # 10. Stress test: large transformer 
     transformer_block(seq=512, d_model=1024, d_ff=4096, n_heads=16,
                       cap=120000, bw=50, name="transformer-stress")
     
-    print(f"\nGenerated {10} custom benchmarks in benchmarks/")
+    # Harder 5
+    print("\n  --- Harder benchmarks ---")
+    irregular_dag(n_layers=5, branches_per_layer=[3, 2, 4, 2, 3],
+                  cap=60000, bw=15, name="irregular-5layer")
+    shared_weight_network(n_stages=5, d=256, seq=128,
+                          cap=50000, bw=10, name="shared-weights-5")
+    deep_narrow_chain(n_ops=20, dim=128, cap=25000, bw=8, name="deep-narrow-20")
+    multi_path_reduction(n_paths=6, depth=3, dim=192, cap=45000, bw=12,
+                         name="multipath-6")
+    encoder_decoder(enc_layers=2, dec_layers=3, d=256, seq_enc=128, seq_dec=64,
+                    cap=55000, bw=12, name="enc-dec-2x3")
+    
+    print(f"\nGenerated 15 custom benchmarks in benchmarks/")
