@@ -29,7 +29,7 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         result.total_moves += pass_result.moves_applied;
 
         if (pass_result.best_cost < result.best_cost - 0.001) {
-            // FM improved — keep it as-is, don't collapse with greedy
+            // FM improved directly
             double improvement = result.best_cost - pass_result.best_cost;
             result.best_cost = pass_result.best_cost;
             result.best_partition = std::move(pass_result.best_partition);
@@ -41,13 +41,16 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
                       << ", +" << pass_result.moves_positive
                       << " -" << pass_result.moves_negative << ")\n";
         } else {
-            no_improve++;
-
-            // Greedy-kick: every 5 non-improving passes, try greedy on the
-            // FM-perturbed partition. FM may have moved to a different basin
-            // that greedy can exploit. Only the greedy phase (fast), no tabu.
-            if (no_improve % 5 == 0) {
-                auto greedy_kick = greedy_descent(Partition(pass_result.best_partition));
+            // FM didn't improve. Run greedy descent on the END state — the
+            // maximally perturbed partition after all moves (including worsening
+            // ones and locked ops). This is the furthest from the starting
+            // local minimum and most likely to reach a new basin.
+            //
+            // Key insight: pass_result.best_partition is just the starting
+            // partition when the pass didn't improve. But end_partition has
+            // been moved around by FM and is genuinely different.
+            if (pass_result.moves_applied > 0) {
+                auto greedy_kick = greedy_descent(std::move(pass_result.end_partition));
                 if (greedy_kick.total_cost() < result.best_cost - 0.001) {
                     double improvement = result.best_cost - greedy_kick.total_cost();
                     result.best_cost = greedy_kick.total_cost();
@@ -58,10 +61,11 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
                     if (g_verbose) std::cerr << "    FM pass " << pass
                               << ": greedy-kick escaped to " << result.best_cost
                               << " (delta=" << improvement << ")\n";
-                    continue;  // don't check no_improve limit
+                    continue;  // don't count towards no_improve
                 }
             }
 
+            no_improve++;
             if (no_improve >= cfg.max_no_improve) {
                 if (g_verbose) std::cerr << "    FM: " << cfg.max_no_improve
                           << " consecutive passes without improvement, stopping\n";

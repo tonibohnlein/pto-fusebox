@@ -139,5 +139,9 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         active.activate_neighbors_of(affected);
     }
 
+    // Capture the final (maximally perturbed) state
+    result.end_partition = part;
+    result.end_cost = part.total_cost();
+
     return result;
 }

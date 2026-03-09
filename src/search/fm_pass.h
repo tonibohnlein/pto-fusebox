@@ -9,8 +9,8 @@
 // ============================================================================
 
 struct FMConfig {
-    double floor_fraction = 0.80;     // allow moves worsening by up to this % of cost
-    double max_drift_fraction = 0.80; // abort if cumulative gain drops this % below best
+    double floor_fraction = 0.30;     // allow moves worsening by up to this % of cost
+    double max_drift_fraction = 0.50; // abort if cumulative gain drops this % below best
     int init_count = 1;               // number of border ops to activate initially
     unsigned seed = 42;               // RNG seed for random initial subset
 };
@@ -21,7 +21,9 @@ struct FMConfig {
 
 struct FMPassResult {
     Partition best_partition;    // best partition seen during this pass
+    Partition end_partition;     // final state after all moves (maximally perturbed)
     double best_cost = 1e18;    // cost of best_partition
+    double end_cost = 1e18;     // cost of end_partition
     double start_cost = 1e18;   // cost at start of pass
     int moves_applied = 0;      // total moves applied
     int moves_positive = 0;     // moves with positive saving
