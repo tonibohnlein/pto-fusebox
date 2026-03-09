@@ -114,6 +114,45 @@ std::optional<Subgraph> Subgraph::create(const Problem& prob,
         sg.all_out_heights_.assign(hs.begin(), hs.end());
     }
 
+    // Precompute per-boundary-tensor role info for fast working_set/compute_cost.
+    {
+        std::map<size_t, BoundaryTensorInfo> info_map;
+        auto ensure = [&](size_t t) -> BoundaryTensorInfo& {
+            auto it = info_map.find(t);
+            if (it == info_map.end()) {
+                info_map[t] = {t};
+                return info_map[t];
+            }
+            return it->second;
+        };
+
+        for (auto i : sg.ops_) {
+            const auto& op = prob.ops[i];
+            if (op.type == OpType::MatMul) {
+                size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
+                if (sg.boundary_inputs_.count(lhs)) {
+                    auto& info = ensure(lhs);
+                    info.max_lhs_K = std::max(info.max_lhs_K, prob.tensors[lhs].width);
+                }
+                if (sg.boundary_inputs_.count(rhs))
+                    ensure(rhs).is_mm_rhs = true;
+                if (sg.boundary_outputs_.count(out))
+                    ensure(out).is_mm_out = true;
+            } else {
+                for (auto t : op.inputs)
+                    if (sg.boundary_inputs_.count(t))
+                        ensure(t).is_pw_in = true;
+            }
+            for (auto t : op.outputs)
+                if (sg.boundary_outputs_.count(t))
+                    ensure(t).is_boundary_out = true;
+        }
+
+        sg.boundary_tensor_info_.reserve(info_map.size());
+        for (auto& [id, info] : info_map)
+            sg.boundary_tensor_info_.push_back(info);
+    }
+
     return sg;
 }
 
@@ -162,55 +201,36 @@ bool Subgraph::is_valid_tiling(const TileConfig& cfg) const {
 int64_t Subgraph::working_set(const TileConfig& cfg,
                                const std::set<size_t>& retained_from_prev,
                                const std::set<size_t>& retain_these) const {
-    // A boundary tensor may be used by multiple ops with different slice shapes
-    // (e.g., T0 as MM LHS needs h*K, but as PW input needs h*w).
-    // We must use the MAXIMUM size for each tensor.
-    std::map<size_t, int64_t> tensor_ws;
+    int64_t ws = 0;
 
-    auto update = [&](size_t t, int64_t size) {
-        auto it = tensor_ws.find(t);
-        if (it == tensor_ws.end()) tensor_ws[t] = size;
-        else it->second = std::max(it->second, size);
-    };
+    for (auto& info : boundary_tensor_info_) {
+        int64_t full = prob_->tensors[info.id].width * prob_->tensors[info.id].height;
 
-    for (auto i : ops_) {
-        const auto& op = prob_->ops[i];
-        if (op.type == OpType::MatMul) {
-            int64_t Ki = op_K(i);
-            size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
-            if (boundary_inputs_.count(lhs)) {
-                if (retained_from_prev.count(lhs))
-                    update(lhs, prob_->tensors[lhs].width * prob_->tensors[lhs].height);
-                else
-                    update(lhs, cfg.h * Ki);
-            }
-            if (boundary_inputs_.count(rhs)) {
-                if (retained_from_prev.count(rhs))
-                    update(rhs, prob_->tensors[rhs].width * prob_->tensors[rhs].height);
-                else
-                    update(rhs, cfg.k * cfg.w);
-            }
-            if (boundary_outputs_.count(out))
-                update(out, cfg.h * cfg.w);
-        } else {
-            for (auto t : op.inputs)
-                if (boundary_inputs_.count(t)) {
-                    if (retained_from_prev.count(t))
-                        update(t, prob_->tensors[t].width * prob_->tensors[t].height);
-                    else
-                        update(t, cfg.h * cfg.w);
-                }
+        if (retained_from_prev.count(info.id)) {
+            ws += full;
+            continue;
         }
+
+        // Take the maximum working set contribution across all roles
+        int64_t max_size = 0;
+        if (info.max_lhs_K > 0)
+            max_size = std::max(max_size, cfg.h * info.max_lhs_K);
+        if (info.is_mm_rhs)
+            max_size = std::max(max_size, cfg.k * cfg.w);
+        if (info.is_mm_out || info.is_pw_in)
+            max_size = std::max(max_size, cfg.h * cfg.w);
+
+        ws += max_size;
     }
 
-    int64_t ws = 0;
-    for (auto& [t, size] : tensor_ws)
-        ws += size;
-
-    // Retained-from-prev tensors NOT used as boundary inputs still occupy memory
-    for (auto t : retained_from_prev)
-        if (!tensor_ws.count(t))
+    // Retained-from-prev tensors NOT in boundary_tensor_info_ still occupy memory
+    for (auto t : retained_from_prev) {
+        bool found = false;
+        for (auto& info : boundary_tensor_info_)
+            if (info.id == t) { found = true; break; }
+        if (!found)
             ws += prob_->tensors[t].width * prob_->tensors[t].height;
+    }
 
     // Retained output accumulates: at the last tile, (full_size - h*w) of
     // previously-computed tiles are in memory alongside the current tile
@@ -364,10 +384,13 @@ CostResult Subgraph::best_cost(const std::set<size_t>& retained_from_prev,
     int64_t min_w = std::max<int64_t>(1, prob_->native_w / 4);
     int64_t min_h = std::max<int64_t>(1, prob_->native_h / 4);
 
-    std::vector<SnakeDir> snakes = {SnakeDir::None};
+    // For MatMul subgraphs: snake reuse (RM or CM) always ties or beats None.
+    // For PW-only: snake has no effect, use None as placeholder.
+    std::vector<SnakeDir> snakes;
     if (has_matmul_) {
-        snakes.push_back(SnakeDir::RowMajor);
-        snakes.push_back(SnakeDir::ColMajor);
+        snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};
+    } else {
+        snakes = {SnakeDir::None};
     }
 
     // Filter raw candidates: w must divide all output widths, etc.
