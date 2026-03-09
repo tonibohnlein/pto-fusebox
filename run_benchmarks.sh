@@ -25,7 +25,7 @@ echo ""
 total_score=0
 count=0
 
-for f in "$BENCH_DIR"/mlsys-2026-*.json; do
+for f in "$BENCH_DIR"/*.json; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .json)
     out="${BUILD_DIR}/${name}_sol.json"
