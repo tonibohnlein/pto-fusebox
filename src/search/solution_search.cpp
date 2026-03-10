@@ -299,8 +299,26 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!is_connected_without(si_set, op, dag, prob.num_ops()))
         continue;
 
+      if (!shapes_match(&prob, op, dst.subgraph.ops().front())) 
+        continue;
+
       std::set<size_t> new_src = si_set;
       new_src.erase(op);
+      
+      bool topo_violation = false;
+      if (dir == 1) { 
+        // Moving RIGHT (Delaying op): 'op' cannot be a dependency for anything left behind
+        for (auto succ : dag.op_succs[op]) {
+          if (new_src.count(succ)) { topo_violation = true; break; }
+        }
+      } else { 
+        // Moving LEFT (Advancing op): 'op' cannot depend on anything left behind
+        for (auto pred : dag.op_preds[op]) {
+          if (new_src.count(pred)) { topo_violation = true; break; }
+        }
+      }
+      if (topo_violation) continue;
+      
       std::set<size_t> new_dst = dj_set;
       new_dst.insert(op);
       auto sg_s = Subgraph::create(prob, dag, {new_src.begin(), new_src.end()});
@@ -339,6 +357,10 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         continue;
 
       auto ops_j = state.steps[sj].subgraph.ops();
+
+      if (!shapes_match(&prob, si_ops.front(), ops_j.front())) 
+        continue;
+
       std::vector<size_t> merged;
       std::set<size_t> seen;
       for (auto o : si_ops)
@@ -393,6 +415,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
           break;
         }
       if (!produces_for_sj)
+        continue;
+
+      if (!shapes_match(&prob, op, sj_ops.front())) 
         continue;
 
       std::vector<size_t> expanded(sj_ops.begin(), sj_ops.end());

@@ -44,6 +44,8 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             int gen_j = part.groups[gj].gen;
 
             // Move 1: Merge gi and gj
+            if (shapes_match(part.prob, part.groups[gi].ops, part.groups[gj].ops) &&
+                !part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) 
             {
                 std::set<size_t> merged = part.groups[gi].ops;
                 merged.insert(part.groups[gj].ops.begin(),
@@ -69,6 +71,10 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 // Tabu check: adj_op moving into gi
                 if (tabu && tabu->is_tabu(adj_op, gi)) continue;
 
+                // SHAPE & MACRO-CYCLE CHECKS
+                if (!shapes_match(part.prob, adj_op, part.groups[gi].ops)) continue;
+                if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
+
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
                 double new_gi_cost = part.eval_set(new_gi);
@@ -93,6 +99,10 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             // Move 3: Recompute adj_op in gi (keep in gj too)
             {
                 if (tabu && tabu->is_tabu(adj_op, gi)) continue;
+
+                // SHAPE & MACRO-CYCLE CHECKS
+                if (!shapes_match(part.prob, adj_op, part.groups[gi].ops)) continue;
+                if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
 
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
