@@ -5,80 +5,72 @@
 
 Solution optimize_retain(const Problem& prob, const DAG& dag, Solution sol) {
     auto steps = sol.steps();
-    size_t n = steps.size();
+    bool improved = true;
 
-    // 1. Calculate intervals: tensor -> {producer_step, last_consumer_step}
-    std::map<size_t, std::pair<int, int>> intervals;
+    while (improved) {
+        improved = false;
+        // Build perfectly accurate baseline state
+        Solution current(prob, dag, steps);
 
-    for (size_t i = 0; i < n; i++) {
-        const auto& sg = steps[i].subgraph;
-        
-        // Producer (Sink Tensor)
-        size_t sink = sg.sink_tensor();
-        if (prob.retainable_tensors.count(sink)) {
-            if (intervals.find(sink) == intervals.end()) {
-                intervals[sink] = {(int)i, (int)i};
+        for (size_t i = 0; i + 1 < current.num_steps(); i++) {
+            const auto& si = current.step(i);
+            const auto& sj = current.step(i + 1);
+
+            // 1. Gather candidates: must be boundary_in/out of `i`, and boundary_in of `i+1`
+            std::vector<size_t> candidates;
+            for (auto t : si.subgraph.boundary_inputs()) {
+                if (sj.subgraph.boundary_inputs().count(t)) candidates.push_back(t);
             }
-        }
-        
-        // Consumers (Boundary Inputs)
-        for (auto t : sg.boundary_inputs()) {
-            if (prob.retainable_tensors.count(t)) {
-                if (intervals.find(t) == intervals.end()) {
-                    intervals[t] = {0, (int)i}; // Graph input, born at step 0
-                } else {
-                    intervals[t].second = std::max(intervals[t].second, (int)i);
+            size_t sink = si.subgraph.sink_tensor();
+            if (sj.subgraph.boundary_inputs().count(sink)) {
+                candidates.push_back(sink);
+            }
+
+            // 2. Sort candidates by size (Largest first = maximum bandwidth saved)
+            std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+                return prob.tensors[a].width * prob.tensors[a].height >
+                       prob.tensors[b].width * prob.tensors[b].height;
+            });
+
+            // 3. Test retaining them safely
+            for (auto t : candidates) {
+                // Skip if already retained or inherently unretainable
+                if (steps[i].retain_these.count(t)) continue;
+                if (!prob.retainable_tensors.count(t)) continue;
+
+                auto trial_retain_i = steps[i].retain_these;
+                trial_retain_i.insert(t);
+
+                // Re-evaluate Step i with accurate entering state
+                std::set<size_t> entering_i = current.retained_entering(i);
+                auto cost_i = steps[i].subgraph.best_cost(entering_i, trial_retain_i);
+                if (!cost_i.feasible) continue;
+
+                // Re-evaluate Step i+1 (it receives whatever i retained)
+                std::set<size_t> entering_j = trial_retain_i; 
+                auto trial_retain_j = steps[i+1].retain_these;
+                auto cost_j = steps[i+1].subgraph.best_cost(entering_j, trial_retain_j);
+                if (!cost_j.feasible) continue;
+
+                // CRITICAL FIX 1: Did we ACTUALLY save time? 
+                // (Prevents shrinking tiles to fit a tensor if it costs more compute latency)
+                double old_latency = current.step_latency(i) + current.step_latency(i + 1);
+                double new_latency = cost_i.latency + cost_j.latency;
+
+                if (new_latency < old_latency - 0.01) {
+                    steps[i].retain_these = trial_retain_i;
+                    steps[i].config = cost_i.config;
+                    steps[i+1].config = cost_j.config;
+                    improved = true;
+                    break; // Break candidate loop
                 }
             }
+            
+            // CRITICAL FIX 2: If we changed memory state, break step loop to rebuild `current`!
+            if (improved) break; 
         }
     }
-
-    // 2. Clear existing retain_these to rebuild optimally from scratch
-    for (auto& step : steps) step.retain_these.clear();
-
-    // 3. Sort candidates by size (Largest tensors save the most bandwidth)
-    std::vector<size_t> candidates;
-    for (auto& kv : intervals) {
-        if (kv.second.first < kv.second.second) { // Spans at least across to the next step
-            candidates.push_back(kv.first);
-        }
-    }
-    std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
-        return prob.tensors[a].width * prob.tensors[a].height >
-               prob.tensors[b].width * prob.tensors[b].height;
-    });
-
-    // 4. Greedily allocate tensor lifespans into the fast memory
-    for (auto t : candidates) {
-        int start = intervals[t].first;
-        int end = intervals[t].second;
-        
-        bool fits_everywhere = true;
-        
-        // Check if it fits in every step's fast memory during its lifespan
-        for (int i = start; i < end; i++) {
-            auto trial_retain = steps[i].retain_these;
-            trial_retain.insert(t);
-
-            std::set<size_t> entering;
-            if (i > 0) entering = steps[i-1].retain_these; // Approximate entering set
-
-            auto cost = steps[i].subgraph.best_cost(entering, trial_retain);
-            if (!cost.feasible) {
-                fits_everywhere = false;
-                break;
-            }
-        }
-
-        // If it fits across the whole gap, commit it!
-        if (fits_everywhere) {
-            for (int i = start; i < end; i++) {
-                steps[i].retain_these.insert(t);
-            }
-        }
-    }
-
-    // 5. Return a new Solution object, which natively re-evaluates exact costs
+    
     return Solution(prob, dag, std::move(steps));
 }
 
