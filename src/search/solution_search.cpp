@@ -131,6 +131,7 @@ struct SolState {
     gen.assign(steps.size(), 0);
     rebuild_all();
   }
+  
   void rebuild_all() {
     size_t n = steps.size();
     ret_entering.resize(n);
@@ -140,6 +141,20 @@ struct SolState {
     std::set<size_t> cur;
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
+
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      std::set<size_t> useful_retain;
+      for (auto t : steps[i].retain_these) {
+        bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
+                     steps[i].subgraph.boundary_outputs().count(t) ||
+                     t == steps[i].subgraph.sink_tensor();
+        bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
+        if (valid && useful) {
+          useful_retain.insert(t);
+        }
+      }
+      steps[i].retain_these = useful_retain;
+
       auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
                                               steps[i].retain_these);
       if (c.latency >= 1e17) {
@@ -161,6 +176,7 @@ struct SolState {
       cur = steps[i].retain_these;
     }
   }
+
   void rebuild_from(size_t idx) {
     size_t n = steps.size();
     ret_entering.resize(n);
@@ -174,6 +190,20 @@ struct SolState {
       total += cost[i];
     for (size_t i = idx; i < n; i++) {
       ret_entering[i] = cur;
+
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      std::set<size_t> useful_retain;
+      for (auto t : steps[i].retain_these) {
+        bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
+                     steps[i].subgraph.boundary_outputs().count(t) ||
+                     t == steps[i].subgraph.sink_tensor();
+        bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
+        if (valid && useful) {
+          useful_retain.insert(t);
+        }
+      }
+      steps[i].retain_these = useful_retain;
+
       auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
                                               steps[i].retain_these);
       if (c.latency >= 1e17) {
@@ -198,6 +228,7 @@ struct SolState {
       cur = steps[i].retain_these;
     }
   }
+
   size_t size() const { return steps.size(); }
   void bump(size_t i) {
     if (i < gen.size())

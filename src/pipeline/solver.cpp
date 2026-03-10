@@ -237,8 +237,6 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
                                         gd.future_needs(sink, scheduled);
 
                 // Step 3: Evaluate with full resident set + output retain.
-                // Pass ALL useful_resident (including pass-through tensors that
-                // this group doesn't use — working_set counts them at full size).
                 CostResult cost;
                 bool retained_sink = false;
 
@@ -291,23 +289,22 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
                     next.in_deg[v]--;
                 next.total_latency = state.total_latency + cost.latency;
 
-                // Propagate memory state: useful pass-through + newly retained output
-                next.resident = useful_resident;
+                // Apply intermediate residency
+                std::set<size_t> intermediate_resident = useful_resident;
                 if (retained_sink)
-                    next.resident.insert(sink);
+                    intermediate_resident.insert(sink);
 
-                // Record retain decision for this step:
-                // For the solution output, only retain tensors that this step
-                // actually produces or consumes (boundary tensors). Pass-through
-                // tensors are tracked in the beam state for scoring but may not
-                // be supported by the evaluator in tensors_to_retain.
+                // Determine strictly what can physically stay in memory
                 std::set<size_t> exportable_retain;
-                for (auto t : next.resident) {
+                for (auto t : intermediate_resident) {
                     // Keep if it's a boundary output or boundary input of this group
                     if (gd.groups[gi].sg.boundary_outputs().count(t) ||
                         gd.groups[gi].sg.boundary_inputs().count(t))
                         exportable_retain.insert(t);
                 }
+                
+                // STRICT RESIDENCY FIX: Only propagate what can physically be retained
+                next.resident = exportable_retain;
                 next.retain_per_step = state.retain_per_step;
                 next.retain_per_step.push_back(exportable_retain);
 
@@ -346,7 +343,6 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
 // ============================================================================
 // Build Solution from a Partition — tries both DFS and beam search
 // ============================================================================
-
 static Solution build_solution(const Problem& prob, const DAG& dag,
                                 const Partition& part) {
     auto gd_opt = GroupDAGInfo::build(prob, dag, part);
@@ -366,16 +362,24 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     auto beam_result = beam_search_ordering(gd, beam_width);
 
     // Build solution using beam's ordering AND retain decisions.
-    // beam_result.retain_per_step[i] contains ALL tensors that step i keeps
-    // resident for future steps (both new outputs and pass-through tensors).
     std::vector<ScheduleStep> beam_steps;
     std::set<size_t> beam_entering;  // retained from previous step
 
     for (size_t i = 0; i < beam_result.order.size(); i++) {
         size_t idx = beam_result.order[i];
         std::set<size_t> retain_these;
-        if (i < beam_result.retain_per_step.size())
-            retain_these = beam_result.retain_per_step[i];
+        
+        if (i < beam_result.retain_per_step.size()) {
+            // Filter: only retain if the NEXT step actually uses it
+            if (i + 1 < beam_result.order.size()) {
+                size_t next_idx = beam_result.order[i + 1];
+                for (auto t : beam_result.retain_per_step[i]) {
+                    if (gd.groups[next_idx].sg.boundary_inputs().count(t)) {
+                        retain_these.insert(t);
+                    }
+                }
+            }
+        }
 
         // Compute cost with the actual retained state
         auto cost = gd.groups[idx].sg.best_cost(beam_entering, retain_these);
