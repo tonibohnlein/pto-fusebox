@@ -62,6 +62,6 @@ std::vector<ScheduleStep> solution_greedy_descent(const Problem& prob, const DAG
                                                     std::chrono::steady_clock::time_point deadline 
                                                     = std::chrono::steady_clock::time_point::max());
 
-// Full outer loop: passes + greedy-kick + cooling
+// Parallel FM search: N threads with different seeds, adaptive cooling
 Solution solution_fm_search(const Problem& prob, const DAG& dag,
                              Solution sol, const SolutionFMConfig& cfg = {});

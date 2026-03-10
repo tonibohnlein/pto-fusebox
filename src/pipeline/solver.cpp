@@ -1,6 +1,7 @@
 #include "pipeline/solver.h"
 #include "partition/partition.h"
 #include "search/parallel_search.h"
+#include "search/solution_search.h"
 #include "postopt/post_opt.h"
 #include <iostream>
 #include <iomanip>
@@ -456,14 +457,16 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     }
     double after_retain_recomp = sol.total_latency();
 
-    // Phase 3: Solution-level local search (unified partition + retain moves)
-    std::cerr << "Phase 3: Solution-level local search...\n";
-    sol = optimize_solution(prob, dag, std::move(sol), deadline);
+    // Phase 3: Solution-level FM search
+    std::cerr << "Phase 3: Solution-level FM search...\n";
+    SolutionFMConfig sfm_cfg;
+    sfm_cfg.deadline = deadline;
+    sol = solution_fm_search(prob, dag, std::move(sol), sfm_cfg);
     double after_sol_opt = sol.total_latency();
-    if (after_sol_opt < after_retain_recomp - 0.01)
-        std::cerr << "  Solution opt: " << after_retain_recomp << " → " << after_sol_opt
+    if (after_sol_opt < after_build - 0.01)
+        std::cerr << "  Solution opt: " << after_build << " → " << after_sol_opt
                   << " (-" << std::fixed << std::setprecision(1)
-                  << 100.0*(after_retain_recomp - after_sol_opt)/after_retain_recomp << "%)\n";
+                  << 100.0*(after_build - after_sol_opt)/after_build << "%)\n";
     else
         std::cerr << "  Solution opt: no improvement\n";
 
@@ -483,7 +486,7 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     std::cerr << "  Partition:  " << partition_cost << "\n";
     std::cerr << "  Build+opt:  " << after_build;
     if (after_build < partition_cost - 0.01)
-        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+        std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0*(partition_cost - after_build)/partition_cost << "%)";
     std::cerr << "\n";
     std::cerr << "  Retain+rec: " << after_retain_recomp;
@@ -491,14 +494,14 @@ Solution solve(const Problem& prob, TimePoint deadline) {
         std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0*(after_build - after_retain_recomp)/after_build << "%)";
     std::cerr << "\n";
-    std::cerr << "  Sol-opt:    " << after_sol_opt;
+    std::cerr << "  Sol-FM:     " << after_sol_opt;
     if (after_sol_opt < after_retain_recomp - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0*(after_retain_recomp - after_sol_opt)/after_retain_recomp << "%)";
     std::cerr << "\n";
     std::cerr << "  Final:      " << final_cost;
     if (final_cost < partition_cost - 0.01)
-        std::cerr << " (-" << std::fixed << std::setprecision(1) 
+        std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << improve_pct << "% total)";
     std::cerr << "\n";
 

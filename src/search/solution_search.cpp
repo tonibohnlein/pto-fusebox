@@ -4,11 +4,15 @@
 #include <algorithm>
 #include <iostream>
 #include <set>
+#include <map>
 #include <queue>
 #include <vector>
 #include <chrono>
 #include <cmath>
 #include <random>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 using Clock = std::chrono::steady_clock;
 using SolMoveHeap = std::priority_queue<SolutionMove>;
@@ -934,7 +938,7 @@ static Solution solution_fm_search_single(const Problem& prob, const DAG& dag,
 }
 
 // ============================================================================
-// Parallel solution FM: run multiple outer loops with different seeds
+// Parallel solution FM: N threads with different seeds, logging
 // ============================================================================
 
 #include <thread>
@@ -948,25 +952,102 @@ Solution solution_fm_search(const Problem& prob, const DAG& dag,
     int num_threads = hw_threads;
 
     auto init_steps = sol.steps();
-    double best_cost = sol.total_latency();
-    std::vector<ScheduleStep> best_steps = init_steps;
-    std::mutex best_mutex;
+    double init_cost = sol.total_latency();
+
+    struct ThreadResult {
+        std::vector<ScheduleStep> steps;
+        double cost = 1e18;
+        int passes = 0;
+        int improving = 0;
+        int total_moves = 0;
+    };
+
+    std::vector<ThreadResult> results(num_threads);
+    std::mutex log_mu;
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
         threads.emplace_back([&, t]() {
-            SolutionFMConfig tc = cfg;
-            tc.pass_config.seed = (unsigned)(cfg.pass_config.seed + t * 1000);
-            auto result = solution_fm_search_single(prob, dag, init_steps, tc);
-            double cost = result.total_latency();
-            std::lock_guard<std::mutex> lock(best_mutex);
-            if (cost < best_cost - 0.01) {
-                best_cost = cost;
-                best_steps = result.steps();
+            auto best_steps = init_steps;
+            double best_cost = init_cost;
+            int no_improve = 0;
+            int total_passes = 0, improving_passes = 0, total_moves = 0;
+
+            double base_floor = cfg.pass_config.floor_fraction;
+            double base_drift = cfg.pass_config.max_drift_fraction;
+            double heat = 1.0;
+
+            for (int pass = 0; pass < cfg.max_passes; pass++) {
+                if (Clock::now() >= cfg.deadline) break;
+                if (no_improve >= cfg.max_no_improve) break;
+
+                double progress = (double)pass / std::max(1, cfg.max_passes - 1);
+                double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
+                double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
+                double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
+
+                SolutionFMPassConfig pc = cfg.pass_config;
+                pc.seed = (unsigned)(cfg.pass_config.seed + t * 1000 + pass * 7);
+                pc.floor_fraction = eff_floor;
+                pc.max_drift_fraction = eff_drift;
+                pc.deadline = cfg.deadline;
+
+                auto pr = solution_fm_pass(prob, dag, best_steps, pc);
+                total_passes++;
+                total_moves += pr.moves_applied;
+
+                if (pr.best_cost < best_cost - 0.01) {
+                    best_cost = pr.best_cost;
+                    best_steps = std::move(pr.best_steps);
+                    no_improve = 0;
+                    improving_passes++;
+                    heat = std::clamp(heat * 0.7, 0.1, 3.0);
+                } else {
+                    if (pr.moves_applied > 0) {
+                        auto kicked = solution_greedy_descent(prob, dag,
+                            std::move(pr.end_steps), cfg.deadline);
+                        Solution kicked_sol(prob, dag, kicked);
+                        kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
+                        if (kicked_sol.total_latency() < best_cost - 0.01) {
+                            best_cost = kicked_sol.total_latency();
+                            best_steps = kicked_sol.steps();
+                            no_improve = 0;
+                            improving_passes++;
+                            heat = std::clamp(heat * 0.9, 0.1, 3.0);
+                            continue;
+                        }
+                    }
+                    no_improve++;
+                    heat = std::clamp(heat * 1.3, 0.1, 3.0);
+                }
             }
+
+            results[t] = {std::move(best_steps), best_cost,
+                          total_passes, improving_passes, total_moves};
         });
     }
     for (auto& t : threads) t.join();
 
-    return Solution(prob, dag, std::move(best_steps));
+    // Find best across threads and log
+    int best_t = 0;
+    for (int t = 1; t < num_threads; t++)
+        if (results[t].cost < results[best_t].cost) best_t = t;
+
+    std::cerr << "  Sol-FM: " << num_threads << " threads";
+    int total_passes = 0, total_improving = 0, total_moves = 0;
+    for (int t = 0; t < num_threads; t++) {
+        total_passes += results[t].passes;
+        total_improving += results[t].improving;
+        total_moves += results[t].total_moves;
+    }
+    std::cerr << ", " << total_passes << " passes"
+              << " (" << total_improving << " improving)"
+              << ", " << total_moves << " moves";
+    if (results[best_t].cost < init_cost - 0.01) {
+        std::cerr << ", best=" << results[best_t].cost
+                  << " (thread " << best_t << ")";
+    }
+    std::cerr << "\n";
+
+    return Solution(prob, dag, std::move(results[best_t].steps));
 }

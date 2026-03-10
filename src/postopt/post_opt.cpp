@@ -98,7 +98,7 @@ Solution optimize_recompute(const Problem& prob, const DAG& dag, Solution sol) {
 }
 
 // ============================================================================
-// Solution-level optimizer: delegates to solution_fm_search
+// Solution-level optimizer: run solution FM in parallel with different seeds
 // ============================================================================
 
 #include "search/solution_search.h"
