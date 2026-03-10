@@ -358,7 +358,7 @@ static int greedy_phase(Partition& part) {
 
         if (!part.groups[m.ga].alive || part.groups[m.ga].gen != m.gen_a)
             continue;
-        if (m.type == Move::MERGE || m.type == Move::STEAL) {
+        if (m.type == Move::MERGE || m.type == Move::STEAL || m.type == Move::RECOMPUTE) {
             if (!part.groups[m.gb].alive || part.groups[m.gb].gen != m.gen_b)
                 continue;
         }
@@ -399,7 +399,7 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
         // Stale check
         if (!part.groups[m.ga].alive || part.groups[m.ga].gen != m.gen_a)
             continue;
-        if (m.type == Move::MERGE || m.type == Move::STEAL) {
+        if (m.type == Move::MERGE || m.type == Move::STEAL || m.type == Move::RECOMPUTE) {
             if (!part.groups[m.gb].alive || part.groups[m.gb].gen != m.gen_b)
                 continue;
         }

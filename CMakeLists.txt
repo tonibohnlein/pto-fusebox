@@ -52,6 +52,9 @@ set(TEST_SOURCES
     test/move_gain_test.cpp
     test/retain_snake_test.cpp
     test/constructed_optima_test.cpp
+    test/cost_cache_test.cpp
+    test/evolution_test.cpp
+    test/solution_search_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
