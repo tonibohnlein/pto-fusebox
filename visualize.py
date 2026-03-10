@@ -47,7 +47,6 @@ def generate_instance_dot(input_data, out_filepath):
         f.write("\n".join(lines))
     print(f"Instance DOT written to {out_filepath}")
 
-
 def generate_solution_dot(input_data, output_data, out_filepath):
     """Generates a DOT file showing the scheduled/fused solution using identical layout."""
     
@@ -77,7 +76,33 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         for op in sub_ops:
             op_to_step[op] = step_idx
 
-    # 1. Define Tensors (Identical structural definition to instance)
+    # --- Ephemeral Tensor Deduction ---
+    tensor_producers = {}
+    tensor_consumers = {i: [] for i in range(len(input_data['widths']))}
+
+    for op_idx in range(len(input_data['op_types'])):
+        for t_in in input_data['inputs'][op_idx]:
+            tensor_consumers[t_in].append(op_idx)
+        for t_out in input_data['outputs'][op_idx]:
+            tensor_producers[t_out] = op_idx
+
+    ephemeral_tensors = set()
+    for t_idx in range(len(input_data['widths'])):
+        # Must have a producer and at least one consumer to be ephemeral
+        if t_idx in tensor_producers and len(tensor_consumers[t_idx]) > 0:
+            prod_op = tensor_producers[t_idx]
+            prod_step = op_to_step.get(prod_op, -1)
+            
+            if prod_step != -1:
+                is_ephemeral = True
+                for cons_op in tensor_consumers[t_idx]:
+                    if op_to_step.get(cons_op, -1) != prod_step:
+                        is_ephemeral = False
+                        break
+                if is_ephemeral:
+                    ephemeral_tensors.add(t_idx)
+
+    # 1. Define Tensors
     lines.append("    // --- Tensors ---")
     for i, (w, h) in enumerate(zip(input_data['widths'], input_data['heights'])):
         size_kb = (w * h) / 1024.0
@@ -86,11 +111,14 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             steps_str = ",".join(map(str, step_retains[i]))
             label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[Retained: Steps {steps_str}]"
             lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=gold];")
+        elif i in ephemeral_tensors:
+            label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[Ephemeral]"
+            lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=silver];")
         else:
             label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)"
             lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=lightblue];")
 
-    # 2. Define Ops (Identical structural definition, but with Step colors and labels)
+    # 2. Define Ops
     lines.append("\n    // --- Operations ---")
     for i in range(len(input_data['op_types'])):
         op_type = input_data['op_types'][i]
@@ -101,7 +129,6 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             gran = output_data['granularities'][step_idx]
             lat = output_data['subgraph_latencies'][step_idx]
             
-            # Safe snake traversal check
             trav_order = output_data.get('traversal_orders', [])[step_idx]
             snake_str = "None"
             if trav_order is not None and len(trav_order) > 1:
@@ -110,7 +137,6 @@ def generate_solution_dot(input_data, output_data, out_filepath):
                 else:
                     snake_str = "ColMajor"
             
-            # Combine basic info with solution info
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nStep {step_idx}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}\\nLat: {lat:.1f}\\n{snake_str}"
             color = colors[step_idx % len(colors)]
         else:
@@ -119,13 +145,11 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             
         lines.append(f"    Op{i} [label=\"{label}\", shape=ellipse, style=filled, fillcolor=\"{color}\"];")
 
-    # 3. Define Edges (Exactly matching the instance topology)
+    # 3. Define Edges
     lines.append("\n    // --- Data Edges ---")
     for i in range(len(input_data['op_types'])):
-        # Inputs to Op
         for in_t in input_data['inputs'][i]:
             lines.append(f"    T{in_t} -> Op{i};")
-        # Op to Outputs
         for out_t in input_data['outputs'][i]:
             lines.append(f"    Op{i} -> T{out_t};")
 
@@ -134,7 +158,6 @@ def generate_solution_dot(input_data, output_data, out_filepath):
     with open(out_filepath, 'w') as f:
         f.write("\n".join(lines))
     print(f"Solution DOT written to {out_filepath}")
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
