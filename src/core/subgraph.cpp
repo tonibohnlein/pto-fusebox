@@ -398,38 +398,47 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
   // Memory transfer costs per tile-step.
   // Each boundary input tensor is loaded at most once per tile; use a counted
-  // set to avoid double-charging when multiple ops share the same input.
+  // array to avoid double-charging when multiple ops share the same input.
   double lhs_load = 0, rhs_load = 0, pw_in_load = 0, out_evict = 0;
-  std::set<size_t> xfer_counted;
+  size_t xfer_counted[128];
+  int xfer_count = 0;
+
+  auto is_counted = [&](size_t t) {
+    for (int idx = 0; idx < xfer_count; ++idx)
+      if (xfer_counted[idx] == t)
+        return true;
+    return false;
+  };
+
   for (auto i : ops_) {
     const auto &op = prob_->ops[i];
     if (op.type == OpType::MatMul) {
       int64_t Ki = op_K(i);
       if (boundary_inputs_.count(op.inputs[0]) &&
           !retained_from_prev.count(op.inputs[0]) &&
-          !xfer_counted.count(op.inputs[0])) {
+          !is_counted(op.inputs[0])) {
         lhs_load += (double)(cfg.h * Ki) / B;
-        xfer_counted.insert(op.inputs[0]);
+        xfer_counted[xfer_count++] = op.inputs[0];
       }
       if (boundary_inputs_.count(op.inputs[1]) &&
           !retained_from_prev.count(op.inputs[1]) &&
-          !xfer_counted.count(op.inputs[1])) {
+          !is_counted(op.inputs[1])) {
         rhs_load += (double)(cfg.k * cfg.w) / B;
-        xfer_counted.insert(op.inputs[1]);
+        xfer_counted[xfer_count++] = op.inputs[1];
       }
     } else {
       for (auto t : op.inputs)
         if (boundary_inputs_.count(t) && !retained_from_prev.count(t) &&
-            !xfer_counted.count(t)) {
+            !is_counted(t)) {
           pw_in_load += (double)(cfg.h * cfg.w) / B;
-          xfer_counted.insert(t);
+          xfer_counted[xfer_count++] = t;
         }
     }
     for (auto t : op.outputs)
       if (boundary_outputs_.count(t) && !retain_these.count(t) &&
-          !xfer_counted.count(t)) {
+          !is_counted(t)) {
         out_evict += (double)(cfg.h * cfg.w) / B;
-        xfer_counted.insert(t);
+        xfer_counted[xfer_count++] = t;
       }
   }
 
