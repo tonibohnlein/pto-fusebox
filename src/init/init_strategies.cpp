@@ -21,6 +21,9 @@ static std::vector<int> build_op_to_group(const Partition& p) {
 static bool try_merge(Partition& p, size_t ga, size_t gb) {
     if (ga == gb || !p.groups[ga].alive || !p.groups[gb].alive) return false;
 
+    if (p.dag->merge_creates_cycle(p.groups[ga].ops, p.groups[gb].ops)) return false;
+    if (!shapes_match(p.prob, p.groups[ga].ops, p.groups[gb].ops)) return false;
+
     std::set<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
     double new_cost = p.eval_set(merged);

@@ -41,7 +41,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             bool x_in_gy = part.groups[gy].ops.count(op);
 
             // --- Steal: move op from gx to gy ---
-            if (!x_in_gy) {
+            if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gx = part.groups[gx].ops;
                 new_gx.erase(op);
 
@@ -70,7 +70,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
 
             // --- Merge: combine gx and gy ---
-            {
+            if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
                 double merged_cost = part.eval_set(merged);
@@ -83,7 +83,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
 
             // --- Recompute: add op to gy (keep in gx) ---
-            if (!x_in_gy) {
+            if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
                 double new_gy_cost = part.eval_set(new_gy);
