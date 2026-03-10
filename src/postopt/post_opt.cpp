@@ -91,6 +91,8 @@ Solution optimize_recompute(const Problem& prob, const DAG& dag, Solution sol) {
                 if (prod < 0) continue;
                 if (current_ops.count((size_t)prod)) continue;
 
+                if (!shapes_match(&prob, (size_t)prod, current_ops)) continue;
+
                 auto expanded_ops = step.subgraph.ops();
                 expanded_ops.push_back((size_t)prod);
 

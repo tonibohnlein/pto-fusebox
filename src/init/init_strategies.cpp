@@ -159,6 +159,9 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
             }
 
             for (auto cand : neighbors) {
+                if (!shapes_match(p.prob, cand, group)) continue;
+                if (p.dag->merge_creates_cycle({cand}, group)) continue;
+
                 std::set<size_t> expanded = group;
                 expanded.insert(cand);
                 double cost = p.eval_set(expanded);
@@ -213,6 +216,9 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
         for (auto succ : dag.op_succs[op]) {
             int gj = op_grp[succ];
             if (gj < 0 || (size_t)gj == (size_t)gi) continue;
+
+            if (!shapes_match(p.prob, p.groups[gi].ops, p.groups[gj].ops)) continue;
+            if (p.dag->merge_creates_cycle(p.groups[gi].ops, p.groups[gj].ops)) continue;
 
             std::set<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[gj].ops.begin(), p.groups[gj].ops.end());
