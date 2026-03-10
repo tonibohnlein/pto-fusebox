@@ -209,8 +209,10 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
-            // Replace ga with the components
-            if (er.remainder_components.size() == 1) {
+            // Replace ga with the components safely!
+            if (er.remainder_components.empty()) {
+                part.groups[m.ga].alive = false;
+            } else if (er.remainder_components.size() == 1) {
                 part.groups[m.ga].ops = std::move(er.remainder_components[0]);
                 part.groups[m.ga].cost = er.component_costs[0];
             } else {
@@ -238,12 +240,20 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
-            part.groups[m.ga].ops = std::move(er.remainder_components[0]);
-            part.groups[m.ga].cost = er.component_costs[0];
-            for (size_t i = 1; i < er.remainder_components.size(); i++) {
-                size_t new_gi = part.add_group(
-                    std::move(er.remainder_components[i]), er.component_costs[i]);
-                affected.insert(new_gi);
+            // Replace ga with the components safely!
+            if (er.remainder_components.empty()) {
+                part.groups[m.ga].alive = false;
+            } else if (er.remainder_components.size() == 1) {
+                part.groups[m.ga].ops = std::move(er.remainder_components[0]);
+                part.groups[m.ga].cost = er.component_costs[0];
+            } else {
+                part.groups[m.ga].ops = std::move(er.remainder_components[0]);
+                part.groups[m.ga].cost = er.component_costs[0];
+                for (size_t i = 1; i < er.remainder_components.size(); i++) {
+                    size_t new_gi = part.add_group(
+                        std::move(er.remainder_components[i]), er.component_costs[i]);
+                    affected.insert(new_gi);
+                }
             }
             part.groups[m.ga].gen++;
             affected.insert(m.ga);
