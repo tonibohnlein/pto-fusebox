@@ -704,33 +704,57 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     return {m.step_a, m.step_a + 1};
   }
   case SolutionMove::EJECT: {
-    if (m.step_a >= state.size())
-      return {SIZE_MAX, 0};
+    if (m.step_a >= state.size()) return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
     std::set<size_t> si_set(si.subgraph.ops().begin(), si.subgraph.ops().end());
     std::set<size_t> rem = si_set;
     rem.erase(m.op);
+
+    // ====================================================================
+    // TOPOLOGICAL TIMELINE CHECK
+    // We cannot blindly put the ejected op after the remainder!
+    // ====================================================================
+    bool must_be_before = false;
+    for (auto succ : dag.op_succs[m.op]) {
+        if (rem.count(succ)) must_be_before = true;
+    }
+    bool must_be_after = false;
+    for (auto pred : dag.op_preds[m.op]) {
+        if (rem.count(pred)) must_be_after = true;
+    }
+    if (must_be_before && must_be_after) return {SIZE_MAX, 0}; // Paradox!
+    // ====================================================================
+
     auto sg_r = Subgraph::create(prob, dag, {rem.begin(), rem.end()});
     auto sg_s = Subgraph::create(prob, dag, {m.op});
-    if (!sg_r || !sg_s)
-      return {SIZE_MAX, 0};
+    if (!sg_r || !sg_s) return {SIZE_MAX, 0};
+    
     auto rr = filter_retain(si.retain_these, *sg_r);
     auto cr = sg_r->best_cost(state.ret_entering[m.step_a], rr);
     auto cs = sg_s->best_cost({}, {});
-    if (!cr.feasible || !cs.feasible)
-      return {SIZE_MAX, 0};
-    si.subgraph = std::move(*sg_r);
-    si.config = cr.config;
-    si.retain_these = rr;
-    ScheduleStep ns;
-    ns.subgraph = std::move(*sg_s);
-    ns.config = cs.config;
-    state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(ns));
+    if (!cr.feasible || !cs.feasible) return {SIZE_MAX, 0};
+    
+    ScheduleStep step_r;
+    step_r.subgraph = std::move(*sg_r);
+    step_r.config = cr.config;
+    step_r.retain_these = rr;
+
+    ScheduleStep step_s;
+    step_s.subgraph = std::move(*sg_s);
+    step_s.config = cs.config;
+
+    // Apply strict chronological order
+    if (must_be_before) {
+        state.steps[m.step_a] = std::move(step_s);
+        state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(step_r));
+    } else {
+        state.steps[m.step_a] = std::move(step_r);
+        state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(step_s));
+    }
     return {m.step_a, state.size()};
   }
   case SolutionMove::INTERNAL_EJECT: {
-    if (m.step_a >= state.size())
-      return {SIZE_MAX, 0};
+    if (m.step_a >= state.size()) return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
     std::set<size_t> si_set(si.subgraph.ops().begin(), si.subgraph.ops().end());
     Partition tmp;
@@ -738,43 +762,63 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     tmp.dag = &dag;
     tmp.groups.push_back({si_set, state.cost[m.step_a], true, 0});
     auto er = tmp.eval_eject(m.op, 0);
-    if (!er.feasible)
-      return {SIZE_MAX, 0};
-    std::set<size_t> rem = si_set;
-    rem.erase(m.op);
-    auto comps = tmp.connected_components(rem);
-    std::vector<ScheduleStep> new_steps;
-    auto sg_sin = Subgraph::create(prob, dag, {m.op});
-    if (!sg_sin)
-      return {SIZE_MAX, 0};
-    auto cs = sg_sin->best_cost({}, {});
-    if (!cs.feasible)
-      return {SIZE_MAX, 0};
-    ScheduleStep ss;
-    ss.subgraph = std::move(*sg_sin);
-    ss.config = cs.config;
-    new_steps.push_back(std::move(ss));
-    for (auto &comp : comps) {
-      auto sg = Subgraph::create(prob, dag, {comp.begin(), comp.end()});
-      if (!sg)
-        return {SIZE_MAX, 0};
-      auto cc = sg->best_cost({}, {});
-      if (!cc.feasible)
-        return {SIZE_MAX, 0};
-      ScheduleStep ns;
-      ns.subgraph = std::move(*sg);
-      ns.config = cc.config;
-      new_steps.push_back(std::move(ns));
+    if (!er.feasible) return {SIZE_MAX, 0};
+
+    // ====================================================================
+    // TOPOLOGICAL TIMELINE SORT
+    // We must rebuild the local DAG of fragments to sort them chronologically!
+    // ====================================================================
+    std::vector<std::set<size_t>> new_groups;
+    new_groups.push_back({m.op});
+    for (auto& comp : er.remainder_components) new_groups.push_back(comp);
+
+    int k = new_groups.size();
+    std::vector<int> in_deg(k, 0);
+    std::vector<std::vector<int>> adj(k);
+    for (int i = 0; i < k; i++) {
+        for (int j = 0; j < k; j++) {
+            if (i == j) continue;
+            bool has_edge = false;
+            for (auto u : new_groups[i]) {
+                for (auto v : dag.op_succs[u]) {
+                    if (new_groups[j].count(v)) has_edge = true;
+                }
+            }
+            if (has_edge) { adj[i].push_back(j); in_deg[j]++; }
+        }
     }
+    
+    std::vector<int> order;
+    std::vector<int> q;
+    for (int i = 0; i < k; i++) if (in_deg[i] == 0) q.push_back(i);
+    while(!q.empty()) {
+        int u = q.back(); q.pop_back();
+        order.push_back(u);
+        for (int v : adj[u]) if (--in_deg[v] == 0) q.push_back(v);
+    }
+    if (order.size() != k) return {SIZE_MAX, 0}; // Impossible cycle!
+    // ====================================================================
+
+    std::vector<ScheduleStep> new_steps;
+    for (int idx : order) {
+        auto sg = Subgraph::create(prob, dag, {new_groups[idx].begin(), new_groups[idx].end()});
+        if (!sg) return {SIZE_MAX, 0};
+        auto cc = sg->best_cost({}, {});
+        if (!cc.feasible) return {SIZE_MAX, 0};
+        ScheduleStep ns;
+        ns.subgraph = std::move(*sg);
+        ns.config = cc.config;
+        new_steps.push_back(std::move(ns));
+    }
+
     state.steps.erase(state.steps.begin() + m.step_a);
-    for (size_t k = 0; k < new_steps.size(); k++)
-      state.steps.insert(state.steps.begin() + m.step_a + k,
-                         std::move(new_steps[k]));
+    for (size_t i = 0; i < new_steps.size(); i++)
+      state.steps.insert(state.steps.begin() + m.step_a + i, std::move(new_steps[i]));
+      
     return {m.step_a, state.size()};
   }
   case SolutionMove::SPLIT: {
-    if (m.step_a >= state.size())
-      return {SIZE_MAX, 0};
+    if (m.step_a >= state.size()) return {SIZE_MAX, 0};
     Partition tmp;
     tmp.prob = &prob;
     tmp.dag = &dag;
@@ -782,32 +826,50 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     std::set<size_t> op_set(ops.begin(), ops.end());
     tmp.groups.push_back({op_set, 0, true, 0});
     auto sr = tmp.eval_split(m.op, m.op2, 0);
-    if (!sr.feasible)
-      return {SIZE_MAX, 0};
-    auto sg_a =
-        Subgraph::create(prob, dag, {sr.side_a.begin(), sr.side_a.end()});
-    auto sg_b =
-        Subgraph::create(prob, dag, {sr.side_b.begin(), sr.side_b.end()});
-    if (!sg_a || !sg_b)
-      return {SIZE_MAX, 0};
+    if (!sr.feasible) return {SIZE_MAX, 0};
+
+    // ====================================================================
+    // TOPOLOGICAL TIMELINE CHECK
+    // Undirected BFS doesn't guarantee side_a precedes side_b!
+    // ====================================================================
+    bool a_before_b = false, b_before_a = false;
+    for (auto op_a : sr.side_a) {
+        for (auto succ : dag.op_succs[op_a]) if (sr.side_b.count(succ)) a_before_b = true;
+        for (auto pred : dag.op_preds[op_a]) if (sr.side_b.count(pred)) b_before_a = true;
+    }
+    if (a_before_b && b_before_a) return {SIZE_MAX, 0};
+    
+    if (b_before_a) {
+        std::swap(sr.side_a, sr.side_b);
+        // Cost swapping is unnecessary as we recalculate below
+    }
+    // ====================================================================
+
+    auto sg_a = Subgraph::create(prob, dag, {sr.side_a.begin(), sr.side_a.end()});
+    auto sg_b = Subgraph::create(prob, dag, {sr.side_b.begin(), sr.side_b.end()});
+    if (!sg_a || !sg_b) return {SIZE_MAX, 0};
+
     std::set<size_t> br;
     for (auto t : sg_a->boundary_outputs())
       if (sg_b->boundary_inputs().count(t) && prob.retainable_tensors.count(t))
         br.insert(t);
+        
     auto c_a = sg_a->best_cost(state.ret_entering[m.step_a], br);
     if (!c_a.feasible) {
       br.clear();
       c_a = sg_a->best_cost(state.ret_entering[m.step_a], {});
     }
+    
     auto vr = filter_retain(state.steps[m.step_a].retain_these, *sg_b);
     auto c_b = sg_b->best_cost(br, vr);
-    if (!c_b.feasible)
-      c_b = sg_b->best_cost(br, {});
-    if (!c_a.feasible || !c_b.feasible)
-      return {SIZE_MAX, 0};
+    if (!c_b.feasible) c_b = sg_b->best_cost(br, {});
+    
+    if (!c_a.feasible || !c_b.feasible) return {SIZE_MAX, 0};
+    
     state.steps[m.step_a].subgraph = std::move(*sg_a);
     state.steps[m.step_a].config = c_a.config;
     state.steps[m.step_a].retain_these = br;
+    
     ScheduleStep ns;
     ns.subgraph = std::move(*sg_b);
     ns.config = c_b.config;
