@@ -38,6 +38,9 @@ FMMove best_move_for(const Partition& part, size_t op,
                     if (gy != gx) neighbor_groups.insert(gy);
 
         for (auto gy : neighbor_groups) {
+            
+            if (!shapes_match(part.prob, op, part.groups[gy].ops)) continue;
+
             bool x_in_gy = part.groups[gy].ops.count(op);
 
             // --- Steal: move op from gx to gy ---

@@ -38,6 +38,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     // Pick random pair
     auto [ga, gb] = adj_pairs[rng() % adj_pairs.size()];
 
+    if (!shapes_match(part.prob, part.groups[ga].ops, part.groups[gb].ops)) return part;
     if (part.dag->merge_creates_cycle(part.groups[ga].ops, part.groups[gb].ops)) return part;
     
     // Merge: add all ops from gb into ga
@@ -124,6 +125,7 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Pick random target
     size_t dst_gi = targets[rng() % targets.size()];
 
+    if (!shapes_match(part.prob, op, part.groups[dst_gi].ops)) return part;
     if (part.dag->merge_creates_cycle({op}, part.groups[dst_gi].ops)) return part;
     
     // Check: removing op from src must leave it connected and non-empty
@@ -228,6 +230,7 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     std::vector<size_t> tgt_vec(target_groups.begin(), target_groups.end());
     size_t dst_gi = tgt_vec[rng() % tgt_vec.size()];
     
+    if (!shapes_match(part.prob, block, part.groups[dst_gi].ops)) return part;
     if (part.dag->merge_creates_cycle(block, part.groups[dst_gi].ops)) return part;
 
     // Evaluate
@@ -353,6 +356,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         size_t best_gi = SIZE_MAX;
         
         for (auto gi : adj_child_groups) {
+            if (!shapes_match(child.prob, cluster, child.groups[gi].ops)) continue;
             if (child.dag->merge_creates_cycle(cluster, child.groups[gi].ops)) continue;
 
             std::set<size_t> merged = child.groups[gi].ops;
