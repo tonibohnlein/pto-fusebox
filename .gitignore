@@ -2,6 +2,8 @@
 *.d
 
 build/*
+build-debug/*
+build-rel-dbg/*
 
 # Compiled Object files
 *.slo
