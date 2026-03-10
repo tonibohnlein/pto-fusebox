@@ -1,9 +1,11 @@
 #include "io/io.h"
 #include "pipeline/solver.h"
 #include "io/verify.h"
+#include "search/verbose.h"
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <vector>
 #include <chrono>
 
 // Determine time budget (seconds) from the benchmark filename.
@@ -36,13 +38,22 @@ int main(int argc, char* argv[]) {
         return verify_examples() ? 0 : 1;
     }
 
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input.json> <output.json>\n";
+    // Check for -v flag
+    bool verbose = false;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-v") verbose = true;
+        else args.push_back(argv[i]);
+    }
+    if (verbose) g_verbose = true; else g_verbose = false;
+
+    if (args.size() != 2) {
+        std::cerr << "Usage: " << argv[0] << " [-v] <input.json> <output.json>\n";
         std::cerr << "       " << argv[0] << " --verify\n";
         return 1;
     }
 
-    auto prob = read_problem(argv[1]);
+    auto prob = read_problem(args[0]);
     std::cerr << "Problem: " << prob.num_tensors() << " tensors, "
               << prob.num_ops() << " ops, fast_mem=" << prob.fast_memory_capacity
               << " bw=" << prob.slow_memory_bandwidth
@@ -50,7 +61,7 @@ int main(int argc, char* argv[]) {
               << "/" << prob.num_tensors() << "\n";
 
     // Set wall-clock deadline: 75% of budget for FM search, 25% for greedy/tabu/postopt
-    double budget = get_time_budget(argv[1]);
+    double budget = get_time_budget(args[0]);
     auto start = SteadyClock::now();
     auto deadline = start + std::chrono::milliseconds((int)(budget * 750));  // 75%
     std::cerr << "Time budget: " << budget << "s (FM deadline: " 
@@ -86,6 +97,6 @@ int main(int argc, char* argv[]) {
     std::cerr << "Wall time: " << std::fixed << std::setprecision(1) 
               << elapsed << "s / " << budget << "s\n";
 
-    write_solution(argv[2], sol);
+    write_solution(args[1], sol);
     return 0;
 }

