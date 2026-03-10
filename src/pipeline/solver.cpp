@@ -236,49 +236,45 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
                 bool want_retain_sink = prob.retainable_tensors.count(sink) &&
                                         gd.future_needs(sink, scheduled);
 
-                // Step 3: Evaluate with full resident set + output retain.
-                CostResult cost;
-                bool retained_sink = false;
+                // Step 3: Evaluate memory states and strictly enforce latency improvement
+                CostResult best_cost = gd.groups[gi].base_cost;
+                std::set<size_t> best_resident;
+                bool best_retained_sink = false;
 
-                // Try: all resident + retain output
+                // Option A: Keep only what this group strictly uses
+                std::set<size_t> only_used;
+                for (auto t : useful_resident)
+                    if (gd.groups[gi].sg.boundary_inputs().count(t))
+                        only_used.insert(t);
+                
+                auto c_used = gd.groups[gi].sg.best_cost(only_used, {});
+                if (c_used.feasible && c_used.latency < best_cost.latency) {
+                    best_cost = c_used; best_resident = only_used; best_retained_sink = false;
+                }
+
+                // Option B: Keep all pass-through residents
+                auto c_all = gd.groups[gi].sg.best_cost(useful_resident, {});
+                if (c_all.feasible && c_all.latency < best_cost.latency) {
+                    best_cost = c_all; best_resident = useful_resident; best_retained_sink = false;
+                }
+
                 if (want_retain_sink) {
-                    retain_these.insert(sink);
-                    cost = gd.groups[gi].sg.best_cost(useful_resident, retain_these);
-                    if (cost.feasible) {
-                        retained_sink = true;
-                    } else {
-                        retain_these.clear();
+                    // Option C: Only used + retain sink
+                    auto c_used_sink = gd.groups[gi].sg.best_cost(only_used, {sink});
+                    if (c_used_sink.feasible && c_used_sink.latency < best_cost.latency) {
+                        best_cost = c_used_sink; best_resident = only_used; best_retained_sink = true;
+                    }
+                    
+                    // Option D: All resident + retain sink
+                    auto c_all_sink = gd.groups[gi].sg.best_cost(useful_resident, {sink});
+                    if (c_all_sink.feasible && c_all_sink.latency < best_cost.latency) {
+                        best_cost = c_all_sink; best_resident = useful_resident; best_retained_sink = true;
                     }
                 }
 
-                // Fallback 1: all resident, no output retain
-                if (!cost.feasible) {
-                    cost = gd.groups[gi].sg.best_cost(useful_resident, {});
-                }
-
-                // Fallback 2: drop pass-through tensors (only keep what this group uses)
-                if (!cost.feasible) {
-                    std::set<size_t> only_used;
-                    for (auto t : useful_resident)
-                        if (gd.groups[gi].sg.boundary_inputs().count(t))
-                            only_used.insert(t);
-                    useful_resident = only_used;
-                    cost = gd.groups[gi].sg.best_cost(useful_resident, {});
-                }
-
-                // Fallback 3: no retained tensors at all
-                if (!cost.feasible) {
-                    useful_resident.clear();
-                    cost = gd.groups[gi].sg.best_cost({}, {});
-                }
-
-                // Fallback 4: base cost (should always work)
-                if (!cost.feasible) {
-                    cost = gd.groups[gi].base_cost;
-                    useful_resident.clear();
-                    retain_these.clear();
-                    retained_sink = false;
-                }
+                CostResult cost = best_cost;
+                useful_resident = best_resident;
+                bool retained_sink = best_retained_sink;
 
                 // Build next state
                 State next;
