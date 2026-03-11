@@ -46,16 +46,12 @@ static std::vector<size_t> random_subset_n(const std::vector<size_t>& ops,
 static std::vector<size_t> merge_lock_ops(const Partition& part, const FMMove& m) {
     std::vector<size_t> to_lock = {m.op};
 
-    // Find ops in gb that are DAG neighbors of m.op
-    for (auto pred : part.dag->op_preds[m.op]) {
-        if (m.gb < part.groups.size() && part.groups[m.gb].alive &&
-            part.groups[m.gb].ops.count(pred))
-            to_lock.push_back(pred);
-    }
-    for (auto succ : part.dag->op_succs[m.op]) {
-        if (m.gb < part.groups.size() && part.groups[m.gb].alive &&
-            part.groups[m.gb].ops.count(succ))
-            to_lock.push_back(succ);
+    // Find ops in gb that are neighbors of m.op (DAG edges + co-consumers)
+    if (m.gb < part.groups.size() && part.groups[m.gb].alive) {
+        for (auto nbr : part.dag->op_neighbors[m.op]) {
+            if (part.groups[m.gb].ops.count(nbr))
+                to_lock.push_back(nbr);
+        }
     }
     return to_lock;
 }

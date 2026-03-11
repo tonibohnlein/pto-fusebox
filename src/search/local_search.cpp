@@ -1,51 +1,26 @@
 #include "search/verbose.h"
 #include "search/local_search.h"
 #include "init/init_strategies.h"
+#include "search/fm_outer.h"
 #include <iostream>
 
 // ============================================================================
-// TabuList
+// Move generation (positive-saving only)
 // ============================================================================
 
-void TabuList::add(size_t op, size_t group) {
-    entries_[{op, group}] = ttl_;
-}
-
-bool TabuList::is_tabu(size_t op, size_t group) const {
-    return entries_.count({op, group}) > 0;
-}
-
-void TabuList::tick() {
-    for (auto it = entries_.begin(); it != entries_.end(); ) {
-        if (--it->second <= 0)
-            it = entries_.erase(it);
-        else
-            ++it;
-    }
-}
-
-// ============================================================================
-// Move generation
-//
-// Generates moves involving group gi with saving > -floor.
-// If tabu is non-null, filters moves that would reverse a tabu entry.
-// ============================================================================
-
-void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
-                    double floor, const TabuList* tabu) {
+void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
     if (!part.groups[gi].alive) return;
 
     auto neighbors = part.boundary_neighbors(gi);
     for (auto adj_op : neighbors) {
-        auto adj_groups = part.groups_of(adj_op);
+        auto& adj_groups = part.groups_of(adj_op);
         for (auto gj : adj_groups) {
             if (gj == gi) continue;
             int gen_i = part.groups[gi].gen;
             int gen_j = part.groups[gj].gen;
 
             // Move 1: Merge gi and gj
-            if (shapes_match(part.prob, part.groups[gi].ops, part.groups[gj].ops) &&
-                !part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) 
+            if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops))
             {
                 std::set<size_t> merged = part.groups[gi].ops;
                 merged.insert(part.groups[gj].ops.begin(),
@@ -53,26 +28,12 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 double new_cost = part.eval_set(merged);
                 double saving = (part.groups[gi].cost + part.groups[gj].cost)
                                 - new_cost;
-                if (saving > -floor) {
-                    // Check tabu: after merge, ops from gb are in ga
-                    // Tabu if any op from gb is tabu for ga
-                    bool blocked = false;
-                    if (tabu) {
-                        for (auto op : part.groups[gj].ops)
-                            if (tabu->is_tabu(op, gi)) { blocked = true; break; }
-                    }
-                    if (!blocked)
-                        heap.push({Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
-                }
+                if (saving > 0.01)
+                    heap.push({Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
             }
 
             // Move 2: Steal adj_op from gj into gi
             {
-                // Tabu check: adj_op moving into gi
-                if (tabu && tabu->is_tabu(adj_op, gi)) continue;
-
-                // SHAPE & MACRO-CYCLE CHECKS
-                if (!shapes_match(part.prob, adj_op, part.groups[gi].ops)) continue;
                 if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
 
                 std::set<size_t> new_gi = part.groups[gi].ops;
@@ -90,7 +51,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                     if (valid) {
                         double saving = (part.groups[gi].cost + part.groups[gj].cost)
                                         - (new_gi_cost + new_gj_cost);
-                        if (saving > -floor)
+                        if (saving > 0.01)
                             heap.push({Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
                     }
                 }
@@ -98,30 +59,23 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
 
             // Move 3: Recompute adj_op in gi (keep in gj too)
             {
-                if (tabu && tabu->is_tabu(adj_op, gi)) continue;
-
-                // SHAPE & MACRO-CYCLE CHECKS
-                if (!shapes_match(part.prob, adj_op, part.groups[gi].ops)) continue;
                 if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
 
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
                 double new_gi_cost = part.eval_set(new_gi);
                 double saving = part.groups[gi].cost - new_gi_cost;
-                if (saving > -floor)
+                if (saving > 0.01)
                     heap.push({Move::RECOMPUTE, gi, gj, adj_op, saving, gen_i, gen_j});
             }
         }
     }
 
-    // Move 4: Eject a border op from gi into a new singleton
+    // Move 4: Eject a border op from gi
     if (part.groups[gi].ops.size() >= 2) {
         auto ejectable = part.ejectable_ops(gi);
         int gen_i = part.groups[gi].gen;
         for (auto op : ejectable) {
-            // Tabu check: op leaving gi
-            if (tabu && tabu->is_tabu(op, gi)) continue;
-
             std::set<size_t> remainder = part.groups[gi].ops;
             remainder.erase(op);
             double remainder_cost = part.eval_set(remainder);
@@ -131,35 +85,31 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             if (singleton_cost >= 1e17) continue;
 
             double saving = part.groups[gi].cost - (remainder_cost + singleton_cost);
-            if (saving > -floor)
+            if (saving > 0.01)
                 heap.push({Move::EJECT, gi, 0, op, saving, gen_i, 0});
         }
     }
 
-    // Move 5: Internal eject — eject an internal op (may split into 3+ components)
+    // Move 5: Internal eject
     if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
         auto internals = part.internal_ops(gi);
         int gen_i = part.groups[gi].gen;
         for (auto op : internals) {
-            if (tabu && tabu->is_tabu(op, gi)) continue;
-
             auto er = part.eval_eject(op, gi);
             if (!er.feasible) continue;
-            if (er.saving > -floor)
+            if (er.saving > 0.01)
                 heap.push({Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
         }
     }
 
-    // Move 6: Split group at a bridge edge into two non-trivial parts
+    // Move 6: Split at bridge edges
     if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
         auto bridges = part.bridge_edges(gi);
         int gen_i = part.groups[gi].gen;
         for (auto& [a, b] : bridges) {
-            if (tabu && (tabu->is_tabu(a, gi) || tabu->is_tabu(b, gi))) continue;
-
             auto sr = part.eval_split(a, b, gi);
             if (!sr.feasible) continue;
-            if (sr.saving > -floor) {
+            if (sr.saving > 0.01) {
                 Move m;
                 m.type = Move::SPLIT;
                 m.ga = gi; m.gb = 0; m.op = a;
@@ -173,17 +123,11 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
 }
 
 // ============================================================================
-// Apply a move. Returns dirty set (empty if move rejected on re-verify).
-// Also populates tabu_entries with (op, group) pairs to mark tabu.
+// Apply a move. Returns dirty group set (empty if move rejected on re-verify).
 // ============================================================================
 
-struct ApplyResult {
+static std::set<size_t> apply_move(Partition& part, const Move& m) {
     std::set<size_t> dirty;
-    std::vector<std::pair<size_t, size_t>> tabu_entries;  // (op, group) to forbid
-};
-
-static ApplyResult apply_move(Partition& part, const Move& m) {
-    ApplyResult result;
 
     switch (m.type) {
         case Move::MERGE: {
@@ -192,49 +136,42 @@ static ApplyResult apply_move(Partition& part, const Move& m) {
                           part.groups[m.gb].ops.end());
             double new_cost = part.eval_set(merged);
             if (new_cost >= part.groups[m.ga].cost + part.groups[m.gb].cost - 0.001)
-                if (m.saving > 0) return result;  // positive move no longer profitable
+                return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
+            dirty = part.adjacent_groups(m.ga);
             auto nb = part.adjacent_groups(m.gb);
-            result.dirty.insert(nb.begin(), nb.end());
-            result.dirty.erase(m.ga); result.dirty.erase(m.gb);
-
-            // Tabu: ops from gb can't be ejected from ga
-            for (auto op : part.groups[m.gb].ops)
-                result.tabu_entries.push_back({op, m.ga});
+            dirty.insert(nb.begin(), nb.end());
+            dirty.erase(m.ga); dirty.erase(m.gb);
 
             part.groups[m.ga].ops = std::move(merged);
             part.groups[m.ga].cost = new_cost;
             part.groups[m.ga].gen++;
             part.groups[m.gb].alive = false;
             part.groups[m.gb].gen++;
-            result.dirty.insert(m.ga);
+            dirty.insert(m.ga);
             break;
         }
         case Move::STEAL: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
             double new_ga_cost = part.eval_set(new_ga);
-            if (new_ga_cost >= 1e17) return result;
+            if (new_ga_cost >= 1e17) return {};
 
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.erase(m.op);
             double new_gb_cost = 0;
             if (!new_gb.empty()) {
                 new_gb_cost = part.eval_set(new_gb);
-                if (new_gb_cost >= 1e17) return result;
+                if (new_gb_cost >= 1e17) return {};
             }
             double actual_saving = (part.groups[m.ga].cost + part.groups[m.gb].cost)
                                    - (new_ga_cost + new_gb_cost);
-            if (actual_saving < -0.001 && m.saving > 0) return result;
+            if (actual_saving < -0.001) return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
+            dirty = part.adjacent_groups(m.ga);
             auto nb = part.adjacent_groups(m.gb);
-            result.dirty.insert(nb.begin(), nb.end());
-            result.dirty.erase(m.ga); result.dirty.erase(m.gb);
-
-            // Tabu: op can't be stolen back from ga to gb
-            result.tabu_entries.push_back({m.op, m.gb});
+            dirty.insert(nb.begin(), nb.end());
+            dirty.erase(m.ga); dirty.erase(m.gb);
 
             part.groups[m.ga].ops = std::move(new_ga);
             part.groups[m.ga].cost = new_ga_cost;
@@ -246,8 +183,8 @@ static ApplyResult apply_move(Partition& part, const Move& m) {
                 part.groups[m.gb].cost = new_gb_cost;
             }
             part.groups[m.gb].gen++;
-            result.dirty.insert(m.ga);
-            if (part.groups[m.gb].alive) result.dirty.insert(m.gb);
+            dirty.insert(m.ga);
+            if (part.groups[m.gb].alive) dirty.insert(m.gb);
             break;
         }
         case Move::RECOMPUTE: {
@@ -255,35 +192,32 @@ static ApplyResult apply_move(Partition& part, const Move& m) {
             new_ga.insert(m.op);
             double new_cost = part.eval_set(new_ga);
             double actual_saving = part.groups[m.ga].cost - new_cost;
-            if (actual_saving < -0.001 && m.saving > 0) return result;
+            if (actual_saving < -0.001) return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
-            result.dirty.erase(m.ga);
-
-            // Tabu: op can't be removed from ga
-            result.tabu_entries.push_back({m.op, m.ga});
+            dirty = part.adjacent_groups(m.ga);
+            dirty.erase(m.ga);
 
             part.groups[m.ga].ops = std::move(new_ga);
             part.groups[m.ga].cost = new_cost;
             part.groups[m.ga].gen++;
-            result.dirty.insert(m.ga);
+            dirty.insert(m.ga);
             break;
         }
         case Move::EJECT: {
             std::set<size_t> remainder = part.groups[m.ga].ops;
             remainder.erase(m.op);
             double remainder_cost = part.eval_set(remainder);
-            if (remainder_cost >= 1e17) return result;
+            if (remainder_cost >= 1e17) return {};
 
             double singleton_cost = part.eval_set({m.op});
-            if (singleton_cost >= 1e17) return result;
+            if (singleton_cost >= 1e17) return {};
 
             double actual_saving = part.groups[m.ga].cost
                                    - (remainder_cost + singleton_cost);
-            if (actual_saving < -0.001 && m.saving > 0) return result;
+            if (actual_saving < -0.001) return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
-            result.dirty.erase(m.ga);
+            dirty = part.adjacent_groups(m.ga);
+            dirty.erase(m.ga);
 
             part.groups[m.ga].ops = std::move(remainder);
             part.groups[m.ga].cost = remainder_cost;
@@ -291,118 +225,66 @@ static ApplyResult apply_move(Partition& part, const Move& m) {
 
             size_t new_gi = part.add_group({m.op}, singleton_cost);
 
-            // Tabu: op can't be merged back into ga
-            result.tabu_entries.push_back({m.op, m.ga});
-
-            result.dirty.insert(m.ga);
-            result.dirty.insert(new_gi);
+            dirty.insert(m.ga);
+            dirty.insert(new_gi);
             break;
         }
         case Move::INTERNAL_EJECT: {
             auto er = part.eval_eject(m.op, m.ga);
-            if (!er.feasible) return result;
-            if (er.saving < -0.001 && m.saving > 0) return result;
+            if (!er.feasible || er.saving < -0.001) return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
-            result.dirty.erase(m.ga);
+            dirty = part.adjacent_groups(m.ga);
+            dirty.erase(m.ga);
 
-            // Replace ga with first component, create new groups for rest
             part.groups[m.ga].ops = er.remainder_components[0];
             part.groups[m.ga].cost = er.component_costs[0];
             part.groups[m.ga].gen++;
-            result.dirty.insert(m.ga);
+            dirty.insert(m.ga);
 
             for (size_t c = 1; c < er.remainder_components.size(); c++) {
                 size_t ng = part.add_group(er.remainder_components[c], er.component_costs[c]);
-                result.dirty.insert(ng);
+                dirty.insert(ng);
             }
 
             if (er.singleton_cost > 0) {
                 size_t sg = part.add_group({m.op}, er.singleton_cost);
-                result.dirty.insert(sg);
+                dirty.insert(sg);
             }
-
-            result.tabu_entries.push_back({m.op, m.ga});
             break;
         }
         case Move::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
-            if (!sr.feasible) return result;
-            if (sr.saving < -0.001 && m.saving > 0) return result;
+            if (!sr.feasible || sr.saving < -0.001) return {};
 
-            result.dirty = part.adjacent_groups(m.ga);
-            result.dirty.erase(m.ga);
+            dirty = part.adjacent_groups(m.ga);
+            dirty.erase(m.ga);
 
-            // Replace ga with side_a, create new group for side_b
             part.groups[m.ga].ops = sr.side_a;
             part.groups[m.ga].cost = sr.cost_a;
             part.groups[m.ga].gen++;
-            result.dirty.insert(m.ga);
+            dirty.insert(m.ga);
 
             size_t gb = part.add_group(sr.side_b, sr.cost_b);
-            result.dirty.insert(gb);
-
-            // Tabu: don't immediately re-merge
-            result.tabu_entries.push_back({m.op, gb});
-            result.tabu_entries.push_back({m.op2, m.ga});
+            dirty.insert(gb);
             break;
         }
     }
 
-    return result;
+    part.rebuild_index();
+    return dirty;
 }
 
 // ============================================================================
-// Phase 1: Greedy descent (positive moves only)
+// Greedy descent
 // ============================================================================
 
-static int greedy_phase(Partition& part) {
+Partition greedy_descent(Partition part) {
     MoveHeap heap;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, 0.0, nullptr);
+        generate_moves(part, gi, heap);
 
     int applied = 0;
     while (!heap.empty()) {
-        Move m = heap.top();
-        heap.pop();
-
-        if (!part.groups[m.ga].alive || part.groups[m.ga].gen != m.gen_a)
-            continue;
-        if (m.type == Move::MERGE || m.type == Move::STEAL || m.type == Move::RECOMPUTE) {
-            if (!part.groups[m.gb].alive || part.groups[m.gb].gen != m.gen_b)
-                continue;
-        }
-
-        auto result = apply_move(part, m);
-        if (result.dirty.empty()) continue;
-
-        applied++;
-        for (auto gi : result.dirty)
-            generate_moves(part, gi, heap, 0.0, nullptr);
-    }
-    return applied;
-}
-
-// ============================================================================
-// Phase 2: Tabu exploration (allows worsening moves)
-// ============================================================================
-
-static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) {
-    int tabu_ttl = std::max(5, (int)part.num_alive() / 3);
-    TabuList tabu(tabu_ttl);
-
-    double neg_floor = best_cost * 0.10;
-
-    int max_no_improve = std::max(10, (int)part.prob->num_ops() / 3);
-    int no_improve = 0;
-    int applied = 0;
-
-    // Build initial heap with negative moves allowed
-    MoveHeap heap;
-    for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, neg_floor, &tabu);
-
-    while (!heap.empty() && no_improve < max_no_improve) {
         Move m = heap.top();
         heap.pop();
 
@@ -414,85 +296,27 @@ static int tabu_phase(Partition& part, Partition& best_seen, double& best_cost) 
                 continue;
         }
 
-        // Snapshot before worsening move if we're at best
-        if (m.saving < 0) {
-            double current_cost = part.total_cost();
-            if (current_cost <= best_cost + 0.001) {
-                best_seen = part;
-                best_cost = current_cost;
-            }
-        }
-
-        auto result = apply_move(part, m);
-        if (result.dirty.empty()) continue;
-
-        // Register tabu entries
-        for (auto& [op, grp] : result.tabu_entries)
-            tabu.add(op, grp);
+        auto dirty = apply_move(part, m);
+        if (dirty.empty()) continue;
 
         applied++;
-
-        // Check for new best
-        double new_cost = part.total_cost();
-        if (new_cost < best_cost - 0.001) {
-            best_cost = new_cost;
-            best_seen = part;
-            no_improve = 0;
-            if (g_verbose) std::cerr << "      tabu: new best " << best_cost << "\n";
-        } else {
-            no_improve++;
-        }
-
-        // Regenerate moves only for dirty groups
-        for (auto gi : result.dirty)
-            generate_moves(part, gi, heap, neg_floor, &tabu);
-
-        tabu.tick();
+        for (auto gi : dirty)
+            generate_moves(part, gi, heap);
     }
 
-    return applied;
-}
-
-Partition greedy_descent(Partition part) {
-    greedy_phase(part);
+    if (g_verbose && applied > 0)
+        std::cerr << "    greedy: " << applied << " moves, cost="
+                  << part.total_cost() << "\n";
     return part;
 }
 
 // ============================================================================
-// Two-phase local search from a given partition
-// ============================================================================
-
-Partition local_search_from(Partition part) {
-    // Phase 1: greedy descent
-    int greedy_moves = greedy_phase(part);
-    if (g_verbose) std::cerr << "    greedy: " << greedy_moves << " moves, cost="
-              << part.total_cost() << "\n";
-
-    // Snapshot best after greedy
-    Partition best_seen = part;
-    double best_cost = part.total_cost();
-
-    // Phase 2: tabu exploration — allows worsening moves to escape local optima
-    {
-        int tabu_moves = tabu_phase(part, best_seen, best_cost);
-        if (tabu_moves > 0) {
-            if (g_verbose) std::cerr << "    tabu: " << tabu_moves << " moves, best="
-                      << best_cost << "\n";
-        }
-    }
-
-    if (g_verbose) std::cerr << "    -> " << best_seen.num_alive() << " groups, cost="
-              << best_seen.total_cost() << "\n";
-    return best_seen;
-}
-
-// ============================================================================
-// Multi-start: run from each initialization, return overall best
+// Full search pipeline
 // ============================================================================
 
 Partition local_search(const Problem& prob, const DAG& dag) {
+    // Phase 1: try all initialization strategies + greedy descent
     auto strategies = all_init_strategies();
-
     Partition best;
     double best_cost = 1e18;
 
@@ -502,7 +326,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
         if (g_verbose) std::cerr << "    " << init.num_alive() << " groups, cost="
                   << init.total_cost() << "\n";
 
-        auto result = local_search_from(std::move(init));
+        auto result = greedy_descent(std::move(init));
 
         if (result.total_cost() < best_cost - 0.001) {
             best_cost = result.total_cost();
@@ -511,7 +335,25 @@ Partition local_search(const Problem& prob, const DAG& dag) {
         }
     }
 
-    std::cerr << "  Best: " << best.num_alive() << " groups, cost="
+    std::cerr << "  After greedy: " << best.num_alive() << " groups, cost="
+              << best.total_cost() << "\n";
+
+    // Phase 2: FM exploration from the best greedy result
+    FMOuterConfig fm_cfg;
+    fm_cfg.pass_config.floor_fraction = 0.30;
+    fm_cfg.pass_config.max_drift_fraction = 0.50;
+    fm_cfg.pass_config.init_count = 3;
+    fm_cfg.max_passes = 1000;
+    fm_cfg.max_no_improve = 15;
+
+    auto fm_result = fm_outer_loop(best, fm_cfg);
+
+    if (fm_result.best_cost < best_cost - 0.001) {
+        best = std::move(fm_result.best_partition);
+        best_cost = fm_result.best_cost;
+    }
+
+    std::cerr << "  Final: " << best.num_alive() << " groups, cost="
               << best.total_cost() << "\n";
     return best;
 }

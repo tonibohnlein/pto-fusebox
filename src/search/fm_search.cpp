@@ -21,25 +21,18 @@ FMMove best_move_for(const Partition& part, size_t op,
                saving > -floor && saving > best.saving;
     };
 
-    // Collect neighbor groups via DAG edges
-    // For each group gx containing op, find groups of DAG neighbors
+    // Collect neighbor groups via DAG edges + shared inputs
     for (auto gx : groups_of_x) {
         if (!part.is_border_op(op, gx)) continue;
 
-        // Neighbor groups reachable via op's DAG edges
+        // Neighbor groups reachable via op_neighbors (DAG edges + co-consumers)
         std::set<size_t> neighbor_groups;
-        for (auto pred : part.dag->op_preds[op])
-            if (!part.groups[gx].ops.count(pred))
-                for (auto gy : part.groups_of(pred))
-                    if (gy != gx) neighbor_groups.insert(gy);
-        for (auto succ : part.dag->op_succs[op])
-            if (!part.groups[gx].ops.count(succ))
-                for (auto gy : part.groups_of(succ))
+        for (auto nbr : part.dag->op_neighbors[op])
+            if (!part.groups[gx].ops.count(nbr))
+                for (auto gy : part.groups_of(nbr))
                     if (gy != gx) neighbor_groups.insert(gy);
 
         for (auto gy : neighbor_groups) {
-            
-            if (!shapes_match(part.prob, op, part.groups[gy].ops)) continue;
 
             bool x_in_gy = part.groups[gy].ops.count(op);
 
@@ -281,5 +274,6 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             return {};
     }
 
+    part.rebuild_index();
     return affected;
 }

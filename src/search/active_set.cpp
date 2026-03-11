@@ -83,12 +83,9 @@ std::set<size_t> ActiveSet::op_relevant_groups(size_t op) const {
     std::set<size_t> groups;
     for (auto gi : part_->groups_of(op))
         groups.insert(gi);
-    // Also add groups of DAG neighbors
-    for (auto pred : part_->dag->op_preds[op])
-        for (auto gi : part_->groups_of(pred))
-            groups.insert(gi);
-    for (auto succ : part_->dag->op_succs[op])
-        for (auto gi : part_->groups_of(succ))
+    // Also add groups of all neighbors (DAG edges + co-consumers)
+    for (auto nbr : part_->dag->op_neighbors[op])
+        for (auto gi : part_->groups_of(nbr))
             groups.insert(gi);
     return groups;
 }
