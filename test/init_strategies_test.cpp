@@ -3,7 +3,7 @@
 //
 // Each strategy must satisfy invariants:
 //   1. Every op is covered by at least one group
-//   2. Each group forms a valid Subgraph (single-sink, connected)
+//   2. Each group forms a valid Subgraph (connected, valid boundary outputs)
 //   3. Group costs match eval_set()
 //   4. Total cost <= trivial partition cost (no strategy should be worse)
 

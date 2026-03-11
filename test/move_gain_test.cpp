@@ -98,7 +98,7 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
     int type_counts[6] = {};
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         MoveHeap heap;
-        generate_moves(part, gi, heap, floor, nullptr);
+        generate_moves(part, gi, heap);
         while (!heap.empty()) {
             Move m = heap.top(); heap.pop();
             auto gc = verify_heap_move(part, m);
@@ -220,7 +220,7 @@ void test_merge_forces_smaller_tiles() {
     std::cout << "=== test_merge_forces_smaller_tiles ===\n";
     // Tensors 512x512. Cap=280000. Single PW: ws = 128*128 = 16384 → fits at [128,128].
     // Fused 2 PW: ws = 128*128 = 16384 → still fits. Same cost.
-    // But with 3 PW fused: still single-sink. Let me use tight cap.
+    // But with 3 PW fused: still valid. Let me use tight cap.
     // 
     // Actually for PW, ws doesn't grow with fusion (output in-place).
     // For MatMul: ws grows. Let me use MatMul.
@@ -253,7 +253,7 @@ void test_merge_forces_smaller_tiles() {
     MoveHeap heap;
     int pos = 0, neg = 0;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, 1e18, nullptr);
+        generate_moves(part, gi, heap);
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
         if (m.saving > 0.01) pos++;
@@ -319,7 +319,7 @@ void test_recompute_saves_large_tensor() {
     
     // Verify at least one recompute exists (even if negative)
     MoveHeap heap;
-    generate_moves(part, 2, heap, 1e18, nullptr);
+    generate_moves(part, 2, heap);
     int recomp_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -405,7 +405,7 @@ void test_post_greedy_varied() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
-    auto part = local_search_from(Partition::trivial(p, d));
+    auto part = greedy_descent(Partition::trivial(p, d));
     std::cout << "  post-greedy: " << part.num_alive() << " groups\n";
     tally(verify_all_moves("post_greedy", part));
     tally(verify_all_fm("post_greedy", part));
@@ -520,7 +520,7 @@ void test_eject_from_chain3() {
     
     // Check eject count
     MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18, nullptr);
+    generate_moves(part, 0, heap);
     int eject_count = 0, pos_ej = 0, neg_ej = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -619,7 +619,7 @@ void test_negative_steal_gain() {
     MoveHeap heap;
     int pos=0, neg=0;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, 1e18, nullptr);
+        generate_moves(part, gi, heap);
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
         if (m.saving > 0.01) pos++; else if (m.saving < -0.01) neg++;
@@ -643,7 +643,7 @@ void test_mixed_chain_at_optimum() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
-    auto part = local_search_from(Partition::trivial(p, d));
+    auto part = greedy_descent(Partition::trivial(p, d));
     
     auto [n, bad] = verify_all_moves("mixed_opt", part);
     tally({n, bad});
@@ -686,7 +686,7 @@ void test_internal_eject_chain4() {
 
     // Verify heap generates internal eject
     MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18, nullptr);
+    generate_moves(part, 0, heap);
     int ie_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -736,7 +736,7 @@ void test_split_chain4() {
 
     // Verify heap generates SPLIT moves
     MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18, nullptr);
+    generate_moves(part, 0, heap);
     int split_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -788,7 +788,7 @@ void test_internal_diamond_fused() {
 
     // But internal eject should still work
     MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18, nullptr);
+    generate_moves(part, 0, heap);
     int ie=0, sp=0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -831,7 +831,7 @@ void test_internal_eject_helps() {
 
     // Check what internal moves find
     MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18, nullptr);
+    generate_moves(part, 0, heap);
     int ie=0, sp=0, best_type=-1;
     double best_saving = -1e18;
     while (!heap.empty()) {

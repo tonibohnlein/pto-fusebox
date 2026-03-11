@@ -59,7 +59,7 @@ void test_fanin_boundary() {
     CHECK("T3 boundary in", sg.boundary_inputs().count(3));
     CHECK("T4 boundary in", sg.boundary_inputs().count(4));
     CHECK("4 boundary inputs", sg.boundary_inputs().size() == 4);
-    CHECK("T6 sink", sg.sink_tensor() == 6);
+    CHECK("T6 is boundary output", sg.boundary_outputs().count(6));
 }
 
 void test_fanin_working_set() {

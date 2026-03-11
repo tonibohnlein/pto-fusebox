@@ -105,10 +105,10 @@ void test_create_single_op() {
   DAG d = DAG::build(p);
   auto sg0 = Subgraph::create(p, d, {0});
   CHECK("Op0 valid", sg0.has_value());
-  CHECK_EQ_S("Op0 sink", sg0->sink_tensor(), 1);
+  CHECK("Op0 T1 boundary out", sg0->boundary_outputs().count(1));
   auto sg1 = Subgraph::create(p, d, {1});
   CHECK("Op1 valid", sg1.has_value());
-  CHECK_EQ_S("Op1 sink", sg1->sink_tensor(), 2);
+  CHECK("Op1 T2 boundary out", sg1->boundary_outputs().count(2));
 }
 
 void test_create_fused_chain() {
@@ -117,13 +117,13 @@ void test_create_fused_chain() {
   DAG d = DAG::build(p);
   auto sg = Subgraph::create(p, d, {0, 1});
   CHECK("fused valid", sg.has_value());
-  CHECK_EQ_S("fused sink", sg->sink_tensor(), 2);
+  CHECK("fused T2 boundary out", sg->boundary_outputs().count(2));
   CHECK("T1 ephemeral", sg->ephemeral().count(1));
   CHECK("T0 boundary", sg->boundary_inputs().count(0));
 }
 
-void test_create_multi_sink_rejected() {
-  std::cout << "--- test_create_multi_sink_rejected ---\n";
+void test_create_multi_output_same_dims() {
+  std::cout << "--- test_create_multi_output_same_dims ---\n";
   Problem p;
   p.tensors = {{128, 128}, {128, 128}, {128, 128}};
   p.ops = {{OpType::Pointwise, {0}, {1}, 1000},
@@ -133,8 +133,21 @@ void test_create_multi_sink_rejected() {
   p.native_w = 128;
   p.native_h = 128;
   DAG d = DAG::build(p);
-  CHECK("multi-sink rejected", !Subgraph::create(p, d, {0, 1}).has_value());
+  // Multi-output is valid when all boundary outputs have same dimensions
+  CHECK("multi-output accepted", Subgraph::create(p, d, {0, 1}).has_value());
   CHECK("Op0 alone valid", Subgraph::create(p, d, {0}).has_value());
+
+  // Multi-output with different dims should be rejected
+  Problem p2;
+  p2.tensors = {{128, 128}, {256, 256}, {128, 128}};
+  p2.ops = {{OpType::Pointwise, {0}, {1}, 1000},
+            {OpType::Pointwise, {0}, {2}, 1000}};
+  p2.fast_memory_capacity = 50000;
+  p2.slow_memory_bandwidth = 10;
+  p2.native_w = 128;
+  p2.native_h = 128;
+  DAG d2 = DAG::build(p2);
+  CHECK("diff-dim multi-output rejected", !Subgraph::create(p2, d2, {0, 1}).has_value());
 }
 
 void test_create_disconnected_rejected() {
@@ -179,9 +192,8 @@ void test_create_diamond_fusions() {
   CHECK("T1 ephemeral in {0,2}", sg02->ephemeral().count(1));
 
   auto sg012 = Subgraph::create(p, d, {0, 1, 2});
-  CHECK("{0,1,2} valid", sg012.has_value());
-  CHECK("T1 eph in {0,1,2}", sg012->ephemeral().count(1));
-  CHECK("T2 eph in {0,1,2}", sg012->ephemeral().count(2));
+  // {0,1,2} is rejected: T1 is ephemeral but consumed by both Op1 and Op2 (fan-out)
+  CHECK("{0,1,2} rejected (eph fan-out)", !sg012.has_value());
 }
 
 void test_create_empty_rejected() {
@@ -619,13 +631,21 @@ void test_matmul_pw_fusion_K() {
   CHECK_EQ_I("fused max_K", sg->max_K(), 256);
   CHECK("T2 ephemeral", sg->ephemeral().count(2));
 
-  // num_k_passes from the MatMul's K=256
-  auto c = sg->compute_cost(N(128, 128, 64));
-  CHECK_EQ_I("fused k_passes", c.num_k_passes, 4);
+  // PW sink rule: k must be 1
+  CHECK("k=64 rejected (PW sink)", !sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
+  CHECK("k=1 accepted", sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
 
-  // Compute per step: MatMul = 2000*64/256=500 per k-step.
-  // PW = 500 but runs once per tile (added at last k-step only).
-  CHECK_EQ("fused comp/step (MM only)", c.compute_per_step, 500.0);
+  // With k=1, nk = 256 k-passes
+  auto c = sg->compute_cost(N(128, 128, 1));
+  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 256);
+
+  // Compute per step: MatMul = 2000*1/256 per k-step ≈ 7.8125
+  CHECK_EQ("fused comp/step (MM only)", c.compute_per_step, 2000.0 * 1.0 / 256.0);
+
+  // best_cost should pick k=1 (only valid option)
+  auto best = sg->best_cost();
+  CHECK("best feasible", best.feasible);
+  CHECK_EQ_I("best k=1", best.config.k, 1);
 }
 
 // ==================== Non-power-of-2 tiling ====================
@@ -946,7 +966,7 @@ void test_subgraph_cache_concurrency() {
 int main() {
   test_create_single_op();
   test_create_fused_chain();
-  test_create_multi_sink_rejected();
+  test_create_multi_output_same_dims();
   test_create_disconnected_rejected();
   test_create_diamond_fusions();
   test_create_empty_rejected();

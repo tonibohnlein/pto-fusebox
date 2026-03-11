@@ -72,7 +72,7 @@ void test_chain2() {
     CHECK("T0 boundary in", sg.boundary_inputs().count(0));
     CHECK("T1 boundary in", sg.boundary_inputs().count(1));
     CHECK("T2 boundary in", sg.boundary_inputs().count(2));
-    CHECK("T4 sink", sg.sink_tensor() == 4);
+    CHECK("T4 is boundary output", sg.boundary_outputs().count(4));
     CHECK_EQ_I("max_K=128", sg.max_K(), 128);
 
     // --- Working set at [128,128,32] ---
@@ -147,7 +147,7 @@ void test_chain3() {
     CHECK("T1 boundary in", sg.boundary_inputs().count(1));
     CHECK("T3 boundary in", sg.boundary_inputs().count(3));
     CHECK("T5 boundary in", sg.boundary_inputs().count(5));
-    CHECK("T6 sink", sg.sink_tensor() == 6);
+    CHECK("T6 is boundary output", sg.boundary_outputs().count(6));
     CHECK("4 boundary inputs", sg.boundary_inputs().size() == 4);
     CHECK_EQ_I("max_K=128", sg.max_K(), 128);
 

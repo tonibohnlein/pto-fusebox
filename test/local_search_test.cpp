@@ -619,107 +619,17 @@ void test_eject_move() {
 
 // ==================== Tabu mechanics ====================
 
-void test_tabu_list_basic() {
-    std::cout << "--- test_tabu_list_basic ---\n";
-    TabuList tabu(3);
 
-    CHECK("initially empty", !tabu.is_tabu(0, 1));
-    tabu.add(0, 1);
-    CHECK("added is tabu", tabu.is_tabu(0, 1));
-    CHECK("other not tabu", !tabu.is_tabu(0, 2));
-    CHECK("other not tabu", !tabu.is_tabu(1, 1));
 
-    tabu.tick();
-    CHECK("still tabu after 1 tick", tabu.is_tabu(0, 1));
-    tabu.tick();
-    CHECK("still tabu after 2 ticks", tabu.is_tabu(0, 1));
-    tabu.tick();
-    CHECK("expired after 3 ticks", !tabu.is_tabu(0, 1));
-}
 
-void test_tabu_list_multiple() {
-    std::cout << "--- test_tabu_list_multiple ---\n";
-    TabuList tabu(2);
-
-    tabu.add(0, 1);
-    tabu.tick();
-    tabu.add(2, 3);  // added 1 tick later
-    tabu.tick();
-
-    // (0,1) had TTL=2, 2 ticks passed → expired
-    CHECK("first expired", !tabu.is_tabu(0, 1));
-    // (2,3) had TTL=2, 1 tick passed → still active
-    CHECK("second still active", tabu.is_tabu(2, 3));
-
-    tabu.tick();
-    CHECK("second expired", !tabu.is_tabu(2, 3));
-}
-
-void test_tabu_filters_moves() {
-    std::cout << "--- test_tabu_filters_moves ---\n";
-    auto p = make_chain3(); DAG d = DAG::build(p);
-    auto part = Partition::trivial(p, d);
-
-    TabuList tabu(5);
-    tabu.add(1, 0);  // Op1 can't go into G0
-
-    // Generate moves for G0 with tabu — should NOT include merge(G0,G1)
-    // because Op1 is tabu for G0
-    MoveHeap heap_tabu;
-    generate_moves(part, 0, heap_tabu, 0.0, &tabu);
-
-    MoveHeap heap_free;
-    generate_moves(part, 0, heap_free, 0.0, nullptr);
-
-    // Free heap should have more moves than tabu heap
-    CHECK("tabu reduces moves", heap_tabu.size() <= heap_free.size());
-    std::cout << "    free=" << heap_free.size() << " tabu=" << heap_tabu.size() << "\n";
-}
-
-void test_negative_moves_generated() {
-    std::cout << "--- test_negative_moves_generated ---\n";
-    // 4-op chain: Op0->Op1->Op2->Op3. Fuse {Op0,Op1,Op2}, leave {Op3} separate.
-    // Op2 has Op3 as external successor → Op2 is ejectable.
-    // Eject(Op2) is negative (unfusing is worse). With floor > 0 it should appear.
-    Problem p;
-    p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},1000},
-             {OpType::Pointwise,{1},{2},1000},
-             {OpType::Pointwise,{2},{3},1000},
-             {OpType::Pointwise,{3},{4},1000}};
-    p.fast_memory_capacity = 50000;
-    p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
-    DAG d = DAG::build(p);
-
-    Partition part;
-    part.prob = &p; part.dag = &d;
-    std::set<size_t> fused = {0, 1, 2};
-    double fused_cost = part.eval_set(fused);
-    part.groups.push_back({fused, fused_cost, true, 0});
-    double op3_cost = part.eval_set({3});
-    part.groups.push_back({{3}, op3_cost, true, 0});
-
-    // With floor=0: only positive moves
-    MoveHeap heap_pos;
-    generate_moves(part, 0, heap_pos, 0.0);
-
-    // With large floor: includes negative moves (eject Op2)
-    MoveHeap heap_neg;
-    generate_moves(part, 0, heap_neg, fused_cost);
-
-    CHECK("negative floor gives more moves", heap_neg.size() >= heap_pos.size());
-    std::cout << "    positive-only=" << heap_pos.size()
-              << " with-negative=" << heap_neg.size() << "\n";
-}
 
 void test_best_seen_preserved() {
     std::cout << "--- test_best_seen_preserved ---\n";
-    // Verify that local_search_from returns the best-seen, not the final state
+    // Verify that greedy_descent returns improved partition, not the final state
     auto p = make_chain3(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    auto result = local_search_from(std::move(part));
+    auto result = greedy_descent(std::move(part));
 
     // Result should be valid and at least as good as trivial
     double trivial_cost = Partition::trivial(p, d).total_cost();
@@ -753,10 +663,6 @@ int main() {
     test_local_search_chain();
     test_local_search_diamond();
     test_local_search_produces_valid_solution();
-    test_tabu_list_basic();
-    test_tabu_list_multiple();
-    test_tabu_filters_moves();
-    test_negative_moves_generated();
     test_best_seen_preserved();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "

@@ -200,9 +200,10 @@ void test_retain_two_step_chain() {
     CHECK_EQ("chain step1", sg1->compute_cost({128,128,1,SnakeDir::None},{1}).latency, 1638.4);
 }
 
-void test_retain_fused_mm_pw_splitk() {
-    std::cout << "--- test_retain_fused_mm_pw_splitk ---\n";
+void test_retain_fused_mm_pw_k1() {
+    std::cout << "--- test_retain_fused_mm_pw_k1 ---\n";
     // Op0: MM T0@T1→T2. Op1: PW T2→T3. Fused, T2 eph. K=128.
+    // PW sink rule forces k=1. With k=1, nk=128 k-passes.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},{OpType::Pointwise,{2},{3},500}};
@@ -211,12 +212,19 @@ void test_retain_fused_mm_pw_splitk() {
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0,1});
+    CHECK("has_pw_sink", sg.has_value());
 
-    // [128,128,32]: 4 k-passes. mm=500, pw=500.
-    // No ret: k0=max(500,2048)=2048, k1,2=max(500,409.6)=500, k3=max(1000,2048)=2048 → 5096
-    CHECK_EQ("fused no ret", sg->compute_cost({128,128,32,SnakeDir::None}).latency, 5096.0);
-    // T0 ret: k0=max(500,409.6)=500, k1,2=500, k3=max(1000,2048)=2048 → 3548
-    CHECK_EQ("fused ret", sg->compute_cost({128,128,32,SnakeDir::None},{0}).latency, 3548.0);
+    // k>1 must be rejected (PW sink rule)
+    CHECK("k=32 rejected", !sg->is_valid_tiling({128,128,32,SnakeDir::None}));
+    CHECK("k=128 rejected", !sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+
+    // k=1 must be accepted
+    CHECK("k=1 accepted", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+
+    // best_cost should pick k=1
+    auto best = sg->best_cost();
+    CHECK("best feasible", best.feasible);
+    CHECK("best k=1", best.config.k == 1);
 }
 
 // ==================== Snake × retain cross-product tests ====================
@@ -385,7 +393,7 @@ int main() {
     test_retain_transfer_pw();
     test_retain_transfer_output();
     test_retain_two_step_chain();
-    test_retain_fused_mm_pw_splitk();
+    test_retain_fused_mm_pw_k1();
     test_snake_3x2_no_retain();
     test_snake_3x2_lhs_retained();
     test_snake_3x2_membound_retained();

@@ -15,7 +15,7 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     CostResult result;
     result.config = cfg;
     const auto& prob = sg.problem();
-    result.working_set = sg.working_set(cfg, rfp);
+    result.working_set = sg.working_set(cfg, rfp, rt);
     if (result.working_set > prob.fast_memory_capacity) return result;
     result.feasible = true;
 
@@ -72,8 +72,11 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
                         }
                 }
             }
-            if (ks == nk - 1 && !rt.count(sg.sink_tensor()))
-                mo += (double)(cfg.h * cfg.w) / B;
+            if (ks == nk - 1) {
+                for (auto t : sg.boundary_outputs())
+                    if (!rt.count(t))
+                        mo += (double)(cfg.h * cfg.w) / B;
+            }
             double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
             total += std::max(step_comp, mi + mo);
         }
@@ -151,12 +154,12 @@ int main() {
       run({"rectn",p,{0},{128,128,128,N},{},{}});run({"rectr",p,{0},{128,128,128,R},{},{}});
       run({"rectc",p,{0},{128,128,128,C},{},{}});run({"rect64r",p,{0},{64,128,128,R},{},{}});
       run({"rect64c",p,{0},{64,128,128,C},{},{}}); }
-    // Fused MM+PW
+    // Fused MM+PW (PW sink rule forces k=1)
     { Problem p;p.tensors={{256,256},{256,256},{256,256},{256,256}};
       p.ops={{OpType::MatMul,{0,1},{2},2000},{OpType::Pointwise,{2},{3},500}};
       p.fast_memory_capacity=100000;p.slow_memory_bandwidth=15;p.native_w=128;p.native_h=128;
-      run({"fusen",p,{0,1},{128,128,64,N},{},{}});run({"fuser",p,{0,1},{128,128,64,R},{},{}});
-      run({"fusec",p,{0,1},{128,128,64,C},{},{}});run({"fuse64",p,{0,1},{64,64,64,R},{},{}}); }
+      run({"fusen",p,{0,1},{128,128,1,N},{},{}});run({"fuser",p,{0,1},{128,128,1,R},{},{}});
+      run({"fusec",p,{0,1},{128,128,1,C},{},{}});run({"fuse64",p,{0,1},{64,64,1,R},{},{}}); }
     // Retained
     { Problem p;p.tensors={{256,256},{256,256},{256,256}};
       p.ops={{OpType::MatMul,{0,1},{2},2000}};p.fast_memory_capacity=200000;p.slow_memory_bandwidth=10;
