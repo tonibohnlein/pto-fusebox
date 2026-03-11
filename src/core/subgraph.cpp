@@ -468,24 +468,36 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       out_evict += (double)(cfg.h * cfg.w) / B;
   }
 
-  // Per-tile cost given reuse pattern
-  auto tile_cost = [&](bool lhs_fresh, bool rhs_fresh) {
-    double lat = 0;
-    for (int ks = 0; ks < nk; ks++) {
-      double mi = rhs_load; // RHS strips streamed each k-step
-      if (ks == 0) {
-        mi = 0;
-        if (lhs_fresh)
-          mi += lhs_load;
-        if (rhs_fresh)
-          mi += rhs_load;
-        mi += pw_in_load;
-      }
-      double mo = (ks == nk - 1) ? out_evict : 0;
-      double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
-      lat += std::max(step_comp, mi + mo);
+  // Per-tile cost given reuse pattern — O(1) analytical formula.
+  // The nk k-steps have 3 distinct phases:
+  //   Step 0:        load LHS (if fresh) + first RHS (if fresh) + PW inputs
+  //   Steps 1..nk-2: load RHS strip (all identical)
+  //   Step nk-1:     load RHS strip + evict output + PW compute
+  // When nk=1, all three collapse into a single step.
+  auto tile_cost = [&](bool lhs_fresh, bool rhs_fresh) -> double {
+    if (nk == 1) {
+      // Single step: everything happens at once
+      double mi = pw_in_load;
+      if (lhs_fresh) mi += lhs_load;
+      if (rhs_fresh) mi += rhs_load;
+      double mo = out_evict;
+      return std::max(mm_comp + pw_comp, mi + mo);
     }
-    return lat;
+
+    // Step 0: LHS + first RHS + PW inputs, compute = mm only
+    double mi0 = pw_in_load;
+    if (lhs_fresh) mi0 += lhs_load;
+    if (rhs_fresh) mi0 += rhs_load;
+    double step0 = std::max(mm_comp, mi0);
+
+    // Middle steps (1..nk-2): each loads one RHS strip, mm compute
+    double mid_step = std::max(mm_comp, rhs_load);
+    double mid_total = (nk >= 3) ? (double)(nk - 2) * mid_step : 0.0;
+
+    // Last step (nk-1): RHS strip + evict + PW compute
+    double last = std::max(mm_comp + pw_comp, rhs_load + out_evict);
+
+    return step0 + mid_total + last;
   };
 
   if (cfg.snake == SnakeDir::None) {

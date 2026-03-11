@@ -436,9 +436,16 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
 Solution solve(const Problem& prob, TimePoint deadline) {
     DAG dag = DAG::build(prob);
 
+    auto now = SteadyClock::now();
+    auto total_budget = deadline - now;
+
+    // Time allocation: 60% partition search, 25% solution FM, 15% build+postopt
+    auto phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 60 / 100);
+    auto phase3_deadline = deadline; // uses remaining time after phase 2
+
     std::cerr << "Phase 1: Parallel search (init + greedy + FM + evo)...\n";
     ParallelConfig pcfg;
-    pcfg.fm.deadline = deadline;
+    pcfg.fm.deadline = phase1_deadline;
     auto best_part = parallel_search(prob, dag, pcfg);
     double partition_cost = best_part.total_cost();
     std::cerr << "  Partition cost: " << partition_cost 
@@ -463,7 +470,7 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     // Phase 3: Solution-level FM search
     std::cerr << "Phase 3: Solution-level FM search...\n";
     SolutionFMConfig sfm_cfg;
-    sfm_cfg.deadline = deadline;
+    sfm_cfg.deadline = phase3_deadline;
     sol = solution_fm_search(prob, dag, std::move(sol), sfm_cfg);
     double after_sol_opt = sol.total_latency();
     if (after_sol_opt < after_build - 0.01)
