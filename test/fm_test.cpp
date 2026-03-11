@@ -83,6 +83,7 @@ void test_is_border_op() {
     part.groups[0].ops = {0, 1, 2};
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     CHECK("fused Op0 not border", !part.is_border_op(0, 0));
     CHECK("fused Op1 not border", !part.is_border_op(1, 0));
@@ -101,6 +102,7 @@ void test_border_ops() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     auto bops = part.border_ops(0);
     CHECK_EQ_S("1 border op in fused chain", bops.size(), 1);
@@ -122,6 +124,7 @@ void test_border_ops_diamond() {
     part.groups[1].ops = {1, 2};
     part.groups[1].cost = part.eval_set({1, 2});
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     auto bops = part.border_ops(1);
     CHECK("Op1 is border", std::find(bops.begin(), bops.end(), 1) != bops.end());
@@ -186,6 +189,7 @@ void test_eject_simple() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
 
     // Eject Op1 from G0: remainder={Op0}, singleton={Op1}
     auto er = part.eval_eject(1, 0);
@@ -210,6 +214,7 @@ void test_eject_with_disconnection() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
 
     // Eject Op1: remainder = {Op0, Op2, Op3}
     // Op0 and Op2 are NOT connected (Op1 was the bridge) → 2 components
@@ -239,6 +244,7 @@ void test_eject_recomputed_op() {
     part.groups[1].ops = {1, 2};
     part.groups[1].cost = part.eval_set({1, 2});
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     // Eject Op1 from G0: Op1 is still in G1, so no singleton needed
     auto er = part.eval_eject(1, 0);
@@ -297,15 +303,18 @@ void test_best_move_with_floor() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
 
     // Op2 is border (succ Op3 outside? No, Op3 is inside too.)
     // Actually all ops are inside one group — no border ops, no moves.
     // Let me use a different setup: {Op0,Op1,Op2} + {Op3}
     part.groups[0].ops = {0, 1, 2};
     part.groups[0].cost = part.eval_set({0, 1, 2});
+    part.rebuild_index();
     part.groups[3].alive = true;
     part.groups[3].ops = {3};
     part.groups[3].cost = part.eval_set({3});
+    part.rebuild_index();
 
     // Op2 is border (succ Op3 in G3). With floor=0, eject would be negative.
     auto m_strict = best_move_for(part, 2, 0.0);
@@ -334,6 +343,7 @@ void test_best_move_recomputed_op() {
     part.groups[1].ops = {1, 2};
     part.groups[1].cost = part.eval_set({1, 2});
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     // Op1 has moves from G0 and from G1
     auto m = best_move_for(part, 1);
@@ -353,6 +363,7 @@ void test_apply_steal() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
 
     double before = part.total_cost();
     FMMove m = FMMove{FMMove::STEAL, 1, 0, 2, SIZE_MAX, 0.0};
@@ -407,6 +418,7 @@ void test_apply_eject_with_split() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
 
     // Eject Op1: splits into {Op0} and {Op2,Op3} plus singleton {Op1}
     FMMove m = FMMove{FMMove::EJECT, 1, 0, SIZE_MAX, SIZE_MAX, 0.0};
@@ -481,6 +493,7 @@ void test_active_set_activate_border() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     ActiveSet as(part, 0.0);
     as.activate_border(0);
@@ -619,6 +632,7 @@ void test_active_set_with_negative_floor() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     // With floor=0: Op2's eject is negative, might not pop
     ActiveSet as_strict(part, 0.0);
@@ -746,6 +760,7 @@ void test_fm_pass_drift_stops() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
     double start_cost = part.total_cost();
 
     FMConfig cfg;
@@ -794,6 +809,7 @@ void test_fm_pass_negative_moves() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
     double optimal_cost = part.total_cost();
 
     FMConfig cfg;
@@ -910,6 +926,7 @@ void test_fm_outer_from_optimum() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
     double opt_cost = part.total_cost();
 
     FMOuterConfig cfg;

@@ -37,6 +37,7 @@ static GainCheck verify_heap_move(Partition part, const Move& m) {
             part.groups[m.ga].ops = merged;
             part.groups[m.ga].cost = nc;
             part.groups[m.gb].alive = false;
+            part.rebuild_index();
             gc.applied = true; break;
         }
         case Move::STEAL: {
@@ -49,6 +50,7 @@ static GainCheck verify_heap_move(Partition part, const Move& m) {
             part.groups[m.ga].ops = new_ga; part.groups[m.ga].cost = nac;
             if (new_gb.empty()) part.groups[m.gb].alive = false;
             else { part.groups[m.gb].ops = new_gb; part.groups[m.gb].cost = nbc; }
+            part.rebuild_index();
             gc.applied = true; break;
         }
         case Move::RECOMPUTE: {
@@ -98,7 +100,7 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
     int type_counts[6] = {};
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         MoveHeap heap;
-        generate_moves(part, gi, heap);
+        generate_moves(part, gi, heap, floor);
         while (!heap.empty()) {
             Move m = heap.top(); heap.pop();
             auto gc = verify_heap_move(part, m);
@@ -253,7 +255,7 @@ void test_merge_forces_smaller_tiles() {
     MoveHeap heap;
     int pos = 0, neg = 0;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap);
+        generate_moves(part, gi, heap, 1e18);
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
         if (m.saving > 0.01) pos++;
@@ -283,6 +285,7 @@ void test_eject_with_external_successor() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
     // G0={Op0,Op1}, G2={Op2}
     tally(verify_all_moves("eject_ext", part));
     tally(verify_all_fm("eject_ext", part));
@@ -312,6 +315,7 @@ void test_recompute_saves_large_tensor() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
     // G0={Op0,Op1}, G2={Op2}
     // Recompute Op0 into G2: {Op0,Op2} can make T1 ephemeral
     tally(verify_all_moves("recomp_diamond", part));
@@ -319,7 +323,7 @@ void test_recompute_saves_large_tensor() {
     
     // Verify at least one recompute exists (even if negative)
     MoveHeap heap;
-    generate_moves(part, 2, heap);
+    generate_moves(part, 2, heap, 1e18);
     int recomp_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -349,6 +353,7 @@ void test_steal_pw_from_mm_group() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
     // G0={Op0,Op1}. Op0 has no pred outside. But Op0 IS ejectable (it's a
     // source of the chain, boundary because it has no preds → not a boundary op!)
     // Actually boundary_neighbors checks DAG preds/succs OUTSIDE group.
@@ -363,6 +368,7 @@ void test_steal_pw_from_mm_group() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
     // G0={Op0,Op1}, G2={Op2}
     tally(verify_all_moves("steal_pw_mm", part));
     tally(verify_all_fm("steal_pw_mm", part));
@@ -513,6 +519,7 @@ void test_eject_from_chain3() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
     // G0={0,1,2}, G3={3}. Op2 is boundary (succ Op3 in G3). Ejectable.
     auto [n, bad] = verify_all_moves("eject_chain3", part);
     tally({n, bad});
@@ -520,7 +527,7 @@ void test_eject_from_chain3() {
     
     // Check eject count
     MoveHeap heap;
-    generate_moves(part, 0, heap);
+    generate_moves(part, 0, heap, 1e18);
     int eject_count = 0, pos_ej = 0, neg_ej = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -557,6 +564,7 @@ void test_fm_steal_preferred() {
     part.groups[2].ops = {2, 3};
     part.groups[2].cost = part.eval_set({2, 3});
     part.groups[3].alive = false;
+    part.rebuild_index();
     
     tally(verify_all_moves("fm_steal", part));
     auto [nfm, bad] = verify_all_fm("fm_steal", part);
@@ -590,6 +598,7 @@ void test_fm_eject_preferred() {
     part.groups[0].ops = {0, 1};
     part.groups[0].cost = part.eval_set({0, 1});
     part.groups[1].alive = false;
+    part.rebuild_index();
     // G0={0,1}, G2={2}
 
     auto [n, bad] = verify_all_moves("fm_eject", part);
@@ -619,7 +628,7 @@ void test_negative_steal_gain() {
     MoveHeap heap;
     int pos=0, neg=0;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap);
+        generate_moves(part, gi, heap, 1e18);
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
         if (m.saving > 0.01) pos++; else if (m.saving < -0.01) neg++;
@@ -673,6 +682,7 @@ void test_internal_eject_chain4() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
 
     // Op1 should be internal (pred Op0 inside, succ Op2 inside)
     auto internals = part.internal_ops(0);
@@ -686,7 +696,7 @@ void test_internal_eject_chain4() {
 
     // Verify heap generates internal eject
     MoveHeap heap;
-    generate_moves(part, 0, heap);
+    generate_moves(part, 0, heap, 1e18);
     int ie_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -726,6 +736,7 @@ void test_split_chain4() {
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.groups[3].alive = false;
+    part.rebuild_index();
 
     // Check bridge edges
     auto bridges = part.bridge_edges(0);
@@ -736,7 +747,7 @@ void test_split_chain4() {
 
     // Verify heap generates SPLIT moves
     MoveHeap heap;
-    generate_moves(part, 0, heap);
+    generate_moves(part, 0, heap, 1e18);
     int split_count = 0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -781,6 +792,7 @@ void test_internal_diamond_fused() {
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
+    part.rebuild_index();
 
     auto bridges = part.bridge_edges(0);
     std::cout << "  bridges: " << bridges.size() << " (expect 0 for triangle)\n";
@@ -788,7 +800,7 @@ void test_internal_diamond_fused() {
 
     // But internal eject should still work
     MoveHeap heap;
-    generate_moves(part, 0, heap);
+    generate_moves(part, 0, heap, 1e18);
     int ie=0, sp=0;
     while (!heap.empty()) {
         Move m = heap.top(); heap.pop();
@@ -825,13 +837,14 @@ void test_internal_eject_helps() {
     part.groups[0].ops = {0, 1, 2, 3, 4};
     part.groups[0].cost = part.eval_set({0, 1, 2, 3, 4});
     for (int i = 1; i < 5; i++) part.groups[i].alive = false;
+    part.rebuild_index();
 
     double fused_cost = part.total_cost();
     std::cout << "  fused(5) cost=" << fused_cost << "\n";
 
     // Check what internal moves find
     MoveHeap heap;
-    generate_moves(part, 0, heap);
+    generate_moves(part, 0, heap, 1e18);
     int ie=0, sp=0, best_type=-1;
     double best_saving = -1e18;
     while (!heap.empty()) {

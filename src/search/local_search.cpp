@@ -8,7 +8,8 @@
 // Move generation (positive-saving only)
 // ============================================================================
 
-void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
+void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
+                    double floor) {
     if (!part.groups[gi].alive) return;
 
     auto neighbors = part.boundary_neighbors(gi);
@@ -28,7 +29,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
                 double new_cost = part.eval_set(merged);
                 double saving = (part.groups[gi].cost + part.groups[gj].cost)
                                 - new_cost;
-                if (saving > 0.01)
+                if (saving > -floor)
                     heap.push({Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
             }
 
@@ -51,7 +52,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
                     if (valid) {
                         double saving = (part.groups[gi].cost + part.groups[gj].cost)
                                         - (new_gi_cost + new_gj_cost);
-                        if (saving > 0.01)
+                        if (saving > -floor)
                             heap.push({Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
                     }
                 }
@@ -65,7 +66,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
                 new_gi.insert(adj_op);
                 double new_gi_cost = part.eval_set(new_gi);
                 double saving = part.groups[gi].cost - new_gi_cost;
-                if (saving > 0.01)
+                if (saving > -floor)
                     heap.push({Move::RECOMPUTE, gi, gj, adj_op, saving, gen_i, gen_j});
             }
         }
@@ -85,7 +86,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
             if (singleton_cost >= 1e17) continue;
 
             double saving = part.groups[gi].cost - (remainder_cost + singleton_cost);
-            if (saving > 0.01)
+            if (saving > -floor)
                 heap.push({Move::EJECT, gi, 0, op, saving, gen_i, 0});
         }
     }
@@ -97,7 +98,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
         for (auto op : internals) {
             auto er = part.eval_eject(op, gi);
             if (!er.feasible) continue;
-            if (er.saving > 0.01)
+            if (er.saving > -floor)
                 heap.push({Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
         }
     }
@@ -109,7 +110,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap) {
         for (auto& [a, b] : bridges) {
             auto sr = part.eval_split(a, b, gi);
             if (!sr.feasible) continue;
-            if (sr.saving > 0.01) {
+            if (sr.saving > -floor) {
                 Move m;
                 m.type = Move::SPLIT;
                 m.ga = gi; m.gb = 0; m.op = a;

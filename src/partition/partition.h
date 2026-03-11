@@ -51,8 +51,12 @@ struct Partition {
     double total_cost() const;
     size_t num_alive() const;
 
-    // All alive groups containing op (O(1) via index)
-    const std::vector<size_t>& groups_of(size_t op) const { return op_to_groups_[op]; }
+    // All alive groups containing op (O(1) via index, safe if index not built)
+    const std::vector<size_t>& groups_of(size_t op) const {
+        static const std::vector<size_t> empty;
+        if (op_to_groups_.empty() || op >= op_to_groups_.size()) return empty;
+        return op_to_groups_[op];
+    }
 
     // Is op on the boundary of group gi?
     bool is_border_op(size_t op, size_t gi) const;

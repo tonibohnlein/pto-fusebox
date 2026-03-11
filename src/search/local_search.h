@@ -27,10 +27,12 @@ struct Move {
 using MoveHeap = std::priority_queue<Move>;
 
 // ============================================================================
-// Generate all positive-saving moves involving group gi.
+// Generate moves involving group gi with saving > -floor.
+// floor=0 (default) means only positive-saving moves.
 // ============================================================================
 
-void generate_moves(const Partition& part, size_t gi, MoveHeap& heap);
+void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
+                    double floor = 0.0);
 
 // ============================================================================
 // Greedy descent: repeatedly apply the best positive move until no

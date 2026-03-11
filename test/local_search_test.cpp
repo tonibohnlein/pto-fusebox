@@ -80,6 +80,7 @@ void test_groups_of() {
 
     // After killing G1, Op1 has no groups
     part.groups[1].alive = false;
+    part.rebuild_index();
     gs = part.groups_of(1);
     CHECK_EQ_S("Op1 in 0 groups after kill", gs.size(), 0);
 }
@@ -230,6 +231,7 @@ void test_recompute_move() {
     part.groups[2].ops = new_g2;
     part.groups[2].cost = new_cost;
     part.groups[2].gen++;
+    part.rebuild_index();
 
     CHECK("Op1 still in G1", part.groups[1].ops.count(1));
     CHECK("Op1 also in G2", part.groups[2].ops.count(1));
@@ -399,6 +401,7 @@ void test_recompute_gain_correctness() {
     part.groups[1].ops = {0, 1};
     part.groups[1].cost = new_gt_cost;
     part.groups[1].gen++;
+    part.rebuild_index();
     // G0 unchanged
 
     double total_after = part.total_cost();

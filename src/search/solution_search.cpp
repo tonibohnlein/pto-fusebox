@@ -461,6 +461,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
     tmp.prob = &prob;
     tmp.dag = &dag;
     tmp.groups.push_back({si_set, state.cost[si], true, 0});
+    tmp.rebuild_index();
     auto er = tmp.eval_eject(op, 0);
     if (er.feasible && er.saving > -floor && er.saving > best.saving) {
       best.type = SolutionMove::INTERNAL_EJECT;
@@ -477,6 +478,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       tmp.prob = &prob;
       tmp.dag = &dag;
       tmp.groups.push_back({si_set, 0, true, 0});
+      tmp.rebuild_index();
       auto sr = tmp.eval_split(a, b, 0);
       if (!sr.feasible)
         return;
@@ -751,6 +753,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     tmp.prob = &prob;
     tmp.dag = &dag;
     tmp.groups.push_back({si_set, state.cost[m.step_a], true, 0});
+    tmp.rebuild_index();
     auto er = tmp.eval_eject(m.op, 0);
     if (!er.feasible) return {SIZE_MAX, 0};
 
@@ -815,6 +818,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto ops = state.steps[m.step_a].subgraph.ops();
     std::set<size_t> op_set(ops.begin(), ops.end());
     tmp.groups.push_back({op_set, 0, true, 0});
+    tmp.rebuild_index();
     auto sr = tmp.eval_split(m.op, m.op2, 0);
     if (!sr.feasible) return {SIZE_MAX, 0};
 
