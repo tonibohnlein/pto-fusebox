@@ -10,6 +10,9 @@
 #include <set>
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 // ============================================================================
 // Shared group-level DAG structure for ordering algorithms
@@ -439,81 +442,111 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     auto now = SteadyClock::now();
     auto total_budget = deadline - now;
 
-    // Time allocation: 60% partition search, 25% solution FM, 15% build+postopt
-    auto phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 60 / 100);
-    auto phase3_deadline = deadline; // uses remaining time after phase 2
+    // Time allocation: 35% partition search, 5% build, 60% solution FM
+    auto phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 35 / 100);
+    auto phase2_deadline = phase1_deadline + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 5 / 100);
+    auto phase3_deadline = deadline;
 
+    // ================================================================
+    // Phase 1: Partition pool via parallel search
+    // ================================================================
     std::cerr << "Phase 1: Parallel search (init + greedy + FM + evo)...\n";
     ParallelConfig pcfg;
     pcfg.fm.deadline = phase1_deadline;
-    auto best_part = parallel_search(prob, dag, pcfg);
-    double partition_cost = best_part.total_cost();
-    std::cerr << "  Partition cost: " << partition_cost 
-              << " (" << best_part.num_alive() << " groups)\n";
+    auto partition_pool = parallel_search(prob, dag, pcfg);
 
-    std::cerr << "Phase 2: Build solution (DFS + beam + retain/recompute)...\n";
-    auto sol = build_solution(prob, dag, best_part);
-    double after_build = sol.total_latency();
-    std::cerr << "  After build+opt: " << after_build 
-              << " (" << sol.num_steps() << " steps)\n";
+    std::cerr << "  Partition pool: " << partition_pool.size() << " entries, best="
+              << partition_pool[0].total_cost() << "\n";
 
-    // Additional retain+recompute passes
-    for (int pass = 1; pass <= 2; pass++) {
-        double before = sol.total_latency();
-        sol = optimize_retain(prob, dag, std::move(sol));
-        sol = optimize_recompute(prob, dag, std::move(sol));
-        sol = optimize_retain(prob, dag, std::move(sol));
-        if (sol.total_latency() >= before - 0.01) break;
+    // ================================================================
+    // Phase 2: Build solutions from each partition in the pool (parallel)
+    // ================================================================
+    std::cerr << "Phase 2: Build solutions from " << partition_pool.size() << " partitions...\n";
+
+    std::vector<Solution> solution_pool;
+    std::mutex sol_mutex;
+
+    {
+        int hw_threads = (int)std::thread::hardware_concurrency();
+        if (hw_threads <= 0) hw_threads = 4;
+        int n_tasks = (int)partition_pool.size();
+        std::atomic<int> next_task{0};
+
+        auto build_worker = [&]() {
+            while (true) {
+                int tid = next_task.fetch_add(1);
+                if (tid >= n_tasks) break;
+                if (SteadyClock::now() >= phase2_deadline) break;
+
+                auto sol = build_solution(prob, dag, partition_pool[tid]);
+                auto vr = sol.validate();
+                if (vr.valid) {
+                    std::lock_guard<std::mutex> lock(sol_mutex);
+                    solution_pool.push_back(std::move(sol));
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        int nt = std::min(hw_threads, n_tasks);
+        for (int i = 0; i < nt; i++) threads.emplace_back(build_worker);
+        for (auto& t : threads) t.join();
     }
-    double after_retain_recomp = sol.total_latency();
 
-    // Phase 3: Solution-level FM search
-    std::cerr << "Phase 3: Solution-level FM search...\n";
+    // Sort solution pool by latency
+    std::sort(solution_pool.begin(), solution_pool.end(),
+              [](const Solution& a, const Solution& b) {
+                  return a.total_latency() < b.total_latency();
+              });
+
+    if (solution_pool.empty()) {
+        // Fallback: build from best partition
+        auto sol = build_solution(prob, dag, partition_pool[0]);
+        solution_pool.push_back(std::move(sol));
+    }
+
+    double after_build = solution_pool[0].total_latency();
+    std::cerr << "  Solution pool: " << solution_pool.size() << " solutions, best="
+              << after_build << "\n";
+
+    // ================================================================
+    // Phase 3: Solution-level FM search from diverse starting points
+    // ================================================================
+    std::cerr << "Phase 3: Solution-level FM from " << solution_pool.size() << " starting points...\n";
     SolutionFMConfig sfm_cfg;
     sfm_cfg.deadline = phase3_deadline;
-    sol = solution_fm_search(prob, dag, std::move(sol), sfm_cfg);
-    double after_sol_opt = sol.total_latency();
-    if (after_sol_opt < after_build - 0.01)
-        std::cerr << "  Solution opt: " << after_build << " → " << after_sol_opt
-                  << " (-" << std::fixed << std::setprecision(1)
-                  << 100.0*(after_build - after_sol_opt)/after_build << "%)\n";
-    else
-        std::cerr << "  Solution opt: no improvement\n";
+    auto final_sol = solution_fm_search(prob, dag, std::move(solution_pool), sfm_cfg);
+    double after_sol_fm = final_sol.total_latency();
 
     // Final retain+recompute cleanup
-    sol = optimize_retain(prob, dag, std::move(sol));
-    sol = optimize_recompute(prob, dag, std::move(sol));
-    sol = optimize_retain(prob, dag, std::move(sol));
+    final_sol = optimize_retain(prob, dag, std::move(final_sol));
+    final_sol = optimize_recompute(prob, dag, std::move(final_sol));
+    final_sol = optimize_retain(prob, dag, std::move(final_sol));
 
-    auto vr = sol.validate();
+    auto vr = final_sol.validate();
     if (!vr.valid)
         std::cerr << "  WARNING: " << vr.error << "\n";
 
     // Summary
-    double final_cost = sol.total_latency();
-    double improve_pct = 100.0 * (partition_cost - final_cost) / partition_cost;
+    double partition_cost = partition_pool[0].total_cost();
+    double final_cost = final_sol.total_latency();
     std::cerr << "  === Summary ===\n";
     std::cerr << "  Partition:  " << partition_cost << "\n";
-    std::cerr << "  Build+opt:  " << after_build;
+    std::cerr << "  Build:      " << after_build;
     if (after_build < partition_cost - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0*(partition_cost - after_build)/partition_cost << "%)";
     std::cerr << "\n";
-    std::cerr << "  Retain+rec: " << after_retain_recomp;
-    if (after_retain_recomp < after_build - 0.01)
+    std::cerr << "  Sol-FM:     " << after_sol_fm;
+    if (after_sol_fm < after_build - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
-                  << 100.0*(after_build - after_retain_recomp)/after_build << "%)";
-    std::cerr << "\n";
-    std::cerr << "  Sol-FM:     " << after_sol_opt;
-    if (after_sol_opt < after_retain_recomp - 0.01)
-        std::cerr << " (-" << std::fixed << std::setprecision(1)
-                  << 100.0*(after_retain_recomp - after_sol_opt)/after_retain_recomp << "%)";
+                  << 100.0*(after_build - after_sol_fm)/after_build << "%)";
     std::cerr << "\n";
     std::cerr << "  Final:      " << final_cost;
     if (final_cost < partition_cost - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
-                  << improve_pct << "% total)";
+                  << 100.0*(partition_cost - final_cost)/partition_cost << "% total)";
     std::cerr << "\n";
 
-    return sol;
+    return final_sol;
 }

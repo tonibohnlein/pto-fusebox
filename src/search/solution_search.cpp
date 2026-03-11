@@ -1412,13 +1412,34 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
 
 Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
                             const SolutionFMConfig &cfg) {
+  // Delegate to multi-start with a single-element pool
+  std::vector<Solution> pool;
+  pool.push_back(std::move(sol));
+  return solution_fm_search(prob, dag, std::move(pool), cfg);
+}
+
+Solution solution_fm_search(const Problem &prob, const DAG &dag,
+                            std::vector<Solution> pool,
+                            const SolutionFMConfig &cfg) {
+  if (pool.empty()) return Solution(prob, dag, {});
+
   int hw_threads = (int)std::thread::hardware_concurrency();
   if (hw_threads <= 0)
     hw_threads = 4;
   int num_threads = hw_threads;
 
-  auto init_steps = sol.steps();
-  double init_cost = sol.total_latency();
+  // Precompute per-pool-entry steps and costs
+  struct PoolEntry {
+    std::vector<ScheduleStep> steps;
+    double cost;
+  };
+  std::vector<PoolEntry> pool_entries;
+  for (auto& s : pool)
+    pool_entries.push_back({s.steps(), s.total_latency()});
+
+  double global_best_init = pool_entries[0].cost;
+  for (auto& pe : pool_entries)
+    global_best_init = std::min(global_best_init, pe.cost);
 
   struct ThreadResult {
     std::vector<ScheduleStep> steps;
@@ -1429,14 +1450,17 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
   };
 
   std::vector<ThreadResult> results(num_threads);
-  bool main_verbose = g_verbose; // capture before spawning threads
+  bool main_verbose = g_verbose;
 
   std::vector<std::thread> threads;
   for (int t = 0; t < num_threads; t++) {
     threads.emplace_back([&, t]() {
       g_verbose = (t == 0) && main_verbose;
-      auto best_steps = init_steps;
-      double best_cost = init_cost;
+
+      // Each thread starts from a different pool entry (round-robin)
+      auto& start = pool_entries[t % pool_entries.size()];
+      auto best_steps = start.steps;
+      double best_cost = start.cost;
       int no_improve = 0;
       int total_passes = 0, improving_passes = 0, total_moves = 0;
 
@@ -1453,8 +1477,6 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
         double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
         double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
 
-        // Adaptive patience: more patience when exploring widely (high
-        // temp/heat), less when converging (low temp/heat). Minimum 3.
         if (no_improve >= cfg.max_no_improve)
           break;
 
@@ -1516,7 +1538,8 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
     if (results[t].cost < results[best_t].cost)
       best_t = t;
 
-  std::cerr << "  Sol-FM: " << num_threads << " threads";
+  std::cerr << "  Sol-FM: " << num_threads << " threads from "
+            << pool_entries.size() << " starting solutions";
   int total_passes = 0, total_improving = 0, total_moves = 0;
   for (int t = 0; t < num_threads; t++) {
     total_passes += results[t].passes;
@@ -1526,7 +1549,7 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
   std::cerr << ", " << total_passes << " passes"
             << " (" << total_improving << " improving)"
             << ", " << total_moves << " moves";
-  if (results[best_t].cost < init_cost - 0.01) {
+  if (results[best_t].cost < global_best_init - 0.01) {
     std::cerr << ", best=" << results[best_t].cost << " (thread " << best_t
               << ")";
   }

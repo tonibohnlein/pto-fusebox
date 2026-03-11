@@ -96,7 +96,7 @@ static void pool_sort(std::vector<PoolEntry>& pool) {
 // Parallel generational search
 // ============================================================================
 
-Partition parallel_search(const Problem& prob, const DAG& dag,
+std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                           const ParallelConfig& cfg) {
     auto strategies = all_init_strategies();
     int num_strategies = (int)strategies.size();
@@ -187,7 +187,7 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
 
     std::vector<PoolEntry> pool;
     for (auto& r : gen0_results)
-        pool_insert(pool, std::move(r), 8);
+        pool_insert(pool, std::move(r), cfg.pool_size);
     pool_sort(pool);
 
     std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
@@ -290,7 +290,7 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
 
         int accepted = 0;
         for (auto& r : mut_results)
-            if (r.cost < 1e17 && pool_insert(pool, std::move(r), 8))
+            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size))
                 accepted++;
         pool_sort(pool);
 
@@ -319,5 +319,9 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
     std::cerr << "  Cache: " << shared_cache.size() << " entries, "
               << shared_cache.hits() << " hits, " << shared_cache.misses() << " misses\n";
 
-    return std::move(pool[0].partition);
+    std::vector<Partition> result;
+    result.reserve(pool.size());
+    for (auto& pe : pool)
+        result.push_back(std::move(pe.partition));
+    return result;
 }

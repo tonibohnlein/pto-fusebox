@@ -3,6 +3,7 @@
 #include "solution/solution.h"
 #include <chrono>
 #include <set>
+#include <vector>
 
 // ============================================================================
 // Solution-level FM search
@@ -45,7 +46,7 @@ struct SolutionFMPassResult {
 };
 
 struct SolutionFMConfig {
-    int max_passes = 100;
+    int max_passes = 1000;
     int max_no_improve = 30;
     SolutionFMPassConfig pass_config;
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
@@ -63,5 +64,11 @@ std::vector<ScheduleStep> solution_greedy_descent(const Problem& prob, const DAG
                                                     = std::chrono::steady_clock::time_point::max());
 
 // Parallel FM search: N threads with different seeds, adaptive cooling
+// Single starting solution
 Solution solution_fm_search(const Problem& prob, const DAG& dag,
                              Solution sol, const SolutionFMConfig& cfg = {});
+
+// Multi-start: each thread starts from a different solution in the pool
+// Returns the best solution found across all threads and starting points
+Solution solution_fm_search(const Problem& prob, const DAG& dag,
+                             std::vector<Solution> pool, const SolutionFMConfig& cfg = {});
