@@ -36,7 +36,12 @@ for f in "$BENCH_DIR"/*.json; do
     ms=$(( (end - start) / 1000000 ))
     
     cost=$(echo "$result" | sed 's/Total: //')
-    printf "%-20s %12s  (%5dms)\n" "$name" "$cost" "$ms"
+    printf "%-20s %12s  (%5dms)\\n" "$name" "$cost" "$ms"
+    
+    if [ -f "$out" ]; then
+        python3 "$(dirname "$0")/visualize.py" solution "$f" "$out" "${BUILD_DIR}/${name}_sol.dot" > /dev/null 2>&1
+    fi
+    
     count=$((count + 1))
 done
 

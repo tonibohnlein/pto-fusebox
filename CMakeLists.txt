@@ -55,6 +55,7 @@ set(TEST_SOURCES
     test/cost_cache_test.cpp
     test/evolution_test.cpp
     test/solution_search_test.cpp
+    test/sanity_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
