@@ -19,6 +19,9 @@
 //     execution grid requires every op to tile at w × h)
 //   - h divides every output height (boundary AND ephemeral)
 //   - k divides every MatMul's K dimension (= LHS tensor width)
+//   - If any boundary output is produced by a PW op, k must be 1.
+//     (PW runs once per tile; with k>1 the cost model for mixed MM→PW
+//      chains is ambiguous, so we enforce k=1 for safety.)
 //
 // Note: this means ops with different output widths CAN share a subgraph
 // only if there exists a w that divides all of them.
@@ -93,6 +96,7 @@ private:
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
+  bool has_pw_sink_ = false;  // true if any boundary output is produced by a PW op
   int64_t max_K_ = 1;
 
   // Tiling constraints derived from per-tensor roles.
@@ -101,12 +105,6 @@ private:
   std::vector<int64_t> w_divides_;  // w must divide all these
   std::vector<int64_t> h_divides_;  // h must divide all these
   std::vector<int64_t> k_divides_;  // k must divide all these
-
-  // Ephemeral tensors that are MatMul outputs consumed by a PW op.
-  // When k>1, these need a w×h accumulator in fast memory (the MM
-  // accumulates across k-steps before the PW can fire).
-  // When k=1, truly ephemeral — zero capacity.
-  std::set<size_t> eph_mm_accumulators_;
 
   // Precomputed per-boundary-tensor info for fast working_set/compute_cost.
   struct BoundaryTensorInfo {

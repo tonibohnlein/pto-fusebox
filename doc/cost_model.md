@@ -112,13 +112,32 @@ The code collects three sets of values:
 
 Each tensor contributes to these sets based on its role as described above.
 
+### PW sink constraint
+
+**If any boundary output is produced by a Pointwise op, k must be 1.**
+
+Rationale: PW ops execute once per spatial tile and have no reduction dimension.
+When k > 1, the subgraph's k-loop drives MatMul accumulation across multiple
+steps. If a PW op is a sink of the subgraph, the interaction between the MatMul's
+multi-step accumulation and the PW's single-shot execution creates ambiguity in
+the cost model (when does the PW fire? what memory does the intermediate occupy
+across k-steps?). Rather than model this complex interaction, we enforce k = 1
+for any subgraph with a PW sink. This is not restrictive in practice because:
+
+- PW-only subgraphs already have k = 1 (no MatMul, no reduction)
+- MatMul chains without PW sinks can still use k > 1
+- Mixed subgraphs like MM→PW will use k = 1, which means the MatMul fully
+  computes its output in one step, the PW fires immediately, and the intermediate
+  is truly ephemeral with zero memory cost — the simplest possible model.
+
 ### Candidate generation
 
 Valid tiling candidates are divisors of the GCD of each constraint set:
 
     w ∈ divisors(gcd(w_divides_))
     h ∈ divisors(gcd(h_divides_))
-    k ∈ divisors(gcd(k_divides_))
+    k ∈ {1}                          if any boundary output is a PW output
+    k ∈ divisors(gcd(k_divides_))    otherwise
 
 This is efficient: the GCD captures the tightest common divisibility requirement.
 
@@ -147,7 +166,6 @@ The working set is the peak fast memory occupied during any single tile-step
     ws = Σ (boundary input slices) + Σ (boundary output slices)
          + Σ (retained-from-prev full tensors)
          + Σ (retain-these output accumulation)
-         + Σ (ephemeral MM→PW accumulators when k < K)
 
 ### Per-input contributions
 
@@ -176,15 +194,10 @@ slice size across all roles is used.
   at `[128,128]` fits in capacity 25,000 (input 16,384 ≤ 25,000; if output
   were counted, 32,768 > 25,000 would be OOM).
 
-### Ephemeral MM→PW accumulators
-
-When an ephemeral tensor is produced by a MatMul and consumed by a Pointwise op:
-- If the producing MatMul completes in **one k-step** (i.e., `k ≥ K` for that
-  MatMul): the data flows directly, truly ephemeral. Zero capacity.
-- If the producing MatMul needs **multiple k-steps** (i.e., `k < K`): the MatMul
-  accumulates a `w × h` result across k-steps. The PW cannot fire until
-  accumulation is complete. The `w × h` accumulator persists in fast memory,
-  adding `w × h` to the working set.
+Note: for mixed MM→PW subgraphs, the PW sink constraint forces k = 1. This
+means the MatMul completes its output in a single step, so the ephemeral
+intermediate is never an accumulator — it flows directly to the PW. No extra
+memory is needed for ephemeral MM→PW intermediates.
 
 ### Shared boundary inputs
 
@@ -392,8 +405,8 @@ The optimizer enumerates all valid `[w, h, k]` combinations:
   tensor roles (MatMul RHS widths, boundary output widths, etc.)
 - `h` ∈ divisors of `gcd(h_divides_)` — values h must divide (MatMul LHS
   heights, boundary output heights, etc.)
-- `k` ∈ divisors of `gcd(k_divides_)` — values k must divide (MatMul reduction
-  dimensions, i.e., LHS widths and RHS heights)
+- `k` ∈ `{1}` if any boundary output is a PW output (PW sink constraint);
+  otherwise `k` ∈ divisors of `gcd(k_divides_)` (MatMul reduction dimensions)
 - Snake ∈ {RowMajor, ColMajor} for MatMul subgraphs, {None} for PW-only
 
 Minimum tile size: `native_w/4 × native_h/4` (relaxed to 1×1 if nothing fits).

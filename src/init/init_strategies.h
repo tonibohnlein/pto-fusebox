@@ -1,6 +1,6 @@
 #pragma once
 
-#include "partition/partition.h"
+#include "partition.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -10,7 +10,7 @@
 //
 // Each strategy produces a valid Partition from the problem: every op is
 // covered by at least one group, each group forms a valid Subgraph
-// (single-sink, connected), and costs are evaluated via best_cost().
+// (connected, feasible), and costs are evaluated via best_cost().
 //
 // Strategies differ in how they discover fusion opportunities:
 //   - trivial: no fusion (baseline)

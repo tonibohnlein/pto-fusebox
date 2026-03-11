@@ -1,4 +1,4 @@
-#include "init/init_strategies.h"
+#include "init_strategies.h"
 #include <algorithm>
 #include <numeric>
 #include <iostream>
@@ -22,7 +22,6 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
     if (ga == gb || !p.groups[ga].alive || !p.groups[gb].alive) return false;
 
     if (p.dag->merge_creates_cycle(p.groups[ga].ops, p.groups[gb].ops)) return false;
-    if (!shapes_match(p.prob, p.groups[ga].ops, p.groups[gb].ops)) return false;
 
     std::set<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
@@ -111,6 +110,40 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag) {
             op_grp = build_op_to_group(p);
     }
 
+    // Phase C: co-consumer merging by shared tensor size
+    // For each tensor (including graph inputs), try merging pairs of consumer
+    // groups. This captures the benchmark-13 pattern where parallel ops share
+    // a large input tensor.
+    struct SharedTensor {
+        size_t tensor;
+        int64_t size;
+    };
+    std::vector<SharedTensor> shared_tensors;
+    for (size_t t = 0; t < prob.tensors.size(); t++) {
+        if (dag.tensor_consumers[t].size() > 1) {
+            shared_tensors.push_back({t,
+                prob.tensors[t].width * prob.tensors[t].height});
+        }
+    }
+    std::sort(shared_tensors.begin(), shared_tensors.end(),
+              [](const SharedTensor& a, const SharedTensor& b) {
+                  return a.size > b.size;
+              });
+
+    op_grp = build_op_to_group(p);
+    for (auto& st : shared_tensors) {
+        auto& consumers = dag.tensor_consumers[st.tensor];
+        for (size_t i = 0; i < consumers.size(); i++) {
+            for (size_t j = i + 1; j < consumers.size(); j++) {
+                int ga = op_grp[consumers[i]];
+                int gb = op_grp[consumers[j]];
+                if (ga < 0 || gb < 0 || ga == gb) continue;
+                if (try_merge(p, (size_t)ga, (size_t)gb))
+                    op_grp = build_op_to_group(p);
+            }
+        }
+    }
+
     return p;
 }
 
@@ -156,10 +189,14 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
                 for (auto succ : dag.op_succs[op])
                     if (!group.count(succ) && !assigned[succ])
                         neighbors.insert(succ);
+                // Co-consumers of same input tensor
+                for (auto t : prob.ops[op].inputs)
+                    for (auto co : dag.tensor_consumers[t])
+                        if (co != op && !group.count(co) && !assigned[co])
+                            neighbors.insert(co);
             }
 
             for (auto cand : neighbors) {
-                if (!shapes_match(p.prob, cand, group)) continue;
                 if (p.dag->merge_creates_cycle({cand}, group)) continue;
 
                 std::set<size_t> expanded = group;
@@ -213,11 +250,25 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
         size_t best_gj = SIZE_MAX;
         double best_saving = 0;
 
+        // Collect candidate groups: DAG successors + co-consumers of shared inputs
+        std::set<int> candidate_groups;
         for (auto succ : dag.op_succs[op]) {
             int gj = op_grp[succ];
-            if (gj < 0 || (size_t)gj == (size_t)gi) continue;
+            if (gj >= 0 && (size_t)gj != (size_t)gi)
+                candidate_groups.insert(gj);
+        }
+        for (auto t : prob.ops[op].inputs) {
+            for (auto co : dag.tensor_consumers[t]) {
+                if (co != op) {
+                    int gj = op_grp[co];
+                    if (gj >= 0 && (size_t)gj != (size_t)gi)
+                        candidate_groups.insert(gj);
+                }
+            }
+        }
 
-            if (!shapes_match(p.prob, p.groups[gi].ops, p.groups[gj].ops)) continue;
+        for (int gj : candidate_groups) {
+
             if (p.dag->merge_creates_cycle(p.groups[gi].ops, p.groups[gj].ops)) continue;
 
             std::set<size_t> merged = p.groups[gi].ops;

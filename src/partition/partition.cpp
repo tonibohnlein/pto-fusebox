@@ -1,5 +1,6 @@
-#include "partition/partition.h"
-#include "core/cost_cache.h"
+#include "partition.h"
+#include "cost_cache.h"
+#include <map>
 
 Partition Partition::trivial(const Problem& prob, const DAG& dag) {
     Partition p;
@@ -39,10 +40,16 @@ std::vector<size_t> Partition::groups_of(size_t op) const {
 }
 
 bool Partition::is_border_op(size_t op, size_t gi) const {
+    // An op is on the border if it has any neighbor (DAG edge or shared input)
+    // outside the group.
     for (auto p : dag->op_preds[op])
         if (!groups[gi].ops.count(p)) return true;
     for (auto s : dag->op_succs[op])
         if (!groups[gi].ops.count(s)) return true;
+    // Check co-consumers of same input tensor
+    for (auto t : prob->ops[op].inputs)
+        for (auto co : dag->tensor_consumers[t])
+            if (co != op && !groups[gi].ops.count(co)) return true;
     return false;
 }
 
@@ -61,6 +68,11 @@ std::set<size_t> Partition::boundary_neighbors(size_t gi) const {
             if (!groups[gi].ops.count(p)) result.insert(p);
         for (auto s : dag->op_succs[op])
             if (!groups[gi].ops.count(s)) result.insert(s);
+        // Co-consumers of same input tensor
+        for (auto t : prob->ops[op].inputs)
+            for (auto co : dag->tensor_consumers[t])
+                if (co != op && !groups[gi].ops.count(co))
+                    result.insert(co);
     }
     return result;
 }
@@ -95,13 +107,7 @@ std::vector<size_t> Partition::ejectable_ops(size_t gi) const {
 
     std::vector<size_t> result;
     for (auto op : groups[gi].ops) {
-        bool on_boundary = false;
-        for (auto p : dag->op_preds[op])
-            if (!groups[gi].ops.count(p)) { on_boundary = true; break; }
-        if (!on_boundary)
-            for (auto s : dag->op_succs[op])
-                if (!groups[gi].ops.count(s)) { on_boundary = true; break; }
-        if (on_boundary)
+        if (is_border_op(op, gi))
             result.push_back(op);
     }
     return result;
@@ -112,10 +118,16 @@ std::vector<std::set<size_t>> Partition::connected_components(
     std::vector<std::set<size_t>> components;
     std::vector<bool> visited(prob->num_ops(), false);
 
+    // Build co-consumer adjacency within the op set
+    std::map<size_t, std::vector<size_t>> tensor_to_ops;
+    for (auto op : ops)
+        for (auto t : prob->ops[op].inputs)
+            tensor_to_ops[t].push_back(op);
+
     for (auto seed : ops) {
         if (visited[seed]) continue;
 
-        // BFS from seed within ops
+        // BFS from seed within ops, using DAG edges + shared-input edges
         std::set<size_t> comp;
         std::vector<size_t> queue = {seed};
         visited[seed] = true;
@@ -123,6 +135,7 @@ std::vector<std::set<size_t>> Partition::connected_components(
         while (!queue.empty()) {
             size_t u = queue.back(); queue.pop_back();
             comp.insert(u);
+            // DAG edges
             for (auto v : dag->op_preds[u]) {
                 if (ops.count(v) && !visited[v]) {
                     visited[v] = true;
@@ -133,6 +146,15 @@ std::vector<std::set<size_t>> Partition::connected_components(
                 if (ops.count(v) && !visited[v]) {
                     visited[v] = true;
                     queue.push_back(v);
+                }
+            }
+            // Shared-input edges (co-consumers of same tensor)
+            for (auto t : prob->ops[u].inputs) {
+                for (auto v : tensor_to_ops[t]) {
+                    if (v != u && !visited[v]) {
+                        visited[v] = true;
+                        queue.push_back(v);
+                    }
                 }
             }
         }
@@ -191,16 +213,9 @@ Partition::EjectResult Partition::eval_eject(size_t op, size_t gi) const {
 std::vector<size_t> Partition::internal_ops(size_t gi) const {
     if (!groups[gi].alive) return {};
     std::vector<size_t> result;
-    for (auto op : groups[gi].ops) {
-        bool internal = true;
-        for (auto p : dag->op_preds[op])
-            if (!groups[gi].ops.count(p)) { internal = false; break; }
-        if (internal)
-            for (auto s : dag->op_succs[op])
-                if (!groups[gi].ops.count(s)) { internal = false; break; }
-        if (internal)
+    for (auto op : groups[gi].ops)
+        if (!is_border_op(op, gi))
             result.push_back(op);
-    }
     return result;
 }
 

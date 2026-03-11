@@ -84,34 +84,29 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         return std::nullopt;
   }
 
-  // Detect ephemeral MM→PW accumulators: MM output consumed by PW.
-  // When k>1, these need w×h accumulator space in fast memory.
-  {
-    // Map: tensor -> producing op index
-    std::map<size_t, size_t> eph_producer;
-    for (auto i : sg.ops_)
-      for (auto t : prob.ops[i].outputs)
-        if (sg.ephemeral_.count(t))
-          eph_producer[t] = i;
-
-    // Map: tensor -> consuming op index
-    std::map<size_t, size_t> eph_consumer_op;
-    for (auto i : sg.ops_)
-      for (auto t : prob.ops[i].inputs)
-        if (sg.ephemeral_.count(t))
-          eph_consumer_op[t] = i;
-
-    for (auto t : sg.ephemeral_) {
-      bool produced_by_mm = (prob.ops[eph_producer[t]].type == OpType::MatMul);
-      bool consumed_by_pw = (prob.ops[eph_consumer_op[t]].type == OpType::Pointwise);
-      if (produced_by_mm && consumed_by_pw)
-        sg.eph_mm_accumulators_.insert(t);
-    }
-  }
-
   // Must have at least one boundary output
   if (sg.boundary_outputs_.empty())
     return std::nullopt;
+
+  // Detect if any boundary output (sink) is produced by a PW op.
+  // If so, k must be 1 (PW runs once per tile; with k>1 the interaction
+  // between MM accumulation and PW execution is ambiguous).
+  {
+    // Map: tensor -> producing op index
+    std::map<size_t, size_t> tensor_producer_in_sg;
+    for (auto i : sg.ops_)
+      for (auto t : prob.ops[i].outputs)
+        tensor_producer_in_sg[t] = i;
+
+    for (auto t : sg.boundary_outputs_) {
+      auto it = tensor_producer_in_sg.find(t);
+      if (it != tensor_producer_in_sg.end() &&
+          prob.ops[it->second].type == OpType::Pointwise) {
+        sg.has_pw_sink_ = true;
+        break;
+      }
+    }
+  }
 
   // All boundary outputs must have the same dimensions
   {
@@ -327,7 +322,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   sg.ws_cand_ = w_gcd > 0 ? all_divisors(w_gcd) : std::vector<int64_t>{1};
   sg.hs_cand_ = h_gcd > 0 ? all_divisors(h_gcd) : std::vector<int64_t>{1};
-  sg.ks_cand_ = k_gcd > 0 ? all_divisors(k_gcd) : std::vector<int64_t>{1};
+  // If any boundary output is produced by a PW op, k must be 1.
+  sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{1}
+              : k_gcd > 0       ? all_divisors(k_gcd)
+                                : std::vector<int64_t>{1};
 
   return sg;
 }
@@ -338,6 +336,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
 bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
+    return false;
+
+  // If any boundary output is a PW output, k must be 1
+  if (has_pw_sink_ && cfg.k > 1)
     return false;
 
   for (int64_t v : w_divides_)
@@ -440,29 +442,6 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       ws += full - tile;
     else
       ws += full;
-  }
-
-  // Ephemeral MM→PW accumulators: when the producing MatMul needs multiple
-  // k-steps (K_mm / k > 1), the w×h accumulator persists in fast memory
-  // across those steps until the PW fires at the last step.
-  // When K_mm <= k (single k-step), the MM completes in one shot and the
-  // PW consumes it immediately — no persistent accumulator needed.
-  for (auto t : eph_mm_accumulators_) {
-    // Find the producing op to get its K dimension
-    for (auto i : ops_) {
-      const auto &op = prob_->ops[i];
-      if (op.type == OpType::MatMul) {
-        for (auto ot : op.outputs) {
-          if (ot == t) {
-            int64_t K_mm = prob_->tensors[op.inputs[0]].width;
-            if (K_mm > cfg.k)
-              ws += cfg.w * cfg.h;
-            goto next_accum;
-          }
-        }
-      }
-    }
-    next_accum:;
   }
 
   return ws;

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "core/types.h"
-#include "core/dag.h"
-#include "core/subgraph.h"
+#include "types.h"
+#include "dag.h"
+#include "subgraph.h"
 #include <set>
 #include <vector>
 
@@ -14,6 +14,10 @@ class CostCache;  // forward declaration
 // Each Group is a set of op indices. Groups may overlap (recomputation).
 // Every op must be in at least one group. Groups carry a generation counter
 // for lazy heap invalidation in the local search.
+//
+// Validity: Subgraph::create is the authoritative check. It verifies
+// connectivity (including shared-input edges), ephemeral fan-out, and
+// boundary output dimension consistency.
 // ============================================================================
 
 struct Partition {
@@ -62,7 +66,7 @@ struct Partition {
     // --- Evaluation ---
 
     // Evaluate a candidate op set: create Subgraph + best_cost().
-    // Returns cost, or 1e18 if invalid (not single-sink, disconnected, infeasible).
+    // Returns cost, or 1e18 if invalid (disconnected, infeasible, etc.).
     double eval_set(const std::set<size_t>& ops) const;
 
     // Result of ejecting an op from a group
