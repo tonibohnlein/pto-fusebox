@@ -102,6 +102,9 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             continue;
         }
 
+        // Rebuild index so subsequent groups_of / adjacent_groups are correct
+        part.rebuild_index();
+
         result.moves_applied++;
         if (move.saving > 0.001)
             result.moves_positive++;
