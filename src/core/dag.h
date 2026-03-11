@@ -15,6 +15,13 @@ struct DAG {
     std::vector<std::vector<size_t>> tensor_consumers; // tensor -> consuming ops
     std::vector<std::set<size_t>> op_preds;            // op -> predecessor ops
     std::vector<std::set<size_t>> op_succs;            // op -> successor ops
+
+    // Expanded adjacency: DAG edges + co-consumer edges (undirected).
+    // op_neighbors[i] includes all ops j such that i→j, j→i, or i and j
+    // share a common input tensor. Precomputed at build time. Used for
+    // connectivity checks in Subgraph::create and Partition::connected_components.
+    std::vector<std::vector<size_t>> op_neighbors;
+
     std::vector<size_t> graph_inputs;                  // tensors with no producer
     std::vector<size_t> graph_outputs;                 // tensors with no consumer
 
@@ -25,8 +32,6 @@ struct DAG {
     std::vector<size_t> topo_sort() const;
 
     // Would merging two op-sets create a cycle in the condensed DAG?
-    // True iff there exists a directed path from one set to the other
-    // through ops outside both sets.
     bool merge_creates_cycle(const std::set<size_t>& a,
                              const std::set<size_t>& b) const;
 };

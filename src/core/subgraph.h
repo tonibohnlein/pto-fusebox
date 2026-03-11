@@ -12,7 +12,8 @@
 // Invariants enforced at construction:
 //   1. At least one boundary output tensor
 //   2. All boundary outputs have the same (W, H) dimensions
-//   3. Connected: ops form a connected sub-DAG (undirected)
+//   3. Connected: ops form a connected sub-DAG (via DAG edges or shared inputs)
+//   5. Ephemeral tensors have exactly one consumer within the subgraph
 //
 // Tiling validity constraints (derived from chain execution model):
 //   - w divides every output width (boundary AND ephemeral — the unified
@@ -96,28 +97,27 @@ private:
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
-  bool has_pw_sink_ = false;  // true if any boundary output is produced by a PW op
+  bool has_pw_sink_ = false;
   int64_t max_K_ = 1;
 
-  // Tiling constraints derived from per-tensor roles.
-  // w must divide every value in w_divides_, etc.
-  // Built at create() time by analyzing how each tensor is consumed.
-  std::vector<int64_t> w_divides_;  // w must divide all these
-  std::vector<int64_t> h_divides_;  // h must divide all these
-  std::vector<int64_t> k_divides_;  // k must divide all these
+  // Role-based tiling constraints.
+  std::vector<int64_t> w_divides_;
+  std::vector<int64_t> h_divides_;
+  std::vector<int64_t> k_divides_;
 
   // Precomputed per-boundary-tensor info for fast working_set/compute_cost.
   struct BoundaryTensorInfo {
     size_t id;
-    int64_t max_lhs_K = 0;    // max K among MM ops using this as LHS (0 = not LHS)
-    bool is_mm_rhs = false;    // used as MatMul RHS
-    bool is_mm_out = false;    // MatMul boundary output (accumulator — counts in WS)
-    bool is_boundary_out = false; // is a boundary output tensor (for eviction tracking)
-    bool is_pw_in = false;     // used as Pointwise input
+    int64_t full_size;             // width * height (precomputed)
+    int64_t max_lhs_K = 0;        // max K among MM ops using this as LHS
+    bool is_mm_rhs = false;
+    bool is_mm_out = false;        // MatMul boundary output (accumulator)
+    bool is_boundary_out = false;
+    bool is_pw_in = false;
   };
   std::vector<BoundaryTensorInfo> boundary_tensor_info_;
 
-  std::vector<int64_t> ws_cand_; // Divisor candidates for 'w' (must divide all output widths)
-  std::vector<int64_t> hs_cand_; // Divisor candidates for 'h' (must divide all output heights)
-  std::vector<int64_t> ks_cand_; // Divisor candidates for 'k' (must divide all K values)
+  std::vector<int64_t> ws_cand_;
+  std::vector<int64_t> hs_cand_;
+  std::vector<int64_t> ks_cand_;
 };

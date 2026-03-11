@@ -8,12 +8,13 @@
 // ============================================================================
 
 // Map each op to its current alive group index. Assumes no overlap.
+// Uses Partition's index if available, otherwise builds from scratch.
 static std::vector<int> build_op_to_group(const Partition& p) {
     std::vector<int> m(p.prob->num_ops(), -1);
-    for (size_t i = 0; i < p.groups.size(); i++)
-        if (p.groups[i].alive)
-            for (auto op : p.groups[i].ops)
-                m[op] = (int)i;
+    for (size_t op = 0; op < p.prob->num_ops(); op++) {
+        auto& gs = p.groups_of(op);
+        if (!gs.empty()) m[op] = (int)gs[0];
+    }
     return m;
 }
 
@@ -33,6 +34,7 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
         p.groups[ga].gen++;
         p.groups[gb].alive = false;
         p.groups[gb].gen++;
+        p.rebuild_index();
         return true;
     }
     return false;
@@ -183,17 +185,9 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
 
             std::set<size_t> neighbors;
             for (auto op : group) {
-                for (auto pred : dag.op_preds[op])
-                    if (!group.count(pred) && !assigned[pred])
-                        neighbors.insert(pred);
-                for (auto succ : dag.op_succs[op])
-                    if (!group.count(succ) && !assigned[succ])
-                        neighbors.insert(succ);
-                // Co-consumers of same input tensor
-                for (auto t : prob.ops[op].inputs)
-                    for (auto co : dag.tensor_consumers[t])
-                        if (co != op && !group.count(co) && !assigned[co])
-                            neighbors.insert(co);
+                for (auto v : dag.op_neighbors[op])
+                    if (!group.count(v) && !assigned[v])
+                        neighbors.insert(v);
             }
 
             for (auto cand : neighbors) {
@@ -226,6 +220,7 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
         }
     }
 
+    p.rebuild_index();
     return p;
 }
 
@@ -250,21 +245,12 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
         size_t best_gj = SIZE_MAX;
         double best_saving = 0;
 
-        // Collect candidate groups: DAG successors + co-consumers of shared inputs
+        // Collect candidate groups from all neighbors (DAG edges + shared inputs)
         std::set<int> candidate_groups;
-        for (auto succ : dag.op_succs[op]) {
-            int gj = op_grp[succ];
+        for (auto v : dag.op_neighbors[op]) {
+            int gj = op_grp[v];
             if (gj >= 0 && (size_t)gj != (size_t)gi)
                 candidate_groups.insert(gj);
-        }
-        for (auto t : prob.ops[op].inputs) {
-            for (auto co : dag.tensor_consumers[t]) {
-                if (co != op) {
-                    int gj = op_grp[co];
-                    if (gj >= 0 && (size_t)gj != (size_t)gi)
-                        candidate_groups.insert(gj);
-                }
-            }
         }
 
         for (int gj : candidate_groups) {

@@ -25,6 +25,29 @@ DAG DAG::build(const Problem& prob) {
         }
     }
 
+    // Build expanded adjacency: DAG edges + co-consumer edges
+    d.op_neighbors.resize(prob.num_ops());
+    {
+        std::vector<std::set<size_t>> nbr_set(prob.num_ops());
+        // DAG edges (undirected)
+        for (size_t i = 0; i < prob.num_ops(); i++) {
+            for (auto j : d.op_preds[i]) nbr_set[i].insert(j);
+            for (auto j : d.op_succs[i]) nbr_set[i].insert(j);
+        }
+        // Co-consumer edges: ops sharing an input tensor
+        for (size_t t = 0; t < prob.num_tensors(); t++) {
+            auto& cons = d.tensor_consumers[t];
+            for (size_t a = 0; a < cons.size(); a++)
+                for (size_t b = a + 1; b < cons.size(); b++) {
+                    nbr_set[cons[a]].insert(cons[b]);
+                    nbr_set[cons[b]].insert(cons[a]);
+                }
+        }
+        // Flatten to vectors for cache-friendly iteration
+        for (size_t i = 0; i < prob.num_ops(); i++)
+            d.op_neighbors[i].assign(nbr_set[i].begin(), nbr_set[i].end());
+    }
+
     // Identify graph inputs and outputs
     std::set<size_t> produced, consumed;
     for (auto& op : prob.ops) {
@@ -58,27 +81,26 @@ std::vector<size_t> DAG::topo_sort() const {
 }
 
 bool DAG::merge_creates_cycle(const std::set<size_t>& a, const std::set<size_t>& b) const {
-    std::set<size_t> merged;
-    merged.insert(a.begin(), a.end());
-    merged.insert(b.begin(), b.end());
+    // Use vector<bool> for O(1) lookups instead of std::set
+    std::vector<bool> in_merged(num_ops, false);
+    for (auto op : a) in_merged[op] = true;
+    for (auto op : b) in_merged[op] = true;
 
-    // BFS from `from` through external ops; return true if we reach `to`
     auto has_external_path = [&](const std::set<size_t>& from,
                                  const std::set<size_t>& to) {
-        std::set<size_t> visited;
+        std::vector<bool> visited(num_ops, false);
         std::vector<size_t> queue;
         for (auto op : from)
             for (auto s : op_succs[op])
-                if (!merged.count(s) && !visited.count(s))
-                    { visited.insert(s); queue.push_back(s); }
+                if (!in_merged[s] && !visited[s])
+                    { visited[s] = true; queue.push_back(s); }
 
         while (!queue.empty()) {
             size_t u = queue.back(); queue.pop_back();
-            // Check successors: if any lands in `to`, we found an external path
             for (auto v : op_succs[u]) {
-                if (to.count(v)) return true;       // reached target through external
-                if (!merged.count(v) && !visited.count(v))
-                    { visited.insert(v); queue.push_back(v); }
+                if (to.count(v)) return true;
+                if (!in_merged[v] && !visited[v])
+                    { visited[v] = true; queue.push_back(v); }
             }
         }
         return false;
