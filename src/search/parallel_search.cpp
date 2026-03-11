@@ -33,20 +33,23 @@ struct PoolEntry {
 
 static double partition_distance(const Partition& a, const Partition& b) {
     size_t n = a.prob->num_ops();
-    auto group_of = [&](const Partition& p, size_t op) -> int {
-        for (size_t gi = 0; gi < p.groups.size(); gi++)
-            if (p.groups[gi].alive && p.groups[gi].ops.count(op))
-                return (int)gi;
-        return -1;
-    };
+    // Build op→group maps once (O(ops×groups) but only done once per call)
+    std::vector<int> ga_map(n, -1), gb_map(n, -1);
+    for (size_t gi = 0; gi < a.groups.size(); gi++)
+        if (a.groups[gi].alive)
+            for (auto op : a.groups[gi].ops)
+                ga_map[op] = (int)gi;
+    for (size_t gi = 0; gi < b.groups.size(); gi++)
+        if (b.groups[gi].alive)
+            for (auto op : b.groups[gi].ops)
+                gb_map[op] = (int)gi;
+
     int disagree = 0, total = 0;
     for (size_t i = 0; i < n; i++) {
-        int ga = group_of(a, i), gb = group_of(b, i);
-        if (ga < 0 || gb < 0) continue;
+        if (ga_map[i] < 0 || gb_map[i] < 0) continue;
         for (size_t j = i + 1; j < n; j++) {
-            int ga2 = group_of(a, j), gb2 = group_of(b, j);
-            if (ga2 < 0 || gb2 < 0) continue;
-            if ((ga == ga2) != (gb == gb2)) disagree++;
+            if (ga_map[j] < 0 || gb_map[j] < 0) continue;
+            if ((ga_map[i] == ga_map[j]) != (gb_map[i] == gb_map[j])) disagree++;
             total++;
         }
     }
@@ -147,7 +150,7 @@ Partition parallel_search(const Problem& prob, const DAG& dag,
             part.cache = &shared_cache;
             double init_cost = part.total_cost();
 
-            part = local_search_from(std::move(part));
+            part = greedy_descent(std::move(part));
             double greedy_cost = part.total_cost();
 
             FMOuterConfig fc = gen0_fm;

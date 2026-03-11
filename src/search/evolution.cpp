@@ -38,7 +38,6 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     // Pick random pair
     auto [ga, gb] = adj_pairs[rng() % adj_pairs.size()];
 
-    if (!shapes_match(part.prob, part.groups[ga].ops, part.groups[gb].ops)) return part;
     if (part.dag->merge_creates_cycle(part.groups[ga].ops, part.groups[gb].ops)) return part;
     
     // Merge: add all ops from gb into ga
@@ -53,6 +52,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     part.groups[ga].cost = cost;
     part.groups[ga].gen++;
     part.groups[gb].alive = false;
+    part.rebuild_index();
     
     return part;
 }
@@ -86,6 +86,7 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
     part.groups[gi].cost = sr.cost_a;
     part.groups[gi].gen++;
     part.add_group(sr.side_b, sr.cost_b);
+    part.rebuild_index();
     
     return part;
 }
@@ -108,13 +109,10 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Pick random border op
     auto [op, src_gi] = border_ops[rng() % border_ops.size()];
     
-    // Find neighbor groups
+    // Find neighbor groups (via all neighbor edges including co-consumers)
     std::vector<size_t> targets;
-    for (auto p : part.dag->op_preds[op])
-        for (auto gi : part.groups_of(p))
-            if (gi != src_gi) targets.push_back(gi);
-    for (auto s : part.dag->op_succs[op])
-        for (auto gi : part.groups_of(s))
+    for (auto nbr : part.dag->op_neighbors[op])
+        for (auto gi : part.groups_of(nbr))
             if (gi != src_gi) targets.push_back(gi);
     
     // Deduplicate
@@ -125,7 +123,6 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Pick random target
     size_t dst_gi = targets[rng() % targets.size()];
 
-    if (!shapes_match(part.prob, op, part.groups[dst_gi].ops)) return part;
     if (part.dag->merge_creates_cycle({op}, part.groups[dst_gi].ops)) return part;
     
     // Check: removing op from src must leave it connected and non-empty
@@ -151,6 +148,7 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     part.groups[dst_gi].ops = new_dst;
     part.groups[dst_gi].cost = dst_cost;
     part.groups[dst_gi].gen++;
+    part.rebuild_index();
     
     return part;
 }
@@ -202,14 +200,11 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     auto comps = part.connected_components(remainder);
     if (comps.size() != 1) return part;
     
-    // Find a target group adjacent to the block
+    // Find a target group adjacent to the block (via all neighbor edges)
     std::set<size_t> target_groups;
     for (auto op : block) {
-        for (auto p : part.dag->op_preds[op])
-            for (auto gi : part.groups_of(p))
-                if (gi != src_gi) target_groups.insert(gi);
-        for (auto s : part.dag->op_succs[op])
-            for (auto gi : part.groups_of(s))
+        for (auto nbr : part.dag->op_neighbors[op])
+            for (auto gi : part.groups_of(nbr))
                 if (gi != src_gi) target_groups.insert(gi);
     }
     if (target_groups.empty()) {
@@ -223,6 +218,7 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
         part.groups[src_gi].cost = rem_cost;
         part.groups[src_gi].gen++;
         part.add_group(block, block_cost);
+        part.rebuild_index();
         return part;
     }
     
@@ -230,7 +226,6 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     std::vector<size_t> tgt_vec(target_groups.begin(), target_groups.end());
     size_t dst_gi = tgt_vec[rng() % tgt_vec.size()];
     
-    if (!shapes_match(part.prob, block, part.groups[dst_gi].ops)) return part;
     if (part.dag->merge_creates_cycle(block, part.groups[dst_gi].ops)) return part;
 
     // Evaluate
@@ -249,6 +244,7 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     part.groups[dst_gi].ops = new_dst;
     part.groups[dst_gi].cost = dst_cost;
     part.groups[dst_gi].gen++;
+    part.rebuild_index();
     
     return part;
 }
@@ -334,21 +330,18 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     child.prob = &prob;
     child.dag = &dag;
     child.cache = parent_a.cache;
+    child.rebuild_index();
     
     for (auto ck : cluster_keys) {
         auto& cluster = clusters[ck];
         
         // Find existing child groups adjacent to this cluster
+        // Use op_neighbors + groups_of (requires index to be current)
         std::set<size_t> adj_child_groups;
         for (auto op : cluster) {
-            for (auto p : dag.op_preds[op])
-                for (size_t gi = 0; gi < child.groups.size(); gi++)
-                    if (child.groups[gi].alive && child.groups[gi].ops.count(p))
-                        adj_child_groups.insert(gi);
-            for (auto s : dag.op_succs[op])
-                for (size_t gi = 0; gi < child.groups.size(); gi++)
-                    if (child.groups[gi].alive && child.groups[gi].ops.count(s))
-                        adj_child_groups.insert(gi);
+            for (auto nbr : dag.op_neighbors[op])
+                for (auto gi : child.groups_of(nbr))
+                    adj_child_groups.insert(gi);
         }
         
         // Try merging with each adjacent group, pick cheapest
@@ -356,13 +349,11 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         size_t best_gi = SIZE_MAX;
         
         for (auto gi : adj_child_groups) {
-            if (!shapes_match(child.prob, cluster, child.groups[gi].ops)) continue;
             if (child.dag->merge_creates_cycle(cluster, child.groups[gi].ops)) continue;
 
             std::set<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
             double c = child.eval_set(merged);
-            // Compare merged cost vs keeping separate
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;
                 best_gi = gi;
@@ -373,24 +364,22 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         double standalone = child.eval_set(cluster);
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
-            // Merge is competitive — do it
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
         } else if (standalone < 1e17) {
-            // Create new group
             child.add_group(cluster, standalone);
         } else {
-            // Infeasible as standalone — force merge with any adjacent group
             if (best_gi != SIZE_MAX) {
                 for (auto op : cluster) child.groups[best_gi].ops.insert(op);
                 child.groups[best_gi].cost = best_cost;
                 child.groups[best_gi].gen++;
             } else {
-                // Last resort: create group even if infeasible
                 child.add_group(cluster, 1e18);
             }
         }
+        // Keep index current for next cluster iteration
+        child.rebuild_index();
     }
     
     return child;
