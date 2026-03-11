@@ -40,8 +40,7 @@ static std::set<size_t> filter_retain(const std::set<size_t> &retain,
                                       const Subgraph &sg) {
   std::set<size_t> r;
   for (auto t : retain)
-    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t) ||
-        t == sg.sink_tensor())
+    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
       r.insert(t);
   return r;
 }
@@ -106,7 +105,7 @@ find_steps_of_tensor(const std::vector<ScheduleStep> &steps, size_t t) {
   for (size_t i = 0; i < steps.size(); i++)
     if (steps[i].subgraph.boundary_inputs().count(t) ||
         steps[i].subgraph.boundary_outputs().count(t) ||
-        t == steps[i].subgraph.sink_tensor() || steps[i].retain_these.count(t))
+        steps[i].retain_these.count(t))
       r.push_back(i);
   return r;
 }
@@ -146,8 +145,7 @@ struct SolState {
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
-                     steps[i].subgraph.boundary_outputs().count(t) ||
-                     t == steps[i].subgraph.sink_tensor();
+                     steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
         if (valid && useful) {
           useful_retain.insert(t);
@@ -195,8 +193,7 @@ struct SolState {
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
-                     steps[i].subgraph.boundary_outputs().count(t) ||
-                     t == steps[i].subgraph.sink_tensor();
+                     steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
         if (valid && useful) {
           useful_retain.insert(t);
@@ -299,8 +296,6 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!is_connected_without(si_set, op, dag, prob.num_ops()))
         continue;
 
-      if (!shapes_match(&prob, op, dst.subgraph.ops().front())) 
-        continue;
 
       std::set<size_t> new_src = si_set;
       new_src.erase(op);
@@ -358,8 +353,6 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
 
       auto ops_j = state.steps[sj].subgraph.ops();
 
-      if (!shapes_match(&prob, si_ops.front(), ops_j.front())) 
-        continue;
 
       std::vector<size_t> merged;
       std::set<size_t> seen;
@@ -417,8 +410,6 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!produces_for_sj)
         continue;
 
-      if (!shapes_match(&prob, op, sj_ops.front())) 
-        continue;
 
       std::vector<size_t> expanded(sj_ops.begin(), sj_ops.end());
       expanded.push_back(op);
@@ -560,8 +551,7 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
 
     // Step i must have t as a boundary tensor to retain it
     bool si_boundary = si.subgraph.boundary_inputs().count(t) ||
-                       si.subgraph.boundary_outputs().count(t) ||
-                       t == si.subgraph.sink_tensor();
+                       si.subgraph.boundary_outputs().count(t);
     if (!si_boundary)
       continue;
     // Step i+1 must benefit from having t
@@ -980,14 +970,6 @@ generate_step_moves(SolState &state, size_t si, SolMoveHeap &heap, double floor,
       heap.push(m);
     }
   }
-  // Sink tensor
-  size_t sink = state.steps[si].subgraph.sink_tensor();
-  auto m = best_move_for_tensor(state, sink, empty, floor);
-  if (m.valid() && m.saving > -floor) {
-    m.gen_a = (m.step_a < state.size()) ? state.gen[m.step_a] : -1;
-    m.gen_b = (m.step_a + 1 < state.size()) ? state.gen[m.step_a + 1] : -1;
-    heap.push(m);
-  }
   // Retained tensors
   for (auto t : state.steps[si].retain_these) {
     auto mr = best_move_for_tensor(state, t, empty, floor);
@@ -1093,7 +1075,6 @@ struct SolActiveSet {
       activate_tensor(state, t);
     for (auto t : step.subgraph.boundary_outputs())
       activate_tensor(state, t);
-    activate_tensor(state, step.subgraph.sink_tensor());
     for (auto t : step.retain_these)
       activate_tensor(state, t);
   }
@@ -1109,7 +1090,6 @@ struct SolActiveSet {
         affected_tensors.insert(t);
       for (auto t : state.steps[i].subgraph.boundary_outputs())
         affected_tensors.insert(t);
-      affected_tensors.insert(state.steps[i].subgraph.sink_tensor());
     }
     // Neighbors: one step before lo and after hi
     if (lo > 0) {

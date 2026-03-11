@@ -116,10 +116,12 @@ static std::vector<size_t> dfs_ordering(const GroupDAGInfo& gd) {
     auto retain_score = [&](size_t cand, size_t prev) -> int64_t {
         if (prev >= n) return 0;
         int64_t score = 0;
-        size_t prev_sink = gd.groups[prev].sg.sink_tensor();
-        if (gd.groups[cand].sg.boundary_inputs().count(prev_sink) &&
-            gd.prob->retainable_tensors.count(prev_sink))
-            score += gd.prob->tensors[prev_sink].width * gd.prob->tensors[prev_sink].height;
+        // Check if any boundary output of prev is needed by cand
+        for (auto prev_out : gd.groups[prev].sg.boundary_outputs()) {
+            if (gd.groups[cand].sg.boundary_inputs().count(prev_out) &&
+                gd.prob->retainable_tensors.count(prev_out))
+                score += gd.prob->tensors[prev_out].width * gd.prob->tensors[prev_out].height;
+        }
         for (auto t : gd.groups[cand].sg.boundary_inputs())
             if (gd.groups[prev].sg.boundary_inputs().count(t) &&
                 gd.prob->retainable_tensors.count(t))
@@ -230,16 +232,18 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
                         useful_resident.insert(t);
 
                 // Step 2: Determine what to retain after this step.
-                // Candidate: this group's sink tensor, if future steps need it.
-                std::set<size_t> retain_these;
-                size_t sink = gd.groups[gi].sg.sink_tensor();
-                bool want_retain_sink = prob.retainable_tensors.count(sink) &&
-                                        gd.future_needs(sink, scheduled);
+                // Candidates: boundary outputs that future steps need.
+                std::set<size_t> retainable_outputs;
+                for (auto t : gd.groups[gi].sg.boundary_outputs()) {
+                    if (prob.retainable_tensors.count(t) &&
+                        gd.future_needs(t, scheduled))
+                        retainable_outputs.insert(t);
+                }
 
                 // Step 3: Evaluate memory states and strictly enforce latency improvement
                 CostResult best_cost = gd.groups[gi].base_cost;
                 std::set<size_t> best_resident;
-                bool best_retained_sink = false;
+                std::set<size_t> best_retain_these;
 
                 // Option A: Keep only what this group strictly uses
                 std::set<size_t> only_used;
@@ -249,32 +253,31 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
                 
                 auto c_used = gd.groups[gi].sg.best_cost(only_used, {});
                 if (c_used.feasible && c_used.latency < best_cost.latency) {
-                    best_cost = c_used; best_resident = only_used; best_retained_sink = false;
+                    best_cost = c_used; best_resident = only_used; best_retain_these.clear();
                 }
 
                 // Option B: Keep all pass-through residents
                 auto c_all = gd.groups[gi].sg.best_cost(useful_resident, {});
                 if (c_all.feasible && c_all.latency < best_cost.latency) {
-                    best_cost = c_all; best_resident = useful_resident; best_retained_sink = false;
+                    best_cost = c_all; best_resident = useful_resident; best_retain_these.clear();
                 }
 
-                if (want_retain_sink) {
-                    // Option C: Only used + retain sink
-                    auto c_used_sink = gd.groups[gi].sg.best_cost(only_used, {sink});
-                    if (c_used_sink.feasible && c_used_sink.latency < best_cost.latency) {
-                        best_cost = c_used_sink; best_resident = only_used; best_retained_sink = true;
+                if (!retainable_outputs.empty()) {
+                    // Option C: Only used + retain outputs
+                    auto c_used_ret = gd.groups[gi].sg.best_cost(only_used, retainable_outputs);
+                    if (c_used_ret.feasible && c_used_ret.latency < best_cost.latency) {
+                        best_cost = c_used_ret; best_resident = only_used; best_retain_these = retainable_outputs;
                     }
                     
-                    // Option D: All resident + retain sink
-                    auto c_all_sink = gd.groups[gi].sg.best_cost(useful_resident, {sink});
-                    if (c_all_sink.feasible && c_all_sink.latency < best_cost.latency) {
-                        best_cost = c_all_sink; best_resident = useful_resident; best_retained_sink = true;
+                    // Option D: All resident + retain outputs
+                    auto c_all_ret = gd.groups[gi].sg.best_cost(useful_resident, retainable_outputs);
+                    if (c_all_ret.feasible && c_all_ret.latency < best_cost.latency) {
+                        best_cost = c_all_ret; best_resident = useful_resident; best_retain_these = retainable_outputs;
                     }
                 }
 
                 CostResult cost = best_cost;
                 useful_resident = best_resident;
-                bool retained_sink = best_retained_sink;
 
                 // Build next state
                 State next;
@@ -287,8 +290,8 @@ static BeamResult beam_search_ordering(const GroupDAGInfo& gd, int beam_width) {
 
                 // Apply intermediate residency
                 std::set<size_t> intermediate_resident = useful_resident;
-                if (retained_sink)
-                    intermediate_resident.insert(sink);
+                for (auto t : best_retain_these)
+                    intermediate_resident.insert(t);
 
                 // Determine strictly what can physically stay in memory
                 std::set<size_t> exportable_retain;

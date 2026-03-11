@@ -21,9 +21,8 @@ Solution optimize_retain(const Problem& prob, const DAG& dag, Solution sol) {
             for (auto t : si.subgraph.boundary_inputs()) {
                 if (sj.subgraph.boundary_inputs().count(t)) candidates.push_back(t);
             }
-            size_t sink = si.subgraph.sink_tensor();
-            if (sj.subgraph.boundary_inputs().count(sink)) {
-                candidates.push_back(sink);
+            for (auto t : si.subgraph.boundary_outputs()) {
+                if (sj.subgraph.boundary_inputs().count(t)) candidates.push_back(t);
             }
 
             // 2. Sort candidates by size (Largest first = maximum bandwidth saved)
@@ -90,8 +89,6 @@ Solution optimize_recompute(const Problem& prob, const DAG& dag, Solution sol) {
                 int prod = dag.tensor_producer[t];
                 if (prod < 0) continue;
                 if (current_ops.count((size_t)prod)) continue;
-
-                if (!shapes_match(&prob, (size_t)prod, current_ops)) continue;
 
                 auto expanded_ops = step.subgraph.ops();
                 expanded_ops.push_back((size_t)prod);
