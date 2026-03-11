@@ -1,5 +1,5 @@
-#include "partition.h"
-#include "cost_cache.h"
+#include "partition/partition.h"
+#include "core/cost_cache.h"
 #include <map>
 
 Partition Partition::trivial(const Problem& prob, const DAG& dag) {

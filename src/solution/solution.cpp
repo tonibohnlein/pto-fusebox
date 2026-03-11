@@ -57,29 +57,28 @@ Solution::ValidationResult Solution::validate() const {
         }
     }
 
-    // 3. Per-subgraph: single-sink and connected are guaranteed by Subgraph::create,
-    //    but check tile feasibility with retained tensors.
+    // 3. Per-subgraph: check tile feasibility with retained tensors.
+    //    (Connectivity and boundary output validity are enforced by Subgraph::create.)
     for (size_t i = 0; i < steps_.size(); i++) {
         const auto& step = steps_[i];
-        if (!step.subgraph.is_feasible(step.config, retained_entering_[i])) {
+        if (!step.subgraph.is_feasible(step.config,
+                                       retained_entering_[i],
+                                       step.retain_these)) {
             fail("Step " + std::to_string(i) + ": tile config infeasible "
                  "(working set exceeds fast memory)");
             return vr;
         }
     }
 
-    // 4. Topological order: for each step, all ops it depends on (through
-    //    boundary input tensors) must be produced by an earlier step or
-    //    be graph inputs.
+    // 4. Topological order: for each step, all boundary input tensors must
+    //    have been produced by an earlier step or be graph inputs.
     std::set<size_t> available_tensors;
-    // Graph inputs are always available
     for (auto t : dag_->graph_inputs)
         available_tensors.insert(t);
 
     for (size_t i = 0; i < steps_.size(); i++) {
         const auto& sg = steps_[i].subgraph;
 
-        // Check that all boundary inputs are available
         for (auto t : sg.boundary_inputs()) {
             if (!available_tensors.count(t)) {
                 fail("Step " + std::to_string(i) + ": boundary input tensor "
@@ -88,14 +87,10 @@ Solution::ValidationResult Solution::validate() const {
             }
         }
 
-        // After this step, its sink tensor becomes available
-        available_tensors.insert(sg.sink_tensor());
-
-        // Also: recomputed ops produce their tensors (they become available)
-        for (auto op_idx : sg.ops()) {
+        // All output tensors of all ops in this step become available
+        for (auto op_idx : sg.ops())
             for (auto t : prob_->ops[op_idx].outputs)
                 available_tensors.insert(t);
-        }
     }
 
     // 5. Retain validity: retained tensors must be boundary tensors of the step
@@ -107,7 +102,7 @@ Solution::ValidationResult Solution::validate() const {
             bool is_boundary_out = sg.boundary_outputs().count(t);
             if (!is_boundary_in && !is_boundary_out) {
                 fail("Step " + std::to_string(i) + ": retained tensor "
-                     + std::to_string(t) + " is not a boundary tensor of the subgraph");
+                     + std::to_string(t) + " is not a boundary tensor");
                 return vr;
             }
         }

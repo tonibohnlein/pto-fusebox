@@ -1,7 +1,7 @@
 #pragma once
 
-#include "dag.h"
-#include "types.h"
+#include "core/dag.h"
+#include "core/types.h"
 #include <optional>
 #include <set>
 #include <vector>

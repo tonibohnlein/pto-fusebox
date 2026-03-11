@@ -22,7 +22,7 @@ struct ScheduleStep {
 //
 // Feasibility criteria:
 //   1. Coverage: every op in the DAG appears in at least one subgraph
-//   2. Per-subgraph: single-sink, connected (enforced by Subgraph::create)
+//   2. Per-subgraph: connected, valid boundary outputs (enforced by Subgraph::create)
 //   3. Tile feasibility: working set fits in fast memory (including retained)
 //   4. Topological order: if step j depends on step i, then i < j
 //   5. Retain validity: retained tensors are boundary tensors of the step

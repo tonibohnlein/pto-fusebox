@@ -1,4 +1,4 @@
-#include "init_strategies.h"
+#include "init/init_strategies.h"
 #include <algorithm>
 #include <numeric>
 #include <iostream>

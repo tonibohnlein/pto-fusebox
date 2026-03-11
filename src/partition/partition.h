@@ -1,8 +1,8 @@
 #pragma once
 
-#include "types.h"
-#include "dag.h"
-#include "subgraph.h"
+#include "core/types.h"
+#include "core/dag.h"
+#include "core/subgraph.h"
 #include <set>
 #include <vector>
 
