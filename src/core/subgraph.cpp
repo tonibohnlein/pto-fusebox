@@ -1,7 +1,9 @@
-#include "core/subgraph.h"
+#include "subgraph.h"
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
+#include <numeric>
 
 // ============================================================================
 // Utility
@@ -49,22 +51,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
   }
 
-  // Collect distinct K values for k enumeration
-  if (sg.has_matmul_) {
-    std::set<int64_t> ks;
-    for (auto i : sg.ops_)
-      if (prob.ops[i].type == OpType::MatMul)
-        ks.insert(prob.tensors[prob.ops[i].inputs[0]].width);
-    sg.all_K_values_.assign(ks.begin(), ks.end());
-  }
-
   // Boundary inputs: consumed but not produced inside
   for (auto t : consumed)
     if (!produced.count(t))
       sg.boundary_inputs_.insert(t);
 
-  // Ephemeral: produced AND consumed inside (local check — correct for
-  // the execution model where recomputation creates independent instances)
+  // Ephemeral: produced AND consumed inside
   for (auto t : produced)
     if (consumed.count(t))
       sg.ephemeral_.insert(t);
@@ -74,12 +66,75 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     if (!sg.ephemeral_.count(t))
       sg.boundary_outputs_.insert(t);
 
-  // Validate: exactly one boundary output (single-sink)
-  if (sg.boundary_outputs_.size() != 1)
+  // Validate: ephemeral tensors must have exactly one consumer within
+  // the subgraph. True ephemeral data is produced and immediately consumed
+  // by the next op in the chain — it never sits in fast memory. If two ops
+  // both need it, the tensor must be materialized (boundary, not ephemeral).
+  {
+    // Count consumers of each ephemeral tensor within the op set
+    std::map<size_t, int> eph_consumer_count;
+    for (auto t : sg.ephemeral_)
+      eph_consumer_count[t] = 0;
+    for (auto i : sg.ops_)
+      for (auto t : prob.ops[i].inputs)
+        if (sg.ephemeral_.count(t))
+          eph_consumer_count[t]++;
+    for (auto& [t, cnt] : eph_consumer_count)
+      if (cnt != 1)
+        return std::nullopt;
+  }
+
+  // Detect ephemeral MM→PW accumulators: MM output consumed by PW.
+  // When k>1, these need w×h accumulator space in fast memory.
+  {
+    // Map: tensor -> producing op index
+    std::map<size_t, size_t> eph_producer;
+    for (auto i : sg.ops_)
+      for (auto t : prob.ops[i].outputs)
+        if (sg.ephemeral_.count(t))
+          eph_producer[t] = i;
+
+    // Map: tensor -> consuming op index
+    std::map<size_t, size_t> eph_consumer_op;
+    for (auto i : sg.ops_)
+      for (auto t : prob.ops[i].inputs)
+        if (sg.ephemeral_.count(t))
+          eph_consumer_op[t] = i;
+
+    for (auto t : sg.ephemeral_) {
+      bool produced_by_mm = (prob.ops[eph_producer[t]].type == OpType::MatMul);
+      bool consumed_by_pw = (prob.ops[eph_consumer_op[t]].type == OpType::Pointwise);
+      if (produced_by_mm && consumed_by_pw)
+        sg.eph_mm_accumulators_.insert(t);
+    }
+  }
+
+  // Must have at least one boundary output
+  if (sg.boundary_outputs_.empty())
     return std::nullopt;
 
-  // Validate: ops form a connected sub-DAG (undirected reachability)
+  // All boundary outputs must have the same dimensions
+  {
+    auto it = sg.boundary_outputs_.begin();
+    sg.out_W_ = prob.tensors[*it].width;
+    sg.out_H_ = prob.tensors[*it].height;
+    for (++it; it != sg.boundary_outputs_.end(); ++it) {
+      if (prob.tensors[*it].width != sg.out_W_ ||
+          prob.tensors[*it].height != sg.out_H_)
+        return std::nullopt;
+    }
+  }
+
+  // Validate: ops form a connected group. Two ops are connected if they:
+  //   (a) have a producer-consumer edge (DAG pred/succ), OR
+  //   (b) share a common input tensor (co-consumers)
   if (sg.ops_.size() > 1) {
+    // Build co-consumer adjacency within the op set
+    std::map<size_t, std::vector<size_t>> tensor_to_ops; // tensor -> ops in set that consume it
+    for (auto i : sg.ops_)
+      for (auto t : prob.ops[i].inputs)
+        tensor_to_ops[t].push_back(i);
+
     std::set<size_t> visited;
     std::vector<size_t> bfs = {sg.ops_[0]};
     visited.insert(sg.ops_[0]);
@@ -87,7 +142,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     while (!bfs.empty()) {
       size_t u = bfs.back();
       bfs.pop_back();
-      // Check predecessors and successors within the op set
+      // DAG edges (producer-consumer)
       for (auto v : dag.op_preds[u]) {
         if (op_set.count(v) && !visited.count(v)) {
           visited.insert(v);
@@ -100,30 +155,123 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
           bfs.push_back(v);
         }
       }
+      // Shared-input edges (co-consumers of same tensor)
+      for (auto t : prob.ops[u].inputs) {
+        for (auto v : tensor_to_ops[t]) {
+          if (v != u && !visited.count(v)) {
+            visited.insert(v);
+            bfs.push_back(v);
+          }
+        }
+      }
     }
     if (visited.size() != op_set.size())
       return std::nullopt;
   }
 
-  sg.sink_tensor_ = *sg.boundary_outputs_.begin();
-  sg.out_W_ = prob.tensors[sg.sink_tensor_].width;
-  sg.out_H_ = prob.tensors[sg.sink_tensor_].height;
+  // ---- Collect per-role tiling constraints ----
+  // For each tensor, the slice shape depends on how it's used:
+  //   MatMul output:  w × h  → w | W, h | H
+  //   MatMul LHS:     k × h  → k | W, h | H
+  //   MatMul RHS:     w × k  → w | W, k | H
+  //   PW boundary:    w × h  → w | W, h | H (inputs and output)
+  //   PW ephemeral output consumed as MatMul LHS: k × h → k | W, h | H
+  //   PW ephemeral output consumed as MatMul RHS: w × k → w | W, k | H
+  //   PW ephemeral consumed by PW: propagate from downstream consumer
 
-  // Collect all output tensor dimensions (including ephemeral) for tiling
-  // validation. Every op's output must be tileable at the same [w, h].
-  {
-    std::set<int64_t> ws, hs;
-    for (auto i : sg.ops_) {
-      for (auto t : prob.ops[i].outputs) {
-        ws.insert(prob.tensors[t].width);
-        hs.insert(prob.tensors[t].height);
-      }
+  // Slice type: which tiling parameters constrain width and height
+  enum class SliceW { W_param, K_param }; // width constrained by w or k
+  enum class SliceH { H_param, K_param }; // height constrained by h or k
+
+  // For each ephemeral tensor, determine slice type from its consumer
+  std::map<size_t, std::pair<SliceW, SliceH>> eph_slice_type;
+
+  // Build map: ephemeral tensor -> consumer op
+  std::map<size_t, size_t> eph_consumer;
+  for (auto i : sg.ops_)
+    for (auto t : prob.ops[i].inputs)
+      if (sg.ephemeral_.count(t))
+        eph_consumer[t] = i;
+
+  // Determine slice type for each ephemeral tensor.
+  // Process in reverse topo order within the subgraph so that downstream
+  // PW→PW chains propagate correctly.
+  std::function<std::pair<SliceW, SliceH>(size_t)> get_eph_slice;
+  get_eph_slice = [&](size_t tensor_id) -> std::pair<SliceW, SliceH> {
+    auto it = eph_slice_type.find(tensor_id);
+    if (it != eph_slice_type.end()) return it->second;
+
+    size_t consumer_op = eph_consumer[tensor_id];
+    const auto& cop = prob.ops[consumer_op];
+
+    std::pair<SliceW, SliceH> result;
+    if (cop.type == OpType::MatMul) {
+      if (cop.inputs[0] == tensor_id)
+        result = {SliceW::K_param, SliceH::H_param}; // LHS: k × h
+      else
+        result = {SliceW::W_param, SliceH::K_param}; // RHS: w × k
+    } else {
+      // PW: inputs have same slice type as output
+      size_t pw_out = cop.outputs[0];
+      if (sg.boundary_outputs_.count(pw_out))
+        result = {SliceW::W_param, SliceH::H_param}; // boundary: w × h
+      else
+        result = get_eph_slice(pw_out); // propagate from PW output
     }
-    sg.all_out_widths_.assign(ws.begin(), ws.end());
-    sg.all_out_heights_.assign(hs.begin(), hs.end());
+
+    eph_slice_type[tensor_id] = result;
+    return result;
+  };
+
+  for (auto t : sg.ephemeral_)
+    get_eph_slice(t);
+
+  // Now collect constraints
+  std::set<int64_t> w_set, h_set, k_set;
+
+  // Helper: add constraints for a tensor given its slice type
+  auto add_constraint = [&](size_t t, SliceW sw, SliceH sh) {
+    int64_t W = prob.tensors[t].width;
+    int64_t H = prob.tensors[t].height;
+    if (sw == SliceW::W_param) w_set.insert(W); else k_set.insert(W);
+    if (sh == SliceH::H_param) h_set.insert(H); else k_set.insert(H);
+  };
+
+  for (auto i : sg.ops_) {
+    const auto& op = prob.ops[i];
+
+    if (op.type == OpType::MatMul) {
+      // LHS: always k × h
+      add_constraint(op.inputs[0], SliceW::K_param, SliceH::H_param);
+      // RHS: always w × k
+      add_constraint(op.inputs[1], SliceW::W_param, SliceH::K_param);
+      // Output: w × h (if boundary) or determined by consumer (if ephemeral)
+      size_t out = op.outputs[0];
+      if (sg.boundary_outputs_.count(out))
+        add_constraint(out, SliceW::W_param, SliceH::H_param);
+      else
+        add_constraint(out, eph_slice_type[out].first, eph_slice_type[out].second);
+    } else {
+      // PW: determine output slice type, then apply to all inputs and output
+      size_t out = op.outputs[0];
+      SliceW sw; SliceH sh;
+      if (sg.boundary_outputs_.count(out)) {
+        sw = SliceW::W_param; sh = SliceH::H_param;
+      } else {
+        auto st = eph_slice_type[out];
+        sw = st.first; sh = st.second;
+      }
+      add_constraint(out, sw, sh);
+      for (auto t : op.inputs)
+        add_constraint(t, sw, sh);
+    }
   }
 
-  // Precompute per-boundary-tensor role info for fast working_set/compute_cost.
+  sg.w_divides_.assign(w_set.begin(), w_set.end());
+  sg.h_divides_.assign(h_set.begin(), h_set.end());
+  sg.k_divides_.assign(k_set.begin(), k_set.end());
+
+  // ---- Precompute per-boundary-tensor role info ----
   {
     std::map<size_t, BoundaryTensorInfo> info_map;
     auto ensure = [&](size_t t) -> BoundaryTensorInfo & {
@@ -162,55 +310,24 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.boundary_tensor_info_.push_back(info);
   }
 
-  auto filter_w = [&](const std::vector<int64_t> &raw) {
-    std::vector<int64_t> result;
-    for (int64_t ww : raw) {
-      bool ok = true;
-      for (int64_t ow : sg.all_out_widths_)
-        if (ow % ww != 0) {
-          ok = false;
-          break;
-        }
-      if (ok)
-        result.push_back(ww);
-    }
-    return result;
-  };
-  auto filter_h = [&](const std::vector<int64_t> &raw) {
-    std::vector<int64_t> result;
-    for (int64_t hh : raw) {
-      bool ok = true;
-      for (int64_t oh : sg.all_out_heights_)
-        if (oh % hh != 0) {
-          ok = false;
-          break;
-        }
-      if (ok)
-        result.push_back(hh);
-    }
-    return result;
-  };
-  auto filter_k = [&](const std::vector<int64_t> &raw) {
-    std::vector<int64_t> result;
-    for (int64_t kk : raw) {
-      bool ok = true;
-      for (int64_t Ki : sg.all_K_values_)
-        if (Ki % kk != 0) {
-          ok = false;
-          break;
-        }
-      if (ok)
-        result.push_back(kk);
-    }
-    if (result.empty())
-      result = {1};
-    return result;
+  // ---- Build tiling candidates ----
+  // Candidates for each parameter: divisors of gcd(all constraint values).
+  // w must divide every value in w_divides_, so w divides gcd(w_divides_).
+  auto gcd_of = [](const std::vector<int64_t>& vals) -> int64_t {
+    if (vals.empty()) return 0;
+    int64_t g = vals[0];
+    for (size_t i = 1; i < vals.size(); i++)
+      g = std::gcd(g, vals[i]);
+    return g;
   };
 
-  sg.ws_cand_ = filter_w(all_divisors(sg.out_W_));
-  sg.hs_cand_ = filter_h(all_divisors(sg.out_H_));
-  sg.ks_cand_ = sg.has_matmul_ ? filter_k(all_divisors(sg.max_K_))
-                               : std::vector<int64_t>{1};
+  int64_t w_gcd = gcd_of(sg.w_divides_);
+  int64_t h_gcd = gcd_of(sg.h_divides_);
+  int64_t k_gcd = gcd_of(sg.k_divides_);
+
+  sg.ws_cand_ = w_gcd > 0 ? all_divisors(w_gcd) : std::vector<int64_t>{1};
+  sg.hs_cand_ = h_gcd > 0 ? all_divisors(h_gcd) : std::vector<int64_t>{1};
+  sg.ks_cand_ = k_gcd > 0 ? all_divisors(k_gcd) : std::vector<int64_t>{1};
 
   return sg;
 }
@@ -223,20 +340,12 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
-  // w must divide every op's output width
-  for (int64_t ow : all_out_widths_)
-    if (ow % cfg.w != 0)
-      return false;
-
-  // h must divide every op's output height
-  for (int64_t oh : all_out_heights_)
-    if (oh % cfg.h != 0)
-      return false;
-
-  // k must divide every MatMul's reduction dimension
-  for (int64_t Ki : all_K_values_)
-    if (Ki % cfg.k != 0)
-      return false;
+  for (int64_t v : w_divides_)
+    if (v % cfg.w != 0) return false;
+  for (int64_t v : h_divides_)
+    if (v % cfg.h != 0) return false;
+  for (int64_t v : k_divides_)
+    if (v % cfg.k != 0) return false;
 
   return true;
 }
@@ -249,16 +358,12 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 // For NON-retained boundary inputs: the hardware loads a tile-sized slice
 //   (h×K for MatMul LHS, k×w for MatMul RHS, h×w for Pointwise).
 //
-// For retained_from_prev tensors: the FULL tensor is already resident from
-//   the previous step. It occupies width×height, not a tile-sized slice.
-//   If the tensor is also a boundary input, the hardware reads slices from
-//   the resident copy (zero transfer cost) but the full tensor still consumes
-//   capacity.
+// For retained_from_prev tensors: the FULL tensor is already resident.
 //
-// For retain_these tensors (this step's output being retained): tiles
-//   accumulate without eviction. At the last tile, (num_tiles-1)×h×w of
-//   previously-computed tiles sit in memory alongside the current tile's
-//   working set. The peak additional cost is (full_output_size - h×w).
+// For boundary outputs: the current tile (h×w) is in fast memory.
+//
+// For retain_these tensors (outputs being retained): tiles accumulate
+//   without eviction. Peak additional cost is (full_size - h×w).
 // ============================================================================
 
 int64_t Subgraph::working_set(const TileConfig &cfg,
@@ -281,7 +386,11 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.h * info.max_lhs_K);
     if (info.is_mm_rhs)
       max_size = std::max(max_size, cfg.k * cfg.w);
-    if (info.is_mm_out || info.is_pw_in)
+    if (info.is_pw_in)
+      max_size = std::max(max_size, cfg.h * cfg.w);
+    // MatMul boundary outputs are accumulators that persist during reduction.
+    // PW boundary outputs do NOT count — they reuse input buffer memory.
+    if (info.is_mm_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
 
     ws += max_size;
@@ -300,37 +409,60 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   }
 
   // Retained output accumulates: at the last tile, the full tensor is resident.
-  // If the current tile is already counted above (MM output: is_mm_out → h×w),
-  // we add full - tile. If NOT counted (PW output: max_size=0), add full.
   for (auto t : retain_these) {
     int64_t full = prob_->tensors[t].width * prob_->tensors[t].height;
     int64_t tile = cfg.h * cfg.w;
     if (full <= tile)
       continue; // single tile, no accumulation overhead
 
-    // Check if this tensor's current tile is already counted in ws
+    // The current tile is already counted above (h×w for boundary_out).
+    // Add the rest (previously-computed tiles sitting in memory).
     bool tile_counted = false;
     for (auto &info : boundary_tensor_info_) {
       if (info.id == t) {
-        // Was it counted? Check if any role contributed > 0
         int64_t sz = 0;
         if (info.max_lhs_K > 0)
           sz = std::max(sz, cfg.h * info.max_lhs_K);
         if (info.is_mm_rhs)
           sz = std::max(sz, cfg.k * cfg.w);
-        if (info.is_mm_out || info.is_pw_in)
+        if (info.is_pw_in)
+          sz = std::max(sz, cfg.h * cfg.w);
+        if (info.is_mm_out)
           sz = std::max(sz, cfg.h * cfg.w);
         if (retained_from_prev.count(t))
-          sz = full; // already fully counted
+          sz = full;
         tile_counted = (sz > 0);
         break;
       }
     }
 
     if (tile_counted)
-      ws += full - tile; // current tile already in ws
+      ws += full - tile;
     else
-      ws += full; // PW output: current tile NOT in ws, add everything
+      ws += full;
+  }
+
+  // Ephemeral MM→PW accumulators: when the producing MatMul needs multiple
+  // k-steps (K_mm / k > 1), the w×h accumulator persists in fast memory
+  // across those steps until the PW fires at the last step.
+  // When K_mm <= k (single k-step), the MM completes in one shot and the
+  // PW consumes it immediately — no persistent accumulator needed.
+  for (auto t : eph_mm_accumulators_) {
+    // Find the producing op to get its K dimension
+    for (auto i : ops_) {
+      const auto &op = prob_->ops[i];
+      if (op.type == OpType::MatMul) {
+        for (auto ot : op.outputs) {
+          if (ot == t) {
+            int64_t K_mm = prob_->tensors[op.inputs[0]].width;
+            if (K_mm > cfg.k)
+              ws += cfg.w * cfg.h;
+            goto next_accum;
+          }
+        }
+      }
+    }
+    next_accum:;
   }
 
   return ws;
@@ -345,7 +477,7 @@ bool Subgraph::is_feasible(const TileConfig &cfg,
 }
 
 // ============================================================================
-// Cost computation (analytical, O(1) in tile count)
+// Cost computation
 // ============================================================================
 
 CostResult Subgraph::compute_cost(const TileConfig &cfg,
@@ -371,16 +503,12 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   result.num_k_passes = has_matmul_ ? (int)(max_K_ / cfg.k) : 1;
   int nk = result.num_k_passes;
 
-  // Compute scale: number of native-sized sub-tiles per spatial tile.
-  // Below native: ceil gives 1 (padded execution, full native cost).
-  // Above native: ceil gives the number of native passes needed.
+  // Compute scale: native padding factor
   auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
   int64_t scale =
       ceil_div(cfg.w, prob_->native_w) * ceil_div(cfg.h, prob_->native_h);
 
   // Separate MatMul compute (per k-step) from PW compute (once per tile).
-  // Problem: "For Pointwise operations, k is ignored... executes once per
-  // spatial tile."
   double mm_comp = 0.0;
   double pw_comp = 0.0;
   for (auto i : ops_) {
@@ -394,21 +522,12 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   }
   mm_comp *= (double)scale;
   pw_comp *= (double)scale;
-  result.compute_per_step = mm_comp; // per k-step (PW added only at last step)
+  result.compute_per_step = mm_comp;
 
   // Memory transfer costs per tile-step.
-  // Each boundary input tensor is loaded at most once per tile; use a counted
-  // array to avoid double-charging when multiple ops share the same input.
+  // Use a small set to avoid double-charging shared inputs.
   double lhs_load = 0, rhs_load = 0, pw_in_load = 0, out_evict = 0;
-  size_t xfer_counted[128];
-  int xfer_count = 0;
-
-  auto is_counted = [&](size_t t) {
-    for (int idx = 0; idx < xfer_count; ++idx)
-      if (xfer_counted[idx] == t)
-        return true;
-    return false;
-  };
+  std::set<size_t> xfer_counted;
 
   for (auto i : ops_) {
     const auto &op = prob_->ops[i];
@@ -416,29 +535,29 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       int64_t Ki = op_K(i);
       if (boundary_inputs_.count(op.inputs[0]) &&
           !retained_from_prev.count(op.inputs[0]) &&
-          !is_counted(op.inputs[0])) {
+          !xfer_counted.count(op.inputs[0])) {
         lhs_load += (double)(cfg.h * Ki) / B;
-        xfer_counted[xfer_count++] = op.inputs[0];
+        xfer_counted.insert(op.inputs[0]);
       }
       if (boundary_inputs_.count(op.inputs[1]) &&
           !retained_from_prev.count(op.inputs[1]) &&
-          !is_counted(op.inputs[1])) {
+          !xfer_counted.count(op.inputs[1])) {
         rhs_load += (double)(cfg.k * cfg.w) / B;
-        xfer_counted[xfer_count++] = op.inputs[1];
+        xfer_counted.insert(op.inputs[1]);
       }
     } else {
       for (auto t : op.inputs)
         if (boundary_inputs_.count(t) && !retained_from_prev.count(t) &&
-            !is_counted(t)) {
+            !xfer_counted.count(t)) {
           pw_in_load += (double)(cfg.h * cfg.w) / B;
-          xfer_counted[xfer_count++] = t;
+          xfer_counted.insert(t);
         }
     }
     for (auto t : op.outputs)
       if (boundary_outputs_.count(t) && !retain_these.count(t) &&
-          !is_counted(t)) {
+          !xfer_counted.count(t)) {
         out_evict += (double)(cfg.h * cfg.w) / B;
-        xfer_counted[xfer_count++] = t;
+        xfer_counted.insert(t);
       }
   }
 
@@ -446,7 +565,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   auto tile_cost = [&](bool lhs_fresh, bool rhs_fresh) {
     double lat = 0;
     for (int ks = 0; ks < nk; ks++) {
-      double mi = rhs_load;
+      double mi = rhs_load; // RHS strips streamed each k-step
       if (ks == 0) {
         mi = 0;
         if (lhs_fresh)
@@ -456,7 +575,6 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         mi += pw_in_load;
       }
       double mo = (ks == nk - 1) ? out_evict : 0;
-      // PW compute only at last k-step (PW runs once per tile)
       double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
       lat += std::max(step_comp, mi + mo);
     }
@@ -493,8 +611,6 @@ CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
   int64_t min_w = std::max<int64_t>(1, prob_->native_w / 4);
   int64_t min_h = std::max<int64_t>(1, prob_->native_h / 4);
 
-  // For MatMul subgraphs: snake reuse (RM or CM) always ties or beats None.
-  // For PW-only: snake has no effect, use None as placeholder.
   std::vector<SnakeDir> snakes;
   if (has_matmul_) {
     snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};
@@ -502,7 +618,6 @@ CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
     snakes = {SnakeDir::None};
   }
 
-  // Search over given candidate lists
   auto search = [&](const std::vector<int64_t> &ws,
                     const std::vector<int64_t> &hs,
                     const std::vector<int64_t> &ks, int64_t mw, int64_t mh) {
@@ -530,7 +645,7 @@ CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
 
   CostResult best = search(ws_cand_, hs_cand_, ks_cand_, min_w, min_h);
   if (!best.feasible)
-    best = search(ws_cand_, hs_cand_, ks_cand_, 1, 1); // relax min tile size
+    best = search(ws_cand_, hs_cand_, ks_cand_, 1, 1);
 
   return best;
 }
