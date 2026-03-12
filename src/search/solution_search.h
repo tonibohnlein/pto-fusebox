@@ -58,13 +58,15 @@ struct SolutionFMConfig {
 // One FM pass (active set + op/tensor locking + drift)
 SolutionFMPassResult solution_fm_pass(const Problem& prob, const DAG& dag,
                                        std::vector<ScheduleStep> steps,
-                                       const SolutionFMPassConfig& cfg = {});
+                                       const SolutionFMPassConfig& cfg = {},
+                                       const std::set<size_t>* fr = nullptr);
 
 // Greedy hill climb with heap-based lazy move selection
 std::vector<ScheduleStep> solution_greedy_descent(const Problem& prob, const DAG& dag,
                                                     std::vector<ScheduleStep> steps,
                                                     std::chrono::steady_clock::time_point deadline 
-                                                    = std::chrono::steady_clock::time_point::max());
+                                                    = std::chrono::steady_clock::time_point::max(),
+                                                    const std::set<size_t>* fr = nullptr);
 
 // Parallel FM search: N threads with different seeds, adaptive cooling
 // Single starting solution

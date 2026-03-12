@@ -123,60 +123,25 @@ struct SolState {
   std::vector<int> gen; // per-step generation counter
   double total = 0;
 
-  // Precomputed: tensors that CAN be retained (singleton feasibility check)
-  std::set<size_t> feasibly_retainable;
+  // Precomputed: tensors that CAN be retained (singleton feasibility check).
+  // Points to externally-owned set (shared across all SolStates for an instance).
+  // If null, all retainable_tensors are considered feasible (fallback).
+  const std::set<size_t> *feasibly_retainable = nullptr;
 
-  void init(const Problem &p, const DAG &d, std::vector<ScheduleStep> s) {
+  // Convenience: check if tensor is feasibly retainable
+  bool is_feasibly_retainable(size_t t) const {
+    if (feasibly_retainable) return feasibly_retainable->count(t);
+    return prob->retainable_tensors.count(t);
+  }
+
+  void init(const Problem &p, const DAG &d, std::vector<ScheduleStep> s,
+            const std::set<size_t> *fr = nullptr) {
     prob = &p;
     dag = &d;
     steps = std::move(s);
     gen.assign(steps.size(), 0);
-    compute_feasibly_retainable();
+    feasibly_retainable = fr;
     rebuild_all();
-  }
-
-  // Check which tensors can actually be retained:
-  // 1. Must fit in fast memory (already in prob->retainable_tensors)
-  // 2. Producer singleton must have a feasible tiling with tensor retained
-  // 3. Each consumer singleton must have a feasible tiling with tensor entering
-  void compute_feasibly_retainable() {
-    feasibly_retainable.clear();
-    for (auto t : prob->retainable_tensors) {
-      // Quick size check (redundant with retainable_tensors, but explicit)
-      if (prob->tensors[t].size() > prob->fast_memory_capacity)
-        continue;
-
-      bool ok = true;
-
-      // Check producer: singleton subgraph with retain_these={t}
-      int prod = dag->tensor_producer[t];
-      if (prod >= 0) {
-        auto sg = Subgraph::create(*prob, *dag, {(size_t)prod});
-        if (!sg) { ok = false; }
-        else {
-          // Producer must be feasible while retaining t
-          auto bc = sg->best_cost({}, {t});
-          if (!bc.feasible) ok = false;
-        }
-      }
-
-      if (!ok) continue;
-
-      // Check each consumer: singleton subgraph with ret_entering={t}
-      for (size_t op = 0; op < prob->num_ops() && ok; op++) {
-        bool consumes = false;
-        for (auto inp : prob->ops[op].inputs)
-          if (inp == t) { consumes = true; break; }
-        if (!consumes) continue;
-
-        auto sg = Subgraph::create(*prob, *dag, {op});
-        if (!sg) { ok = false; break; }
-        auto bc = sg->best_cost({t}, {});
-        if (!bc.feasible) { ok = false; break; }
-      }
-
-      if (ok) feasibly_retainable.insert(t);
-    }
   }
   
   void rebuild_all() {
@@ -285,6 +250,47 @@ struct SolState {
       g++;
   }
 };
+
+// ============================================================================
+// One-time feasibility check: which tensors can actually be retained?
+// Depends only on Problem + DAG, not on the current solution.
+// ============================================================================
+static std::set<size_t> compute_feasibly_retainable(const Problem &prob, const DAG &dag) {
+    std::set<size_t> result;
+    for (auto t : prob.retainable_tensors) {
+        if (prob.tensors[t].size() > prob.fast_memory_capacity)
+            continue;
+
+        bool ok = true;
+
+        // Producer singleton must be feasible while retaining t
+        int prod = dag.tensor_producer[t];
+        if (prod >= 0) {
+            auto sg = Subgraph::create(prob, dag, {(size_t)prod});
+            if (!sg) { ok = false; }
+            else {
+                auto bc = sg->best_cost({}, {t});
+                if (!bc.feasible) ok = false;
+            }
+        }
+        if (!ok) continue;
+
+        // Each consumer singleton must be feasible with t entering
+        for (size_t op = 0; op < prob.num_ops() && ok; op++) {
+            bool consumes = false;
+            for (auto inp : prob.ops[op].inputs)
+                if (inp == t) { consumes = true; break; }
+            if (!consumes) continue;
+
+            auto sg = Subgraph::create(prob, dag, {op});
+            if (!sg) { ok = false; break; }
+            auto bc = sg->best_cost({t}, {});
+            if (!bc.feasible) { ok = false; break; }
+        }
+        if (ok) result.insert(t);
+    }
+    return result;
+}
 
 // ============================================================================
 // Best move for a single OP (partition-style moves)
@@ -589,7 +595,7 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
   const auto &prob = *state.prob;
   if (locked_tensors.count(t))
     return best;
-  if (!state.feasibly_retainable.count(t))
+  if (!state.is_feasibly_retainable(t))
     return best;
 
   // RETAIN_ADD: find step pairs where adding t to retain helps
@@ -1107,7 +1113,7 @@ struct SolActiveSet {
   void activate_tensor(SolState &state, size_t t) {
     if (active_tensors.count(t) || locked_tensors.count(t))
       return;
-    if (!state.feasibly_retainable.count(t))
+    if (!state.is_feasibly_retainable(t))
       return;  // precomputed: can never be retained
     if (Clock::now() >= deadline)
       return;
@@ -1213,9 +1219,10 @@ struct SolActiveSet {
 std::vector<ScheduleStep>
 solution_greedy_descent(const Problem &prob, const DAG &dag,
                         std::vector<ScheduleStep> steps,
-                        Clock::time_point deadline) {
+                        Clock::time_point deadline,
+                        const std::set<size_t> *fr) {
   SolState state;
-  state.init(prob, dag, std::move(steps));
+  state.init(prob, dag, std::move(steps), fr);
   SolMoveHeap heap;
 
   // Generate initial moves — for large solutions, limit initial scope
@@ -1267,9 +1274,10 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
 
 SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
                                       std::vector<ScheduleStep> steps,
-                                      const SolutionFMPassConfig &cfg) {
+                                      const SolutionFMPassConfig &cfg,
+                                      const std::set<size_t> *fr) {
   SolState state;
-  state.init(prob, dag, std::move(steps));
+  state.init(prob, dag, std::move(steps), fr);
 
   SolutionFMPassResult result;
   result.start_cost = state.total;
@@ -1286,7 +1294,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   // Initialize: seed init_count entities (biased 2:1 toward tensors)
   std::mt19937 rng(cfg.seed);
   std::vector<size_t> all_tensors;
-  for (auto t : state.feasibly_retainable)
+  for (auto t : (state.feasibly_retainable ? *state.feasibly_retainable : prob.retainable_tensors))
     all_tensors.push_back(t);
   std::vector<size_t> all_ops;
   for (size_t i = 0; i < state.size(); i++)
@@ -1763,16 +1771,10 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
 
     double starting_best = global_best_cost;
 
-    // One-time feasibility check: which tensors can actually be retained?
-    {
-        SolState probe;
-        probe.prob = &prob;
-        probe.dag = &dag;
-        probe.steps = pool[0].steps; // dummy, just need prob+dag for the check
-        probe.compute_feasibly_retainable();
-        std::cerr << "  Feasibly retainable: " << probe.feasibly_retainable.size()
-                  << "/" << prob.retainable_tensors.size() << " tensors\n";
-    }
+    // One-time feasibility check: depends only on Problem + DAG
+    auto fr = compute_feasibly_retainable(prob, dag);
+    std::cerr << "  Feasibly retainable: " << fr.size()
+              << "/" << prob.retainable_tensors.size() << " tensors\n";
 
     // Pool insert with diversity
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
@@ -1912,7 +1914,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     pc.max_drift_fraction = eff_drift;
                     pc.max_no_improve = eff_no_improve;
 
-                    auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc);
+                    auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc, &fr);
                     total_fm_passes++;
 
                     if (pr.best_cost < child_cost - 0.01) {
@@ -1929,7 +1931,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     // Also try greedy descent on end state
                     if (pr.moves_applied > 0 && Clock::now() < cfg.deadline) {
                         auto kicked = solution_greedy_descent(prob, dag,
-                            std::move(pr.end_steps), cfg.deadline);
+                            std::move(pr.end_steps), cfg.deadline, &fr);
                         Solution kicked_sol(prob, dag, kicked);
                         kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
                         pool_insert(kicked_sol.steps(), kicked_sol.total_latency());

@@ -16,6 +16,12 @@ def generate_instance_dot(input_data, out_filepath):
         ""
     ]
 
+    cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
+    if cap_kb > 0:
+        lines.append(f'    label="Fast Memory Capacity: {cap_kb:.1f} KB\\n";')
+        lines.append('    labelloc="t";')
+        lines.append('')
+
     # 1. Define Tensors (Data)
     lines.append("    // --- Tensors ---")
     for i, (w, h) in enumerate(zip(input_data['widths'], input_data['heights'])):
@@ -61,20 +67,28 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         ""
     ]
 
+    cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
+    if cap_kb > 0:
+        lines.append(f'    label="Fast Memory Capacity: {cap_kb:.1f} KB\\n";')
+        lines.append('    labelloc="t";')
+        lines.append('')
+
     # Pre-calculate solution metadata
     retained_tensors = set()
     step_retains = {}
-    for step_idx, retains in enumerate(output_data['tensors_to_retain']):
+    for step_idx, retains in enumerate(output_data.get('tensors_to_retain', [])):
         for t in retains:
             retained_tensors.add(t)
             if t not in step_retains:
                 step_retains[t] = []
             step_retains[t].append(step_idx)
 
-    op_to_step = {}
+    op_steps = {}
     for step_idx, sub_ops in enumerate(output_data['subgraphs']):
         for op in sub_ops:
-            op_to_step[op] = step_idx
+            if op not in op_steps:
+                op_steps[op] = []
+            op_steps[op].append(step_idx)
 
     # --- Ephemeral Tensor Deduction ---
     tensor_producers = {}
@@ -86,37 +100,96 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         for t_out in input_data['outputs'][op_idx]:
             tensor_producers[t_out] = op_idx
 
-    ephemeral_tensors = set()
-    for t_idx in range(len(input_data['widths'])):
-        # Must have a producer and at least one consumer to be ephemeral
-        if t_idx in tensor_producers and len(tensor_consumers[t_idx]) > 0:
-            prod_op = tensor_producers[t_idx]
-            prod_step = op_to_step.get(prod_op, -1)
-            
-            if prod_step != -1:
-                is_ephemeral = True
-                for cons_op in tensor_consumers[t_idx]:
-                    if op_to_step.get(cons_op, -1) != prod_step:
-                        is_ephemeral = False
-                        break
-                if is_ephemeral:
-                    ephemeral_tensors.add(t_idx)
+    prod_steps_for_t = {}
+    for t in range(len(input_data['widths'])):
+        prod_op = tensor_producers.get(t, -1)
+        prod_steps_for_t[t] = set(op_steps.get(prod_op, []))
+
+    cons_steps_for_t = {t: set() for t in range(len(input_data['widths']))}
+    for t in range(len(input_data['widths'])):
+        for cons_op in tensor_consumers[t]:
+            for s in op_steps.get(cons_op, []):
+                cons_steps_for_t[t].add(s)
 
     # 1. Define Tensors
     lines.append("    // --- Tensors ---")
+    
+    cap_kb_raw = input_data.get('fast_memory_capacity', 0) / 1024.0
+    
     for i, (w, h) in enumerate(zip(input_data['widths'], input_data['heights'])):
         size_kb = (w * h) / 1024.0
         
-        if i in retained_tensors:
-            steps_str = ",".join(map(str, step_retains[i]))
-            label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[Retained: Steps {steps_str}]"
-            lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=gold];")
-        elif i in ephemeral_tensors:
-            label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[Ephemeral]"
-            lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=silver];")
+        # Base style parameters
+        style_list = ["filled"]
+        border_color = "black"
+        penwidth = 1.0
+
+        # Mark with red border if tensor doesn't fit in fast memory
+        if cap_kb_raw > 0 and size_kb > cap_kb_raw:
+            border_color = "red"
+            penwidth = 3.0
+            
+        is_retained = i in retained_tensors
+        is_ephemeral = False
+        is_nonephemeral = False
+        
+        prod_op = tensor_producers.get(i, -1)
+        
+        if prod_op == -1 or len(tensor_consumers[i]) == 0:
+            is_nonephemeral = True # Network input/output
         else:
-            label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)"
-            lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=lightblue];")
+            # We examine each specific producer-consumer pair individually to check for ephemerality
+            for s in prod_steps_for_t[i]:
+                # If there's an external consumer not inside this producer step, it acts non-ephemerally for that path
+                step_is_ephemeral = True
+                for global_cons in tensor_consumers[i]:
+                    if s not in op_steps.get(global_cons, []):
+                        step_is_ephemeral = False
+                        break
+                if step_is_ephemeral:
+                    is_ephemeral = True
+                else:
+                    is_nonephemeral = True
+                    
+            for s in cons_steps_for_t[i]:
+                # If a consumer step did not also produce it, it acts non-ephemerally for that path
+                if s not in prod_steps_for_t[i]:
+                    is_nonephemeral = True
+
+        # Now decide colors based on mixture of roles
+        roles = []
+        colors_for_roles = []
+        
+        if is_retained:
+            steps_str = ",".join(map(str, step_retains[i]))
+            roles.append(f"Retained: {steps_str}")
+            colors_for_roles.append("gold")
+            
+        if is_nonephemeral and not is_retained:
+            roles.append("Mem")
+            colors_for_roles.append("lightblue")
+            
+        if is_ephemeral:
+            roles.append("Eph")
+            colors_for_roles.append("silver")
+            
+        # Fallback if no roles caught (should be impossible)
+        if not roles:
+            roles.append("Unknown")
+            colors_for_roles.append("lightblue")
+            
+        # Compile styling string
+        if len(colors_for_roles) > 1:
+            style_list.append("wedged")
+            
+        fillcolor_str = ":".join(colors_for_roles)
+        style_str = ",".join(style_list)
+        role_label = "|".join(roles)
+            
+        label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[{role_label}]"
+        
+        # Add to graph
+        lines.append(f"    T{i} [label=\"{label}\", shape=box, style=\"{style_str}\", fillcolor=\"{fillcolor_str}\", color=\"{border_color}\", penwidth={penwidth}];")
 
     # 2. Define Ops
     lines.append("\n    // --- Operations ---")
@@ -124,26 +197,35 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         op_type = input_data['op_types'][i]
         cost = input_data['base_costs'][i]
         
-        step_idx = op_to_step.get(i, -1)
-        if step_idx != -1:
-            gran = output_data['granularities'][step_idx]
-            lat = output_data['subgraph_latencies'][step_idx]
+        steps = op_steps.get(i, [])
+        if steps:
+            # Use wedged multi-colors to vividly indicate sharing/multiple instances of recomputations
+            style = "filled,wedged" if len(steps) > 1 else "filled"
+            color_list = ":".join(colors[s % len(colors)] for s in steps)
             
-            trav_order = output_data.get('traversal_orders', [])[step_idx]
+            first_step = steps[0]
+            gran_list = output_data.get('granularities', [])
+            gran = gran_list[first_step] if len(gran_list) > first_step else ['?','?','?']
+            
+            lat_list = output_data.get('subgraph_latencies', [])
+            lat = lat_list[first_step] if len(lat_list) > first_step else 0.0
+            
+            trav_order = output_data.get('traversal_orders', [])
             snake_str = "None"
-            if trav_order is not None and len(trav_order) > 1:
-                if abs(trav_order[1] - trav_order[0]) == 1:
+            if len(trav_order) > first_step and trav_order[first_step] is not None and len(trav_order[first_step]) > 1:
+                t_ord = trav_order[first_step]
+                if abs(t_ord[1] - t_ord[0]) == 1:
                     snake_str = "RowMajor"
                 else:
                     snake_str = "ColMajor"
             
-            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nStep {step_idx}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}\\nLat: {lat:.1f}\\n{snake_str}"
-            color = colors[step_idx % len(colors)]
+            step_str = ",".join(map(str, steps))
+            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}\\nLat: {lat:.1f}\\n{snake_str}"
+            lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
         else:
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"
             color = "lightgrey"
-            
-        lines.append(f"    Op{i} [label=\"{label}\", shape=ellipse, style=filled, fillcolor=\"{color}\"];")
+            lines.append(f"    Op{i} [label=\"{label}\", shape=ellipse, style=filled, fillcolor=\"{color}\"];")
 
     # 3. Define Edges
     lines.append("\n    // --- Data Edges ---")
