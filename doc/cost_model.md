@@ -48,6 +48,15 @@ each ephemeral tensor must have exactly **one** consumer op within the subgraph.
 Fan-out of ephemeral tensors is invalid because the data exists only momentarily
 and cannot be consumed twice.
 
+### 6. Ephemeral tensors have no external consumers
+
+An ephemeral tensor must not be consumed by any op **outside** the subgraph.
+Since ephemeral data never touches fast memory or slow memory, external ops would
+have no way to access it. If a tensor is produced inside the subgraph and consumed
+both internally and externally, it must be classified as a boundary output (not
+ephemeral), so the solver must either not fuse the producer into this subgraph
+or ensure the external consumer is also included.
+
 Note: fan-out of **boundary** tensors is fine — boundary tensors are materialized
 in slow memory (or retained in fast memory) and can be read by multiple subgraphs.
 
@@ -188,11 +197,10 @@ slice size across all roles is used.
 
 - **MatMul output (accumulator)**: `h × w`. Required because the accumulator
   must persist in fast memory across k-steps.
-- **PW output**: **NOT counted**. The hardware processes PW element-by-element
-  in a streaming fashion; the output does not need a separate buffer in fast
-  memory. This is confirmed by Example 2 in PROBLEM.md where a PW singleton
-  at `[128,128]` fits in capacity 25,000 (input 16,384 ≤ 25,000; if output
-  were counted, 32,768 > 25,000 would be OOM).
+- **PW output**: `h × w`. The output tile must be in fast memory to be written.
+
+In all cases, boundary outputs contribute `h × w` to the working set. For MatMul
+outputs this also serves as the accumulator across k-steps.
 
 Note: for mixed MM→PW subgraphs, the PW sink constraint forces k = 1. This
 means the MatMul completes its output in a single step, so the ephemeral
@@ -247,6 +255,25 @@ estimate.
   full output.
 - Above native (e.g., w=256, native=128): `ceil(256/128) = 2`. The hardware
   needs 2 native passes per tile direction.
+
+### Spatial vs temporal scaling (issue #38 clarification)
+
+The key distinction is that **spatial tiling** and **k-splitting** scale compute
+differently:
+
+- **Spatial tiling** (multiple tiles covering a large tensor): each tile pays
+  `base_cost × scale`. The full native array fires each time. Total compute =
+  `num_tiles × base_cost × scale`. More tiles means more total work — there is
+  no per-tile reduction. (Example 2: 4 tiles × 1000 = 4000 total.)
+- **K-splitting** (reduction dimension split into steps): each k-step pays
+  `base_cost × (k / K)`. Fewer cycles are streamed through the array. Total
+  compute = `base_cost × scale` (same as a single full-K step). Splitting K
+  into more steps does not increase total compute. (Example 5: 4 steps × 500 =
+  2000 per op, same as 1 step × 2000.)
+
+The organizers confirmed this after issue #38 and updated PROBLEM.md to call it
+out explicitly. They also enforced that `native_granularity` is the same across
+all dimensions in the benchmark datasets.
 
 ### Per-k-step compute
 
@@ -325,14 +352,47 @@ A tile's total latency is the sum of its k-step latencies.
 
 ---
 
-## Snake traversal (tile ordering)
+## Tile ordering and data reuse
 
-Without snake (`None`): every tile loads all its inputs fresh. The per-tile cost
-is `tile_cost(lhs_fresh=true, rhs_fresh=true)` and total = `num_tiles × per_tile`.
+The hardware implicitly reuses any tensor data that is still resident in fast
+memory from the previous tile step. This applies regardless of traversal order —
+raster order gets reuse too. The traversal order controls *which* strips are
+shared between consecutive tiles.
 
-With snake, tiles are visited in a zig-zag pattern that enables data reuse for
-**MatMul** subgraphs. For PW-only subgraphs, snake has no effect (all inputs
-depend on both row and column, so there's no strip reuse).
+For **MatMul**, each tile loads an LHS row strip (identified by the output's row
+index) and an RHS column strip (identified by the output's column index). If
+consecutive tiles share the same row, the LHS strip is reused. If they share the
+same column, the RHS strip is reused.
+
+For **PW-only** subgraphs, all boundary inputs have shape `h × w` and change
+with every tile position, so there is no strip reuse regardless of traversal
+order.
+
+### Reuse constraint with k-splitting (nk > 1)
+
+When k < K (the reduction dimension is split), the RHS strip loaded in the last
+k-step of tile N covers k-range `[(nk-1)×k, K)`. Tile N+1's first k-step needs
+k-range `[0, k)` — a completely different strip. So **RHS reuse across spatial
+tiles is invalid when nk > 1**. LHS reuse remains valid because the full `h × K`
+LHS strip stays resident across all k-steps.
+
+In the code, `tile_cost()` forces `rhs_fresh = true` when `nk > 1`.
+
+### Raster order (default / `None`)
+
+Standard row-major traversal: `(0,0), (0,1), ..., (0,ntw-1), (1,0), ...`
+
+Within each row, consecutive tiles share the LHS row strip. At the start of a
+new row, both LHS and RHS must be reloaded (the LHS row changes, and the RHS
+column jumps back to 0 — which was last loaded ntw-1 tiles ago and has been
+evicted).
+
+Tile classification for raster order:
+- **ff** (both fresh): `nth` tiles (first tile of each row)
+- **rf** (LHS reused, RHS fresh): `(ntw - 1) × nth` tiles (subsequent tiles in each row)
+
+This was confirmed by the updated Example 4A (issues #3, #15, #37): raster order
+on a 2×2 grid gives 2×2048 + 2×1500 = 7096, not 4×2048 = 8192.
 
 ### RowMajor snake
 
@@ -358,14 +418,26 @@ are transposed:
 - **rf** (LHS reused): `ntw - 1`
 - **fr** (RHS reused): `(nth - 1) × ntw`
 
-### Which snake is better?
+### Which traversal is best?
 
-RowMajor creates more LHS-reuse tiles (`(ntw-1)×nth`), ColMajor creates more
-RHS-reuse tiles (`(nth-1)×ntw`). Choose RowMajor when LHS is large relative to
-RHS (wide grid), ColMajor when RHS is large (tall grid).
+**Raster vs snake**: Raster already gets LHS reuse within each row (same count
+as RowMajor: `(ntw-1)×nth` LHS-reuse tiles). The advantage of snake is the
+additional reuse at **row/column boundaries**:
 
-Snake only affects MatMul subgraphs. For PW-only, all boundary inputs have shape
-`h × w` regardless of tile position, so there's no spatial reuse pattern.
+- **Raster**: `nth` fresh tiles (start of each row) + `(ntw-1)×nth` LHS-reuse
+- **RowMajor**: same LHS-reuse as raster, plus `nth-1` RHS-reuse tiles at row
+  boundaries (saves 1 fresh tile per transition). Strictly better by `nth-1`
+  tiles of RHS savings.
+- **ColMajor**: `ntw-1` LHS-reuse + `(nth-1)×ntw` RHS-reuse. Better than
+  RowMajor when RHS strips are more expensive than LHS strips.
+
+Choose RowMajor when LHS is large relative to RHS (wide grid), ColMajor when
+RHS is large (tall grid). For PW-only subgraphs, all three are identical.
+
+**With k-splitting (nk > 1)**: RHS reuse across spatial tiles is invalid (see
+above), so the fr (RHS-reuse) tiles in snake degrade to ff (both fresh). Snake
+still helps via LHS reuse, but the row/column-transition benefit disappears.
+In this case, raster and RowMajor snake produce the same cost.
 
 ---
 
@@ -407,7 +479,9 @@ The optimizer enumerates all valid `[w, h, k]` combinations:
   heights, boundary output heights, etc.)
 - `k` ∈ `{1}` if any boundary output is a PW output (PW sink constraint);
   otherwise `k` ∈ divisors of `gcd(k_divides_)` (MatMul reduction dimensions)
-- Snake ∈ {RowMajor, ColMajor} for MatMul subgraphs, {None} for PW-only
+- Snake ∈ {RowMajor, ColMajor} for MatMul subgraphs, {None} for PW-only.
+  Raster (None) is not searched for MatMul because RowMajor is always ≥ raster
+  (same LHS reuse plus additional RHS reuse at row boundaries).
 
 Minimum tile size: `native_w/4 × native_h/4` (relaxed to 1×1 if nothing fits).
 
@@ -421,11 +495,24 @@ latency, and keeps the minimum.
     total_latency = Σ over all tiles of Σ over all k-steps of
                     max(step_compute, memory_in + memory_out)
 
-With snake, this simplifies to:
+This simplifies analytically using reuse counts:
 
     total = ff_count × tile_cost(true, true)
           + rf_count × tile_cost(false, true)
           + fr_count × tile_cost(true, false)
 
 Where `tile_cost(lhs_fresh, rhs_fresh)` sums the k-step roofline values for
-one tile with the given reuse pattern.
+one tile with the given reuse pattern. When `nk > 1`, `rhs_fresh` is forced
+`true` inside `tile_cost` (RHS reuse is invalid across tiles with k-splitting).
+
+The counts for each traversal mode:
+
+| Mode | ff (both fresh) | rf (LHS reused) | fr (RHS reused) |
+|------|----------------|-----------------|-----------------|
+| Raster | nth | (ntw-1)×nth | 0 |
+| RowMajor | 1 | (ntw-1)×nth | nth-1 |
+| ColMajor | 1 | ntw-1 | (nth-1)×ntw |
+| PW-only | ntw×nth | 0 | 0 |
+
+For PW-only subgraphs, all inputs depend on both row and column, so there is
+no strip reuse and every tile pays the same cost.
