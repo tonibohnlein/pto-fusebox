@@ -447,10 +447,28 @@ Solution solve(const Problem& prob, TimePoint deadline) {
         effective_deadline = now + std::chrono::seconds(3);
     auto total_budget = effective_deadline - now;
 
-    // Time allocation: 35% partition search, 5% build, 60% solution evo+FM
-    auto phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 35 / 100);
-    auto phase2_deadline = phase1_deadline + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 5 / 100);
-    auto phase3_deadline = now + total_budget;
+    // Precompute once: which tensors can physically be retained?
+    auto feasibly_ret = compute_feasibly_retainable(prob, dag);
+    bool has_retain = !feasibly_ret.empty();
+
+    std::cerr << "  Retainable tensors: " << feasibly_ret.size()
+              << " / " << prob.retainable_tensors.size() << "\n";
+
+    // Time allocation depends on whether retain is useful.
+    // No retainable tensors → solution cost = partition cost for any topo order,
+    // so solution FM/evo is pointless. Give all time to partition search.
+    TimePoint phase1_deadline, phase2_deadline, phase3_deadline;
+    if (has_retain) {
+        // Normal: 35% partition, 5% build, 60% solution evo+FM
+        phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 35 / 100);
+        phase2_deadline = phase1_deadline + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 5 / 100);
+        phase3_deadline = now + total_budget;
+    } else {
+        // No retain: 95% partition, 5% build (topo sort only), no phase 3
+        phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 95 / 100);
+        phase2_deadline = now + total_budget;
+        phase3_deadline = now;  // skip
+    }
 
     // ================================================================
     // Phase 1: Partition pool via parallel search
@@ -464,14 +482,11 @@ Solution solve(const Problem& prob, TimePoint deadline) {
               << partition_pool[0].total_cost() << "\n";
 
     // ================================================================
-    // Phase 2: Build solutions from each partition in the pool (parallel)
-    // Keep DFS, beam, and random-retain solutions for diversity.
+    // Phase 2: Build solutions from each partition in the pool
     // ================================================================
 
-    // Precompute once: which tensors can physically be retained?
-    auto feasibly_ret = compute_feasibly_retainable(prob, dag);
-
-    std::cerr << "Phase 2: Build solutions from " << partition_pool.size() << " partitions...\n";
+    std::cerr << "Phase 2: Build solutions from " << partition_pool.size() << " partitions"
+              << (has_retain ? "" : " (no-retain fast path)") << "...\n";
 
     std::vector<Solution> solution_pool;
     std::mutex sol_mutex;
@@ -492,6 +507,22 @@ Solution solve(const Problem& prob, TimePoint deadline) {
                 auto gd_opt = GroupDAGInfo::build(prob, dag, part);
                 if (!gd_opt) continue;
                 auto& gd = *gd_opt;
+
+                if (!has_retain) {
+                    // No-retain fast path: any topological order gives the same cost.
+                    // Just build a DFS solution without retain/recompute optimization.
+                    auto dfs_order = dfs_ordering(gd);
+                    std::vector<ScheduleStep> dfs_steps;
+                    for (auto idx : dfs_order)
+                        dfs_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
+                    Solution dfs_sol(prob, dag, std::move(dfs_steps));
+                    {
+                        std::lock_guard<std::mutex> lock(sol_mutex);
+                        if (dfs_sol.validate().valid)
+                            solution_pool.push_back(std::move(dfs_sol));
+                    }
+                    continue;
+                }
 
                 // DFS solution
                 auto dfs_order = dfs_ordering(gd);
@@ -687,16 +718,25 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     // ================================================================
     // Phase 3: Solution-level evolutionary search with FM polish
     // ================================================================
-    std::cerr << "Phase 3: Solution evolution + FM from " << solution_pool.size() << " starting points...\n";
-    SolutionFMConfig sfm_cfg;
-    sfm_cfg.deadline = phase3_deadline;
-    auto final_sol = solution_evo_search(prob, dag, std::move(solution_pool), sfm_cfg);
-    double after_sol_evo = final_sol.total_latency();
+    Solution final_sol(prob, dag, {});
+    double after_sol_evo;
 
-    // Final retain+recompute cleanup
-    final_sol = optimize_retain(prob, dag, std::move(final_sol));
-    final_sol = optimize_recompute(prob, dag, std::move(final_sol));
-    final_sol = optimize_retain(prob, dag, std::move(final_sol));
+    if (has_retain) {
+        std::cerr << "Phase 3: Solution evolution + FM from " << solution_pool.size() << " starting points...\n";
+        SolutionFMConfig sfm_cfg;
+        sfm_cfg.deadline = phase3_deadline;
+        final_sol = solution_evo_search(prob, dag, std::move(solution_pool), sfm_cfg);
+        after_sol_evo = final_sol.total_latency();
+
+        // Final retain+recompute cleanup
+        final_sol = optimize_retain(prob, dag, std::move(final_sol));
+        final_sol = optimize_recompute(prob, dag, std::move(final_sol));
+        final_sol = optimize_retain(prob, dag, std::move(final_sol));
+    } else {
+        std::cerr << "Phase 3: Skipped (no retainable tensors — solution cost = partition cost)\n";
+        final_sol = std::move(solution_pool[0]);
+        after_sol_evo = final_sol.total_latency();
+    }
 
     auto vr = final_sol.validate();
     if (!vr.valid)
