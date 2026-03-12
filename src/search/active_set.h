@@ -32,9 +32,6 @@ public:
     void activate_border(size_t gi);
     void activate_group_ops(size_t gi);
 
-    // Activate border ops of groups adjacent to the given set of groups.
-    void activate_neighbors_of(const std::set<size_t>& affected_groups);
-
     // --- Selection ---
 
     // Pop the unlocked op with the highest saving. Locks it.
@@ -45,11 +42,14 @@ public:
     // Used for merge partner locking.
     void lock(size_t op);
 
-    // --- Update ---
+    // --- Update + Activate (combined) ---
 
-    // Recompute best moves for all active, unlocked ops that belong to
-    // any of the given groups (or adjacent groups). Called after a move.
-    void update_affected(const std::set<size_t>& affected_groups);
+    // After a move: recompute best moves for affected ops AND activate new
+    // border ops, in a single pass over affected + adjacent groups.
+    void refresh_after_move(const std::set<size_t>& affected_groups);
+
+    // Lock multiple ops at once (for tensor moves that touch many ops).
+    void lock_all(const std::vector<size_t>& ops);
 
     // --- Queries ---
 

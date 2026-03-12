@@ -13,12 +13,18 @@
 
 struct FMMove {
     enum Type { NONE = -1, STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3,
-                INTERNAL_EJECT = 4, SPLIT = 5 } type = NONE;
+                INTERNAL_EJECT = 4, SPLIT = 5,
+                TENSOR_MERGE = 6, TENSOR_EXTRACT = 7 } type = NONE;
     size_t op = SIZE_MAX;     // initiating op
     size_t ga = SIZE_MAX;     // source group
     size_t gb = SIZE_MAX;     // target group
-    size_t op2 = SIZE_MAX;    // second op (for SPLIT)
+    size_t op2 = SIZE_MAX;    // second op (for SPLIT) / tensor_id (for TENSOR_*)
     double saving = -1e18;    // positive = improvement
+
+    // For TENSOR_MERGE/TENSOR_EXTRACT: groups involved (resolved at apply time)
+    std::vector<size_t> tensor_groups;
+    // For TENSOR_EXTRACT: the consumer ops to extract
+    std::vector<size_t> tensor_consumer_ops;
 
     bool valid() const { return type != NONE; }
 };

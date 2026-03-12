@@ -131,6 +131,140 @@ FMMove best_move_for(const Partition& part, size_t op,
         }
     }
 
+    // --- Tensor-centric moves: TENSOR_MERGE and TENSOR_EXTRACT ---
+    // For each boundary input tensor of op's groups, check if merging all
+    // consumer groups (and optionally the producer group) is profitable.
+    {
+        std::set<size_t> tensors_checked;
+        for (auto gx : groups_of_x) {
+            for (auto t : part.prob->ops[op].inputs) {
+                if (tensors_checked.count(t)) continue;
+                tensors_checked.insert(t);
+
+                // Collect all consumer groups of tensor t
+                auto& consumers = part.dag->tensor_consumers[t];
+                if (consumers.size() < 2) continue;
+
+                std::set<size_t> consumer_groups;
+                std::vector<size_t> consumer_ops_vec;
+                for (auto cop : consumers) {
+                    for (auto cg : part.groups_of(cop)) {
+                        consumer_groups.insert(cg);
+                    }
+                    consumer_ops_vec.push_back(cop);
+                }
+
+                // Optionally include producer group (tensor becomes ephemeral)
+                int prod = part.dag->tensor_producer[t];
+                size_t producer_group = SIZE_MAX;
+                if (prod >= 0) {
+                    auto& pg = part.groups_of((size_t)prod);
+                    if (!pg.empty()) {
+                        producer_group = pg[0];
+                        consumer_groups.insert(producer_group);
+                    }
+                }
+
+                if (consumer_groups.size() < 2) continue;
+
+                // Check no locked ops in any of these groups
+                bool has_locked = false;
+                for (auto cg : consumer_groups) {
+                    if (!part.groups[cg].alive) { has_locked = true; break; }
+                    for (auto cop : part.groups[cg].ops) {
+                        if (locked.count(cop)) { has_locked = true; break; }
+                    }
+                    if (has_locked) break;
+                }
+                if (has_locked) continue;
+
+                // TENSOR_MERGE: merge all consumer (+ producer) groups
+                {
+                    std::set<size_t> merged_ops;
+                    double old_cost = 0;
+                    bool cycle = false;
+                    std::vector<size_t> group_list(consumer_groups.begin(),
+                                                   consumer_groups.end());
+
+                    for (auto cg : group_list) {
+                        old_cost += part.groups[cg].cost;
+                        merged_ops.insert(part.groups[cg].ops.begin(),
+                                          part.groups[cg].ops.end());
+                    }
+
+                    // Pairwise cycle check (conservative but correct)
+                    for (size_t a = 0; a < group_list.size() && !cycle; a++)
+                        for (size_t b = a + 1; b < group_list.size() && !cycle; b++)
+                            if (part.dag->merge_creates_cycle(
+                                    part.groups[group_list[a]].ops,
+                                    part.groups[group_list[b]].ops))
+                                cycle = true;
+
+                    if (!cycle) {
+                        double new_cost = part.eval_set(merged_ops);
+                        if (new_cost < 1e17) {
+                            double saving = old_cost - new_cost;
+                            if (accept(saving)) {
+                                FMMove candidate;
+                                candidate.type = FMMove::TENSOR_MERGE;
+                                candidate.op = op;
+                                candidate.op2 = t;  // tensor_id
+                                candidate.saving = saving;
+                                candidate.tensor_groups = group_list;
+                                if (candidate.saving > best.saving) best = candidate;
+                            }
+                        }
+                    }
+                }
+
+                // TENSOR_EXTRACT: pull just the consumer ops (+ producer) into
+                // a new group, leaving remainders in their original groups.
+                {
+                    std::set<size_t> extract_ops(consumer_ops_vec.begin(),
+                                                 consumer_ops_vec.end());
+                    if (prod >= 0) extract_ops.insert((size_t)prod);
+
+                    double old_cost = 0;
+                    double remainder_cost = 0;
+                    bool feasible = true;
+                    std::vector<size_t> group_list(consumer_groups.begin(),
+                                                   consumer_groups.end());
+
+                    for (auto cg : group_list) {
+                        old_cost += part.groups[cg].cost;
+                        std::set<size_t> remainder;
+                        for (auto rop : part.groups[cg].ops)
+                            if (!extract_ops.count(rop))
+                                remainder.insert(rop);
+                        if (!remainder.empty()) {
+                            double rc = part.eval_set(remainder);
+                            if (rc >= 1e17) { feasible = false; break; }
+                            remainder_cost += rc;
+                        }
+                    }
+
+                    if (feasible) {
+                        double extract_cost = part.eval_set(extract_ops);
+                        if (extract_cost < 1e17) {
+                            double saving = old_cost - (extract_cost + remainder_cost);
+                            if (accept(saving)) {
+                                FMMove candidate;
+                                candidate.type = FMMove::TENSOR_EXTRACT;
+                                candidate.op = op;
+                                candidate.op2 = t;  // tensor_id
+                                candidate.saving = saving;
+                                candidate.tensor_groups = group_list;
+                                candidate.tensor_consumer_ops.assign(
+                                    extract_ops.begin(), extract_ops.end());
+                                if (candidate.saving > best.saving) best = candidate;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return best;
 }
 
@@ -268,6 +402,90 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
             size_t gb = part.add_group(std::move(sr.side_b), sr.cost_b);
             affected.insert(gb);
+            break;
+        }
+        case FMMove::TENSOR_MERGE: {
+            // Re-verify: all groups must still be alive
+            for (auto cg : m.tensor_groups)
+                if (!part.groups[cg].alive) return {};
+
+            // Merge all ops from all groups into one
+            std::set<size_t> merged_ops;
+            for (auto cg : m.tensor_groups)
+                merged_ops.insert(part.groups[cg].ops.begin(),
+                                  part.groups[cg].ops.end());
+
+            double merged_cost = part.eval_set(merged_ops);
+            if (merged_cost >= 1e17) return {};
+
+            // Re-verify saving is still positive
+            double old_cost = 0;
+            for (auto cg : m.tensor_groups) old_cost += part.groups[cg].cost;
+            if (merged_cost >= old_cost - 0.001) return {};
+
+            // First group absorbs everything, rest are killed
+            size_t survivor = m.tensor_groups[0];
+            part.groups[survivor].ops = std::move(merged_ops);
+            part.groups[survivor].cost = merged_cost;
+            part.groups[survivor].gen++;
+            affected.insert(survivor);
+
+            for (size_t i = 1; i < m.tensor_groups.size(); i++) {
+                part.groups[m.tensor_groups[i]].alive = false;
+                part.groups[m.tensor_groups[i]].gen++;
+                affected.insert(m.tensor_groups[i]);
+            }
+            break;
+        }
+        case FMMove::TENSOR_EXTRACT: {
+            // Re-verify: all groups must still be alive
+            for (auto cg : m.tensor_groups)
+                if (!part.groups[cg].alive) return {};
+
+            std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
+                                         m.tensor_consumer_ops.end());
+
+            // Evaluate the extracted group
+            double extract_cost = part.eval_set(extract_ops);
+            if (extract_cost >= 1e17) return {};
+
+            // Evaluate all remainders
+            double old_cost = 0;
+            double remainder_total = 0;
+            struct RemainderInfo { size_t gi; std::set<size_t> ops; double cost; };
+            std::vector<RemainderInfo> remainders;
+
+            for (auto cg : m.tensor_groups) {
+                old_cost += part.groups[cg].cost;
+                std::set<size_t> rem;
+                for (auto rop : part.groups[cg].ops)
+                    if (!extract_ops.count(rop))
+                        rem.insert(rop);
+                double rc = 0;
+                if (!rem.empty()) {
+                    rc = part.eval_set(rem);
+                    if (rc >= 1e17) return {};
+                }
+                remainder_total += rc;
+                remainders.push_back({cg, std::move(rem), rc});
+            }
+
+            if (extract_cost + remainder_total >= old_cost - 0.001) return {};
+
+            // Apply: update remainder groups, create extracted group
+            for (auto& ri : remainders) {
+                if (ri.ops.empty()) {
+                    part.groups[ri.gi].alive = false;
+                } else {
+                    part.groups[ri.gi].ops = std::move(ri.ops);
+                    part.groups[ri.gi].cost = ri.cost;
+                }
+                part.groups[ri.gi].gen++;
+                affected.insert(ri.gi);
+            }
+
+            size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
+            affected.insert(new_gi);
             break;
         }
         default:

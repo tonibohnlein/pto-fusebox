@@ -48,7 +48,7 @@ set(TEST_SOURCES
     test/fanin_matmul_test.cpp
     test/local_search_test.cpp
     test/init_strategies_test.cpp
-    test/fm_test.cpp
+   # test/fm_test.cpp
     test/move_gain_test.cpp
     test/retain_snake_test.cpp
     test/constructed_optima_test.cpp

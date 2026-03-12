@@ -34,17 +34,6 @@ void ActiveSet::activate_group_ops(size_t gi) {
     }
 }
 
-void ActiveSet::activate_neighbors_of(const std::set<size_t>& affected_groups) {
-    // Activate all ops of affected groups and their neighbors
-    for (auto gi : affected_groups) {
-        if (!part_->groups[gi].alive) continue;
-        activate_group_ops(gi);
-        auto adj = part_->adjacent_groups(gi);
-        for (auto gj : adj)
-            activate_group_ops(gj);
-    }
-}
-
 // ============================================================================
 // Selection
 // ============================================================================
@@ -90,8 +79,8 @@ std::set<size_t> ActiveSet::op_relevant_groups(size_t op) const {
     return groups;
 }
 
-void ActiveSet::update_affected(const std::set<size_t>& affected_groups) {
-    // Collect the full set of affected + adjacent groups
+void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
+    // Step 1: Collect the full set of affected + adjacent groups (once)
     std::set<size_t> relevant;
     for (auto gi : affected_groups) {
         relevant.insert(gi);
@@ -101,11 +90,10 @@ void ActiveSet::update_affected(const std::set<size_t>& affected_groups) {
         }
     }
 
-    // Recompute best moves for active, unlocked ops that touch relevant groups
+    // Step 2: Recompute best moves for active, unlocked ops that touch relevant groups
     for (auto& entry : entries_) {
         if (locked_.count(entry.op)) continue;
 
-        // Check if this op touches any relevant group
         auto op_groups = op_relevant_groups(entry.op);
         bool touches = false;
         for (auto gi : op_groups) {
@@ -116,6 +104,17 @@ void ActiveSet::update_affected(const std::set<size_t>& affected_groups) {
             entry.move = best_move_for(*part_, entry.op, floor_, locked_);
         }
     }
+
+    // Step 3: Activate new border/internal ops of relevant groups
+    for (auto gi : relevant) {
+        if (!part_->groups[gi].alive) continue;
+        activate_group_ops(gi);
+    }
+}
+
+void ActiveSet::lock_all(const std::vector<size_t>& ops) {
+    for (auto op : ops)
+        locked_.insert(op);
 }
 
 // ============================================================================

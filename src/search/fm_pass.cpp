@@ -88,11 +88,20 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
 
         FMMove move = *move_opt;
 
-        // Additional locking for merge: lock boundary ops from partner group
-        // (must do BEFORE apply, since apply changes the group)
+        // Additional locking: collect ops that should be locked BEFORE apply
+        // (since apply changes the groups)
         std::vector<size_t> extra_locks;
         if (move.type == FMMove::MERGE) {
             extra_locks = merge_lock_ops(part, move);
+        } else if (move.type == FMMove::TENSOR_MERGE
+                || move.type == FMMove::TENSOR_EXTRACT) {
+            // Lock ALL ops in ALL groups involved in the tensor move.
+            // These ops are all being relocated — they must not initiate
+            // further moves this pass.
+            for (auto cg : move.tensor_groups)
+                if (part.groups[cg].alive)
+                    for (auto cop : part.groups[cg].ops)
+                        extra_locks.push_back(cop);
         }
 
         // Apply the move
@@ -101,9 +110,6 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             // Move failed on re-verify — just continue
             continue;
         }
-
-        // Rebuild index so subsequent groups_of / adjacent_groups are correct
-        part.rebuild_index();
 
         result.moves_applied++;
         if (move.saving > 0.001)
@@ -125,17 +131,12 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         // Check max drift: if we've dropped too far below the pass-best, abort
         if (best_cumulative_gain - cumulative_gain > max_drift) break;
 
-        // Lock extra ops (merge partners)
+        // Lock extra ops (merge/tensor partners).
         // active.pop_best() already locked move.op.
-        // For merge: also lock the boundary ops from the partner group.
-        for (auto op : extra_locks)
-            active.lock(op);
+        active.lock_all(extra_locks);
 
-        // Step 3: Update existing active ops affected by the move
-        active.update_affected(affected);
-
-        // Step 4: Activate new border ops of affected and adjacent groups
-        active.activate_neighbors_of(affected);
+        // Update affected ops + activate new border ops (combined)
+        active.refresh_after_move(affected);
     }
 
     // Capture the final (maximally perturbed) state
