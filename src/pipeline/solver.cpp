@@ -440,12 +440,16 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     DAG dag = DAG::build(prob);
 
     auto now = SteadyClock::now();
-    auto total_budget = deadline - now;
+    auto effective_deadline = deadline;
+    // If no real deadline was given (tests), cap at 10s
+    if (deadline == no_deadline() || (deadline - now) > std::chrono::seconds(300))
+        effective_deadline = now + std::chrono::seconds(10);
+    auto total_budget = effective_deadline - now;
 
-    // Time allocation: 35% partition search, 5% build, 60% solution FM
+    // Time allocation: 35% partition search, 5% build, 60% solution evo+FM
     auto phase1_deadline = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 35 / 100);
     auto phase2_deadline = phase1_deadline + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 5 / 100);
-    auto phase3_deadline = deadline;
+    auto phase3_deadline = now + total_budget;
 
     // ================================================================
     // Phase 1: Partition pool via parallel search
@@ -552,13 +556,13 @@ Solution solve(const Problem& prob, TimePoint deadline) {
               << after_build << "\n";
 
     // ================================================================
-    // Phase 3: Solution-level FM search from diverse starting points
+    // Phase 3: Solution-level evolutionary search with FM polish
     // ================================================================
-    std::cerr << "Phase 3: Solution-level FM from " << solution_pool.size() << " starting points...\n";
+    std::cerr << "Phase 3: Solution evolution + FM from " << solution_pool.size() << " starting points...\n";
     SolutionFMConfig sfm_cfg;
     sfm_cfg.deadline = phase3_deadline;
-    auto final_sol = solution_fm_search(prob, dag, std::move(solution_pool), sfm_cfg);
-    double after_sol_fm = final_sol.total_latency();
+    auto final_sol = solution_evo_search(prob, dag, std::move(solution_pool), sfm_cfg);
+    double after_sol_evo = final_sol.total_latency();
 
     // Final retain+recompute cleanup
     final_sol = optimize_retain(prob, dag, std::move(final_sol));
@@ -579,10 +583,10 @@ Solution solve(const Problem& prob, TimePoint deadline) {
         std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0*(partition_cost - after_build)/partition_cost << "%)";
     std::cerr << "\n";
-    std::cerr << "  Sol-FM:     " << after_sol_fm;
-    if (after_sol_fm < after_build - 0.01)
+    std::cerr << "  Sol-Evo:     " << after_sol_evo;
+    if (after_sol_evo < after_build - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
-                  << 100.0*(after_build - after_sol_fm)/after_build << "%)";
+                  << 100.0*(after_build - after_sol_evo)/after_build << "%)";
     std::cerr << "\n";
     std::cerr << "  Final:      " << final_cost;
     if (final_cost < partition_cost - 0.01)

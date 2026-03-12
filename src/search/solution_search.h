@@ -2,6 +2,7 @@
 
 #include "solution/solution.h"
 #include <chrono>
+#include <random>
 #include <set>
 #include <vector>
 
@@ -46,8 +47,8 @@ struct SolutionFMPassResult {
 };
 
 struct SolutionFMConfig {
-    int max_passes = 1000;
-    int max_no_improve = 30;
+    int max_passes = 200;
+    int max_no_improve = 40;
     SolutionFMPassConfig pass_config;
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
 };
@@ -68,7 +69,17 @@ std::vector<ScheduleStep> solution_greedy_descent(const Problem& prob, const DAG
 Solution solution_fm_search(const Problem& prob, const DAG& dag,
                              Solution sol, const SolutionFMConfig& cfg = {});
 
-// Multi-start: each thread starts from a different solution in the pool
-// Returns the best solution found across all threads and starting points
-Solution solution_fm_search(const Problem& prob, const DAG& dag,
-                             std::vector<Solution> pool, const SolutionFMConfig& cfg = {});
+// Multi-start evolutionary search with FM polish
+// Maintains a diverse pool; threads cycle: mutate → polish → pool insert
+Solution solution_evo_search(const Problem& prob, const DAG& dag,
+                              std::vector<Solution> pool, const SolutionFMConfig& cfg = {});
+
+// Solution mutation operators (return mutated steps, or empty if mutation failed)
+std::vector<ScheduleStep> mutate_swap_steps(const Problem& prob, const DAG& dag,
+                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng);
+std::vector<ScheduleStep> mutate_retain_toggle(const Problem& prob, const DAG& dag,
+                                                const std::vector<ScheduleStep>& steps, std::mt19937& rng);
+std::vector<ScheduleStep> mutate_split_step(const Problem& prob, const DAG& dag,
+                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng);
+std::vector<ScheduleStep> mutate_merge_steps(const Problem& prob, const DAG& dag,
+                                              const std::vector<ScheduleStep>& steps, std::mt19937& rng);

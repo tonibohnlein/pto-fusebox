@@ -1295,19 +1295,19 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     result.moves_applied++;
     state.rebuild_from(lo);
 
-    if (g_verbose) {
-      auto &m = *m_opt;
-      std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
-                << " step=" << m.step_a;
-      if (m.op != SIZE_MAX)
-        std::cerr << " op=" << m.op;
-      if (m.tensor != SIZE_MAX)
-        std::cerr << " t=" << m.tensor;
-      std::cerr << " saving=" << m.saving << " total=" << state.total
-                << " active=" << active.entries.size()
-                << " locked_ops=" << active.locked_ops.size()
-                << " locked_t=" << active.locked_tensors.size() << "\n";
-    }
+    // if (false) {
+    //   auto &m = *m_opt;
+    //   std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
+    //             << " step=" << m.step_a;
+    //   if (m.op != SIZE_MAX)
+    //     std::cerr << " op=" << m.op;
+    //   if (m.tensor != SIZE_MAX)
+    //     std::cerr << " t=" << m.tensor;
+    //   std::cerr << " saving=" << m.saving << " total=" << state.total
+    //             << " active=" << active.entries.size()
+    //             << " locked_ops=" << active.locked_ops.size()
+    //             << " locked_t=" << active.locked_tensors.size() << "\n";
+    // }
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
@@ -1412,186 +1412,449 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
 
 Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
                             const SolutionFMConfig &cfg) {
-  // Delegate to multi-start with a single-element pool
   std::vector<Solution> pool;
   pool.push_back(std::move(sol));
-  return solution_fm_search(prob, dag, std::move(pool), cfg);
+  return solution_evo_search(prob, dag, std::move(pool), cfg);
 }
 
-Solution solution_fm_search(const Problem &prob, const DAG &dag,
-                            std::vector<Solution> pool,
-                            const SolutionFMConfig &cfg) {
-  if (pool.empty()) return Solution(prob, dag, {});
+// ============================================================================
+// Solution mutation operators
+// ============================================================================
 
-  int hw_threads = (int)std::thread::hardware_concurrency();
-  if (hw_threads <= 0)
-    hw_threads = 4;
-  int num_threads = hw_threads;
+// Helper: check if step i must come before step j (data dependency)
+static bool steps_depend(const Problem& prob, const DAG& dag,
+                         const ScheduleStep& a, const ScheduleStep& b) {
+    std::set<size_t> b_ops(b.subgraph.ops().begin(), b.subgraph.ops().end());
+    for (auto op_a : a.subgraph.ops())
+        for (auto succ : dag.op_succs[op_a])
+            if (b_ops.count(succ)) return true;
+    return false;
+}
 
-  // Precompute per-pool-entry steps and costs
-  struct PoolEntry {
-    std::vector<ScheduleStep> steps;
-    double cost;
-  };
-  std::vector<PoolEntry> pool_entries;
-  for (auto& s : pool)
-    pool_entries.push_back({s.steps(), s.total_latency()});
+// Helper: recompute costs for a step sequence (fixing retain entering sets)
+static void recompute_costs(const Problem& prob, const DAG& dag,
+                            std::vector<ScheduleStep>& steps) {
+    std::set<size_t> entering;
+    for (size_t i = 0; i < steps.size(); i++) {
+        auto bc = steps[i].subgraph.best_cost(entering, steps[i].retain_these);
+        if (!bc.feasible) {
+            steps[i].retain_these.clear();
+            bc = steps[i].subgraph.best_cost(entering, {});
+        }
+        if (!bc.feasible) {
+            entering.clear();
+            steps[i].retain_these.clear();
+            bc = steps[i].subgraph.best_cost({}, {});
+        }
+        steps[i].config = bc.config;
+        entering = steps[i].retain_these;
+    }
+}
 
-  // Shared best across all threads (protected by mutex)
-  std::mutex best_mutex;
-  std::vector<ScheduleStep> global_best_steps = pool_entries[0].steps;
-  double global_best_cost = pool_entries[0].cost;
-  for (auto& pe : pool_entries)
-    if (pe.cost < global_best_cost) {
-      global_best_cost = pe.cost;
-      global_best_steps = pe.steps;
+// SWAP: swap two adjacent independent steps
+std::vector<ScheduleStep> mutate_swap_steps(const Problem& prob, const DAG& dag,
+                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
+    if (steps.size() < 2) return {};
+
+    // Collect all swappable pairs
+    std::vector<size_t> swappable;
+    for (size_t i = 0; i + 1 < steps.size(); i++) {
+        if (!steps_depend(prob, dag, steps[i], steps[i+1]) &&
+            !steps_depend(prob, dag, steps[i+1], steps[i]))
+            swappable.push_back(i);
+    }
+    if (swappable.empty()) return {};
+
+    // Pick 1-3 random swaps
+    auto result = steps;
+    int n_swaps = std::min((int)swappable.size(), 1 + (int)(rng() % 3));
+    std::shuffle(swappable.begin(), swappable.end(), rng);
+    std::set<size_t> used;
+    int done = 0;
+    for (auto idx : swappable) {
+        if (done >= n_swaps) break;
+        if (used.count(idx) || used.count(idx+1) || (idx > 0 && used.count(idx-1))) continue;
+        std::swap(result[idx], result[idx + 1]);
+        used.insert(idx);
+        done++;
     }
 
-  struct ThreadResult {
-    std::vector<ScheduleStep> steps;
-    double cost = 1e18;
-    int passes = 0;
-    int improving = 0;
-    int total_moves = 0;
-  };
+    // Clear retains (they may be invalid after reordering) and recompute
+    for (auto& s : result) s.retain_these.clear();
+    recompute_costs(prob, dag, result);
+    return result;
+}
 
-  std::vector<ThreadResult> results(num_threads);
-  bool main_verbose = g_verbose;
+// RETAIN_TOGGLE: add or remove a retain decision
+std::vector<ScheduleStep> mutate_retain_toggle(const Problem& prob, const DAG& dag,
+                                                const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
+    if (steps.size() < 2) return {};
+    auto result = steps;
 
-  std::vector<std::thread> threads;
-  for (int t = 0; t < num_threads; t++) {
-    threads.emplace_back([&, t]() {
-      g_verbose = (t == 0) && main_verbose;
+    // 50% chance add, 50% remove
+    bool do_add = rng() % 2 == 0;
 
-      // Thread-local best
-      auto& start = pool_entries[t % pool_entries.size()];
-      auto best_steps = start.steps;
-      double best_cost = start.cost;
-      int total_passes = 0, improving_passes = 0, total_moves = 0;
-
-      double base_floor = cfg.pass_config.floor_fraction;
-      double base_drift = cfg.pass_config.max_drift_fraction;
-
-      // Cycle through pool entries when stuck
-      int pool_idx = t % (int)pool_entries.size();
-      int no_improve = 0;
-      double heat = 1.0;
-      int pass = 0;
-
-      while (pass < cfg.max_passes && Clock::now() < cfg.deadline) {
-        // If stuck, restart from next pool entry (or global best)
-        if (no_improve >= cfg.max_no_improve) {
-          pool_idx = (pool_idx + 1) % (int)pool_entries.size();
-          no_improve = 0;
-          heat = 1.0;
-
-          // Pick the better of: next pool entry vs global best
-          {
-            std::lock_guard<std::mutex> lock(best_mutex);
-            if (global_best_cost < pool_entries[pool_idx].cost - 0.01) {
-              best_steps = global_best_steps;
-              best_cost = global_best_cost;
-            } else {
-              best_steps = pool_entries[pool_idx].steps;
-              best_cost = pool_entries[pool_idx].cost;
+    if (do_add) {
+        // Find a step boundary where we could retain something
+        std::vector<std::pair<size_t, size_t>> candidates; // (step_idx, tensor)
+        for (size_t i = 0; i + 1 < result.size(); i++) {
+            for (auto t : result[i].subgraph.boundary_outputs()) {
+                if (prob.retainable_tensors.count(t) &&
+                    result[i+1].subgraph.boundary_inputs().count(t) &&
+                    !result[i].retain_these.count(t))
+                    candidates.push_back({i, t});
             }
-          }
-          if (g_verbose)
-            std::cerr << "    [t" << t << "] restart from pool[" << pool_idx
-                      << "] cost=" << best_cost << "\n";
-        }
-
-        double progress = (double)pass / std::max(1, cfg.max_passes - 1);
-        double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
-        double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
-        double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
-
-        SolutionFMPassConfig pc = cfg.pass_config;
-        pc.seed = (unsigned)(cfg.pass_config.seed + t * 1000 + pass * 7);
-        pc.floor_fraction = eff_floor;
-        pc.max_drift_fraction = eff_drift;
-        pc.deadline = cfg.deadline;
-
-        auto pr = solution_fm_pass(prob, dag, best_steps, pc);
-        total_passes++;
-        total_moves += pr.moves_applied;
-        pass++;
-
-        if (g_verbose && pr.moves_applied > 0) {
-          std::cerr << "    [t" << t << " pass " << pass
-                    << "] moves=" << pr.moves_applied
-                    << " best=" << pr.best_cost << " end=" << pr.end_cost
-                    << " heat=" << std::fixed << std::setprecision(2) << heat
-                    << "\n";
-        }
-
-        if (pr.best_cost < best_cost - 0.01) {
-          best_cost = pr.best_cost;
-          best_steps = std::move(pr.best_steps);
-          no_improve = 0;
-          improving_passes++;
-          heat = std::clamp(heat * 0.7, 0.1, 3.0);
-
-          // Share with other threads
-          std::lock_guard<std::mutex> lock(best_mutex);
-          if (best_cost < global_best_cost - 0.01) {
-            global_best_cost = best_cost;
-            global_best_steps = best_steps;
-          }
-        } else {
-          if (pr.moves_applied > 0) {
-            auto kicked = solution_greedy_descent(
-                prob, dag, std::move(pr.end_steps), cfg.deadline);
-            Solution kicked_sol(prob, dag, kicked);
-            kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
-            if (kicked_sol.total_latency() < best_cost - 0.01) {
-              best_cost = kicked_sol.total_latency();
-              best_steps = kicked_sol.steps();
-              no_improve = 0;
-              improving_passes++;
-              heat = std::clamp(heat * 0.9, 0.1, 3.0);
-
-              std::lock_guard<std::mutex> lock(best_mutex);
-              if (best_cost < global_best_cost - 0.01) {
-                global_best_cost = best_cost;
-                global_best_steps = best_steps;
-              }
-              continue;
+            // Also try retaining boundary inputs that the next step also needs
+            for (auto t : result[i].subgraph.boundary_inputs()) {
+                if (prob.retainable_tensors.count(t) &&
+                    result[i+1].subgraph.boundary_inputs().count(t) &&
+                    !result[i].retain_these.count(t))
+                    candidates.push_back({i, t});
             }
-          }
-          no_improve++;
-          heat = std::clamp(heat * 1.3, 0.1, 3.0);
         }
-      }
+        if (candidates.empty()) return {};
+        auto [si, t] = candidates[rng() % candidates.size()];
+        result[si].retain_these.insert(t);
+    } else {
+        // Remove a random retain
+        std::vector<std::pair<size_t, size_t>> candidates;
+        for (size_t i = 0; i < result.size(); i++)
+            for (auto t : result[i].retain_these)
+                candidates.push_back({i, t});
+        if (candidates.empty()) return {};
+        auto [si, t] = candidates[rng() % candidates.size()];
+        result[si].retain_these.erase(t);
+    }
 
-      results[t] = {std::move(best_steps), best_cost, total_passes,
-                    improving_passes, total_moves};
-    });
-  }
-  for (auto &t : threads)
-    t.join();
+    recompute_costs(prob, dag, result);
+    return result;
+}
 
-  // Find best across threads
-  int best_t = 0;
-  for (int t = 1; t < num_threads; t++)
-    if (results[t].cost < results[best_t].cost)
-      best_t = t;
+// SPLIT: split a large step into two
+std::vector<ScheduleStep> mutate_split_step(const Problem& prob, const DAG& dag,
+                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
+    // Find steps with >= 3 ops
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i < steps.size(); i++)
+        if (steps[i].subgraph.ops().size() >= 3)
+            candidates.push_back(i);
+    if (candidates.empty()) return {};
 
-  std::cerr << "  Sol-FM: " << num_threads << " threads from "
-            << pool_entries.size() << " starting solutions";
-  int total_passes = 0, total_improving = 0, total_moves = 0;
-  for (int t = 0; t < num_threads; t++) {
-    total_passes += results[t].passes;
-    total_improving += results[t].improving;
-    total_moves += results[t].total_moves;
-  }
-  std::cerr << ", " << total_passes << " passes"
-            << " (" << total_improving << " improving)"
-            << ", " << total_moves << " moves";
-  if (results[best_t].cost < global_best_cost + 0.01) {
-    std::cerr << ", best=" << results[best_t].cost;
-  }
-  std::cerr << "\n";
+    size_t si = candidates[rng() % candidates.size()];
+    auto& ops = steps[si].subgraph.ops();
 
-  return Solution(prob, dag, std::move(results[best_t].steps));
+    // Try random split point: pick an op, BFS from it to form one side
+    std::vector<size_t> ops_vec(ops.begin(), ops.end());
+    std::shuffle(ops_vec.begin(), ops_vec.end(), rng);
+
+    // Take first half of shuffled ops
+    size_t split = 1 + rng() % (ops_vec.size() - 1);
+    std::vector<size_t> side_a(ops_vec.begin(), ops_vec.begin() + split);
+    std::vector<size_t> side_b(ops_vec.begin() + split, ops_vec.end());
+
+    auto sg_a = Subgraph::create(prob, dag, side_a);
+    auto sg_b = Subgraph::create(prob, dag, side_b);
+    if (!sg_a || !sg_b) return {};
+
+    auto ca = sg_a->best_cost();
+    auto cb = sg_b->best_cost();
+    if (!ca.feasible || !cb.feasible) return {};
+
+    // Determine ordering: does side_a have predecessors of side_b?
+    bool a_before_b = false, b_before_a = false;
+    std::set<size_t> set_a(side_a.begin(), side_a.end());
+    std::set<size_t> set_b(side_b.begin(), side_b.end());
+    for (auto op : side_a)
+        for (auto succ : dag.op_succs[op])
+            if (set_b.count(succ)) a_before_b = true;
+    for (auto op : side_b)
+        for (auto succ : dag.op_succs[op])
+            if (set_a.count(succ)) b_before_a = true;
+
+    if (a_before_b && b_before_a) return {}; // cycle
+
+    // Build new steps
+    std::vector<ScheduleStep> result;
+    for (size_t i = 0; i < si; i++) result.push_back(steps[i]);
+
+    if (b_before_a) std::swap(sg_a, sg_b), std::swap(ca, cb);
+
+    result.push_back({std::move(*sg_a), ca.config, {}});
+    result.push_back({std::move(*sg_b), cb.config, {}});
+
+    for (size_t i = si + 1; i < steps.size(); i++) result.push_back(steps[i]);
+
+    // Clear retains and recompute
+    for (auto& s : result) s.retain_these.clear();
+    recompute_costs(prob, dag, result);
+    return result;
+}
+
+// MERGE: merge two adjacent steps
+std::vector<ScheduleStep> mutate_merge_steps(const Problem& prob, const DAG& dag,
+                                              const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
+    if (steps.size() < 2) return {};
+
+    // Find mergeable adjacent pairs
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i + 1 < steps.size(); i++) {
+        auto& ops_a = steps[i].subgraph.ops();
+        auto& ops_b = steps[i+1].subgraph.ops();
+        std::vector<size_t> merged(ops_a.begin(), ops_a.end());
+        merged.insert(merged.end(), ops_b.begin(), ops_b.end());
+        if (!dag.merge_creates_cycle(
+                {ops_a.begin(), ops_a.end()},
+                {ops_b.begin(), ops_b.end()}))
+            candidates.push_back(i);
+    }
+    if (candidates.empty()) return {};
+
+    size_t si = candidates[rng() % candidates.size()];
+    auto& ops_a = steps[si].subgraph.ops();
+    auto& ops_b = steps[si+1].subgraph.ops();
+    std::vector<size_t> merged(ops_a.begin(), ops_a.end());
+    merged.insert(merged.end(), ops_b.begin(), ops_b.end());
+
+    auto sg = Subgraph::create(prob, dag, merged);
+    if (!sg) return {};
+    auto bc = sg->best_cost();
+    if (!bc.feasible) return {};
+
+    std::vector<ScheduleStep> result;
+    for (size_t i = 0; i < si; i++) result.push_back(steps[i]);
+    result.push_back({std::move(*sg), bc.config, {}});
+    for (size_t i = si + 2; i < steps.size(); i++) result.push_back(steps[i]);
+
+    for (auto& s : result) s.retain_these.clear();
+    recompute_costs(prob, dag, result);
+    return result;
+}
+
+// ============================================================================
+// Solution evolutionary search
+// ============================================================================
+
+// Solution distance: fraction of ops that are in different steps
+static double solution_distance(const Problem& prob,
+                                const std::vector<ScheduleStep>& a,
+                                const std::vector<ScheduleStep>& b) {
+    size_t n = prob.num_ops();
+    // Map op → step index
+    std::vector<int> map_a(n, -1), map_b(n, -1);
+    for (size_t i = 0; i < a.size(); i++)
+        for (auto op : a[i].subgraph.ops()) map_a[op] = (int)i;
+    for (size_t i = 0; i < b.size(); i++)
+        for (auto op : b[i].subgraph.ops()) map_b[op] = (int)i;
+
+    int disagree = 0, total = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (map_a[i] < 0 || map_b[i] < 0) continue;
+        for (size_t j = i + 1; j < n; j++) {
+            if (map_a[j] < 0 || map_b[j] < 0) continue;
+            total++;
+            bool same_a = (map_a[i] == map_a[j]);
+            bool same_b = (map_b[i] == map_b[j]);
+            if (same_a != same_b) disagree++;
+        }
+    }
+    return total > 0 ? (double)disagree / total : 0.0;
+}
+
+Solution solution_evo_search(const Problem &prob, const DAG &dag,
+                              std::vector<Solution> init_pool,
+                              const SolutionFMConfig &cfg) {
+    if (init_pool.empty()) return Solution(prob, dag, {});
+
+    using Clock = std::chrono::steady_clock;
+
+    int hw_threads = (int)std::thread::hardware_concurrency();
+    if (hw_threads <= 0) hw_threads = 4;
+    int num_threads = hw_threads;
+
+    // --- Shared pool (thread-safe) ---
+    struct SolPoolEntry {
+        std::vector<ScheduleStep> steps;
+        double cost;
+    };
+    const size_t MAX_POOL = 16;
+
+    std::vector<SolPoolEntry> pool;
+    std::mutex pool_mutex;
+    double global_best_cost = 1e18;
+
+    // Initialize pool from input solutions
+    for (auto& sol : init_pool) {
+        pool.push_back({sol.steps(), sol.total_latency()});
+        global_best_cost = std::min(global_best_cost, sol.total_latency());
+    }
+    // Sort pool by cost
+    std::sort(pool.begin(), pool.end(),
+              [](const SolPoolEntry& a, const SolPoolEntry& b) { return a.cost < b.cost; });
+    if (pool.size() > MAX_POOL) pool.resize(MAX_POOL);
+
+    double starting_best = global_best_cost;
+
+    // Pool insert with diversity
+    auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+
+        // Check for near-duplicates
+        for (auto& pe : pool) {
+            double dist = solution_distance(prob, pe.steps, steps);
+            if (dist < 0.005) {
+                if (cost < pe.cost - 0.01) {
+                    pe.steps = std::move(steps);
+                    pe.cost = cost;
+                    if (cost < global_best_cost) global_best_cost = cost;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        if (pool.size() < MAX_POOL) {
+            pool.push_back({std::move(steps), cost});
+            if (cost < global_best_cost) global_best_cost = cost;
+            return true;
+        }
+
+        // Replace worst if better
+        size_t worst = 0;
+        for (size_t i = 1; i < pool.size(); i++)
+            if (pool[i].cost > pool[worst].cost) worst = i;
+        if (cost < pool[worst].cost - 0.01) {
+            pool[worst] = {std::move(steps), cost};
+            if (cost < global_best_cost) global_best_cost = cost;
+            return true;
+        }
+        return false;
+    };
+
+    // --- Stats ---
+    std::atomic<int> total_mutations{0}, total_fm_passes{0};
+    std::atomic<int> total_improvements{0}, total_fm_improvements{0};
+    std::atomic<int> total_generations{0};
+
+    // --- Worker threads ---
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; t++) {
+        threads.emplace_back([&, t]() {
+            std::mt19937 rng(cfg.pass_config.seed + t * 997);
+            int local_gen = 0;
+
+            while (Clock::now() < cfg.deadline) {
+                local_gen++;
+                total_generations++;
+
+                // Pick a parent from pool (biased toward best)
+                std::vector<ScheduleStep> parent;
+                double parent_cost;
+                {
+                    std::lock_guard<std::mutex> lock(pool_mutex);
+                    if (pool.empty()) break;
+                    // Tournament selection: pick 3, choose best
+                    size_t best_idx = rng() % pool.size();
+                    for (int k = 0; k < 2; k++) {
+                        size_t idx = rng() % pool.size();
+                        if (pool[idx].cost < pool[best_idx].cost) best_idx = idx;
+                    }
+                    parent = pool[best_idx].steps;
+                    parent_cost = pool[best_idx].cost;
+                }
+
+                // --- Mutate ---
+                std::vector<ScheduleStep> child;
+                int mut_type = rng() % 4;
+                switch (mut_type) {
+                    case 0: child = mutate_swap_steps(prob, dag, parent, rng); break;
+                    case 1: child = mutate_retain_toggle(prob, dag, parent, rng); break;
+                    case 2: child = mutate_split_step(prob, dag, parent, rng); break;
+                    case 3: child = mutate_merge_steps(prob, dag, parent, rng); break;
+                }
+
+                // If mutation failed, try another type
+                if (child.empty()) {
+                    for (int retry = 0; retry < 3 && child.empty(); retry++) {
+                        mut_type = rng() % 4;
+                        switch (mut_type) {
+                            case 0: child = mutate_swap_steps(prob, dag, parent, rng); break;
+                            case 1: child = mutate_retain_toggle(prob, dag, parent, rng); break;
+                            case 2: child = mutate_split_step(prob, dag, parent, rng); break;
+                            case 3: child = mutate_merge_steps(prob, dag, parent, rng); break;
+                        }
+                    }
+                    if (child.empty()) continue;
+                }
+                total_mutations++;
+
+                // Validate
+                Solution child_sol(prob, dag, child);
+                if (!child_sol.validate().valid) continue;
+
+                // --- Polish: retain optimization ---
+                child_sol = optimize_retain(prob, dag, std::move(child_sol));
+                double child_cost = child_sol.total_latency();
+
+                // Insert raw mutant
+                if (child_cost < parent_cost + parent_cost * 0.1) {
+                    // Only insert if not too much worse (keeps diversity)
+                    pool_insert(child_sol.steps(), child_cost);
+                }
+
+                if (child_cost < parent_cost - 0.01) {
+                    total_improvements++;
+                }
+
+                // --- Polish: FM pass (if time allows) ---
+                if (Clock::now() < cfg.deadline) {
+                    SolutionFMPassConfig pc = cfg.pass_config;
+                    pc.seed = (unsigned)(rng());
+                    pc.deadline = cfg.deadline;
+                    pc.floor_fraction = 0.1 + 0.4 * (rng() % 100) / 100.0;
+                    pc.max_drift_fraction = 0.2 + 0.6 * (rng() % 100) / 100.0;
+
+                    auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc);
+                    total_fm_passes++;
+
+                    if (pr.best_cost < child_cost - 0.01) {
+                        total_fm_improvements++;
+                        Solution fm_sol(prob, dag, pr.best_steps);
+                        fm_sol = optimize_retain(prob, dag, std::move(fm_sol));
+                        pool_insert(fm_sol.steps(), fm_sol.total_latency());
+                    }
+
+                    // Also try greedy descent on end state
+                    if (pr.moves_applied > 0 && Clock::now() < cfg.deadline) {
+                        auto kicked = solution_greedy_descent(prob, dag,
+                            std::move(pr.end_steps), cfg.deadline);
+                        Solution kicked_sol(prob, dag, kicked);
+                        kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
+                        pool_insert(kicked_sol.steps(), kicked_sol.total_latency());
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads)
+        t.join();
+
+    // Sort pool, return best
+    std::sort(pool.begin(), pool.end(),
+              [](const SolPoolEntry& a, const SolPoolEntry& b) { return a.cost < b.cost; });
+
+    std::cerr << "  Sol-Evo: " << num_threads << " threads, "
+              << total_generations.load() << " generations, "
+              << total_mutations.load() << " mutations ("
+              << total_improvements.load() << " improving), "
+              << total_fm_passes.load() << " FM passes ("
+              << total_fm_improvements.load() << " improving)";
+    if (pool[0].cost < starting_best - 0.01) {
+        std::cerr << ", improved " << starting_best << " → " << pool[0].cost
+                  << " (-" << std::fixed << std::setprecision(2)
+                  << 100.0 * (starting_best - pool[0].cost) / starting_best << "%)";
+    }
+    std::cerr << ", pool=" << pool.size() << " entries\n";
+
+    return Solution(prob, dag, std::move(pool[0].steps));
 }
