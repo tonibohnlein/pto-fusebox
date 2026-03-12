@@ -1723,18 +1723,54 @@ static double solution_distance(const Problem& prob,
     for (size_t i = 0; i < b.size(); i++)
         for (auto op : b[i].subgraph.ops()) map_b[op] = (int)i;
 
-    int disagree = 0, total = 0;
+    // Component 1: grouping disagreement (are ops i,j in the same step?)
+    int grp_disagree = 0, grp_total = 0;
     for (size_t i = 0; i < n; i++) {
         if (map_a[i] < 0 || map_b[i] < 0) continue;
         for (size_t j = i + 1; j < n; j++) {
             if (map_a[j] < 0 || map_b[j] < 0) continue;
-            total++;
+            grp_total++;
             bool same_a = (map_a[i] == map_a[j]);
             bool same_b = (map_b[i] == map_b[j]);
-            if (same_a != same_b) disagree++;
+            if (same_a != same_b) grp_disagree++;
         }
     }
-    return total > 0 ? (double)disagree / total : 0.0;
+    double d_group = grp_total > 0 ? (double)grp_disagree / grp_total : 0.0;
+
+    // Component 2: ordering disagreement (for ops in DIFFERENT steps,
+    // does op i come before op j in both solutions?)
+    int ord_disagree = 0, ord_total = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (map_a[i] < 0 || map_b[i] < 0) continue;
+        for (size_t j = i + 1; j < n; j++) {
+            if (map_a[j] < 0 || map_b[j] < 0) continue;
+            // Only count if ops are in different steps in at least one solution
+            if (map_a[i] == map_a[j] && map_b[i] == map_b[j]) continue;
+            ord_total++;
+            bool a_before_a = (map_a[i] < map_a[j]);
+            bool b_before_b = (map_b[i] < map_b[j]);
+            if (a_before_a != b_before_b) ord_disagree++;
+        }
+    }
+    double d_order = ord_total > 0 ? (double)ord_disagree / ord_total : 0.0;
+
+    // Component 3: retain disagreement (symmetric difference of all retain sets)
+    std::set<size_t> ret_a, ret_b;
+    for (auto& s : a) for (auto t : s.retain_these) ret_a.insert(t);
+    for (auto& s : b) for (auto t : s.retain_these) ret_b.insert(t);
+    int ret_union = 0, ret_diff = 0;
+    std::set<size_t> all_ret;
+    all_ret.insert(ret_a.begin(), ret_a.end());
+    all_ret.insert(ret_b.begin(), ret_b.end());
+    ret_union = (int)all_ret.size();
+    for (auto t : all_ret) {
+        bool in_a = ret_a.count(t), in_b = ret_b.count(t);
+        if (in_a != in_b) ret_diff++;
+    }
+    double d_retain = ret_union > 0 ? (double)ret_diff / ret_union : 0.0;
+
+    // Weighted combination: grouping is most important, order and retain add diversity
+    return 0.5 * d_group + 0.3 * d_order + 0.2 * d_retain;
 }
 
 Solution solution_evo_search(const Problem &prob, const DAG &dag,
@@ -1780,32 +1816,72 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
         std::lock_guard<std::mutex> lock(pool_mutex);
 
-        // Check for near-duplicates
-        for (auto& pe : pool) {
-            double dist = solution_distance(prob, pe.steps, steps);
-            if (dist < 0.005) {
-                if (cost < pe.cost - 0.01) {
-                    pe.steps = std::move(steps);
-                    pe.cost = cost;
-                    if (cost < global_best_cost) global_best_cost = cost;
-                    return true;
-                }
-                return false;
+        // Compute min distance to any existing pool entry
+        double min_dist = 1.0;
+        size_t closest_idx = 0;
+        for (size_t i = 0; i < pool.size(); i++) {
+            double dist = solution_distance(prob, pool[i].steps, steps);
+            if (dist < min_dist) {
+                min_dist = dist;
+                closest_idx = i;
             }
         }
 
+        // Near-duplicate: only replace if strictly better
+        if (min_dist < 0.01) {
+            if (cost < pool[closest_idx].cost - 0.01) {
+                pool[closest_idx].steps = std::move(steps);
+                pool[closest_idx].cost = cost;
+                if (cost < global_best_cost) global_best_cost = cost;
+                return true;
+            }
+            return false;
+        }
+
+        // Pool not full: always add
         if (pool.size() < MAX_POOL) {
             pool.push_back({std::move(steps), cost});
             if (cost < global_best_cost) global_best_cost = cost;
             return true;
         }
 
-        // Replace worst if better
-        size_t worst = 0;
+        // Pool full: diversity-aware eviction.
+        // Never evict the best entry (index 0 after sort, but pool may not be sorted).
+        // Find pool entry with smallest min-distance to its nearest neighbor
+        // (the least-unique entry). Replace it if:
+        //   (a) candidate is more diverse (larger min_dist), OR
+        //   (b) candidate has better cost AND reasonable diversity
+        size_t best_cost_idx = 0;
         for (size_t i = 1; i < pool.size(); i++)
-            if (pool[i].cost > pool[worst].cost) worst = i;
-        if (cost < pool[worst].cost - 0.01) {
-            pool[worst] = {std::move(steps), cost};
+            if (pool[i].cost < pool[best_cost_idx].cost) best_cost_idx = i;
+
+        // Find the least-unique entry (smallest min-neighbor-distance), excluding best
+        size_t least_unique = SIZE_MAX;
+        double least_unique_dist = 2.0;
+        for (size_t i = 0; i < pool.size(); i++) {
+            if (i == best_cost_idx) continue; // protect the best
+            double nn_dist = 1.0;
+            for (size_t j = 0; j < pool.size(); j++) {
+                if (i == j) continue;
+                double d = solution_distance(prob, pool[i].steps, pool[j].steps);
+                nn_dist = std::min(nn_dist, d);
+            }
+            if (nn_dist < least_unique_dist) {
+                least_unique_dist = nn_dist;
+                least_unique = i;
+            }
+        }
+
+        if (least_unique == SIZE_MAX) return false;
+
+        // Replace the least-unique entry if candidate brings more diversity
+        // or has better cost with at least some diversity
+        bool more_diverse = (min_dist > least_unique_dist + 0.01);
+        bool better_cost = (cost < pool[least_unique].cost - 0.01);
+        bool decent_diversity = (min_dist > 0.02);
+
+        if (more_diverse || (better_cost && decent_diversity)) {
+            pool[least_unique] = {std::move(steps), cost};
             if (cost < global_best_cost) global_best_cost = cost;
             return true;
         }
@@ -1845,19 +1921,16 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
                 int eff_no_improve = std::max(30, (int)(cfg.pass_config.max_no_improve * temp * heat));
 
-                // Pick a parent from pool (tournament selection: pick 3, choose best)
+                // Pick a parent from pool (uniform random — pool diversity
+                // is maintained by the insertion policy, not selection bias)
                 std::vector<ScheduleStep> parent;
                 double parent_cost;
                 {
                     std::lock_guard<std::mutex> lock(pool_mutex);
                     if (pool.empty()) break;
-                    size_t best_idx = rng() % pool.size();
-                    for (int k = 0; k < 2; k++) {
-                        size_t idx = rng() % pool.size();
-                        if (pool[idx].cost < pool[best_idx].cost) best_idx = idx;
-                    }
-                    parent = pool[best_idx].steps;
-                    parent_cost = pool[best_idx].cost;
+                    size_t idx = rng() % pool.size();
+                    parent = pool[idx].steps;
+                    parent_cost = pool[idx].cost;
                 }
 
                 // --- Mutate ---

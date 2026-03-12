@@ -139,23 +139,36 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             is_nonephemeral = True # Network input/output
         else:
             # We examine each specific producer-consumer pair individually to check for ephemerality
+            # A tensor can be ephemeral to Step A, if Step A produces it and Step A consumes it, AND Step A contains ALL global consumers of this tensor.
+            # Wait, if Step A contains all global consumers, then it doesn't leave Step A. It's purely ephemeral.
+            # If Step B ALSO consumes it, then Step A does NOT contain all global consumers, so it leaves Step A.
+            # Thus, the tensor must be written to Mem. It is Mem.
+            # When would a tensor be BOTH Mem and Eph?
+            # E.g., produced by Step A. Consumed by Step A. Also consumed by Step B.
+            # In this case, inside Step A it might be forwarded directly in fast memory, but it STILL must be written to slow memory for Step B.
+            # So is it Eph and Mem? Yes. It's used ephemerally in A, and via Mem in B.
+            
+            # Re-evaluating ephemerality:
+            # Ephemeral: Produced in Step X, and at least one consumer is ALSO in Step X.
+            # Non-ephemeral (Mem): At least one consumer is in Step Y (where Y != X), OR no consumers exist.
+            
             for s in prod_steps_for_t[i]:
-                # If there's an external consumer not inside this producer step, it acts non-ephemerally for that path
-                step_is_ephemeral = True
-                for global_cons in tensor_consumers[i]:
-                    if s not in op_steps.get(global_cons, []):
-                        step_is_ephemeral = False
-                        break
-                if step_is_ephemeral:
+                # Does step 's' also consume it?
+                if s in cons_steps_for_t[i]:
                     is_ephemeral = True
-                else:
-                    is_nonephemeral = True
-                    
-            for s in cons_steps_for_t[i]:
-                # If a consumer step did not also produce it, it acts non-ephemerally for that path
-                if s not in prod_steps_for_t[i]:
-                    is_nonephemeral = True
-
+                # Does any other step consume it?
+                for cons_s in cons_steps_for_t[i]:
+                    if cons_s != s:
+                        is_nonephemeral = True
+            
+            # If produced but never consumed (network output), it's Mem
+            if not cons_steps_for_t[i]:
+                is_nonephemeral = True
+            
+            # If it's pure ephemeral, is_nonephemeral will remain False.
+            # If it's both, both become True.
+            # If it's purely cross-subgraph, is_ephemeral remains False.
+            
         # Now decide colors based on mixture of roles
         roles = []
         colors_for_roles = []
