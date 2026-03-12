@@ -42,8 +42,6 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     mm_comp *= (double)scale;
     pw_comp *= (double)scale;
 
-    bool reuse = (cfg.snake != SnakeDir::None);
-    auto tiles = make_traversal(ntw, nth, cfg.snake);
     const auto& bi = sg.boundary_inputs();
     double total = 0; int pr = -1, pc = -1;
 
@@ -57,12 +55,10 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
                 if (op.type == OpType::MatMul) {
                     size_t lhs = op.inputs[0], rhs = op.inputs[1];
                     if (bi.count(lhs) && !rfp.count(lhs) && !xfer_done.count(lhs)) {
-                        if (!reuse) { if (ks == 0) { mi += (double)(cfg.h * sg.op_K(i)) / B; xfer_done.insert(lhs); } }
-                        else { if (ks == 0 && (tp == 0 || tr != pr)) { mi += (double)(cfg.h * sg.op_K(i)) / B; xfer_done.insert(lhs); } }
+                        if (ks == 0 && (tp == 0 || tr != pr)) { mi += (double)(cfg.h * sg.op_K(i)) / B; xfer_done.insert(lhs); }
                     }
                     if (bi.count(rhs) && !rfp.count(rhs) && !xfer_done.count(rhs)) {
-                        if (!reuse) { mi += (double)(cfg.k * cfg.w) / B; xfer_done.insert(rhs); }
-                        else { if (ks > 0 || (ks == 0 && (tp == 0 || tc != pc))) { mi += (double)(cfg.k * cfg.w) / B; xfer_done.insert(rhs); } }
+                        if (ks > 0 || (ks == 0 && (tp == 0 || tc != pc || nk > 1))) { mi += (double)(cfg.k * cfg.w) / B; xfer_done.insert(rhs); }
                     }
                 } else {
                     if (ks == 0) for (auto t : op.inputs)
@@ -96,8 +92,9 @@ int main() {
         if (!sg) { std::cout << "SKIP " << tc.nm << "\n"; return; }
         auto a = sg->compute_cost(tc.cfg, tc.rfp, tc.rt);
         auto s = simulate(*sg, tc.cfg, tc.rfp, tc.rt);
-        if (std::abs(a.latency - s.latency) < 0.01) pass++;
-        else { fail++; std::cout << "FAIL " << tc.nm << ": a=" << a.latency << " s=" << s.latency << "\n"; }
+        if (!a.feasible && !s.feasible) pass++;
+        else if (a.feasible && s.feasible && std::abs(a.latency - s.latency) < 0.01) pass++;
+        else { fail++; std::cout << "FAIL " << tc.nm << ": a=" << a.latency << " s=" << s.latency << " (fea=" << a.feasible << "," << s.feasible << ")\n"; }
     };
 
     auto N = SnakeDir::None; auto R = SnakeDir::RowMajor; auto C = SnakeDir::ColMajor;

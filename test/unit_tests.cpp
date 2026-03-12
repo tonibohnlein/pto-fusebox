@@ -180,16 +180,18 @@ void test_create_diamond_fusions() {
 
   auto sg01 = Subgraph::create(p, d, {0, 1});
   CHECK("{0,1} valid", sg01.has_value());
-  CHECK("T1 ephemeral in {0,1}", sg01->ephemeral().count(1));
+  CHECK("T1 NOT ephemeral in {0,1}", !sg01->ephemeral().count(1));
+  CHECK("T1 boundary out in {0,1}", sg01->boundary_outputs().count(1));
 
   auto sg12 = Subgraph::create(p, d, {1, 2});
   CHECK("{1,2} valid", sg12.has_value());
   CHECK("T2 ephemeral in {1,2}", sg12->ephemeral().count(2));
-  CHECK("T1 boundary of {1,2}", sg12->boundary_inputs().count(1));
+  CHECK("T1 boundary in {1,2}", sg12->boundary_inputs().count(1));
 
   auto sg02 = Subgraph::create(p, d, {0, 2});
   CHECK("{0,2} valid", sg02.has_value());
-  CHECK("T1 ephemeral in {0,2}", sg02->ephemeral().count(1));
+  CHECK("T1 NOT ephemeral in {0,2}", !sg02->ephemeral().count(1));
+  CHECK("T1 boundary out in {0,2}", sg02->boundary_outputs().count(1));
 
   auto sg012 = Subgraph::create(p, d, {0, 1, 2});
   // {0,1,2} is rejected: T1 is ephemeral but consumed by both Op1 and Op2 (fan-out)
@@ -210,7 +212,7 @@ void test_ws_pointwise() {
   auto p = make_chain_pw();
   DAG d = DAG::build(p);
   auto sg = Subgraph::create(p, d, {0});
-  CHECK_EQ_I("PW ws", sg->working_set(N(128, 128, 1)), 128 * 128);
+  CHECK_EQ_I("PW ws", sg->working_set(N(128, 128, 1)), 128 * 128 * 2);
 }
 
 void test_ws_matmul() {
@@ -875,8 +877,8 @@ void test_retain_output_accumulation() {
   // ws = ws_no(16384) + full(65536) = 81920.
   auto ws_ret = sg->working_set(N(128, 128, 1), {}, {1});
   std::cout << "    ws retain output: " << ws_ret << "\n";
-  // Retain adds full tensor size for PW output (current tile was not in ws)
-  CHECK_EQ_I("accumulation cost", ws_ret - ws_no, 256 * 256);
+  // Retain adds (full tensor size - tile size) for PW output
+  CHECK_EQ_I("accumulation cost", ws_ret - ws_no, 256 * 256 - 128 * 128);
 
   CHECK("retain output infeasible at cap=40000",
         !sg->is_feasible(N(128, 128, 1), {}, {1}));
