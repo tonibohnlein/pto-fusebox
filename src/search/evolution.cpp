@@ -451,37 +451,17 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
             for (auto op : parent_b.groups[gi].ops)
                 grp_b[op] = (int)gi;
     
-    // Step 2: Union-Find to cluster ops that agree in both parents
-    std::vector<size_t> uf(n_ops);
-    std::iota(uf.begin(), uf.end(), 0);
-    std::function<size_t(size_t)> find = [&](size_t x) -> size_t {
-        return uf[x] == x ? x : (uf[x] = find(uf[x]));
-    };
-    auto unite = [&](size_t x, size_t y) {
-        x = find(x); y = find(y);
-        if (x != y) uf[x] = y;
-    };
-    
+    // Step 2: Cluster ops that agree in both parents.
+    // Two ops are in the same cluster iff they share the same group in BOTH parents.
+    // O(n) via hashing (grp_a, grp_b) pairs — no pairwise comparison needed.
+    std::map<std::pair<int,int>, std::set<size_t>> clusters;
     for (size_t i = 0; i < n_ops; i++) {
         if (grp_a[i] < 0 || grp_b[i] < 0) continue;
-        for (size_t j = i + 1; j < n_ops; j++) {
-            if (grp_a[j] < 0 || grp_b[j] < 0) continue;
-            // Same group in both parents → must stay together
-            if (grp_a[i] == grp_a[j] && grp_b[i] == grp_b[j])
-                unite(i, j);
-        }
+        clusters[{grp_a[i], grp_b[i]}].insert(i);
     }
     
-    // Step 3: Collect clusters
-    std::map<size_t, std::set<size_t>> clusters;
-    for (size_t i = 0; i < n_ops; i++)
-        if (grp_a[i] >= 0)
-            clusters[find(i)].insert(i);
-    
-    // Step 4: Shuffle clusters and greedily assign to groups.
-    // For each cluster, try merging with existing child groups that share
-    // a DAG edge. If no merge works, create a new group.
-    std::vector<size_t> cluster_keys;
+    // Step 3: Shuffle clusters and greedily assign to groups.
+    std::vector<std::pair<int,int>> cluster_keys;
     for (auto& [k, _] : clusters) cluster_keys.push_back(k);
     std::shuffle(cluster_keys.begin(), cluster_keys.end(), rng);
     

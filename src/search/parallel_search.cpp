@@ -13,6 +13,7 @@
 #include <chrono>
 #include <random>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 
 using Clock = std::chrono::steady_clock;
@@ -64,12 +65,11 @@ static double partition_distance(const Partition& a, const Partition& b) {
     }
     if (total <= 1) return 0.0;
 
-    // Rand index via contingency table:
-    //   same_in_a = Σ_i C(row_i, 2)
-    //   same_in_b = Σ_j C(col_j, 2)
-    //   agreements = Σ_ij C(n_ij, 2)
-    //   disagree = same_in_a + same_in_b - 2 * agreements
-    //   total_pairs = C(total, 2)
+    // Adjusted Rand Index (ARI) via contingency table.
+    // ARI corrects for chance: random partitions → ARI ≈ 0, identical → ARI = 1.
+    // Unadjusted Rand index has a floor effect (~0.85-0.95 for random partitions
+    // of typical sizes), compressing meaningful variation into a narrow band.
+    // We return 1 - ARI as a distance (0 = identical, 1 = maximally different).
     auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
 
     int64_t same_a = 0, same_b = 0, agree = 0;
@@ -79,9 +79,20 @@ static double partition_distance(const Partition& a, const Partition& b) {
         for (int j = 0; j < num_gb; j++)
             agree += choose2(table[i][j]);
 
-    int64_t disagree = same_a + same_b - 2 * agree;
     int64_t total_pairs = choose2(total);
-    return total_pairs > 0 ? (double)disagree / total_pairs : 0.0;
+    if (total_pairs == 0) return 0.0;
+
+    // ARI = (agree - expected) / (max_possible - expected)
+    // expected = same_a * same_b / total_pairs
+    // max_possible = (same_a + same_b) / 2
+    double expected = (double)same_a * same_b / total_pairs;
+    double max_agree = (double)(same_a + same_b) / 2.0;
+    double denom = max_agree - expected;
+    if (std::abs(denom) < 1e-12) return 0.0;  // both partitions are identical
+
+    double ari = ((double)agree - expected) / denom;
+    ari = std::clamp(ari, 0.0, 1.0);
+    return 1.0 - ari;  // distance: 0 = identical, 1 = maximally different
 }
 
 // ============================================================================
@@ -102,7 +113,8 @@ static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
     }
 
     // Near-duplicate: only replace if strictly better
-    if (min_dist < 0.01) {
+    // ARI distance: 0 = identical, 1 = maximally different
+    if (min_dist < 0.05) {
         if (entry.cost < pool[closest_idx].cost - 0.01) {
             pool[closest_idx] = std::move(entry);
             return true;
@@ -142,9 +154,9 @@ static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
     if (least_unique == SIZE_MAX) return false;
 
     // Replace least-unique if candidate brings more diversity or better cost with diversity
-    bool more_diverse = (min_dist > least_unique_dist + 0.01);
+    bool more_diverse = (min_dist > least_unique_dist + 0.05);
     bool better_cost = (entry.cost < pool[least_unique].cost - 0.01);
-    bool decent_diversity = (min_dist > 0.02);
+    bool decent_diversity = (min_dist > 0.10);
 
     if (more_diverse || (better_cost && decent_diversity)) {
         pool[least_unique] = std::move(entry);

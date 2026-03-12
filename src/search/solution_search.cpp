@@ -69,14 +69,9 @@ static bool is_connected_without(const std::set<size_t> &ops, size_t rm,
   while (!q.empty()) {
     size_t u = q.back();
     q.pop_back();
-    for (auto v : dag.op_preds[u])
-      if (v != rm && ops.count(v) && !vis[v]) {
-        vis[v] = true;
-        clr.push_back(v);
-        q.push_back(v);
-        cnt++;
-      }
-    for (auto v : dag.op_succs[u])
+    // Use op_neighbors (DAG edges + co-consumer edges) for full connectivity,
+    // matching Subgraph::create's connectivity check.
+    for (auto v : dag.op_neighbors[u])
       if (v != rm && ops.count(v) && !vis[v]) {
         vis[v] = true;
         clr.push_back(v);
@@ -123,6 +118,9 @@ struct SolState {
   std::vector<int> gen; // per-step generation counter
   double total = 0;
 
+  // O(1) op → step lookup (rebuilt on every structural change)
+  std::vector<size_t> op_to_step;
+
   // Precomputed: tensors that CAN be retained (singleton feasibility check).
   // Points to externally-owned set (shared across all SolStates for an instance).
   // If null, all retainable_tensors are considered feasible (fallback).
@@ -132,6 +130,17 @@ struct SolState {
   bool is_feasibly_retainable(size_t t) const {
     if (feasibly_retainable) return feasibly_retainable->count(t);
     return prob->retainable_tensors.count(t);
+  }
+
+  size_t step_of(size_t op) const {
+    return op < op_to_step.size() ? op_to_step[op] : SIZE_MAX;
+  }
+
+  void rebuild_op_index() {
+    op_to_step.assign(prob->num_ops(), SIZE_MAX);
+    for (size_t i = 0; i < steps.size(); i++)
+      for (auto op : steps[i].subgraph.ops())
+        op_to_step[op] = i;
   }
 
   void init(const Problem &p, const DAG &d, std::vector<ScheduleStep> s,
@@ -186,6 +195,7 @@ struct SolState {
       total += c.latency;
       cur = steps[i].retain_these;
     }
+    rebuild_op_index();
   }
 
   void rebuild_from(size_t idx) {
@@ -237,6 +247,7 @@ struct SolState {
       total += c.latency;
       cur = steps[i].retain_these;
     }
+    rebuild_op_index();
   }
 
   size_t size() const { return steps.size(); }
@@ -305,7 +316,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
   if (locked_ops.count(op))
     return best;
 
-  size_t si = find_step_of(state.steps, op);
+  size_t si = state.step_of(op);
   if (si == SIZE_MAX)
     return best;
 
@@ -1323,7 +1334,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
       seeds_added++;
     } else if (o_idx < all_ops.size()) {
       active.activate_op(state, all_ops[o_idx]);
-      size_t si = find_step_of(state.steps, all_ops[o_idx]);
+      size_t si = state.step_of(all_ops[o_idx]);
       if (si != SIZE_MAX) {
         active.activate_step(state, si);
         if (si > 0) active.activate_step(state, si - 1);
@@ -1538,6 +1549,168 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
   std::vector<Solution> pool;
   pool.push_back(std::move(sol));
   return solution_evo_search(prob, dag, std::move(pool), cfg);
+}
+
+// ============================================================================
+// Solution crossover: agreement-based (like partition crossover)
+//
+// 1. Map ops to steps in both parents
+// 2. Cluster ops that share the same step in BOTH parents (O(n) via hash)
+// 3. Each cluster → validate as subgraph, split invalid ones to singletons
+// 4. Topologically sort clusters
+// 5. Greedily merge adjacent small clusters where profitable
+// 6. Apply retain decisions from both parents
+// ============================================================================
+
+// Forward declaration (defined below with mutation helpers)
+static void recompute_costs(const Problem& prob, const DAG& dag,
+                            std::vector<ScheduleStep>& steps);
+
+static std::vector<ScheduleStep> solution_crossover(
+    const Problem& prob, const DAG& dag,
+    const std::vector<ScheduleStep>& parent_a,
+    const std::vector<ScheduleStep>& parent_b,
+    std::mt19937& rng) {
+
+    size_t n_ops = prob.num_ops();
+
+    // Step 1: Map ops to step index in each parent
+    std::vector<int> map_a(n_ops, -1), map_b(n_ops, -1);
+    for (size_t i = 0; i < parent_a.size(); i++)
+        for (auto op : parent_a[i].subgraph.ops()) map_a[op] = (int)i;
+    for (size_t i = 0; i < parent_b.size(); i++)
+        for (auto op : parent_b[i].subgraph.ops()) map_b[op] = (int)i;
+
+    // Step 2: Agreement clusters — ops with same (step_a, step_b) pair
+    std::map<std::pair<int,int>, std::vector<size_t>> clusters;
+    for (size_t op = 0; op < n_ops; op++) {
+        if (map_a[op] < 0 && map_b[op] < 0) continue;
+        int a = map_a[op] >= 0 ? map_a[op] : -1;
+        int b = map_b[op] >= 0 ? map_b[op] : -1;
+        clusters[{a, b}].push_back(op);
+    }
+
+    // Step 3: Validate each cluster as a subgraph. Invalid → split to singletons.
+    std::vector<std::vector<size_t>> valid_groups;
+    for (auto& [key, ops] : clusters) {
+        auto sg = Subgraph::create(prob, dag, ops);
+        if (sg) {
+            valid_groups.push_back(std::move(ops));
+        } else {
+            for (auto op : ops)
+                valid_groups.push_back({op});
+        }
+    }
+
+    // Step 4: Topological sort groups by inter-group DAG edges
+    size_t ng = valid_groups.size();
+    // Map each op to its group index
+    std::vector<size_t> op_group(n_ops, SIZE_MAX);
+    for (size_t g = 0; g < ng; g++)
+        for (auto op : valid_groups[g])
+            op_group[op] = g;
+
+    std::vector<int> in_deg(ng, 0);
+    std::vector<std::set<size_t>> adj(ng);
+    for (size_t g = 0; g < ng; g++)
+        for (auto op : valid_groups[g])
+            for (auto succ : dag.op_succs[op]) {
+                size_t sg = op_group[succ];
+                if (sg != SIZE_MAX && sg != g && !adj[g].count(sg)) {
+                    adj[g].insert(sg);
+                    in_deg[sg]++;
+                }
+            }
+
+    std::vector<size_t> order;
+    std::vector<size_t> q;
+    for (size_t g = 0; g < ng; g++)
+        if (in_deg[g] == 0) q.push_back(g);
+    while (!q.empty()) {
+        // Random tie-breaking for diversity
+        size_t pick = rng() % q.size();
+        std::swap(q[pick], q.back());
+        size_t u = q.back(); q.pop_back();
+        order.push_back(u);
+        for (auto v : adj[u])
+            if (--in_deg[v] == 0) q.push_back(v);
+    }
+    if (order.size() != ng) return {};  // cycle (shouldn't happen)
+
+    // Step 5: Build child steps in topological order.
+    // Try merging each cluster with the previous step if profitable.
+    std::vector<ScheduleStep> child_steps;
+    for (auto gi : order) {
+        auto& ops = valid_groups[gi];
+        auto sg = Subgraph::create(prob, dag, ops);
+        if (!sg) {
+            // Shouldn't happen (validated above), but add singletons as fallback
+            for (auto op : ops) {
+                auto ss = Subgraph::create(prob, dag, {op});
+                if (!ss) continue;
+                auto bc = ss->best_cost({}, {});
+                if (!bc.feasible) continue;
+                child_steps.push_back({std::move(*ss), bc.config, {}});
+            }
+            continue;
+        }
+
+        // Try merging with previous step
+        bool merged = false;
+        if (!child_steps.empty()) {
+            auto& prev = child_steps.back();
+            auto prev_ops = prev.subgraph.ops();
+            std::vector<size_t> combined(prev_ops.begin(), prev_ops.end());
+            combined.insert(combined.end(), ops.begin(), ops.end());
+            // Only merge if no cycle and Subgraph is valid
+            auto sg_m = Subgraph::create(prob, dag, combined);
+            if (sg_m) {
+                auto bc_m = sg_m->best_cost({}, {});
+                auto bc_sep = sg->best_cost({}, {});
+                if (bc_m.feasible && bc_sep.feasible) {
+                    double merged_cost = bc_m.latency;
+                    double separate_cost = prev.subgraph.best_cost({}, {}).latency + bc_sep.latency;
+                    if (merged_cost < separate_cost + 100) {
+                        prev.subgraph = std::move(*sg_m);
+                        prev.config = bc_m.config;
+                        prev.retain_these.clear();
+                        merged = true;
+                    }
+                }
+            }
+        }
+
+        if (!merged) {
+            auto bc = sg->best_cost({}, {});
+            if (bc.feasible)
+                child_steps.push_back({std::move(*sg), bc.config, {}});
+        }
+    }
+
+    if (child_steps.empty()) return {};
+
+    // Step 6: Apply retain decisions from both parents.
+    // Collect all retain decisions — recompute_costs will prune invalid ones.
+    std::set<size_t> retained_tensors;
+    for (auto& s : parent_a)
+        for (auto t : s.retain_these)
+            retained_tensors.insert(t);
+    for (auto& s : parent_b)
+        for (auto t : s.retain_these)
+            retained_tensors.insert(t);
+    // Apply where structurally valid
+    for (size_t i = 0; i + 1 < child_steps.size(); i++) {
+        for (auto t : retained_tensors) {
+            bool valid_here = child_steps[i].subgraph.boundary_inputs().count(t) ||
+                              child_steps[i].subgraph.boundary_outputs().count(t);
+            bool useful_next = child_steps[i+1].subgraph.boundary_inputs().count(t);
+            if (valid_here && useful_next && prob.retainable_tensors.count(t))
+                child_steps[i].retain_these.insert(t);
+        }
+    }
+
+    recompute_costs(prob, dag, child_steps);
+    return child_steps;
 }
 
 // ============================================================================
@@ -1844,50 +2017,70 @@ std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
 // Solution evolutionary search
 // ============================================================================
 
-// Solution distance: fraction of ops that are in different steps
+// Solution distance: ARI for grouping + ordering + retain disagreement.
+// Uses contingency table for O(n + sa*sb) grouping instead of O(n²) pairwise.
 static double solution_distance(const Problem& prob,
                                 const std::vector<ScheduleStep>& a,
                                 const std::vector<ScheduleStep>& b) {
     size_t n = prob.num_ops();
     // Map op → step index
     std::vector<int> map_a(n, -1), map_b(n, -1);
+    int num_sa = (int)a.size(), num_sb = (int)b.size();
     for (size_t i = 0; i < a.size(); i++)
         for (auto op : a[i].subgraph.ops()) map_a[op] = (int)i;
     for (size_t i = 0; i < b.size(); i++)
         for (auto op : b[i].subgraph.ops()) map_b[op] = (int)i;
 
-    // Component 1: grouping disagreement (are ops i,j in the same step?)
-    int grp_disagree = 0, grp_total = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (map_a[i] < 0 || map_b[i] < 0) continue;
-        for (size_t j = i + 1; j < n; j++) {
-            if (map_a[j] < 0 || map_b[j] < 0) continue;
-            grp_total++;
-            bool same_a = (map_a[i] == map_a[j]);
-            bool same_b = (map_b[i] == map_b[j]);
-            if (same_a != same_b) grp_disagree++;
+    // Component 1: grouping via Adjusted Rand Index (contingency table)
+    double d_group = 0.0;
+    if (num_sa > 0 && num_sb > 0) {
+        std::vector<std::vector<int>> table(num_sa, std::vector<int>(num_sb, 0));
+        std::vector<int> row_sum(num_sa, 0), col_sum(num_sb, 0);
+        int total = 0;
+        for (size_t op = 0; op < n; op++) {
+            if (map_a[op] < 0 || map_b[op] < 0) continue;
+            table[map_a[op]][map_b[op]]++;
+            row_sum[map_a[op]]++;
+            col_sum[map_b[op]]++;
+            total++;
+        }
+        if (total > 1) {
+            auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
+            int64_t same_a = 0, same_b = 0, agree = 0;
+            for (int i = 0; i < num_sa; i++) same_a += choose2(row_sum[i]);
+            for (int j = 0; j < num_sb; j++) same_b += choose2(col_sum[j]);
+            for (int i = 0; i < num_sa; i++)
+                for (int j = 0; j < num_sb; j++)
+                    agree += choose2(table[i][j]);
+            int64_t total_pairs = choose2(total);
+            double expected = (double)same_a * same_b / total_pairs;
+            double max_agree = (double)(same_a + same_b) / 2.0;
+            double denom = max_agree - expected;
+            if (std::abs(denom) > 1e-12) {
+                double ari = std::clamp(((double)agree - expected) / denom, 0.0, 1.0);
+                d_group = 1.0 - ari;
+            }
         }
     }
-    double d_group = grp_total > 0 ? (double)grp_disagree / grp_total : 0.0;
 
-    // Component 2: ordering disagreement (for ops in DIFFERENT steps,
-    // does op i come before op j in both solutions?)
+    // Component 2: ordering disagreement via Kendall tau-like metric.
+    // Only count pairs in different steps in at least one solution.
+    // Use step indices directly — O(n²) but n ≤ ~100 so ~5000 pairs.
     int ord_disagree = 0, ord_total = 0;
     for (size_t i = 0; i < n; i++) {
         if (map_a[i] < 0 || map_b[i] < 0) continue;
         for (size_t j = i + 1; j < n; j++) {
             if (map_a[j] < 0 || map_b[j] < 0) continue;
-            // Only count if ops are in different steps in at least one solution
             if (map_a[i] == map_a[j] && map_b[i] == map_b[j]) continue;
             ord_total++;
-            bool a_before_a = (map_a[i] < map_a[j]);
-            bool b_before_b = (map_b[i] < map_b[j]);
-            if (a_before_a != b_before_b) ord_disagree++;
+            bool a_i_first = (map_a[i] < map_a[j]);
+            bool b_i_first = (map_b[i] < map_b[j]);
+            if (a_i_first != b_i_first) ord_disagree++;
         }
     }
     double d_order = ord_total > 0 ? (double)ord_disagree / ord_total : 0.0;
 
-    // Component 3: retain disagreement (symmetric difference of all retain sets)
+    // Component 3: retain disagreement (symmetric difference)
     std::set<size_t> ret_a, ret_b;
     for (auto& s : a) for (auto t : s.retain_these) ret_a.insert(t);
     for (auto& s : b) for (auto t : s.retain_these) ret_b.insert(t);
@@ -1902,7 +2095,7 @@ static double solution_distance(const Problem& prob,
     }
     double d_retain = ret_union > 0 ? (double)ret_diff / ret_union : 0.0;
 
-    // Weighted combination: grouping is most important, order and retain add diversity
+    // Weighted combination
     return 0.5 * d_group + 0.3 * d_order + 0.2 * d_retain;
 }
 
@@ -1945,7 +2138,8 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
         }
 
         // Near-duplicate: only replace if strictly better
-        if (min_dist < 0.01) {
+        // ARI-based distance: 0 = identical, ~1 = maximally different
+        if (min_dist < 0.05) {
             if (cost < pool[closest_idx].cost - 0.01) {
                 pool[closest_idx].steps = std::move(steps);
                 pool[closest_idx].cost = cost;
@@ -1986,9 +2180,9 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
 
         if (least_unique == SIZE_MAX) return false;
 
-        bool more_diverse = (min_dist > least_unique_dist + 0.01);
+        bool more_diverse = (min_dist > least_unique_dist + 0.05);
         bool better_cost = (cost < pool[least_unique].cost - 0.01);
-        bool decent_diversity = (min_dist > 0.02);
+        bool decent_diversity = (min_dist > 0.10);
 
         if (more_diverse || (better_cost && decent_diversity)) {
             pool[least_unique] = {std::move(steps), cost};
@@ -2052,21 +2246,30 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
                 double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
 
-                // Pick a parent from pool (uniform random — pool diversity
-                // is maintained by the insertion policy, not selection bias)
-                std::vector<ScheduleStep> parent;
-                double parent_cost;
+                // --- Select operator: Crossover (1/3) or Mutation (2/3) ---
+                std::vector<ScheduleStep> child;
+                bool do_crossover = (rng() % 3 == 0);
+
+                std::vector<ScheduleStep> parent, parent2;
                 {
                     std::lock_guard<std::mutex> lock(pool_mutex);
                     if (pool.empty()) break;
-                    size_t idx = rng() % pool.size();
-                    parent = pool[idx].steps;
-                    parent_cost = pool[idx].cost;
+                    size_t idx1 = rng() % pool.size();
+                    parent = pool[idx1].steps;
+                    if (do_crossover && pool.size() >= 2) {
+                        size_t idx2 = rng() % pool.size();
+                        while (idx2 == idx1) idx2 = rng() % pool.size();
+                        parent2 = pool[idx2].steps;
+                    }
                 }
 
-                // --- Mutate: apply 1-3 random FM-style moves ---
-                int n_moves = 1 + (int)(rng() % 3);
-                std::vector<ScheduleStep> child = mutate_random(prob, dag, parent, rng, n_moves);
+                if (do_crossover && !parent2.empty())
+                    child = solution_crossover(prob, dag, parent, parent2, rng);
+                if (child.empty()) {
+                    // Mutation path (2/3 of the time, or crossover fallback)
+                    int n_moves = 1 + (int)(rng() % 3);
+                    child = mutate_random(prob, dag, parent, rng, n_moves);
+                }
                 if (child.empty()) continue;
                 total_mutations++;
 
@@ -2113,6 +2316,15 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                             thread_best_cost = fm_sol.total_latency();
                             improved = true;
                         }
+                    }
+
+                    // Also insert perturbed end state for diversity.
+                    // FM explored this neighborhood but didn't find it best —
+                    // it may seed useful crossover/mutation from a different basin.
+                    if (pr.end_cost < 1e17 && pr.end_cost > pr.best_cost + 0.01) {
+                        Solution end_sol(prob, dag, pr.end_steps);
+                        if (end_sol.validate().valid)
+                            pool_insert(end_sol.steps(), end_sol.total_latency());
                     }
                 }
 
