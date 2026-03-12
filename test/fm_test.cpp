@@ -590,8 +590,8 @@ void test_active_set_update_after_move() {
     auto affected = apply_fm_move(part, *m);
     CHECK("move applied", !affected.empty());
 
-    // Update affected ops
-    as.update_affected(affected);
+    // Update affected ops and activate new neighbors (combined)
+    as.refresh_after_move(affected);
 
     // Remaining unlocked ops should have recomputed moves
     // (We can't easily check the move content, but we verify no crash
@@ -612,13 +612,13 @@ void test_active_set_activate_neighbors() {
     as.activate(0);
     CHECK_EQ_S("1 active", as.num_active(), 1);
 
-    // Now activate neighbors of G0 (which contains Op0)
+    // Now refresh after a hypothetical move on G0.
     // G0 is adjacent to G1 (via Op1). Border ops of G1: Op1 itself (singleton).
-    // G1 is adjacent to G0 and G2. Border ops of G2: Op2.
-    as.activate_neighbors_of({0});
+    // refresh_after_move activates border ops of affected + adjacent groups.
+    as.refresh_after_move({0});
 
     CHECK("Op1 activated", as.is_active(1));
-    std::cout << "    after activate_neighbors_of({G0}): "
+    std::cout << "    after refresh_after_move({G0}): "
               << as.num_active() << " active\n";
 }
 

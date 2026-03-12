@@ -305,15 +305,16 @@ void test_chain3_tiled() {
     // Compute per step: 3 × (2000 × 32/256) = 3 × 250 = 750
     CHECK_EQ("comp/step", c.compute_per_step, 750.0);
 
-    // Null traversal (no reuse): each of the 4 tiles loads T0 row strip fresh
+    // Raster traversal: 2×2 grid with LHS reuse within each row.
+    // With nk=8, rhs_fresh is forced (RHS strip changes k-range between tiles).
     //
-    // Per tile, 8 k-steps:
-    //   k=0: T0(128×256/20=1638.4) + T1(32×128/20=204.8) × 3 = 1638.4+614.4 = 2252.8
-    //         lat = max(750, 2252.8) = 2252.8
-    //   k=1..6: 3×204.8 = 614.4. lat = max(750, 614.4) = 750
-    //   k=7: 614.4 + T6_evict(128×128/20=819.2) = 1433.6. lat = max(750, 1433.6) = 1433.6
-    // Per tile total = 2252.8 + 6×750 + 1433.6 = 8186.4
-    // 4 tiles × 8186.4 = 32745.6
+    // FF tile (both fresh): k0 + 6×k_mid + k_last = 8186.4
+    // RF tile (LHS reused): rf_k0 + 6×k_mid + k_last = 6683.6
+    //
+    // Raster on 2×2: [0,1,2,3]
+    //   Row 0: tile(0,0)=FF, tile(0,1)=RF
+    //   Row 1: tile(1,0)=FF, tile(1,1)=RF
+    // Total = 2×FF + 2×RF = 2×8186.4 + 2×6683.6 = 29740.0
 
     double B = 20.0;
     double t0_load = 128.0 * 256.0 / B;   // 1638.4
@@ -324,54 +325,43 @@ void test_chain3_tiled() {
     double k0 = std::max(comp, t0_load + 3 * rhs_slice);          // max(750, 2252.8)
     double k_mid = std::max(comp, 3 * rhs_slice);                  // max(750, 614.4)
     double k_last = std::max(comp, 3 * rhs_slice + t6_evict);     // max(750, 1433.6)
-    double per_tile = k0 + 6 * k_mid + k_last;
-    double total_null = 4 * per_tile;
+    double per_tile = k0 + 6 * k_mid + k_last;  // FF tile cost
+
+    double rf_k0 = std::max(comp, 3 * rhs_slice);  // 750 (no T0 load)
+    double rf_per_tile = rf_k0 + 6 * k_mid + k_last;  // 6683.6
+
+    // Raster: 2 FF + 2 RF = 29740.0
+    double total_raster = 2 * per_tile + 2 * rf_per_tile;
 
     CHECK_EQ("k0 lat", k0, 2252.8);
     CHECK_EQ("k_mid lat", k_mid, 750.0);
     CHECK_EQ("k_last lat", k_last, 1433.6);
-    CHECK_EQ("per tile", per_tile, 8186.4);
-    CHECK_EQ("null total", c.latency, total_null);
+    CHECK_EQ("FF tile", per_tile, 8186.4);
+    CHECK_EQ("RF tile", rf_per_tile, 6683.6);
+    CHECK_EQ("raster total", c.latency, total_raster);
 
-    // Snake traversal: 2×2 grid
-    // Row snake: [0,1,3,2]
-    //   Tile 0 (r=0,c=0): FF → k0 + 6×k_mid + k_last = 8186.4
-    //   Tile 1 (r=0,c=1): RF (reuse LHS) → no T0 load
-    //     k=0: 3×204.8 = 614.4. lat = max(750, 614.4) = 750
-    //     k=1..6: 750
-    //     k=7: 614.4 + 819.2 = 1433.6. lat = 1433.6
-    //     Total: 750 + 6×750 + 1433.6 = 6683.6
-    //   Tile 2 (r=1,c=1): FR (reuse RHS) → T0 loaded, no T1/T3/T5 change at k=0
-    //     Wait, FR means fresh LHS, reuse RHS.
-    //     k=0: T0 load(1638.4) + 0 (RHS reused) + PW=0 = 1638.4. lat=max(750,1638.4)=1638.4
-    //     k=1..6: 3×204.8=614.4. lat = 750
-    //     k=7: 614.4+819.2=1433.6
-    //     Total: 1638.4 + 6×750 + 1433.6 = 7572
-    //   Tile 3 (r=1,c=0): RF (reuse LHS)
-    //     Same as tile 1: 6683.6
+    // Snake traversal: 2×2 grid, RowMajor [0,1,3,2]
+    //   Tile 0 (r=0,c=0): FF = 8186.4
+    //   Tile 1 (r=0,c=1): RF (same row, LHS reused) = 6683.6
+    //   Tile 2 (r=1,c=1): FR (same column) — but nk>1 forces rhs_fresh,
+    //     so FR degrades to FF = 8186.4
+    //   Tile 3 (r=1,c=0): RF (same row, LHS reused) = 6683.6
     //
-    // Snake total = 8186.4 + 6683.6 + 7572.0 + 6683.6 = 29125.6
+    // Snake total = FF + RF + FF + RF = 8186.4 + 6683.6 + 8186.4 + 6683.6 = 29740.0
+    // Same as raster! With nk>1, the RHS reuse at row transitions is invalid,
+    // so snake's only advantage (FR tiles) is lost.
 
     auto c_snake = sg.compute_cost(TC(128,128,32, SnakeDir::RowMajor));
 
-    double rf_k0 = std::max(comp, 3 * rhs_slice);  // 750 (no T0 load)
-    double rf_per_tile = rf_k0 + 6 * k_mid + k_last;  // 750+4500+1433.6 = 6683.6
+    double total_snake = 2 * per_tile + 2 * rf_per_tile;  // same as raster
 
-    double fr_k0 = std::max(comp, t0_load);  // 1638.4 (no RHS load at k=0)
-    double fr_per_tile = fr_k0 + 6 * k_mid + k_last;  // 1638.4+4500+1433.6 = 7572
-
-    double total_snake = per_tile + rf_per_tile + fr_per_tile + rf_per_tile;
-    // = 8186.4 + 6683.6 + 7572 + 6683.6 = 29125.6
-
-    CHECK_EQ("RF tile", rf_per_tile, 6683.6);
-    CHECK_EQ("FR tile", fr_per_tile, 7572.0);
-    CHECK_EQ("snake total hand", total_snake, 29125.6);
+    CHECK_EQ("snake total hand", total_snake, 29740.0);
     CHECK_EQ("snake total code", c_snake.latency, total_snake);
 
-    // Snake is cheaper than null
-    CHECK("snake < null", c_snake.latency < c.latency);
-    std::cout << "  Null=" << c.latency << " Snake=" << c_snake.latency
-              << " (saved " << (int)(100*(c.latency - c_snake.latency)/c.latency) << "%)\n";
+    // With nk>1: snake == raster (FR tiles degrade to FF)
+    CHECK_EQ("snake == raster", c_snake.latency, c.latency);
+    std::cout << "  Raster=" << c.latency << " Snake=" << c_snake.latency
+              << " (nk>1: snake FR degrades to FF, no advantage)\n";
 }
 
 // ============================================================================
