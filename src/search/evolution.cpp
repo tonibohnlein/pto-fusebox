@@ -250,17 +250,176 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
 }
 
 // ============================================================================
+// Mutate: random eject
+// ============================================================================
+
+Partition mutate_eject(Partition part, std::mt19937& rng) {
+    auto ag = alive_groups(part);
+    
+    // Collect groups with ≥2 ops
+    std::vector<size_t> candidates;
+    for (auto gi : ag)
+        if (part.groups[gi].ops.size() >= 2) candidates.push_back(gi);
+    if (candidates.empty()) return part;
+    
+    // Pick random group
+    size_t gi = candidates[rng() % candidates.size()];
+    
+    // Pick random op from the group
+    std::vector<size_t> ops_vec(part.groups[gi].ops.begin(),
+                                part.groups[gi].ops.end());
+    size_t op = ops_vec[rng() % ops_vec.size()];
+    
+    // Evaluate eject (handles disconnection into components)
+    auto er = part.eval_eject(op, gi);
+    if (!er.feasible) return part;
+    
+    // Apply: replace group with components + singleton
+    if (er.remainder_components.size() == 1) {
+        part.groups[gi].ops = std::move(er.remainder_components[0]);
+        part.groups[gi].cost = er.component_costs[0];
+    } else {
+        part.groups[gi].ops = std::move(er.remainder_components[0]);
+        part.groups[gi].cost = er.component_costs[0];
+        for (size_t c = 1; c < er.remainder_components.size(); c++)
+            part.add_group(std::move(er.remainder_components[c]),
+                           er.component_costs[c]);
+    }
+    part.groups[gi].gen++;
+    
+    if (er.singleton_cost > 0)
+        part.add_group({op}, er.singleton_cost);
+    
+    part.rebuild_index();
+    return part;
+}
+
+// ============================================================================
+// Mutate: tensor-centric merge
+// ============================================================================
+
+Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
+    const Problem& prob = *part.prob;
+    const DAG& dag = *part.dag;
+    
+    // Collect tensors with ≥2 consumers in different groups
+    std::vector<size_t> candidate_tensors;
+    for (size_t t = 0; t < prob.num_tensors(); t++) {
+        auto& consumers = dag.tensor_consumers[t];
+        if (consumers.size() < 2) continue;
+        
+        // Check if consumers are in ≥2 different groups
+        std::set<size_t> groups_seen;
+        for (auto cop : consumers)
+            for (auto gi : part.groups_of(cop))
+                groups_seen.insert(gi);
+        if (groups_seen.size() >= 2)
+            candidate_tensors.push_back(t);
+    }
+    if (candidate_tensors.empty()) return part;
+    
+    // Pick random tensor
+    size_t t = candidate_tensors[rng() % candidate_tensors.size()];
+    
+    // Collect all consumer groups + optionally the producer group
+    std::set<size_t> target_groups;
+    for (auto cop : dag.tensor_consumers[t])
+        for (auto gi : part.groups_of(cop))
+            target_groups.insert(gi);
+    
+    int prod = dag.tensor_producer[t];
+    if (prod >= 0)
+        for (auto gi : part.groups_of((size_t)prod))
+            target_groups.insert(gi);
+    
+    if (target_groups.size() < 2) return part;
+    
+    // Check for cycles (pairwise — conservative)
+    std::vector<size_t> group_list(target_groups.begin(), target_groups.end());
+    for (size_t a = 0; a < group_list.size(); a++)
+        for (size_t b = a + 1; b < group_list.size(); b++)
+            if (dag.merge_creates_cycle(part.groups[group_list[a]].ops,
+                                        part.groups[group_list[b]].ops))
+                return part;
+    
+    // Try full merge first
+    std::set<size_t> merged_ops;
+    for (auto gi : group_list)
+        merged_ops.insert(part.groups[gi].ops.begin(),
+                          part.groups[gi].ops.end());
+    
+    double merged_cost = part.eval_set(merged_ops);
+    if (merged_cost < 1e17) {
+        // Apply full merge: first group absorbs all, rest are killed
+        part.groups[group_list[0]].ops = std::move(merged_ops);
+        part.groups[group_list[0]].cost = merged_cost;
+        part.groups[group_list[0]].gen++;
+        for (size_t i = 1; i < group_list.size(); i++) {
+            part.groups[group_list[i]].alive = false;
+            part.groups[group_list[i]].gen++;
+        }
+        part.rebuild_index();
+        return part;
+    }
+    
+    // Fallback: extract just the consumer ops (+ producer) into a new group
+    std::set<size_t> extract_ops;
+    for (auto cop : dag.tensor_consumers[t])
+        extract_ops.insert(cop);
+    if (prod >= 0)
+        extract_ops.insert((size_t)prod);
+    
+    double extract_cost = part.eval_set(extract_ops);
+    if (extract_cost >= 1e17) return part;
+    
+    // Compute remainder costs
+    bool feasible = true;
+    struct RemInfo { size_t gi; std::set<size_t> ops; double cost; };
+    std::vector<RemInfo> remainders;
+    
+    for (auto gi : group_list) {
+        std::set<size_t> rem;
+        for (auto op : part.groups[gi].ops)
+            if (!extract_ops.count(op))
+                rem.insert(op);
+        double rc = 0;
+        if (!rem.empty()) {
+            rc = part.eval_set(rem);
+            if (rc >= 1e17) { feasible = false; break; }
+        }
+        remainders.push_back({gi, std::move(rem), rc});
+    }
+    if (!feasible) return part;
+    
+    // Apply extract
+    for (auto& ri : remainders) {
+        if (ri.ops.empty()) {
+            part.groups[ri.gi].alive = false;
+        } else {
+            part.groups[ri.gi].ops = std::move(ri.ops);
+            part.groups[ri.gi].cost = ri.cost;
+        }
+        part.groups[ri.gi].gen++;
+    }
+    part.add_group(std::move(extract_ops), extract_cost);
+    part.rebuild_index();
+    return part;
+}
+
+// ============================================================================
 // Compound mutation: mix of random operators
 // ============================================================================
 
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) {
     for (int i = 0; i < num_mutations; i++) {
-        int choice = rng() % 4;
+        int choice = rng() % 6;
         switch (choice) {
             case 0: part = mutate_merge(std::move(part), rng); break;
             case 1: part = mutate_split(std::move(part), rng); break;
             case 2: part = mutate_reassign(std::move(part), rng); break;
             case 3: part = mutate_block_move(std::move(part), rng); break;
+            case 4: part = mutate_eject(std::move(part), rng); break;
+            case 5: part = mutate_tensor_merge(std::move(part), rng); break;
         }
     }
     return part;

@@ -26,6 +26,15 @@ Partition mutate_reassign(Partition part, std::mt19937& rng);
 // Block move: move an entire DAG chain (connected subpath) between groups.
 Partition mutate_block_move(Partition part, std::mt19937& rng);
 
+// Random eject: pick a random op from a random group, eject it as a singleton.
+// If this disconnects the group, the components become separate groups.
+Partition mutate_eject(Partition part, std::mt19937& rng);
+
+// Tensor-centric merge: pick a random tensor with ≥2 consumer ops in different
+// groups, merge all consumer groups (+ optionally the producer group).
+// If full merge is infeasible, try extracting just the consumer ops.
+Partition mutate_tensor_merge(Partition part, std::mt19937& rng);
+
 // Compound mutation: apply N random mutations (mix of all types).
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng);
 

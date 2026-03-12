@@ -33,27 +33,55 @@ struct PoolEntry {
 
 static double partition_distance(const Partition& a, const Partition& b) {
     size_t n = a.prob->num_ops();
-    // Build op→group maps once (O(ops×groups) but only done once per call)
-    std::vector<int> ga_map(n, -1), gb_map(n, -1);
-    for (size_t gi = 0; gi < a.groups.size(); gi++)
-        if (a.groups[gi].alive)
-            for (auto op : a.groups[gi].ops)
-                ga_map[op] = (int)gi;
-    for (size_t gi = 0; gi < b.groups.size(); gi++)
-        if (b.groups[gi].alive)
-            for (auto op : b.groups[gi].ops)
-                gb_map[op] = (int)gi;
 
-    int disagree = 0, total = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (ga_map[i] < 0 || gb_map[i] < 0) continue;
-        for (size_t j = i + 1; j < n; j++) {
-            if (ga_map[j] < 0 || gb_map[j] < 0) continue;
-            if ((ga_map[i] == ga_map[j]) != (gb_map[i] == gb_map[j])) disagree++;
-            total++;
+    // Build op → group maps
+    std::vector<int> ga_map(n, -1), gb_map(n, -1);
+    int num_ga = 0, num_gb = 0;
+    for (size_t gi = 0; gi < a.groups.size(); gi++)
+        if (a.groups[gi].alive) {
+            for (auto op : a.groups[gi].ops) ga_map[op] = num_ga;
+            num_ga++;
         }
+    for (size_t gi = 0; gi < b.groups.size(); gi++)
+        if (b.groups[gi].alive) {
+            for (auto op : b.groups[gi].ops) gb_map[op] = num_gb;
+            num_gb++;
+        }
+    if (num_ga == 0 || num_gb == 0) return 0.0;
+
+    // Build contingency table: n_ij = |group_i_in_a ∩ group_j_in_b|
+    // Also track row/col totals.
+    std::vector<std::vector<int>> table(num_ga, std::vector<int>(num_gb, 0));
+    std::vector<int> row_sum(num_ga, 0), col_sum(num_gb, 0);
+    int total = 0;
+
+    for (size_t op = 0; op < n; op++) {
+        if (ga_map[op] < 0 || gb_map[op] < 0) continue;
+        table[ga_map[op]][gb_map[op]]++;
+        row_sum[ga_map[op]]++;
+        col_sum[gb_map[op]]++;
+        total++;
     }
-    return total > 0 ? (double)disagree / total : 0.0;
+    if (total <= 1) return 0.0;
+
+    // Rand index via contingency table:
+    //   same_in_a = Σ_i C(row_i, 2)
+    //   same_in_b = Σ_j C(col_j, 2)
+    //   agreements = Σ_ij C(n_ij, 2)
+    //   disagree = same_in_a + same_in_b - 2 * agreements
+    //   total_pairs = C(total, 2)
+    auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
+
+    int64_t same_a = 0, same_b = 0, agree = 0;
+    for (int i = 0; i < num_ga; i++) same_a += choose2(row_sum[i]);
+    for (int j = 0; j < num_gb; j++) same_b += choose2(col_sum[j]);
+    for (int i = 0; i < num_ga; i++)
+        for (int j = 0; j < num_gb; j++)
+            agree += choose2(table[i][j]);
+
+    int64_t disagree = same_a + same_b - 2 * agree;
+    int64_t total_pairs = choose2(total);
+    return total_pairs > 0 ? (double)disagree / total_pairs : 0.0;
 }
 
 // ============================================================================
