@@ -55,26 +55,18 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
   }
 
-  // Classify tensors using indexed vectors.
-  // A tensor produced AND consumed within the subgraph is ephemeral ONLY if
-  // ALL of its consumers are inside the subgraph. If any consumer is external,
-  // the tensor must be a boundary output so the external op can access it from
-  // slow memory. The internal consumer reads from the fast-memory-resident
-  // output tile at zero additional transfer cost.
+  // Classify tensors.
+  // A tensor produced AND consumed within the subgraph is ephemeral — it lives
+  // only in the tile buffer and is never transferred to/from slow memory.
+  // External consumers (if any) are satisfied by recomputation or other subgraphs;
+  // that's a solution-level concern, not a subgraph-level one.
   std::vector<bool> is_ephemeral(num_tensors, false);
 
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t]) {
-      bool all_consumers_internal = true;
-      for (auto consumer : dag.tensor_consumers[t]) {
-        if (!is_in_sg[consumer]) { all_consumers_internal = false; break; }
-      }
-      if (all_consumers_internal)
-        is_ephemeral[t] = true;
-      // else: tensor has external consumers → falls through to boundary_output
-    }
+    if (is_produced[t] && is_consumed[t])
+      is_ephemeral[t] = true;
   }
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_produced[t] && !is_ephemeral[t])
@@ -83,8 +75,8 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.ephemeral_.insert(t);
   }
 
-  // Validate: ephemeral tensors have exactly one consumer within subgraph.
-  // (Fan-out of ephemeral data is invalid — it exists only momentarily.)
+  // Validate: ephemeral tensors must have exactly one INTERNAL consumer.
+  // (The tile exists momentarily — can't fan out within a subgraph.)
   {
     std::vector<int> eph_count(num_tensors, 0);
     for (auto i : sg.ops_)
@@ -94,17 +86,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     for (size_t t = 0; t < num_tensors; t++)
       if (is_ephemeral[t] && eph_count[t] != 1)
         return std::nullopt;
-  }
-
-  // Defensive assert: by construction, ephemeral tensors now have no external
-  // consumers (we only set is_ephemeral when all consumers are internal).
-  // This check is redundant but guards against future classification bugs.
-  for (size_t t = 0; t < num_tensors; t++) {
-    if (is_ephemeral[t]) {
-      for (auto consumer : dag.tensor_consumers[t])
-        if (!is_in_sg[consumer])
-          return std::nullopt;
-    }
   }
 
   // Must have at least one boundary output
@@ -370,8 +351,8 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.h * cfg.w);
     if (info.is_mm_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
-    // PW boundary outputs have is_boundary_out but none of the above flags.
-    // Their tile (w×h) must still be counted in the working set.
+    // PW boundary outputs need their tile in fast memory too.
+    // (Redundant for MM outputs where is_mm_out already covers this.)
     if (info.is_boundary_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
 
