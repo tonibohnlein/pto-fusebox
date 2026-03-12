@@ -2,7 +2,6 @@
 
 #include "partition/partition.h"
 #include "search/fm_outer.h"
-#include <vector>
 
 // ============================================================================
 // Parallel multi-start search.

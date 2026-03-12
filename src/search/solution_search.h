@@ -78,12 +78,10 @@ Solution solution_fm_search(const Problem& prob, const DAG& dag,
 Solution solution_evo_search(const Problem& prob, const DAG& dag,
                               std::vector<Solution> pool, const SolutionFMConfig& cfg = {});
 
-// Solution mutation operators (return mutated steps, or empty if mutation failed)
-std::vector<ScheduleStep> mutate_swap_steps(const Problem& prob, const DAG& dag,
-                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng);
-std::vector<ScheduleStep> mutate_retain_toggle(const Problem& prob, const DAG& dag,
-                                                const std::vector<ScheduleStep>& steps, std::mt19937& rng);
-std::vector<ScheduleStep> mutate_split_step(const Problem& prob, const DAG& dag,
-                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng);
-std::vector<ScheduleStep> mutate_merge_steps(const Problem& prob, const DAG& dag,
-                                              const std::vector<ScheduleStep>& steps, std::mt19937& rng);
+// Solution mutation: apply 1-N random FM-style moves (STEAL, MERGE, EJECT,
+// SPLIT, RETAIN_ADD, RETAIN_REMOVE) without cost consideration.
+// Preserves retain decisions where possible via filter_retain.
+// Returns empty vector if all attempted moves fail.
+std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
+                                         const std::vector<ScheduleStep>& steps,
+                                         std::mt19937& rng, int n_moves = 0);

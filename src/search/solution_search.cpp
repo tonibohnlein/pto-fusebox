@@ -1495,7 +1495,7 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag, Solution sol,
 }
 
 // ============================================================================
-// Solution mutation operators
+// Solution mutation: random FM-style moves
 // ============================================================================
 
 // Helper: check if step i must come before step j (data dependency)
@@ -1528,183 +1528,270 @@ static void recompute_costs(const Problem& prob, const DAG& dag,
     }
 }
 
-// SWAP: swap two adjacent independent steps
-std::vector<ScheduleStep> mutate_swap_steps(const Problem& prob, const DAG& dag,
-                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
-    if (steps.size() < 2) return {};
+// Apply one random FM-style move to steps. Returns true if a move was applied.
+static bool apply_one_random_move(const Problem& prob, const DAG& dag,
+                                   std::vector<ScheduleStep>& steps, std::mt19937& rng) {
+    if (steps.empty()) return false;
 
-    // Collect all swappable pairs
-    std::vector<size_t> swappable;
-    for (size_t i = 0; i + 1 < steps.size(); i++) {
-        if (!steps_depend(prob, dag, steps[i], steps[i+1]) &&
-            !steps_depend(prob, dag, steps[i+1], steps[i]))
-            swappable.push_back(i);
+    // Weighted move types: SWAP(15) STEAL(25) MERGE(15) EJECT(15) SPLIT(10) RETAIN_ADD(10) RETAIN_REMOVE(10)
+    int roll = rng() % 100;
+    int move_type;
+    if (roll < 15) move_type = 0;       // SWAP adjacent steps
+    else if (roll < 40) move_type = 1;  // STEAL op between adjacent steps
+    else if (roll < 55) move_type = 2;  // MERGE adjacent steps
+    else if (roll < 70) move_type = 3;  // EJECT op to singleton
+    else if (roll < 80) move_type = 4;  // SPLIT step
+    else if (roll < 90) move_type = 5;  // RETAIN_ADD
+    else move_type = 6;                 // RETAIN_REMOVE
+
+    switch (move_type) {
+
+    case 0: { // SWAP: swap two adjacent independent steps
+        if (steps.size() < 2) return false;
+        std::vector<size_t> swappable;
+        for (size_t i = 0; i + 1 < steps.size(); i++)
+            if (!steps_depend(prob, dag, steps[i], steps[i+1]) &&
+                !steps_depend(prob, dag, steps[i+1], steps[i]))
+                swappable.push_back(i);
+        if (swappable.empty()) return false;
+        size_t idx = swappable[rng() % swappable.size()];
+        std::swap(steps[idx], steps[idx + 1]);
+        // Retains may become invalid at the swap boundary — fix via recompute
+        recompute_costs(prob, dag, steps);
+        return true;
     }
-    if (swappable.empty()) return {};
 
-    // Pick 1-3 random swaps
-    auto result = steps;
-    int n_swaps = std::min((int)swappable.size(), 1 + (int)(rng() % 3));
-    std::shuffle(swappable.begin(), swappable.end(), rng);
-    std::set<size_t> used;
-    int done = 0;
-    for (auto idx : swappable) {
-        if (done >= n_swaps) break;
-        if (used.count(idx) || used.count(idx+1) || (idx > 0 && used.count(idx-1))) continue;
-        std::swap(result[idx], result[idx + 1]);
-        used.insert(idx);
-        done++;
-    }
-
-    // Clear retains (they may be invalid after reordering) and recompute
-    for (auto& s : result) s.retain_these.clear();
-    recompute_costs(prob, dag, result);
-    return result;
-}
-
-// RETAIN_TOGGLE: add or remove a retain decision
-std::vector<ScheduleStep> mutate_retain_toggle(const Problem& prob, const DAG& dag,
-                                                const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
-    if (steps.size() < 2) return {};
-    auto result = steps;
-
-    // 50% chance add, 50% remove
-    bool do_add = rng() % 2 == 0;
-
-    if (do_add) {
-        // Find a step boundary where we could retain something
-        std::vector<std::pair<size_t, size_t>> candidates; // (step_idx, tensor)
-        for (size_t i = 0; i + 1 < result.size(); i++) {
-            for (auto t : result[i].subgraph.boundary_outputs()) {
-                if (prob.retainable_tensors.count(t) &&
-                    result[i+1].subgraph.boundary_inputs().count(t) &&
-                    !result[i].retain_these.count(t))
-                    candidates.push_back({i, t});
-            }
-            // Also try retaining boundary inputs that the next step also needs
-            for (auto t : result[i].subgraph.boundary_inputs()) {
-                if (prob.retainable_tensors.count(t) &&
-                    result[i+1].subgraph.boundary_inputs().count(t) &&
-                    !result[i].retain_these.count(t))
-                    candidates.push_back({i, t});
+    case 1: { // STEAL: move a random op from step_a to adjacent step_b
+        if (steps.size() < 2) return false;
+        // Collect all (step, op, neighbor_step) candidates
+        struct StealCandidate { size_t src; size_t op; size_t dst; };
+        std::vector<StealCandidate> cands;
+        for (size_t i = 0; i < steps.size(); i++) {
+            if (steps[i].subgraph.ops().size() < 2) continue; // don't empty a step
+            for (auto op : steps[i].subgraph.ops()) {
+                // Can steal to previous step?
+                if (i > 0) cands.push_back({i, op, i - 1});
+                // Can steal to next step?
+                if (i + 1 < steps.size()) cands.push_back({i, op, i + 1});
             }
         }
-        if (candidates.empty()) return {};
-        auto [si, t] = candidates[rng() % candidates.size()];
-        result[si].retain_these.insert(t);
-    } else {
-        // Remove a random retain
-        std::vector<std::pair<size_t, size_t>> candidates;
-        for (size_t i = 0; i < result.size(); i++)
-            for (auto t : result[i].retain_these)
-                candidates.push_back({i, t});
-        if (candidates.empty()) return {};
-        auto [si, t] = candidates[rng() % candidates.size()];
-        result[si].retain_these.erase(t);
+        if (cands.empty()) return false;
+        std::shuffle(cands.begin(), cands.end(), rng);
+
+        for (auto& c : cands) {
+            auto& src = steps[c.src];
+            auto& dst = steps[c.dst];
+            std::set<size_t> ns(src.subgraph.ops().begin(), src.subgraph.ops().end());
+            ns.erase(c.op);
+            std::set<size_t> nd(dst.subgraph.ops().begin(), dst.subgraph.ops().end());
+            nd.insert(c.op);
+            auto ss = Subgraph::create(prob, dag, {ns.begin(), ns.end()});
+            auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
+            if (!ss || !sd) continue;
+            auto sr = filter_retain(src.retain_these, *ss);
+            auto dr = filter_retain(dst.retain_these, *sd);
+            // Check feasibility with empty entering (conservative — recompute fixes later)
+            auto cs = ss->best_cost({}, sr);
+            auto cd = sd->best_cost({}, dr);
+            if (!cs.feasible || !cd.feasible) continue;
+            src.subgraph = std::move(*ss);
+            src.config = cs.config;
+            src.retain_these = sr;
+            dst.subgraph = std::move(*sd);
+            dst.config = cd.config;
+            dst.retain_these = dr;
+            recompute_costs(prob, dag, steps);
+            return true;
+        }
+        return false;
     }
 
-    recompute_costs(prob, dag, result);
-    return result;
-}
-
-// SPLIT: split a large step into two
-std::vector<ScheduleStep> mutate_split_step(const Problem& prob, const DAG& dag,
-                                             const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
-    // Find steps with >= 3 ops
-    std::vector<size_t> candidates;
-    for (size_t i = 0; i < steps.size(); i++)
-        if (steps[i].subgraph.ops().size() >= 3)
-            candidates.push_back(i);
-    if (candidates.empty()) return {};
-
-    size_t si = candidates[rng() % candidates.size()];
-    auto& ops = steps[si].subgraph.ops();
-
-    // Try random split point: pick an op, BFS from it to form one side
-    std::vector<size_t> ops_vec(ops.begin(), ops.end());
-    std::shuffle(ops_vec.begin(), ops_vec.end(), rng);
-
-    // Take first half of shuffled ops
-    size_t split = 1 + rng() % (ops_vec.size() - 1);
-    std::vector<size_t> side_a(ops_vec.begin(), ops_vec.begin() + split);
-    std::vector<size_t> side_b(ops_vec.begin() + split, ops_vec.end());
-
-    auto sg_a = Subgraph::create(prob, dag, side_a);
-    auto sg_b = Subgraph::create(prob, dag, side_b);
-    if (!sg_a || !sg_b) return {};
-
-    auto ca = sg_a->best_cost();
-    auto cb = sg_b->best_cost();
-    if (!ca.feasible || !cb.feasible) return {};
-
-    // Determine ordering: does side_a have predecessors of side_b?
-    bool a_before_b = false, b_before_a = false;
-    std::set<size_t> set_a(side_a.begin(), side_a.end());
-    std::set<size_t> set_b(side_b.begin(), side_b.end());
-    for (auto op : side_a)
-        for (auto succ : dag.op_succs[op])
-            if (set_b.count(succ)) a_before_b = true;
-    for (auto op : side_b)
-        for (auto succ : dag.op_succs[op])
-            if (set_a.count(succ)) b_before_a = true;
-
-    if (a_before_b && b_before_a) return {}; // cycle
-
-    // Build new steps
-    std::vector<ScheduleStep> result;
-    for (size_t i = 0; i < si; i++) result.push_back(steps[i]);
-
-    if (b_before_a) std::swap(sg_a, sg_b), std::swap(ca, cb);
-
-    result.push_back({std::move(*sg_a), ca.config, {}});
-    result.push_back({std::move(*sg_b), cb.config, {}});
-
-    for (size_t i = si + 1; i < steps.size(); i++) result.push_back(steps[i]);
-
-    // Clear retains and recompute
-    for (auto& s : result) s.retain_these.clear();
-    recompute_costs(prob, dag, result);
-    return result;
-}
-
-// MERGE: merge two adjacent steps
-std::vector<ScheduleStep> mutate_merge_steps(const Problem& prob, const DAG& dag,
-                                              const std::vector<ScheduleStep>& steps, std::mt19937& rng) {
-    if (steps.size() < 2) return {};
-
-    // Find mergeable adjacent pairs
-    std::vector<size_t> candidates;
-    for (size_t i = 0; i + 1 < steps.size(); i++) {
-        auto& ops_a = steps[i].subgraph.ops();
-        auto& ops_b = steps[i+1].subgraph.ops();
+    case 2: { // MERGE: merge two adjacent steps
+        if (steps.size() < 2) return false;
+        std::vector<size_t> cands;
+        for (size_t i = 0; i + 1 < steps.size(); i++) {
+            auto& ops_a = steps[i].subgraph.ops();
+            auto& ops_b = steps[i+1].subgraph.ops();
+            if (!dag.merge_creates_cycle({ops_a.begin(), ops_a.end()},
+                                          {ops_b.begin(), ops_b.end()}))
+                cands.push_back(i);
+        }
+        if (cands.empty()) return false;
+        size_t si = cands[rng() % cands.size()];
+        auto& ops_a = steps[si].subgraph.ops();
+        auto& ops_b = steps[si+1].subgraph.ops();
         std::vector<size_t> merged(ops_a.begin(), ops_a.end());
         merged.insert(merged.end(), ops_b.begin(), ops_b.end());
-        if (!dag.merge_creates_cycle(
-                {ops_a.begin(), ops_a.end()},
-                {ops_b.begin(), ops_b.end()}))
-            candidates.push_back(i);
+        auto sg = Subgraph::create(prob, dag, merged);
+        if (!sg) return false;
+        auto ret = filter_retain(steps[si+1].retain_these, *sg);
+        auto bc = sg->best_cost({}, ret);
+        if (!bc.feasible) { ret.clear(); bc = sg->best_cost({}, {}); }
+        if (!bc.feasible) return false;
+        steps[si].subgraph = std::move(*sg);
+        steps[si].config = bc.config;
+        steps[si].retain_these = ret;
+        steps.erase(steps.begin() + si + 1);
+        recompute_costs(prob, dag, steps);
+        return true;
     }
-    if (candidates.empty()) return {};
 
-    size_t si = candidates[rng() % candidates.size()];
-    auto& ops_a = steps[si].subgraph.ops();
-    auto& ops_b = steps[si+1].subgraph.ops();
-    std::vector<size_t> merged(ops_a.begin(), ops_a.end());
-    merged.insert(merged.end(), ops_b.begin(), ops_b.end());
+    case 3: { // EJECT: remove a random op from a multi-op step, create singleton
+        std::vector<std::pair<size_t, size_t>> cands; // (step, op)
+        for (size_t i = 0; i < steps.size(); i++)
+            if (steps[i].subgraph.ops().size() >= 2)
+                for (auto op : steps[i].subgraph.ops())
+                    cands.push_back({i, op});
+        if (cands.empty()) return false;
+        std::shuffle(cands.begin(), cands.end(), rng);
 
-    auto sg = Subgraph::create(prob, dag, merged);
-    if (!sg) return {};
-    auto bc = sg->best_cost();
-    if (!bc.feasible) return {};
+        for (auto& [si, op] : cands) {
+            auto& s = steps[si];
+            std::set<size_t> rem(s.subgraph.ops().begin(), s.subgraph.ops().end());
+            rem.erase(op);
 
-    std::vector<ScheduleStep> result;
-    for (size_t i = 0; i < si; i++) result.push_back(steps[i]);
-    result.push_back({std::move(*sg), bc.config, {}});
-    for (size_t i = si + 2; i < steps.size(); i++) result.push_back(steps[i]);
+            // Check ordering constraints
+            bool must_before = false, must_after = false;
+            for (auto succ : dag.op_succs[op]) if (rem.count(succ)) must_before = true;
+            for (auto pred : dag.op_preds[op]) if (rem.count(pred)) must_after = true;
+            if (must_before && must_after) continue;
 
-    for (auto& s : result) s.retain_these.clear();
-    recompute_costs(prob, dag, result);
-    return result;
+            auto sg_r = Subgraph::create(prob, dag, {rem.begin(), rem.end()});
+            auto sg_s = Subgraph::create(prob, dag, {op});
+            if (!sg_r || !sg_s) continue;
+            auto rr = filter_retain(s.retain_these, *sg_r);
+            auto cr = sg_r->best_cost({}, rr);
+            auto cs = sg_s->best_cost({}, {});
+            if (!cr.feasible || !cs.feasible) continue;
+
+            ScheduleStep step_r{std::move(*sg_r), cr.config, rr};
+            ScheduleStep step_s{std::move(*sg_s), cs.config, {}};
+
+            if (must_before) {
+                steps[si] = std::move(step_s);
+                steps.insert(steps.begin() + si + 1, std::move(step_r));
+            } else {
+                steps[si] = std::move(step_r);
+                steps.insert(steps.begin() + si + 1, std::move(step_s));
+            }
+            recompute_costs(prob, dag, steps);
+            return true;
+        }
+        return false;
+    }
+
+    case 4: { // SPLIT: pick a step with ≥3 ops, split randomly into two
+        std::vector<size_t> cands;
+        for (size_t i = 0; i < steps.size(); i++)
+            if (steps[i].subgraph.ops().size() >= 3) cands.push_back(i);
+        if (cands.empty()) return false;
+        std::shuffle(cands.begin(), cands.end(), rng);
+
+        for (auto si : cands) {
+            auto& ops = steps[si].subgraph.ops();
+            std::vector<size_t> ops_vec(ops.begin(), ops.end());
+            std::shuffle(ops_vec.begin(), ops_vec.end(), rng);
+            size_t split = 1 + rng() % (ops_vec.size() - 1);
+            std::vector<size_t> side_a(ops_vec.begin(), ops_vec.begin() + split);
+            std::vector<size_t> side_b(ops_vec.begin() + split, ops_vec.end());
+
+            auto sg_a = Subgraph::create(prob, dag, side_a);
+            auto sg_b = Subgraph::create(prob, dag, side_b);
+            if (!sg_a || !sg_b) continue;
+
+            // Preserve retains where possible
+            auto ret_a = filter_retain(steps[si].retain_these, *sg_a);
+            auto ret_b = filter_retain(steps[si].retain_these, *sg_b);
+            auto ca = sg_a->best_cost({}, ret_a);
+            auto cb = sg_b->best_cost({}, ret_b);
+            if (!ca.feasible) { ret_a.clear(); ca = sg_a->best_cost({}, {}); }
+            if (!cb.feasible) { ret_b.clear(); cb = sg_b->best_cost({}, {}); }
+            if (!ca.feasible || !cb.feasible) continue;
+
+            // Determine ordering
+            std::set<size_t> set_a(side_a.begin(), side_a.end());
+            std::set<size_t> set_b(side_b.begin(), side_b.end());
+            bool a_before_b = false, b_before_a = false;
+            for (auto op : side_a)
+                for (auto succ : dag.op_succs[op])
+                    if (set_b.count(succ)) a_before_b = true;
+            for (auto op : side_b)
+                for (auto succ : dag.op_succs[op])
+                    if (set_a.count(succ)) b_before_a = true;
+            if (a_before_b && b_before_a) continue; // cycle
+
+            if (b_before_a) {
+                std::swap(sg_a, sg_b); std::swap(ca, cb);
+                std::swap(ret_a, ret_b);
+            }
+
+            std::vector<ScheduleStep> result;
+            for (size_t i = 0; i < si; i++) result.push_back(steps[i]);
+            result.push_back({std::move(*sg_a), ca.config, ret_a});
+            result.push_back({std::move(*sg_b), cb.config, ret_b});
+            for (size_t i = si + 1; i < steps.size(); i++) result.push_back(steps[i]);
+            recompute_costs(prob, dag, result);
+            steps = std::move(result);
+            return true;
+        }
+        return false;
+    }
+
+    case 5: { // RETAIN_ADD: randomly add a retain decision
+        if (steps.size() < 2) return false;
+        std::vector<std::pair<size_t, size_t>> cands; // (step, tensor)
+        for (size_t i = 0; i + 1 < steps.size(); i++) {
+            for (auto t : steps[i].subgraph.boundary_outputs()) {
+                if (prob.retainable_tensors.count(t) &&
+                    steps[i+1].subgraph.boundary_inputs().count(t) &&
+                    !steps[i].retain_these.count(t))
+                    cands.push_back({i, t});
+            }
+            for (auto t : steps[i].subgraph.boundary_inputs()) {
+                if (prob.retainable_tensors.count(t) &&
+                    steps[i+1].subgraph.boundary_inputs().count(t) &&
+                    !steps[i].retain_these.count(t))
+                    cands.push_back({i, t});
+            }
+        }
+        if (cands.empty()) return false;
+        auto [si, t] = cands[rng() % cands.size()];
+        steps[si].retain_these.insert(t);
+        recompute_costs(prob, dag, steps);
+        return true;
+    }
+
+    case 6: { // RETAIN_REMOVE: randomly remove a retain decision
+        std::vector<std::pair<size_t, size_t>> cands;
+        for (size_t i = 0; i < steps.size(); i++)
+            for (auto t : steps[i].retain_these)
+                cands.push_back({i, t});
+        if (cands.empty()) return false;
+        auto [si, t] = cands[rng() % cands.size()];
+        steps[si].retain_these.erase(t);
+        recompute_costs(prob, dag, steps);
+        return true;
+    }
+
+    } // switch
+    return false;
+}
+
+std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
+                                         const std::vector<ScheduleStep>& steps,
+                                         std::mt19937& rng, int n_moves) {
+    if (steps.empty()) return {};
+    if (n_moves <= 0) n_moves = 1 + (int)(rng() % 3); // default: 1-3 moves
+
+    auto result = steps;
+    int applied = 0;
+    int attempts = 0;
+    while (applied < n_moves && attempts < n_moves * 4) {
+        attempts++;
+        if (apply_one_random_move(prob, dag, result, rng))
+            applied++;
+    }
+    return applied > 0 ? result : std::vector<ScheduleStep>{};
 }
 
 // ============================================================================
@@ -1933,29 +2020,10 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     parent_cost = pool[idx].cost;
                 }
 
-                // --- Mutate ---
-                std::vector<ScheduleStep> child;
-                int mut_type = rng() % 4;
-                switch (mut_type) {
-                    case 0: child = mutate_swap_steps(prob, dag, parent, rng); break;
-                    case 1: child = mutate_retain_toggle(prob, dag, parent, rng); break;
-                    case 2: child = mutate_split_step(prob, dag, parent, rng); break;
-                    case 3: child = mutate_merge_steps(prob, dag, parent, rng); break;
-                }
-
-                // If mutation failed, try another type
-                if (child.empty()) {
-                    for (int retry = 0; retry < 3 && child.empty(); retry++) {
-                        mut_type = rng() % 4;
-                        switch (mut_type) {
-                            case 0: child = mutate_swap_steps(prob, dag, parent, rng); break;
-                            case 1: child = mutate_retain_toggle(prob, dag, parent, rng); break;
-                            case 2: child = mutate_split_step(prob, dag, parent, rng); break;
-                            case 3: child = mutate_merge_steps(prob, dag, parent, rng); break;
-                        }
-                    }
-                    if (child.empty()) continue;
-                }
+                // --- Mutate: apply 1-3 random FM-style moves ---
+                int n_moves = 1 + (int)(rng() % 3);
+                std::vector<ScheduleStep> child = mutate_random(prob, dag, parent, rng, n_moves);
+                if (child.empty()) continue;
                 total_mutations++;
 
                 // Validate
@@ -1966,10 +2034,8 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 child_sol = optimize_retain(prob, dag, std::move(child_sol));
                 double child_cost = child_sol.total_latency();
 
-                // Insert mutant if not too much worse (keeps diversity)
-                if (child_cost < parent_cost + parent_cost * 0.1) {
-                    pool_insert(child_sol.steps(), child_cost);
-                }
+                // Try inserting mutant (diversity-aware pool handles filtering)
+                pool_insert(child_sol.steps(), child_cost);
 
                 bool improved = false;
                 if (child_cost < thread_best_cost - 0.01) {

@@ -17,10 +17,14 @@ def generate_instance_dot(input_data, out_filepath):
     ]
 
     cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
-    if cap_kb > 0:
-        lines.append(f'    label="Fast Memory Capacity: {cap_kb:.1f} KB\\n";')
-        lines.append('    labelloc="t";')
-        lines.append('')
+    bw = input_data.get('slow_memory_bandwidth', 'Unknown')
+    gran = input_data.get('native_granularity', 'Unknown')
+    if isinstance(gran, list):
+        gran = "x".join(map(str, gran))
+    
+    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} KB\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
+    lines.append('')
 
     # 1. Define Tensors (Data)
     lines.append("    // --- Tensors ---")
@@ -68,10 +72,14 @@ def generate_solution_dot(input_data, output_data, out_filepath):
     ]
 
     cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
-    if cap_kb > 0:
-        lines.append(f'    label="Fast Memory Capacity: {cap_kb:.1f} KB\\n";')
-        lines.append('    labelloc="t";')
-        lines.append('')
+    bw = input_data.get('slow_memory_bandwidth', 'Unknown')
+    gran = input_data.get('native_granularity', 'Unknown')
+    if isinstance(gran, list):
+        gran = "x".join(map(str, gran))
+    
+    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} KB\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
+    lines.append('')
 
     # Pre-calculate solution metadata
     retained_tensors = set()

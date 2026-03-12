@@ -36,6 +36,10 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag);
 // Process ops in reverse topological order, merge into successor groups
 Partition init_reverse_topo(const Problem& prob, const DAG& dag);
 
+// Random partition: start from singletons, apply random merges
+// Produces different results each call (uses internal counter for seed variation)
+Partition init_random(const Problem& prob, const DAG& dag);
+
 // All registered strategies
 std::vector<InitStrategy> all_init_strategies();
 

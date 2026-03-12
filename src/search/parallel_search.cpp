@@ -62,29 +62,64 @@ static double partition_distance(const Partition& a, const Partition& b) {
 
 static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
                          size_t max_pool) {
-    // If nearly identical to a better member, replace only if better.
-    // But allow near-duplicates if pool has room (diversity in ordering/retain later).
-    for (auto& pe : pool) {
-        double dist = partition_distance(pe.partition, entry.partition);
-        if (dist < 0.005) {  // truly identical partitions
-            if (entry.cost < pe.cost - 0.01) {
-                pe = std::move(entry);
-                return true;
-            }
-            return false;  // identical and not better
+    // Compute min distance to existing entries
+    double min_dist = 1.0;
+    size_t closest_idx = 0;
+    for (size_t i = 0; i < pool.size(); i++) {
+        double dist = partition_distance(pool[i].partition, entry.partition);
+        if (dist < min_dist) {
+            min_dist = dist;
+            closest_idx = i;
         }
     }
-    // Different partition — always add if room
+
+    // Near-duplicate: only replace if strictly better
+    if (min_dist < 0.01) {
+        if (entry.cost < pool[closest_idx].cost - 0.01) {
+            pool[closest_idx] = std::move(entry);
+            return true;
+        }
+        return false;
+    }
+
+    // Pool not full: always add
     if (pool.size() < max_pool) {
         pool.push_back(std::move(entry));
         return true;
     }
-    // Full — replace worst if better
-    size_t worst = 0;
+
+    // Pool full: diversity-aware eviction.
+    // Never evict the best-cost entry.
+    size_t best_cost_idx = 0;
     for (size_t i = 1; i < pool.size(); i++)
-        if (pool[i].cost > pool[worst].cost) worst = i;
-    if (entry.cost < pool[worst].cost - 0.01) {
-        pool[worst] = std::move(entry);
+        if (pool[i].cost < pool[best_cost_idx].cost) best_cost_idx = i;
+
+    // Find the least-unique entry (smallest nearest-neighbor distance), excluding best
+    size_t least_unique = SIZE_MAX;
+    double least_unique_dist = 2.0;
+    for (size_t i = 0; i < pool.size(); i++) {
+        if (i == best_cost_idx) continue;
+        double nn_dist = 1.0;
+        for (size_t j = 0; j < pool.size(); j++) {
+            if (i == j) continue;
+            double d = partition_distance(pool[i].partition, pool[j].partition);
+            nn_dist = std::min(nn_dist, d);
+        }
+        if (nn_dist < least_unique_dist) {
+            least_unique_dist = nn_dist;
+            least_unique = i;
+        }
+    }
+
+    if (least_unique == SIZE_MAX) return false;
+
+    // Replace least-unique if candidate brings more diversity or better cost with diversity
+    bool more_diverse = (min_dist > least_unique_dist + 0.01);
+    bool better_cost = (entry.cost < pool[least_unique].cost - 0.01);
+    bool decent_diversity = (min_dist > 0.02);
+
+    if (more_diverse || (better_cost && decent_diversity)) {
+        pool[least_unique] = std::move(entry);
         return true;
     }
     return false;
@@ -239,7 +274,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 bool do_crossover = (pool.size() >= 2) && (tid % 3 == 0);
 
                 if (do_crossover) {
-                    // Pick two different parents via tournament
+                    // Pick two different parents (uniform random)
                     size_t p1 = rng() % pool.size();
                     size_t p2 = rng() % pool.size();
                     while (p2 == p1 && pool.size() > 1) p2 = rng() % pool.size();
@@ -248,10 +283,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     child.cache = &shared_cache;
                     origin = "xover";
                 } else {
-                    // Pick parent via tournament
-                    size_t p1 = rng() % pool.size();
-                    size_t p2 = rng() % pool.size();
-                    size_t pi = (pool[p1].cost <= pool[p2].cost) ? p1 : p2;
+                    // Pick parent (uniform random — pool diversity maintained by insertion)
+                    size_t pi = rng() % pool.size();
 
                     int num_muts = 2 + (int)(rng() % 5);  // 2..6 mutations
                     child = mutate_compound(Partition(pool[pi].partition), num_muts, rng);

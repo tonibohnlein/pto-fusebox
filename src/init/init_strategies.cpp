@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <random>
+#include <atomic>
 
 // ============================================================================
 // Helpers
@@ -278,6 +280,72 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
 }
 
 // ============================================================================
+// Random: start from singletons, randomly merge along DAG edges
+// ============================================================================
+
+Partition init_random(const Problem& prob, const DAG& dag) {
+    static std::atomic<int> call_counter{0};
+    int seed = 12345 + call_counter.fetch_add(1) * 77;
+    std::mt19937 rng(seed);
+
+    Partition p = Partition::trivial(prob, dag);
+
+    // Collect all edges: (producer_group, consumer_group) via tensors
+    struct Edge { size_t op_a; size_t op_b; size_t tensor; };
+    std::vector<Edge> edges;
+    for (size_t t = 0; t < prob.num_tensors(); t++) {
+        int prod = dag.tensor_producer[t];
+        if (prod < 0) continue;
+        for (size_t op = 0; op < prob.num_ops(); op++) {
+            for (auto inp : prob.ops[op].inputs) {
+                if (inp == t && op != (size_t)prod) {
+                    edges.push_back({(size_t)prod, op, t});
+                }
+            }
+        }
+    }
+
+    // Shuffle edges and try random merges
+    std::shuffle(edges.begin(), edges.end(), rng);
+
+    // Try merging a random fraction of edges (30-70%)
+    int target_merges = (int)(edges.size() * (0.3 + 0.4 * (rng() % 1000) / 1000.0));
+    int merges_done = 0;
+
+    for (auto& e : edges) {
+        if (merges_done >= target_merges) break;
+
+        auto& gs_a = p.groups_of(e.op_a);
+        auto& gs_b = p.groups_of(e.op_b);
+        if (gs_a.empty() || gs_b.empty()) continue;
+        size_t ga = gs_a[0], gb = gs_b[0];
+        if (ga == gb) continue; // already same group
+        if (!p.groups[ga].alive || !p.groups[gb].alive) continue;
+
+        // Check cycle
+        if (dag.merge_creates_cycle(p.groups[ga].ops, p.groups[gb].ops))
+            continue;
+
+        // Try merge — accept if subgraph is valid (feasible tiling exists)
+        std::set<size_t> merged = p.groups[ga].ops;
+        merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
+        double new_cost = p.eval_set(merged);
+        if (new_cost >= 1e17) continue; // infeasible
+
+        // Accept unconditionally (random strategy — cost doesn't matter)
+        p.groups[ga].ops = std::move(merged);
+        p.groups[ga].cost = new_cost;
+        p.groups[ga].gen++;
+        p.groups[gb].alive = false;
+        p.groups[gb].gen++;
+        p.rebuild_index();
+        merges_done++;
+    }
+
+    return p;
+}
+
+// ============================================================================
 // Registry and selection
 // ============================================================================
 
@@ -287,6 +355,7 @@ std::vector<InitStrategy> all_init_strategies() {
         {"chain+edge",  init_chain_then_edge},
         {"seed+grow",   init_seed_and_grow},
         {"rev-topo",    init_reverse_topo},
+        {"random",      init_random},
     };
 }
 
