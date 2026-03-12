@@ -13,6 +13,54 @@ latency follows a roofline model: `max(compute, memory_in + memory_out)`.
 
 ---
 
+## The Unified Execution Grid (issue #28)
+
+The central concept of the hardware model. A single `[w, h, k]` configuration
+applied to a subgraph deterministically defines:
+
+1. **The spatial tile grid** — the boundary output tensor (dimensions `W × H`)
+   is divided into `(W/w) × (H/h)` tiles, each of size `w × h`. All boundary
+   outputs must have the same `(W, H)` so they share the same grid.
+
+2. **The k-iteration count** — for MatMul ops with reduction dimension `K`,
+   each spatial tile is computed in `K/k` accumulation steps. PW ops have no
+   reduction dimension and execute once per spatial tile.
+
+3. **The slice shape of every tensor** — each tensor's slice is determined by
+   its role relative to the ops that use it:
+
+       MatMul output:  w × h       (one tile of the spatial grid)
+       MatMul LHS:     k × h       (a strip of the reduction dimension × height)
+       MatMul RHS:     w × k       (width × a strip of the reduction dimension)
+       PW output:      w × h       (same as the spatial tile)
+       PW input:       w × h       (same as the spatial tile)
+
+   For ephemeral tensors (internal to the subgraph), the slice shape propagates
+   from the consumer: if an ephemeral feeds a MatMul as LHS, its slice is `k × h`
+   even though it was produced by a PW op.
+
+4. **The execution loop** — the hardware iterates:
+
+       for each spatial tile (row, col) in traversal_order:
+           for each k-step d in 0..K/k-1:
+               - load boundary input slices that changed since last step
+               - execute all ops in subgraph chain order on this tile's slices
+               - if d == K/k-1: evict boundary output slices (unless retained)
+
+   All ops in the subgraph share the same loop. This is what "unified" means —
+   you cannot give different ops different tiling parameters.
+
+5. **The validity constraints that follow from this**:
+   - `w` must divide every tensor dimension that maps to the w-axis
+   - `h` must divide every tensor dimension that maps to the h-axis
+   - `k` must divide every reduction dimension K
+   - All boundary outputs must have the same `(W, H)` (single grid)
+   - Ephemeral tensors need not match `(W, H)` — their dimensions may differ
+     (e.g., 4096-wide ephemerals in a chain where the boundary output is 128-wide),
+     as long as `w`, `h`, `k` divide the appropriate dimensions per their role
+
+---
+
 ## Subgraph validity
 
 A set of ops forms a valid subgraph if ALL of the following hold:
