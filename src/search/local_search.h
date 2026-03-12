@@ -1,38 +1,44 @@
 #pragma once
 
 #include "partition/partition.h"
+#include "search/fm_search.h"  // reuse best_move_for / apply_fm_move
 #include <cmath>
 #include <queue>
 
 // ============================================================================
-// Move: a candidate partition modification for greedy descent
+// OpMove: one best move per op, for the greedy descent heap.
+//
+// Unlike the old Move struct (one entry per (group, neighbor, move_type)
+// triple), this produces at most one heap entry per op. This keeps the
+// heap size O(num_ops) instead of O(ops × neighbors × move_types).
+//
+// Staleness is detected by storing the generation of the primary group
+// at evaluation time. If the group's gen changes, the entry is stale.
 // ============================================================================
 
-struct Move {
-    enum Type { MERGE = 0, STEAL = 1, RECOMPUTE = 2, EJECT = 3,
-                INTERNAL_EJECT = 4, SPLIT = 5 } type;
-    size_t ga, gb;       // groups involved
-    size_t op;           // op involved (for steal/recompute/eject/internal_eject/split)
-    double saving;       // positive = improvement
-    int gen_a, gen_b;    // generation of ga, gb when evaluated
-    size_t op2 = 0;      // second op (for SPLIT: the neighbor)
+struct OpMove {
+    size_t op = SIZE_MAX;     // initiating op
+    FMMove move;              // the best move for this op
+    size_t primary_group = SIZE_MAX;
+    int gen_at_eval = -1;     // gen of primary_group when evaluated
 
-    bool operator<(const Move& o) const {
-        if (std::abs(saving - o.saving) > 0.001) return saving < o.saving;
-        if (type != o.type) return type > o.type;
-        return ga > o.ga;
+    double saving() const { return move.saving; }
+    bool valid() const { return move.valid(); }
+
+    bool operator<(const OpMove& o) const {
+        if (std::abs(move.saving - o.move.saving) > 0.001)
+            return move.saving < o.move.saving;
+        return op > o.op;
     }
 };
 
-using MoveHeap = std::priority_queue<Move>;
+using MoveHeap = std::priority_queue<OpMove>;
 
 // ============================================================================
-// Generate moves involving group gi with saving > -floor.
-// floor=0 (default) means only positive-saving moves.
+// Push the best move for a single op into the heap.
 // ============================================================================
 
-void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
-                    double floor = 0.0);
+void push_op_move(const Partition& part, size_t op, MoveHeap& heap);
 
 // ============================================================================
 // Greedy descent: repeatedly apply the best positive move until no
