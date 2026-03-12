@@ -7,7 +7,6 @@
 #include "partition/partition.h"
 #include "search/local_search.h"
 #include "search/fm_search.h"
-#include "test_move_helpers.h"
 #include "solution/solution.h"
 #include <algorithm>
 #include <cmath>
@@ -251,26 +250,21 @@ void test_stale_detection() {
     auto p = make_chain3(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // Create an OpMove referencing G0→G1 merge at current gen
-    OpMove om;
-    om.op = 0;
-    om.move = FMMove{FMMove::MERGE, 0, 0, 1, SIZE_MAX, 100.0};
-    om.primary_group = 0;
-    om.gen_a = part.groups[0].gen;
-    om.gen_b = part.groups[1].gen;
+    // Create a Move referencing G0→G1 merge at current gen
+    Move m{Move::MERGE, 0, 1, 0, 100.0, part.groups[0].gen, part.groups[1].gen};
 
     // Move is fresh
-    CHECK("fresh: ga alive", part.groups[om.move.ga].alive);
-    CHECK("fresh: ga gen match", part.groups[om.primary_group].gen == om.gen_a);
-    CHECK("fresh: gb gen match", part.groups[om.move.gb].gen == om.gen_b);
+    CHECK("fresh: ga alive", part.groups[m.ga].alive);
+    CHECK("fresh: ga gen match", part.groups[m.ga].gen == m.gen_a);
+    CHECK("fresh: gb gen match", part.groups[m.gb].gen == m.gen_b);
 
     // Modify G0 → gen increments → move becomes stale
     part.groups[0].gen++;
-    CHECK("stale: gen_a mismatch", part.groups[om.primary_group].gen != om.gen_a);
+    CHECK("stale: gen mismatch", part.groups[m.ga].gen != m.gen_a);
 
     // Kill G1 → move also stale
     part.groups[1].alive = false;
-    CHECK("stale: gb dead", !part.groups[om.move.gb].alive);
+    CHECK("stale: gb dead", !part.groups[m.gb].alive);
 }
 
 // ==================== Move generation ====================
@@ -280,25 +274,21 @@ void test_generate_moves() {
     auto p = make_chain3(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    auto moves = all_moves_for_group(part, 0);
+    MoveHeap heap;
+    generate_moves(part, 0, heap);
 
-    // G0 = {Op0}, neighbor = Op1 in G1. Should generate merge, steal, recompute.
-    CHECK("moves generated", !moves.empty());
+    // G0 = {Op0}, neighbor = Op1 in G1.
+    // With one-best-per-op, at most one move pushed per boundary op.
+    CHECK("moves generated", !heap.empty());
 
-    // Count move types
-    int merges = 0, steals = 0, recomputes = 0;
-    for (auto& m : moves) {
-        switch (m.type) {
-            case FMMove::MERGE: merges++; break;
-            case FMMove::STEAL: steals++; break;
-            case FMMove::RECOMPUTE: recomputes++; break;
-            default: break;
-        }
+    int count = 0;
+    while (!heap.empty()) {
+        auto m = heap.top(); heap.pop();
+        CHECK("positive saving", m.saving > 0);
+        count++;
     }
-    // At minimum we should have a merge(G0,G1) and possibly steal/recompute
-    CHECK("has merge", merges > 0);
-    std::cout << "  moves: " << merges << " merge, " << steals << " steal, "
-              << recomputes << " recompute\n";
+    CHECK("at least one move", count >= 1);
+    std::cout << "  " << count << " moves generated (one best per op)\n";
 }
 
 // ==================== Move gain correctness ====================

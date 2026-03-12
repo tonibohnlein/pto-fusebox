@@ -11,36 +11,41 @@
 void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                     double floor) {
     if (!part.groups[gi].alive) return;
+    int gen_i = part.groups[gi].gen;
 
+    // Helper: track best candidate and push if good enough
+    auto try_better = [](Move& best, Move candidate) {
+        if (candidate.saving > best.saving)
+            best = candidate;
+    };
+
+    // --- Border moves: one best per neighbor op ---
+    // adj_op is outside gi; evaluate MERGE/STEAL/RECOMPUTE with each neighbor group
     auto neighbors = part.boundary_neighbors(gi);
     for (auto adj_op : neighbors) {
-        auto& adj_groups = part.groups_of(adj_op);
-        for (auto gj : adj_groups) {
+        Move best;
+        best.saving = -floor;
+
+        for (auto gj : part.groups_of(adj_op)) {
             if (gj == gi) continue;
-            int gen_i = part.groups[gi].gen;
             int gen_j = part.groups[gj].gen;
 
-            // Move 1: Merge gi and gj
-            if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops))
-            {
+            // MERGE
+            if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
                 std::set<size_t> merged = part.groups[gi].ops;
-                merged.insert(part.groups[gj].ops.begin(),
-                              part.groups[gj].ops.end());
+                merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                 double new_cost = part.eval_set(merged);
-                double saving = (part.groups[gi].cost + part.groups[gj].cost)
-                                - new_cost;
-                if (saving > -floor)
-                    heap.push({Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
+                double saving = (part.groups[gi].cost + part.groups[gj].cost) - new_cost;
+                try_better(best, {Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
             }
 
-            // Move 2: Steal adj_op from gj into gi
-            {
-                if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
-
+            // STEAL + RECOMPUTE (share the gi-expansion eval)
+            if (!part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
                 double new_gi_cost = part.eval_set(new_gi);
                 if (new_gi_cost < 1e17) {
+                    // STEAL: move adj_op from gj to gi
                     std::set<size_t> new_gj = part.groups[gj].ops;
                     new_gj.erase(adj_op);
                     double new_gj_cost = 0;
@@ -52,30 +57,23 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                     if (valid) {
                         double saving = (part.groups[gi].cost + part.groups[gj].cost)
                                         - (new_gi_cost + new_gj_cost);
-                        if (saving > -floor)
-                            heap.push({Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
+                        try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
                     }
+
+                    // RECOMPUTE: add adj_op to gi, keep in gj
+                    double rsaving = part.groups[gi].cost - new_gi_cost;
+                    try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
                 }
             }
-
-            // Move 3: Recompute adj_op in gi (keep in gj too)
-            {
-                if (part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) continue;
-
-                std::set<size_t> new_gi = part.groups[gi].ops;
-                new_gi.insert(adj_op);
-                double new_gi_cost = part.eval_set(new_gi);
-                double saving = part.groups[gi].cost - new_gi_cost;
-                if (saving > -floor)
-                    heap.push({Move::RECOMPUTE, gi, gj, adj_op, saving, gen_i, gen_j});
-            }
         }
+
+        if (best.saving > -floor)
+            heap.push(best);
     }
 
-    // Move 4: Eject a border op from gi
+    // --- Eject moves: one per ejectable border op ---
     if (part.groups[gi].ops.size() >= 2) {
         auto ejectable = part.ejectable_ops(gi);
-        int gen_i = part.groups[gi].gen;
         for (auto op : ejectable) {
             std::set<size_t> remainder = part.groups[gi].ops;
             remainder.erase(op);
@@ -91,34 +89,43 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
         }
     }
 
-    // Move 5: Internal eject
+    // --- Internal moves: one best per internal op (INTERNAL_EJECT or SPLIT) ---
     if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
         auto internals = part.internal_ops(gi);
-        int gen_i = part.groups[gi].gen;
         for (auto op : internals) {
-            auto er = part.eval_eject(op, gi);
-            if (!er.feasible) continue;
-            if (er.saving > -floor)
-                heap.push({Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
-        }
-    }
+            Move best;
+            best.saving = -floor;
 
-    // Move 6: Split at bridge edges
-    if (part.groups[gi].ops.size() >= 3 && part.groups[gi].ops.size() <= 15) {
-        auto bridges = part.bridge_edges(gi);
-        int gen_i = part.groups[gi].gen;
-        for (auto& [a, b] : bridges) {
-            auto sr = part.eval_split(a, b, gi);
-            if (!sr.feasible) continue;
-            if (sr.saving > -floor) {
-                Move m;
-                m.type = Move::SPLIT;
-                m.ga = gi; m.gb = 0; m.op = a;
-                m.saving = sr.saving;
-                m.gen_a = gen_i; m.gen_b = 0;
-                m.op2 = b;
-                heap.push(m);
+            auto er = part.eval_eject(op, gi);
+            if (er.feasible)
+                try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
+
+            // SPLIT at bridge edges incident to this op
+            for (auto succ : part.dag->op_succs[op]) {
+                if (!part.groups[gi].ops.count(succ)) continue;
+                auto sr = part.eval_split(op, succ, gi);
+                if (sr.feasible) {
+                    Move m;
+                    m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
+                    m.op = op; m.saving = sr.saving;
+                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = succ;
+                    try_better(best, m);
+                }
             }
+            for (auto pred : part.dag->op_preds[op]) {
+                if (!part.groups[gi].ops.count(pred)) continue;
+                auto sr = part.eval_split(pred, op, gi);
+                if (sr.feasible) {
+                    Move m;
+                    m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
+                    m.op = pred; m.saving = sr.saving;
+                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = op;
+                    try_better(best, m);
+                }
+            }
+
+            if (best.saving > -floor)
+                heap.push(best);
         }
     }
 }
