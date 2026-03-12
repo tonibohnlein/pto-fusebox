@@ -1350,8 +1350,6 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   double cumul_gain = 0, best_cumul_gain = 0;
   int no_improve = 0;
   int max_no_improve = std::max(30, cfg.max_no_improve);
-  static const char *move_names[] = {"STEAL",   "SPLIT",  "MERGE", "RET_ADD",
-                                     "RET_REM", "RECOMP", "EJECT", "INT_EJECT"};
 
   for (int iter = 0; ; iter++) {
     // --- Stopping criteria ---
@@ -1368,20 +1366,6 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
       continue;
     result.moves_applied++;
     state.rebuild_from(lo);
-
-    if (g_verbose) {
-      auto &m = *m_opt;
-      std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
-                << " step=" << m.step_a;
-      if (m.op != SIZE_MAX)
-        std::cerr << " op=" << m.op;
-      if (m.tensor != SIZE_MAX)
-        std::cerr << " t=" << m.tensor;
-      std::cerr << " saving=" << m.saving << " total=" << state.total
-                << " active=" << active.entries.size()
-                << " locked_ops=" << active.locked_ops.size()
-                << " locked_t=" << active.locked_tensors.size() << "\n";
-    }
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
