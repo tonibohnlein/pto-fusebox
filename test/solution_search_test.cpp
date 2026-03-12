@@ -28,6 +28,9 @@ static Problem make_chain4_pw() {
     p.fast_memory_capacity = 50000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
+    for (size_t i = 0; i < p.tensors.size(); i++)
+        if (p.tensors[i].size() <= p.fast_memory_capacity)
+            p.retainable_tensors.insert(i);
     return p;
 }
 
@@ -42,6 +45,9 @@ static Problem make_shared_input() {
     p.fast_memory_capacity = 50000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
+    for (size_t i = 0; i < p.tensors.size(); i++)
+        if (p.tensors[i].size() <= p.fast_memory_capacity)
+            p.retainable_tensors.insert(i);
     return p;
 }
 
@@ -160,6 +166,7 @@ void test_fm_search_monotone() {
     SolutionFMConfig cfg;
     cfg.max_passes = 5;
     cfg.max_no_improve = 3;
+    cfg.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     
     auto result = solution_fm_search(p, d, std::move(sol), cfg);
     CHECK("fm_search ≤ initial", result.total_latency() <= before + 0.01);
@@ -197,6 +204,7 @@ void test_split_produces_valid_retain() {
     SolutionFMConfig cfg;
     cfg.max_passes = 3;
     cfg.max_no_improve = 2;
+    cfg.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     
     auto result = solution_fm_search(p, d, std::move(sol), cfg);
     auto vr = result.validate();
@@ -215,6 +223,7 @@ void test_merge_preserves_coverage() {
     cfg.max_passes = 5;
     cfg.max_no_improve = 3;
     cfg.pass_config.floor_fraction = 0.5;
+    cfg.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     
     auto result = solution_fm_search(p, d, std::move(sol), cfg);
     auto vr = result.validate();
@@ -235,6 +244,7 @@ void test_greedy_kick_escape() {
     cfg.max_passes = 10;
     cfg.max_no_improve = 5;
     cfg.pass_config.floor_fraction = 0.3;
+    cfg.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     
     auto result = solution_fm_search(p, d, std::move(sol), cfg);
     CHECK("outer loop ≤ initial", result.total_latency() <= before + 0.01);
