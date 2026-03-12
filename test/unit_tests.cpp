@@ -180,8 +180,10 @@ void test_create_diamond_fusions() {
 
   auto sg01 = Subgraph::create(p, d, {0, 1});
   CHECK("{0,1} valid", sg01.has_value());
-  CHECK("T1 NOT ephemeral in {0,1}", !sg01->ephemeral().count(1));
-  CHECK("T1 boundary out in {0,1}", sg01->boundary_outputs().count(1));
+  // T1 produced by Op0, consumed by Op1 — both in subgraph → ephemeral.
+  // External consumer Op2 is a solution-level concern (recomputation).
+  CHECK("T1 ephemeral in {0,1}", sg01->ephemeral().count(1));
+  CHECK("T2 boundary out in {0,1}", sg01->boundary_outputs().count(2));
 
   auto sg12 = Subgraph::create(p, d, {1, 2});
   CHECK("{1,2} valid", sg12.has_value());
@@ -190,8 +192,9 @@ void test_create_diamond_fusions() {
 
   auto sg02 = Subgraph::create(p, d, {0, 2});
   CHECK("{0,2} valid", sg02.has_value());
-  CHECK("T1 NOT ephemeral in {0,2}", !sg02->ephemeral().count(1));
-  CHECK("T1 boundary out in {0,2}", sg02->boundary_outputs().count(1));
+  // T1 produced by Op0, consumed by Op2 — both in subgraph → ephemeral.
+  CHECK("T1 ephemeral in {0,2}", sg02->ephemeral().count(1));
+  CHECK("T3 boundary out in {0,2}", sg02->boundary_outputs().count(3));
 
   auto sg012 = Subgraph::create(p, d, {0, 1, 2});
   // {0,1,2} is rejected: T1 is ephemeral but consumed by both Op1 and Op2 (fan-out)

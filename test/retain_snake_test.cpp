@@ -80,20 +80,20 @@ void test_retain_ws_matmul_lhs() {
 
 void test_retain_ws_pw() {
     std::cout << "--- test_retain_ws_pw ---\n";
-    // PW T0(256x256) -> T1(256x256). Cap=70000.
+    // PW T0(256x256) -> T1(256x256). Cap=90000 (PW output counts in WS).
     Problem p;
     p.tensors = {{256,256},{256,256}};
     p.ops = {{OpType::Pointwise,{0},{1},1000}};
-    p.fast_memory_capacity = 70000;
+    p.fast_memory_capacity = 90000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // No retain: ws = h*w = 16384
-    CHECK_EQ_I("PW no ret", sg->compute_cost({128,128,1,SnakeDir::None}).working_set, 16384);
-    // T0 retained: ws = full(65536)
-    CHECK_EQ_I("PW ret T0", sg->compute_cost({128,128,1,SnakeDir::None},{0}).working_set, 65536);
+    // No retain: ws = pw_in(h*w=16384) + boundary_out(h*w=16384) = 32768
+    CHECK_EQ_I("PW no ret", sg->compute_cost({128,128,1,SnakeDir::None}).working_set, 32768);
+    // T0 retained: ws = full(65536) + boundary_out(16384) = 81920
+    CHECK_EQ_I("PW ret T0", sg->compute_cost({128,128,1,SnakeDir::None},{0}).working_set, 81920);
 }
 
 void test_retain_ws_output_accumulation() {
@@ -128,9 +128,9 @@ void test_retain_ws_unused_tensor() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // ws = T0(16384) + T2_full(65536) = 81920 > 80000
+    // ws = T0_in(16384) + T1_out(16384) + T2_full(65536) = 98304 > 80000
     auto c = sg->compute_cost({128,128,1,SnakeDir::None}, {2});
-    CHECK_EQ_I("unused ret ws", c.working_set, 81920);
+    CHECK_EQ_I("unused ret ws", c.working_set, 98304);
     CHECK("unused ret infeasible", !c.feasible);
 }
 
@@ -164,15 +164,15 @@ void test_retain_transfer_pw() {
     Problem p;
     p.tensors = {{256,256},{256,256}};
     p.ops = {{OpType::Pointwise,{0},{1},1000}};
-    p.fast_memory_capacity = 70000;
+    p.fast_memory_capacity = 90000;  // PW output counts in WS: retained needs 81920
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // No retain: 4 tiles × max(1000, 3276.8) = 4 × 3276.8 = 13107.2
+    // No retain: 4 tiles × max(1000, 1638.4+1638.4) = 4 × 3276.8 = 13107.2
     CHECK_EQ("PW no ret", sg->compute_cost({128,128,1,SnakeDir::None}).latency, 13107.2);
-    // T0 retained: 4 tiles × max(1000, 1638.4) = 4 × 1638.4 = 6553.6
+    // T0 retained: 4 tiles × max(1000, 0+1638.4) = 4 × 1638.4 = 6553.6
     CHECK_EQ("PW ret in", sg->compute_cost({128,128,1,SnakeDir::None},{0}).latency, 6553.6);
 }
 
