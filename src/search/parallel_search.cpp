@@ -216,6 +216,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     gen0_tasks = (int)gen0_task_list.size();
 
     std::vector<PoolEntry> gen0_results(gen0_tasks);
+    std::vector<PoolEntry> gen0_end_partitions(gen0_tasks);  // perturbed states for diversity
     std::atomic<int> next_task{0};
 
     auto gen0_worker = [&]() {
@@ -240,6 +241,10 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
             gen0_results[tid] = {std::move(fm.best_partition), fm_cost,
                                   strategies[task.strategy_idx].name};
+
+            // Also capture perturbed end state for pool diversity
+            if (fm.end_cost < 1e17 && fm.end_cost > fm_cost + 0.01)
+                gen0_end_partitions[tid] = {std::move(fm.end_partition), fm.end_cost, "end+" + strategies[task.strategy_idx].name};
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - start).count();
             std::lock_guard<std::mutex> lock(log_mutex);
@@ -268,6 +273,9 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::vector<PoolEntry> pool;
     for (auto& r : gen0_results)
         pool_insert(pool, std::move(r), cfg.pool_size);
+    for (auto& r : gen0_end_partitions)
+        if (r.cost < 1e17)
+            pool_insert(pool, std::move(r), cfg.pool_size);
     pool_sort(pool);
 
     std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
@@ -293,6 +301,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
         int mut_tasks = std::min(num_threads, std::max(2, (int)pool.size()));
         std::vector<PoolEntry> mut_results(mut_tasks);
+        std::vector<PoolEntry> mut_end_partitions(mut_tasks);
         next_task.store(0);
 
         auto evo_worker = [&]() {
@@ -346,6 +355,9 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
                 mut_results[tid] = {std::move(fm.best_partition), after_fm, origin};
 
+                if (fm.end_cost < 1e17 && fm.end_cost > after_fm + 0.01)
+                    mut_end_partitions[tid] = {std::move(fm.end_partition), fm.end_cost, "end+" + origin};
+
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - start).count();
                 if (after_fm < best_ever - 0.01) {
@@ -368,6 +380,9 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
         int accepted = 0;
         for (auto& r : mut_results)
+            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size))
+                accepted++;
+        for (auto& r : mut_end_partitions)
             if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size))
                 accepted++;
         pool_sort(pool);

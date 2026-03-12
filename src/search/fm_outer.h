@@ -24,7 +24,9 @@ struct FMOuterConfig {
 
 struct FMOuterResult {
     Partition best_partition;
+    Partition end_partition;         // last pass's perturbed state (for diversity)
     double best_cost = 1e18;
+    double end_cost = 1e18;
     int total_passes = 0;
     int improving_passes = 0;
     int total_moves = 0;

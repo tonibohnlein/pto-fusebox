@@ -57,6 +57,12 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         result.total_passes++;
         result.total_moves += pass_result.moves_applied;
 
+        // Keep the last perturbed state for diversity seeding
+        if (pass_result.moves_applied > 0) {
+            result.end_partition = pass_result.end_partition;
+            result.end_cost = pass_result.end_cost;
+        }
+
         if (pass_result.best_cost < result.best_cost - 0.001) {
             // FM improved directly — cool down (narrow search near this basin)
             double improvement = result.best_cost - pass_result.best_cost;

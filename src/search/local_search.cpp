@@ -22,6 +22,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
     // --- Border moves: one best per neighbor op ---
     // adj_op is outside gi; evaluate MERGE/STEAL/RECOMPUTE with each neighbor group
     auto neighbors = part.boundary_neighbors(gi);
+    std::set<size_t> merge_checked;  // groups already evaluated for MERGE with gi
     for (auto adj_op : neighbors) {
         Move best;
         best.saving = -floor;
@@ -30,13 +31,16 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             if (gj == gi) continue;
             int gen_j = part.groups[gj].gen;
 
-            // MERGE
-            if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
-                std::set<size_t> merged = part.groups[gi].ops;
-                merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
-                double new_cost = part.eval_set(merged);
-                double saving = (part.groups[gi].cost + part.groups[gj].cost) - new_cost;
-                try_better(best, {Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
+            // MERGE (once per gj — result is the same regardless of which adj_op)
+            if (!merge_checked.count(gj)) {
+                merge_checked.insert(gj);
+                if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
+                    std::set<size_t> merged = part.groups[gi].ops;
+                    merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
+                    double new_cost = part.eval_set(merged);
+                    double saving = (part.groups[gi].cost + part.groups[gj].cost) - new_cost;
+                    try_better(best, {Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
+                }
             }
 
             // STEAL + RECOMPUTE (share the gi-expansion eval)
@@ -75,17 +79,10 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
     if (part.groups[gi].ops.size() >= 2) {
         auto ejectable = part.ejectable_ops(gi);
         for (auto op : ejectable) {
-            std::set<size_t> remainder = part.groups[gi].ops;
-            remainder.erase(op);
-            double remainder_cost = part.eval_set(remainder);
-            if (remainder_cost >= 1e17) continue;
-
-            double singleton_cost = part.eval_set({op});
-            if (singleton_cost >= 1e17) continue;
-
-            double saving = part.groups[gi].cost - (remainder_cost + singleton_cost);
-            if (saving > -floor)
-                heap.push({Move::EJECT, gi, 0, op, saving, gen_i, 0});
+            auto er = part.eval_eject(op, gi);
+            if (!er.feasible) continue;
+            if (er.saving > -floor)
+                heap.push({Move::EJECT, gi, 0, op, er.saving, gen_i, 0});
         }
     }
 
@@ -212,29 +209,26 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             break;
         }
         case Move::EJECT: {
-            std::set<size_t> remainder = part.groups[m.ga].ops;
-            remainder.erase(m.op);
-            double remainder_cost = part.eval_set(remainder);
-            if (remainder_cost >= 1e17) return {};
-
-            double singleton_cost = part.eval_set({m.op});
-            if (singleton_cost >= 1e17) return {};
-
-            double actual_saving = part.groups[m.ga].cost
-                                   - (remainder_cost + singleton_cost);
-            if (actual_saving < -0.001) return {};
+            auto er = part.eval_eject(m.op, m.ga);
+            if (!er.feasible || er.saving < -0.001) return {};
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);
 
-            part.groups[m.ga].ops = std::move(remainder);
-            part.groups[m.ga].cost = remainder_cost;
+            part.groups[m.ga].ops = er.remainder_components[0];
+            part.groups[m.ga].cost = er.component_costs[0];
             part.groups[m.ga].gen++;
-
-            size_t new_gi = part.add_group({m.op}, singleton_cost);
-
             dirty.insert(m.ga);
-            dirty.insert(new_gi);
+
+            for (size_t c = 1; c < er.remainder_components.size(); c++) {
+                size_t ng = part.add_group(er.remainder_components[c], er.component_costs[c]);
+                dirty.insert(ng);
+            }
+
+            if (er.singleton_cost > 0) {
+                size_t sg = part.add_group({m.op}, er.singleton_cost);
+                dirty.insert(sg);
+            }
             break;
         }
         case Move::INTERNAL_EJECT: {
