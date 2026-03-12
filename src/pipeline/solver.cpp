@@ -460,6 +460,7 @@ Solution solve(const Problem& prob, TimePoint deadline) {
 
     // ================================================================
     // Phase 2: Build solutions from each partition in the pool (parallel)
+    // Keep BOTH DFS and beam solutions for diversity.
     // ================================================================
     std::cerr << "Phase 2: Build solutions from " << partition_pool.size() << " partitions...\n";
 
@@ -478,11 +479,52 @@ Solution solve(const Problem& prob, TimePoint deadline) {
                 if (tid >= n_tasks) break;
                 if (SteadyClock::now() >= phase2_deadline) break;
 
-                auto sol = build_solution(prob, dag, partition_pool[tid]);
-                auto vr = sol.validate();
-                if (vr.valid) {
+                auto& part = partition_pool[tid];
+                auto gd_opt = GroupDAGInfo::build(prob, dag, part);
+                if (!gd_opt) continue;
+                auto& gd = *gd_opt;
+
+                // DFS solution
+                auto dfs_order = dfs_ordering(gd);
+                std::vector<ScheduleStep> dfs_steps;
+                for (auto idx : dfs_order)
+                    dfs_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
+                Solution dfs_sol(prob, dag, std::move(dfs_steps));
+                dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
+                dfs_sol = optimize_recompute(prob, dag, std::move(dfs_sol));
+                dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
+
+                // Beam solution
+                int beam_width = std::min(20, std::max(5, (int)gd.size()));
+                auto beam_result = beam_search_ordering(gd, beam_width);
+                std::vector<ScheduleStep> beam_steps;
+                std::set<size_t> beam_entering;
+                for (size_t i = 0; i < beam_result.order.size(); i++) {
+                    size_t idx = beam_result.order[i];
+                    std::set<size_t> retain_these;
+                    if (i < beam_result.retain_per_step.size() && i + 1 < beam_result.order.size()) {
+                        size_t next_idx = beam_result.order[i + 1];
+                        for (auto t : beam_result.retain_per_step[i])
+                            if (gd.groups[next_idx].sg.boundary_inputs().count(t))
+                                retain_these.insert(t);
+                    }
+                    auto cost = gd.groups[idx].sg.best_cost(beam_entering, retain_these);
+                    if (!cost.feasible) { retain_these.clear(); cost = gd.groups[idx].sg.best_cost(beam_entering, {}); }
+                    if (!cost.feasible) { beam_entering.clear(); retain_these.clear(); cost = gd.groups[idx].base_cost; }
+                    beam_steps.push_back({Subgraph(gd.groups[idx].sg), cost.config, retain_these});
+                    beam_entering = retain_these;
+                }
+                Solution beam_sol(prob, dag, std::move(beam_steps));
+                beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
+                beam_sol = optimize_recompute(prob, dag, std::move(beam_sol));
+                beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
+
+                {
                     std::lock_guard<std::mutex> lock(sol_mutex);
-                    solution_pool.push_back(std::move(sol));
+                    if (dfs_sol.validate().valid)
+                        solution_pool.push_back(std::move(dfs_sol));
+                    if (beam_sol.validate().valid)
+                        solution_pool.push_back(std::move(beam_sol));
                 }
             }
         };

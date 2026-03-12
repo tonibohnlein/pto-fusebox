@@ -62,21 +62,24 @@ static double partition_distance(const Partition& a, const Partition& b) {
 
 static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
                          size_t max_pool) {
-    // If similar to a better member, reject. If similar but better, replace.
+    // If nearly identical to a better member, replace only if better.
+    // But allow near-duplicates if pool has room (diversity in ordering/retain later).
     for (auto& pe : pool) {
         double dist = partition_distance(pe.partition, entry.partition);
-        if (dist < 0.03) {
+        if (dist < 0.005) {  // truly identical partitions
             if (entry.cost < pe.cost - 0.01) {
                 pe = std::move(entry);
                 return true;
             }
-            return false;
+            return false;  // identical and not better
         }
     }
+    // Different partition — always add if room
     if (pool.size() < max_pool) {
         pool.push_back(std::move(entry));
         return true;
     }
+    // Full — replace worst if better
     size_t worst = 0;
     for (size_t i = 1; i < pool.size(); i++)
         if (pool[i].cost > pool[worst].cost) worst = i;

@@ -1437,9 +1437,15 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
   for (auto& s : pool)
     pool_entries.push_back({s.steps(), s.total_latency()});
 
-  double global_best_init = pool_entries[0].cost;
+  // Shared best across all threads (protected by mutex)
+  std::mutex best_mutex;
+  std::vector<ScheduleStep> global_best_steps = pool_entries[0].steps;
+  double global_best_cost = pool_entries[0].cost;
   for (auto& pe : pool_entries)
-    global_best_init = std::min(global_best_init, pe.cost);
+    if (pe.cost < global_best_cost) {
+      global_best_cost = pe.cost;
+      global_best_steps = pe.steps;
+    }
 
   struct ThreadResult {
     std::vector<ScheduleStep> steps;
@@ -1457,28 +1463,48 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
     threads.emplace_back([&, t]() {
       g_verbose = (t == 0) && main_verbose;
 
-      // Each thread starts from a different pool entry (round-robin)
+      // Thread-local best
       auto& start = pool_entries[t % pool_entries.size()];
       auto best_steps = start.steps;
       double best_cost = start.cost;
-      int no_improve = 0;
       int total_passes = 0, improving_passes = 0, total_moves = 0;
 
       double base_floor = cfg.pass_config.floor_fraction;
       double base_drift = cfg.pass_config.max_drift_fraction;
-      double heat = 1.0;
 
-      for (int pass = 0; pass < cfg.max_passes; pass++) {
-        if (Clock::now() >= cfg.deadline)
-          break;
+      // Cycle through pool entries when stuck
+      int pool_idx = t % (int)pool_entries.size();
+      int no_improve = 0;
+      double heat = 1.0;
+      int pass = 0;
+
+      while (pass < cfg.max_passes && Clock::now() < cfg.deadline) {
+        // If stuck, restart from next pool entry (or global best)
+        if (no_improve >= cfg.max_no_improve) {
+          pool_idx = (pool_idx + 1) % (int)pool_entries.size();
+          no_improve = 0;
+          heat = 1.0;
+
+          // Pick the better of: next pool entry vs global best
+          {
+            std::lock_guard<std::mutex> lock(best_mutex);
+            if (global_best_cost < pool_entries[pool_idx].cost - 0.01) {
+              best_steps = global_best_steps;
+              best_cost = global_best_cost;
+            } else {
+              best_steps = pool_entries[pool_idx].steps;
+              best_cost = pool_entries[pool_idx].cost;
+            }
+          }
+          if (g_verbose)
+            std::cerr << "    [t" << t << "] restart from pool[" << pool_idx
+                      << "] cost=" << best_cost << "\n";
+        }
 
         double progress = (double)pass / std::max(1, cfg.max_passes - 1);
         double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
         double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
         double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
-
-        if (no_improve >= cfg.max_no_improve)
-          break;
 
         SolutionFMPassConfig pc = cfg.pass_config;
         pc.seed = (unsigned)(cfg.pass_config.seed + t * 1000 + pass * 7);
@@ -1489,13 +1515,13 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
         auto pr = solution_fm_pass(prob, dag, best_steps, pc);
         total_passes++;
         total_moves += pr.moves_applied;
+        pass++;
 
-        if (g_verbose) {
+        if (g_verbose && pr.moves_applied > 0) {
           std::cerr << "    [t" << t << " pass " << pass
                     << "] moves=" << pr.moves_applied
                     << " best=" << pr.best_cost << " end=" << pr.end_cost
-                    << " floor=" << std::fixed << std::setprecision(3)
-                    << eff_floor << " heat=" << heat << " no_imp=" << no_improve
+                    << " heat=" << std::fixed << std::setprecision(2) << heat
                     << "\n";
         }
 
@@ -1505,6 +1531,13 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
           no_improve = 0;
           improving_passes++;
           heat = std::clamp(heat * 0.7, 0.1, 3.0);
+
+          // Share with other threads
+          std::lock_guard<std::mutex> lock(best_mutex);
+          if (best_cost < global_best_cost - 0.01) {
+            global_best_cost = best_cost;
+            global_best_steps = best_steps;
+          }
         } else {
           if (pr.moves_applied > 0) {
             auto kicked = solution_greedy_descent(
@@ -1517,6 +1550,12 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
               no_improve = 0;
               improving_passes++;
               heat = std::clamp(heat * 0.9, 0.1, 3.0);
+
+              std::lock_guard<std::mutex> lock(best_mutex);
+              if (best_cost < global_best_cost - 0.01) {
+                global_best_cost = best_cost;
+                global_best_steps = best_steps;
+              }
               continue;
             }
           }
@@ -1532,7 +1571,7 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
   for (auto &t : threads)
     t.join();
 
-  // Find best across threads and log
+  // Find best across threads
   int best_t = 0;
   for (int t = 1; t < num_threads; t++)
     if (results[t].cost < results[best_t].cost)
@@ -1549,9 +1588,8 @@ Solution solution_fm_search(const Problem &prob, const DAG &dag,
   std::cerr << ", " << total_passes << " passes"
             << " (" << total_improving << " improving)"
             << ", " << total_moves << " moves";
-  if (results[best_t].cost < global_best_init - 0.01) {
-    std::cerr << ", best=" << results[best_t].cost << " (thread " << best_t
-              << ")";
+  if (results[best_t].cost < global_best_cost + 0.01) {
+    std::cerr << ", best=" << results[best_t].cost;
   }
   std::cerr << "\n";
 
