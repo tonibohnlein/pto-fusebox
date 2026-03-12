@@ -84,6 +84,17 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         return std::nullopt;
   }
 
+  // Validate: ephemeral tensors must not have consumers outside the subgraph.
+  // Otherwise the external op could never access the data (it never touches
+  // fast memory or slow memory).
+  for (size_t t = 0; t < num_tensors; t++) {
+    if (is_ephemeral[t]) {
+      for (auto consumer : dag.tensor_consumers[t])
+        if (!is_in_sg[consumer])
+          return std::nullopt;
+    }
+  }
+
   // Must have at least one boundary output
   if (sg.boundary_outputs_.empty())
     return std::nullopt;
@@ -242,10 +253,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // ---- Precompute per-boundary-tensor role info ----
   {
     // Use vector indexed by tensor ID, then flatten to boundary_tensor_info_
-    std::vector<int8_t> tensor_in_info(num_tensors, -1); // -1 = not in info
+    std::vector<int> tensor_in_info(num_tensors, -1); // -1 = not in info
     auto ensure = [&](size_t t) -> size_t {
       if (tensor_in_info[t] < 0) {
-        tensor_in_info[t] = (int8_t)sg.boundary_tensor_info_.size();
+        tensor_in_info[t] = (int)sg.boundary_tensor_info_.size();
         sg.boundary_tensor_info_.push_back(
           {t, prob.tensors[t].width * prob.tensors[t].height});
       }
@@ -347,6 +358,10 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.h * cfg.w);
     if (info.is_mm_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
+    // PW boundary outputs have is_boundary_out but none of the above flags.
+    // Their tile (w×h) must still be counted in the working set.
+    if (info.is_boundary_out)
+      max_size = std::max(max_size, cfg.h * cfg.w);
 
     ws += max_size;
   }
@@ -375,6 +390,7 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
         if (info.is_mm_rhs) sz = std::max(sz, cfg.k * cfg.w);
         if (info.is_pw_in) sz = std::max(sz, cfg.h * cfg.w);
         if (info.is_mm_out) sz = std::max(sz, cfg.h * cfg.w);
+        if (info.is_boundary_out) sz = std::max(sz, cfg.h * cfg.w);
         if (retained_from_prev.count(t)) sz = full;
         tile_counted = (sz > 0);
         break;
@@ -475,6 +491,11 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   //   Step nk-1:     load RHS strip + evict output + PW compute
   // When nk=1, all three collapse into a single step.
   auto tile_cost = [&](bool lhs_fresh, bool rhs_fresh) -> double {
+    // When k < K (nk > 1), the RHS strip loaded in the last k-step of the
+    // previous tile covers a different k-range than step 0 of this tile.
+    // LHS reuse IS valid: the full h×K strip stays resident across k-steps.
+    if (nk > 1) rhs_fresh = true;
+
     if (nk == 1) {
       // Single step: everything happens at once
       double mi = pw_in_load;
@@ -501,7 +522,20 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   };
 
   if (cfg.snake == SnakeDir::None) {
-    result.latency = (double)num_tiles * tile_cost(true, true);
+    // Raster order (row-major): consecutive tiles in the same row share the
+    // LHS row strip.  Moving to a new row reloads both LHS and RHS.
+    //   Per row: 1 tile with both fresh + (num_tw-1) tiles with LHS reused.
+    //   Rows: num_th rows.
+    // For PW-only subgraphs lhs_load/rhs_load are 0 so the distinction is
+    // immaterial — the formula collapses to num_tiles * tile_cost(true,true).
+    if (has_matmul_ && num_tw > 1) {
+      int count_ff = num_th;
+      int count_rf = (num_tw - 1) * num_th;
+      result.latency = count_ff * tile_cost(true, true) +
+                       count_rf * tile_cost(false, true);
+    } else {
+      result.latency = (double)num_tiles * tile_cost(true, true);
+    }
   } else {
     int count_ff, count_rf, count_fr;
     if (cfg.snake == SnakeDir::RowMajor) {
