@@ -5,68 +5,71 @@
 
 Solution optimize_retain(const Problem& prob, const DAG& dag, Solution sol) {
     auto steps = sol.steps();
-    bool improved = true;
+    bool global_improved = true;
 
-    while (improved) {
-        improved = false;
-        // Build perfectly accurate baseline state
-        Solution current(prob, dag, steps);
+    while (global_improved) {
+        global_improved = false;
 
-        for (size_t i = 0; i + 1 < current.num_steps(); i++) {
-            const auto& si = current.step(i);
-            const auto& sj = current.step(i + 1);
+        // Forward sweep: track entering state incrementally so changes at
+        // pair (i, i+1) cascade correctly into pairs (i+1, i+2), etc.
+        // This avoids breaking out and rebuilding the Solution on every change.
+        std::set<size_t> entering_state;
 
-            // 1. Gather candidates: must be boundary_in/out of `i`, and boundary_in of `i+1`
+        for (size_t i = 0; i + 1 < steps.size(); i++) {
+            // Compute step i and i+1 costs with the current (possibly updated)
+            // entering state — accurate even after prior cascade changes.
+            auto actual_i = steps[i].subgraph.compute_cost(
+                steps[i].config, entering_state, steps[i].retain_these);
+            std::set<size_t> entering_j = steps[i].retain_these;
+            auto actual_j = steps[i+1].subgraph.compute_cost(
+                steps[i+1].config, entering_j, steps[i+1].retain_these);
+            double old_pair = actual_i.latency + actual_j.latency;
+
+            // Gather candidates: boundary tensors of step i that step i+1 needs
             std::vector<size_t> candidates;
-            for (auto t : si.subgraph.boundary_inputs()) {
-                if (sj.subgraph.boundary_inputs().count(t)) candidates.push_back(t);
+            for (auto t : steps[i].subgraph.boundary_inputs()) {
+                if (steps[i+1].subgraph.boundary_inputs().count(t))
+                    candidates.push_back(t);
             }
-            for (auto t : si.subgraph.boundary_outputs()) {
-                if (sj.subgraph.boundary_inputs().count(t)) candidates.push_back(t);
+            for (auto t : steps[i].subgraph.boundary_outputs()) {
+                if (steps[i+1].subgraph.boundary_inputs().count(t))
+                    candidates.push_back(t);
             }
 
-            // 2. Sort candidates by size (Largest first = maximum bandwidth saved)
+            // Sort by size descending (largest bandwidth savings first)
             std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
-                return prob.tensors[a].width * prob.tensors[a].height >
-                       prob.tensors[b].width * prob.tensors[b].height;
+                return prob.tensors[a].size() > prob.tensors[b].size();
             });
 
-            // 3. Test retaining them safely
             for (auto t : candidates) {
-                // Skip if already retained or inherently unretainable
                 if (steps[i].retain_these.count(t)) continue;
                 if (!prob.retainable_tensors.count(t)) continue;
 
                 auto trial_retain_i = steps[i].retain_these;
                 trial_retain_i.insert(t);
 
-                // Re-evaluate Step i with accurate entering state
-                std::set<size_t> entering_i = current.retained_entering(i);
-                auto cost_i = steps[i].subgraph.best_cost(entering_i, trial_retain_i);
+                // Re-evaluate step i with trial retain
+                auto cost_i = steps[i].subgraph.best_cost(entering_state, trial_retain_i);
                 if (!cost_i.feasible) continue;
 
-                // Re-evaluate Step i+1 (it receives whatever i retained)
-                std::set<size_t> entering_j = trial_retain_i; 
-                auto trial_retain_j = steps[i+1].retain_these;
-                auto cost_j = steps[i+1].subgraph.best_cost(entering_j, trial_retain_j);
+                // Re-evaluate step i+1 with new entering state
+                auto cost_j = steps[i+1].subgraph.best_cost(
+                    trial_retain_i, steps[i+1].retain_these);
                 if (!cost_j.feasible) continue;
 
-                // CRITICAL FIX 1: Did we ACTUALLY save time? 
-                // (Prevents shrinking tiles to fit a tensor if it costs more compute latency)
-                double old_latency = current.step_latency(i) + current.step_latency(i + 1);
-                double new_latency = cost_i.latency + cost_j.latency;
-
-                if (new_latency < old_latency - 0.01) {
+                double new_pair = cost_i.latency + cost_j.latency;
+                if (new_pair < old_pair - 0.01) {
                     steps[i].retain_these = trial_retain_i;
                     steps[i].config = cost_i.config;
                     steps[i+1].config = cost_j.config;
-                    improved = true;
-                    break; // Break candidate loop
+                    global_improved = true;
+                    // Don't break — cascade forward to check (i+1, i+2) next
+                    break; // break candidate loop, continue step loop
                 }
             }
-            
-            // CRITICAL FIX 2: If we changed memory state, break step loop to rebuild `current`!
-            if (improved) break; 
+
+            // Advance entering state for the next pair
+            entering_state = steps[i].retain_these;
         }
     }
     
