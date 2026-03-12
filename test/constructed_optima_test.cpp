@@ -171,23 +171,25 @@ void test_diamond_retain_optimal() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
 
-    // {0,1,2} is rejected: T1 is ephemeral but consumed by both Op1 and Op2 (fan-out).
-    // Best partition without retain: {0}+{1,2} = 3276.8+3276.8 = 6553.6
-    // With retain: {0} retain T1, then {1,2} with T1 resident = 4638.4
+    // With ephemeral fix: {0,1,2} IS valid. T1 and T2 are both produced+consumed
+    // internally with all consumers inside → both ephemeral.
+    // Fuse-all: 1 tile at [128,128], comp=4500, mem=3276.8. lat=4500.
     DAG d = DAG::build(p);
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
-    CHECK("fuse-all rejected (eph fan-out)", tmp.eval_set({0,1,2}) >= 1e17);
+    double fuse_all = tmp.eval_set({0,1,2});
+    CHECK("fuse-all accepted", fuse_all < 1e17);
+    CHECK_EQ("fuse-all cost", fuse_all, 4500.0);
 
     double best_no_retain = tmp.eval_set({0}) + tmp.eval_set({1,2});
     double retain_strat = 4638.4;
-    std::cout << "  best_no_retain=" << best_no_retain
+    std::cout << "  fuse_all=" << fuse_all << " best_no_retain=" << best_no_retain
               << " retain_strat=" << retain_strat << "\n";
     CHECK_EQ("best_no_retain", best_no_retain, 6553.6);
+    CHECK("fuse-all < retain", fuse_all < retain_strat);
 
     auto sol = solve(p);
     std::cout << "  solver: " << sol.total_latency() << "\n";
-    // Solver should find at least the no-retain partition; with retain it could do 4638.4
-    CHECK_LE("solver ≤ no_retain", sol.total_latency(), best_no_retain + 1);
+    CHECK_LE("solver ≤ fuse-all", sol.total_latency(), fuse_all + 1);
 }
 
 // ========================================================================
@@ -328,7 +330,9 @@ void test_snake_direction_matters() {
     // With K=512, nk=4 at k=128. The hand calculation is complex.
     // Just verify RM < CM (LHS is expensive: 128*512/10 = 6553.6 vs RHS 1638.4)
     CHECK("RM < CM", c_rm.latency < c_cm.latency);
-    CHECK("RM < none", c_rm.latency < c_none.latency);
+    // With nk>1: raster gets LHS reuse within rows, and FR tiles degrade to FF.
+    // So RM == raster (both give 2×FF + 2×RF). RM ≤ none.
+    CHECK("RM <= none", c_rm.latency <= c_none.latency + 0.1);
 
     auto sol = solve(p);
     std::cout << "  solver: " << sol.total_latency() << "\n";

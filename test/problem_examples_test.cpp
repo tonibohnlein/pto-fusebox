@@ -220,31 +220,35 @@ void test_ex3_strategy_b() {
     DAG d = DAG::build(p);
 
     // Step 0: {Op0, Op1} → T2 (sink). Retain T2.
+    // T1 is produced by Op0 and consumed by Op1 (internal) AND Op2 (external).
+    // Since Op2 is external, T1 is boundary output (not ephemeral).
     auto sg0 = make_sg(p, d, {0, 1});
     CHECK("3B sg0 valid", sg0.num_ops() == 2);
-    CHECK("3B T1 ephemeral", sg0.ephemeral().count(1));
+    CHECK("3B T1 boundary out", sg0.boundary_outputs().count(1));
     auto c0 = sg0.compute_cost(TC(128,128,1), {}, {2});
-    // mem_in = T0/B = 1638.4. No eviction (T2 retained). comp = 3000.
-    // lat = max(3000, 1638.4) = 3000
-    CHECK_EQ("3B step0", c0.latency, 3000.0);
+    // mem_in = T0(1638.4). mem_out = T1(1638.4) (T2 retained). comp = 3000.
+    // lat = max(3000, 1638.4+1638.4) = max(3000, 3276.8) = 3276.8
+    CHECK_EQ("3B step0", c0.latency, 3276.8);
 
     // Step 1: {Op0, Op2} → T3 (sink). T2 retained from step 0.
+    // T1 produced by Op0 (internal), consumed by Op2 (internal) AND Op1 (external).
+    // T1 is boundary output (not ephemeral).
     auto sg1 = make_sg(p, d, {0, 2});
     CHECK("3B sg1 valid", sg1.num_ops() == 2);
-    CHECK("3B T1 ephemeral in sg1", sg1.ephemeral().count(1));
+    CHECK("3B T1 boundary out in sg1", sg1.boundary_outputs().count(1));
     auto c1 = sg1.compute_cost(TC(128,128,1), {2}, {});
-    // mem_in = T0/B = 1638.4 (T2 retained, not loaded). comp = 3000.
-    // mem_out = T3/B = 1638.4.
-    // lat = max(3000, 1638.4 + 1638.4) = max(3000, 3276.8) = 3276.8
-    CHECK_EQ("3B step1", c1.latency, 3276.8);
-    CHECK_EQ("3B total", c0.latency + c1.latency, 6276.8);
+    // mem_in = T0(1638.4) (T2 retained, free).
+    // mem_out = T1(1638.4) + T3(1638.4) = 3276.8
+    // comp = 3000. lat = max(3000, 1638.4+3276.8) = max(3000, 4915.2) = 4915.2
+    CHECK_EQ("3B step1", c1.latency, 4915.2);
+    CHECK_EQ("3B total", c0.latency + c1.latency, 8192.0);
 
     Solution sol(p, d, {
         {std::move(sg0), TC(128,128,1), {2}},
         {std::move(sg1), TC(128,128,1), {}},
     });
     CHECK("3B solution valid", sol.validate().valid);
-    CHECK_EQ("3B solution total", sol.total_latency(), 6276.8);
+    CHECK_EQ("3B solution total", sol.total_latency(), 8192.0);
 }
 
 void test_ex3_strategy_c() {
@@ -307,10 +311,12 @@ void test_ex4_strategy_a() {
     auto c = sg.compute_cost(TC(64,64,128, SnakeDir::None));
     CHECK_EQ_I("4A tiles", c.num_spatial_tiles, 4);
     CHECK_EQ_I("4A k_passes", c.num_k_passes, 1);
-    // Per tile: mem_in = h*K/B + K*w/B = 819.2+819.2=1638.4, mem_out=64*64/10=409.6
-    // comp = 1500 (k/K=1). lat = max(1500, 2048) = 2048.
-    // 4 tiles × 2048 = 8192
-    CHECK_EQ("4A latency", c.latency, 8192.0);
+    // Per FF tile: mem_in = LHS(819.2)+RHS(819.2)=1638.4, mem_out=409.6
+    //   lat = max(1500, 2048) = 2048
+    // Per RF tile (LHS reused within row): mem_in = RHS(819.2), mem_out=409.6
+    //   lat = max(1500, 1228.8) = 1500
+    // Raster on 2×2: row0: FF,RF. row1: FF,RF. = 2×2048 + 2×1500 = 7096
+    CHECK_EQ("4A latency", c.latency, 7096.0);
 
     Solution sol(p, d, {{std::move(sg), TC(64,64,128), {}}});
     CHECK("4A solution valid", sol.validate().valid);

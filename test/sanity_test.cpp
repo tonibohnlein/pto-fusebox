@@ -8,6 +8,7 @@
 #include "init/init_strategies.h"
 #include "search/local_search.h"
 #include "search/fm_search.h"
+#include "test_move_helpers.h"
 #include "search/active_set.h"
 #include "search/fm_pass.h"
 #include "search/fm_outer.h"
@@ -233,23 +234,22 @@ void test_move_generation() {
 
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
-        MoveHeap heap;
-        generate_moves(part, gi, heap, 1e18);  // include negative moves
+        auto moves = all_moves_for_group(part, gi, 1e18);
 
-        while (!heap.empty()) {
-            Move m = heap.top(); heap.pop();
+        for (auto& m : moves) {
             total_moves++;
             switch (m.type) {
-                case Move::MERGE: merge_count++; break;
-                case Move::STEAL: steal_count++; break;
-                case Move::RECOMPUTE: recomp_count++; break;
-                case Move::EJECT: eject_count++; break;
-                case Move::INTERNAL_EJECT: ie_count++; break;
-                case Move::SPLIT: split_count++; break;
+                case FMMove::MERGE: merge_count++; break;
+                case FMMove::STEAL: steal_count++; break;
+                case FMMove::RECOMPUTE: recomp_count++; break;
+                case FMMove::EJECT: eject_count++; break;
+                case FMMove::INTERNAL_EJECT: ie_count++; break;
+                case FMMove::SPLIT: split_count++; break;
+                default: break;
             }
 
             // Verify gain accuracy for merge moves (cheap to check)
-            if (m.type == Move::MERGE) {
+            if (m.type == FMMove::MERGE) {
                 std::set<size_t> merged = part.groups[m.ga].ops;
                 merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
                 double actual = part.groups[m.ga].cost + part.groups[m.gb].cost - part.eval_set(merged);

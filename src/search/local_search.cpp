@@ -12,7 +12,6 @@ void push_op_move(const Partition& part, size_t op, MoveHeap& heap) {
     auto move = best_move_for(part, op, /*floor=*/0.0);
     if (!move.valid() || move.saving < 0.001) return;
 
-    // Find primary group for staleness tracking
     auto& groups = part.groups_of(op);
     if (groups.empty()) return;
     size_t primary = groups[0];
@@ -21,7 +20,12 @@ void push_op_move(const Partition& part, size_t op, MoveHeap& heap) {
     entry.op = op;
     entry.move = move;
     entry.primary_group = primary;
-    entry.gen_at_eval = part.groups[primary].gen;
+    entry.gen_a = part.groups[primary].gen;
+
+    // Track secondary group gen for two-group moves
+    if (move.gb < part.groups.size() && part.groups[move.gb].alive)
+        entry.gen_b = part.groups[move.gb].gen;
+
     heap.push(entry);
 }
 
@@ -32,14 +36,12 @@ void push_op_move(const Partition& part, size_t op, MoveHeap& heap) {
 static std::set<size_t> dirty_ops(const Partition& part,
                                    const std::set<size_t>& affected_groups) {
     std::set<size_t> ops;
-    // Collect affected + adjacent groups
     std::set<size_t> relevant = affected_groups;
     for (auto gi : affected_groups) {
         if (!part.groups[gi].alive) continue;
         auto adj = part.adjacent_groups(gi);
         relevant.insert(adj.begin(), adj.end());
     }
-    // All ops in relevant groups
     for (auto gi : relevant) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops)
@@ -55,7 +57,6 @@ static std::set<size_t> dirty_ops(const Partition& part,
 Partition greedy_descent(Partition part) {
     MoveHeap heap;
 
-    // Seed: one best move per op
     for (size_t op = 0; op < part.prob->num_ops(); op++)
         push_op_move(part, op, heap);
 
@@ -64,28 +65,37 @@ Partition greedy_descent(Partition part) {
         OpMove entry = heap.top();
         heap.pop();
 
-        // Staleness check: has the primary group changed since evaluation?
+        // Stop when no positive moves remain
+        if (entry.move.saving <= 0.001) break;
+
+        // Staleness: primary group gen must match
         if (entry.primary_group >= part.groups.size() ||
             !part.groups[entry.primary_group].alive ||
-            part.groups[entry.primary_group].gen != entry.gen_at_eval)
+            part.groups[entry.primary_group].gen != entry.gen_a)
             continue;
 
-        // Also check secondary group for merge/steal/recompute
-        if (entry.move.type == FMMove::MERGE ||
-            entry.move.type == FMMove::STEAL ||
-            entry.move.type == FMMove::RECOMPUTE) {
-            if (entry.move.gb >= part.groups.size() ||
-                !part.groups[entry.move.gb].alive)
+        // Staleness: secondary group gen must match (for two-group moves)
+        if (entry.move.gb < part.groups.size()) {
+            if (!part.groups[entry.move.gb].alive)
+                continue;
+            if (entry.gen_b >= 0 &&
+                part.groups[entry.move.gb].gen != entry.gen_b)
                 continue;
         }
 
-        // Apply the move (re-verifies internally)
+        // Snapshot cost, apply, then verify improvement.
+        // apply_fm_move is designed for FM (accepts negative moves), so we
+        // must guard against stale entries whose true gain is now ≤ 0.
+        double cost_before = part.total_cost();
+
         auto affected = apply_fm_move(part, entry.move);
         if (affected.empty()) continue;
 
+        double cost_after = part.total_cost();
+        if (cost_after >= cost_before - 0.001) continue;  // no improvement → don't regenerate
+
         applied++;
 
-        // Regenerate: push new best move for each affected op
         auto ops_to_update = dirty_ops(part, affected);
         for (auto op : ops_to_update)
             push_op_move(part, op, heap);
@@ -102,7 +112,6 @@ Partition greedy_descent(Partition part) {
 // ============================================================================
 
 Partition local_search(const Problem& prob, const DAG& dag) {
-    // Phase 1: try all initialization strategies + greedy descent
     auto strategies = all_init_strategies();
     Partition best;
     double best_cost = 1e18;
@@ -125,7 +134,6 @@ Partition local_search(const Problem& prob, const DAG& dag) {
     std::cerr << "  After greedy: " << best.num_alive() << " groups, cost="
               << best.total_cost() << "\n";
 
-    // Phase 2: FM exploration from the best greedy result
     FMOuterConfig fm_cfg;
     fm_cfg.pass_config.floor_fraction = 0.30;
     fm_cfg.pass_config.max_drift_fraction = 0.50;

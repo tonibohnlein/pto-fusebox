@@ -33,9 +33,16 @@ static double simulate(int ntw, int nth, int nk,
     for (int tp = 0; tp < (int)tiles.size(); tp++) {
         int r = tiles[tp] / ntw, c = tiles[tp] % ntw;
         bool lf, rf;
-        if (snake == SnakeDir::None) { lf = true; rf = true; }
-        else if (tp == 0) { lf = true; rf = true; }
-        else { lf = (r != pr); rf = (c != pc); }
+        if (snake == SnakeDir::None) {
+            // Raster: LHS reuse within rows, RHS always fresh
+            lf = (tp == 0 || r != pr);
+            rf = true;
+        } else if (tp == 0) {
+            lf = true; rf = true;
+        } else {
+            lf = (r != pr); rf = (c != pc);
+            if (nk > 1) rf = true;  // nk>1 kills RHS reuse at column transitions
+        }
         for (int ks = 0; ks < nk; ks++) {
             double mi = 0;
             if (ks == 0) { if (lf && !lhs_retained) mi += lhs_load; if (rf) mi += rhs_load; }
@@ -142,9 +149,13 @@ void test_retain_transfer_lhs() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // No retain: 4 tiles × (max(1000,4915.2) + max(1000,3276.8)) = 4 × 8192 = 32768
-    CHECK_EQ("no ret lat", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 32768.0);
-    // T0 retained: 4 tiles × (max(1000,1638.4) + max(1000,3276.8)) = 4 × 4915.2 = 19660.8
+    // No retain, raster: 2×FF + 2×RF (LHS reuse within rows)
+    //   FF: max(1000,4915.2) + max(1000,3276.8) = 8192
+    //   RF: max(1000,1638.4) + max(1000,3276.8) = 4915.2
+    //   Total: 2×8192 + 2×4915.2 = 26214.4
+    CHECK_EQ("no ret lat", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 26214.4);
+    // T0 retained: LHS free → FF=RF. Each = max(1000,1638.4)+max(1000,3276.8) = 4915.2
+    //   Total: 4×4915.2 = 19660.8
     CHECK_EQ("ret T0 lat", sg->compute_cost({128,128,128,SnakeDir::None},{0}).latency, 19660.8);
 }
 
@@ -244,15 +255,17 @@ void test_snake_3x2_no_retain() {
 
     // ff: k0=max(2500,4915.2)=4915.2, k1=max(2500,3276.8)=3276.8 → 8192
     // rf: k0=max(2500,1638.4)=2500, k1=3276.8 → 5776.8
-    // fr: k0=max(2500,3276.8)=3276.8, k1=3276.8 → 6553.6
-    double ff=8192, rf=5776.8, fr=6553.6;
-    
-    CHECK_EQ("None", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 6*ff);
-    // RM: ff=1, rf=4, fr=1
-    CHECK_EQ("RM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency, ff+4*rf+fr);
-    // CM: ff=1, rf=2, fr=3
-    CHECK_EQ("CM", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency, ff+2*rf+3*fr);
-    // RM < CM (3 cols → 4 LHS reuses vs 1)
+    // fr: nk=2 → rhs_fresh → fr degrades to ff = 8192
+    double ff=8192, rf=5776.8;
+
+    // Raster (None): 3×2 grid, LHS reuse within rows.
+    //   Row 0: FF,RF,RF. Row 1: FF,RF,RF. = 2×FF + 4×RF
+    CHECK_EQ("None", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 2*ff+4*rf);
+    // RM: [0,1,2,5,4,3]. FF,RF,RF,FF(was FR, nk>1),RF,RF = 2×FF + 4×RF (same as raster)
+    CHECK_EQ("RM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency, 2*ff+4*rf);
+    // CM: [0,3,4,1,2,5]. FF,FF(was FR),RF,FF(was FR),RF,FF(was FR) = 4×FF + 2×RF
+    CHECK_EQ("CM", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency, 4*ff+2*rf);
+    // RM < CM (nk>1: FR→FF kills CM's advantage; RM has more LHS reuses)
     CHECK("RM < CM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency <
                       sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency);
 }
@@ -287,19 +300,18 @@ void test_snake_3x2_membound_retained() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // LHS=0. ff/rf: k0=max(250,1638.4)=1638.4, k1=3276.8 → 4915.2
-    // fr: k0=max(250,0)=250, k1=3276.8 → 3526.8
-    double fast=4915.2, slow=3526.8;
+    // LHS=T0 retained. nk=2 → FR degrades to FF.
+    // With LHS free, FF=RF (LHS load is 0 in both cases).
+    // All tiles: k0=max(250,RHS(1638.4))=1638.4, k1=max(250,RHS+evict(3276.8))=3276.8 → 4915.2
+    double all_same = 6 * 4915.2;  // 29491.2
 
-    // RM: ff=1, rf=4, fr=1. 5*fast + slow = 28102.8
-    CHECK_EQ("RM ret", sg->compute_cost({128,128,128,SnakeDir::RowMajor},{0}).latency,
-             5*fast + slow);
-    // CM: ff=1, rf=2, fr=3. 3*fast + 3*slow = 25326
-    CHECK_EQ("CM ret", sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency,
-             3*fast + 3*slow);
-    // CM wins: more fr tiles → more RHS reuse
-    CHECK("CM < RM", sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency <
-                     sg->compute_cost({128,128,128,SnakeDir::RowMajor},{0}).latency);
+    // RM: all tiles identical = 29491.2
+    CHECK_EQ("RM ret", sg->compute_cost({128,128,128,SnakeDir::RowMajor},{0}).latency, all_same);
+    // CM: all tiles identical = 29491.2
+    CHECK_EQ("CM ret", sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency, all_same);
+    // CM == RM (nk>1 kills RHS reuse that would have made CM better)
+    CHECK("CM == RM", std::abs(sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency -
+                               sg->compute_cost({128,128,128,SnakeDir::RowMajor},{0}).latency) < 0.1);
 }
 
 void test_snake_3x2_membound_no_retain() {
@@ -315,23 +327,25 @@ void test_snake_3x2_membound_no_retain() {
 
     // ff: k0=max(250,4915.2)=4915.2, k1=3276.8 → 8192
     // rf: k0=max(250,1638.4)=1638.4, k1=3276.8 → 4915.2
-    // fr: k0=max(250,3276.8)=3276.8, k1=3276.8 → 6553.6
+    // fr: nk=2 → degrades to ff = 8192
+    double ff=8192, rf=4915.2;
 
-    // RM: ff=1, rf=4, fr=1. 8192+4*4915.2+6553.6 = 34406.4
+    // RM: 2×FF+4×RF (same as raster with nk>1)
     CHECK_EQ("RM nret", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency,
-             8192+4*4915.2+6553.6);
-    // CM: ff=1, rf=2, fr=3. 8192+2*4915.2+3*6553.6 = 37683.2
+             2*ff+4*rf);
+    // CM: 4×FF+2×RF
     CHECK_EQ("CM nret", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency,
-             8192+2*4915.2+3*6553.6);
-    // RM wins: more rf tiles → more LHS reuse
+             4*ff+2*rf);
+    // RM wins: more LHS reuse tiles
     CHECK("RM < CM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency <
                      sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency);
 }
 
 void test_snake_retain_preference_flip() {
     std::cout << "--- test_snake_retain_preference_flip ---\n";
-    // Without retain: RowMajor wins (LHS reuse from wide grid)
-    // With LHS retained: ColMajor wins (RHS reuse from tall-ish grid, LHS free)
+    // Without retain: RowMajor wins (more LHS reuse from wide grid)
+    // With LHS retained + nk>1: all tiles same (LHS free, RHS reuse killed by nk>1)
+    //   → CM == RM. The original "flip" only happens with nk=1.
     Problem p;
     p.tensors = {{256,256},{384,256},{384,256}};
     p.ops = {{OpType::MatMul,{0,1},{2},500}};
@@ -347,7 +361,8 @@ void test_snake_retain_preference_flip() {
     auto cm_ret = sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency;
 
     CHECK("no ret: RM wins", rm_nret < cm_nret);
-    CHECK("ret: CM wins", cm_ret < rm_ret);
+    // With retain + nk>1: CM == RM (FR→FF kills RHS reuse advantage)
+    CHECK("ret: CM == RM", std::abs(cm_ret - rm_ret) < 0.1);
     std::cout << "  no_ret: RM=" << rm_nret << " CM=" << cm_nret
               << " | ret: RM=" << rm_ret << " CM=" << cm_ret << "\n";
 }

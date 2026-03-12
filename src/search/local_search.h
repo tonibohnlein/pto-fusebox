@@ -8,19 +8,17 @@
 // ============================================================================
 // OpMove: one best move per op, for the greedy descent heap.
 //
-// Unlike the old Move struct (one entry per (group, neighbor, move_type)
-// triple), this produces at most one heap entry per op. This keeps the
-// heap size O(num_ops) instead of O(ops × neighbors × move_types).
-//
-// Staleness is detected by storing the generation of the primary group
-// at evaluation time. If the group's gen changes, the entry is stale.
+// Stores generation counters for BOTH primary and secondary groups to
+// detect staleness. The old per-group Move struct tracked this via gen_a
+// and gen_b; we do the same here per-op.
 // ============================================================================
 
 struct OpMove {
     size_t op = SIZE_MAX;     // initiating op
     FMMove move;              // the best move for this op
     size_t primary_group = SIZE_MAX;
-    int gen_at_eval = -1;     // gen of primary_group when evaluated
+    int gen_a = -1;           // gen of primary group when evaluated
+    int gen_b = -1;           // gen of secondary group (gb) when evaluated
 
     double saving() const { return move.saving; }
     bool valid() const { return move.valid(); }

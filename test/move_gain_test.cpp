@@ -7,6 +7,7 @@
 #include "core/dag.h"
 #include "partition/partition.h"
 #include "search/local_search.h"
+#include "test_move_helpers.h"
 #include "search/fm_search.h"
 #include <iostream>
 #include <cmath>
@@ -20,89 +21,22 @@ static void CHECK(const char* l, bool c) {
     if (c) g_pass++; else { g_fail++; std::cout << "  FAIL: " << l << "\n"; }
 }
 
-// Apply a heap move to a copy and return (before, after) costs
-struct GainCheck { double before, after, reported; bool applied; };
-
-static GainCheck verify_heap_move(Partition part, const Move& m) {
-    GainCheck gc;
-    gc.before = part.total_cost();
-    gc.reported = m.saving;
-    gc.applied = false;
-    switch (m.type) {
-        case Move::MERGE: {
-            std::set<size_t> merged = part.groups[m.ga].ops;
-            merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
-            double nc = part.eval_set(merged);
-            if (nc >= 1e17) return gc;
-            part.groups[m.ga].ops = merged;
-            part.groups[m.ga].cost = nc;
-            part.groups[m.gb].alive = false;
-            part.rebuild_index();
-            gc.applied = true; break;
-        }
-        case Move::STEAL: {
-            std::set<size_t> new_ga = part.groups[m.ga].ops; new_ga.insert(m.op);
-            double nac = part.eval_set(new_ga);
-            if (nac >= 1e17) return gc;
-            std::set<size_t> new_gb = part.groups[m.gb].ops; new_gb.erase(m.op);
-            double nbc = new_gb.empty() ? 0 : part.eval_set(new_gb);
-            if (!new_gb.empty() && nbc >= 1e17) return gc;
-            part.groups[m.ga].ops = new_ga; part.groups[m.ga].cost = nac;
-            if (new_gb.empty()) part.groups[m.gb].alive = false;
-            else { part.groups[m.gb].ops = new_gb; part.groups[m.gb].cost = nbc; }
-            part.rebuild_index();
-            gc.applied = true; break;
-        }
-        case Move::RECOMPUTE: {
-            std::set<size_t> new_ga = part.groups[m.ga].ops; new_ga.insert(m.op);
-            double nc = part.eval_set(new_ga);
-            if (nc >= 1e17) return gc;
-            part.groups[m.ga].ops = new_ga; part.groups[m.ga].cost = nc;
-            gc.applied = true; break;
-        }
-        case Move::EJECT: {
-            std::set<size_t> rem = part.groups[m.ga].ops; rem.erase(m.op);
-            double rc = part.eval_set(rem), sc = part.eval_set({m.op});
-            if (rc >= 1e17 || sc >= 1e17) return gc;
-            part.groups[m.ga].ops = rem; part.groups[m.ga].cost = rc;
-            part.add_group({m.op}, sc);
-            gc.applied = true; break;
-        }
-        case Move::INTERNAL_EJECT: {
-            auto er = part.eval_eject(m.op, m.ga);
-            if (!er.feasible) return gc;
-            part.groups[m.ga].ops = std::move(er.remainder_components[0]);
-            part.groups[m.ga].cost = er.component_costs[0];
-            for (size_t i = 1; i < er.remainder_components.size(); i++)
-                part.add_group(std::move(er.remainder_components[i]), er.component_costs[i]);
-            if (er.singleton_cost > 0)
-                part.add_group({m.op}, er.singleton_cost);
-            gc.applied = true; break;
-        }
-        case Move::SPLIT: {
-            auto sr = part.eval_split(m.op, m.op2, m.ga);
-            if (!sr.feasible) return gc;
-            part.groups[m.ga].ops = std::move(sr.side_a);
-            part.groups[m.ga].cost = sr.cost_a;
-            part.add_group(std::move(sr.side_b), sr.cost_b);
-            gc.applied = true; break;
-        }
-    }
-    gc.after = part.total_cost();
-    return gc;
+// Apply an FMMove to a copy and return (before, after) costs — uses apply_fm_move
+static GainCheck verify_heap_move(Partition part, const FMMove& m) {
+    return verify_move_gain(std::move(part), m);
 }
 
 // Verify ALL heap moves from a partition. Returns (checked, failed) counts.
 static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
                                             double floor = 1e18) {
     int checked = 0, bad = 0;
-    const char* names[] = {"MERGE", "STEAL", "RECOMPUTE", "EJECT", "INT_EJECT", "SPLIT"};
+    // FMMove::Type ordering: STEAL=0, EJECT=1, RECOMPUTE=2, MERGE=3, INT_EJECT=4, SPLIT=5
+    const char* names[] = {"STEAL", "EJECT", "RECOMPUTE", "MERGE", "INT_EJECT", "SPLIT"};
     int type_counts[6] = {};
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
-        MoveHeap heap;
-        generate_moves(part, gi, heap, floor);
-        while (!heap.empty()) {
-            Move m = heap.top(); heap.pop();
+        if (!part.groups[gi].alive) continue;
+        auto moves = all_moves_for_group(part, gi, floor);
+        for (auto& m : moves) {
             auto gc = verify_heap_move(part, m);
             if (!gc.applied) continue;
             checked++;
@@ -117,14 +51,10 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
         }
     }
     std::cout << "  " << label << ": " << checked << " moves ("
-              << type_counts[0] << "M " << type_counts[1] << "S "
-              << type_counts[2] << "R " << type_counts[3] << "E "
+              << type_counts[3] << "M " << type_counts[0] << "S "
+              << type_counts[2] << "R " << type_counts[1] << "E "
               << type_counts[4] << "IE " << type_counts[5] << "SP) "
               << bad << " bad\n";
-
-
-
-
     return {checked, bad};
 }
 
@@ -252,14 +182,13 @@ void test_merge_forces_smaller_tiles() {
     tally({nf, badf});
     
     // Check that some moves are negative (merge makes things worse)
-    MoveHeap heap;
     int pos = 0, neg = 0;
-    for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, 1e18);
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.saving > 0.01) pos++;
-        else if (m.saving < -0.01) neg++;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        for (auto& m : all_moves_for_group(part, gi, 1e18)) {
+            if (m.saving > 0.01) pos++;
+            else if (m.saving < -0.01) neg++;
+        }
     }
     CHECK("has positive moves", pos > 0);
     CHECK("has negative moves", neg > 0);
@@ -322,12 +251,9 @@ void test_recompute_saves_large_tensor() {
     tally(verify_all_fm("recomp_diamond", part));
     
     // Verify at least one recompute exists (even if negative)
-    MoveHeap heap;
-    generate_moves(part, 2, heap, 1e18);
     int recomp_count = 0;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::RECOMPUTE) {
+    for (auto& m : all_moves_for_group(part, 2, 1e18)) {
+        if (m.type == FMMove::RECOMPUTE) {
             recomp_count++;
             std::cout << "  recompute Op" << m.op << " in G" << m.ga 
                       << ": saving=" << m.saving << "\n";
@@ -526,12 +452,9 @@ void test_eject_from_chain3() {
     tally(verify_all_fm("eject_chain3", part));
     
     // Check eject count
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
     int eject_count = 0, pos_ej = 0, neg_ej = 0;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::EJECT) {
+    for (auto& m : all_moves_for_group(part, 0, 1e18)) {
+        if (m.type == FMMove::EJECT) {
             eject_count++;
             if (m.saving > 0.01) pos_ej++;
             else if (m.saving < -0.01) neg_ej++;
@@ -625,13 +548,12 @@ void test_negative_steal_gain() {
     tally(verify_all_fm("neg_steal", part));
     
     // Count positive vs negative
-    MoveHeap heap;
     int pos=0, neg=0;
-    for (size_t gi = 0; gi < part.groups.size(); gi++)
-        generate_moves(part, gi, heap, 1e18);
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.saving > 0.01) pos++; else if (m.saving < -0.01) neg++;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        for (auto& m : all_moves_for_group(part, gi, 1e18)) {
+            if (m.saving > 0.01) pos++; else if (m.saving < -0.01) neg++;
+        }
     }
     std::cout << "  " << pos << " positive, " << neg << " negative\n";
 }
@@ -694,13 +616,10 @@ void test_internal_eject_chain4() {
     CHECK("Op1 internal", found_op1);
     CHECK("Op2 internal", found_op2);
 
-    // Verify heap generates internal eject
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    // Verify generates internal eject
     int ie_count = 0;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::INTERNAL_EJECT) {
+    for (auto& m : all_moves_for_group(part, 0, 1e18)) {
+        if (m.type == FMMove::INTERNAL_EJECT) {
             ie_count++;
             auto gc = verify_heap_move(part, m);
             if (gc.applied) {
@@ -745,13 +664,10 @@ void test_split_chain4() {
     for (auto& [a,b] : bridges) std::cout << " (" << a << "→" << b << ")";
     std::cout << "\n";
 
-    // Verify heap generates SPLIT moves
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    // Verify generates SPLIT moves
     int split_count = 0;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::SPLIT) {
+    for (auto& m : all_moves_for_group(part, 0, 1e18)) {
+        if (m.type == FMMove::SPLIT) {
             split_count++;
             auto gc = verify_heap_move(part, m);
             if (gc.applied) {
@@ -799,13 +715,10 @@ void test_internal_diamond_fused() {
     // With Op0→Op2 direct edge, it's a triangle → 0 bridges is correct
 
     // But internal eject should still work
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
     int ie=0, sp=0;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::INTERNAL_EJECT) { ie++; }
-        if (m.type == Move::SPLIT) { sp++; }
+    for (auto& m : all_moves_for_group(part, 0, 1e18)) {
+        if (m.type == FMMove::INTERNAL_EJECT) { ie++; }
+        if (m.type == FMMove::SPLIT) { sp++; }
     }
     // Op0 has no preds outside, succ Op1,Op2 inside → internal
     // But Op0 also has NO preds → it IS internal if all succs are inside.
@@ -843,19 +756,16 @@ void test_internal_eject_helps() {
     std::cout << "  fused(5) cost=" << fused_cost << "\n";
 
     // Check what internal moves find
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
     int ie=0, sp=0, best_type=-1;
     double best_saving = -1e18;
-    while (!heap.empty()) {
-        Move m = heap.top(); heap.pop();
-        if (m.type == Move::INTERNAL_EJECT) {
+    for (auto& m : all_moves_for_group(part, 0, 1e18)) {
+        if (m.type == FMMove::INTERNAL_EJECT) {
             ie++;
             auto gc = verify_heap_move(part, m);
             if (gc.applied && std::abs(gc.reported - (gc.before-gc.after)) < 0.5)
                 if (m.saving > best_saving) { best_saving = m.saving; best_type = 4; }
         }
-        if (m.type == Move::SPLIT) {
+        if (m.type == FMMove::SPLIT) {
             sp++;
             auto gc = verify_heap_move(part, m);
             if (gc.applied && std::abs(gc.reported - (gc.before-gc.after)) < 0.5)
