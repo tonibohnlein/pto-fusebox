@@ -123,12 +123,60 @@ struct SolState {
   std::vector<int> gen; // per-step generation counter
   double total = 0;
 
+  // Precomputed: tensors that CAN be retained (singleton feasibility check)
+  std::set<size_t> feasibly_retainable;
+
   void init(const Problem &p, const DAG &d, std::vector<ScheduleStep> s) {
     prob = &p;
     dag = &d;
     steps = std::move(s);
     gen.assign(steps.size(), 0);
+    compute_feasibly_retainable();
     rebuild_all();
+  }
+
+  // Check which tensors can actually be retained:
+  // 1. Must fit in fast memory (already in prob->retainable_tensors)
+  // 2. Producer singleton must have a feasible tiling with tensor retained
+  // 3. Each consumer singleton must have a feasible tiling with tensor entering
+  void compute_feasibly_retainable() {
+    feasibly_retainable.clear();
+    for (auto t : prob->retainable_tensors) {
+      // Quick size check (redundant with retainable_tensors, but explicit)
+      if (prob->tensors[t].size() > prob->fast_memory_capacity)
+        continue;
+
+      bool ok = true;
+
+      // Check producer: singleton subgraph with retain_these={t}
+      int prod = dag->tensor_producer[t];
+      if (prod >= 0) {
+        auto sg = Subgraph::create(*prob, *dag, {(size_t)prod});
+        if (!sg) { ok = false; }
+        else {
+          // Producer must be feasible while retaining t
+          auto bc = sg->best_cost({}, {t});
+          if (!bc.feasible) ok = false;
+        }
+      }
+
+      if (!ok) continue;
+
+      // Check each consumer: singleton subgraph with ret_entering={t}
+      for (size_t op = 0; op < prob->num_ops() && ok; op++) {
+        bool consumes = false;
+        for (auto inp : prob->ops[op].inputs)
+          if (inp == t) { consumes = true; break; }
+        if (!consumes) continue;
+
+        auto sg = Subgraph::create(*prob, *dag, {op});
+        if (!sg) { ok = false; break; }
+        auto bc = sg->best_cost({t}, {});
+        if (!bc.feasible) { ok = false; break; }
+      }
+
+      if (ok) feasibly_retainable.insert(t);
+    }
   }
   
   void rebuild_all() {
@@ -541,7 +589,7 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
   const auto &prob = *state.prob;
   if (locked_tensors.count(t))
     return best;
-  if (!prob.retainable_tensors.count(t))
+  if (!state.feasibly_retainable.count(t))
     return best;
 
   // RETAIN_ADD: find step pairs where adding t to retain helps
@@ -1059,8 +1107,8 @@ struct SolActiveSet {
   void activate_tensor(SolState &state, size_t t) {
     if (active_tensors.count(t) || locked_tensors.count(t))
       return;
-    if (!state.prob->retainable_tensors.count(t))
-      return;
+    if (!state.feasibly_retainable.count(t))
+      return;  // precomputed: can never be retained
     if (Clock::now() >= deadline)
       return;
     active_tensors.insert(t);
@@ -1235,14 +1283,11 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   active.floor = floor;
   active.deadline = cfg.deadline;
 
-  // Initialize: 1 random entity (tensor preferred, like partition FM's
-  // init_count=1) The active set grows locally via update_affected +
-  // activate_step after each move.
+  // Initialize: seed init_count entities (biased 2:1 toward tensors)
   std::mt19937 rng(cfg.seed);
   std::vector<size_t> all_tensors;
-  for (size_t t = 0; t < prob.num_tensors(); t++)
-    if (prob.retainable_tensors.count(t))
-      all_tensors.push_back(t);
+  for (auto t : state.feasibly_retainable)
+    all_tensors.push_back(t);
   std::vector<size_t> all_ops;
   for (size_t i = 0; i < state.size(); i++)
     for (auto op : state.steps[i].subgraph.ops())
@@ -1253,41 +1298,62 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   std::shuffle(all_tensors.begin(), all_tensors.end(), rng);
   std::shuffle(all_ops.begin(), all_ops.end(), rng);
 
-  if (!all_tensors.empty()) {
-    active.activate_tensor(state, all_tensors[0]);
-    // Activate seed step + adjacent steps (like partition FM's
-    // activate_neighbors_of)
-    auto steps_of = find_steps_of_tensor(state.steps, all_tensors[0]);
-    for (auto si : steps_of) {
-      active.activate_step(state, si);
-      if (si > 0)
-        active.activate_step(state, si - 1);
-      if (si + 1 < state.size())
-        active.activate_step(state, si + 1);
-    }
-  } else if (!all_ops.empty()) {
-    active.activate_op(state, all_ops[0]);
-    size_t si = find_step_of(state.steps, all_ops[0]);
-    if (si != SIZE_MAX) {
-      active.activate_step(state, si);
-      if (si > 0)
-        active.activate_step(state, si - 1);
-      if (si + 1 < state.size())
-        active.activate_step(state, si + 1);
+  int seeds_added = 0;
+  size_t t_idx = 0, o_idx = 0;
+  while (seeds_added < cfg.init_count && Clock::now() < cfg.deadline) {
+    // 2:1 bias toward tensors
+    bool pick_tensor = (rng() % 3 != 0) && t_idx < all_tensors.size();
+    if (pick_tensor) {
+      active.activate_tensor(state, all_tensors[t_idx]);
+      auto steps_of = find_steps_of_tensor(state.steps, all_tensors[t_idx]);
+      for (auto si : steps_of) {
+        active.activate_step(state, si);
+        if (si > 0) active.activate_step(state, si - 1);
+        if (si + 1 < state.size()) active.activate_step(state, si + 1);
+      }
+      t_idx++;
+      seeds_added++;
+    } else if (o_idx < all_ops.size()) {
+      active.activate_op(state, all_ops[o_idx]);
+      size_t si = find_step_of(state.steps, all_ops[o_idx]);
+      if (si != SIZE_MAX) {
+        active.activate_step(state, si);
+        if (si > 0) active.activate_step(state, si - 1);
+        if (si + 1 < state.size()) active.activate_step(state, si + 1);
+      }
+      o_idx++;
+      seeds_added++;
+    } else if (t_idx < all_tensors.size()) {
+      // Fallback: use tensor even if we wanted op
+      active.activate_tensor(state, all_tensors[t_idx]);
+      auto steps_of = find_steps_of_tensor(state.steps, all_tensors[t_idx]);
+      for (auto si : steps_of) {
+        active.activate_step(state, si);
+        if (si > 0) active.activate_step(state, si - 1);
+        if (si + 1 < state.size()) active.activate_step(state, si + 1);
+      }
+      t_idx++;
+      seeds_added++;
+    } else {
+      break; // exhausted both
     }
   }
 
   double cumul_gain = 0, best_cumul_gain = 0;
+  int no_improve = 0;
+  int max_no_improve = std::max(30, cfg.max_no_improve);
   static const char *move_names[] = {"STEAL",   "SPLIT",  "MERGE", "RET_ADD",
                                      "RET_REM", "RECOMP", "EJECT", "INT_EJECT"};
 
-  for (int iter = 0; iter < 200; iter++) {
-    if (Clock::now() >= cfg.deadline)
-      break;
+  for (int iter = 0; ; iter++) {
+    // --- Stopping criteria ---
+    if (Clock::now() >= cfg.deadline) break;
+    if (no_improve >= max_no_improve) break;
 
     auto m_opt = active.pop_best();
-    if (!m_opt || m_opt->saving < -floor)
-      break;
+    // Active set empty or best move below floor → stop
+    if (!m_opt) break;
+    if (m_opt->saving < -floor) break;
 
     auto [lo, hi] = apply_move(state, *m_opt);
     if (lo == SIZE_MAX)
@@ -1295,7 +1361,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     result.moves_applied++;
     state.rebuild_from(lo);
 
-    // if (false) {
+    // if (g_verbose) {
     //   auto &m = *m_opt;
     //   std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
     //             << " step=" << m.step_a;
@@ -1314,6 +1380,9 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
       result.best_cost = state.total;
       result.best_steps = state.steps;
       best_cumul_gain = cumul_gain;
+      no_improve = 0;
+    } else {
+      no_improve++;
     }
     if (best_cumul_gain - cumul_gain > max_drift)
       break;
@@ -1694,6 +1763,17 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
 
     double starting_best = global_best_cost;
 
+    // One-time feasibility check: which tensors can actually be retained?
+    {
+        SolState probe;
+        probe.prob = &prob;
+        probe.dag = &dag;
+        probe.steps = pool[0].steps; // dummy, just need prob+dag for the check
+        probe.compute_feasibly_retainable();
+        std::cerr << "  Feasibly retainable: " << probe.feasibly_retainable.size()
+                  << "/" << prob.retainable_tensors.size() << " tensors\n";
+    }
+
     // Pool insert with diversity
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
         std::lock_guard<std::mutex> lock(pool_mutex);
@@ -1741,18 +1821,34 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
         threads.emplace_back([&, t]() {
             std::mt19937 rng(cfg.pass_config.seed + t * 997);
             int local_gen = 0;
+            int local_no_improve = 0;
+            double heat = 1.0;
+
+            double base_floor = cfg.pass_config.floor_fraction;
+            double base_drift = cfg.pass_config.max_drift_fraction;
+            double thread_best_cost;
+            {
+                std::lock_guard<std::mutex> lock(pool_mutex);
+                thread_best_cost = global_best_cost;
+            }
 
             while (Clock::now() < cfg.deadline) {
                 local_gen++;
                 total_generations++;
 
-                // Pick a parent from pool (biased toward best)
+                // --- Temperature: cosine annealing × heat ---
+                double progress = std::min(1.0, (double)local_gen / 200.0);
+                double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
+                double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
+                double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
+                int eff_no_improve = std::max(30, (int)(cfg.pass_config.max_no_improve * temp * heat));
+
+                // Pick a parent from pool (tournament selection: pick 3, choose best)
                 std::vector<ScheduleStep> parent;
                 double parent_cost;
                 {
                     std::lock_guard<std::mutex> lock(pool_mutex);
                     if (pool.empty()) break;
-                    // Tournament selection: pick 3, choose best
                     size_t best_idx = rng() % pool.size();
                     for (int k = 0; k < 2; k++) {
                         size_t idx = rng() % pool.size();
@@ -1795,23 +1891,26 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 child_sol = optimize_retain(prob, dag, std::move(child_sol));
                 double child_cost = child_sol.total_latency();
 
-                // Insert raw mutant
+                // Insert mutant if not too much worse (keeps diversity)
                 if (child_cost < parent_cost + parent_cost * 0.1) {
-                    // Only insert if not too much worse (keeps diversity)
                     pool_insert(child_sol.steps(), child_cost);
                 }
 
-                if (child_cost < parent_cost - 0.01) {
+                bool improved = false;
+                if (child_cost < thread_best_cost - 0.01) {
+                    thread_best_cost = child_cost;
                     total_improvements++;
+                    improved = true;
                 }
 
-                // --- Polish: FM pass (if time allows) ---
+                // --- Polish: FM pass with temperature-controlled parameters ---
                 if (Clock::now() < cfg.deadline) {
                     SolutionFMPassConfig pc = cfg.pass_config;
                     pc.seed = (unsigned)(rng());
                     pc.deadline = cfg.deadline;
-                    pc.floor_fraction = 0.1 + 0.4 * (rng() % 100) / 100.0;
-                    pc.max_drift_fraction = 0.2 + 0.6 * (rng() % 100) / 100.0;
+                    pc.floor_fraction = eff_floor;
+                    pc.max_drift_fraction = eff_drift;
+                    pc.max_no_improve = eff_no_improve;
 
                     auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc);
                     total_fm_passes++;
@@ -1821,6 +1920,10 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                         Solution fm_sol(prob, dag, pr.best_steps);
                         fm_sol = optimize_retain(prob, dag, std::move(fm_sol));
                         pool_insert(fm_sol.steps(), fm_sol.total_latency());
+                        if (fm_sol.total_latency() < thread_best_cost - 0.01) {
+                            thread_best_cost = fm_sol.total_latency();
+                            improved = true;
+                        }
                     }
 
                     // Also try greedy descent on end state
@@ -1830,7 +1933,20 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                         Solution kicked_sol(prob, dag, kicked);
                         kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
                         pool_insert(kicked_sol.steps(), kicked_sol.total_latency());
+                        if (kicked_sol.total_latency() < thread_best_cost - 0.01) {
+                            thread_best_cost = kicked_sol.total_latency();
+                            improved = true;
+                        }
                     }
+                }
+
+                // Adapt heat based on improvement
+                if (improved) {
+                    local_no_improve = 0;
+                    heat = std::clamp(heat * 0.7, 0.1, 3.0);
+                } else {
+                    local_no_improve++;
+                    heat = std::clamp(heat * 1.1, 0.1, 3.0);
                 }
             }
         });

@@ -33,6 +33,8 @@ struct SolutionMove {
 struct SolutionFMPassConfig {
     double floor_fraction = 0.30;
     double max_drift_fraction = 0.50;
+    int init_count = 3;           // seed entities (biased toward tensors)
+    int max_no_improve = 50;      // consecutive non-improving moves before stop (min 30)
     unsigned seed = 42;
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
 };

@@ -443,7 +443,7 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     auto effective_deadline = deadline;
     // If no real deadline was given (tests), cap at 10s
     if (deadline == no_deadline() || (deadline - now) > std::chrono::seconds(300))
-        effective_deadline = now + std::chrono::seconds(10);
+        effective_deadline = now + std::chrono::seconds(3);
     auto total_budget = effective_deadline - now;
 
     // Time allocation: 35% partition search, 5% build, 60% solution evo+FM
