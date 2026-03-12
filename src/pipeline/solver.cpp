@@ -13,6 +13,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <random>
 
 // ============================================================================
 // Shared group-level DAG structure for ordering algorithms
@@ -464,8 +465,12 @@ Solution solve(const Problem& prob, TimePoint deadline) {
 
     // ================================================================
     // Phase 2: Build solutions from each partition in the pool (parallel)
-    // Keep BOTH DFS and beam solutions for diversity.
+    // Keep DFS, beam, and random-retain solutions for diversity.
     // ================================================================
+
+    // Precompute once: which tensors can physically be retained?
+    auto feasibly_ret = compute_feasibly_retainable(prob, dag);
+
     std::cerr << "Phase 2: Build solutions from " << partition_pool.size() << " partitions...\n";
 
     std::vector<Solution> solution_pool;
@@ -523,12 +528,136 @@ Solution solve(const Problem& prob, TimePoint deadline) {
                 beam_sol = optimize_recompute(prob, dag, std::move(beam_sol));
                 beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
 
+                // Random-retain variant: pick tensors to retain first, then
+                // build an ordering that supports those retain decisions.
+                // Diversity comes from which tensors are retained, not from ordering.
+                std::mt19937 rand_rng(42 + tid * 1337);
+
+                // 1. Find retainable tensors at group boundaries
+                //    T is retainable between groups if:
+                //    - T is in feasibly_ret (singleton feasibility check)
+                //    - T is boundary_output of some group (producer)
+                //    - T is boundary_input of some other group (consumer)
+                struct RetainCandidate {
+                    size_t tensor;
+                    size_t prod_group;   // group that produces T
+                    size_t cons_group;   // a group that consumes T
+                };
+                std::vector<RetainCandidate> retain_cands;
+                for (size_t gi = 0; gi < gd.size(); gi++) {
+                    for (auto t : gd.groups[gi].sg.boundary_outputs()) {
+                        if (!feasibly_ret.count(t)) continue;
+                        for (size_t gj = 0; gj < gd.size(); gj++) {
+                            if (gi == gj) continue;
+                            if (gd.groups[gj].sg.boundary_inputs().count(t))
+                                retain_cands.push_back({t, gi, gj});
+                        }
+                    }
+                }
+
+                // 2. Randomly pick ~50% of candidates
+                std::shuffle(retain_cands.begin(), retain_cands.end(), rand_rng);
+                int n_retain = (int)(retain_cands.size() * (0.3 + 0.4 * (rand_rng() % 1000) / 1000.0));
+                retain_cands.resize(std::min(n_retain, (int)retain_cands.size()));
+
+                // Build adjacency preferences: prod_group → cons_group for each retained tensor
+                // Map: for each group, which retained tensors want to enter it from which predecessor?
+                // wants_from[cons_group] = set of (prod_group, tensor) pairs
+                std::map<size_t, std::vector<std::pair<size_t, size_t>>> wants_from;
+                for (auto& rc : retain_cands)
+                    wants_from[rc.cons_group].push_back({rc.prod_group, rc.tensor});
+
+                // 3. Greedy topological sort: prefer groups that receive retained tensors
+                //    from the just-scheduled group
+                size_t n_groups = gd.size();
+                std::vector<int> in_deg = gd.in_deg;
+                std::vector<bool> scheduled(n_groups, false);
+                std::vector<size_t> order;
+                order.reserve(n_groups);
+                size_t last_group = SIZE_MAX;
+
+                while (order.size() < n_groups) {
+                    // Collect ready groups (in_deg == 0 and not scheduled)
+                    std::vector<size_t> ready;
+                    for (size_t i = 0; i < n_groups; i++)
+                        if (!scheduled[i] && in_deg[i] == 0)
+                            ready.push_back(i);
+                    if (ready.empty()) break; // shouldn't happen if DAG is valid
+
+                    // Score each ready group: how many retained tensors enter from last_group?
+                    size_t best = ready[0];
+                    int best_score = -1;
+                    for (auto gi : ready) {
+                        int score = 0;
+                        if (last_group != SIZE_MAX) {
+                            auto it = wants_from.find(gi);
+                            if (it != wants_from.end())
+                                for (auto& [pg, t] : it->second)
+                                    if (pg == last_group) score++;
+                        }
+                        if (score > best_score || (score == best_score && rand_rng() % 2)) {
+                            best_score = score;
+                            best = gi;
+                        }
+                    }
+
+                    order.push_back(best);
+                    scheduled[best] = true;
+                    last_group = best;
+                    for (auto succ : gd.succs[best])
+                        in_deg[succ]--;
+                }
+
+                // 4. Build steps with retain decisions based on adjacency
+                std::vector<ScheduleStep> rand_steps;
+                for (auto idx : order)
+                    rand_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
+
+                // Map group_index → step_position for quick lookup
+                std::vector<size_t> group_to_step(n_groups, SIZE_MAX);
+                for (size_t i = 0; i < order.size(); i++)
+                    group_to_step[order[i]] = i;
+
+                // For each retained tensor: if producer and consumer are adjacent, retain it
+                for (auto& rc : retain_cands) {
+                    size_t sp = group_to_step[rc.prod_group];
+                    size_t sc = group_to_step[rc.cons_group];
+                    if (sp != SIZE_MAX && sc == sp + 1)
+                        rand_steps[sp].retain_these.insert(rc.tensor);
+                }
+
+                // 5. Forward pass: verify feasibility and set configs
+                std::set<size_t> rand_entering;
+                for (size_t i = 0; i < rand_steps.size(); i++) {
+                    auto& si = rand_steps[i];
+                    auto cost = si.subgraph.best_cost(rand_entering, si.retain_these);
+                    if (!cost.feasible) {
+                        // Drop retains one by one until feasible
+                        auto ret = si.retain_these;
+                        std::vector<size_t> ret_vec(ret.begin(), ret.end());
+                        std::shuffle(ret_vec.begin(), ret_vec.end(), rand_rng);
+                        for (auto t : ret_vec) {
+                            ret.erase(t);
+                            cost = si.subgraph.best_cost(rand_entering, ret);
+                            if (cost.feasible) break;
+                        }
+                        if (!cost.feasible) { ret.clear(); cost = si.subgraph.best_cost(rand_entering, {}); }
+                        if (!cost.feasible) { rand_entering.clear(); ret.clear(); cost = si.subgraph.best_cost({}, {}); }
+                        si.retain_these = ret;
+                    }
+                    si.config = cost.config;
+                    rand_entering = si.retain_these;
+                }
+                Solution rand_sol(prob, dag, std::move(rand_steps));
+
                 {
                     std::lock_guard<std::mutex> lock(sol_mutex);
                     if (dfs_sol.validate().valid)
                         solution_pool.push_back(std::move(dfs_sol));
                     if (beam_sol.validate().valid)
                         solution_pool.push_back(std::move(beam_sol));
+                    if (rand_sol.validate().valid)
+                        solution_pool.push_back(std::move(rand_sol));
                 }
             }
         };

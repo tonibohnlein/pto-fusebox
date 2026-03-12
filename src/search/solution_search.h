@@ -85,3 +85,8 @@ Solution solution_evo_search(const Problem& prob, const DAG& dag,
 std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
                                          const std::vector<ScheduleStep>& steps,
                                          std::mt19937& rng, int n_moves = 0);
+
+// One-time feasibility check: which tensors can actually be retained?
+// Depends only on Problem + DAG, not on the current solution.
+// For each tensor: checks singleton producer/consumer subgraphs have feasible tiling with retain.
+std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag);

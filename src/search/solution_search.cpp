@@ -255,7 +255,7 @@ struct SolState {
 // One-time feasibility check: which tensors can actually be retained?
 // Depends only on Problem + DAG, not on the current solution.
 // ============================================================================
-static std::set<size_t> compute_feasibly_retainable(const Problem &prob, const DAG &dag) {
+std::set<size_t> compute_feasibly_retainable(const Problem &prob, const DAG &dag) {
     std::set<size_t> result;
     for (auto t : prob.retainable_tensors) {
         if (prob.tensors[t].size() > prob.fast_memory_capacity)
@@ -1369,19 +1369,19 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     result.moves_applied++;
     state.rebuild_from(lo);
 
-    // if (g_verbose) {
-    //   auto &m = *m_opt;
-    //   std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
-    //             << " step=" << m.step_a;
-    //   if (m.op != SIZE_MAX)
-    //     std::cerr << " op=" << m.op;
-    //   if (m.tensor != SIZE_MAX)
-    //     std::cerr << " t=" << m.tensor;
-    //   std::cerr << " saving=" << m.saving << " total=" << state.total
-    //             << " active=" << active.entries.size()
-    //             << " locked_ops=" << active.locked_ops.size()
-    //             << " locked_t=" << active.locked_tensors.size() << "\n";
-    // }
+    if (g_verbose) {
+      auto &m = *m_opt;
+      std::cerr << "      [pass] iter=" << iter << " " << move_names[m.type]
+                << " step=" << m.step_a;
+      if (m.op != SIZE_MAX)
+        std::cerr << " op=" << m.op;
+      if (m.tensor != SIZE_MAX)
+        std::cerr << " t=" << m.tensor;
+      std::cerr << " saving=" << m.saving << " total=" << state.total
+                << " active=" << active.entries.size()
+                << " locked_ops=" << active.locked_ops.size()
+                << " locked_t=" << active.locked_tensors.size() << "\n";
+    }
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
@@ -1477,6 +1477,68 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   result.end_steps = state.steps;
   result.end_cost = state.total;
   return result;
+}
+
+// ============================================================================
+// Solution FM outer loop: multiple passes with fresh seeds
+// Each pass explores a different neighborhood. Best-seen is tracked globally.
+// Stops after max_no_improve_passes consecutive passes without improvement.
+// ============================================================================
+
+static SolutionFMPassResult solution_fm_outer(const Problem &prob, const DAG &dag,
+                                               std::vector<ScheduleStep> steps,
+                                               const SolutionFMPassConfig &base_cfg,
+                                               const std::set<size_t> *fr,
+                                               int max_passes = 0,
+                                               int max_no_improve_passes = 0) {
+  if (max_passes <= 0) max_passes = 20;
+  if (max_no_improve_passes <= 0) max_no_improve_passes = 5;
+
+  SolutionFMPassResult best;
+  best.start_cost = Solution(prob, dag, steps).total_latency();
+  best.best_cost = best.start_cost;
+  best.best_steps = steps;
+  best.end_steps = steps;
+  best.end_cost = best.start_cost;
+
+  std::mt19937 seed_rng(base_cfg.seed);
+  int no_improve_passes = 0;
+
+  for (int pass = 0; pass < max_passes; pass++) {
+    if (Clock::now() >= base_cfg.deadline) break;
+    if (no_improve_passes >= max_no_improve_passes) break;
+
+    SolutionFMPassConfig pc = base_cfg;
+    pc.seed = (unsigned)(seed_rng());
+
+    // Inner FM pass: seed → lock-based exploration → drift → stop
+    auto pr = solution_fm_pass(prob, dag, best.best_steps, pc, fr);
+    best.moves_applied += pr.moves_applied;
+
+    // Greedy descent on end state: no locking, only improving moves.
+    // The FM pass may have drifted to a worse state that has a different
+    // local basin — greedy descent finds the bottom of that basin.
+    if (pr.moves_applied > 0 && Clock::now() < base_cfg.deadline) {
+      auto descended = solution_greedy_descent(prob, dag,
+          std::move(pr.end_steps), base_cfg.deadline, fr);
+      Solution desc_sol(prob, dag, descended);
+      if (desc_sol.total_latency() < pr.best_cost - 0.01) {
+        pr.best_cost = desc_sol.total_latency();
+        pr.best_steps = std::move(descended);
+      }
+    }
+
+    if (pr.best_cost < best.best_cost - 0.01) {
+      best.best_cost = pr.best_cost;
+      best.best_steps = std::move(pr.best_steps);
+      no_improve_passes = 0;
+    } else {
+      no_improve_passes++;
+    }
+    best.end_steps = pr.end_steps;
+    best.end_cost = pr.end_cost;
+  }
+  return best;
 }
 
 // ============================================================================
@@ -2005,7 +2067,6 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
                 double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
                 double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
-                int eff_no_improve = std::max(30, (int)(cfg.pass_config.max_no_improve * temp * heat));
 
                 // Pick a parent from pool (uniform random — pool diversity
                 // is maintained by the insertion policy, not selection bias)
@@ -2043,19 +2104,20 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     improved = true;
                 }
 
-                // --- Polish: FM pass with temperature-controlled parameters ---
+                // --- Polish: FM outer loop (multiple passes with fresh seeds) ---
                 if (Clock::now() < cfg.deadline) {
                     SolutionFMPassConfig pc = cfg.pass_config;
                     pc.seed = (unsigned)(rng());
                     pc.deadline = cfg.deadline;
                     pc.floor_fraction = eff_floor;
                     pc.max_drift_fraction = eff_drift;
-                    pc.max_no_improve = eff_no_improve;
-                    // Scale seeding depth to problem size: more steps → more seeds
-                    int num_steps = (int)child_sol.num_steps();
-                    pc.init_count = std::max(3, num_steps / 3);
 
-                    auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc, &fr);
+                    // Outer loop: more passes early (temp high), fewer late (temp low)
+                    int max_passes = std::max(3, (int)(10 * temp * heat));
+                    int max_no_imp_passes = std::max(2, (int)(4 * temp * heat));
+
+                    auto pr = solution_fm_outer(prob, dag, child_sol.steps(), pc, &fr,
+                                                max_passes, max_no_imp_passes);
                     total_fm_passes++;
 
                     if (pr.best_cost < child_cost - 0.01) {
@@ -2065,19 +2127,6 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                         pool_insert(fm_sol.steps(), fm_sol.total_latency());
                         if (fm_sol.total_latency() < thread_best_cost - 0.01) {
                             thread_best_cost = fm_sol.total_latency();
-                            improved = true;
-                        }
-                    }
-
-                    // Also try greedy descent on end state
-                    if (pr.moves_applied > 0 && Clock::now() < cfg.deadline) {
-                        auto kicked = solution_greedy_descent(prob, dag,
-                            std::move(pr.end_steps), cfg.deadline, &fr);
-                        Solution kicked_sol(prob, dag, kicked);
-                        kicked_sol = optimize_retain(prob, dag, std::move(kicked_sol));
-                        pool_insert(kicked_sol.steps(), kicked_sol.total_latency());
-                        if (kicked_sol.total_latency() < thread_best_cost - 0.01) {
-                            thread_best_cost = kicked_sol.total_latency();
                             improved = true;
                         }
                     }
