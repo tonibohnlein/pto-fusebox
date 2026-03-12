@@ -166,11 +166,25 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     int tasks_per_strategy = std::max(1, num_threads / num_strategies);
     int gen0_tasks = num_strategies * tasks_per_strategy;
 
+    // If we still have spare threads, fill with extra random inits
+    // (random strategy produces different results each call)
+    int random_idx = -1;
+    for (int s = 0; s < num_strategies; s++)
+        if (strategies[s].name == "random") { random_idx = s; break; }
+
     struct Gen0Task { int strategy_idx; unsigned seed; };
     std::vector<Gen0Task> gen0_task_list;
     for (int s = 0; s < num_strategies; s++)
         for (int t = 0; t < tasks_per_strategy; t++)
             gen0_task_list.push_back({s, (unsigned)(42 + s * 100 + t * 7)});
+
+    // Pad up to num_threads with random inits
+    if (random_idx >= 0) {
+        int extra = num_threads - (int)gen0_task_list.size();
+        for (int i = 0; i < extra; i++)
+            gen0_task_list.push_back({random_idx,
+                (unsigned)(9999 + i * 31)});
+    }
     gen0_tasks = (int)gen0_task_list.size();
 
     std::vector<PoolEntry> gen0_results(gen0_tasks);

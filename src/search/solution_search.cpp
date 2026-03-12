@@ -1882,24 +1882,8 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     std::mutex pool_mutex;
     double global_best_cost = 1e18;
 
-    // Initialize pool from input solutions
-    for (auto& sol : init_pool) {
-        pool.push_back({sol.steps(), sol.total_latency()});
-        global_best_cost = std::min(global_best_cost, sol.total_latency());
-    }
-    // Sort pool by cost
-    std::sort(pool.begin(), pool.end(),
-              [](const SolPoolEntry& a, const SolPoolEntry& b) { return a.cost < b.cost; });
-    if (pool.size() > MAX_POOL) pool.resize(MAX_POOL);
-
-    double starting_best = global_best_cost;
-
-    // One-time feasibility check: depends only on Problem + DAG
-    auto fr = compute_feasibly_retainable(prob, dag);
-    std::cerr << "  Feasibly retainable: " << fr.size()
-              << "/" << prob.retainable_tensors.size() << " tensors\n";
-
-    // Pool insert with diversity
+    // Pool insert is defined before initialization so we can use it
+    // for diversity-aware seeding too.
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
         std::lock_guard<std::mutex> lock(pool_mutex);
 
@@ -1933,20 +1917,15 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
         }
 
         // Pool full: diversity-aware eviction.
-        // Never evict the best entry (index 0 after sort, but pool may not be sorted).
-        // Find pool entry with smallest min-distance to its nearest neighbor
-        // (the least-unique entry). Replace it if:
-        //   (a) candidate is more diverse (larger min_dist), OR
-        //   (b) candidate has better cost AND reasonable diversity
         size_t best_cost_idx = 0;
         for (size_t i = 1; i < pool.size(); i++)
             if (pool[i].cost < pool[best_cost_idx].cost) best_cost_idx = i;
 
-        // Find the least-unique entry (smallest min-neighbor-distance), excluding best
+        // Find the least-unique entry (smallest nearest-neighbor distance), excluding best
         size_t least_unique = SIZE_MAX;
         double least_unique_dist = 2.0;
         for (size_t i = 0; i < pool.size(); i++) {
-            if (i == best_cost_idx) continue; // protect the best
+            if (i == best_cost_idx) continue;
             double nn_dist = 1.0;
             for (size_t j = 0; j < pool.size(); j++) {
                 if (i == j) continue;
@@ -1961,8 +1940,6 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
 
         if (least_unique == SIZE_MAX) return false;
 
-        // Replace the least-unique entry if candidate brings more diversity
-        // or has better cost with at least some diversity
         bool more_diverse = (min_dist > least_unique_dist + 0.01);
         bool better_cost = (cost < pool[least_unique].cost - 0.01);
         bool decent_diversity = (min_dist > 0.02);
@@ -1975,6 +1952,25 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
         return false;
     };
 
+    // Initialize pool from input solutions — diversity-filtered
+    // Sort by cost first so the best entry enters first and is protected
+    std::sort(init_pool.begin(), init_pool.end(),
+              [](const Solution& a, const Solution& b) {
+                  return a.total_latency() < b.total_latency();
+              });
+    for (auto& sol : init_pool)
+        pool_insert(sol.steps(), sol.total_latency());
+
+    double starting_best = global_best_cost;
+
+    // One-time feasibility check: depends only on Problem + DAG
+    auto fr = compute_feasibly_retainable(prob, dag);
+    std::cerr << "  Feasibly retainable: " << fr.size()
+              << "/" << prob.retainable_tensors.size() << " tensors\n";
+
+    std::cerr << "  Init pool: " << pool.size() << " diverse entries from "
+              << init_pool.size() << " candidates\n";
+
     // --- Stats ---
     std::atomic<int> total_mutations{0}, total_fm_passes{0};
     std::atomic<int> total_improvements{0}, total_fm_improvements{0};
@@ -1985,6 +1981,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     for (int t = 0; t < num_threads; t++) {
         threads.emplace_back([&, t]() {
             std::mt19937 rng(cfg.pass_config.seed + t * 997);
+            auto thread_start = Clock::now();
             int local_gen = 0;
             int local_no_improve = 0;
             double heat = 1.0;
@@ -2001,8 +1998,10 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 local_gen++;
                 total_generations++;
 
-                // --- Temperature: cosine annealing × heat ---
-                double progress = std::min(1.0, (double)local_gen / 200.0);
+                // --- Temperature: cosine annealing based on wall-clock progress ---
+                auto elapsed = std::chrono::duration<double>(Clock::now() - thread_start).count();
+                auto budget = std::chrono::duration<double>(cfg.deadline - thread_start).count();
+                double progress = std::clamp(elapsed / std::max(budget, 0.1), 0.0, 1.0);
                 double temp = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
                 double eff_floor = std::clamp(base_floor * temp * heat, 0.02, 1.0);
                 double eff_drift = std::clamp(base_drift * temp * heat, 0.05, 2.0);
@@ -2052,6 +2051,9 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     pc.floor_fraction = eff_floor;
                     pc.max_drift_fraction = eff_drift;
                     pc.max_no_improve = eff_no_improve;
+                    // Scale seeding depth to problem size: more steps → more seeds
+                    int num_steps = (int)child_sol.num_steps();
+                    pc.init_count = std::max(3, num_steps / 3);
 
                     auto pr = solution_fm_pass(prob, dag, child_sol.steps(), pc, &fr);
                     total_fm_passes++;
