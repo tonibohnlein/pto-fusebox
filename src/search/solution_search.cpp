@@ -2388,12 +2388,15 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
               << total_improvements.load() << " improving), "
               << total_fm_passes.load() << " FM passes ("
               << total_fm_improvements.load() << " improving)";
-    if (pool[0].cost < starting_best - 0.01) {
+    if (!pool.empty() && pool[0].cost < starting_best - 0.01) {
         std::cerr << ", improved " << starting_best << " → " << pool[0].cost
                   << " (-" << std::fixed << std::setprecision(2)
                   << 100.0 * (starting_best - pool[0].cost) / starting_best << "%)";
     }
     std::cerr << ", pool=" << pool.size() << " entries\n";
 
+    if (pool.empty()) return init_pool.empty()
+        ? Solution(prob, dag, {})
+        : Solution(prob, dag, init_pool[0].steps());
     return Solution(prob, dag, std::move(pool[0].steps));
 }

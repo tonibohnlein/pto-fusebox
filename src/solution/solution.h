@@ -3,79 +3,77 @@
 #include "core/types.h"
 #include "core/dag.h"
 #include "core/subgraph.h"
+#include "solution/ordering.h"
 #include <set>
 #include <string>
 #include <vector>
+
+// Forward declaration — avoids pulling all of partition.h into every translation
+// unit that includes solution.h.
+struct Partition;
 
 // ============================================================================
 // ScheduleStep: a subgraph with its chosen tile configuration and retain set
 // ============================================================================
 
 struct ScheduleStep {
-    Subgraph subgraph;
-    TileConfig config;
-    std::set<size_t> retain_these;  // tensors to keep in fast memory after this step
+    Subgraph         subgraph;
+    TileConfig       config;
+    std::set<size_t> retain_these;
 };
 
 // ============================================================================
 // Solution: an ordered sequence of ScheduleSteps covering the DAG.
-//
-// Feasibility criteria:
-//   1. Coverage: every op in the DAG appears in at least one subgraph
-//   2. Per-subgraph: connected, valid boundary outputs (enforced by Subgraph::create)
-//   3. Tile feasibility: working set fits in fast memory (including retained)
-//   4. Topological order: if step j depends on step i, then i < j
-//   5. Retain validity: retained tensors are boundary tensors of the step
 // ============================================================================
 
 class Solution {
 public:
-    // --- Construction ---
-
-    // Build from an ordered list of steps. Evaluates costs accounting for
-    // inter-step retained tensors.
+    // --- Construction from raw steps (used by solution_search) ---
     Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep> steps);
+
+    // --- Construction from a Partition ---
+    //
+    // Takes ownership of the partition, calls finalize() to re-populate Group::sg
+    // and the group-level DAG (stale after Phase 1 search mutations), then runs
+    // DFS and beam search ordering and returns the lower-latency result.
+    static Solution from_partition(const Problem& prob, const DAG& dag,
+                                   Partition part);
+
+    // Lower-level: build ScheduleSteps from a pre-computed OrderingResult.
+    // Performs per-step feasibility fallback (drop retains until feasible).
+    // Exposed for callers (e.g. solver.cpp random variant) that compute their
+    // own ordering.
+    static std::vector<ScheduleStep> steps_from_ordering(
+        const Problem& prob, const DAG& dag,
+        const Partition& part,
+        const OrderingResult& res);
 
     // --- Validation ---
 
     struct ValidationResult {
-        bool valid = true;
-        std::string error;         // first error found (empty if valid)
+        bool        valid = true;
+        std::string error;
     };
 
     ValidationResult validate() const;
 
     // --- Cost ---
 
-    double total_latency() const { return total_latency_; }
-    double step_latency(size_t i) const { return step_costs_[i].latency; }
-    const CostResult& step_cost(size_t i) const { return step_costs_[i]; }
+    double            total_latency()  const { return total_latency_; }
+    double            step_latency(size_t i) const { return step_costs_[i].latency; }
+    const CostResult& step_cost(size_t i)    const { return step_costs_[i]; }
 
     // --- Accessors ---
 
-    const Problem& problem() const { return *prob_; }
-    const DAG& dag() const { return *dag_; }
-    size_t num_steps() const { return steps_.size(); }
-    const ScheduleStep& step(size_t i) const { return steps_[i]; }
-    const std::vector<ScheduleStep>& steps() const { return steps_; }
-
-    // What's retained entering step i (computed from step i-1's retain set)
-    const std::set<size_t>& retained_entering(size_t i) const { return retained_entering_[i]; }
+    const Problem&                   problem()           const { return *prob_; }
+    const DAG&                       dag()               const { return *dag_; }
+    size_t                           num_steps()         const { return steps_.size(); }
+    const ScheduleStep&              step(size_t i)      const { return steps_[i]; }
+    const std::vector<ScheduleStep>& steps()             const { return steps_; }
+    const std::set<size_t>&          retained_entering(size_t i) const { return retained_entering_[i]; }
 
     // --- Ephemeral gap check (solution-level) ---
 
-    // Check if proposed_ops for a step would create an ephemeral gap:
-    // a tensor that is ephemeral in the proposed set (produced+consumed
-    // internally) but has an external consumer in another step whose step
-    // does NOT contain the producer (no recomputation path), and no other
-    // step writes T as a boundary output.
-    //
-    // Only moves that ADD ops to a step can create gaps:
-    //   MERGE, STEAL (target), RECOMPUTE.
-    // EJECT/SPLIT/RETAIN moves cannot create gaps.
-    //
-    // exclude_step / exclude_step2: steps being modified (skip when
-    // checking availability — they're being replaced by proposed_ops).
     static bool creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                        const std::set<size_t>& proposed_ops,
                                        const std::vector<ScheduleStep>& steps,
@@ -83,12 +81,10 @@ public:
                                        size_t exclude_step2 = SIZE_MAX);
 
 private:
-    const Problem* prob_;
-    const DAG* dag_;
+    const Problem*           prob_;
+    const DAG*               dag_;
     std::vector<ScheduleStep> steps_;
-
-    // Computed at construction
-    std::vector<CostResult> step_costs_;
-    std::vector<std::set<size_t>> retained_entering_;  // per step
-    double total_latency_ = 0;
+    std::vector<CostResult>  step_costs_;
+    std::vector<std::set<size_t>> retained_entering_;
+    double                   total_latency_ = 0;
 };

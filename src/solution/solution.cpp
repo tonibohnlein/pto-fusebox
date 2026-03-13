@@ -1,4 +1,6 @@
 #include "solution/solution.h"
+#include "partition/partition.h"
+#include <algorithm>
 #include <sstream>
 
 // ============================================================================
@@ -22,9 +24,101 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
             currently_retained,
             steps_[i].retain_these);
 
-        total_latency_ += step_costs_[i].latency;
+        total_latency_   += step_costs_[i].latency;
         currently_retained = steps_[i].retain_these;
     }
+}
+
+// ============================================================================
+// steps_from_ordering
+//
+// Converts an OrderingResult into concrete ScheduleSteps.
+// For each group in the ordering:
+//   1. Build the intended retain_these (filter: only tensors needed by the
+//      immediately following step are actually retained).
+//   2. Call best_cost with the current entering set and retain_these.
+//   3. If infeasible, progressively fall back:
+//        a. Clear retain_these, try again with entering.
+//        b. Clear entering too, use the cached no-retention baseline.
+// ============================================================================
+
+std::vector<ScheduleStep> Solution::steps_from_ordering(
+        const Problem& /*prob*/, const DAG& /*dag*/,
+        const Partition& part,
+        const OrderingResult& res) {
+
+    std::vector<ScheduleStep> steps;
+    steps.reserve(res.order.size());
+    std::set<size_t> entering;
+
+    for (size_t i = 0; i < res.order.size(); i++) {
+        size_t gi = res.order[i];
+        const Partition::Group& g = part.groups[gi];
+        if (!g.sg) continue;
+        const Subgraph& sg = *g.sg;
+
+        // Build retain_these: only keep tensors the next step will actually read
+        std::set<size_t> retain_these;
+        if (i + 1 < res.order.size() && i < res.retain_per_step.size()) {
+            size_t next_gi = res.order[i + 1];
+            if (part.groups[next_gi].sg) {
+                const auto& next_inputs = part.groups[next_gi].sg->boundary_inputs();
+                for (auto t : res.retain_per_step[i])
+                    if (next_inputs.count(t)) retain_these.insert(t);
+            }
+        }
+
+        // Attempt 1: full retention context
+        auto cost = sg.best_cost(entering, retain_these);
+
+        // Attempt 2: drop retain_these, keep entering
+        if (!cost.feasible) {
+            retain_these.clear();
+            cost = sg.best_cost(entering, {});
+        }
+
+        // Attempt 3: clear everything, use cached no-retain baseline
+        if (!cost.feasible) {
+            entering.clear();
+            retain_these.clear();
+            // Use the stored baseline to avoid a full best_cost() enumeration
+            cost.feasible = (g.cost < 1e17);
+            cost.latency  = g.cost;
+            cost.config   = g.best_cfg;
+        }
+
+        steps.push_back({Subgraph(sg), cost.config, retain_these});
+        entering = retain_these;
+    }
+
+    return steps;
+}
+
+// ============================================================================
+// from_partition
+//
+// Runs DFS and beam search, builds a Solution from each, returns the better.
+// ============================================================================
+
+Solution Solution::from_partition(const Problem& prob, const DAG& dag,
+                                   Partition part) {
+    // Re-populate Group::sg / best_cfg and rebuild the group-level DAG.
+    // Phase 1 search mutates ops/costs but never touches these fields.
+    part.finalize();
+
+    auto dfs_res  = dfs_ordering(part);
+    int  bw       = std::min(20, std::max(5, (int)part.num_alive()));
+    auto beam_res = beam_search_ordering(part, bw);
+
+    auto dfs_steps  = steps_from_ordering(prob, dag, part, dfs_res);
+    auto beam_steps = steps_from_ordering(prob, dag, part, beam_res);
+
+    Solution dfs_sol (prob, dag, std::move(dfs_steps));
+    Solution beam_sol(prob, dag, std::move(beam_steps));
+
+    return (beam_sol.total_latency() < dfs_sol.total_latency() - 0.01)
+           ? std::move(beam_sol)
+           : std::move(dfs_sol);
 }
 
 // ============================================================================
@@ -33,106 +127,67 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
 
 Solution::ValidationResult Solution::validate() const {
     ValidationResult vr;
-    auto fail = [&](const std::string& msg) {
-        vr.valid = false;
-        vr.error = msg;
-    };
+    auto fail = [&](const std::string& msg) { vr.valid = false; vr.error = msg; };
 
-    // 1. Non-empty
-    if (steps_.empty()) {
-        fail("Solution has no steps");
-        return vr;
-    }
+    if (steps_.empty()) { fail("Solution has no steps"); return vr; }
 
-    // 2. Coverage: every op appears in at least one subgraph
-    std::set<size_t> covered_ops;
+    // Coverage
+    std::set<size_t> covered;
     for (auto& step : steps_)
-        for (auto op : step.subgraph.ops())
-            covered_ops.insert(op);
+        for (auto op : step.subgraph.ops()) covered.insert(op);
+    for (size_t i = 0; i < prob_->num_ops(); i++)
+        if (!covered.count(i)) { fail("Op " + std::to_string(i) + " not covered"); return vr; }
 
-    for (size_t i = 0; i < prob_->num_ops(); i++) {
-        if (!covered_ops.count(i)) {
-            fail("Op " + std::to_string(i) + " not covered by any subgraph");
+    // Per-subgraph feasibility
+    for (size_t i = 0; i < steps_.size(); i++)
+        if (!steps_[i].subgraph.is_feasible(steps_[i].config,
+                                             retained_entering_[i],
+                                             steps_[i].retain_these)) {
+            fail("Step " + std::to_string(i) + ": working set exceeds fast memory");
             return vr;
         }
-    }
 
-    // 3. Per-subgraph: check tile feasibility with retained tensors.
-    //    (Connectivity and boundary output validity are enforced by Subgraph::create.)
+    // Topological order
+    std::set<size_t> available(dag_->graph_inputs.begin(), dag_->graph_inputs.end());
     for (size_t i = 0; i < steps_.size(); i++) {
-        const auto& step = steps_[i];
-        if (!step.subgraph.is_feasible(step.config,
-                                       retained_entering_[i],
-                                       step.retain_these)) {
-            fail("Step " + std::to_string(i) + ": tile config infeasible "
-                 "(working set exceeds fast memory)");
-            return vr;
-        }
-    }
-
-    // 4. Topological order: for each step, all boundary input tensors must
-    //    have been produced by an earlier step or be graph inputs.
-    std::set<size_t> available_tensors;
-    for (auto t : dag_->graph_inputs)
-        available_tensors.insert(t);
-
-    for (size_t i = 0; i < steps_.size(); i++) {
-        const auto& sg = steps_[i].subgraph;
-
-        for (auto t : sg.boundary_inputs()) {
-            if (!available_tensors.count(t)) {
-                fail("Step " + std::to_string(i) + ": boundary input tensor "
+        for (auto t : steps_[i].subgraph.boundary_inputs())
+            if (!available.count(t)) {
+                fail("Step " + std::to_string(i) + ": boundary input T"
                      + std::to_string(t) + " not yet produced");
                 return vr;
             }
-        }
-
-        // All output tensors of all ops in this step become available
-        for (auto op_idx : sg.ops())
-            for (auto t : prob_->ops[op_idx].outputs)
-                available_tensors.insert(t);
+        for (auto op : steps_[i].subgraph.ops())
+            for (auto t : prob_->ops[op].outputs) available.insert(t);
     }
 
-    // 5. Retain validity: retained tensors must be boundary tensors of the step
+    // Retain validity
     for (size_t i = 0; i < steps_.size(); i++) {
-        const auto& step = steps_[i];
-        const auto& sg = step.subgraph;
-        for (auto t : step.retain_these) {
-            bool is_boundary_in = sg.boundary_inputs().count(t);
-            bool is_boundary_out = sg.boundary_outputs().count(t);
-            if (!is_boundary_in && !is_boundary_out) {
-                fail("Step " + std::to_string(i) + ": retained tensor "
+        const auto& sg = steps_[i].subgraph;
+        for (auto t : steps_[i].retain_these)
+            if (!sg.boundary_inputs().count(t) && !sg.boundary_outputs().count(t)) {
+                fail("Step " + std::to_string(i) + ": retained T"
                      + std::to_string(t) + " is not a boundary tensor");
                 return vr;
             }
-        }
     }
 
-    // 6. Check that computed costs are feasible
-    for (size_t i = 0; i < steps_.size(); i++) {
+    // Cost feasibility
+    for (size_t i = 0; i < steps_.size(); i++)
         if (!step_costs_[i].feasible) {
-            fail("Step " + std::to_string(i) + ": cost evaluation returned infeasible");
+            fail("Step " + std::to_string(i) + ": cost evaluation infeasible");
             return vr;
         }
-    }
 
-    // 7. Check for ephemeral gaps: no step should need a tensor that's
-    //    ephemeral in its producing step without a recomputation path
+    // Ephemeral gap check
     for (size_t si = 0; si < steps_.size(); si++) {
         for (auto t : steps_[si].subgraph.boundary_inputs()) {
-            // Is T available from slow memory?
-            if (dag_->tensor_producer[t] < 0) continue;  // graph input, always available
+            if (dag_->tensor_producer[t] < 0) continue;
             bool found = false;
-            for (size_t sj = 0; sj < steps_.size(); sj++) {
-                if (steps_[sj].subgraph.boundary_outputs().count(t)) {
-                    found = true;
-                    break;
-                }
-            }
+            for (size_t sj = 0; sj < steps_.size(); sj++)
+                if (steps_[sj].subgraph.boundary_outputs().count(t)) { found = true; break; }
             if (!found) {
-                fail("Step " + std::to_string(si) + ": boundary input T" +
-                     std::to_string(t) + " is not available from slow memory "
-                     "(ephemeral in producing step, no recomputation)");
+                fail("Step " + std::to_string(si) + ": T" + std::to_string(t)
+                     + " not available from slow memory (ephemeral gap)");
                 return vr;
             }
         }
@@ -142,7 +197,7 @@ Solution::ValidationResult Solution::validate() const {
 }
 
 // ============================================================================
-// Ephemeral gap check for solution-level moves
+// Ephemeral gap check (solution-level)
 // ============================================================================
 
 bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
@@ -150,43 +205,33 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                       const std::vector<ScheduleStep>& steps,
                                       size_t exclude_step,
                                       size_t exclude_step2) {
-    // Find tensors that would be ephemeral in proposed_ops
     for (auto op : proposed_ops) {
         for (auto t : prob.ops[op].outputs) {
-            // Is T consumed internally?
             bool consumed_internally = false;
             for (auto cop : dag.tensor_consumers[t])
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
-            // T would be ephemeral. Check external consumers.
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 
-            // Is T available as boundary output from another step?
             bool available = false;
             for (size_t si = 0; si < steps.size(); si++) {
                 if (si == exclude_step || si == exclude_step2) continue;
-                if (steps[si].subgraph.boundary_outputs().count(t)) {
-                    available = true;
-                    break;
-                }
+                if (steps[si].subgraph.boundary_outputs().count(t)) { available = true; break; }
             }
             if (available) continue;
 
-            // Check each external consumer's step for recomputation
             for (auto cop : dag.tensor_consumers[t]) {
                 if (proposed_ops.count(cop)) continue;
                 for (size_t si = 0; si < steps.size(); si++) {
                     if (si == exclude_step || si == exclude_step2) continue;
-                    bool in_step = false;
-                    for (auto o : steps[si].subgraph.ops())
-                        if (o == cop) { in_step = true; break; }
-                    if (!in_step) continue;
-                    bool has_prod = false;
-                    for (auto o : steps[si].subgraph.ops())
-                        if (o == (size_t)prod_op) { has_prod = true; break; }
-                    if (!has_prod) return true;  // GAP
+                    bool in_step = false, has_prod = false;
+                    for (auto o : steps[si].subgraph.ops()) {
+                        if (o == cop)              in_step  = true;
+                        if (o == (size_t)prod_op)  has_prod = true;
+                    }
+                    if (in_step && !has_prod) return true;
                 }
             }
         }

@@ -2,8 +2,43 @@
 #include "core/cost_cache.h"
 
 // ============================================================================
-// Index maintenance
+// finalize()
 // ============================================================================
+
+void Partition::finalize() {
+    // Re-populate Group::sg and Group::best_cfg for every alive group.
+    // Phase 1 search mutates ops/cost but never touches these fields — they
+    // are only needed when converting a Partition to a Solution via ordering.
+    //
+    // We intentionally do NOT use CostCache here.  The cache stores only
+    // scalars (doubles) for Phase 1 search performance.  Storing Subgraph
+    // objects in the cache would copy them on every one of the millions of
+    // cache hits during Phase 1, destroying search throughput.
+    // finalize() is called only once per partition in Phase 2 (O(pool *
+    // groups) total calls), so direct Subgraph::create is cheap.
+    for (auto& g : groups) {
+        if (!g.alive) continue;
+        // Always recreate from current ops — never skip based on g.sg.
+        // Phase 1 mutations change ops without clearing g.sg (too expensive
+        // to do at every mutation site), so any cached sg may be stale.
+        // finalize() is called only O(pool) times, so recreation is cheap.
+        g.sg = std::nullopt;
+
+        auto sg_opt = Subgraph::create(*prob, *dag,
+                          std::vector<size_t>(g.ops.begin(), g.ops.end()));
+        if (sg_opt) {
+            auto c = sg_opt->best_cost();
+            if (c.feasible) {
+                g.cost     = c.latency;   // authoritative: may differ from search cost
+                g.best_cfg = c.config;
+            }
+            g.sg = std::move(*sg_opt);
+        }
+    }
+
+    rebuild_index();
+    rebuild_group_dag();
+}
 
 void Partition::rebuild_index() {
     op_to_groups_.assign(prob->num_ops(), {});
@@ -13,6 +48,39 @@ void Partition::rebuild_index() {
                 op_to_groups_[op].push_back(i);
 }
 
+void Partition::rebuild_group_dag() {
+    size_t ng = groups.size();
+    group_preds.assign(ng, {});
+    group_succs.assign(ng, {});
+    group_in_deg.assign(ng, 0);
+    tensor_to_group.clear();
+
+    // Map: boundary output tensor → group index (alive groups only)
+    for (size_t i = 0; i < ng; i++) {
+        if (!groups[i].alive || !groups[i].sg) continue;
+        for (auto t : groups[i].sg->boundary_outputs())
+            tensor_to_group[t] = i;
+    }
+
+    // For each alive group i, for each boundary input tensor t, find which
+    // alive group produces t and add the directed edge producer → i.
+    for (size_t i = 0; i < ng; i++) {
+        if (!groups[i].alive || !groups[i].sg) continue;
+        for (auto t : groups[i].sg->boundary_inputs()) {
+            int prod_op = dag->tensor_producer[t];
+            if (prod_op < 0) continue;  // graph input — no producing group
+            for (auto gj : op_to_groups_[(size_t)prod_op]) {
+                if (!groups[gj].alive || gj == i) continue;
+                if (group_preds[i].insert(gj).second)
+                    group_succs[gj].insert(i);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < ng; i++)
+        group_in_deg[i] = (int)group_preds[i].size();
+}
+
 // ============================================================================
 // Construction
 // ============================================================================
@@ -20,18 +88,23 @@ void Partition::rebuild_index() {
 Partition Partition::trivial(const Problem& prob, const DAG& dag) {
     Partition p;
     p.prob = &prob;
-    p.dag = &dag;
+    p.dag  = &dag;
     p.groups.resize(prob.num_ops());
+
     for (size_t i = 0; i < prob.num_ops(); i++) {
-        p.groups[i].ops = {i};
+        p.groups[i].ops   = {i};
         p.groups[i].alive = true;
         auto sg = Subgraph::create(prob, dag, {i});
         if (sg) {
             auto c = sg->best_cost();
-            p.groups[i].cost = c.feasible ? c.latency : 1e18;
+            p.groups[i].cost     = c.feasible ? c.latency : 1e18;
+            p.groups[i].best_cfg = c.config;
+            p.groups[i].sg       = std::move(*sg);
         }
     }
+
     p.rebuild_index();
+    p.rebuild_group_dag();
     return p;
 }
 
@@ -76,13 +149,18 @@ std::set<size_t> Partition::boundary_neighbors(size_t gi) const {
 
 std::set<size_t> Partition::adjacent_groups(size_t gi) const {
     std::set<size_t> result;
-    auto neighbors = boundary_neighbors(gi);
-    // Use op_to_groups_ index: O(neighbors) instead of O(neighbors × groups)
-    for (auto op : neighbors)
+    for (auto op : boundary_neighbors(gi))
         for (auto gj : op_to_groups_[op])
-            if (gj != gi)
-                result.insert(gj);
+            if (gj != gi) result.insert(gj);
     return result;
+}
+
+bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const {
+    for (size_t i = 0; i < groups.size(); i++) {
+        if (!groups[i].alive || scheduled[i]) continue;
+        if (groups[i].sg && groups[i].sg->boundary_inputs().count(t)) return true;
+    }
+    return false;
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {
@@ -94,14 +172,28 @@ double Partition::eval_set(const std::set<size_t>& ops) const {
     return c.feasible ? c.latency : 1e18;
 }
 
-size_t Partition::add_group(std::set<size_t> ops, double cost) {
+// ============================================================================
+// Mutation
+// ============================================================================
+
+size_t Partition::add_group(std::set<size_t> ops, double cost,
+                             std::optional<Subgraph> sg, TileConfig cfg) {
     size_t idx = groups.size();
-    groups.push_back({std::move(ops), cost, true, 0});
-    // Update index incrementally (avoid full rebuild)
+    Group g;
+    g.ops      = std::move(ops);
+    g.cost     = cost;
+    g.alive    = true;
+    g.gen      = 0;
+    g.best_cfg = cfg;
+    g.sg       = std::move(sg);
+    groups.push_back(std::move(g));
+
+    // Update op_to_groups_ incrementally
     if (op_to_groups_.size() < prob->num_ops())
         op_to_groups_.resize(prob->num_ops());
     for (auto op : groups[idx].ops)
         op_to_groups_[op].push_back(idx);
+
     return idx;
 }
 
@@ -128,33 +220,26 @@ std::vector<size_t> Partition::internal_ops(size_t gi) const {
 }
 
 // ============================================================================
-// Connected components using precomputed op_neighbors
+// Connected components
 // ============================================================================
 
 std::vector<std::set<size_t>> Partition::connected_components(
         const std::set<size_t>& ops) const {
     std::vector<std::set<size_t>> components;
-    // Use a vector<bool> for O(1) visited checks
     std::vector<bool> in_set(prob->num_ops(), false);
     std::vector<bool> visited(prob->num_ops(), false);
     for (auto op : ops) in_set[op] = true;
 
     for (auto seed : ops) {
         if (visited[seed]) continue;
-
         std::set<size_t> comp;
         std::vector<size_t> queue = {seed};
         visited[seed] = true;
-
         while (!queue.empty()) {
             size_t u = queue.back(); queue.pop_back();
             comp.insert(u);
-            for (auto v : dag->op_neighbors[u]) {
-                if (in_set[v] && !visited[v]) {
-                    visited[v] = true;
-                    queue.push_back(v);
-                }
-            }
+            for (auto v : dag->op_neighbors[u])
+                if (in_set[v] && !visited[v]) { visited[v] = true; queue.push_back(v); }
         }
         components.push_back(std::move(comp));
     }
@@ -167,42 +252,31 @@ std::vector<std::set<size_t>> Partition::connected_components(
 
 Partition::EjectResult Partition::eval_eject(size_t op, size_t gi) const {
     EjectResult result;
-
     if (!groups[gi].alive || !groups[gi].ops.count(op)) return result;
     if (groups[gi].ops.size() <= 1) return result;
 
     std::set<size_t> remainder = groups[gi].ops;
     remainder.erase(op);
-
     result.remainder_components = connected_components(remainder);
 
+    double total_remainder = 0;
     result.component_costs.reserve(result.remainder_components.size());
-    double total_remainder_cost = 0;
     for (auto& comp : result.remainder_components) {
-        double cost = eval_set(comp);
-        if (cost >= 1e17) return result;
-        result.component_costs.push_back(cost);
-        total_remainder_cost += cost;
+        double c = eval_set(comp);
+        if (c >= 1e17) return result;
+        result.component_costs.push_back(c);
+        total_remainder += c;
     }
 
-    // Use index to check if op is in other groups
-    bool op_in_other_groups = false;
-    for (auto gj : op_to_groups_[op]) {
-        if (gj != gi) {
-            op_in_other_groups = true;
-            break;
-        }
-    }
+    bool op_in_other = false;
+    for (auto gj : op_to_groups_[op])
+        if (gj != gi) { op_in_other = true; break; }
 
-    if (op_in_other_groups) {
-        result.singleton_cost = 0;
-    } else {
-        result.singleton_cost = eval_set({op});
-        if (result.singleton_cost >= 1e17) return result;
-    }
+    result.singleton_cost = op_in_other ? 0.0 : eval_set({op});
+    if (!op_in_other && result.singleton_cost >= 1e17) return result;
 
     result.feasible = true;
-    result.saving = groups[gi].cost - (total_remainder_cost + result.singleton_cost);
+    result.saving   = groups[gi].cost - (total_remainder + result.singleton_cost);
     return result;
 }
 
@@ -217,8 +291,6 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     if (groups[gi].ops.size() < 3) return result;
 
     const auto& ops = groups[gi].ops;
-
-    // BFS from op_a skipping edge a↔b, using op_neighbors for connectivity
     std::vector<bool> visited(prob->num_ops(), false);
     std::vector<size_t> queue = {op_a};
     visited[op_a] = true;
@@ -232,14 +304,12 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
             queue.push_back(v);
         }
     }
-
     if (visited[op_b]) return result;
 
     for (auto op : ops) {
         if (visited[op]) result.side_a.insert(op);
-        else result.side_b.insert(op);
+        else             result.side_b.insert(op);
     }
-
     if (result.side_a.empty() || result.side_b.empty()) return result;
 
     result.cost_a = eval_set(result.side_a);
@@ -248,7 +318,7 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     if (result.cost_b >= 1e17) return result;
 
     result.feasible = true;
-    result.saving = groups[gi].cost - (result.cost_a + result.cost_b);
+    result.saving   = groups[gi].cost - (result.cost_a + result.cost_b);
     return result;
 }
 
@@ -260,17 +330,15 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
     if (!groups[gi].alive || groups[gi].ops.size() < 3) return {};
 
     std::vector<std::pair<size_t,size_t>> bridges;
-    const auto& ops = groups[gi].ops;
-    size_t nops = prob->num_ops();
+    const auto& ops  = groups[gi].ops;
+    size_t       nops = prob->num_ops();
 
-    std::vector<bool> visited(nops, false);
+    std::vector<bool>   visited(nops, false);
     std::vector<size_t> to_clear;
 
-    // For each DAG edge within the group, check if it's a bridge
     for (auto u : ops) {
         for (auto v : dag->op_succs[u]) {
             if (!ops.count(v)) continue;
-
             for (auto idx : to_clear) visited[idx] = false;
             to_clear.clear();
 
@@ -290,24 +358,14 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
                     queue.push_back(x);
                 }
             }
-
-            if (!found)
-                bridges.push_back({u, v});
+            if (!found) bridges.push_back({u, v});
         }
     }
     return bridges;
 }
 
 // ============================================================================
-// Ephemeral gap check: would this op-set create an unresolvable gap?
-//
-// A tensor T is ephemeral in proposed_ops if it's both produced and consumed
-// internally. If T also has an external consumer whose group does NOT contain
-// T's producer (no recomputation path), this is a gap — the tensor can't be
-// read from slow memory because it was never written there.
-//
-// This mirrors merge_creates_cycle: a partition-level constraint that
-// Subgraph::create can't check on its own.
+// Ephemeral gap check
 // ============================================================================
 
 bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
@@ -317,40 +375,32 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
-            // Is T consumed internally in proposed_ops?
             bool consumed_internally = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
-            // T would be ephemeral. Check external consumers.
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
 
-            // Is T available as boundary output from another group
-            // (excluding the groups being replaced by proposed_ops)?
             bool available_from_other = false;
             for (auto gj : groups_of((size_t)prod_op)) {
                 if (!groups[gj].alive) continue;
                 if (gj == exclude_ga || gj == exclude_gb) continue;
-                bool gj_consumes_t = false;
+                bool gj_consumes = false;
                 for (auto cop : dag->tensor_consumers[t])
-                    if (groups[gj].ops.count(cop)) { gj_consumes_t = true; break; }
-                if (!gj_consumes_t) {
-                    available_from_other = true;
-                    break;
-                }
+                    if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available_from_other = true; break; }
             }
             if (available_from_other) continue;
 
-            // Check each external consumer's group for recomputation
             for (auto cop : dag->tensor_consumers[t]) {
                 if (proposed_ops.count(cop)) continue;
                 for (auto gj : groups_of(cop)) {
                     if (!groups[gj].alive) continue;
                     if (gj == exclude_ga || gj == exclude_gb) continue;
                     if (groups[gj].ops.count((size_t)prod_op)) continue;
-                    return true;  // GAP
+                    return true;
                 }
             }
         }
@@ -376,10 +426,10 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             bool available_from_other = false;
             for (auto gj : groups_of((size_t)prod_op)) {
                 if (!groups[gj].alive || excluded.count(gj)) continue;
-                bool gj_consumes_t = false;
+                bool gj_consumes = false;
                 for (auto cop : dag->tensor_consumers[t])
-                    if (groups[gj].ops.count(cop)) { gj_consumes_t = true; break; }
-                if (!gj_consumes_t) { available_from_other = true; break; }
+                    if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available_from_other = true; break; }
             }
             if (available_from_other) continue;
 

@@ -38,29 +38,31 @@ FMMove best_move_for(const Partition& part, size_t op,
 
             // --- Steal: move op from gx to gy ---
             if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
-                std::set<size_t> new_gx = part.groups[gx].ops;
-                new_gx.erase(op);
+                std::set<size_t> new_gy = part.groups[gy].ops;
+                new_gy.insert(op);
+                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
+                    std::set<size_t> new_gx = part.groups[gx].ops;
+                    new_gx.erase(op);
 
-                // Check remainder validity (may disconnect)
-                double new_gx_cost = 0;
-                bool gx_valid = true;
-                if (new_gx.empty()) {
-                    // gx becomes empty — only valid if op is in other groups
-                    if (groups_of_x.size() <= 1) gx_valid = false;
-                } else {
-                    new_gx_cost = part.eval_set(new_gx);
-                    if (new_gx_cost >= 1e17) gx_valid = false;
-                }
+                    // Check remainder validity (may disconnect)
+                    double new_gx_cost = 0;
+                    bool gx_valid = true;
+                    if (new_gx.empty()) {
+                        // gx becomes empty — only valid if op is in other groups
+                        if (groups_of_x.size() <= 1) gx_valid = false;
+                    } else {
+                        new_gx_cost = part.eval_set(new_gx);
+                        if (new_gx_cost >= 1e17) gx_valid = false;
+                    }
 
-                if (gx_valid) {
-                    std::set<size_t> new_gy = part.groups[gy].ops;
-                    new_gy.insert(op);
-                    double new_gy_cost = part.eval_set(new_gy);
-                    if (new_gy_cost < 1e17) {
-                        double saving = (part.groups[gx].cost + part.groups[gy].cost)
-                                        - (new_gx_cost + new_gy_cost);
-                        if (accept(saving))
-                            best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
+                    if (gx_valid) {
+                        double new_gy_cost = part.eval_set(new_gy);
+                        if (new_gy_cost < 1e17) {
+                            double saving = (part.groups[gx].cost + part.groups[gy].cost)
+                                            - (new_gx_cost + new_gy_cost);
+                            if (accept(saving))
+                                best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
+                        }
                     }
                 }
             }
@@ -69,12 +71,14 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
-                double merged_cost = part.eval_set(merged);
-                if (merged_cost < 1e17) {
-                    double saving = (part.groups[gx].cost + part.groups[gy].cost)
-                                    - merged_cost;
-                    if (accept(saving))
-                        best = FMMove{FMMove::MERGE, op, gx, gy, SIZE_MAX, saving};
+                if (!part.creates_ephemeral_gap(merged, gx, gy)) {
+                    double merged_cost = part.eval_set(merged);
+                    if (merged_cost < 1e17) {
+                        double saving = (part.groups[gx].cost + part.groups[gy].cost)
+                                        - merged_cost;
+                        if (accept(saving))
+                            best = FMMove{FMMove::MERGE, op, gx, gy, SIZE_MAX, saving};
+                    }
                 }
             }
 
@@ -82,11 +86,13 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
-                double new_gy_cost = part.eval_set(new_gy);
-                if (new_gy_cost < 1e17) {
-                    double saving = part.groups[gy].cost - new_gy_cost;
-                    if (accept(saving))
-                        best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
+                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
+                    double new_gy_cost = part.eval_set(new_gy);
+                    if (new_gy_cost < 1e17) {
+                        double saving = part.groups[gy].cost - new_gy_cost;
+                        if (accept(saving))
+                            best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
+                    }
                 }
             }
         }
@@ -201,17 +207,20 @@ FMMove best_move_for(const Partition& part, size_t op,
                                 cycle = true;
 
                     if (!cycle) {
-                        double new_cost = part.eval_set(merged_ops);
-                        if (new_cost < 1e17) {
-                            double saving = old_cost - new_cost;
-                            if (accept(saving)) {
-                                FMMove candidate;
-                                candidate.type = FMMove::TENSOR_MERGE;
-                                candidate.op = op;
-                                candidate.op2 = t;  // tensor_id
-                                candidate.saving = saving;
-                                candidate.tensor_groups = group_list;
-                                if (candidate.saving > best.saving) best = candidate;
+                        std::vector<size_t> excl(group_list.begin(), group_list.end());
+                        if (!part.creates_ephemeral_gap(merged_ops, excl)) {
+                            double new_cost = part.eval_set(merged_ops);
+                            if (new_cost < 1e17) {
+                                double saving = old_cost - new_cost;
+                                if (accept(saving)) {
+                                    FMMove candidate;
+                                    candidate.type = FMMove::TENSOR_MERGE;
+                                    candidate.op = op;
+                                    candidate.op2 = t;  // tensor_id
+                                    candidate.saving = saving;
+                                    candidate.tensor_groups = group_list;
+                                    if (candidate.saving > best.saving) best = candidate;
+                                }
                             }
                         }
                     }
@@ -244,19 +253,22 @@ FMMove best_move_for(const Partition& part, size_t op,
                     }
 
                     if (feasible) {
-                        double extract_cost = part.eval_set(extract_ops);
-                        if (extract_cost < 1e17) {
-                            double saving = old_cost - (extract_cost + remainder_cost);
-                            if (accept(saving)) {
-                                FMMove candidate;
-                                candidate.type = FMMove::TENSOR_EXTRACT;
-                                candidate.op = op;
-                                candidate.op2 = t;  // tensor_id
-                                candidate.saving = saving;
-                                candidate.tensor_groups = group_list;
-                                candidate.tensor_consumer_ops.assign(
-                                    extract_ops.begin(), extract_ops.end());
-                                if (candidate.saving > best.saving) best = candidate;
+                        std::vector<size_t> excl(group_list.begin(), group_list.end());
+                        if (!part.creates_ephemeral_gap(extract_ops, excl)) {
+                            double extract_cost = part.eval_set(extract_ops);
+                            if (extract_cost < 1e17) {
+                                double saving = old_cost - (extract_cost + remainder_cost);
+                                if (accept(saving)) {
+                                    FMMove candidate;
+                                    candidate.type = FMMove::TENSOR_EXTRACT;
+                                    candidate.op = op;
+                                    candidate.op2 = t;  // tensor_id
+                                    candidate.saving = saving;
+                                    candidate.tensor_groups = group_list;
+                                    candidate.tensor_consumer_ops.assign(
+                                        extract_ops.begin(), extract_ops.end());
+                                    if (candidate.saving > best.saving) best = candidate;
+                                }
                             }
                         }
                     }
@@ -285,6 +297,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
 
+            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 
@@ -308,6 +321,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::MERGE: {
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
+            if (part.creates_ephemeral_gap(merged, m.ga, m.gb)) return {};
             double cost = part.eval_set(merged);
             if (cost >= 1e17) return {};
 
@@ -323,6 +337,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::RECOMPUTE: {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
+            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
             double cost = part.eval_set(new_gb);
             if (cost >= 1e17) return {};
 
@@ -415,6 +430,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                 merged_ops.insert(part.groups[cg].ops.begin(),
                                   part.groups[cg].ops.end());
 
+            if (part.creates_ephemeral_gap(merged_ops,
+                    std::vector<size_t>(m.tensor_groups.begin(),
+                                        m.tensor_groups.end()))) return {};
             double merged_cost = part.eval_set(merged_ops);
             if (merged_cost >= 1e17) return {};
 
@@ -446,6 +464,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                                          m.tensor_consumer_ops.end());
 
             // Evaluate the extracted group
+            if (part.creates_ephemeral_gap(extract_ops,
+                    std::vector<size_t>(m.tensor_groups.begin(),
+                                        m.tensor_groups.end()))) return {};
             double extract_cost = part.eval_set(extract_ops);
             if (extract_cost >= 1e17) return {};
 

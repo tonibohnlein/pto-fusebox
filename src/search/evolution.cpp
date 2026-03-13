@@ -45,6 +45,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     for (auto op : part.groups[gb].ops)
         merged.insert(op);
     
+    if (part.creates_ephemeral_gap(merged, ga, gb)) return part;
     double cost = part.eval_set(merged);
     if (cost >= 1e17) return part;  // infeasible merge
     
@@ -138,6 +139,7 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     new_dst.insert(op);
+    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -234,6 +236,7 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     for (auto op : block) new_dst.insert(op);
+    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -348,6 +351,8 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         merged_ops.insert(part.groups[gi].ops.begin(),
                           part.groups[gi].ops.end());
     
+    std::vector<size_t> group_list_vec(group_list.begin(), group_list.end());
+    if (part.creates_ephemeral_gap(merged_ops, group_list_vec)) return part;
     double merged_cost = part.eval_set(merged_ops);
     if (merged_cost < 1e17) {
         // Apply full merge: first group absorbs all, rest are killed
@@ -369,6 +374,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
     
+    if (part.creates_ephemeral_gap(extract_ops, group_list_vec)) return part;
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
     
@@ -492,6 +498,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
 
             std::set<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
+            if (child.creates_ephemeral_gap(merged, gi, SIZE_MAX)) continue;
             double c = child.eval_set(merged);
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;

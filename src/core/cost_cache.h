@@ -14,6 +14,12 @@
 // (depends only on the ops and the problem). During local search, the same
 // op-sets are evaluated millions of times across greedy, tabu, and FM passes.
 // Caching avoids redundant Subgraph::create + tiling enumeration.
+//
+// NOTE: only the scalar cost is stored here — not the Subgraph or TileConfig.
+// finalize() rebuilds those on demand for the small partition pool (O(pool *
+// groups) calls, all cache misses converted to Subgraph::create directly).
+// Storing Subgraph in this cache would copy a heavy object on every one of
+// the millions of cache hits during Phase 1, destroying search performance.
 // ============================================================================
 
 struct VectorHash {
@@ -59,9 +65,9 @@ public:
         return cost;
     }
     
-    size_t hits() const { return hits_.load(std::memory_order_relaxed); }
+    size_t hits()  const { return hits_.load(std::memory_order_relaxed); }
     size_t misses() const { return misses_.load(std::memory_order_relaxed); }
-    size_t size() const { std::lock_guard<std::mutex> lock(mutex_); return map_.size(); }
+    size_t size()  const { std::lock_guard<std::mutex> lock(mutex_); return map_.size(); }
     
 private:
     mutable std::mutex mutex_;

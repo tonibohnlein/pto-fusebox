@@ -37,9 +37,11 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
                     std::set<size_t> merged = part.groups[gi].ops;
                     merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
-                    double new_cost = part.eval_set(merged);
-                    double saving = (part.groups[gi].cost + part.groups[gj].cost) - new_cost;
-                    try_better(best, {Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
+                    if (!part.creates_ephemeral_gap(merged, gi, gj)) {
+                        double new_cost = part.eval_set(merged);
+                        double saving = (part.groups[gi].cost + part.groups[gj].cost) - new_cost;
+                        try_better(best, {Move::MERGE, gi, gj, 0, saving, gen_i, gen_j});
+                    }
                 }
             }
 
@@ -47,26 +49,28 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             if (!part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
-                double new_gi_cost = part.eval_set(new_gi);
-                if (new_gi_cost < 1e17) {
-                    // STEAL: move adj_op from gj to gi
-                    std::set<size_t> new_gj = part.groups[gj].ops;
-                    new_gj.erase(adj_op);
-                    double new_gj_cost = 0;
-                    bool valid = true;
-                    if (!new_gj.empty()) {
-                        new_gj_cost = part.eval_set(new_gj);
-                        if (new_gj_cost >= 1e17) valid = false;
-                    }
-                    if (valid) {
-                        double saving = (part.groups[gi].cost + part.groups[gj].cost)
-                                        - (new_gi_cost + new_gj_cost);
-                        try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
-                    }
+                if (!part.creates_ephemeral_gap(new_gi, gi, SIZE_MAX)) {
+                    double new_gi_cost = part.eval_set(new_gi);
+                    if (new_gi_cost < 1e17) {
+                        // STEAL: move adj_op from gj to gi
+                        std::set<size_t> new_gj = part.groups[gj].ops;
+                        new_gj.erase(adj_op);
+                        double new_gj_cost = 0;
+                        bool valid = true;
+                        if (!new_gj.empty()) {
+                            new_gj_cost = part.eval_set(new_gj);
+                            if (new_gj_cost >= 1e17) valid = false;
+                        }
+                        if (valid) {
+                            double saving = (part.groups[gi].cost + part.groups[gj].cost)
+                                            - (new_gi_cost + new_gj_cost);
+                            try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
+                        }
 
-                    // RECOMPUTE: add adj_op to gi, keep in gj
-                    double rsaving = part.groups[gi].cost - new_gi_cost;
-                    try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
+                        // RECOMPUTE: add adj_op to gi, keep in gj
+                        double rsaving = part.groups[gi].cost - new_gi_cost;
+                        try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
+                    }
                 }
             }
         }
@@ -139,6 +143,7 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(),
                           part.groups[m.gb].ops.end());
+            if (part.creates_ephemeral_gap(merged, m.ga, m.gb)) return {};
             double new_cost = part.eval_set(merged);
             if (new_cost >= part.groups[m.ga].cost + part.groups[m.gb].cost - 0.001)
                 return {};
@@ -159,6 +164,7 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::STEAL: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
+            if (part.creates_ephemeral_gap(new_ga, m.ga, SIZE_MAX)) return {};
             double new_ga_cost = part.eval_set(new_ga);
             if (new_ga_cost >= 1e17) return {};
 
@@ -195,6 +201,7 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::RECOMPUTE: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
+            if (part.creates_ephemeral_gap(new_ga, m.ga, SIZE_MAX)) return {};
             double new_cost = part.eval_set(new_ga);
             double actual_saving = part.groups[m.ga].cost - new_cost;
             if (actual_saving < -0.001) return {};
