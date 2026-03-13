@@ -40,7 +40,9 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
-                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
+                // gx loses op after STEAL — exclude it so it cannot be counted
+                // as a recompute source for tensors op produces inside new_gy.
+                if (!part.creates_ephemeral_gap(new_gy, gy, gx)) {
                     std::set<size_t> new_gx = part.groups[gx].ops;
                     new_gx.erase(op);
 
@@ -297,7 +299,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
 
-            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
+            // m.ga loses m.op after STEAL — exclude it so it cannot be counted
+            // as a recompute source for tensors m.op produces inside new_gb.
+            if (part.creates_ephemeral_gap(new_gb, m.gb, m.ga)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 

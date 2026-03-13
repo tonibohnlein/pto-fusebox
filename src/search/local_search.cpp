@@ -49,7 +49,12 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             if (!part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
-                if (!part.creates_ephemeral_gap(new_gi, gi, SIZE_MAX)) {
+                // For STEAL, adj_op is removed from gj after the move, so gj must
+                // be excluded from the recompute-exemption check: gj can no longer
+                // serve as a backup producer of tensors that adj_op emits.
+                // For RECOMPUTE, adj_op stays in gj so excluding gj is equally
+                // safe (gj's own consumers are fine; only cross-group consumers matter).
+                if (!part.creates_ephemeral_gap(new_gi, gi, gj)) {
                     double new_gi_cost = part.eval_set(new_gi);
                     if (new_gi_cost < 1e17) {
                         // STEAL: move adj_op from gj to gi
@@ -164,7 +169,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::STEAL: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
-            if (part.creates_ephemeral_gap(new_ga, m.ga, SIZE_MAX)) return {};
+            // m.gb loses m.op after STEAL — exclude it so it is not incorrectly
+            // treated as a recompute source for tensors that m.op produces.
+            if (part.creates_ephemeral_gap(new_ga, m.ga, m.gb)) return {};
             double new_ga_cost = part.eval_set(new_ga);
             if (new_ga_cost >= 1e17) return {};
 
