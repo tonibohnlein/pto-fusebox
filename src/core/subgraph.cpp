@@ -56,28 +56,19 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   }
 
   // Classify tensors.
-  // A tensor produced AND consumed within the subgraph is ephemeral ONLY IF
-  // all its consumers are internal. If any consumer is external, the tensor
-  // is a boundary output — it must be written to slow memory so that the
-  // external consumer's subgraph can read it.
+  // A tensor produced AND consumed within the subgraph is ephemeral — it lives
+  // only in the tile buffer and is never transferred to/from slow memory.
+  // External consumers (if any) are satisfied by recomputation in their own
+  // subgraphs — that's a solution-level concern, not a subgraph-level one.
+  // (Confirmed by PROBLEM.md Ex3B: T1 is ephemeral in {Op0,Op1} even though
+  // Op2 in another subgraph also consumes T1. Op2's subgraph recomputes Op0.)
   std::vector<bool> is_ephemeral(num_tensors, false);
 
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t]) {
-      // Check that ALL consumers are within this subgraph
-      bool all_consumers_internal = true;
-      for (auto cop : dag.tensor_consumers[t]) {
-        if (!is_in_sg[cop]) {
-          all_consumers_internal = false;
-          break;
-        }
-      }
-      if (all_consumers_internal)
-        is_ephemeral[t] = true;
-      // else: has external consumers → boundary output (written to slow mem)
-    }
+    if (is_produced[t] && is_consumed[t])
+      is_ephemeral[t] = true;
   }
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_produced[t] && !is_ephemeral[t])

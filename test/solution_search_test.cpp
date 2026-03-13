@@ -104,9 +104,11 @@ void test_retain_add_improves() {
     auto p = make_shared_input();
     DAG d = DAG::build(p);
     
-    // Op0 produces T1, then Op1 and Op2 both consume T1.
-    // If Op1 is in step 1 and Op2 in step 2, retaining T1 should help.
-    auto sol = make_grouped_solution(p, d, {{0, 1}, {2}});
+    // Op0 produces T1, then Op1 and Op2 both consume T1 in separate steps.
+    // Retaining T1 after step 0 saves re-reading it from slow memory.
+    // Note: {{0,1},{2}} would make T1 ephemeral in step 0 (produced+consumed
+    // internally) — step 2 couldn't read it. Use singletons instead.
+    auto sol = make_grouped_solution(p, d, {{0}, {1}, {2}});
     double before = sol.total_latency();
     
     // Run retain optimization

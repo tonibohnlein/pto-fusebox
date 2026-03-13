@@ -96,6 +96,11 @@ Solution optimize_recompute(const Problem& prob, const DAG& dag, Solution sol) {
                 auto expanded_ops = step.subgraph.ops();
                 expanded_ops.push_back((size_t)prod);
 
+                // Check: would this create an ephemeral gap?
+                std::set<size_t> expanded_set(expanded_ops.begin(), expanded_ops.end());
+                if (Solution::creates_ephemeral_gap(prob, dag, expanded_set, steps, i))
+                    continue;
+
                 auto esg = Subgraph::create(prob, dag, expanded_ops);
                 if (!esg) continue;
 
