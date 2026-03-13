@@ -59,6 +59,7 @@ DAG DAG::build(const Problem& prob) {
         if (!consumed.count(i)) d.graph_outputs.push_back(i);
     }
 
+    d.precompute_reachability();
     return d;
 }
 
@@ -80,31 +81,32 @@ std::vector<size_t> DAG::topo_sort() const {
     return order;
 }
 
-bool DAG::merge_creates_cycle(const std::set<size_t>& a, const std::set<size_t>& b) const {
-    // Use vector<bool> for O(1) lookups instead of std::set
-    std::vector<bool> in_merged(num_ops, false);
-    for (auto op : a) in_merged[op] = true;
-    for (auto op : b) in_merged[op] = true;
+void DAG::precompute_reachability() {
+    words_per_row_ = (num_ops + 63) / 64;
+    reachable_.assign(num_ops * words_per_row_, 0);
 
-    auto has_external_path = [&](const std::set<size_t>& from,
-                                 const std::set<size_t>& to) {
-        std::vector<bool> visited(num_ops, false);
-        std::vector<size_t> queue;
-        for (auto op : from)
-            for (auto s : op_succs[op])
-                if (!in_merged[s] && !visited[s])
-                    { visited[s] = true; queue.push_back(s); }
+    auto order = topo_sort();
+    for (int i = (int)order.size() - 1; i >= 0; i--) {
+        size_t u = order[i];
+        // u reaches itself
+        reachable_[u * words_per_row_ + u / 64] |= (1ull << (u % 64));
+        // u reaches everything its successors reach
+        for (auto v : op_succs[u])
+            row_or(u, v);
+    }
+}
 
-        while (!queue.empty()) {
-            size_t u = queue.back(); queue.pop_back();
-            for (auto v : op_succs[u]) {
-                if (to.count(v)) return true;
-                if (!in_merged[v] && !visited[v])
-                    { visited[v] = true; queue.push_back(v); }
-            }
-        }
-        return false;
-    };
+bool DAG::merge_creates_cycle(const std::set<size_t>& a,
+                               const std::set<size_t>& b) const {
+    // Build bitmasks for each side
+    std::vector<uint64_t> mask_a(words_per_row_, 0), mask_b(words_per_row_, 0);
+    for (auto u : a) mask_a[u / 64] |= (1ull << (u % 64));
+    for (auto u : b) mask_b[u / 64] |= (1ull << (u % 64));
 
-    return has_external_path(a, b) || has_external_path(b, a);
+    // Cycle iff any node in B reaches any node in A, or vice versa
+    for (auto u : b)
+        if (row_intersects(u, mask_a)) return true;
+    for (auto u : a)
+        if (row_intersects(u, mask_b)) return true;
+    return false;
 }
