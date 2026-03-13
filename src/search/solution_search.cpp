@@ -45,6 +45,20 @@ static std::set<size_t> filter_retain(const std::set<size_t> &retain,
   return r;
 }
 
+// Quick check: does a solution have any ephemeral gaps?
+static bool has_ephemeral_gaps(const DAG &dag,
+                                const std::vector<ScheduleStep> &steps) {
+  for (auto &step : steps)
+    for (auto t : step.subgraph.boundary_inputs()) {
+      if (dag.tensor_producer[t] < 0) continue;
+      bool found = false;
+      for (auto &s : steps)
+        if (s.subgraph.boundary_outputs().count(t)) { found = true; break; }
+      if (!found) return true;
+    }
+  return false;
+}
+
 static bool is_connected_without(const std::set<size_t> &ops, size_t rm,
                                  const DAG &dag, size_t n) {
   if (ops.size() <= 2)
@@ -381,6 +395,10 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       
       std::set<size_t> new_dst = dj_set;
       new_dst.insert(op);
+      // Check ephemeral gap: would new_dst create an ephemeral tensor
+      // that some other step needs but can't get?
+      if (Solution::creates_ephemeral_gap(prob, dag, new_dst, state.steps, sj, si))
+        continue;
       auto sg_s = Subgraph::create(prob, dag, {new_src.begin(), new_src.end()});
       auto sg_d = Subgraph::create(prob, dag, {new_dst.begin(), new_dst.end()});
       if (!sg_s || !sg_d)
@@ -427,6 +445,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       for (auto o : ops_j)
         if (seen.insert(o).second)
           merged.push_back(o);
+      // Check ephemeral gap for the merged set (exclude both merging steps)
+      if (Solution::creates_ephemeral_gap(prob, dag, seen, state.steps, si, sj))
+        continue;
       auto sg = Subgraph::create(prob, dag, merged);
       if (!sg)
         continue;
@@ -478,6 +499,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
 
       std::vector<size_t> expanded(sj_ops.begin(), sj_ops.end());
       expanded.push_back(op);
+      std::set<size_t> expanded_set(expanded.begin(), expanded.end());
+      if (Solution::creates_ephemeral_gap(prob, dag, expanded_set, state.steps, sj))
+        continue;
       auto sg = Subgraph::create(prob, dag, expanded);
       if (!sg)
         continue;
@@ -693,6 +717,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     ns.erase(m.op);
     std::set<size_t> nd(dst.subgraph.ops().begin(), dst.subgraph.ops().end());
     nd.insert(m.op);
+    if (Solution::creates_ephemeral_gap(prob, dag, nd, state.steps, m.step_b, m.step_a))
+      return {SIZE_MAX, 0};
     auto ss = Subgraph::create(prob, dag, {ns.begin(), ns.end()});
     auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
     if (!ss || !sd)
@@ -725,6 +751,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     for (auto o : oj)
       if (seen.insert(o).second)
         merged.push_back(o);
+    if (Solution::creates_ephemeral_gap(prob, dag, seen, state.steps, m.step_a, m.step_b))
+      return {SIZE_MAX, 0};
     auto sg = Subgraph::create(prob, dag, merged);
     if (!sg)
       return {SIZE_MAX, 0};
@@ -1380,9 +1408,11 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
-      result.best_cost = state.total;
-      result.best_steps = state.steps;
-      best_cumul_gain = cumul_gain;
+      if (!has_ephemeral_gaps(dag, state.steps)) {
+        result.best_cost = state.total;
+        result.best_steps = state.steps;
+        best_cumul_gain = cumul_gain;
+      }
       no_improve = 0;
     } else {
       no_improve++;
@@ -1710,6 +1740,7 @@ static std::vector<ScheduleStep> solution_crossover(
     }
 
     recompute_costs(prob, dag, child_steps);
+    if (has_ephemeral_gaps(dag, child_steps)) return {};
     return child_steps;
 }
 
@@ -1807,6 +1838,7 @@ static bool apply_one_random_move(const Problem& prob, const DAG& dag,
             auto ss = Subgraph::create(prob, dag, {ns.begin(), ns.end()});
             auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
             if (!ss || !sd) continue;
+            if (Solution::creates_ephemeral_gap(prob, dag, nd, steps, c.dst, c.src)) continue;
             auto sr = filter_retain(src.retain_these, *ss);
             auto dr = filter_retain(dst.retain_these, *sd);
             // Check feasibility with empty entering (conservative — recompute fixes later)
@@ -1841,6 +1873,9 @@ static bool apply_one_random_move(const Problem& prob, const DAG& dag,
         auto& ops_b = steps[si+1].subgraph.ops();
         std::vector<size_t> merged(ops_a.begin(), ops_a.end());
         merged.insert(merged.end(), ops_b.begin(), ops_b.end());
+        std::set<size_t> merged_set(merged.begin(), merged.end());
+        if (Solution::creates_ephemeral_gap(prob, dag, merged_set, steps, si, si+1))
+            return false;
         auto sg = Subgraph::create(prob, dag, merged);
         if (!sg) return false;
         auto ret = filter_retain(steps[si+1].retain_these, *sg);
@@ -2010,7 +2045,9 @@ std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
         if (apply_one_random_move(prob, dag, result, rng))
             applied++;
     }
-    return applied > 0 ? result : std::vector<ScheduleStep>{};
+    if (applied == 0) return {};
+    if (has_ephemeral_gaps(dag, result)) return {};
+    return result;
 }
 
 // ============================================================================
@@ -2124,6 +2161,8 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     // Pool insert is defined before initialization so we can use it
     // for diversity-aware seeding too.
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
+        if (has_ephemeral_gaps(dag, steps)) return false;
+
         std::lock_guard<std::mutex> lock(pool_mutex);
 
         // Compute min distance to any existing pool entry

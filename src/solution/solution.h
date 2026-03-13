@@ -62,6 +62,26 @@ public:
     // What's retained entering step i (computed from step i-1's retain set)
     const std::set<size_t>& retained_entering(size_t i) const { return retained_entering_[i]; }
 
+    // --- Ephemeral gap check (solution-level) ---
+
+    // Check if proposed_ops for a step would create an ephemeral gap:
+    // a tensor that is ephemeral in the proposed set (produced+consumed
+    // internally) but has an external consumer in another step whose step
+    // does NOT contain the producer (no recomputation path), and no other
+    // step writes T as a boundary output.
+    //
+    // Only moves that ADD ops to a step can create gaps:
+    //   MERGE, STEAL (target), RECOMPUTE.
+    // EJECT/SPLIT/RETAIN moves cannot create gaps.
+    //
+    // exclude_step / exclude_step2: steps being modified (skip when
+    // checking availability — they're being replaced by proposed_ops).
+    static bool creates_ephemeral_gap(const Problem& prob, const DAG& dag,
+                                       const std::set<size_t>& proposed_ops,
+                                       const std::vector<ScheduleStep>& steps,
+                                       size_t exclude_step,
+                                       size_t exclude_step2 = SIZE_MAX);
+
 private:
     const Problem* prob_;
     const DAG* dag_;

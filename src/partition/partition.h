@@ -104,6 +104,25 @@ struct Partition {
     SplitResult eval_split(size_t op_a, size_t op_b, size_t gi) const;
     std::vector<std::pair<size_t,size_t>> bridge_edges(size_t gi) const;
 
+    // --- Ephemeral gap check ---
+
+    // Check if a proposed op-set would create an ephemeral gap: a tensor
+    // that is ephemeral in this set (produced+consumed internally) but has
+    // an external consumer whose group does NOT contain the producer.
+    // This is a partition-level constraint (like merge_creates_cycle).
+    //
+    // Returns true if the proposed set has a gap → move should be rejected.
+    // Check if proposed_ops for a group would create an ephemeral gap.
+    // exclude_ga / exclude_gb: groups being replaced by the proposed ops
+    // (skip when checking availability — they won't exist after the move).
+    bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+                               size_t exclude_ga = SIZE_MAX,
+                               size_t exclude_gb = SIZE_MAX) const;
+
+    // Overload for excluding N groups (TENSOR_MERGE)
+    bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+                               const std::vector<size_t>& exclude_groups) const;
+
 private:
     // Index: op -> list of alive group indices containing it.
     // Rebuilt by rebuild_index().

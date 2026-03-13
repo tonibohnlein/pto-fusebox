@@ -28,6 +28,9 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
 
     std::set<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
+
+    if (p.creates_ephemeral_gap(merged, ga, gb)) return false;
+
     double new_cost = p.eval_set(merged);
 
     if (new_cost < p.groups[ga].cost + p.groups[gb].cost - 0.01) {
@@ -197,6 +200,29 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
 
                 std::set<size_t> expanded = group;
                 expanded.insert(cand);
+
+                // Check: would this expansion create an ephemeral tensor
+                // with external consumers? During init, unassigned ops will
+                // go to singleton groups without recomputation, so any
+                // external consumer of an ephemeral tensor = future gap.
+                bool has_gap = false;
+                for (auto op : expanded) {
+                    for (auto t : prob.ops[op].outputs) {
+                        // Is T consumed internally in expanded?
+                        bool consumed_in = false;
+                        for (auto cop : dag.tensor_consumers[t])
+                            if (expanded.count(cop)) { consumed_in = true; break; }
+                        if (!consumed_in) continue;
+                        // T would be ephemeral. Any external consumer?
+                        for (auto cop : dag.tensor_consumers[t]) {
+                            if (!expanded.count(cop)) { has_gap = true; break; }
+                        }
+                        if (has_gap) break;
+                    }
+                    if (has_gap) break;
+                }
+                if (has_gap) continue;
+
                 double cost = p.eval_set(expanded);
                 if (cost < best_cost - 0.01) {
                     best_cost = cost;
@@ -261,6 +287,9 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
 
             std::set<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[gj].ops.begin(), p.groups[gj].ops.end());
+
+            if (p.creates_ephemeral_gap(merged, (size_t)gi, (size_t)gj)) continue;
+
             double new_cost = p.eval_set(merged);
             double saving = (p.groups[gi].cost + p.groups[gj].cost) - new_cost;
 
@@ -329,6 +358,7 @@ Partition init_random(const Problem& prob, const DAG& dag) {
         // Try merge — accept if subgraph is valid (feasible tiling exists)
         std::set<size_t> merged = p.groups[ga].ops;
         merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
+        if (p.creates_ephemeral_gap(merged, ga, gb)) continue;
         double new_cost = p.eval_set(merged);
         if (new_cost >= 1e17) continue; // infeasible
 

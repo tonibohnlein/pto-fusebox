@@ -407,13 +407,13 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     double dfs_raw = dfs_sol.total_latency();
     double beam_raw = beam_sol.total_latency();
 
-    auto dfs_opt = optimize_retain(prob, dag, std::move(dfs_sol));
-    dfs_opt = optimize_recompute(prob, dag, std::move(dfs_opt));
-    double dfs_lat = dfs_opt.total_latency();
+    dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
+    dfs_sol = optimize_recompute(prob, dag, std::move(dfs_sol));
+    double dfs_lat = dfs_sol.total_latency();
 
-    auto beam_opt = optimize_retain(prob, dag, std::move(beam_sol));
-    beam_opt = optimize_recompute(prob, dag, std::move(beam_opt));
-    double beam_lat = beam_opt.total_latency();
+    beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
+    beam_sol = optimize_recompute(prob, dag, std::move(beam_sol));
+    double beam_lat = beam_sol.total_latency();
 
     std::cerr << "  DFS:  raw=" << dfs_raw << " → opt=" << dfs_lat;
     if (dfs_lat < dfs_raw - 0.01) 
@@ -428,9 +428,9 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     std::cerr << "  Winner: " << (beam_lat < dfs_lat - 0.01 ? "Beam" : "DFS") << "\n";
 
     if (beam_lat < dfs_lat - 0.01) {
-        return beam_opt;
+        return beam_sol;
     }
-    return dfs_opt;
+    return dfs_sol;
 }
 
 // ============================================================================
@@ -444,7 +444,7 @@ Solution solve(const Problem& prob, TimePoint deadline) {
     auto effective_deadline = deadline;
     // If no real deadline was given (tests), cap at 10s
     if (deadline == no_deadline() || (deadline - now) > std::chrono::seconds(300))
-        effective_deadline = now + std::chrono::seconds(3);
+        effective_deadline = now + std::chrono::seconds(5);
     auto total_budget = effective_deadline - now;
 
     // Precompute once: which tensors can physically be retained?
@@ -729,9 +729,13 @@ Solution solve(const Problem& prob, TimePoint deadline) {
         after_sol_evo = final_sol.total_latency();
 
         // Final retain+recompute cleanup
+        auto pre_opt = final_sol;
         final_sol = optimize_retain(prob, dag, std::move(final_sol));
         final_sol = optimize_recompute(prob, dag, std::move(final_sol));
         final_sol = optimize_retain(prob, dag, std::move(final_sol));
+        // If post-opt introduced ephemeral gaps, revert
+        if (!final_sol.validate().valid)
+            final_sol = std::move(pre_opt);
     } else {
         std::cerr << "Phase 3: Skipped (no retainable tensors — solution cost = partition cost)\n";
         final_sol = std::move(solution_pool[0]);

@@ -297,3 +297,101 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
     }
     return bridges;
 }
+
+// ============================================================================
+// Ephemeral gap check: would this op-set create an unresolvable gap?
+//
+// A tensor T is ephemeral in proposed_ops if it's both produced and consumed
+// internally. If T also has an external consumer whose group does NOT contain
+// T's producer (no recomputation path), this is a gap — the tensor can't be
+// read from slow memory because it was never written there.
+//
+// This mirrors merge_creates_cycle: a partition-level constraint that
+// Subgraph::create can't check on its own.
+// ============================================================================
+
+bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+                                      size_t exclude_ga,
+                                      size_t exclude_gb) const {
+    if (!prob || !dag) return false;
+
+    for (auto op : proposed_ops) {
+        for (auto t : prob->ops[op].outputs) {
+            // Is T consumed internally in proposed_ops?
+            bool consumed_internally = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
+            if (!consumed_internally) continue;
+
+            // T would be ephemeral. Check external consumers.
+            int prod_op = dag->tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            // Is T available as boundary output from another group
+            // (excluding the groups being replaced by proposed_ops)?
+            bool available_from_other = false;
+            for (auto gj : groups_of((size_t)prod_op)) {
+                if (!groups[gj].alive) continue;
+                if (gj == exclude_ga || gj == exclude_gb) continue;
+                bool gj_consumes_t = false;
+                for (auto cop : dag->tensor_consumers[t])
+                    if (groups[gj].ops.count(cop)) { gj_consumes_t = true; break; }
+                if (!gj_consumes_t) {
+                    available_from_other = true;
+                    break;
+                }
+            }
+            if (available_from_other) continue;
+
+            // Check each external consumer's group for recomputation
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (proposed_ops.count(cop)) continue;
+                for (auto gj : groups_of(cop)) {
+                    if (!groups[gj].alive) continue;
+                    if (gj == exclude_ga || gj == exclude_gb) continue;
+                    if (groups[gj].ops.count((size_t)prod_op)) continue;
+                    return true;  // GAP
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+                                      const std::vector<size_t>& exclude_groups) const {
+    if (!prob || !dag) return false;
+    std::set<size_t> excluded(exclude_groups.begin(), exclude_groups.end());
+
+    for (auto op : proposed_ops) {
+        for (auto t : prob->ops[op].outputs) {
+            bool consumed_internally = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
+            if (!consumed_internally) continue;
+
+            int prod_op = dag->tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            bool available_from_other = false;
+            for (auto gj : groups_of((size_t)prod_op)) {
+                if (!groups[gj].alive || excluded.count(gj)) continue;
+                bool gj_consumes_t = false;
+                for (auto cop : dag->tensor_consumers[t])
+                    if (groups[gj].ops.count(cop)) { gj_consumes_t = true; break; }
+                if (!gj_consumes_t) { available_from_other = true; break; }
+            }
+            if (available_from_other) continue;
+
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (proposed_ops.count(cop)) continue;
+                for (auto gj : groups_of(cop)) {
+                    if (!groups[gj].alive || excluded.count(gj)) continue;
+                    if (groups[gj].ops.count((size_t)prod_op)) continue;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}

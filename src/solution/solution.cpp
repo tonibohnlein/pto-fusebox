@@ -116,5 +116,80 @@ Solution::ValidationResult Solution::validate() const {
         }
     }
 
+    // 7. Check for ephemeral gaps: no step should need a tensor that's
+    //    ephemeral in its producing step without a recomputation path
+    for (size_t si = 0; si < steps_.size(); si++) {
+        for (auto t : steps_[si].subgraph.boundary_inputs()) {
+            // Is T available from slow memory?
+            if (dag_->tensor_producer[t] < 0) continue;  // graph input, always available
+            bool found = false;
+            for (size_t sj = 0; sj < steps_.size(); sj++) {
+                if (steps_[sj].subgraph.boundary_outputs().count(t)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                fail("Step " + std::to_string(si) + ": boundary input T" +
+                     std::to_string(t) + " is not available from slow memory "
+                     "(ephemeral in producing step, no recomputation)");
+                return vr;
+            }
+        }
+    }
+
     return vr;
+}
+
+// ============================================================================
+// Ephemeral gap check for solution-level moves
+// ============================================================================
+
+bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
+                                      const std::set<size_t>& proposed_ops,
+                                      const std::vector<ScheduleStep>& steps,
+                                      size_t exclude_step,
+                                      size_t exclude_step2) {
+    // Find tensors that would be ephemeral in proposed_ops
+    for (auto op : proposed_ops) {
+        for (auto t : prob.ops[op].outputs) {
+            // Is T consumed internally?
+            bool consumed_internally = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
+            if (!consumed_internally) continue;
+
+            // T would be ephemeral. Check external consumers.
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            // Is T available as boundary output from another step?
+            bool available = false;
+            for (size_t si = 0; si < steps.size(); si++) {
+                if (si == exclude_step || si == exclude_step2) continue;
+                if (steps[si].subgraph.boundary_outputs().count(t)) {
+                    available = true;
+                    break;
+                }
+            }
+            if (available) continue;
+
+            // Check each external consumer's step for recomputation
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (proposed_ops.count(cop)) continue;
+                for (size_t si = 0; si < steps.size(); si++) {
+                    if (si == exclude_step || si == exclude_step2) continue;
+                    bool in_step = false;
+                    for (auto o : steps[si].subgraph.ops())
+                        if (o == cop) { in_step = true; break; }
+                    if (!in_step) continue;
+                    bool has_prod = false;
+                    for (auto o : steps[si].subgraph.ops())
+                        if (o == (size_t)prod_op) { has_prod = true; break; }
+                    if (!has_prod) return true;  // GAP
+                }
+            }
+        }
+    }
+    return false;
 }
