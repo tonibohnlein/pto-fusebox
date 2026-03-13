@@ -2,7 +2,6 @@
 #include "partition/partition.h"
 #include "search/parallel_search.h"
 #include "search/solution_search.h"
-#include "postopt/post_opt.h"
 #include <iostream>
 #include <iomanip>
 #include <map>
@@ -403,28 +402,11 @@ static Solution build_solution(const Problem& prob, const DAG& dag,
     }
     Solution beam_sol(prob, dag, std::move(beam_steps));
 
-    // Pick the better one AFTER running retain+recompute on both.
-    double dfs_raw = dfs_sol.total_latency();
-    double beam_raw = beam_sol.total_latency();
-
-    dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
-    dfs_sol = optimize_recompute(prob, dag, std::move(dfs_sol));
     double dfs_lat = dfs_sol.total_latency();
-
-    beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
-    beam_sol = optimize_recompute(prob, dag, std::move(beam_sol));
     double beam_lat = beam_sol.total_latency();
 
-    std::cerr << "  DFS:  raw=" << dfs_raw << " → opt=" << dfs_lat;
-    if (dfs_lat < dfs_raw - 0.01) 
-        std::cerr << " (-" << std::fixed << std::setprecision(1) 
-                  << 100.0*(dfs_raw-dfs_lat)/dfs_raw << "%)";
-    std::cerr << "\n";
-    std::cerr << "  Beam: raw=" << beam_raw << " → opt=" << beam_lat;
-    if (beam_lat < beam_raw - 0.01) 
-        std::cerr << " (-" << std::fixed << std::setprecision(1) 
-                  << 100.0*(beam_raw-beam_lat)/beam_raw << "%)";
-    std::cerr << "\n";
+    std::cerr << "  DFS:  " << dfs_lat << "\n";
+    std::cerr << "  Beam: " << beam_lat << "\n";
     std::cerr << "  Winner: " << (beam_lat < dfs_lat - 0.01 ? "Beam" : "DFS") << "\n";
 
     if (beam_lat < dfs_lat - 0.01) {
@@ -530,9 +512,6 @@ Solution solve(const Problem& prob, TimePoint deadline) {
                 for (auto idx : dfs_order)
                     dfs_steps.push_back({Subgraph(gd.groups[idx].sg), gd.groups[idx].base_cost.config, {}});
                 Solution dfs_sol(prob, dag, std::move(dfs_steps));
-                dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
-                dfs_sol = optimize_recompute(prob, dag, std::move(dfs_sol));
-                dfs_sol = optimize_retain(prob, dag, std::move(dfs_sol));
 
                 // Beam solution
                 int beam_width = std::min(20, std::max(5, (int)gd.size()));
@@ -555,9 +534,6 @@ Solution solve(const Problem& prob, TimePoint deadline) {
                     beam_entering = retain_these;
                 }
                 Solution beam_sol(prob, dag, std::move(beam_steps));
-                beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
-                beam_sol = optimize_recompute(prob, dag, std::move(beam_sol));
-                beam_sol = optimize_retain(prob, dag, std::move(beam_sol));
 
                 // Random-retain variant: pick tensors to retain first, then
                 // build an ordering that supports those retain decisions.
@@ -727,15 +703,6 @@ Solution solve(const Problem& prob, TimePoint deadline) {
         sfm_cfg.deadline = phase3_deadline;
         final_sol = solution_evo_search(prob, dag, std::move(solution_pool), sfm_cfg);
         after_sol_evo = final_sol.total_latency();
-
-        // Final retain+recompute cleanup
-        auto pre_opt = final_sol;
-        final_sol = optimize_retain(prob, dag, std::move(final_sol));
-        final_sol = optimize_recompute(prob, dag, std::move(final_sol));
-        final_sol = optimize_retain(prob, dag, std::move(final_sol));
-        // If post-opt introduced ephemeral gaps, revert
-        if (!final_sol.validate().valid)
-            final_sol = std::move(pre_opt);
     } else {
         std::cerr << "Phase 3: Skipped (no retainable tensors — solution cost = partition cost)\n";
         final_sol = std::move(solution_pool[0]);

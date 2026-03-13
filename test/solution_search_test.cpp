@@ -5,7 +5,6 @@
 #include "core/subgraph.h"
 #include "solution/solution.h"
 #include "search/solution_search.h"
-#include "postopt/post_opt.h"
 #include <iostream>
 #include <cmath>
 #include <set>
@@ -99,25 +98,6 @@ void test_greedy_never_worsens() {
     CHECK("greedy produces valid solution", vr.valid);
 }
 
-void test_retain_add_improves() {
-    std::cout << "=== SolFM: retain_add finds improvement ===\n";
-    auto p = make_shared_input();
-    DAG d = DAG::build(p);
-    
-    // Op0 produces T1, then Op1 and Op2 both consume T1 in separate steps.
-    // Retaining T1 after step 0 saves re-reading it from slow memory.
-    // Note: {{0,1},{2}} would make T1 ephemeral in step 0 (produced+consumed
-    // internally) — step 2 couldn't read it. Use singletons instead.
-    auto sol = make_grouped_solution(p, d, {{0}, {1}, {2}});
-    double before = sol.total_latency();
-    
-    // Run retain optimization
-    auto opt = optimize_retain(p, d, std::move(sol));
-    double after = opt.total_latency();
-    CHECK("retain found improvement or same", after <= before + 0.01);
-    auto vr = opt.validate();
-    CHECK("valid after retain", vr.valid);
-}
 
 void test_fm_pass_basic() {
     std::cout << "=== SolFM: fm_pass basic ===\n";
@@ -280,7 +260,6 @@ void test_deadline_respected() {
 
 int main() {
     test_greedy_never_worsens();
-    test_retain_add_improves();
     test_fm_pass_basic();
     test_fm_pass_respects_floor();
     test_fm_search_monotone();

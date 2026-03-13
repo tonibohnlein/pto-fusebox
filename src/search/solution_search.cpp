@@ -1,6 +1,5 @@
 #include "search/solution_search.h"
 #include "partition/partition.h"
-#include "postopt/post_opt.h"
 #include "search/verbose.h"
 #include <algorithm>
 #include <atomic>
@@ -2316,8 +2315,6 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                 Solution child_sol(prob, dag, child);
                 if (!child_sol.validate().valid) continue;
 
-                // --- Polish: retain optimization ---
-                child_sol = optimize_retain(prob, dag, std::move(child_sol));
                 double child_cost = child_sol.total_latency();
 
                 // Try inserting mutant (diversity-aware pool handles filtering)
@@ -2349,7 +2346,6 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     if (pr.best_cost < child_cost - 0.01) {
                         total_fm_improvements++;
                         Solution fm_sol(prob, dag, pr.best_steps);
-                        fm_sol = optimize_retain(prob, dag, std::move(fm_sol));
                         pool_insert(fm_sol.steps(), fm_sol.total_latency());
                         if (fm_sol.total_latency() < thread_best_cost - 0.01) {
                             thread_best_cost = fm_sol.total_latency();

@@ -14,7 +14,6 @@
 #include "search/fm_outer.h"
 #include "search/evolution.h"
 #include "solution/solution.h"
-#include "postopt/post_opt.h"
 #include "core/cost_cache.h"
 #include "search/verbose.h"
 #include <iostream>
@@ -396,59 +395,6 @@ void test_evolution() {
 }
 
 // ============================================================================
-// Test 8: Full pipeline — partition → solution → validate → post-opt
-// ============================================================================
-void test_full_pipeline() {
-    std::cout << "\n=== Test 8: Full pipeline ===\n";
-    auto p = make_pw_chain8();
-    DAG d = DAG::build(p);
-
-    // Phase 1: Partition search
-    auto part = best_initial(p, d);
-    part = greedy_descent(std::move(part));
-    double partition_cost = part.total_cost();
-    std::cout << "  Partition: " << part.num_alive() << " groups, cost="
-              << partition_cost << "\n";
-
-    // Phase 2: Build solution
-    auto sol = partition_to_solution(p, d, part);
-    auto vr = sol.validate();
-    CHECK("solution valid", vr.valid);
-    if (!vr.valid) std::cout << "    Error: " << vr.error << "\n";
-    std::cout << "  Solution: " << sol.num_steps() << " steps, latency="
-              << sol.total_latency() << "\n";
-
-    // Phase 3: Post-opt retain
-    auto sol_opt = optimize_retain(p, d, std::move(sol));
-    auto vr2 = sol_opt.validate();
-    CHECK("post-opt valid", vr2.valid);
-    if (!vr2.valid) std::cout << "    Error: " << vr2.error << "\n";
-    std::cout << "  Post-opt: " << sol_opt.num_steps() << " steps, latency="
-              << sol_opt.total_latency() << "\n";
-
-    // Post-opt should not worsen
-    CHECK_LE("post-opt ≤ original", sol_opt.total_latency(), partition_cost + 1);
-
-    // Print schedule
-    for (size_t i = 0; i < sol_opt.num_steps(); i++) {
-        auto& s = sol_opt.step(i);
-        std::cout << "    Step " << i << ": ops={";
-        for (size_t j = 0; j < s.subgraph.ops().size(); j++) {
-            if (j) std::cout << ",";
-            std::cout << s.subgraph.ops()[j];
-        }
-        std::cout << "} [" << s.config.w << "," << s.config.h << "," << s.config.k << "]";
-        if (!s.retain_these.empty()) {
-            std::cout << " retain={";
-            bool first = true;
-            for (auto t : s.retain_these) { if (!first) std::cout << ","; std::cout << "T" << t; first = false; }
-            std::cout << "}";
-        }
-        std::cout << " lat=" << sol_opt.step_latency(i) << "\n";
-    }
-}
-
-// ============================================================================
 // Test 9: MM diamond — eph fan-out handled correctly
 // ============================================================================
 void test_mm_diamond() {
@@ -582,7 +528,6 @@ int main() {
     test_fm_inner_pass();
     test_fm_outer_loop();
     test_evolution();
-    test_full_pipeline();
     test_mm_diamond();
     test_parallel_mm();
     test_pw_sink_rule();
