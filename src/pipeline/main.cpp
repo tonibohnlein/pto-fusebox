@@ -1,6 +1,5 @@
 #include "io/io.h"
 #include "pipeline/solver.h"
-#include "io/verify.h"
 #include "search/verbose.h"
 #include <iostream>
 #include <iomanip>
@@ -27,10 +26,6 @@ static double get_time_budget(const std::string& filename) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc == 2 && std::string(argv[1]) == "--verify") {
-        return verify_examples() ? 0 : 1;
-    }
-
     bool verbose = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) {
@@ -41,7 +36,6 @@ int main(int argc, char* argv[]) {
 
     if (args.size() != 2) {
         std::cerr << "Usage: " << argv[0] << " [-v] <input.json> <output.json>\n";
-        std::cerr << "       " << argv[0] << " --verify\n";
         return 1;
     }
 
