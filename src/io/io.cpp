@@ -1,159 +1,83 @@
 #include "io/io.h"
+#include "core/cost.h"
+#include "solution/solution.h"
 #include <fstream>
-#include <sstream>
 #include <iostream>
-#include <stdexcept>
-#include <cctype>
-#include <map>
+#include <nlohmann/json.hpp>
 
-struct JsonParser {
-    std::string src;
-    size_t pos = 0;
-    void skip_ws() { while (pos < src.size() && std::isspace(src[pos])) pos++; }
-    char peek() { skip_ws(); return pos < src.size() ? src[pos] : 0; }
-    char next() { skip_ws(); return pos < src.size() ? src[pos++] : 0; }
-    void expect(char c) { if (next() != c) throw std::runtime_error(std::string("Expected '") + c + "'"); }
-    std::string parse_string() {
-        expect('"');
-        std::string r;
-        while (pos < src.size() && src[pos] != '"') r += src[pos++];
-        pos++;
-        return r;
-    }
-    double parse_number() {
-        skip_ws();
-        size_t start = pos;
-        if (pos < src.size() && src[pos] == '-') pos++;
-        while (pos < src.size() && (std::isdigit(src[pos]) || src[pos] == '.' || src[pos] == 'e' || src[pos] == 'E')) pos++;
-        return std::stod(src.substr(start, pos - start));
-    }
-    std::vector<int64_t> parse_int_array() {
-        std::vector<int64_t> r;
-        expect('[');
-        if (peek() != ']') { r.push_back((int64_t)parse_number()); while (peek() == ',') { next(); r.push_back((int64_t)parse_number()); } }
-        expect(']');
-        return r;
-    }
-    std::vector<std::vector<int64_t>> parse_2d_int_array() {
-        std::vector<std::vector<int64_t>> r;
-        expect('[');
-        if (peek() != ']') { r.push_back(parse_int_array()); while (peek() == ',') { next(); r.push_back(parse_int_array()); } }
-        expect(']');
-        return r;
-    }
-    std::vector<std::string> parse_string_array() {
-        std::vector<std::string> r;
-        expect('[');
-        if (peek() != ']') { r.push_back(parse_string()); while (peek() == ',') { next(); r.push_back(parse_string()); } }
-        expect(']');
-        return r;
-    }
-};
+using json = nlohmann::json;
 
 Problem read_problem(const std::string& filename) {
     std::ifstream f(filename);
-    if (!f) throw std::runtime_error("Cannot open " + filename);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    JsonParser p;
-    p.src = ss.str();
-    p.expect('{');
-
-    Problem prob;
-    prob.fast_memory_capacity = 0;
-    prob.slow_memory_bandwidth = 1;
-    prob.native_w = 128;
-    prob.native_h = 128;
-
-    std::vector<int64_t> widths, heights, base_costs;
-    std::vector<std::vector<int64_t>> inputs, outputs;
-    std::vector<std::string> op_types;
-
-    while (p.peek() != '}') {
-        std::string key = p.parse_string();
-        p.expect(':');
-        if (key == "widths") widths = p.parse_int_array();
-        else if (key == "heights") heights = p.parse_int_array();
-        else if (key == "inputs") inputs = p.parse_2d_int_array();
-        else if (key == "outputs") outputs = p.parse_2d_int_array();
-        else if (key == "base_costs") base_costs = p.parse_int_array();
-        else if (key == "op_types") op_types = p.parse_string_array();
-        else if (key == "fast_memory_capacity") prob.fast_memory_capacity = (int64_t)p.parse_number();
-        else if (key == "slow_memory_bandwidth") prob.slow_memory_bandwidth = (int64_t)p.parse_number();
-        else if (key == "native_granularity") {
-            auto g = p.parse_int_array();
-            if (g.size() >= 2) { prob.native_w = g[0]; prob.native_h = g[1]; }
-        }
-        if (p.peek() == ',') p.next();
+    if (!f.is_open()) {
+        std::cerr << "Error: cannot open " << filename << "\n";
+        std::exit(1);
     }
-    p.expect('}');
+    json j = json::parse(f);
 
-    size_t n_tensors = widths.size();
-    prob.tensors.resize(n_tensors);
-    for (size_t i = 0; i < n_tensors; i++) {
-        prob.tensors[i].width = widths[i];
-        prob.tensors[i].height = heights[i];
+    Problem p;
+    auto& widths = j["widths"];
+    auto& heights = j["heights"];
+    for (size_t i = 0; i < widths.size(); i++)
+        p.tensors.push_back({widths[i].get<int64_t>(), heights[i].get<int64_t>()});
+
+    auto& inputs = j["inputs"];
+    auto& outputs = j["outputs"];
+    auto& base_costs = j["base_costs"];
+    auto& op_types = j["op_types"];
+    for (size_t i = 0; i < op_types.size(); i++) {
+        Op op;
+        op.type = (op_types[i].get<std::string>() == "MatMul")
+                  ? OpType::MatMul : OpType::Pointwise;
+        for (auto& t : inputs[i]) op.inputs.push_back(t.get<size_t>());
+        for (auto& t : outputs[i]) op.outputs.push_back(t.get<size_t>());
+        op.base_cost = base_costs[i].get<int64_t>();
+        p.ops.push_back(std::move(op));
     }
 
-    size_t n_ops = op_types.size();
-    prob.ops.resize(n_ops);
-    for (size_t i = 0; i < n_ops; i++) {
-        prob.ops[i].type = (op_types[i] == "MatMul") ? OpType::MatMul : OpType::Pointwise;
-        prob.ops[i].base_cost = base_costs[i];
-        if (i < inputs.size())
-            for (auto t : inputs[i]) prob.ops[i].inputs.push_back((size_t)t);
-        if (i < outputs.size())
-            for (auto t : outputs[i]) prob.ops[i].outputs.push_back((size_t)t);
-    }
+    p.fast_memory_capacity = j["fast_memory_capacity"].get<int64_t>();
+    p.slow_memory_bandwidth = j["slow_memory_bandwidth"].get<int64_t>();
+    auto& ng = j["native_granularity"];
+    p.native_w = ng[0].get<int64_t>();
+    p.native_h = ng[1].get<int64_t>();
 
-    std::set<size_t> produced, consumed;
-    std::map<size_t, int> consumer_count;
-    for (auto& op : prob.ops) {
-        for (auto t : op.outputs) produced.insert(t);
-        for (auto t : op.inputs) {
-            consumed.insert(t);
-            consumer_count[t]++;
-        }
-    }
+    // Precompute which tensors can be retained (full size fits in fast memory)
+    for (size_t i = 0; i < p.tensors.size(); i++)
+        if (p.tensors[i].width * p.tensors[i].height <= p.fast_memory_capacity)
+            p.retainable_tensors.insert(i);
 
-    for (auto t : produced) {
-        if (!consumed.count(t)) continue;
-        if (prob.tensors[t].size() > prob.fast_memory_capacity) continue;
-        // Single-consumer produced tensors: still retainable (useful when
-        // producer and consumer are in different steps, e.g. T5, T11 in custom)
-        prob.retainable_tensors.insert(t);
-    }
-
-    // Graph inputs with >1 consumer: retainable (saves re-reading from slow
-    // memory across steps). Single-consumer graph inputs: not retainable
-    // (only read once, nothing to save).
-    for (size_t t = 0; t < prob.num_tensors(); t++) {
-        if (produced.count(t)) continue;           // already handled above
-        if (!consumed.count(t)) continue;           // not used at all
-        if (consumer_count[t] <= 1) continue;       // single consumer → useless
-        if (prob.tensors[t].size() > prob.fast_memory_capacity) continue;
-        prob.retainable_tensors.insert(t);
-    }
-
-    return prob;
+    return p;
 }
 
 void write_solution(const std::string& filename, const Solution& sol) {
-    std::ofstream f(filename);
-    f << "{\n  \"steps\": [\n";
-    auto& steps = sol.steps();
-    for (size_t i = 0; i < steps.size(); i++) {
-        f << "    {\"ops\": [";
-        auto ops = steps[i].subgraph.ops();
-        for (size_t j = 0; j < ops.size(); j++) {
-            f << ops[j]; if (j + 1 < ops.size()) f << ", ";
+    json j;
+    j["subgraphs"] = json::array();
+    j["granularities"] = json::array();
+    j["tensors_to_retain"] = json::array();
+    j["traversal_orders"] = json::array();
+    j["subgraph_latencies"] = json::array();
+
+    for (size_t i = 0; i < sol.num_steps(); i++) {
+        const auto& step = sol.step(i);
+        const auto& cfg = step.config;
+
+        j["subgraphs"].push_back(step.subgraph.ops());
+        j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
+        j["tensors_to_retain"].push_back(
+            std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
+
+        if (cfg.snake != SnakeDir::None) {
+            int ntw = (int)(step.subgraph.output_width() / cfg.w);
+            int nth = (int)(step.subgraph.output_height() / cfg.h);
+            auto order = make_traversal(ntw, nth, cfg.snake);
+            j["traversal_orders"].push_back(
+                std::vector<int64_t>(order.begin(), order.end()));
+        } else {
+            j["traversal_orders"].push_back(nullptr);
         }
-        f << "], \"retain\": [";
-        size_t k = 0;
-        for (auto t : steps[i].retain_these) { f << t; if (++k < steps[i].retain_these.size()) f << ", "; }
-        f << "]}";
-        if (i + 1 < steps.size()) f << ",";
-        f << "\n";
+        j["subgraph_latencies"].push_back(sol.step_latency(i));
     }
-    f << "  ],\n  \"total_latency\": " << sol.total_latency() << "\n}\n";
+
+    std::ofstream f(filename);
+    f << j.dump(2) << "\n";
 }
