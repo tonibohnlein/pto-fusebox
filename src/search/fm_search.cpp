@@ -40,9 +40,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
-                // gx loses op after STEAL — exclude it so it cannot be counted
-                // as a recompute source for tensors op produces inside new_gy.
-                if (!part.creates_ephemeral_gap(new_gy, gy, gx)) {
+                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
                     std::set<size_t> new_gx = part.groups[gx].ops;
                     new_gx.erase(op);
 
@@ -256,7 +254,13 @@ FMMove best_move_for(const Partition& part, size_t op,
 
                     if (feasible) {
                         std::vector<size_t> excl(group_list.begin(), group_list.end());
-                        if (!part.creates_ephemeral_gap(extract_ops, excl)) {
+                        // Cycle check: the new group N=extract_ops must not form a
+                        // cycle in the condensed DAG with the remainder groups.
+                        // merge_creates_cycle(extract_ops, {}) checks whether N,
+                        // treated as a super-node, has any external op that can
+                        // reach back into N — covering chains of any length.
+                        if (!part.dag->merge_creates_cycle(extract_ops, {}) &&
+                            !part.creates_ephemeral_gap(extract_ops, excl)) {
                             double extract_cost = part.eval_set(extract_ops);
                             if (extract_cost < 1e17) {
                                 double saving = old_cost - (extract_cost + remainder_cost);
@@ -299,9 +303,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
 
-            // m.ga loses m.op after STEAL — exclude it so it cannot be counted
-            // as a recompute source for tensors m.op produces inside new_gb.
-            if (part.creates_ephemeral_gap(new_gb, m.gb, m.ga)) return {};
+            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 
@@ -468,6 +470,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                                          m.tensor_consumer_ops.end());
 
             // Evaluate the extracted group
+            // Cycle check: N=extract_ops as a new super-node must not create a
+            // condensed DAG cycle with the remainder groups.
+            if (part.dag->merge_creates_cycle(extract_ops, {})) return {};
             if (part.creates_ephemeral_gap(extract_ops,
                     std::vector<size_t>(m.tensor_groups.begin(),
                                         m.tensor_groups.end()))) return {};

@@ -107,8 +107,10 @@ void test_cycle_chain4() {
     CHECK("chain {0},{1,2} ok", !d.merge_creates_cycle({0}, {1,2}));
     CHECK("chain {0,1},{2,3} ok", !d.merge_creates_cycle({0,1}, {2,3}));
 
-    // Multi-op group spanning the gap: should still detect cycle
-    CHECK("chain {0,2},{1} cycle", d.merge_creates_cycle({0,2}, {1}));
+    // Merging {0,2} with {1} yields S={0,1,2}.  The condensed DAG becomes S→{3},
+    // which is acyclic.  merge_creates_cycle asks "does the RESULT have a cycle?"
+    // — not "was the starting partition valid?".  Correct answer is false.
+    CHECK("chain {0,2},{1} no cycle in result", !d.merge_creates_cycle({0,2}, {1}));
 }
 
 // --- 1b: diamond ---

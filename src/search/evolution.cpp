@@ -139,9 +139,7 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     new_dst.insert(op);
-    // src_gi loses op after reassign — exclude it so it cannot be counted
-    // as a recompute source for tensors op produces inside new_dst.
-    if (part.creates_ephemeral_gap(new_dst, dst_gi, src_gi)) return part;
+    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -238,9 +236,7 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     for (auto op : block) new_dst.insert(op);
-    // src_gi loses the block after the move — exclude it so it cannot be counted
-    // as a recompute source for tensors the block produces inside new_dst.
-    if (part.creates_ephemeral_gap(new_dst, dst_gi, src_gi)) return part;
+    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -378,6 +374,9 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
     
+    // Cycle check: N=extract_ops as a new super-node must not create a
+    // condensed DAG cycle with the remainder groups.
+    if (dag.merge_creates_cycle(extract_ops, {})) return part;
     if (part.creates_ephemeral_gap(extract_ops, group_list_vec)) return part;
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
