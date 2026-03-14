@@ -65,6 +65,7 @@ set(TEST_SOURCES
     test/fm_search_test.cpp
     test/partition_test.cpp
     test/parallel_search_test.cpp
+    test/ordering_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

@@ -49,6 +49,10 @@ OrderingResult dfs_ordering(const Partition& part) {
     OrderingResult result;
     size_t prev = SIZE_MAX;
 
+    // Pre-size retain_per_step so steps_from_ordering can index it safely.
+    // We'll populate it after building the order.
+    result.retain_per_step.clear();
+
     while (!ready.empty()) {
         size_t chosen    = SIZE_MAX;
         int64_t best_sc  = -1;
@@ -84,6 +88,22 @@ OrderingResult dfs_ordering(const Partition& part) {
 
         for (auto v : part.group_succs[chosen])
             if (part.groups[v].alive && --in_deg[v] == 0) ready.insert(v);
+    }
+
+    // Populate retain_per_step: retain a tensor at step i if it is a boundary
+    // output of step i, a boundary input of step i+1, and retainable.
+    // This gives steps_from_ordering the basic retention hints it needs.
+    size_t n_steps = result.order.size();
+    result.retain_per_step.resize(n_steps);
+    for (size_t i = 0; i + 1 < n_steps; i++) {
+        size_t ga = result.order[i];
+        size_t gb = result.order[i + 1];
+        if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
+        const auto& out_a = part.groups[ga].sg->boundary_outputs();
+        const auto& in_b  = part.groups[gb].sg->boundary_inputs();
+        for (auto t : out_a)
+            if (in_b.count(t) && prob.retainable_tensors.count(t))
+                result.retain_per_step[i].insert(t);
     }
 
     return result;
