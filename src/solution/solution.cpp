@@ -19,6 +19,13 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
     for (size_t i = 0; i < n; i++) {
         retained_entering_[i] = currently_retained;
 
+        // Defensive: retain_these must not overlap with currently_retained
+        // (would double-count in working set). Strip any overlap.
+        std::set<size_t> safe_retain;
+        for (auto t : steps_[i].retain_these)
+            if (!currently_retained.count(t)) safe_retain.insert(t);
+        steps_[i].retain_these = safe_retain;
+
         step_costs_[i] = steps_[i].subgraph.compute_cost(
             steps_[i].config,
             currently_retained,
@@ -64,7 +71,7 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
             if (part.groups[next_gi].sg) {
                 const auto& next_inputs = part.groups[next_gi].sg->boundary_inputs();
                 for (auto t : res.retain_per_step[i])
-                    if (next_inputs.count(t)) retain_these.insert(t);
+                    if (next_inputs.count(t) && !entering.count(t)) retain_these.insert(t);
             }
         }
 

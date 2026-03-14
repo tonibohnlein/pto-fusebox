@@ -36,10 +36,12 @@ static bool step_depends_on(const ScheduleStep &si, const ScheduleStep &sj,
 }
 
 static std::set<size_t> filter_retain(const std::set<size_t> &retain,
-                                      const Subgraph &sg) {
+                                      const Subgraph &sg,
+                                      const std::set<size_t> &entering = {}) {
   std::set<size_t> r;
   for (auto t : retain)
-    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
+    if ((sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
+        && !entering.count(t))  // tensor already entering must not also be in retain_these
       r.insert(t);
   return r;
 }
@@ -60,8 +62,10 @@ static bool has_ephemeral_gaps(const DAG &dag,
 
 static bool is_connected_without(const std::set<size_t> &ops, size_t rm,
                                  const DAG &dag, size_t n) {
-  if (ops.size() <= 2)
-    return false;
+  if (ops.size() <= 1)
+    return false;  // nothing to remove from, or already empty
+  if (ops.size() == 2)
+    return true;   // removing rm leaves a singleton — trivially connected
   size_t seed = SIZE_MAX;
   for (auto op : ops)
     if (op != rm) {
@@ -176,13 +180,16 @@ struct SolState {
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it,
+      // and the tensor is not already entering from the previous step
+      // (if it's in both retained_from_prev and retain_these, working_set asserts).
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
                      steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        if (valid && useful) {
+        bool not_already_entering = !cur.count(t);
+        if (valid && useful && not_already_entering) {
           useful_retain.insert(t);
         }
       }
@@ -225,13 +232,16 @@ struct SolState {
     for (size_t i = idx; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it,
+      // and the tensor is not already entering from the previous step
+      // (if it's in both retained_from_prev and retain_these, working_set asserts).
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
                      steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        if (valid && useful) {
+        bool not_already_entering = !cur.count(t);
+        if (valid && useful && not_already_entering) {
           useful_retain.insert(t);
         }
       }
@@ -402,8 +412,8 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       auto sg_d = Subgraph::create(prob, dag, {new_dst.begin(), new_dst.end()});
       if (!sg_s || !sg_d)
         continue;
-      auto sr = filter_retain(state.steps[si].retain_these, *sg_s);
-      auto dr = filter_retain(dst.retain_these, *sg_d);
+      auto sr = filter_retain(state.steps[si].retain_these, *sg_s, state.ret_entering[si]);
+      auto dr = filter_retain(dst.retain_these, *sg_d, state.ret_entering[sj]);
       auto cs = sg_s->best_cost(state.ret_entering[si], sr);
       if (!cs.feasible)
         continue;
@@ -451,7 +461,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!sg)
         continue;
       size_t lo = std::min(si, sj), hi = std::max(si, sj);
-      auto retain = filter_retain(state.steps[hi].retain_these, *sg);
+      auto retain = filter_retain(state.steps[hi].retain_these, *sg, state.ret_entering[lo]);
       auto cm = sg->best_cost(state.ret_entering[lo], retain);
       if (!cm.feasible) {
         retain.clear();
@@ -504,7 +514,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       auto sg = Subgraph::create(prob, dag, expanded);
       if (!sg)
         continue;
-      auto ret = filter_retain(state.steps[sj].retain_these, *sg);
+      auto ret = filter_retain(state.steps[sj].retain_these, *sg, state.ret_entering[sj]);
       auto ce = sg->best_cost(state.ret_entering[sj], ret);
       if (!ce.feasible)
         continue;
@@ -528,7 +538,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
     auto sg_s = Subgraph::create(prob, dag, {op});
     if (sg_r && sg_s) {
-      auto rr = filter_retain(state.steps[si].retain_these, *sg_r);
+      auto rr = filter_retain(state.steps[si].retain_these, *sg_r, state.ret_entering[si]);
       auto cr = sg_r->best_cost(state.ret_entering[si], rr);
       auto cs = sg_s->best_cost({}, {});
       if (cr.feasible && cs.feasible) {
@@ -584,6 +594,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
           if (second->boundary_inputs().count(t) &&
               prob.retainable_tensors.count(t))
             br.insert(t);
+        // br is computed from first->boundary_outputs, so can't overlap entering[si]
         auto c1 = first->best_cost(state.ret_entering[si], br);
         if (!c1.feasible) {
           br.clear();
@@ -591,7 +602,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         }
         if (!c1.feasible)
           continue;
-        auto sr2 = filter_retain(state.steps[si].retain_these, *second);
+        auto sr2 = filter_retain(state.steps[si].retain_these, *second, br);
         auto c2 = second->best_cost(br, sr2);
         if (!c2.feasible)
           c2 = second->best_cost(br, {});
@@ -607,12 +618,17 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         }
       }
     };
-    for (auto s : dag.op_succs[op])
-      if (si_set.count(s))
-        try_split(op, s);
-    for (auto p : dag.op_preds[op])
-      if (si_set.count(p))
-        try_split(p, op);
+    // SPLIT at bridge edges incident to op.
+    // Use op_neighbors (DAG edges + co-consumer edges) so co-consumer bridges
+    // are also proposed. Canonicalise as (min, max) to avoid evaluating
+    // the same edge twice.
+    std::set<std::pair<size_t,size_t>> split_checked;
+    for (auto v : dag.op_neighbors[op]) {
+      if (!si_set.count(v)) continue;
+      auto edge = std::make_pair(std::min(op, v), std::max(op, v));
+      if (!split_checked.insert(edge).second) continue;
+      try_split(edge.first, edge.second);
+    }
   }
 
   return best;
@@ -638,6 +654,11 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto &sj = state.steps[i + 1];
     if (si.retain_these.count(t))
       continue; // already retained
+    // t must not already be entering this step from the previous step's retain —
+    // if it is, it's already resident and adding it to retain_these too would
+    // double-count it in the working set (assertion in Subgraph::working_set).
+    if (state.ret_entering[i].count(t))
+      continue;
 
     // Step i must have t as a boundary tensor to retain it
     bool si_boundary = si.subgraph.boundary_inputs().count(t) ||
@@ -655,7 +676,11 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto ci = si.subgraph.best_cost(state.ret_entering[i], new_ret);
     if (!ci.feasible)
       continue;
-    auto cj = sj.subgraph.best_cost(new_ent, sj.retain_these);
+    // Strip new_ent from sj.retain_these before calling best_cost —
+    // a tensor can't appear in both retained_from_prev and retain_these.
+    std::set<size_t> sj_safe_retain;
+    for (auto t2 : sj.retain_these) if (!new_ent.count(t2)) sj_safe_retain.insert(t2);
+    auto cj = sj.subgraph.best_cost(new_ent, sj_safe_retain);
     if (!cj.feasible)
       continue;
     double saving =
@@ -681,7 +706,10 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto ci = si.subgraph.best_cost(state.ret_entering[i], new_ret);
     if (!ci.feasible)
       continue;
-    auto cj = sj.subgraph.best_cost(new_ent, sj.retain_these);
+    // Strip new_ent from sj.retain_these before calling best_cost.
+    std::set<size_t> sj_safe_retain_r;
+    for (auto t2 : sj.retain_these) if (!new_ent.count(t2)) sj_safe_retain_r.insert(t2);
+    auto cj = sj.subgraph.best_cost(new_ent, sj_safe_retain_r);
     if (!cj.feasible)
       continue;
     double saving =
@@ -722,8 +750,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
     if (!ss || !sd)
       return {SIZE_MAX, 0};
-    auto sr = filter_retain(src.retain_these, *ss);
-    auto dr = filter_retain(dst.retain_these, *sd);
+    auto sr = filter_retain(src.retain_these, *ss, state.ret_entering[m.step_a]);
+    auto dr = filter_retain(dst.retain_these, *sd, state.ret_entering[m.step_b]);
     auto cs = ss->best_cost(state.ret_entering[m.step_a], sr);
     auto cd = sd->best_cost(state.ret_entering[m.step_b], dr);
     if (!cs.feasible || !cd.feasible)
@@ -755,7 +783,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto sg = Subgraph::create(prob, dag, merged);
     if (!sg)
       return {SIZE_MAX, 0};
-    auto ret = filter_retain(state.steps[m.step_b].retain_these, *sg);
+    auto ret = filter_retain(state.steps[m.step_b].retain_these, *sg, state.ret_entering[m.step_a]);
     auto cm = sg->best_cost(state.ret_entering[m.step_a], ret);
     if (!cm.feasible) {
       ret.clear();
@@ -778,7 +806,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto sg = Subgraph::create(prob, dag, expanded);
     if (!sg)
       return {SIZE_MAX, 0};
-    auto ret = filter_retain(state.steps[m.step_a].retain_these, *sg);
+    auto ret = filter_retain(state.steps[m.step_a].retain_these, *sg, state.ret_entering[m.step_a]);
     auto ce = sg->best_cost(state.ret_entering[m.step_a], ret);
     if (!ce.feasible)
       return {SIZE_MAX, 0};
@@ -813,7 +841,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto sg_s = Subgraph::create(prob, dag, {m.op});
     if (!sg_r || !sg_s) return {SIZE_MAX, 0};
     
-    auto rr = filter_retain(si.retain_these, *sg_r);
+    auto rr = filter_retain(si.retain_these, *sg_r, state.ret_entering[m.step_a]);
     auto cr = sg_r->best_cost(state.ret_entering[m.step_a], rr);
     auto cs = sg_s->best_cost({}, {});
     if (!cr.feasible || !cs.feasible) return {SIZE_MAX, 0};
@@ -946,7 +974,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
       c_a = sg_a->best_cost(state.ret_entering[m.step_a], {});
     }
     
-    auto vr = filter_retain(state.steps[m.step_a].retain_these, *sg_b);
+    // sg_b's entering is br (retained from sg_a); exclude those from its retain_these
+    auto vr = filter_retain(state.steps[m.step_a].retain_these, *sg_b, br);
     auto c_b = sg_b->best_cost(br, vr);
     if (!c_b.feasible) c_b = sg_b->best_cost(br, {});
     
@@ -967,18 +996,26 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     if (m.step_a >= state.size())
       return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
+    // Reject if tensor is already entering from the previous step —
+    // it would appear in both retained_from_prev and retain_these.
+    if (state.ret_entering[m.step_a].count(m.tensor))
+      return {SIZE_MAX, 0};
     auto nr = si.retain_these;
     nr.insert(m.tensor);
     auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
     if (!ci.feasible)
       return {SIZE_MAX, 0};
-    // Must also verify and update step_a+1 with new entering set
+    // Must also verify and update step_a+1 with new entering set.
+    // Strip new_ent from next step's retain_these to avoid overlap assertion.
     if (m.step_a + 1 < state.size()) {
       auto new_ent = nr; // what exits step_a = its retain set
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
-          new_ent, state.steps[m.step_a + 1].retain_these);
+      std::set<size_t> next_safe;
+      for (auto t2 : state.steps[m.step_a + 1].retain_these)
+          if (!new_ent.count(t2)) next_safe.insert(t2);
+      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(new_ent, next_safe);
       if (!cj.feasible)
         return {SIZE_MAX, 0};
+      state.steps[m.step_a + 1].retain_these = next_safe;
       state.steps[m.step_a + 1].config = cj.config;
     }
     si.retain_these = nr;
@@ -994,13 +1031,17 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
     if (!ci.feasible)
       return {SIZE_MAX, 0};
-    // Must also verify and update step_a+1 with new entering set
+    // Must also verify and update step_a+1 with new entering set.
+    // Strip new_ent from next step's retain_these to avoid overlap assertion.
     if (m.step_a + 1 < state.size()) {
       auto new_ent = nr;
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
-          new_ent, state.steps[m.step_a + 1].retain_these);
+      std::set<size_t> next_safe;
+      for (auto t2 : state.steps[m.step_a + 1].retain_these)
+          if (!new_ent.count(t2)) next_safe.insert(t2);
+      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(new_ent, next_safe);
       if (!cj.feasible)
         return {SIZE_MAX, 0};
+      state.steps[m.step_a + 1].retain_these = next_safe;
       state.steps[m.step_a + 1].config = cj.config;
     }
     si.retain_these = nr;
@@ -1762,6 +1803,13 @@ static void recompute_costs(const Problem& prob, const DAG& dag,
                             std::vector<ScheduleStep>& steps) {
     std::set<size_t> entering;
     for (size_t i = 0; i < steps.size(); i++) {
+        // Strip tensors already in entering from retain_these — they are already
+        // resident and must not appear in both retained_from_prev and retain_these.
+        std::set<size_t> safe_retain;
+        for (auto t : steps[i].retain_these)
+            if (!entering.count(t)) safe_retain.insert(t);
+        steps[i].retain_these = safe_retain;
+
         auto bc = steps[i].subgraph.best_cost(entering, steps[i].retain_these);
         if (!bc.feasible) {
             steps[i].retain_these.clear();
@@ -1838,6 +1886,20 @@ static bool apply_one_random_move(const Problem& prob, const DAG& dag,
             auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
             if (!ss || !sd) continue;
             if (Solution::creates_ephemeral_gap(prob, dag, nd, steps, c.dst, c.src)) continue;
+            // Topological check: op must not cross a data dependency boundary.
+            bool topo_ok = true;
+            if (c.dst < c.src) {
+                // Moving LEFT (op goes to earlier step):
+                // op must not depend on anything left behind in src.
+                for (auto pred : dag.op_preds[c.op])
+                    if (ns.count(pred)) { topo_ok = false; break; }
+            } else {
+                // Moving RIGHT (op goes to later step):
+                // nothing left behind in src may depend on op.
+                for (auto succ : dag.op_succs[c.op])
+                    if (ns.count(succ)) { topo_ok = false; break; }
+            }
+            if (!topo_ok) continue;
             auto sr = filter_retain(src.retain_these, *ss);
             auto dr = filter_retain(dst.retain_these, *sd);
             // Check feasibility with empty entering (conservative — recompute fixes later)
