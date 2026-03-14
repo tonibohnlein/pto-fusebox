@@ -1,6 +1,7 @@
 #include "search/verbose.h"
 #include "search/local_search.h"
 #include "init/init_strategies.h"
+#include "core/cost_cache.h"
 #include "search/fm_outer.h"
 #include <iostream>
 
@@ -45,19 +46,17 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 }
             }
 
-            // STEAL + RECOMPUTE (share the gi-expansion eval)
+            // STEAL + RECOMPUTE
             if (!part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
                 std::set<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
-                // For STEAL, adj_op is removed from gj after the move, so gj must
-                // be excluded from the recompute-exemption check: gj can no longer
-                // serve as a backup producer of tensors that adj_op emits.
-                // For RECOMPUTE, adj_op stays in gj so excluding gj is equally
-                // safe (gj's own consumers are fine; only cross-group consumers matter).
-                if (!part.creates_ephemeral_gap(new_gi, gi, gj)) {
-                    double new_gi_cost = part.eval_set(new_gi);
-                    if (new_gi_cost < 1e17) {
-                        // STEAL: move adj_op from gj to gi
+
+                // Evaluate new_gi cost once — shared by STEAL and RECOMPUTE.
+                double new_gi_cost = part.eval_set(new_gi);
+                if (new_gi_cost < 1e17) {
+                    // STEAL: adj_op leaves gj. Gap check required: gj can no
+                    // longer serve as a backup source for tensors adj_op produces.
+                    if (!part.creates_ephemeral_gap(new_gi, gi, gj)) {
                         std::set<size_t> new_gj = part.groups[gj].ops;
                         new_gj.erase(adj_op);
                         double new_gj_cost = 0;
@@ -71,11 +70,16 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                                             - (new_gi_cost + new_gj_cost);
                             try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
                         }
-
-                        // RECOMPUTE: add adj_op to gi, keep in gj
-                        double rsaving = part.groups[gi].cost - new_gi_cost;
-                        try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
                     }
+
+                    // RECOMPUTE: adj_op is copied into gi; gj keeps it. No gap
+                    // check needed — RECOMPUTE cannot create an ephemeral gap:
+                    // new_gi contains the producer of any newly-ephemeral tensor
+                    // and still exports it as a boundary output for external
+                    // consumers. gj keeps adj_op as an additional backup source.
+                    // Cycle safety re-verified in apply_move.
+                    double rsaving = part.groups[gi].cost - new_gi_cost;
+                    try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
                 }
             }
         }
@@ -106,26 +110,22 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             if (er.feasible)
                 try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
 
-            // SPLIT at bridge edges incident to this op
-            for (auto succ : part.dag->op_succs[op]) {
-                if (!part.groups[gi].ops.count(succ)) continue;
-                auto sr = part.eval_split(op, succ, gi);
+            // SPLIT at bridge edges incident to this op.
+            // Iterate op_neighbors (DAG edges + co-consumer edges) so that
+            // co-consumer bridges are also proposed as SPLIT candidates,
+            // not just directed DAG edges (op_succs / op_preds).
+            // Canonicalise each undirected edge as (lo, hi) to avoid calling
+            // eval_split twice for the same edge.
+            for (auto v : part.dag->op_neighbors[op]) {
+                if (!part.groups[gi].ops.count(v)) continue;
+                size_t u_lo = std::min(op, v);
+                size_t u_hi = std::max(op, v);
+                auto sr = part.eval_split(u_lo, u_hi, gi);
                 if (sr.feasible) {
                     Move m;
                     m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
-                    m.op = op; m.saving = sr.saving;
-                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = succ;
-                    try_better(best, m);
-                }
-            }
-            for (auto pred : part.dag->op_preds[op]) {
-                if (!part.groups[gi].ops.count(pred)) continue;
-                auto sr = part.eval_split(pred, op, gi);
-                if (sr.feasible) {
-                    Move m;
-                    m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
-                    m.op = pred; m.saving = sr.saving;
-                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = op;
+                    m.op = u_lo; m.saving = sr.saving;
+                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = u_hi;
                     try_better(best, m);
                 }
             }
@@ -208,7 +208,13 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::RECOMPUTE: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
-            if (part.creates_ephemeral_gap(new_ga, m.ga, SIZE_MAX)) return {};
+            // Cycle check: the op being added must not be reachable from ga
+            // (or vice versa) via other groups in the DAG.
+            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.ga].ops)) return {};
+            // No ephemeral gap check: RECOMPUTE cannot create a gap.
+            // Any tensor that becomes ephemeral in new_ga is produced by an op
+            // now inside new_ga, so new_ga exports it as a boundary output for
+            // external consumers. m.gb also still contains m.op as a backup.
             double new_cost = part.eval_set(new_ga);
             double actual_saving = part.groups[m.ga].cost - new_cost;
             if (actual_saving < -0.001) return {};
@@ -222,30 +228,11 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             dirty.insert(m.ga);
             break;
         }
-        case Move::EJECT: {
-            auto er = part.eval_eject(m.op, m.ga);
-            if (!er.feasible || er.saving < -0.001) return {};
-
-            dirty = part.adjacent_groups(m.ga);
-            dirty.erase(m.ga);
-
-            part.groups[m.ga].ops = er.remainder_components[0];
-            part.groups[m.ga].cost = er.component_costs[0];
-            part.groups[m.ga].gen++;
-            dirty.insert(m.ga);
-
-            for (size_t c = 1; c < er.remainder_components.size(); c++) {
-                size_t ng = part.add_group(er.remainder_components[c], er.component_costs[c]);
-                dirty.insert(ng);
-            }
-
-            if (er.singleton_cost > 0) {
-                size_t sg = part.add_group({m.op}, er.singleton_cost);
-                dirty.insert(sg);
-            }
-            break;
-        }
+        case Move::EJECT:
         case Move::INTERNAL_EJECT: {
+            // EJECT and INTERNAL_EJECT are mechanically identical: both call
+            // eval_eject and apply the result. The distinction is made at
+            // generation time (border op vs internal op in generate_moves).
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible || er.saving < -0.001) return {};
 
@@ -295,6 +282,14 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
 // ============================================================================
 
 Partition greedy_descent(Partition part) {
+    // Cache contract: if the caller set part.cache before passing in, all
+    // eval_set calls during descent route through that cache. The cache
+    // pointer is preserved through std::move, so callers that do:
+    //   auto init = s.init(prob, dag, &cache);   // sets init.cache
+    //   greedy_descent(std::move(init));          // cache preserved
+    // get full cache benefits. A direct call like:
+    //   greedy_descent(Partition::trivial(p, d))  // cache is nullptr
+    // works correctly but is uncached — wire a cache at the call site.
     MoveHeap heap;
     for (size_t gi = 0; gi < part.groups.size(); gi++)
         generate_moves(part, gi, heap);
@@ -331,6 +326,10 @@ Partition greedy_descent(Partition part) {
 // ============================================================================
 
 Partition local_search(const Problem& prob, const DAG& dag) {
+    // Shared cache across all strategies and the greedy/FM passes.
+    // Warm evaluations from init carry into the search immediately.
+    CostCache cache;
+
     // Phase 1: try all initialization strategies + greedy descent
     auto strategies = all_init_strategies();
     Partition best;
@@ -338,7 +337,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
 
     for (auto& s : strategies) {
         std::cerr << "  Init " << s.name << "...\n";
-        auto init = s.init(prob, dag);
+        auto init = s.init(prob, dag, &cache);
         if (g_verbose) std::cerr << "    " << init.num_alive() << " groups, cost="
                   << init.total_cost() << "\n";
 

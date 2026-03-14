@@ -26,6 +26,10 @@ struct PoolEntry {
     Partition partition;
     double cost = 1e18;
     std::string origin;
+
+    PoolEntry() = default;
+    PoolEntry(Partition p, double c, std::string o)
+        : partition(std::move(p)), cost(c), origin(std::move(o)) {}
 };
 
 // ============================================================================
@@ -239,8 +243,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             auto start = Clock::now();
             auto& task = gen0_task_list[tid];
 
-            auto part = strategies[task.strategy_idx].init(prob, dag);
-            part.cache = &shared_cache;
+            auto part = strategies[task.strategy_idx].init(prob, dag, &shared_cache);
             double init_cost = part.total_cost();
 
             part = greedy_descent(std::move(part));

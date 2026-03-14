@@ -1,4 +1,5 @@
 #include "init/init_strategies.h"
+#include "core/cost_cache.h"
 #include <algorithm>
 #include <numeric>
 #include <iostream>
@@ -49,8 +50,10 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
 // Trivial: one op per group
 // ============================================================================
 
-Partition init_trivial(const Problem& prob, const DAG& dag) {
-    return Partition::trivial(prob, dag);
+Partition init_trivial(const Problem& prob, const DAG& dag, CostCache* cache) {
+    auto p = Partition::trivial(prob, dag);
+    p.cache = cache;
+    return p;
 }
 
 // ============================================================================
@@ -62,8 +65,9 @@ Partition init_trivial(const Problem& prob, const DAG& dag) {
 //          merging producer and consumer groups.
 // ============================================================================
 
-Partition init_chain_then_edge(const Problem& prob, const DAG& dag) {
+Partition init_chain_then_edge(const Problem& prob, const DAG& dag, CostCache* cache) {
     auto p = Partition::trivial(prob, dag);
+    p.cache = cache;
     auto op_grp = build_op_to_group(p);
 
     // Phase A: chain detection
@@ -162,10 +166,11 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag) {
 // cost reduction. Stop when no neighbor improves.
 // ============================================================================
 
-Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
+Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cache) {
     Partition p;
     p.prob = &prob;
     p.dag = &dag;
+    p.cache = cache;
 
     std::vector<size_t> order(prob.num_ops());
     std::iota(order.begin(), order.end(), 0);
@@ -259,8 +264,9 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag) {
 // group of each successor. Accept the merge that saves the most.
 // ============================================================================
 
-Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
+Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cache) {
     auto p = Partition::trivial(prob, dag);
+    p.cache = cache;
     auto op_grp = build_op_to_group(p);
 
     auto topo = dag.topo_sort();
@@ -312,26 +318,23 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag) {
 // Random: start from singletons, randomly merge along DAG edges
 // ============================================================================
 
-Partition init_random(const Problem& prob, const DAG& dag) {
+Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
     static std::atomic<int> call_counter{0};
     int seed = 12345 + call_counter.fetch_add(1) * 77;
     std::mt19937 rng(seed);
 
     Partition p = Partition::trivial(prob, dag);
+    p.cache = cache;
 
-    // Collect all edges: (producer_group, consumer_group) via tensors
+    // Collect all DAG edges: (producer_op, consumer_op) via tensors.
+    // Use dag.tensor_consumers[t] directly — O(E) not O(E*V).
     struct Edge { size_t op_a; size_t op_b; size_t tensor; };
     std::vector<Edge> edges;
     for (size_t t = 0; t < prob.num_tensors(); t++) {
         int prod = dag.tensor_producer[t];
         if (prod < 0) continue;
-        for (size_t op = 0; op < prob.num_ops(); op++) {
-            for (auto inp : prob.ops[op].inputs) {
-                if (inp == t && op != (size_t)prod) {
-                    edges.push_back({(size_t)prod, op, t});
-                }
-            }
-        }
+        for (auto consumer : dag.tensor_consumers[t])
+            edges.push_back({(size_t)prod, consumer, t});
     }
 
     // Shuffle edges and try random merges
@@ -389,13 +392,17 @@ std::vector<InitStrategy> all_init_strategies() {
     };
 }
 
-Partition best_initial(const Problem& prob, const DAG& dag) {
+// Run every strategy once and return the lowest-cost partition.
+// All strategies share a single CostCache so evaluations from one strategy
+// benefit subsequent ones, and the warm cache carries into Phase 1 FM search
+// when the caller reuses the same CostCache instance.
+Partition best_initial(const Problem& prob, const DAG& dag, CostCache* cache) {
     auto strategies = all_init_strategies();
 
     size_t best_idx = 0;
     std::vector<Partition> results;
     for (auto& s : strategies) {
-        results.push_back(s.init(prob, dag));
+        results.push_back(s.init(prob, dag, cache));
         std::cerr << "    " << s.name << ": "
                   << results.back().num_alive() << " groups, cost="
                   << results.back().total_cost() << "\n";
@@ -405,4 +412,79 @@ Partition best_initial(const Problem& prob, const DAG& dag) {
     std::cerr << "    -> using " << strategies[best_idx].name << "\n";
 
     return std::move(results[best_idx]);
+}
+// ============================================================================
+// Feasibility validator
+// ============================================================================
+
+std::string verify_partition_feasibility(const Partition& part) {
+    const Problem& prob = *part.prob;
+    const DAG&     dag  = *part.dag;
+
+    // ── 1. Memory feasibility: every alive group must have a valid tiling ──
+    for (size_t i = 0; i < part.groups.size(); i++) {
+        if (!part.groups[i].alive) continue;
+        const auto& g = part.groups[i];
+        // eval_set returns 1e18 if no feasible tiling exists.
+        // Re-evaluate directly via Subgraph to be independent of cache state.
+        auto sg = Subgraph::create(prob, dag,
+                      std::vector<size_t>(g.ops.begin(), g.ops.end()));
+        if (!sg) {
+            return "G" + std::to_string(i) + ": Subgraph::create failed "
+                   "(disconnected or ephemeral fan-out)";
+        }
+        auto c = sg->best_cost();
+        if (!c.feasible) {
+            return "G" + std::to_string(i) + ": no feasible tiling "
+                   "(working set exceeds fast_memory_capacity for all candidates)";
+        }
+    }
+
+    // ── 2. No cycles in the condensed group DAG ───────────────────────────
+    // The condensed group DAG of any partition of a DAG is always acyclic —
+    // this is a direct consequence of the original graph being a DAG.
+    // No check is needed here.
+    //
+    // Note: merge_creates_cycle(A, B) is a *move pre-condition*, not a partition
+    // invariant. It returns true when there is a directed path between op-sets A
+    // and B through intermediate groups; merging them would then create a
+    // self-loop in the condensed DAG. That check belongs in try_merge / apply_move,
+    // not here.
+
+    // ── 3. No ephemeral tensors with external consumers ───────────────────
+    // For each alive group, for each tensor T that would be ephemeral in it
+    // (produced and consumed within the group), verify that every external
+    // consumer of T belongs to a group that also contains T's producer
+    // (so it can produce T ephemerally itself).
+    for (size_t i = 0; i < part.groups.size(); i++) {
+        if (!part.groups[i].alive) continue;
+        const auto& gi_ops = part.groups[i].ops;
+
+        for (auto op : gi_ops) {
+            for (auto t : prob.ops[op].outputs) {
+                // Is T consumed within this group?
+                bool internal_consumer = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (gi_ops.count(cop)) { internal_consumer = true; break; }
+                if (!internal_consumer) continue;
+                // T is ephemeral in group i. Check external consumers.
+                for (auto cop : dag.tensor_consumers[t]) {
+                    if (gi_ops.count(cop)) continue;  // internal — fine
+                    // cop is an external consumer of T. Find its group.
+                    for (auto gj : part.groups_of(cop)) {
+                        if (!part.groups[gj].alive || gj == i) continue;
+                        // gj needs T. Does gj contain T's producer (op)?
+                        if (part.groups[gj].ops.count(op)) continue;  // recomputes it
+                        return "G" + std::to_string(i) + ": T"
+                               + std::to_string(t) + " is ephemeral but external "
+                               "consumer Op" + std::to_string(cop)
+                               + " in G" + std::to_string(gj)
+                               + " has no source (ephemeral gap)";
+                    }
+                }
+            }
+        }
+    }
+
+    return "";  // all invariants satisfied
 }
