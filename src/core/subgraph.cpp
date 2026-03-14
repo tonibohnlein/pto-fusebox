@@ -57,18 +57,30 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   }
 
   // Classify tensors.
-  // A tensor produced AND consumed within the subgraph is ephemeral — it lives
-  // only in the tile buffer and is never transferred to/from slow memory.
-  // External consumers (if any) are satisfied by recomputation in their own
-  // subgraphs — that's a solution-level concern, not a subgraph-level one.
-  // (Confirmed by PROBLEM.md Ex3B: T1 is ephemeral in {Op0,Op1} even though
-  // Op2 in another subgraph also consumes T1. Op2's subgraph recomputes Op0.)
+  // A tensor is ephemeral if it is produced AND consumed within this subgraph
+  // AND has NO external consumers. Ephemeral tensors live only in the tile
+  // buffer and are never transferred to/from slow memory.
+  //
+  // If a tensor is produced and consumed internally BUT also has at least one
+  // external consumer, it must be a boundary_output: the hardware writes it to
+  // slow memory at subgraph completion so the downstream subgraph can load it.
+  // (Reference solution for benchmark 9 confirms this: T20 is produced by Op3
+  // and consumed by Op4 (both in {Op3,Op4,Op5,Op6}) but also needed by Op7 in
+  // the next subgraph — T20 must be a boundary_output, not ephemeral.)
   std::vector<bool> is_ephemeral(num_tensors, false);
+  // Precompute: does each tensor have at least one external consumer?
+  std::vector<bool> has_external_consumer(num_tensors, false);
+  for (size_t t = 0; t < num_tensors; t++) {
+    if (!is_produced[t]) continue;
+    for (auto cons : dag.tensor_consumers[t])
+      if (!is_in_sg[cons]) { has_external_consumer[t] = true; break; }
+  }
 
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t])
+    // Ephemeral only if ALL consumers are internal (no external consumers)
+    if (is_produced[t] && is_consumed[t] && !has_external_consumer[t])
       is_ephemeral[t] = true;
   }
   for (size_t t = 0; t < num_tensors; t++) {
@@ -287,11 +299,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
   }
 
-  // ---- Build O(1) tensor→info lookup ----
-  sg.tensor_id_to_info_.assign(num_tensors, -1);
-  for (int idx = 0; idx < (int)sg.boundary_tensor_info_.size(); idx++)
-    sg.tensor_id_to_info_[sg.boundary_tensor_info_[idx].id] = idx;
-
   // ---- Build tiling candidates ----
   auto gcd_of = [](const std::vector<int64_t>& vals) -> int64_t {
     if (vals.empty()) return 0;
@@ -341,13 +348,6 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
-  // Invalid tilings produce meaningless working sets.  Guard here so callers
-  // that invoke working_set directly (e.g. tests, partition analysis) don't
-  // silently get garbage for configs that violate divisibility rules.
-  // compute_cost / is_feasible already check validity first, so this only
-  // matters for direct calls to working_set.
-  if (!is_valid_tiling(cfg)) return std::numeric_limits<int64_t>::max();
-
   // Sanity check: a tensor should never be in both sets simultaneously.
   // retained_from_prev = carried into this step; retain_these = kept after this
   // step. They refer to different step boundaries and must be disjoint.
@@ -397,10 +397,11 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   // ---- retained_from_prev tensors NOT in boundary_tensor_info_ ----
   // A tensor carried from the previous step that this subgraph does not
   // directly use still occupies fast memory and must be counted.
-  // Use O(1) lookup instead of linear scan over boundary_tensor_info_.
   for (auto t : retained_from_prev) {
-    bool in_info = (t < tensor_id_to_info_.size() && tensor_id_to_info_[t] >= 0);
-    if (!in_info)
+    bool found = false;
+    for (auto &info : boundary_tensor_info_)
+      if (info.id == t) { found = true; break; }
+    if (!found)
       ws += prob_->tensors[t].size();
   }
 

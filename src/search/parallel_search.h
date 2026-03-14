@@ -19,6 +19,8 @@ struct ParallelConfig {
     int tasks_per_init = 0;  // 0 = auto (~1 task per thread)
     int pool_size = 8;       // max partitions to keep in pool
     FMOuterConfig fm;        // FM settings propagated to every task
+    bool early_stop = true;  // stop after 25 non-improving generations
+                             // set false when Phase 1 owns the full budget
 };
 
 std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,

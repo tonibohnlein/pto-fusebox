@@ -293,6 +293,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::atomic<int> next_task{0};
 
     auto gen0_worker = [&]() {
+        g_verbose = false;  // suppress per-move output from worker threads
         while (true) {
             int tid = next_task.fetch_add(1);
             if (tid >= gen0_tasks) break;
@@ -332,7 +333,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         }
     };
 
-    g_verbose = false;  // disable verbose before spawning threads
     std::cerr << "  Gen 0: " << gen0_tasks << " tasks on " 
               << std::min(num_threads, gen0_tasks) << " threads\n";
     {
@@ -378,6 +378,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         next_task.store(0);
 
         auto evo_worker = [&]() {
+            g_verbose = false;
             while (true) {
                 int tid = next_task.fetch_add(1);
                 if (tid >= mut_tasks) break;
@@ -468,7 +469,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             gens_no_improve++;
         }
 
-        if (gens_no_improve >= 25) {
+        if (cfg.early_stop && gens_no_improve >= 25) {
             std::cerr << "  Stopping after " << gen << " generations\n";
             break;
         }

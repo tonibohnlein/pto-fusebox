@@ -50,6 +50,11 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
     std::cerr << "Phase 1: Parallel search...\n";
     ParallelConfig pcfg;
     pcfg.fm.deadline = phase1_dl;
+    // When there are no retainable tensors Phase 3 is skipped entirely, so
+    // Phase 1 owns ~95% of the budget. Disable early-stop so the evo loop
+    // keeps running until the deadline rather than quitting after 25 stagnant
+    // generations (~1s) and leaving 12s unused.
+    pcfg.early_stop = has_retain;
     auto partition_pool = parallel_search(prob, dag, pcfg);
 
     std::cerr << "  Partition pool: " << partition_pool.size()
