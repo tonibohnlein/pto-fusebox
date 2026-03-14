@@ -180,7 +180,7 @@ void test_init_strategies() {
               << " groups=" << p.num_ops() << "\n";
 
     for (auto& s : strategies) {
-        auto part = s.init(p, d);
+        auto part = s.init(p, d, nullptr);
         bool valid = validate_partition(part, p, d);
         CHECK(("init " + s.name + " valid").c_str(), valid);
         CHECK_LE(("init " + s.name + " ≤ trivial").c_str(), part.total_cost(), trivial_cost);
@@ -199,7 +199,7 @@ void test_greedy_descent_all() {
 
     auto strategies = all_init_strategies();
     for (auto& s : strategies) {
-        auto init = s.init(p, d);
+        auto init = s.init(p, d, nullptr);
         double before = init.total_cost();
         auto after = greedy_descent(std::move(init));
         bool valid = validate_partition(after, p, d);
@@ -415,7 +415,7 @@ void test_mm_diamond() {
     CHECK("{1,2,3} feasible", sg_123.has_value());
 
     // Greedy should find a good partition
-    auto part = best_initial(p, d);
+    auto part = best_initial(p, d, nullptr);
     part = greedy_descent(std::move(part));
     bool valid = validate_partition(part, p, d);
     CHECK("mm diamond partition valid", valid);
@@ -446,7 +446,7 @@ void test_parallel_mm() {
     CHECK("fusion helps", all_fused < all_sep);
 
     // Init strategies should discover co-consumer fusion
-    auto part = best_initial(p, d);
+    auto part = best_initial(p, d, nullptr);
     part = greedy_descent(std::move(part));
     std::cout << "  Greedy: " << part.num_alive() << " groups, cost="
               << part.total_cost() << "\n";

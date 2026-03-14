@@ -55,7 +55,7 @@ set(TEST_SOURCES
     test/cost_cache_test.cpp
     test/evolution_test.cpp
     test/solution_search_test.cpp
-    #test/sanity_test.cpp
+    test/sanity_test.cpp
     test/partition_fm_test.cpp
     test/more_unit_tests.cpp
     test/io_test.cpp
@@ -66,6 +66,7 @@ set(TEST_SOURCES
     test/partition_test.cpp
     test/parallel_search_test.cpp
     test/ordering_test.cpp
+    test/solver_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

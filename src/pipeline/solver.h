@@ -26,5 +26,5 @@
 // deadline = TimePoint::max() → use a default 5-second internal budget.
 // ============================================================================
 
-Solution solve(const Problem& prob,
+Solution solve(const Problem& prob, const DAG& dag,
                TimePoint deadline = TimePoint::max());

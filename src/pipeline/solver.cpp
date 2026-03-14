@@ -18,8 +18,7 @@
 // Full pipeline
 // ============================================================================
 
-Solution solve(const Problem& prob, TimePoint deadline) {
-    DAG dag = DAG::build(prob);
+Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
     auto now              = SteadyClock::now();
     auto effective_dl     = deadline;

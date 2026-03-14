@@ -1,4 +1,5 @@
 #include "io/io.h"
+#include "core/dag.h"
 #include "pipeline/solver.h"
 #include "search/verbose.h"
 #include <iostream>
@@ -71,7 +72,8 @@ int main(int argc, char* argv[]) {
     std::cerr << "Time budget: " << std::fixed << std::setprecision(0)
               << budget << "s (deadline=" << (budget * 0.95) << "s)\n\n";
 
-    auto sol = solve(prob, deadline);
+    DAG dag = DAG::build(prob);
+    auto sol = solve(prob, dag, deadline);
 
     auto elapsed = std::chrono::duration<double>(SteadyClock::now() - start).count();
 

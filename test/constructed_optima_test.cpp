@@ -79,7 +79,7 @@ void test_fuse_all_optimal() {
     CHECK("fused < sep", fused4 < all_sep);
 
     // Run solver
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     CHECK_LE("solver finds optimal", sol.total_latency(), fused4);
 }
@@ -140,7 +140,7 @@ void test_mm_chain_tight_memory() {
 
     std::cout << "  separate=" << sep << " fused=" << fused << "\n";
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     CHECK_LE("solver ≤ separate", sol.total_latency(), sep + 1);
     CHECK_LE("solver ≤ fused", sol.total_latency(), fused + 1);
@@ -184,7 +184,7 @@ void test_diamond_retain_optimal() {
               << " retain_strat=" << retain_strat << "\n";
     CHECK_EQ("best_no_retain", best_no_retain, 6553.6);
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     // Solver should find at least the no-retain partition; with retain it could do 4638.4
     CHECK_LE("solver ≤ no_retain", sol.total_latency(), best_no_retain + 1);
@@ -238,7 +238,7 @@ void test_memory_bound_fusion() {
     CHECK_EQ("sep", sep, 39321.6);
     CHECK_EQ("fused", fused3, 13107.2);
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     CHECK_LE("solver finds fused", sol.total_latency(), fused3 + 1);
 }
@@ -332,7 +332,7 @@ void test_snake_direction_matters() {
     // RM and raster give the same tile pattern. So RM ≤ none.
     CHECK("RM <= none", c_rm.latency <= c_none.latency + 0.1);
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     CHECK_LE("solver picks RM", sol.total_latency(), c_rm.latency + 1);
 }
@@ -413,7 +413,7 @@ void test_recompute_optimal() {
 
     CHECK("recompute < sep", recomp < all_sep);
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << " optimal=" << recomp << "\n";
     CHECK_LE("solver ≤ recompute", sol.total_latency(), recomp + 1);
 }
@@ -440,7 +440,7 @@ void test_splitk_fusion() {
 
     double optimal = 6915.2;
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << " optimal=" << optimal << "\n";
     CHECK_LE("solver ≤ splitk optimal", sol.total_latency(), optimal + 1);
 }
@@ -482,7 +482,7 @@ void test_retain_helps() {
     std::cout << "  fused=" << fused << " sep=" << sep << "\n";
     CHECK("fused < sep", fused < sep);
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
     CHECK_LE("solver ≤ fused", sol.total_latency(), fused + 1);
 }
@@ -514,7 +514,7 @@ void test_all_partitions_equal() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << " (expected ~480000)\n";
     CHECK_EQ("compute-bound equal", sol.total_latency(), 480000.0, 100);
 }
@@ -554,7 +554,7 @@ void test_wide_fanout_recompute() {
     double recompute_all = 4 * 3276.8;  // 13107.2
     double all_sep = 3276.8 + 4 * 3276.8;  // 16384
 
-    auto sol = solve(p);
+    DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency()
               << " recompute=" << recompute_all << " sep=" << all_sep << "\n";
     CHECK_LE("solver ≤ recompute", sol.total_latency(), recompute_all + 1);
