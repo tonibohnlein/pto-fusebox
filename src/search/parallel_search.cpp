@@ -236,7 +236,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::atomic<int> next_task{0};
 
     auto gen0_worker = [&]() {
-        g_verbose = false;
         while (true) {
             int tid = next_task.fetch_add(1);
             if (tid >= gen0_tasks) break;
@@ -276,6 +275,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         }
     };
 
+    g_verbose = false;  // disable verbose before spawning threads
     std::cerr << "  Gen 0: " << gen0_tasks << " tasks on " 
               << std::min(num_threads, gen0_tasks) << " threads\n";
     {
@@ -287,7 +287,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
     std::vector<PoolEntry> pool;
     for (auto& r : gen0_results)
-        pool_insert(pool, std::move(r), cfg.pool_size);
+        if (r.cost < 1e17)  // guard: task may have been cancelled before storing a result
+            pool_insert(pool, std::move(r), cfg.pool_size);
     for (auto& r : gen0_end_partitions)
         if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size);
@@ -320,7 +321,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         next_task.store(0);
 
         auto evo_worker = [&]() {
-            g_verbose = false;
             while (true) {
                 int tid = next_task.fetch_add(1);
                 if (tid >= mut_tasks) break;

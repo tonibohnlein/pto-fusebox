@@ -139,6 +139,10 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     new_dst.insert(op);
+    // Gap check: exclude only dst_gi (being replaced by new_dst).
+    // Do NOT exclude src_gi: src_gi still exists as new_src after the move,
+    // and external consumers of ephemeral tensors may reside there.
+    // Excluding src_gi would hide those consumers, causing false negatives.
     if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
@@ -236,6 +240,8 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     for (auto op : block) new_dst.insert(op);
+    // Gap check: exclude only dst_gi (being replaced by new_dst).
+    // Do NOT exclude src_gi: src_gi still exists as remainder after the move.
     if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
@@ -367,13 +373,22 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         return part;
     }
     
-    // Fallback: extract just the consumer ops (+ producer) into a new group
+    // Fallback: extract just the consumer ops (+ producer) into a new group.
     std::set<size_t> extract_ops;
     for (auto cop : dag.tensor_consumers[t])
         extract_ops.insert(cop);
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
     
+    // Cycle check: verify the extracted group doesn't form a cycle with any
+    // non-empty remainder group. merge_creates_cycle(A,{}) is always false
+    // (empty B has no ops to reach into), so check pairwise vs remainders.
+    for (auto gi : group_list) {
+        std::set<size_t> rem;
+        for (auto op : part.groups[gi].ops)
+            if (!extract_ops.count(op)) rem.insert(op);
+        if (!rem.empty() && dag.merge_creates_cycle(extract_ops, rem)) return part;
+    }
     if (part.creates_ephemeral_gap(extract_ops, group_list_vec)) return part;
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;

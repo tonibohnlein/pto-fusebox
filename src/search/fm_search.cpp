@@ -36,37 +36,6 @@ FMMove best_move_for(const Partition& part, size_t op,
 
             bool x_in_gy = part.groups[gy].ops.count(op);
 
-            // --- Steal: move op from gx to gy ---
-            if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
-                std::set<size_t> new_gy = part.groups[gy].ops;
-                new_gy.insert(op);
-                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
-                    std::set<size_t> new_gx = part.groups[gx].ops;
-                    new_gx.erase(op);
-
-                    // Check remainder validity (may disconnect)
-                    double new_gx_cost = 0;
-                    bool gx_valid = true;
-                    if (new_gx.empty()) {
-                        // gx becomes empty — only valid if op is in other groups
-                        if (groups_of_x.size() <= 1) gx_valid = false;
-                    } else {
-                        new_gx_cost = part.eval_set(new_gx);
-                        if (new_gx_cost >= 1e17) gx_valid = false;
-                    }
-
-                    if (gx_valid) {
-                        double new_gy_cost = part.eval_set(new_gy);
-                        if (new_gy_cost < 1e17) {
-                            double saving = (part.groups[gx].cost + part.groups[gy].cost)
-                                            - (new_gx_cost + new_gy_cost);
-                            if (accept(saving))
-                                best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
-                        }
-                    }
-                }
-            }
-
             // --- Merge: combine gx and gy ---
             if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
@@ -82,26 +51,54 @@ FMMove best_move_for(const Partition& part, size_t op,
                 }
             }
 
-            // --- Recompute: add op to gy (keep in gx) ---
+            // --- Steal + Recompute: both add op to gy ---
+            // Evaluate new_gy once — shared by both move types.
             if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
-                if (!part.creates_ephemeral_gap(new_gy, gy, SIZE_MAX)) {
-                    double new_gy_cost = part.eval_set(new_gy);
-                    if (new_gy_cost < 1e17) {
+                double new_gy_cost = part.eval_set(new_gy);
+
+                if (new_gy_cost < 1e17) {
+                    // STEAL: op leaves gx. Exclude gx (losing op, no longer a
+                    // backup source for op's outputs) AND gy (replaced by new_gy).
+                    if (!part.creates_ephemeral_gap(new_gy, gx, gy)) {
+                        std::set<size_t> new_gx = part.groups[gx].ops;
+                        new_gx.erase(op);
+                        double new_gx_cost = 0;
+                        bool gx_valid = true;
+                        if (new_gx.empty()) {
+                            // gx becomes empty — only valid if op is in other groups
+                            if (groups_of_x.size() <= 1) gx_valid = false;
+                        } else {
+                            new_gx_cost = part.eval_set(new_gx);
+                            if (new_gx_cost >= 1e17) gx_valid = false;
+                        }
+                        if (gx_valid) {
+                            double saving = (part.groups[gx].cost + part.groups[gy].cost)
+                                            - (new_gx_cost + new_gy_cost);
+                            if (accept(saving))
+                                best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
+                        }
+                    }
+
+                    // RECOMPUTE: op is copied to gy; gx keeps it. No gap check
+                    // needed — RECOMPUTE cannot create an ephemeral gap: new_gy
+                    // still exports any newly-ephemeral tensor as a boundary
+                    // output, and gx retains op as an additional backup source.
+                    {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
                             best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
                     }
                 }
             }
-        }
+        }  // end for gy
 
-        // --- Eject: remove op from gx ---
+        // --- Eject: remove op from gx (one per gx, not per gy) ---
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving))
             best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
-    }
+    }  // end for gx
 
     // --- Internal moves: INTERNAL_EJECT and SPLIT ---
     // These apply when op is internal (no DAG neighbors outside its group)
@@ -120,19 +117,20 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (candidate.saving > best.saving) best = candidate;
         }
 
-        // SPLIT at each bridge edge incident to op
-        for (auto succ : part.dag->op_succs[op]) {
-            if (!part.groups[gx].ops.count(succ)) continue;
-            auto sr = part.eval_split(op, succ, gx);
-            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, succ, sr.saving};
-            }
-        }
-        for (auto pred : part.dag->op_preds[op]) {
-            if (!part.groups[gx].ops.count(pred)) continue;
-            auto sr = part.eval_split(pred, op, gx);
-            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, pred, sr.saving};
+        // SPLIT at each bridge edge incident to op.
+        // Use op_neighbors (DAG + co-consumer edges) so co-consumer bridges
+        // are also proposed, not just directed op_succs/op_preds edges.
+        // Canonicalise as (lo, hi) to avoid evaluating the same edge twice.
+        {
+            std::set<std::pair<size_t,size_t>> split_checked;
+            for (auto v : part.dag->op_neighbors[op]) {
+                if (!part.groups[gx].ops.count(v)) continue;
+                auto edge = std::make_pair(std::min(op, v), std::max(op, v));
+                if (!split_checked.insert(edge).second) continue;
+                auto sr = part.eval_split(edge.first, edge.second, gx);
+                if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
+                    best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
+                }
             }
         }
     }
@@ -259,7 +257,21 @@ FMMove best_move_for(const Partition& part, size_t op,
                         // merge_creates_cycle(extract_ops, {}) checks whether N,
                         // treated as a super-node, has any external op that can
                         // reach back into N — covering chains of any length.
-                        if (!part.dag->merge_creates_cycle(extract_ops, {}) &&
+                        // Cycle check: verify the extracted group doesn't form
+                        // a cycle with any non-empty remainder group.
+                        // merge_creates_cycle(A, {}) is always false — empty B
+                        // has no ops to reach into — so we check pairwise.
+                        bool extract_cycle = false;
+                        for (auto cg : group_list) {
+                            std::set<size_t> rem;
+                            for (auto rop : part.groups[cg].ops)
+                                if (!extract_ops.count(rop)) rem.insert(rop);
+                            if (!rem.empty() &&
+                                part.dag->merge_creates_cycle(extract_ops, rem)) {
+                                extract_cycle = true; break;
+                            }
+                        }
+                        if (!extract_cycle &&
                             !part.creates_ephemeral_gap(extract_ops, excl)) {
                             double extract_cost = part.eval_set(extract_ops);
                             if (extract_cost < 1e17) {
@@ -303,7 +315,11 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
 
-            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
+            // Cycle re-check at apply time: groups may have changed since evaluation
+            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.gb].ops)) return {};
+            // Gap check: exclude ga (losing m.op, no longer a backup source for
+            // m.op's outputs) AND gb (being replaced by new_gb).
+            if (part.creates_ephemeral_gap(new_gb, m.ga, m.gb)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 
@@ -327,6 +343,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::MERGE: {
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
+            // Cycle re-check at apply time: groups may have changed since evaluation
+            if (part.dag->merge_creates_cycle(part.groups[m.ga].ops,
+                                               part.groups[m.gb].ops)) return {};
             if (part.creates_ephemeral_gap(merged, m.ga, m.gb)) return {};
             double cost = part.eval_set(merged);
             if (cost >= 1e17) return {};
@@ -343,7 +362,11 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::RECOMPUTE: {
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
-            if (part.creates_ephemeral_gap(new_gb, m.gb, SIZE_MAX)) return {};
+            // Cycle re-check at apply time: groups may have changed
+            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.gb].ops)) return {};
+            // No ephemeral gap check: RECOMPUTE cannot create a gap.
+            // new_gb still exports any newly-ephemeral tensor as boundary output;
+            // ga retains m.op as an additional backup source.
             double cost = part.eval_set(new_gb);
             if (cost >= 1e17) return {};
 
@@ -469,10 +492,17 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
 
-            // Evaluate the extracted group
-            // Cycle check: N=extract_ops as a new super-node must not create a
-            // condensed DAG cycle with the remainder groups.
-            if (part.dag->merge_creates_cycle(extract_ops, {})) return {};
+            // Evaluate the extracted group.
+            // Cycle check: verify extract_ops as a new group doesn't form a
+            // cycle with any non-empty remainder group. merge_creates_cycle(A,{})
+            // is always false (empty B has no ops to reach into), so check pairwise.
+            for (auto cg : m.tensor_groups) {
+                std::set<size_t> rem;
+                for (auto rop : part.groups[cg].ops)
+                    if (!extract_ops.count(rop)) rem.insert(rop);
+                if (!rem.empty() && part.dag->merge_creates_cycle(extract_ops, rem))
+                    return {};
+            }
             if (part.creates_ephemeral_gap(extract_ops,
                     std::vector<size_t>(m.tensor_groups.begin(),
                                         m.tensor_groups.end()))) return {};

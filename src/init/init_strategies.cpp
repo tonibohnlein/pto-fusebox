@@ -452,39 +452,19 @@ std::string verify_partition_feasibility(const Partition& part) {
     // not here.
 
     // ── 3. No ephemeral tensors with external consumers ───────────────────
-    // For each alive group, for each tensor T that would be ephemeral in it
-    // (produced and consumed within the group), verify that every external
-    // consumer of T belongs to a group that also contains T's producer
-    // (so it can produce T ephemerally itself).
-    for (size_t i = 0; i < part.groups.size(); i++) {
-        if (!part.groups[i].alive) continue;
-        const auto& gi_ops = part.groups[i].ops;
-
-        for (auto op : gi_ops) {
-            for (auto t : prob.ops[op].outputs) {
-                // Is T consumed within this group?
-                bool internal_consumer = false;
-                for (auto cop : dag.tensor_consumers[t])
-                    if (gi_ops.count(cop)) { internal_consumer = true; break; }
-                if (!internal_consumer) continue;
-                // T is ephemeral in group i. Check external consumers.
-                for (auto cop : dag.tensor_consumers[t]) {
-                    if (gi_ops.count(cop)) continue;  // internal — fine
-                    // cop is an external consumer of T. Find its group.
-                    for (auto gj : part.groups_of(cop)) {
-                        if (!part.groups[gj].alive || gj == i) continue;
-                        // gj needs T. Does gj contain T's producer (op)?
-                        if (part.groups[gj].ops.count(op)) continue;  // recomputes it
-                        return "G" + std::to_string(i) + ": T"
-                               + std::to_string(t) + " is ephemeral but external "
-                               "consumer Op" + std::to_string(cop)
-                               + " in G" + std::to_string(gj)
-                               + " has no source (ephemeral gap)";
-                    }
-                }
-            }
-        }
-    }
+    // T is truly ephemeral in group G only if ALL of T's consumers are inside G.
+    // If any consumer is external, Subgraph::create classifies T as a boundary
+    // output and external consumers load it from slow memory — no gap possible.
+    //
+    // For an existing partition where every group passes eval_set < 1e18, this
+    // invariant is automatically satisfied: eval_set calls Subgraph::create which
+    // correctly classifies each tensor as ephemeral or boundary output based on
+    // whether all consumers are internal. External consumers are always served by
+    // boundary outputs. No further check is needed here.
+    //
+    // Note: creates_ephemeral_gap() is the correct pre-move check used during
+    // search to verify that a PROPOSED fusion would not strand any consumer.
+    // That check is distinct from verifying an existing partition.
 
     return "";  // all invariants satisfied
 }

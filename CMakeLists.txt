@@ -62,7 +62,9 @@ set(TEST_SOURCES
     test/dag_test.cpp
     test/subgraph_test.cpp
     test/cost_model_test.cpp
+    test/fm_search_test.cpp
     test/partition_test.cpp
+    test/parallel_search_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
