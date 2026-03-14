@@ -57,18 +57,18 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   }
 
   // Classify tensors.
-  // A tensor is ephemeral if it is produced AND consumed within this subgraph
-  // AND has NO external consumers. Ephemeral tensors live only in the tile
-  // buffer and are never transferred to/from slow memory.
-  //
-  // If a tensor is produced and consumed internally BUT also has at least one
-  // external consumer, it must be a boundary_output: the hardware writes it to
-  // slow memory at subgraph completion so the downstream subgraph can load it.
-  // (Reference solution for benchmark 9 confirms this: T20 is produced by Op3
-  // and consumed by Op4 (both in {Op3,Op4,Op5,Op6}) but also needed by Op7 in
-  // the next subgraph — T20 must be a boundary_output, not ephemeral.)
+  // A tensor produced AND consumed within the subgraph is ephemeral — it lives
+  // only in the tile buffer and is never transferred to/from slow memory.
+  // External consumers (if any) are satisfied by recomputation in their own
+  // subgraphs — that's a solution-level concern, not a subgraph-level one.
+  // (Confirmed by PROBLEM.md Ex3B: T1 is ephemeral in {Op0,Op1} even though
+  // Op2 in another subgraph also consumes T1. Op2's subgraph recomputes Op0.)
+  // A tensor is ephemeral only if ALL its consumers are internal to this
+  // subgraph. If any consumer is external, the tensor must be a boundary
+  // output — it needs to be written to slow memory so other subgraphs can
+  // load it. Ephemeral gap enforcement is the responsibility of the
+  // partition layer (creates_ephemeral_gap) and solution validation, not here.
   std::vector<bool> is_ephemeral(num_tensors, false);
-  // Precompute: does each tensor have at least one external consumer?
   std::vector<bool> has_external_consumer(num_tensors, false);
   for (size_t t = 0; t < num_tensors; t++) {
     if (!is_produced[t]) continue;
@@ -79,7 +79,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    // Ephemeral only if ALL consumers are internal (no external consumers)
     if (is_produced[t] && is_consumed[t] && !has_external_consumer[t])
       is_ephemeral[t] = true;
   }

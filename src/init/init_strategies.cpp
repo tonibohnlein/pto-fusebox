@@ -206,28 +206,10 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
                 std::set<size_t> expanded = group;
                 expanded.insert(cand);
 
-                // Check: would this expansion create an ephemeral tensor
-                // with external consumers? During init, unassigned ops will
-                // go to singleton groups without recomputation, so any
-                // external consumer of an ephemeral tensor = future gap.
-                bool has_gap = false;
-                for (auto op : expanded) {
-                    for (auto t : prob.ops[op].outputs) {
-                        // Is T consumed internally in expanded?
-                        bool consumed_in = false;
-                        for (auto cop : dag.tensor_consumers[t])
-                            if (expanded.count(cop)) { consumed_in = true; break; }
-                        if (!consumed_in) continue;
-                        // T would be ephemeral. Any external consumer?
-                        for (auto cop : dag.tensor_consumers[t]) {
-                            if (!expanded.count(cop)) { has_gap = true; break; }
-                        }
-                        if (has_gap) break;
-                    }
-                    if (has_gap) break;
-                }
-                if (has_gap) continue;
-
+                // Ephemeral gap check is handled by Subgraph::create (via
+                // eval_set): tensors with external consumers become boundary
+                // outputs, not ephemeral. creates_ephemeral_gap handles the
+                // partition-level constraint. No manual check needed here.
                 double cost = p.eval_set(expanded);
                 if (cost < best_cost - 0.01) {
                     best_cost = cost;
