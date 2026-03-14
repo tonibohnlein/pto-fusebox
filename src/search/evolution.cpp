@@ -374,9 +374,6 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
     
-    // Cycle check: N=extract_ops as a new super-node must not create a
-    // condensed DAG cycle with the remainder groups.
-    if (dag.merge_creates_cycle(extract_ops, {})) return part;
     if (part.creates_ephemeral_gap(extract_ops, group_list_vec)) return part;
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
@@ -496,12 +493,34 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         double best_cost = 1e18;
         size_t best_gi = SIZE_MAX;
         
+        // Gap check for crossover: child is only partially built, so external
+        // consumers of an ephemeral tensor may not yet be in any child group.
+        // child.creates_ephemeral_gap() is blind to those unassigned ops
+        // (groups_of returns empty).  Add a second pass: if any external consumer
+        // of an ephemeral tensor is unassigned, treat it as a definite gap —
+        // crossover never creates recompute groups, so that consumer will end up
+        // in a group that does not contain the producer.
+        auto would_gap = [&](const std::set<size_t>& proposed, size_t excl_gi) -> bool {
+            if (child.creates_ephemeral_gap(proposed, excl_gi, SIZE_MAX)) return true;
+            for (auto op : proposed) {
+                for (auto t : prob.ops[op].outputs) {
+                    bool consumed_in = false;
+                    for (auto cop : dag.tensor_consumers[t])
+                        if (proposed.count(cop)) { consumed_in = true; break; }
+                    if (!consumed_in) continue;
+                    for (auto cop : dag.tensor_consumers[t])
+                        if (!proposed.count(cop) && child.groups_of(cop).empty())
+                            return true;
+                }
+            }
+            return false;
+        };
+
         for (auto gi : adj_child_groups) {
             if (child.dag->merge_creates_cycle(cluster, child.groups[gi].ops)) continue;
-
             std::set<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
-            if (child.creates_ephemeral_gap(merged, gi, SIZE_MAX)) continue;
+            if (would_gap(merged, gi)) continue;
             double c = child.eval_set(merged);
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;

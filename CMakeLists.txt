@@ -57,6 +57,7 @@ set(TEST_SOURCES
     test/solution_search_test.cpp
     test/sanity_test.cpp
     test/partition_fm_test.cpp
+    test/more_unit_tests.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

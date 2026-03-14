@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <cassert>
 
 // ============================================================================
 // Utility
@@ -332,15 +333,38 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 // ============================================================================
 // Working set
 // ============================================================================
-
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
+  // Sanity check: a tensor should never be in both sets simultaneously.
+  // retained_from_prev = carried into this step; retain_these = kept after this
+  // step. They refer to different step boundaries and must be disjoint.
+#ifndef NDEBUG
+  for (auto t : retain_these)
+    assert(!retained_from_prev.count(t) &&
+           "tensor appears in both retained_from_prev and retain_these — "
+           "double-counting would corrupt working set");
+#endif
+
   int64_t ws = 0;
 
+  // ---- Main boundary tensor loop ----
+  // For each boundary tensor, charge the maximum fast-memory footprint it
+  // occupies during a single tile step:
+  //   • retained_from_prev  → full tensor is already resident; charge full_size.
+  //   • retain_these        → SKIP here; their full sizes are added in the
+  //                           post-pass below.  Removing them from the per-tile
+  //                           accounting avoids the role-based mismatch
+  //                           (LHS strips are h×K, not h×w) that plagued the
+  //                           old "full - tile" subtraction.
+  //   • everything else     → charge the role-based tile slice.
   for (auto &info : boundary_tensor_info_) {
     if (retained_from_prev.count(info.id)) {
       ws += info.full_size;
+      continue;
+    }
+    if (retain_these.count(info.id)) {
+      // Handled in post-pass; skip per-tile slice accounting.
       continue;
     }
 
@@ -353,15 +377,14 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.h * cfg.w);
     if (info.is_mm_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
-    // PW boundary outputs need their tile in fast memory too.
-    // (Redundant for MM outputs where is_mm_out already covers this.)
     if (info.is_boundary_out)
       max_size = std::max(max_size, cfg.h * cfg.w);
-
     ws += max_size;
   }
 
-  // Retained-from-prev tensors NOT in boundary_tensor_info_
+  // ---- retained_from_prev tensors NOT in boundary_tensor_info_ ----
+  // A tensor carried from the previous step that this subgraph does not
+  // directly use still occupies fast memory and must be counted.
   for (auto t : retained_from_prev) {
     bool found = false;
     for (auto &info : boundary_tensor_info_)
@@ -370,33 +393,13 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       ws += prob_->tensors[t].size();
   }
 
-  // Retained output accumulation
-  for (auto t : retain_these) {
-    int64_t full = prob_->tensors[t].size();
-    int64_t tile = cfg.h * cfg.w;
-    if (full <= tile)
-      continue;
-
-    bool tile_counted = false;
-    for (auto &info : boundary_tensor_info_) {
-      if (info.id == t) {
-        int64_t sz = 0;
-        if (info.max_lhs_K > 0) sz = std::max(sz, cfg.h * info.max_lhs_K);
-        if (info.is_mm_rhs) sz = std::max(sz, cfg.k * cfg.w);
-        if (info.is_pw_in) sz = std::max(sz, cfg.h * cfg.w);
-        if (info.is_mm_out) sz = std::max(sz, cfg.h * cfg.w);
-        if (info.is_boundary_out) sz = std::max(sz, cfg.h * cfg.w);
-        if (retained_from_prev.count(t)) sz = full;
-        tile_counted = (sz > 0);
-        break;
-      }
-    }
-
-    if (tile_counted)
-      ws += full - tile;
-    else
-      ws += full;
-  }
+  // ---- Post-pass: retained output tensors ----
+  // Each tensor in retain_these must fit in its entirety in fast memory so
+  // that all completed tiles accumulate there while the next tile executes.
+  // Charging full_size is the correct peak occupancy model:
+  //   ws_peak = (all non-retained tile slices) + full_size(each retained tensor)
+  for (auto t : retain_these)
+    ws += prob_->tensors[t].size();
 
   return ws;
 }
