@@ -288,7 +288,8 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     SplitResult result;
     if (!groups[gi].alive) return result;
     if (!groups[gi].ops.count(op_a) || !groups[gi].ops.count(op_b)) return result;
-    if (groups[gi].ops.size() < 3) return result;
+    // No size guard: a 2-op group {A,B} where the single edge is a bridge is
+    // a valid split into {A} and {B}. Let the BFS determine feasibility.
 
     const auto& ops = groups[gi].ops;
     std::vector<bool> visited(prob->num_ops(), false);
@@ -327,7 +328,7 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
 // ============================================================================
 
 std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
-    if (!groups[gi].alive || groups[gi].ops.size() < 3) return {};
+    if (!groups[gi].alive || groups[gi].ops.size() < 2) return {};
 
     std::vector<std::pair<size_t,size_t>> bridges;
     const auto& ops  = groups[gi].ops;
@@ -336,9 +337,22 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
     std::vector<bool>   visited(nops, false);
     std::vector<size_t> to_clear;
 
+    // Iterate all edges in op_neighbors (DAG edges + co-consumer edges).
+    // The old code only iterated op_succs, which missed co-consumer bridges.
+    // A co-consumer bridge is an undirected edge u-v where both ops share a
+    // common boundary input tensor, and severing that connection would split
+    // the group into two disconnected components.
+    // We canonicalise as (min,max) to avoid double-reporting each undirected
+    // edge as both (u,v) and (v,u).
+    std::set<std::pair<size_t,size_t>> seen_edges;
+
     for (auto u : ops) {
-        for (auto v : dag->op_succs[u]) {
+        for (auto v : dag->op_neighbors[u]) {
             if (!ops.count(v)) continue;
+            // Canonicalise undirected edge to avoid duplicates
+            auto edge = std::make_pair(std::min(u,v), std::max(u,v));
+            if (!seen_edges.insert(edge).second) continue;
+
             for (auto idx : to_clear) visited[idx] = false;
             to_clear.clear();
 

@@ -144,6 +144,14 @@ struct Partition {
     SplitResult                          eval_split(size_t op_a, size_t op_b, size_t gi) const;
     std::vector<std::pair<size_t,size_t>> bridge_edges(size_t gi) const;
 
+    // Would merging groups gi and gj create a cycle in the condensed DAG?
+    // Must be checked before any MERGE move in addition to creates_ephemeral_gap.
+    // Thin wrapper around DAG::merge_creates_cycle operating on group op-sets.
+    bool would_create_cycle(size_t gi, size_t gj) const {
+        if (gi >= groups.size() || gj >= groups.size()) return true;
+        return dag->merge_creates_cycle(groups[gi].ops, groups[gj].ops);
+    }
+
     // --- Ephemeral gap check ---
 
     bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
