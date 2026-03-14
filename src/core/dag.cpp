@@ -53,6 +53,16 @@ DAG DAG::build(const Problem& prob) {
     }
 
     d.precompute_reachability();
+
+    // Cache topological order and position map for O(1) lookups by callers.
+    // precompute_reachability already ran topo_sort() internally; we call it
+    // once more here so the result is available externally without redundant
+    // Kahn traversals later. The cost is one extra O(n+e) pass at build time.
+    d.topo_order_ = d.topo_sort();
+    d.topo_pos_.resize(d.num_ops);
+    for (size_t i = 0; i < d.topo_order_.size(); i++)
+        d.topo_pos_[d.topo_order_[i]] = i;
+
     return d;
 }
 
@@ -91,8 +101,8 @@ std::vector<size_t> DAG::topo_sort() const {
 // ============================================================================
 
 void DAG::precompute_reachability() {
+    if (num_ops == 0) { words_per_row_ = 0; return; }
     words_per_row_ = (num_ops + 63) / 64;
-    if (words_per_row_ == 0) words_per_row_ = 1;
 
     reachable_.assign(num_ops * words_per_row_, 0ULL);
 
@@ -178,4 +188,33 @@ bool DAG::merge_creates_cycle(const std::set<size_t>& a,
     for (size_t w = 0; w < words_per_row_; w++)
         if (back_reach[w] & mask_S[w]) return true;
     return false;
+}
+// ============================================================================
+// reachable_from_mask
+//
+// Returns the bitset union of all reachable_[u] rows where u is set in `mask`.
+// This is step 2 of merge_creates_cycle (computing combined_out), exposed as a
+// public API so the partition layer can query "what ops lie between two groups?"
+// without re-doing the conversion from std::set<size_t> to bitmask.
+// ============================================================================
+
+std::vector<uint64_t> DAG::reachable_from_mask(
+        const std::vector<uint64_t>& mask) const {
+    std::vector<uint64_t> result(words_per_row_, 0ULL);
+    if (words_per_row_ == 0) return result;
+
+    for (size_t w = 0; w < words_per_row_; w++) {
+        uint64_t bits = mask[w];
+        while (bits) {
+            int bit = __builtin_ctzll(bits);
+            size_t u = w * 64 + bit;
+            if (u < num_ops) {
+                const uint64_t* row = reachable_.data() + u * words_per_row_;
+                for (size_t w2 = 0; w2 < words_per_row_; w2++)
+                    result[w2] |= row[w2];
+            }
+            bits &= bits - 1;
+        }
+    }
+    return result;
 }

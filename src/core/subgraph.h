@@ -84,6 +84,7 @@ public:
   CostResult best_cost(const std::set<size_t> &retained_from_prev = {},
                        const std::set<size_t> &retain_these = {}) const;
 
+
   Subgraph() = default;
 
 private:
@@ -120,4 +121,9 @@ private:
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;
+
+  // Flat lookup: tensor index → index into boundary_tensor_info_, or -1.
+  // Enables O(1) lookup in working_set for the retained_from_prev scan.
+  // Sized to prob_->num_tensors() and populated by create().
+  std::vector<int> tensor_id_to_info_;
 };

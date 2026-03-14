@@ -287,6 +287,11 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
   }
 
+  // ---- Build O(1) tensor→info lookup ----
+  sg.tensor_id_to_info_.assign(num_tensors, -1);
+  for (int idx = 0; idx < (int)sg.boundary_tensor_info_.size(); idx++)
+    sg.tensor_id_to_info_[sg.boundary_tensor_info_[idx].id] = idx;
+
   // ---- Build tiling candidates ----
   auto gcd_of = [](const std::vector<int64_t>& vals) -> int64_t {
     if (vals.empty()) return 0;
@@ -336,6 +341,13 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
+  // Invalid tilings produce meaningless working sets.  Guard here so callers
+  // that invoke working_set directly (e.g. tests, partition analysis) don't
+  // silently get garbage for configs that violate divisibility rules.
+  // compute_cost / is_feasible already check validity first, so this only
+  // matters for direct calls to working_set.
+  if (!is_valid_tiling(cfg)) return std::numeric_limits<int64_t>::max();
+
   // Sanity check: a tensor should never be in both sets simultaneously.
   // retained_from_prev = carried into this step; retain_these = kept after this
   // step. They refer to different step boundaries and must be disjoint.
@@ -385,11 +397,10 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   // ---- retained_from_prev tensors NOT in boundary_tensor_info_ ----
   // A tensor carried from the previous step that this subgraph does not
   // directly use still occupies fast memory and must be counted.
+  // Use O(1) lookup instead of linear scan over boundary_tensor_info_.
   for (auto t : retained_from_prev) {
-    bool found = false;
-    for (auto &info : boundary_tensor_info_)
-      if (info.id == t) { found = true; break; }
-    if (!found)
+    bool in_info = (t < tensor_id_to_info_.size() && tensor_id_to_info_[t] >= 0);
+    if (!in_info)
       ws += prob_->tensors[t].size();
   }
 
