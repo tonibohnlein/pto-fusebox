@@ -10,78 +10,140 @@ using json = nlohmann::json;
 Problem read_problem(const std::string& filename) {
     std::ifstream f(filename);
     if (!f.is_open()) {
-        std::cerr << "Error: cannot open " << filename << "\n";
+        std::cerr << "Error: cannot open '" << filename << "'\n";
         std::exit(1);
     }
-    json j = json::parse(f);
+
+    json j;
+    try {
+        j = json::parse(f);
+    } catch (const json::parse_error& e) {
+        std::cerr << "Error: failed to parse '" << filename << "': " << e.what() << "\n";
+        std::exit(1);
+    }
+
+    // Validate required top-level keys exist before accessing them.
+    for (const char* key : {"widths", "heights", "inputs", "outputs",
+                             "base_costs", "op_types",
+                             "fast_memory_capacity", "slow_memory_bandwidth",
+                             "native_granularity"}) {
+        if (!j.contains(key)) {
+            std::cerr << "Error: missing required field '" << key
+                      << "' in '" << filename << "'\n";
+            std::exit(1);
+        }
+    }
 
     Problem p;
+
+    // --- Tensors ---
     auto& widths  = j["widths"];
     auto& heights = j["heights"];
+    if (widths.size() != heights.size()) {
+        std::cerr << "Error: widths and heights arrays have different lengths\n";
+        std::exit(1);
+    }
     for (size_t i = 0; i < widths.size(); i++)
         p.tensors.push_back({widths[i].get<int64_t>(), heights[i].get<int64_t>()});
 
+    const size_t num_tensors = p.num_tensors();
+
+    // --- Ops ---
     auto& inputs     = j["inputs"];
     auto& outputs    = j["outputs"];
     auto& base_costs = j["base_costs"];
     auto& op_types   = j["op_types"];
-    for (size_t i = 0; i < op_types.size(); i++) {
+
+    const size_t num_ops = op_types.size();
+    if (inputs.size() != num_ops || outputs.size() != num_ops ||
+        base_costs.size() != num_ops) {
+        std::cerr << "Error: inputs/outputs/base_costs/op_types arrays have "
+                     "inconsistent lengths\n";
+        std::exit(1);
+    }
+
+    for (size_t i = 0; i < num_ops; i++) {
         Op op;
-        op.type = (op_types[i].get<std::string>() == "MatMul")
-                  ? OpType::MatMul : OpType::Pointwise;
-        for (auto& t : inputs[i])  op.inputs.push_back(t.get<size_t>());
-        for (auto& t : outputs[i]) op.outputs.push_back(t.get<size_t>());
+        const std::string type_str = op_types[i].get<std::string>();
+        if (type_str == "MatMul") {
+            op.type = OpType::MatMul;
+        } else if (type_str == "Pointwise") {
+            op.type = OpType::Pointwise;
+        } else {
+            std::cerr << "Error: unknown op type '" << type_str
+                      << "' for op " << i << "\n";
+            std::exit(1);
+        }
+
+        for (auto& t : inputs[i]) {
+            size_t idx = t.get<size_t>();
+            if (idx >= num_tensors) {
+                std::cerr << "Error: op " << i << " input tensor index " << idx
+                          << " out of range (num_tensors=" << num_tensors << ")\n";
+                std::exit(1);
+            }
+            op.inputs.push_back(idx);
+        }
+        for (auto& t : outputs[i]) {
+            size_t idx = t.get<size_t>();
+            if (idx >= num_tensors) {
+                std::cerr << "Error: op " << i << " output tensor index " << idx
+                          << " out of range (num_tensors=" << num_tensors << ")\n";
+                std::exit(1);
+            }
+            op.outputs.push_back(idx);
+        }
         op.base_cost = base_costs[i].get<int64_t>();
         p.ops.push_back(std::move(op));
     }
 
+    // --- Hardware parameters ---
     p.fast_memory_capacity  = j["fast_memory_capacity"].get<int64_t>();
     p.slow_memory_bandwidth = j["slow_memory_bandwidth"].get<int64_t>();
+
     auto& ng = j["native_granularity"];
+    if (!ng.is_array() || ng.size() < 2) {
+        std::cerr << "Error: native_granularity must be a 2-element array [w, h]\n";
+        std::exit(1);
+    }
     p.native_w = ng[0].get<int64_t>();
     p.native_h = ng[1].get<int64_t>();
+
+    if (p.fast_memory_capacity <= 0 || p.slow_memory_bandwidth <= 0 ||
+        p.native_w <= 0 || p.native_h <= 0) {
+        std::cerr << "Error: hardware parameters must be positive\n";
+        std::exit(1);
+    }
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
     //
-    // A tensor is worth retaining across subgraph boundaries only if:
-    //   1. It fits entirely in fast memory.
-    //   2. It has at least one consumer (graph outputs are evicted, never reused).
-    //   3. It is NOT a single-consumer graph input.
+    // A tensor is retainable across subgraph boundaries if ALL of:
+    //   1. Its full size fits in fast memory.
+    //      (A tensor larger than capacity can never be legally pinned.)
+    //   2. It has at least one consuming op.
+    //      (Graph outputs have no consumers — they are evicted at the end and
+    //      never read by a later subgraph, so retaining them is pointless.)
     //
-    // Rationale for rule 3: a graph input with exactly one consumer is read once
-    // and never needed again — retaining it wastes fast memory capacity with no
-    // benefit.  A graph input with multiple consumers, on the other hand, can
-    // save repeated slow-memory loads and is worth keeping resident.
+    // Graph inputs with a single consumer ARE included. Although in a simple
+    // linear schedule they are read once and discarded, recomputation-based
+    // strategies (e.g. diamond graphs like Example 3B) may place the same
+    // graph input in two separate subgraphs. Retaining it after the first
+    // subgraph eliminates the redundant reload in the second.
     //
-    // Produced tensors (op outputs) always remain candidates because they may be
-    // consumed by multiple downstream subgraphs or kept for recomputation paths.
+    // The ordering layer is responsible for deciding whether retention is
+    // actually beneficial for a given schedule; this set is the permissive
+    // upper bound of candidates.
     // -------------------------------------------------------------------------
     {
-        const size_t nt = p.num_tensors();
+        std::vector<size_t> consumer_count(num_tensors, 0);
+        for (auto& op : p.ops)
+            for (auto t : op.inputs)
+                consumer_count[t]++;
 
-        std::vector<size_t> consumer_count(nt, 0);
-        std::vector<bool>   has_producer(nt, false);
-
-        for (auto& op : p.ops) {
-            for (auto t : op.inputs)  consumer_count[t]++;
-            for (auto t : op.outputs) has_producer[t] = true;
-        }
-
-        for (size_t i = 0; i < nt; i++) {
-            // Rule 1: must fit in fast memory
-            if (p.tensors[i].size() > p.fast_memory_capacity)
-                continue;
-
-            // Rule 2: must have at least one consumer
-            if (consumer_count[i] == 0)
-                continue;
-
-            // Rule 3: single-consumer graph inputs are never worth retaining
-            bool is_graph_input = !has_producer[i];
-            if (is_graph_input && consumer_count[i] <= 1)
-                continue;
-
+        for (size_t i = 0; i < num_tensors; i++) {
+            if (p.tensors[i].size() > p.fast_memory_capacity) continue; // rule 1
+            if (consumer_count[i] == 0)                        continue; // rule 2
             p.retainable_tensors.insert(i);
         }
     }
@@ -109,9 +171,16 @@ void write_solution(const std::string& filename, const Solution& sol) {
         if (cfg.snake != SnakeDir::None) {
             int ntw = (int)(step.subgraph.output_width()  / cfg.w);
             int nth = (int)(step.subgraph.output_height() / cfg.h);
-            auto order = make_traversal(ntw, nth, cfg.snake);
-            j["traversal_orders"].push_back(
-                std::vector<int64_t>(order.begin(), order.end()));
+            if (ntw * nth > 1) {
+                // Only emit an explicit traversal order when there is more than
+                // one tile. A single-tile grid has nothing to permute; null
+                // (raster default) is equivalent and cleaner in the output.
+                auto order = make_traversal(ntw, nth, cfg.snake);
+                j["traversal_orders"].push_back(
+                    std::vector<int64_t>(order.begin(), order.end()));
+            } else {
+                j["traversal_orders"].push_back(nullptr);
+            }
         } else {
             j["traversal_orders"].push_back(nullptr);
         }
@@ -120,5 +189,13 @@ void write_solution(const std::string& filename, const Solution& sol) {
     }
 
     std::ofstream f(filename);
+    if (!f.is_open()) {
+        std::cerr << "Error: cannot write '" << filename << "'\n";
+        std::exit(1);
+    }
     f << j.dump(2) << "\n";
+    if (!f) {
+        std::cerr << "Error: write failed for '" << filename << "'\n";
+        std::exit(1);
+    }
 }

@@ -30,14 +30,24 @@ applied to a subgraph deterministically defines:
    its role relative to the ops that use it:
 
        MatMul output:  w × h       (one tile of the spatial grid)
-       MatMul LHS:     k × h       (a strip of the reduction dimension × height)
+       MatMul LHS:     K × h       (full reduction-dimension row strip × height)
        MatMul RHS:     w × k       (width × a strip of the reduction dimension)
        PW output:      w × h       (same as the spatial tile)
        PW input:       w × h       (same as the spatial tile)
 
+   **Important distinction for MatMul LHS**: the LHS row strip (`K × h`, where
+   `K` is the full reduction dimension of that MatMul) is loaded **once** at
+   k-step 0 and held resident in fast memory for all `K/k` k-steps of that
+   spatial tile. It is not re-loaded per k-step. This is why LHS contributes
+   `h × K` (not `h × k`) to the working set, and why LHS transfer is a fixed
+   cost per spatial tile rather than per k-step. The RHS strip (`w × k`), by
+   contrast, covers a different k-range each step and is reloaded every time.
+
    For ephemeral tensors (internal to the subgraph), the slice shape propagates
-   from the consumer: if an ephemeral feeds a MatMul as LHS, its slice is `k × h`
-   even though it was produced by a PW op.
+   from the consumer: if an ephemeral feeds a MatMul as LHS, its tiling
+   constraints are governed by `k` and `h` (not `w`), even though it was
+   produced by a PW op. The ephemeral itself is never resident in fast memory —
+   this propagation only determines which dimensions `w`, `h`, `k` must divide.
 
 4. **The execution loop** — the hardware iterates:
 
@@ -96,17 +106,33 @@ each ephemeral tensor must have exactly **one** consumer op within the subgraph.
 Fan-out of ephemeral tensors is invalid because the data exists only momentarily
 and cannot be consumed twice.
 
-### 6. Ephemeral tensors have no external consumers
+### 6. Ephemeral tensors with external consumers require recomputation (solution level)
 
-An ephemeral tensor must not be consumed by any op **outside** the subgraph.
-Since ephemeral data never touches fast memory or slow memory, external ops would
-have no way to access it. If a tensor is produced inside the subgraph and consumed
-both internally and externally, it must be classified as a boundary output (not
-ephemeral), so the solver must either not fuse the producer into this subgraph
-or ensure the external consumer is also included.
+`Subgraph::create` does **not** reject a subgraph because an ephemeral tensor
+has consumers outside the subgraph. This is intentional: the external consumer
+is handled at the solution level via **recomputation** — the producing op is
+included in a second subgraph that re-derives the tensor from its own boundary
+inputs, treating it as ephemeral there too.
 
-Note: fan-out of **boundary** tensors is fine — boundary tensors are materialized
-in slow memory (or retained in fast memory) and can be read by multiple subgraphs.
+Example (PROBLEM.md Example 3B, diamond graph): `{Op0, Op1}` makes `T1`
+ephemeral even though `Op2` also consumes `T1`. The second step `{Op0, Op2}`
+recomputes `T1` from `T0` and makes it ephemeral again. Neither subgraph needs
+`T1` to be a boundary output.
+
+**What IS enforced at subgraph level (constraint 5)**: each ephemeral tensor
+has exactly one *internal* consumer. Fan-out within a single subgraph is
+invalid because the data exists only momentarily and cannot be consumed twice.
+
+**What IS enforced at solution level**: every boundary input of every subgraph
+must either be a graph input (tensor with no producer) or appear as a boundary
+output of some earlier step in the schedule. A tensor that is only ever ephemeral
+in every subgraph that produces it can never satisfy this requirement for an
+external consumer — this is the "ephemeral gap" that `Solution::validate()`
+detects and rejects.
+
+Note: fan-out of **boundary** tensors is always fine — boundary tensors are
+materialized in slow memory (or retained in fast memory) and can be read by
+multiple subgraphs without restriction.
 
 ---
 
@@ -262,10 +288,24 @@ loaded **once** and counted **once** in both working set and transfer cost.
 
 ### Retained output accumulation
 
-When the output is retained (not evicted after this step), tiles accumulate in
-fast memory. At the last tile, all previous tiles' output is still resident:
+When a boundary output is in `retain_these`, its completed tiles accumulate in
+fast memory instead of being evicted. The implementation accounts for this by
+**excluding the retained tensor from the per-tile working-set accounting** and
+instead **adding its full size unconditionally** in a post-pass:
 
-    additional_ws = full_output_size - h × w
+    ws_contribution = full_output_size   (width × height of the tensor)
+
+This replaces the per-tile contribution of `h × w` that the tensor would
+otherwise have. The net effect is that retaining an output always increases the
+working set by exactly `full_output_size - h × w` relative to the non-retained
+case — all completed tile slices stay pinned in fast memory simultaneously.
+
+**Why this formulation**: an earlier incremental approach (`additional_ws =
+full_output_size - h × w`) assumed the main loop had already charged `h × w`
+for the tensor. This broke when the retained tensor was a MatMul LHS (charged
+`h × K`, not `h × w`) or RHS (charged `k × w`), producing wrong values in both
+directions. The current implementation sidesteps the mismatch entirely: skip in
+the main loop, add full size in the post-pass, regardless of role.
 
 ### Unused retained tensors
 
@@ -489,14 +529,44 @@ In this case, raster and RowMajor snake produce the same cost.
 
 ---
 
+## `retainable_tensors` — which tensors may be retained
+
+`Problem::retainable_tensors` is a precomputed set of tensor indices that are
+eligible to appear in `retain_these` at the solution level. A tensor is
+retainable if and only if its **full size** fits within `fast_memory_capacity`:
+
+    retainable_tensors = { t : tensors[t].width × tensors[t].height ≤ fast_memory_capacity }
+
+**Why this constraint exists**: retaining a tensor keeps its entire `width ×
+height` resident in fast memory (not just one tile slice). If the full tensor
+exceeds the hardware's fast-memory capacity on its own, it can never be legally
+retained regardless of tiling choices, so the ordering layer filters such tensors
+out before attempting retention.
+
+**Where it is used**: the ordering algorithms consult `retainable_tensors` when
+deciding which boundary outputs to include in `retain_these`. `Subgraph::working_set`
+and `compute_cost` do not enforce this constraint internally — they will accept
+any tensor in `retain_these` and compute the resulting working set. The
+constraint is purely a solution-construction heuristic to avoid generating
+obviously infeasible retention decisions.
+
+**Interaction with tiling**: even a retainable tensor may become infeasible to
+retain under a specific tiling if the combined working set (input slices +
+retained-output full sizes + other retained-from-prev tensors) exceeds capacity.
+`best_cost()` handles this by enumerating tilings and checking feasibility for
+each; smaller tiles may be selected precisely to accommodate retained tensors.
+
+---
+
 ## Retain mechanics
 
 ### Retaining an output (this step)
 
 When a boundary output tensor is in `retain_these`:
 - **No eviction**: `out_evict` is 0 for that tensor (transfer savings)
-- **Accumulation overhead**: tiles accumulate without being flushed. The working
-  set increases by `full_size - tile_size` (all completed tiles stay resident)
+- **Full-size working set**: the tensor occupies `width × height` in the working
+  set (all completed tile slices stay pinned simultaneously). See "Retained
+  output accumulation" above for the implementation details.
 - **Tiling impact**: the larger working set may force smaller tiles
 
 ### Using a retained input (from previous step)

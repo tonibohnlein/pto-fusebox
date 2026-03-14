@@ -39,8 +39,14 @@ struct Problem {
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
 
-    // Precomputed: tensors whose full size fits in fast_memory_capacity.
-    // Only these can appear in tensors_to_retain.
+    // Precomputed by read_problem(). A tensor is retainable if:
+    //   1. Its full size (width × height) fits in fast_memory_capacity.
+    //   2. It has at least one consuming op (graph outputs are excluded).
+    // Graph inputs with a single consumer are included — recomputation
+    // schedules may load such a tensor in two separate subgraphs, and
+    // retaining it after the first eliminates the second load.
+    // This set is the permissive upper bound; the ordering layer decides
+    // whether retention is beneficial for any given schedule.
     std::set<size_t> retainable_tensors;
 };
 
