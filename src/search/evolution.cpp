@@ -1,6 +1,51 @@
 #include "search/evolution.h"
+#include "search/merkle_hash.h"
 #include <algorithm>
 #include <functional>
+
+// ============================================================================
+// Merkle-aware ARI canonicalisation
+//
+// Within each Merkle equivalence class (structurally symmetric ops), sort ops
+// by their assignment in map_a, then match them rank-for-rank to ops sorted
+// by their assignment in map_b.  This makes symmetric variants have distance 0
+// instead of a spurious non-zero ARI distance.
+//
+// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
+// ============================================================================
+static void merkle_canonicalise(
+        const MerkleHashes& mh,
+        const std::vector<int>& map_a,
+        std::vector<int>& map_b)   // modified in-place
+{
+    for (auto& [hash, ops] : mh.equiv_classes) {
+        if (ops.size() <= 1) continue;
+
+        // Sort ops by their assignment in A (break ties by op index for stability)
+        std::vector<size_t> by_a(ops.begin(), ops.end());
+        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
+            int gx = (x < map_a.size()) ? map_a[x] : -1;
+            int gy = (y < map_a.size()) ? map_a[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Sort ops by their assignment in B
+        std::vector<size_t> by_b(ops.begin(), ops.end());
+        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
+            int gx = (x < map_b.size()) ? map_b[x] : -1;
+            int gy = (y < map_b.size()) ? map_b[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Match rank-for-rank: A's i-th op gets B's i-th op's assignment
+        std::vector<int> new_b(ops.size());
+        for (size_t i = 0; i < ops.size(); i++)
+            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
+        for (size_t i = 0; i < ops.size(); i++)
+            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
+    }
+}
+
 #include <numeric>
 #include <map>
 #include <set>
@@ -432,16 +477,32 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
 // ============================================================================
 
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) {
-    for (int i = 0; i < num_mutations; i++) {
+    // Retry until exactly num_mutations mutations actually change the partition.
+    // Cap total attempts to avoid spinning on pathological inputs (e.g. a
+    // single-op partition where most operators have nothing to do).
+    const int max_attempts = num_mutations * 10;
+    int applied  = 0;
+    int attempts = 0;
+
+    while (applied < num_mutations && attempts < max_attempts) {
+        attempts++;
+        size_t before_groups = part.num_alive();
+        double before_cost   = part.total_cost();
+
         int choice = rng() % 6;
         switch (choice) {
-            case 0: part = mutate_merge(std::move(part), rng); break;
-            case 1: part = mutate_split(std::move(part), rng); break;
-            case 2: part = mutate_reassign(std::move(part), rng); break;
-            case 3: part = mutate_block_move(std::move(part), rng); break;
-            case 4: part = mutate_eject(std::move(part), rng); break;
+            case 0: part = mutate_merge(std::move(part), rng);        break;
+            case 1: part = mutate_split(std::move(part), rng);        break;
+            case 2: part = mutate_reassign(std::move(part), rng);     break;
+            case 3: part = mutate_block_move(std::move(part), rng);   break;
+            case 4: part = mutate_eject(std::move(part), rng);        break;
             case 5: part = mutate_tensor_merge(std::move(part), rng); break;
         }
+
+        // Only count the step if it actually changed the partition.
+        // Operators return the input unchanged when no valid move exists.
+        if (part.num_alive() != before_groups || part.total_cost() != before_cost)
+            applied++;
     }
     return part;
 }
@@ -456,7 +517,8 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
 // ============================================================================
 
 Partition crossover(const Partition& parent_a, const Partition& parent_b,
-                    std::mt19937& rng) {
+                    std::mt19937& rng,
+                    const MerkleHashes* mh) {
     const Problem& prob = *parent_a.prob;
     const DAG& dag = *parent_a.dag;
     size_t n_ops = prob.num_ops();
@@ -473,6 +535,12 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
                 grp_b[op] = (int)gi;
     
     // Step 2: Cluster ops that agree in both parents.
+    // Apply Merkle canonicalisation so symmetric op permutations are treated as
+    // identical: within each Merkle class, sort by grp_a then match rank-for-rank
+    // in grp_b.  Without this, two symmetric parents would produce no agreement
+    // clusters even though they encode the same partition structure.
+    if (mh) merkle_canonicalise(*mh, grp_a, grp_b);
+
     // Two ops are in the same cluster iff they share the same group in BOTH parents.
     // O(n) via hashing (grp_a, grp_b) pairs — no pairwise comparison needed.
     std::map<std::pair<int,int>, std::set<size_t>> clusters;

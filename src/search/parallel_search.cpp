@@ -5,6 +5,7 @@
 #include "search/fm_outer.h"
 #include "search/evolution.h"
 #include "core/cost_cache.h"
+#include "search/merkle_hash.h"
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -17,6 +18,49 @@
 #include <atomic>
 
 using Clock = std::chrono::steady_clock;
+
+// ============================================================================
+// Merkle-aware ARI canonicalisation
+//
+// Within each Merkle equivalence class (structurally symmetric ops), sort ops
+// by their assignment in map_a, then match them rank-for-rank to ops sorted
+// by their assignment in map_b.  This makes symmetric variants have distance 0
+// instead of a spurious non-zero ARI distance.
+//
+// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
+// ============================================================================
+static void merkle_canonicalise(
+        const MerkleHashes& mh,
+        const std::vector<int>& map_a,
+        std::vector<int>& map_b)   // modified in-place
+{
+    for (auto& [hash, ops] : mh.equiv_classes) {
+        if (ops.size() <= 1) continue;
+
+        // Sort ops by their assignment in A (break ties by op index for stability)
+        std::vector<size_t> by_a(ops.begin(), ops.end());
+        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
+            int gx = (x < map_a.size()) ? map_a[x] : -1;
+            int gy = (y < map_a.size()) ? map_a[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Sort ops by their assignment in B
+        std::vector<size_t> by_b(ops.begin(), ops.end());
+        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
+            int gx = (x < map_b.size()) ? map_b[x] : -1;
+            int gy = (y < map_b.size()) ? map_b[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Match rank-for-rank: A's i-th op gets B's i-th op's assignment
+        std::vector<int> new_b(ops.size());
+        for (size_t i = 0; i < ops.size(); i++)
+            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
+        for (size_t i = 0; i < ops.size(); i++)
+            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
+    }
+}
 
 // ============================================================================
 // Pool entry
@@ -36,7 +80,8 @@ struct PoolEntry {
 // Partition distance
 // ============================================================================
 
-static double partition_distance(const Partition& a, const Partition& b) {
+static double partition_distance(const Partition& a, const Partition& b,
+                                  const MerkleHashes* mh = nullptr) {
     size_t n = a.prob->num_ops();
 
     // Build op → group maps
@@ -53,6 +98,9 @@ static double partition_distance(const Partition& a, const Partition& b) {
             num_gb++;
         }
     if (num_ga == 0 || num_gb == 0) return 0.0;
+
+    // Apply Merkle canonicalisation: symmetric variants → distance 0
+    if (mh) merkle_canonicalise(*mh, ga_map, gb_map);
 
     // Build contingency table: n_ij = |group_i_in_a ∩ group_j_in_b|
     // Also track row/col totals.
@@ -104,12 +152,13 @@ static double partition_distance(const Partition& a, const Partition& b) {
 // ============================================================================
 
 static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
-                         size_t max_pool) {
+                         size_t max_pool,
+                         const MerkleHashes* mh = nullptr) {
     // Compute min distance to existing entries
     double min_dist = 1.0;
     size_t closest_idx = 0;
     for (size_t i = 0; i < pool.size(); i++) {
-        double dist = partition_distance(pool[i].partition, entry.partition);
+        double dist = partition_distance(pool[i].partition, entry.partition, mh);
         if (dist < min_dist) {
             min_dist = dist;
             closest_idx = i;
@@ -189,6 +238,14 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
     CostCache shared_cache;
     std::mutex log_mutex;
+
+    // Compute Merkle hashes once — used for symmetry-aware pool deduplication
+    MerkleHashes mh = MerkleHashes::compute(prob, dag);
+    const MerkleHashes* mhp = mh.symmetric_ops() > 0 ? &mh : nullptr;
+    if (mhp)
+        std::cerr << "  Merkle: " << mh.num_classes()
+                  << " structural classes, " << mh.symmetric_ops()
+                  << " symmetric ops\n";
 
     auto deadline = cfg.fm.deadline;
     bool has_deadline = (deadline != TimePoint::max());
@@ -288,10 +345,10 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::vector<PoolEntry> pool;
     for (auto& r : gen0_results)
         if (r.cost < 1e17)  // guard: task may have been cancelled before storing a result
-            pool_insert(pool, std::move(r), cfg.pool_size);
+            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
     for (auto& r : gen0_end_partitions)
         if (r.cost < 1e17)
-            pool_insert(pool, std::move(r), cfg.pool_size);
+            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
     pool_sort(pool);
 
     std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
@@ -345,14 +402,14 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     size_t p2 = rng() % pool.size();
                     while (p2 == p1 && pool.size() > 1) p2 = rng() % pool.size();
 
-                    child = crossover(pool[p1].partition, pool[p2].partition, rng);
+                    child = crossover(pool[p1].partition, pool[p2].partition, rng, mhp);
                     child.cache = &shared_cache;
                     origin = "xover";
                 } else {
                     // Pick parent (uniform random — pool diversity maintained by insertion)
                     size_t pi = rng() % pool.size();
 
-                    int num_muts = 2 + (int)(rng() % 5);  // 2..6 mutations
+                    int num_muts = 4 + (int)(rng() % 5);  // 4..8 mutations
                     child = mutate_compound(Partition(pool[pi].partition), num_muts, rng);
                     child.cache = &shared_cache;
                     origin = "mutate(" + std::to_string(num_muts) + ")";
@@ -395,10 +452,10 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
         int accepted = 0;
         for (auto& r : mut_results)
-            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size))
+            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size, mhp))
                 accepted++;
         for (auto& r : mut_end_partitions)
-            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size))
+            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size, mhp))
                 accepted++;
         pool_sort(pool);
 

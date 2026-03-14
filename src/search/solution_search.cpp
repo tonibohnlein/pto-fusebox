@@ -1,4 +1,5 @@
 #include "search/solution_search.h"
+#include "search/merkle_hash.h"
 #include "partition/partition.h"
 #include "search/verbose.h"
 #include <algorithm>
@@ -16,6 +17,49 @@
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
+
+// ============================================================================
+// Merkle-aware ARI canonicalisation
+//
+// Within each Merkle equivalence class (structurally symmetric ops), sort ops
+// by their assignment in map_a, then match them rank-for-rank to ops sorted
+// by their assignment in map_b.  This makes symmetric variants have distance 0
+// instead of a spurious non-zero ARI distance.
+//
+// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
+// ============================================================================
+static void merkle_canonicalise(
+        const MerkleHashes& mh,
+        const std::vector<int>& map_a,
+        std::vector<int>& map_b)   // modified in-place
+{
+    for (auto& [hash, ops] : mh.equiv_classes) {
+        if (ops.size() <= 1) continue;
+
+        // Sort ops by their assignment in A (break ties by op index for stability)
+        std::vector<size_t> by_a(ops.begin(), ops.end());
+        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
+            int gx = (x < map_a.size()) ? map_a[x] : -1;
+            int gy = (y < map_a.size()) ? map_a[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Sort ops by their assignment in B
+        std::vector<size_t> by_b(ops.begin(), ops.end());
+        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
+            int gx = (x < map_b.size()) ? map_b[x] : -1;
+            int gy = (y < map_b.size()) ? map_b[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        // Match rank-for-rank: A's i-th op gets B's i-th op's assignment
+        std::vector<int> new_b(ops.size());
+        for (size_t i = 0; i < ops.size(); i++)
+            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
+        for (size_t i = 0; i < ops.size(); i++)
+            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
+    }
+}
 using SolMoveHeap = std::priority_queue<SolutionMove>;
 
 // ============================================================================
@@ -180,9 +224,7 @@ struct SolState {
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it,
-      // and the tensor is not already entering from the previous step
-      // (if it's in both retained_from_prev and retain_these, working_set asserts).
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
@@ -232,9 +274,7 @@ struct SolState {
     for (size_t i = idx; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it,
-      // and the tensor is not already entering from the previous step
-      // (if it's in both retained_from_prev and retain_these, working_set asserts).
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
@@ -594,7 +634,6 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
           if (second->boundary_inputs().count(t) &&
               prob.retainable_tensors.count(t))
             br.insert(t);
-        // br is computed from first->boundary_outputs, so can't overlap entering[si]
         auto c1 = first->best_cost(state.ret_entering[si], br);
         if (!c1.feasible) {
           br.clear();
@@ -2096,15 +2135,34 @@ std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
                                          const std::vector<ScheduleStep>& steps,
                                          std::mt19937& rng, int n_moves) {
     if (steps.empty()) return {};
-    if (n_moves <= 0) n_moves = 1 + (int)(rng() % 3); // default: 1-3 moves
+    if (n_moves <= 0) n_moves = 3 + (int)(rng() % 4); // default: 3-6 moves
 
     auto result = steps;
-    int applied = 0;
+    int applied  = 0;
     int attempts = 0;
-    while (applied < n_moves && attempts < n_moves * 4) {
+    // 10x budget: enough retries even when many move types have no candidates.
+    // Each apply_one_random_move internally shuffles candidates so repeated
+    // attempts on the same type explore different ops/tensors each time.
+    const int max_attempts = n_moves * 10;
+    while (applied < n_moves && attempts < max_attempts) {
         attempts++;
-        if (apply_one_random_move(prob, dag, result, rng))
-            applied++;
+        // Take a snapshot to detect whether the move actually changed the solution.
+        // apply_one_random_move returns true if it applied any structural/retain
+        // change — but we track this independently for accurate counting.
+        size_t before_steps = result.size();
+        std::set<size_t> before_retain;
+        for (auto& s : result) before_retain.insert(s.retain_these.begin(), s.retain_these.end());
+
+        if (apply_one_random_move(prob, dag, result, rng)) {
+            // Verify the state actually changed (not a degenerate no-op)
+            bool changed = (result.size() != before_steps);
+            if (!changed) {
+                std::set<size_t> after_retain;
+                for (auto& s : result) after_retain.insert(s.retain_these.begin(), s.retain_these.end());
+                changed = (after_retain != before_retain);
+            }
+            if (changed) applied++;
+        }
     }
     if (applied == 0) return {};
     if (has_ephemeral_gaps(dag, result)) return {};
@@ -2119,7 +2177,8 @@ std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
 // Uses contingency table for O(n + sa*sb) grouping instead of O(n²) pairwise.
 static double solution_distance(const Problem& prob,
                                 const std::vector<ScheduleStep>& a,
-                                const std::vector<ScheduleStep>& b) {
+                                const std::vector<ScheduleStep>& b,
+                                const MerkleHashes* mh = nullptr) {
     size_t n = prob.num_ops();
     // Map op → step index
     std::vector<int> map_a(n, -1), map_b(n, -1);
@@ -2128,6 +2187,9 @@ static double solution_distance(const Problem& prob,
         for (auto op : a[i].subgraph.ops()) map_a[op] = (int)i;
     for (size_t i = 0; i < b.size(); i++)
         for (auto op : b[i].subgraph.ops()) map_b[op] = (int)i;
+
+    // Apply Merkle canonicalisation before distance computation
+    if (mh) merkle_canonicalise(*mh, map_a, map_b);
 
     // Component 1: grouping via Adjusted Rand Index (contingency table)
     double d_group = 0.0;
@@ -2219,6 +2281,10 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     std::mutex pool_mutex;
     double global_best_cost = 1e18;
 
+    // Symmetry-aware pool deduplication
+    MerkleHashes sol_mh = MerkleHashes::compute(prob, dag);
+    const MerkleHashes* sol_mhp = sol_mh.symmetric_ops() > 0 ? &sol_mh : nullptr;
+
     // Pool insert is defined before initialization so we can use it
     // for diversity-aware seeding too.
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
@@ -2230,7 +2296,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
         double min_dist = 1.0;
         size_t closest_idx = 0;
         for (size_t i = 0; i < pool.size(); i++) {
-            double dist = solution_distance(prob, pool[i].steps, steps);
+            double dist = solution_distance(prob, pool[i].steps, steps, sol_mhp);
             if (dist < min_dist) {
                 min_dist = dist;
                 closest_idx = i;
@@ -2269,7 +2335,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
             double nn_dist = 1.0;
             for (size_t j = 0; j < pool.size(); j++) {
                 if (i == j) continue;
-                double d = solution_distance(prob, pool[i].steps, pool[j].steps);
+                double d = solution_distance(prob, pool[i].steps, pool[j].steps, sol_mhp);
                 nn_dist = std::min(nn_dist, d);
             }
             if (nn_dist < least_unique_dist) {
@@ -2367,7 +2433,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     child = solution_crossover(prob, dag, parent, parent2, rng);
                 if (child.empty()) {
                     // Mutation path (2/3 of the time, or crossover fallback)
-                    int n_moves = 1 + (int)(rng() % 3);
+                    int n_moves = 3 + (int)(rng() % 4);  // 3..6 moves
                     child = mutate_random(prob, dag, parent, rng, n_moves);
                 }
                 if (child.empty()) continue;

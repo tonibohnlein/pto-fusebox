@@ -1,4 +1,5 @@
 #pragma once
+#include "search/merkle_hash.h"
 
 #include "partition/partition.h"
 #include <random>
@@ -44,4 +45,5 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng);
 // Ops that are in the same group in BOTH parents stay together.
 // Ops that disagree are reassigned greedily.
 Partition crossover(const Partition& parent_a, const Partition& parent_b,
-                    std::mt19937& rng);
+                    std::mt19937& rng,
+                    const MerkleHashes* mh = nullptr);
