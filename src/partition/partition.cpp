@@ -394,6 +394,13 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
+            // If T has any external consumer, the proposed group writes T as
+            // a boundary output — it is the provider. No gap possible.
+            bool has_external = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (!proposed_ops.count(cop)) { has_external = true; break; }
+            if (has_external) continue;
+
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
 
@@ -433,6 +440,13 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
+
+            // If T has any external consumer, the proposed group writes T as
+            // a boundary output — it is the provider. No gap possible.
+            bool has_external = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (!proposed_ops.count(cop)) { has_external = true; break; }
+            if (has_external) continue;
 
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;

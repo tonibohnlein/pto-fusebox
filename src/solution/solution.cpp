@@ -219,6 +219,13 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
+            // If T has any external consumer, the proposed step writes T as
+            // a boundary output — it is the provider. No gap possible.
+            bool has_external = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (!proposed_ops.count(cop)) { has_external = true; break; }
+            if (has_external) continue;
+
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 
