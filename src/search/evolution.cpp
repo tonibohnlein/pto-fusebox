@@ -1,6 +1,100 @@
 #include "search/evolution.h"
 #include "search/merkle_hash.h"
 #include <algorithm>
+
+// ============================================================================
+// Inline gap checks — same as in local_search.cpp / fm_search.cpp
+// ============================================================================
+
+static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
+                              size_t ga, size_t gb) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : merged) {
+        for (auto t : prob.ops[op].outputs) {
+            bool consumed_in = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (merged.count(cop)) { consumed_in = true; break; }
+            if (!consumed_in) continue;
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod_op)) {
+                if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (available) continue;
+            for (auto cop : dag.tensor_consumers[t]) {
+                for (auto gj : p.groups_of(cop)) {
+                    if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                    if (!p.groups[gj].ops.count((size_t)prod_op))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& merged,
+                                    const std::vector<size_t>& exclude) {
+    std::set<size_t> excl(exclude.begin(), exclude.end());
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : merged) {
+        for (auto t : prob.ops[op].outputs) {
+            bool consumed_in = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (merged.count(cop)) { consumed_in = true; break; }
+            if (!consumed_in) continue;
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod_op)) {
+                if (!p.groups[gj].alive || excl.count(gj)) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (available) continue;
+            for (auto cop : dag.tensor_consumers[t]) {
+                for (auto gj : p.groups_of(cop)) {
+                    if (!p.groups[gj].alive || excl.count(gj)) continue;
+                    if (!p.groups[gj].ops.count((size_t)prod_op))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool boundary_inputs_unavailable(const Partition& p,
+                                         const std::set<size_t>& proposed) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : proposed) {
+        for (auto t : prob.ops[op].inputs) {
+            int prod = dag.tensor_producer[t];
+            if (prod < 0) continue;
+            if (proposed.count((size_t)prod)) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod)) {
+                if (!p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (!available) return true;
+        }
+    }
+    return false;
+}
 #include <functional>
 
 // ============================================================================
@@ -90,7 +184,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     for (auto op : part.groups[gb].ops)
         merged.insert(op);
     
-    if (part.creates_ephemeral_gap(merged, ga, gb)) return part;
+    if (inline_gap_check(part, merged, ga, gb)) return part;
     double cost = part.eval_set(merged);
     if (cost >= 1e17) return part;  // infeasible merge
     
@@ -126,6 +220,7 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
     auto [op_a, op_b] = bridges[rng() % bridges.size()];
     auto sr = part.eval_split(op_a, op_b, gi);
     if (!sr.feasible) return part;
+    if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gi)) return part;
     
     // Apply split
     part.groups[gi].ops = sr.side_a;
@@ -188,7 +283,8 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Do NOT exclude src_gi: src_gi still exists as new_src after the move,
     // and external consumers of ephemeral tensors may reside there.
     // Excluding src_gi would hide those consumers, causing false negatives.
-    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
+    if (inline_gap_check(part, new_dst, dst_gi, SIZE_MAX)) return part;
+    if (boundary_inputs_unavailable(part, new_dst)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -287,7 +383,8 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     for (auto op : block) new_dst.insert(op);
     // Gap check: exclude only dst_gi (being replaced by new_dst).
     // Do NOT exclude src_gi: src_gi still exists as remainder after the move.
-    if (part.creates_ephemeral_gap(new_dst, dst_gi, SIZE_MAX)) return part;
+    if (inline_gap_check(part, new_dst, dst_gi, SIZE_MAX)) return part;
+    if (boundary_inputs_unavailable(part, new_dst)) return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -324,9 +421,18 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
                                 part.groups[gi].ops.end());
     size_t op = ops_vec[rng() % ops_vec.size()];
     
-    // Evaluate eject (handles disconnection into components)
     auto er = part.eval_eject(op, gi);
     if (!er.feasible) return part;
+    
+    // Gap check
+    {
+        std::vector<std::set<size_t>> components = er.remainder_components;
+        bool op_in_other = false;
+        for (auto gj : part.groups_of(op))
+            if (gj != gi) { op_in_other = true; break; }
+        if (!op_in_other) components.push_back({op});
+        if (part.split_creates_ephemeral_gap(components, gi)) return part;
+    }
     
     // Apply: replace group with components + singleton
     if (er.remainder_components.size() == 1) {
@@ -403,7 +509,8 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
                           part.groups[gi].ops.end());
     
     std::vector<size_t> group_list_vec(group_list.begin(), group_list.end());
-    if (part.creates_ephemeral_gap(merged_ops, group_list_vec)) return part;
+    if (inline_gap_check_multi(part, merged_ops, group_list_vec)) return part;
+    if (boundary_inputs_unavailable(part, merged_ops)) return part;
     double merged_cost = part.eval_set(merged_ops);
     if (merged_cost < 1e17) {
         // Apply full merge: first group absorbs all, rest are killed
@@ -434,7 +541,8 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
             if (!extract_ops.count(op)) rem.insert(op);
         if (!rem.empty() && dag.merge_creates_cycle(extract_ops, rem)) return part;
     }
-    if (part.creates_ephemeral_gap(extract_ops, group_list_vec)) return part;
+    if (inline_gap_check_multi(part, extract_ops, group_list_vec)) return part;
+    if (boundary_inputs_unavailable(part, extract_ops)) return part;
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
     
@@ -584,7 +692,9 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         // crossover never creates recompute groups, so that consumer will end up
         // in a group that does not contain the producer.
         auto would_gap = [&](const std::set<size_t>& proposed, size_t excl_gi) -> bool {
-            if (child.creates_ephemeral_gap(proposed, excl_gi, SIZE_MAX)) return true;
+            if (inline_gap_check(child, proposed, excl_gi, SIZE_MAX)) return true;
+            if (boundary_inputs_unavailable(child, proposed)) return true;
+            // Extra crossover check: unassigned ops that consume an ephemeral tensor
             for (auto op : proposed) {
                 for (auto t : prob.ops[op].outputs) {
                     bool consumed_in = false;

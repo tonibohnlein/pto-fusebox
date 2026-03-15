@@ -2,6 +2,100 @@
 #include <algorithm>
 
 // ============================================================================
+// Inline gap checks — same as in local_search.cpp
+// ============================================================================
+
+static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
+                              size_t ga, size_t gb) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : merged) {
+        for (auto t : prob.ops[op].outputs) {
+            bool consumed_in = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (merged.count(cop)) { consumed_in = true; break; }
+            if (!consumed_in) continue;
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod_op)) {
+                if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (available) continue;
+            for (auto cop : dag.tensor_consumers[t]) {
+                for (auto gj : p.groups_of(cop)) {
+                    if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                    if (!p.groups[gj].ops.count((size_t)prod_op))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& merged,
+                                    const std::vector<size_t>& exclude) {
+    std::set<size_t> excl(exclude.begin(), exclude.end());
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : merged) {
+        for (auto t : prob.ops[op].outputs) {
+            bool consumed_in = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (merged.count(cop)) { consumed_in = true; break; }
+            if (!consumed_in) continue;
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod_op)) {
+                if (!p.groups[gj].alive || excl.count(gj)) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (available) continue;
+            for (auto cop : dag.tensor_consumers[t]) {
+                for (auto gj : p.groups_of(cop)) {
+                    if (!p.groups[gj].alive || excl.count(gj)) continue;
+                    if (!p.groups[gj].ops.count((size_t)prod_op))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool boundary_inputs_unavailable(const Partition& p,
+                                         const std::set<size_t>& proposed) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : proposed) {
+        for (auto t : prob.ops[op].inputs) {
+            int prod = dag.tensor_producer[t];
+            if (prod < 0) continue;
+            if (proposed.count((size_t)prod)) continue;
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod)) {
+                if (!p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (!available) return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 // best_move_for: evaluate all candidate moves for op x
 // ============================================================================
 
@@ -40,7 +134,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
-                if (!part.creates_ephemeral_gap(merged, gx, gy)) {
+                if (!inline_gap_check(part, merged, gx, gy)) {
                     double merged_cost = part.eval_set(merged);
                     if (merged_cost < 1e17) {
                         double saving = (part.groups[gx].cost + part.groups[gy].cost)
@@ -59,9 +153,9 @@ FMMove best_move_for(const Partition& part, size_t op,
                 double new_gy_cost = part.eval_set(new_gy);
 
                 if (new_gy_cost < 1e17) {
-                    // STEAL: op leaves gx. Exclude gx (losing op, no longer a
-                    // backup source for op's outputs) AND gy (replaced by new_gy).
-                    if (!part.creates_ephemeral_gap(new_gy, gx, gy)) {
+                    // STEAL: op leaves gx, joins gy.
+                    if (!inline_gap_check(part, new_gy, gx, gy) &&
+                        !boundary_inputs_unavailable(part, new_gy)) {
                         std::set<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
                         double new_gx_cost = 0;
@@ -81,11 +175,11 @@ FMMove best_move_for(const Partition& part, size_t op,
                         }
                     }
 
-                    // RECOMPUTE: op is copied to gy; gx keeps it. No gap check
-                    // needed — RECOMPUTE cannot create an ephemeral gap: new_gy
-                    // still exports any newly-ephemeral tensor as a boundary
-                    // output, and gx retains op as an additional backup source.
-                    {
+                    // RECOMPUTE: op is copied to gy; gx keeps it.
+                    // Output direction: new_gy might make a tensor ephemeral
+                    // Input direction: new_gy might need a tensor that's ephemeral
+                    if (!inline_gap_check(part, new_gy, gy, SIZE_MAX) &&
+                        !boundary_inputs_unavailable(part, new_gy)) {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
                             best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
@@ -96,8 +190,15 @@ FMMove best_move_for(const Partition& part, size_t op,
 
         // --- Eject: remove op from gx (one per gx, not per gy) ---
         auto er = part.eval_eject(op, gx);
-        if (er.feasible && accept(er.saving))
-            best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+        if (er.feasible && accept(er.saving)) {
+            std::vector<std::set<size_t>> components = er.remainder_components;
+            bool op_in_other = false;
+            for (auto gj : groups_of_x)
+                if (gj != gx) { op_in_other = true; break; }
+            if (!op_in_other) components.push_back({op});
+            if (!part.split_creates_ephemeral_gap(components, gx))
+                best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+        }
     }  // end for gx
 
     // --- Internal moves: INTERNAL_EJECT and SPLIT ---
@@ -110,11 +211,18 @@ FMMove best_move_for(const Partition& part, size_t op,
         // INTERNAL_EJECT: remove op, remainder may split into components
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving)) {
-            FMMove candidate;
-            candidate.type = FMMove::INTERNAL_EJECT;
-            candidate.op = op; candidate.ga = gx;
-            candidate.saving = er.saving;
-            if (candidate.saving > best.saving) best = candidate;
+            std::vector<std::set<size_t>> components = er.remainder_components;
+            bool op_in_other = false;
+            for (auto gj : groups_of_x)
+                if (gj != gx) { op_in_other = true; break; }
+            if (!op_in_other) components.push_back({op});
+            if (!part.split_creates_ephemeral_gap(components, gx)) {
+                FMMove candidate;
+                candidate.type = FMMove::INTERNAL_EJECT;
+                candidate.op = op; candidate.ga = gx;
+                candidate.saving = er.saving;
+                if (candidate.saving > best.saving) best = candidate;
+            }
         }
 
         // SPLIT at each bridge edge incident to op.
@@ -129,7 +237,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (!split_checked.insert(edge).second) continue;
                 auto sr = part.eval_split(edge.first, edge.second, gx);
                 if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                    best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
+                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gx))
+                        best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
                 }
             }
         }
@@ -205,8 +314,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                                 cycle = true;
 
                     if (!cycle) {
-                        std::vector<size_t> excl(group_list.begin(), group_list.end());
-                        if (!part.creates_ephemeral_gap(merged_ops, excl)) {
+                        if (!inline_gap_check_multi(part, merged_ops, group_list) &&
+                            !boundary_inputs_unavailable(part, merged_ops)) {
                             double new_cost = part.eval_set(merged_ops);
                             if (new_cost < 1e17) {
                                 double saving = old_cost - new_cost;
@@ -272,7 +381,9 @@ FMMove best_move_for(const Partition& part, size_t op,
                             }
                         }
                         if (!extract_cycle &&
-                            !part.creates_ephemeral_gap(extract_ops, excl)) {
+                            !inline_gap_check_multi(part, extract_ops,
+                                std::vector<size_t>(group_list.begin(), group_list.end())) &&
+                            !boundary_inputs_unavailable(part, extract_ops)) {
                             double extract_cost = part.eval_set(extract_ops);
                             if (extract_cost < 1e17) {
                                 double saving = old_cost - (extract_cost + remainder_cost);
@@ -317,9 +428,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
             // Cycle re-check at apply time: groups may have changed since evaluation
             if (part.dag->merge_creates_cycle({m.op}, part.groups[m.gb].ops)) return {};
-            // Gap check: exclude ga (losing m.op, no longer a backup source for
-            // m.op's outputs) AND gb (being replaced by new_gb).
-            if (part.creates_ephemeral_gap(new_gb, m.ga, m.gb)) return {};
+            if (inline_gap_check(part, new_gb, m.ga, m.gb)) return {};
+            if (boundary_inputs_unavailable(part, new_gb)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 
@@ -346,7 +456,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             // Cycle re-check at apply time: groups may have changed since evaluation
             if (part.dag->merge_creates_cycle(part.groups[m.ga].ops,
                                                part.groups[m.gb].ops)) return {};
-            if (part.creates_ephemeral_gap(merged, m.ga, m.gb)) return {};
+            if (inline_gap_check(part, merged, m.ga, m.gb)) return {};
             double cost = part.eval_set(merged);
             if (cost >= 1e17) return {};
 
@@ -364,9 +474,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             new_gb.insert(m.op);
             // Cycle re-check at apply time: groups may have changed
             if (part.dag->merge_creates_cycle({m.op}, part.groups[m.gb].ops)) return {};
-            // No ephemeral gap check: RECOMPUTE cannot create a gap.
-            // new_gb still exports any newly-ephemeral tensor as boundary output;
-            // ga retains m.op as an additional backup source.
+            // Output + input direction gap checks
+            if (inline_gap_check(part, new_gb, m.gb, SIZE_MAX)) return {};
+            if (boundary_inputs_unavailable(part, new_gb)) return {};
             double cost = part.eval_set(new_gb);
             if (cost >= 1e17) return {};
 
@@ -379,6 +489,17 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::EJECT: {
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
+
+            // Gap check
+            {
+                std::vector<std::set<size_t>> components = er.remainder_components;
+                bool op_in_other = false;
+                for (auto gj : part.groups_of(m.op))
+                    if (gj != m.ga) { op_in_other = true; break; }
+                if (!op_in_other) components.push_back({m.op});
+                if (part.split_creates_ephemeral_gap(components, m.ga))
+                    return {};
+            }
 
             // Replace ga with the components safely!
             if (er.remainder_components.empty()) {
@@ -411,6 +532,17 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
+            // Gap check
+            {
+                std::vector<std::set<size_t>> components = er.remainder_components;
+                bool op_in_other = false;
+                for (auto gj : part.groups_of(m.op))
+                    if (gj != m.ga) { op_in_other = true; break; }
+                if (!op_in_other) components.push_back({m.op});
+                if (part.split_creates_ephemeral_gap(components, m.ga))
+                    return {};
+            }
+
             // Replace ga with the components safely!
             if (er.remainder_components.empty()) {
                 part.groups[m.ga].alive = false;
@@ -438,6 +570,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible) return {};
+            if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, m.ga))
+                return {};
 
             part.groups[m.ga].ops = std::move(sr.side_a);
             part.groups[m.ga].cost = sr.cost_a;
@@ -459,9 +593,10 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                 merged_ops.insert(part.groups[cg].ops.begin(),
                                   part.groups[cg].ops.end());
 
-            if (part.creates_ephemeral_gap(merged_ops,
+            if (inline_gap_check_multi(part, merged_ops,
                     std::vector<size_t>(m.tensor_groups.begin(),
                                         m.tensor_groups.end()))) return {};
+            if (boundary_inputs_unavailable(part, merged_ops)) return {};
             double merged_cost = part.eval_set(merged_ops);
             if (merged_cost >= 1e17) return {};
 
@@ -503,9 +638,10 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                 if (!rem.empty() && part.dag->merge_creates_cycle(extract_ops, rem))
                     return {};
             }
-            if (part.creates_ephemeral_gap(extract_ops,
+            if (inline_gap_check_multi(part, extract_ops,
                     std::vector<size_t>(m.tensor_groups.begin(),
                                         m.tensor_groups.end()))) return {};
+            if (boundary_inputs_unavailable(part, extract_ops)) return {};
             double extract_cost = part.eval_set(extract_ops);
             if (extract_cost >= 1e17) return {};
 

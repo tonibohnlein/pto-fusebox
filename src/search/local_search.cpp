@@ -7,8 +7,8 @@
 
 // ============================================================================
 // Standalone inline ephemeral gap check for merges.
-// Does NOT depend on Partition::creates_ephemeral_gap — directly checks
-// whether any tensor would become ephemeral with unserved external consumers.
+// Checks: would any tensor PRODUCED by ops in `merged` become ephemeral
+// with unserved external consumers?
 // ============================================================================
 
 static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
@@ -17,26 +17,14 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            // T is ephemeral in merged iff produced AND consumed internally.
             bool consumed_in = false;
             for (auto cop : dag.tensor_consumers[t])
                 if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;  // T is boundary output → fine
+            if (!consumed_in) continue;
 
-            // T would be ephemeral → never written to slow memory.
-            // Check: does any alive group (other than ga/gb) need T?
-            // A group needs T if it contains a consumer of T but NOT the producer.
-            // We must check at the PARTITION level, not DAG level, because
-            // recomputation means an op can appear in multiple groups.
-            // The DAG-level "has_ext" shortcut is wrong: Op3 might be in both
-            // merged AND in G3 (recompute), so DAG says "no ext consumer" but
-            // G3 still needs T from slow memory.
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 
-            // Is T available as a boundary output from some other group?
-            // T is a boundary output of gj if gj has the producer but does
-            // NOT consume T internally (= no consumer of T in gj).
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
@@ -47,15 +35,55 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
             }
             if (available) continue;
 
-            // T is ephemeral everywhere. Check each consumer's groups.
             for (auto cop : dag.tensor_consumers[t]) {
                 for (auto gj : p.groups_of(cop)) {
                     if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                    // gj has a consumer of T but does it also have the producer?
                     if (!p.groups[gj].ops.count((size_t)prod_op))
-                        return true;  // gj needs T but can't get it → gap!
+                        return true;
                 }
             }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Check that all boundary inputs of `proposed` are available from slow memory.
+//
+// inline_gap_check checks the OUTPUT direction: "does this group make a tensor
+// ephemeral that strands external consumers?"
+//
+// This checks the INPUT direction: "does this group NEED a tensor that's
+// ephemeral everywhere it's produced?"
+//
+// Required for RECOMPUTE and STEAL (ga side), where adding an op to a group
+// creates new boundary input demands. NOT needed for MERGE (merged group's
+// inputs ⊆ ga's inputs ∪ gb's inputs, and ga+gb are excluded).
+// ============================================================================
+
+static bool boundary_inputs_unavailable(const Partition& p,
+                                         const std::set<size_t>& proposed) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+
+    for (auto op : proposed) {
+        for (auto t : prob.ops[op].inputs) {
+            int prod = dag.tensor_producer[t];
+            if (prod < 0) continue;            // graph input → always available
+            if (proposed.count((size_t)prod)) continue;  // produced internally → fine
+
+            // T is a boundary input of proposed. Is T available from slow memory?
+            // T is available if some alive group writes it as a boundary output
+            // (= has the producer, does NOT consume T internally).
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod)) {
+                if (!p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (!available) return true;  // T needed but not available → gap!
         }
     }
     return false;
@@ -117,7 +145,8 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                         new_gj.erase(adj_op);
                         std::vector<std::set<size_t>> components = {new_gi};
                         if (!new_gj.empty()) components.push_back(new_gj);
-                        if (!part.split_creates_ephemeral_gap(components, {gi, gj})) {
+                        if (!part.split_creates_ephemeral_gap(components, {gi, gj}) &&
+                            !boundary_inputs_unavailable(part, new_gi)) {
                             double new_gj_cost = 0;
                             bool valid = true;
                             if (!new_gj.empty()) {
@@ -133,11 +162,14 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                     }
 
                     // RECOMPUTE: adj_op is copied into gi; gj keeps it.
-                    // Gap check IS needed: adding adj_op to gi can make a tensor
-                    // ephemeral (produced + consumed internally) that has external
-                    // consumers in other groups. gj is NOT excluded — it still
-                    // exists unchanged and may serve as a source.
-                    if (!inline_gap_check(part, new_gi, gi, SIZE_MAX)) {
+                    // Two checks needed:
+                    //   1. Output direction: does new_gi make a tensor ephemeral
+                    //      that strands external consumers? (inline_gap_check)
+                    //   2. Input direction: does new_gi NEED a tensor that's
+                    //      ephemeral everywhere? (boundary_inputs_unavailable)
+                    //      E.g. adj_op consumes T35 which is ephemeral in gj.
+                    if (!inline_gap_check(part, new_gi, gi, SIZE_MAX) &&
+                        !boundary_inputs_unavailable(part, new_gi)) {
                         double rsaving = part.groups[gi].cost - new_gi_cost;
                         try_better(best, {Move::RECOMPUTE, gi, gj, adj_op, rsaving, gen_i, gen_j});
                     }
@@ -257,6 +289,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
                 if (part.split_creates_ephemeral_gap(components, {m.ga, m.gb}))
                     return {};
             }
+            // Input direction: new_ga gains m.op whose inputs might be ephemeral
+            if (boundary_inputs_unavailable(part, new_ga))
+                return {};
 
             double new_ga_cost = part.eval_set(new_ga);
             if (new_ga_cost >= 1e17) return {};
@@ -292,12 +327,11 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::RECOMPUTE: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
-            // Cycle check
             if (part.dag->merge_creates_cycle({m.op}, part.groups[m.ga].ops)) return {};
-            // Gap check: adding m.op can make a tensor ephemeral in new_ga
-            // that has external consumers. m.gb is NOT excluded — it still
-            // exists unchanged.
+            // Output direction: ephemeral tensors stranding external consumers
             if (inline_gap_check(part, new_ga, m.ga, SIZE_MAX)) return {};
+            // Input direction: new boundary inputs unavailable from slow memory
+            if (boundary_inputs_unavailable(part, new_ga)) return {};
             double new_cost = part.eval_set(new_ga);
             double actual_saving = part.groups[m.ga].cost - new_cost;
             if (actual_saving < -0.001) return {};
