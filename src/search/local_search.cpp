@@ -515,8 +515,16 @@ Partition greedy_descent(Partition part) {
                 continue;
         }
 
+        Partition snapshot = part;
         auto dirty = apply_move(part, m);
-        if (dirty.empty()) continue;
+        if (dirty.empty()) {
+            part = std::move(snapshot);
+            continue;
+        }
+        if (partition_has_gap(part)) {
+            part = std::move(snapshot);
+            continue;
+        }
 
         applied++;
         for (auto gi : dirty)

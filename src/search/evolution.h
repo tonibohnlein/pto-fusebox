@@ -36,9 +36,7 @@ Partition mutate_eject(Partition part, std::mt19937& rng);
 // If full merge is infeasible, try extracting just the consumer ops.
 Partition mutate_tensor_merge(Partition part, std::mt19937& rng);
 
-// Remove a recomputation group: pick a group where every op is also in
-// another alive group, verify removal doesn't create a gap, kill it.
-// Pure cost win — removes redundant work.
+// Remove a recomputation group where every op is covered by another group.
 Partition mutate_de_recompute(Partition part, std::mt19937& rng);
 
 // Compound mutation: apply N random mutations (mix of all types).
