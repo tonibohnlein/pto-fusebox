@@ -10,7 +10,7 @@
 
 struct Move {
     enum Type { MERGE = 0, STEAL = 1, RECOMPUTE = 2, EJECT = 3,
-                INTERNAL_EJECT = 4, SPLIT = 5 } type;
+                INTERNAL_EJECT = 4, SPLIT = 5, DE_RECOMPUTE = 6 } type;
     size_t ga, gb;       // groups involved
     size_t op;           // op involved (for steal/recompute/eject/internal_eject/split)
     double saving;       // positive = improvement

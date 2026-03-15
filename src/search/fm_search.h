@@ -14,7 +14,7 @@
 struct FMMove {
     enum Type { NONE = -1, STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3,
                 INTERNAL_EJECT = 4, SPLIT = 5,
-                TENSOR_MERGE = 6, TENSOR_EXTRACT = 7 } type = NONE;
+                TENSOR_MERGE = 6, TENSOR_EXTRACT = 7, DE_RECOMPUTE = 8 } type = NONE;
     size_t op = SIZE_MAX;     // initiating op
     size_t ga = SIZE_MAX;     // source group
     size_t gb = SIZE_MAX;     // target group

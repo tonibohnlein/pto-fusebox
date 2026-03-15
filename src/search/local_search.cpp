@@ -242,6 +242,46 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 heap.push(best);
         }
     }
+
+    // --- DE_RECOMPUTE: remove group gi if all ops covered elsewhere ---
+    {
+        bool all_covered = true;
+        for (auto op : part.groups[gi].ops) {
+            bool in_other = false;
+            for (auto gj : part.groups_of(op))
+                if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
+            if (!in_other) { all_covered = false; break; }
+        }
+        if (all_covered) {
+            // Check: every boundary output of gi is available from some other group
+            auto sg = Subgraph::create(*part.prob, *part.dag,
+                          std::vector<size_t>(part.groups[gi].ops.begin(),
+                                              part.groups[gi].ops.end()));
+            bool safe = true;
+            if (sg) {
+                for (auto t : sg->boundary_outputs()) {
+                    int prod = part.dag->tensor_producer[t];
+                    if (prod < 0) continue;
+                    bool available = false;
+                    for (auto gj : part.groups_of((size_t)prod)) {
+                        if (gj == gi || !part.groups[gj].alive) continue;
+                        auto sg_j = Subgraph::create(*part.prob, *part.dag,
+                                        std::vector<size_t>(part.groups[gj].ops.begin(),
+                                                            part.groups[gj].ops.end()));
+                        if (sg_j && sg_j->boundary_outputs().count(t)) {
+                            available = true; break;
+                        }
+                    }
+                    if (!available) { safe = false; break; }
+                }
+            }
+            if (safe) {
+                double saving = part.groups[gi].cost;
+                if (saving > -floor)
+                    heap.push({Move::DE_RECOMPUTE, gi, 0, 0, saving, gen_i, 0});
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -403,6 +443,42 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             dirty.insert(gb);
             break;
         }
+        case Move::DE_RECOMPUTE: {
+            // Re-verify: all ops still covered elsewhere
+            for (auto op : part.groups[m.ga].ops) {
+                bool in_other = false;
+                for (auto gj : part.groups_of(op))
+                    if (gj != m.ga && part.groups[gj].alive) { in_other = true; break; }
+                if (!in_other) return {};
+            }
+            // Re-verify: boundary outputs still available
+            auto sg = Subgraph::create(*part.prob, *part.dag,
+                          std::vector<size_t>(part.groups[m.ga].ops.begin(),
+                                              part.groups[m.ga].ops.end()));
+            if (sg) {
+                for (auto t : sg->boundary_outputs()) {
+                    int prod = part.dag->tensor_producer[t];
+                    if (prod < 0) continue;
+                    bool available = false;
+                    for (auto gj : part.groups_of((size_t)prod)) {
+                        if (gj == m.ga || !part.groups[gj].alive) continue;
+                        auto sg_j = Subgraph::create(*part.prob, *part.dag,
+                                        std::vector<size_t>(part.groups[gj].ops.begin(),
+                                                            part.groups[gj].ops.end()));
+                        if (sg_j && sg_j->boundary_outputs().count(t)) {
+                            available = true; break;
+                        }
+                    }
+                    if (!available) return {};
+                }
+            }
+
+            dirty = part.adjacent_groups(m.ga);
+            dirty.erase(m.ga);
+            part.groups[m.ga].alive = false;
+            part.groups[m.ga].gen++;
+            break;
+        }
     }
 
     part.rebuild_index();
@@ -439,20 +515,8 @@ Partition greedy_descent(Partition part) {
                 continue;
         }
 
-        // Snapshot before applying (for gap-revert)
-        Partition snapshot = part;
         auto dirty = apply_move(part, m);
-        if (dirty.empty()) {
-            part = std::move(snapshot);
-            continue;
-        }
-
-        // Full gap validation: compound moves can destroy tensor sources
-        // that earlier moves relied on. Revert if any gap detected.
-        if (partition_has_gap(part)) {
-            part = std::move(snapshot);
-            continue;
-        }
+        if (dirty.empty()) continue;
 
         applied++;
         for (auto gi : dirty)
@@ -689,8 +753,8 @@ Partition local_search(const Problem& prob, const DAG& dag) {
 
         auto result = greedy_descent(std::move(init));
         cleanup_redundant_recomputation(result);
-        // With snapshot+revert in greedy_descent, gaps should not exist.
-        // repair_ephemeral_gaps is a final safety net.
+        // Prevention-based gap checks in all move types should prevent gaps.
+        // repair_ephemeral_gaps is a final safety net — fires a warning if hit.
         repair_ephemeral_gaps(result);
 
         if (result.total_cost() < best_cost - 0.001) {

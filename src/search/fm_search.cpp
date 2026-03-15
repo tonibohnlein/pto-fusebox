@@ -406,6 +406,44 @@ FMMove best_move_for(const Partition& part, size_t op,
         }
     }
 
+    // --- DE_RECOMPUTE: remove a group if all ops covered elsewhere ---
+    for (auto gx : groups_of_x) {
+        bool all_covered = true;
+        for (auto o : part.groups[gx].ops) {
+            bool in_other = false;
+            for (auto gj : part.groups_of(o))
+                if (gj != gx && part.groups[gj].alive) { in_other = true; break; }
+            if (!in_other) { all_covered = false; break; }
+        }
+        if (!all_covered) continue;
+
+        auto sg = Subgraph::create(*part.prob, *part.dag,
+                      std::vector<size_t>(part.groups[gx].ops.begin(),
+                                          part.groups[gx].ops.end()));
+        if (!sg) continue;
+        bool safe = true;
+        for (auto t : sg->boundary_outputs()) {
+            int prod = part.dag->tensor_producer[t];
+            if (prod < 0) continue;
+            bool available = false;
+            for (auto gj : part.groups_of((size_t)prod)) {
+                if (gj == gx || !part.groups[gj].alive) continue;
+                auto sg_j = Subgraph::create(*part.prob, *part.dag,
+                                std::vector<size_t>(part.groups[gj].ops.begin(),
+                                                    part.groups[gj].ops.end()));
+                if (sg_j && sg_j->boundary_outputs().count(t)) {
+                    available = true; break;
+                }
+            }
+            if (!available) { safe = false; break; }
+        }
+        if (safe) {
+            double saving = part.groups[gx].cost;
+            if (accept(saving))
+                best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, saving};
+        }
+    }
+
     return best;
 }
 
@@ -682,6 +720,44 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
             size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
             affected.insert(new_gi);
+            break;
+        }
+        case FMMove::DE_RECOMPUTE: {
+            if (!part.groups[m.ga].alive) return {};
+            // Re-verify: all ops covered elsewhere
+            for (auto o : part.groups[m.ga].ops) {
+                bool in_other = false;
+                for (auto gj : part.groups_of(o))
+                    if (gj != m.ga && part.groups[gj].alive) { in_other = true; break; }
+                if (!in_other) return {};
+            }
+            // Re-verify: boundary outputs available
+            auto sg = Subgraph::create(*part.prob, *part.dag,
+                          std::vector<size_t>(part.groups[m.ga].ops.begin(),
+                                              part.groups[m.ga].ops.end()));
+            if (sg) {
+                for (auto t : sg->boundary_outputs()) {
+                    int prod = part.dag->tensor_producer[t];
+                    if (prod < 0) continue;
+                    bool available = false;
+                    for (auto gj : part.groups_of((size_t)prod)) {
+                        if (gj == m.ga || !part.groups[gj].alive) continue;
+                        auto sg_j = Subgraph::create(*part.prob, *part.dag,
+                                        std::vector<size_t>(part.groups[gj].ops.begin(),
+                                                            part.groups[gj].ops.end()));
+                        if (sg_j && sg_j->boundary_outputs().count(t)) {
+                            available = true; break;
+                        }
+                    }
+                    if (!available) return {};
+                }
+            }
+            // Kill the group
+            auto adj = part.adjacent_groups(m.ga);
+            part.groups[m.ga].alive = false;
+            part.groups[m.ga].gen++;
+            affected.insert(adj.begin(), adj.end());
+            affected.insert(m.ga);
             break;
         }
         default:

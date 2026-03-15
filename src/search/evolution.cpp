@@ -1,6 +1,8 @@
 #include "search/evolution.h"
+#include "search/local_search.h"  // partition_has_gap
 #include "search/merkle_hash.h"
 #include <algorithm>
+#include <iostream>
 
 // ============================================================================
 // Inline gap checks — same as in local_search.cpp / fm_search.cpp
@@ -279,12 +281,13 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     new_dst.insert(op);
-    // Gap check: exclude only dst_gi (being replaced by new_dst).
-    // Do NOT exclude src_gi: src_gi still exists as new_src after the move,
-    // and external consumers of ephemeral tensors may reside there.
-    // Excluding src_gi would hide those consumers, causing false negatives.
-    if (inline_gap_check(part, new_dst, dst_gi, SIZE_MAX)) return part;
-    if (boundary_inputs_unavailable(part, new_dst)) return part;
+    // Gap check: validate BOTH new_src and new_dst simultaneously.
+    // inline_gap_check on new_dst alone is wrong — it sees old src_gi (which
+    // still has op) as a valid tensor source, but after the move src_gi won't
+    // have op. split_creates_ephemeral_gap checks both components against each
+    // other and against the rest of the partition, with both old groups excluded.
+    if (part.split_creates_ephemeral_gap({new_src, new_dst}, {src_gi, dst_gi}))
+        return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -356,6 +359,9 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     }
     if (target_groups.empty()) {
         // No adjacent group — create new group for the block
+        // Gap check: splitting src_gi into {remainder, block}
+        if (part.split_creates_ephemeral_gap({remainder, block}, {src_gi}))
+            return part;
         double block_cost = part.eval_set(block);
         if (block_cost >= 1e17) return part;
         double rem_cost = part.eval_set(remainder);
@@ -381,10 +387,10 @@ Partition mutate_block_move(Partition part, std::mt19937& rng) {
     
     std::set<size_t> new_dst = part.groups[dst_gi].ops;
     for (auto op : block) new_dst.insert(op);
-    // Gap check: exclude only dst_gi (being replaced by new_dst).
-    // Do NOT exclude src_gi: src_gi still exists as remainder after the move.
-    if (inline_gap_check(part, new_dst, dst_gi, SIZE_MAX)) return part;
-    if (boundary_inputs_unavailable(part, new_dst)) return part;
+    // Same fix as mutate_reassign: validate both remainder and new_dst
+    // simultaneously, excluding both old groups.
+    if (part.split_creates_ephemeral_gap({remainder, new_dst}, {src_gi, dst_gi}))
+        return part;
     double dst_cost = part.eval_set(new_dst);
     if (dst_cost >= 1e17) return part;
     
@@ -581,23 +587,84 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
 }
 
 // ============================================================================
+// Mutate: remove a recomputation group
+//
+// A group is a recomputation candidate if every op in it also appears in at
+// least one other alive group. Removing it is valid if every tensor that was
+// a boundary output of the removed group is still available from some other
+// group (as a boundary output, not ephemeral).
+// ============================================================================
+
+Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
+    // Collect candidate groups: all ops covered elsewhere
+    std::vector<size_t> candidates;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        bool all_covered = true;
+        for (auto op : part.groups[gi].ops) {
+            bool in_other = false;
+            for (auto gj : part.groups_of(op))
+                if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
+            if (!in_other) { all_covered = false; break; }
+        }
+        if (all_covered) candidates.push_back(gi);
+    }
+    if (candidates.empty()) return part;
+
+    // Shuffle and try each candidate
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    for (auto gi : candidates) {
+        // Check: every boundary output of gi must be available from some other group
+        auto sg = Subgraph::create(*part.prob, *part.dag,
+                      std::vector<size_t>(part.groups[gi].ops.begin(),
+                                          part.groups[gi].ops.end()));
+        if (!sg) continue;
+
+        bool safe = true;
+        for (auto t : sg->boundary_outputs()) {
+            int prod = part.dag->tensor_producer[t];
+            if (prod < 0) continue;
+            bool available = false;
+            for (auto gj : part.groups_of((size_t)prod)) {
+                if (gj == gi || !part.groups[gj].alive) continue;
+                auto sg_j = Subgraph::create(*part.prob, *part.dag,
+                                std::vector<size_t>(part.groups[gj].ops.begin(),
+                                                    part.groups[gj].ops.end()));
+                if (sg_j && sg_j->boundary_outputs().count(t)) {
+                    available = true; break;
+                }
+            }
+            if (!available) { safe = false; break; }
+        }
+        if (!safe) continue;
+
+        // Safe to remove
+        part.groups[gi].alive = false;
+        part.groups[gi].gen++;
+        part.rebuild_index();
+        return part;
+    }
+
+    return part;  // no candidate was safe
+}
+
+// ============================================================================
 // Compound mutation: mix of random operators
 // ============================================================================
 
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) {
-    // Retry until exactly num_mutations mutations actually change the partition.
-    // Cap total attempts to avoid spinning on pathological inputs (e.g. a
-    // single-op partition where most operators have nothing to do).
     const int max_attempts = num_mutations * 10;
     int applied  = 0;
     int attempts = 0;
 
+    static const char* names[] = {"merge","split","reassign","block_move","eject","tensor_merge","de_recompute"};
+
     while (applied < num_mutations && attempts < max_attempts) {
         attempts++;
-        size_t before_groups = part.num_alive();
-        double before_cost   = part.total_cost();
+        Partition before = part;
 
-        int choice = rng() % 6;
+        int choice = rng() % 7;  // 0-6 now includes de_recompute
         switch (choice) {
             case 0: part = mutate_merge(std::move(part), rng);        break;
             case 1: part = mutate_split(std::move(part), rng);        break;
@@ -605,12 +672,21 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
             case 3: part = mutate_block_move(std::move(part), rng);   break;
             case 4: part = mutate_eject(std::move(part), rng);        break;
             case 5: part = mutate_tensor_merge(std::move(part), rng); break;
+            case 6: part = mutate_de_recompute(std::move(part), rng); break;
         }
 
-        // Only count the step if it actually changed the partition.
-        // Operators return the input unchanged when no valid move exists.
-        if (part.num_alive() != before_groups || part.total_cost() != before_cost)
-            applied++;
+        bool changed = (part.num_alive() != before.num_alive() ||
+                         part.total_cost() != before.total_cost());
+        if (!changed) continue;
+
+        // Hard validation: revert if mutation created a gap
+        if (partition_has_gap(part)) {
+            std::cerr << "    BUG: " << names[choice] << " created ephemeral gap!\n";
+            part = std::move(before);
+            continue;
+        }
+
+        applied++;
     }
     return part;
 }
@@ -723,23 +799,20 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         
         // Also evaluate the cluster as standalone
         double standalone = child.eval_set(cluster);
-        bool standalone_has_gap = (cluster.size() >= 2) && would_gap(cluster, SIZE_MAX);
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
-        } else if (standalone < 1e17 && !standalone_has_gap) {
+        } else if (standalone < 1e17) {
             child.add_group(cluster, standalone);
-        } else if (best_gi != SIZE_MAX) {
-            for (auto op : cluster) child.groups[best_gi].ops.insert(op);
-            child.groups[best_gi].cost = best_cost;
-            child.groups[best_gi].gen++;
         } else {
-            // Last resort: split cluster into singletons (can't have ephemeral gaps)
-            for (auto op : cluster) {
-                double c = child.eval_set({op});
-                child.add_group({op}, c);
+            if (best_gi != SIZE_MAX) {
+                for (auto op : cluster) child.groups[best_gi].ops.insert(op);
+                child.groups[best_gi].cost = best_cost;
+                child.groups[best_gi].gen++;
+            } else {
+                child.add_group(cluster, 1e18);
             }
         }
         // Keep index current for next cluster iteration
