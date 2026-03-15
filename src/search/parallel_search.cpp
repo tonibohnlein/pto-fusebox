@@ -304,6 +304,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             double init_cost = part.total_cost();
 
             part = greedy_descent(std::move(part));
+            cleanup_redundant_recomputation(part);
+            repair_ephemeral_gaps(part);
             double greedy_cost = part.total_cost();
 
             FMOuterConfig fc = gen0_fm;
@@ -419,6 +421,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 // Refine: greedy + FM
                 double after_mutate = child.total_cost();
                 child = greedy_descent(std::move(child));
+                cleanup_redundant_recomputation(child);
+                repair_ephemeral_gaps(child);
                 double after_greedy = child.total_cost();
 
                 FMOuterConfig fc = gen_fm;

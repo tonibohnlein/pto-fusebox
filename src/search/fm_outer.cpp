@@ -80,6 +80,8 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
             bool kicked = false;
             if (pass_result.moves_applied > 0) {
                 auto greedy_kick = greedy_descent(std::move(pass_result.end_partition));
+                cleanup_redundant_recomputation(greedy_kick);
+                repair_ephemeral_gaps(greedy_kick);
                 if (greedy_kick.total_cost() < result.best_cost - 0.001) {
                     double improvement = result.best_cost - greedy_kick.total_cost();
                     result.best_cost = greedy_kick.total_cost();

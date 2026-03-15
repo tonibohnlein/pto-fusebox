@@ -503,7 +503,7 @@ Partition greedy_descent(Partition part) {
 // alive group, AND removing it doesn't create an ephemeral gap.
 // ============================================================================
 
-static void cleanup_redundant_recomputation(Partition& part) {
+void cleanup_redundant_recomputation(Partition& part) {
     bool changed = true;
     int removed = 0;
 
@@ -575,7 +575,7 @@ static void cleanup_redundant_recomputation(Partition& part) {
 // should never fire. But it guarantees a valid partition regardless.
 // ============================================================================
 
-static void repair_ephemeral_gaps(Partition& part) {
+void repair_ephemeral_gaps(Partition& part) {
     int repairs = 0;
     bool changed = true;
 

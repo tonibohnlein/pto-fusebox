@@ -104,6 +104,33 @@ static bool has_ephemeral_gaps(const DAG &dag,
   return false;
 }
 
+// Check INPUT direction: does a proposed op-set need a tensor that's
+// ephemeral everywhere it's produced?
+// exclude_step = step being replaced (not yet updated in `steps` array)
+static bool sol_inputs_unavailable(const Problem &prob, const DAG &dag,
+                                    const std::set<size_t> &proposed,
+                                    const std::vector<ScheduleStep> &steps,
+                                    size_t exclude_step = SIZE_MAX,
+                                    size_t exclude_step2 = SIZE_MAX) {
+  for (auto op : proposed) {
+    for (auto t : prob.ops[op].inputs) {
+      int prod = dag.tensor_producer[t];
+      if (prod < 0) continue;                    // graph input
+      if (proposed.count((size_t)prod)) continue; // produced internally
+      // T is a boundary input. Is it available from some step?
+      bool available = false;
+      for (size_t si = 0; si < steps.size(); si++) {
+        if (si == exclude_step || si == exclude_step2) continue;
+        if (steps[si].subgraph.boundary_outputs().count(t)) {
+          available = true; break;
+        }
+      }
+      if (!available) return true;
+    }
+  }
+  return false;
+}
+
 static bool is_connected_without(const std::set<size_t> &ops, size_t rm,
                                  const DAG &dag, size_t n) {
   if (ops.size() <= 1)
@@ -448,6 +475,8 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       // that some other step needs but can't get?
       if (Solution::creates_ephemeral_gap(prob, dag, new_dst, state.steps, sj, si))
         continue;
+      if (sol_inputs_unavailable(prob, dag, new_dst, state.steps, sj, si))
+        continue;
       auto sg_s = Subgraph::create(prob, dag, {new_src.begin(), new_src.end()});
       auto sg_d = Subgraph::create(prob, dag, {new_dst.begin(), new_dst.end()});
       if (!sg_s || !sg_d)
@@ -550,6 +579,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       expanded.push_back(op);
       std::set<size_t> expanded_set(expanded.begin(), expanded.end());
       if (Solution::creates_ephemeral_gap(prob, dag, expanded_set, state.steps, sj))
+        continue;
+      // Input direction: does expanded set need a tensor ephemeral elsewhere?
+      if (sol_inputs_unavailable(prob, dag, expanded_set, state.steps, sj))
         continue;
       auto sg = Subgraph::create(prob, dag, expanded);
       if (!sg)
@@ -785,6 +817,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     nd.insert(m.op);
     if (Solution::creates_ephemeral_gap(prob, dag, nd, state.steps, m.step_b, m.step_a))
       return {SIZE_MAX, 0};
+    if (sol_inputs_unavailable(prob, dag, nd, state.steps, m.step_b, m.step_a))
+      return {SIZE_MAX, 0};
     auto ss = Subgraph::create(prob, dag, {ns.begin(), ns.end()});
     auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
     if (!ss || !sd)
@@ -842,6 +876,13 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto ops = state.steps[m.step_a].subgraph.ops();
     std::vector<size_t> expanded(ops.begin(), ops.end());
     expanded.push_back(m.op);
+    std::set<size_t> expanded_set(expanded.begin(), expanded.end());
+    // Output direction: does expanded set make a tensor ephemeral that strands others?
+    if (Solution::creates_ephemeral_gap(prob, dag, expanded_set, state.steps, m.step_a))
+      return {SIZE_MAX, 0};
+    // Input direction: does expanded set need a tensor that's ephemeral elsewhere?
+    if (sol_inputs_unavailable(prob, dag, expanded_set, state.steps, m.step_a))
+      return {SIZE_MAX, 0};
     auto sg = Subgraph::create(prob, dag, expanded);
     if (!sg)
       return {SIZE_MAX, 0};
@@ -1925,6 +1966,7 @@ static bool apply_one_random_move(const Problem& prob, const DAG& dag,
             auto sd = Subgraph::create(prob, dag, {nd.begin(), nd.end()});
             if (!ss || !sd) continue;
             if (Solution::creates_ephemeral_gap(prob, dag, nd, steps, c.dst, c.src)) continue;
+            if (sol_inputs_unavailable(prob, dag, nd, steps, c.dst, c.src)) continue;
             // Topological check: op must not cross a data dependency boundary.
             bool topo_ok = true;
             if (c.dst < c.src) {

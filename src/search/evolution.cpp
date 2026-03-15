@@ -723,20 +723,24 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         
         // Also evaluate the cluster as standalone
         double standalone = child.eval_set(cluster);
+        bool standalone_has_gap = (cluster.size() >= 2) && would_gap(cluster, SIZE_MAX);
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
-        } else if (standalone < 1e17) {
+        } else if (standalone < 1e17 && !standalone_has_gap) {
             child.add_group(cluster, standalone);
+        } else if (best_gi != SIZE_MAX) {
+            // Merge into best adjacent group (already gap-checked)
+            for (auto op : cluster) child.groups[best_gi].ops.insert(op);
+            child.groups[best_gi].cost = best_cost;
+            child.groups[best_gi].gen++;
         } else {
-            if (best_gi != SIZE_MAX) {
-                for (auto op : cluster) child.groups[best_gi].ops.insert(op);
-                child.groups[best_gi].cost = best_cost;
-                child.groups[best_gi].gen++;
-            } else {
-                child.add_group(cluster, 1e18);
+            // Last resort: split cluster into singletons (can't have ephemeral gaps)
+            for (auto op : cluster) {
+                double c = child.eval_set({op});
+                child.add_group({op}, c);
             }
         }
         // Keep index current for next cluster iteration

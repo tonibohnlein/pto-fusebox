@@ -50,3 +50,15 @@ Partition greedy_descent(Partition part);
 // ============================================================================
 
 Partition local_search(const Problem& prob, const DAG& dag);
+
+// ============================================================================
+// Post-search cleanup utilities (also used by parallel_search, fm_outer)
+// ============================================================================
+
+// Remove groups where every op is covered by another alive group
+// and removal doesn't create an ephemeral gap.
+void cleanup_redundant_recomputation(Partition& part);
+
+// Fix any remaining ephemeral gaps by ejecting producer ops into singletons.
+// Safety net — with correct gap checks during search, should be a no-op.
+void repair_ephemeral_gaps(Partition& part);
