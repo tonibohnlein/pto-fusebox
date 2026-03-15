@@ -62,3 +62,7 @@ void cleanup_redundant_recomputation(Partition& part);
 // Fix any remaining ephemeral gaps by ejecting producer ops into singletons.
 // Safety net — with correct gap checks during search, should be a no-op.
 void repair_ephemeral_gaps(Partition& part);
+
+// Quick full gap check: returns true if ANY ephemeral gap exists.
+// O(groups * tensors) — use for validation, not hot path.
+bool partition_has_gap(const Partition& part);

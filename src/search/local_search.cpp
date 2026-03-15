@@ -665,6 +665,39 @@ void repair_ephemeral_gaps(Partition& part) {
 }
 
 // ============================================================================
+// Quick full gap check
+// ============================================================================
+
+bool partition_has_gap(const Partition& part) {
+    if (!part.prob || !part.dag) return false;
+
+    // Collect all boundary outputs across alive groups
+    std::set<size_t> all_boundary_outputs;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        auto sg = Subgraph::create(*part.prob, *part.dag,
+                      std::vector<size_t>(part.groups[gi].ops.begin(),
+                                          part.groups[gi].ops.end()));
+        if (sg) for (auto t : sg->boundary_outputs())
+            all_boundary_outputs.insert(t);
+    }
+
+    // Check every group's boundary inputs
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        auto sg = Subgraph::create(*part.prob, *part.dag,
+                      std::vector<size_t>(part.groups[gi].ops.begin(),
+                                          part.groups[gi].ops.end()));
+        if (!sg) continue;
+        for (auto t : sg->boundary_inputs()) {
+            if (part.dag->tensor_producer[t] < 0) continue;
+            if (!all_boundary_outputs.count(t)) return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 // Full search pipeline
 // ============================================================================
 

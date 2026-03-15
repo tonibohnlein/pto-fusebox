@@ -419,6 +419,11 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 }
 
                 // Refine: greedy + FM
+                // First: ensure mutation/crossover didn't create gaps
+                if (partition_has_gap(child)) {
+                    repair_ephemeral_gaps(child);
+                    cleanup_redundant_recomputation(child);
+                }
                 double after_mutate = child.total_cost();
                 child = greedy_descent(std::move(child));
                 cleanup_redundant_recomputation(child);

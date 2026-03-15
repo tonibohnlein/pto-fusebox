@@ -732,7 +732,6 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         } else if (standalone < 1e17 && !standalone_has_gap) {
             child.add_group(cluster, standalone);
         } else if (best_gi != SIZE_MAX) {
-            // Merge into best adjacent group (already gap-checked)
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
