@@ -161,6 +161,22 @@ struct Partition {
     bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
                                const std::vector<size_t>& exclude_groups) const;
 
+    // Check whether splitting group `exclude_gi` into `components` creates a gap.
+    // Unlike creates_ephemeral_gap (which checks ONE proposed group against
+    // existing groups), this checks MULTIPLE new components simultaneously —
+    // required because a tensor might be available from one sibling component
+    // but not from any existing group.
+    bool split_creates_ephemeral_gap(
+        const std::vector<std::set<size_t>>& components,
+        size_t exclude_gi) const {
+        return split_creates_ephemeral_gap(components, std::set<size_t>{exclude_gi});
+    }
+
+    // General form: exclude multiple groups (e.g., for STEAL replacing ga+gb).
+    bool split_creates_ephemeral_gap(
+        const std::vector<std::set<size_t>>& components,
+        const std::set<size_t>& excluded_groups) const;
+
 private:
     std::vector<std::vector<size_t>> op_to_groups_;
 };

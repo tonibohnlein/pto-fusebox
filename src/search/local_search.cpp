@@ -54,21 +54,25 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 // Evaluate new_gi cost once — shared by STEAL and RECOMPUTE.
                 double new_gi_cost = part.eval_set(new_gi);
                 if (new_gi_cost < 1e17) {
-                    // STEAL: adj_op leaves gj. Gap check required: gj can no
-                    // longer serve as a backup source for tensors adj_op produces.
-                    if (!part.creates_ephemeral_gap(new_gi, gi, gj)) {
+                    // STEAL: adj_op leaves gj. Gap check: both the expanded gi
+                    // and the shrunk gj may create ephemeral tensors.
+                    {
                         std::set<size_t> new_gj = part.groups[gj].ops;
                         new_gj.erase(adj_op);
-                        double new_gj_cost = 0;
-                        bool valid = true;
-                        if (!new_gj.empty()) {
-                            new_gj_cost = part.eval_set(new_gj);
-                            if (new_gj_cost >= 1e17) valid = false;
-                        }
-                        if (valid) {
-                            double saving = (part.groups[gi].cost + part.groups[gj].cost)
-                                            - (new_gi_cost + new_gj_cost);
-                            try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
+                        std::vector<std::set<size_t>> components = {new_gi};
+                        if (!new_gj.empty()) components.push_back(new_gj);
+                        if (!part.split_creates_ephemeral_gap(components, {gi, gj})) {
+                            double new_gj_cost = 0;
+                            bool valid = true;
+                            if (!new_gj.empty()) {
+                                new_gj_cost = part.eval_set(new_gj);
+                                if (new_gj_cost >= 1e17) valid = false;
+                            }
+                            if (valid) {
+                                double saving = (part.groups[gi].cost + part.groups[gj].cost)
+                                                - (new_gi_cost + new_gj_cost);
+                                try_better(best, {Move::STEAL, gi, gj, adj_op, saving, gen_i, gen_j});
+                            }
                         }
                     }
 
@@ -94,6 +98,16 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
         for (auto op : ejectable) {
             auto er = part.eval_eject(op, gi);
             if (!er.feasible) continue;
+
+            // Gap check: would the split components strand any consumer?
+            std::vector<std::set<size_t>> components = er.remainder_components;
+            bool op_in_other = false;
+            for (auto gj : part.groups_of(op))
+                if (gj != gi) { op_in_other = true; break; }
+            if (!op_in_other)
+                components.push_back({op});
+            if (part.split_creates_ephemeral_gap(components, gi)) continue;
+
             if (er.saving > -floor)
                 heap.push({Move::EJECT, gi, 0, op, er.saving, gen_i, 0});
         }
@@ -107,26 +121,31 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             best.saving = -floor;
 
             auto er = part.eval_eject(op, gi);
-            if (er.feasible)
-                try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
+            if (er.feasible) {
+                std::vector<std::set<size_t>> components = er.remainder_components;
+                bool op_in_other = false;
+                for (auto gj : part.groups_of(op))
+                    if (gj != gi) { op_in_other = true; break; }
+                if (!op_in_other)
+                    components.push_back({op});
+                if (!part.split_creates_ephemeral_gap(components, gi))
+                    try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
+            }
 
-            // SPLIT at bridge edges incident to this op.
-            // Iterate op_neighbors (DAG edges + co-consumer edges) so that
-            // co-consumer bridges are also proposed as SPLIT candidates,
-            // not just directed DAG edges (op_succs / op_preds).
-            // Canonicalise each undirected edge as (lo, hi) to avoid calling
-            // eval_split twice for the same edge.
             for (auto v : part.dag->op_neighbors[op]) {
                 if (!part.groups[gi].ops.count(v)) continue;
                 size_t u_lo = std::min(op, v);
                 size_t u_hi = std::max(op, v);
                 auto sr = part.eval_split(u_lo, u_hi, gi);
                 if (sr.feasible) {
-                    Move m;
-                    m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
-                    m.op = u_lo; m.saving = sr.saving;
-                    m.gen_a = gen_i; m.gen_b = 0; m.op2 = u_hi;
-                    try_better(best, m);
+                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gi))
+                    {
+                        Move m;
+                        m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
+                        m.op = u_lo; m.saving = sr.saving;
+                        m.gen_a = gen_i; m.gen_b = 0; m.op2 = u_hi;
+                        try_better(best, m);
+                    }
                 }
             }
 
@@ -169,14 +188,22 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::STEAL: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
-            // m.gb loses m.op after STEAL — exclude it so it is not incorrectly
-            // treated as a recompute source for tensors that m.op produces.
-            if (part.creates_ephemeral_gap(new_ga, m.ga, m.gb)) return {};
-            double new_ga_cost = part.eval_set(new_ga);
-            if (new_ga_cost >= 1e17) return {};
 
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.erase(m.op);
+
+            // Ephemeral gap check: both the growing ga and shrinking gb.
+            // Shrinking gb can make a tensor ephemeral that was boundary before.
+            {
+                std::vector<std::set<size_t>> components = {new_ga};
+                if (!new_gb.empty()) components.push_back(new_gb);
+                if (part.split_creates_ephemeral_gap(components, {m.ga, m.gb}))
+                    return {};
+            }
+
+            double new_ga_cost = part.eval_set(new_ga);
+            if (new_ga_cost >= 1e17) return {};
+
             double new_gb_cost = 0;
             if (!new_gb.empty()) {
                 new_gb_cost = part.eval_set(new_gb);
@@ -230,11 +257,22 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         }
         case Move::EJECT:
         case Move::INTERNAL_EJECT: {
-            // EJECT and INTERNAL_EJECT are mechanically identical: both call
-            // eval_eject and apply the result. The distinction is made at
-            // generation time (border op vs internal op in generate_moves).
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible || er.saving < -0.001) return {};
+
+            // Ephemeral gap check: splitting the group may make a tensor
+            // ephemeral in a remainder component, stranding external consumers.
+            {
+                std::vector<std::set<size_t>> components = er.remainder_components;
+                // Add singleton if it will become a new group
+                bool op_in_other = false;
+                for (auto gj : part.groups_of(m.op))
+                    if (gj != m.ga) { op_in_other = true; break; }
+                if (!op_in_other)
+                    components.push_back({m.op});
+                if (part.split_creates_ephemeral_gap(components, m.ga))
+                    return {};
+            }
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);
@@ -258,6 +296,10 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible || sr.saving < -0.001) return {};
+
+            // Ephemeral gap check on the two halves.
+            if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, m.ga))
+                return {};
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);

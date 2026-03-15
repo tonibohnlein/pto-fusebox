@@ -470,3 +470,78 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
     }
     return false;
 }
+
+// ============================================================================
+// split_creates_ephemeral_gap
+//
+// Checks whether replacing excluded groups with a set of new component
+// op-sets creates an ephemeral gap.
+//
+// Unlike creates_ephemeral_gap (single proposed group vs existing groups),
+// this checks multiple sibling components simultaneously.  A tensor might be
+// available as a boundary output from a sibling component even if no existing
+// group provides it.
+// ============================================================================
+
+bool Partition::split_creates_ephemeral_gap(
+        const std::vector<std::set<size_t>>& components,
+        const std::set<size_t>& excluded) const {
+    if (!prob || !dag) return false;
+
+    for (size_t ci = 0; ci < components.size(); ci++) {
+        const auto& comp = components[ci];
+
+        for (auto op : comp) {
+            for (auto t : prob->ops[op].outputs) {
+                bool consumed_in_comp = false;
+                for (auto cop : dag->tensor_consumers[t])
+                    if (comp.count(cop)) { consumed_in_comp = true; break; }
+                if (!consumed_in_comp) continue;
+
+                int prod_op = dag->tensor_producer[t];
+                if (prod_op < 0) continue;
+
+                bool t_available = false;
+
+                // Check sibling components
+                for (size_t cj = 0; cj < components.size() && !t_available; cj++) {
+                    if (cj == ci) continue;
+                    if (!components[cj].count((size_t)prod_op)) continue;
+                    bool cj_consumes = false;
+                    for (auto cop : dag->tensor_consumers[t])
+                        if (components[cj].count(cop)) { cj_consumes = true; break; }
+                    if (!cj_consumes) t_available = true;
+                }
+                // Check existing non-excluded groups
+                for (auto gj : groups_of((size_t)prod_op)) {
+                    if (t_available) break;
+                    if (!groups[gj].alive || excluded.count(gj)) continue;
+                    bool gj_consumes = false;
+                    for (auto cop : dag->tensor_consumers[t])
+                        if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                    if (!gj_consumes) t_available = true;
+                }
+
+                if (t_available) continue;
+
+                for (auto cop : dag->tensor_consumers[t]) {
+                    bool served = false;
+                    for (size_t cj = 0; cj < components.size() && !served; cj++)
+                        if (components[cj].count(cop) && components[cj].count((size_t)prod_op))
+                            served = true;
+                    if (served) continue;
+
+                    for (auto gj : groups_of(cop)) {
+                        if (served) break;
+                        if (!groups[gj].alive || excluded.count(gj)) continue;
+                        if (groups[gj].ops.count((size_t)prod_op)) served = true;
+                    }
+                    if (served) continue;
+
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
