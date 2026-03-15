@@ -214,18 +214,14 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                       size_t exclude_step2) {
     for (auto op : proposed_ops) {
         for (auto t : prob.ops[op].outputs) {
+            // T is ephemeral in proposed_ops iff produced AND consumed internally.
+            // External consumers do NOT make T a boundary output.
             bool consumed_internally = false;
             for (auto cop : dag.tensor_consumers[t])
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
-            // If T has any external consumer, the proposed step writes T as
-            // a boundary output — it is the provider. No gap possible.
-            bool has_external = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (!proposed_ops.count(cop)) { has_external = true; break; }
-            if (has_external) continue;
-
+            // T would be ephemeral. Is it available from some other step?
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 
@@ -236,8 +232,9 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
             }
             if (available) continue;
 
+            // T is ephemeral everywhere. Any consumer in a non-excluded step
+            // that doesn't recompute the producer is stranded.
             for (auto cop : dag.tensor_consumers[t]) {
-                if (proposed_ops.count(cop)) continue;
                 for (size_t si = 0; si < steps.size(); si++) {
                     if (si == exclude_step || si == exclude_step2) continue;
                     bool in_step = false, has_prod = false;

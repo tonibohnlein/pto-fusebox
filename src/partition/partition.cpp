@@ -389,18 +389,21 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
+            // T is ephemeral in proposed_ops iff produced AND consumed internally.
+            // External consumers do NOT prevent T from being ephemeral — they are
+            // the partition's concern (recomputation or availability from elsewhere).
+            // (See PROBLEM.md Example 3B: T1 is ephemeral in [0,1] despite Op2 external.)
             bool consumed_internally = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
-            if (!consumed_internally) continue;
+            if (!consumed_internally) continue;  // T is pure boundary output → no gap
 
-            // If T has any external consumer, the proposed group writes T as
-            // a boundary output — it is the provider. No gap possible.
-            bool has_external = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (!proposed_ops.count(cop)) { has_external = true; break; }
-            if (has_external) continue;
-
+            // T would be ephemeral → never written to slow memory by this group.
+            // Is T available as a boundary output from some other group?
+            // Under the new ephemeral rule: T is ephemeral in gj whenever gj
+            // contains both the producer AND at least one consumer of T.
+            // T is a boundary output of gj only if gj has the producer but
+            // NO internal consumer.
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
 
@@ -415,8 +418,10 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             }
             if (available_from_other) continue;
 
+            // T is ephemeral in every group that produces it.
+            // Any consumer in a non-excluded alive group that does NOT
+            // recompute the producer is stranded.
             for (auto cop : dag->tensor_consumers[t]) {
-                if (proposed_ops.count(cop)) continue;
                 for (auto gj : groups_of(cop)) {
                     if (!groups[gj].alive) continue;
                     if (gj == exclude_ga || gj == exclude_gb) continue;
@@ -441,13 +446,6 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
                 if (proposed_ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
-            // If T has any external consumer, the proposed group writes T as
-            // a boundary output — it is the provider. No gap possible.
-            bool has_external = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (!proposed_ops.count(cop)) { has_external = true; break; }
-            if (has_external) continue;
-
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
 
@@ -462,7 +460,6 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             if (available_from_other) continue;
 
             for (auto cop : dag->tensor_consumers[t]) {
-                if (proposed_ops.count(cop)) continue;
                 for (auto gj : groups_of(cop)) {
                     if (!groups[gj].alive || excluded.count(gj)) continue;
                     if (groups[gj].ops.count((size_t)prod_op)) continue;

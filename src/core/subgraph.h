@@ -107,14 +107,36 @@ private:
   std::vector<int64_t> k_divides_;
 
   // Precomputed per-boundary-tensor info for fast working_set/compute_cost.
+  //
+  // Each boundary tensor has a *residency role* that determines its slice
+  // shape, working-set footprint, and transfer timing.  The role is derived
+  // from the tensor's position in the chain — not from the op type that
+  // directly produces or consumes it.
+  //
+  //   Resident   (h × K) : loaded once per tile, kept across all k-steps.
+  //                         Direct MatMul LHS boundary input only.
+  //   Streamed   (per k) : fresh slice each k-step.
+  //        k × w          : feeds a MatMul RHS slot (directly or via chain).
+  //        h × k          : feeds a MatMul LHS slot via ephemeral chain.
+  //   Tile-once  (h × w) : loaded once per tile.  PW input whose output is
+  //                         a boundary tensor (no downstream MM in the chain).
+  //   Output     (h × w) : boundary output, evicted per tile.
+  //
+  // A tensor may have multiple roles (e.g., used as LHS by one MM and RHS
+  // by another).  Working set = max across roles.
   struct BoundaryTensorInfo {
     size_t id;
-    int64_t full_size;             // width * height (precomputed)
-    int64_t max_lhs_K = 0;        // max K among MM ops using this as LHS
-    bool is_mm_rhs = false;
-    bool is_mm_out = false;        // MatMul boundary output (accumulator)
-    bool is_boundary_out = false;
-    bool is_pw_in = false;
+    int64_t full_size;               // width * height (precomputed)
+
+    // --- Input roles ---
+    int64_t resident_K = 0;          // >0: h×K resident across k-steps
+    bool is_streamed_k_by_w = false; // k×w per k-step
+    bool is_streamed_h_by_k = false; // h×k per k-step
+    bool is_tile_input = false;      // h×w once per tile
+
+    // --- Output roles ---
+    bool is_boundary_out = false;    // h×w evicted per tile
+    bool is_mm_out = false;          // MatMul accumulator (h×w, resident)
   };
   std::vector<BoundaryTensorInfo> boundary_tensor_info_;
 
