@@ -439,50 +439,19 @@ Partition greedy_descent(Partition part) {
                 continue;
         }
 
+        // Snapshot before applying (for gap-revert)
+        Partition snapshot = part;
         auto dirty = apply_move(part, m);
-        if (dirty.empty()) continue;
+        if (dirty.empty()) {
+            part = std::move(snapshot);
+            continue;
+        }
 
-        // DEBUG: validate no ephemeral gaps after every move
-        {
-            part.rebuild_index();
-            std::set<size_t> all_bouts;
-            for (size_t gi2 = 0; gi2 < part.groups.size(); gi2++) {
-                if (!part.groups[gi2].alive) continue;
-                auto sg2 = Subgraph::create(*part.prob, *part.dag,
-                    std::vector<size_t>(part.groups[gi2].ops.begin(),
-                                        part.groups[gi2].ops.end()));
-                if (sg2) for (auto t2 : sg2->boundary_outputs()) all_bouts.insert(t2);
-            }
-            for (size_t gi2 = 0; gi2 < part.groups.size(); gi2++) {
-                if (!part.groups[gi2].alive) continue;
-                auto sg2 = Subgraph::create(*part.prob, *part.dag,
-                    std::vector<size_t>(part.groups[gi2].ops.begin(),
-                                        part.groups[gi2].ops.end()));
-                if (!sg2) continue;
-                for (auto t2 : sg2->boundary_inputs()) {
-                    if (part.dag->tensor_producer[t2] < 0) continue;
-                    if (!all_bouts.count(t2)) {
-                        static const char* move_names[] = {
-                            "MERGE","STEAL","RECOMPUTE","EJECT","INTERNAL_EJECT","SPLIT"};
-                        std::cerr << "    GAP_DEBUG: T" << t2 << " needed by G" << gi2
-                                  << " after " << move_names[m.type]
-                                  << "(ga=" << m.ga << ",gb=" << m.gb
-                                  << ",op=" << m.op << ")\n";
-                        // Print the offending group
-                        for (size_t gk = 0; gk < part.groups.size(); gk++) {
-                            if (!part.groups[gk].alive) continue;
-                            auto sgk = Subgraph::create(*part.prob, *part.dag,
-                                std::vector<size_t>(part.groups[gk].ops.begin(),
-                                                    part.groups[gk].ops.end()));
-                            if (sgk && sgk->ephemeral().count(t2)) {
-                                std::cerr << "      ephemeral in G" << gk << " (ops:";
-                                for (auto o : part.groups[gk].ops) std::cerr << " " << o;
-                                std::cerr << ")\n";
-                            }
-                        }
-                    }
-                }
-            }
+        // Full gap validation: compound moves can destroy tensor sources
+        // that earlier moves relied on. Revert if any gap detected.
+        if (partition_has_gap(part)) {
+            part = std::move(snapshot);
+            continue;
         }
 
         applied++;
@@ -715,38 +684,13 @@ Partition local_search(const Problem& prob, const DAG& dag) {
         std::cerr << "  Init " << s.name << "...\n";
         auto init = s.init(prob, dag, &cache);
         
-        // DEBUG: validate init result
-        {
-            init.rebuild_index();
-            std::set<size_t> all_bouts;
-            for (size_t gi = 0; gi < init.groups.size(); gi++) {
-                if (!init.groups[gi].alive) continue;
-                auto sg = Subgraph::create(prob, dag,
-                    std::vector<size_t>(init.groups[gi].ops.begin(),
-                                        init.groups[gi].ops.end()));
-                if (sg) for (auto t : sg->boundary_outputs()) all_bouts.insert(t);
-            }
-            for (size_t gi = 0; gi < init.groups.size(); gi++) {
-                if (!init.groups[gi].alive) continue;
-                auto sg = Subgraph::create(prob, dag,
-                    std::vector<size_t>(init.groups[gi].ops.begin(),
-                                        init.groups[gi].ops.end()));
-                if (!sg) continue;
-                for (auto t : sg->boundary_inputs()) {
-                    if (dag.tensor_producer[t] < 0) continue;
-                    if (!all_bouts.count(t)) {
-                        std::cerr << "    INIT_GAP: T" << t << " needed by G" << gi
-                                  << " after " << s.name << "\n";
-                    }
-                }
-            }
-        }
-        
         if (g_verbose) std::cerr << "    " << init.num_alive() << " groups, cost="
                   << init.total_cost() << "\n";
 
         auto result = greedy_descent(std::move(init));
         cleanup_redundant_recomputation(result);
+        // With snapshot+revert in greedy_descent, gaps should not exist.
+        // repair_ephemeral_gaps is a final safety net.
         repair_ephemeral_gaps(result);
 
         if (result.total_cost() < best_cost - 0.001) {
