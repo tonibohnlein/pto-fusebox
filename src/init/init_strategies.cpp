@@ -22,6 +22,47 @@ static std::vector<int> build_op_to_group(const Partition& p) {
 }
 
 // Try merging groups ga and gb. Returns true if merge improved cost.
+// Standalone inline ephemeral gap check for a proposed merged op-set.
+// Checks at PARTITION level (not just DAG level) whether any alive group
+// would be stranded by T becoming ephemeral. This handles recomputation:
+// Op3 might be in both merged AND in G3, so the DAG-level "no ext consumer"
+// shortcut is wrong — G3 still needs T from slow memory.
+static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
+                              size_t ga, size_t gb) {
+    const Problem& prob = *p.prob;
+    const DAG& dag = *p.dag;
+    for (auto op : merged) {
+        for (auto t : prob.ops[op].outputs) {
+            bool consumed_in = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (merged.count(cop)) { consumed_in = true; break; }
+            if (!consumed_in) continue;
+
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            bool available = false;
+            for (auto gj : p.groups_of((size_t)prod_op)) {
+                if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                bool gj_consumes = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
+                if (!gj_consumes) { available = true; break; }
+            }
+            if (available) continue;
+
+            for (auto cop : dag.tensor_consumers[t]) {
+                for (auto gj : p.groups_of(cop)) {
+                    if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
+                    if (!p.groups[gj].ops.count((size_t)prod_op))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 static bool try_merge(Partition& p, size_t ga, size_t gb) {
     if (ga == gb || !p.groups[ga].alive || !p.groups[gb].alive) return false;
 
@@ -30,7 +71,7 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
     std::set<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
 
-    if (p.creates_ephemeral_gap(merged, ga, gb)) return false;
+    if (inline_gap_check(p, merged, ga, gb)) return false;
 
     double new_cost = p.eval_set(merged);
 
@@ -294,7 +335,7 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
             std::set<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[gj].ops.begin(), p.groups[gj].ops.end());
 
-            if (p.creates_ephemeral_gap(merged, (size_t)gi, (size_t)gj)) continue;
+            if (inline_gap_check(p, merged, (size_t)gi, (size_t)gj)) continue;
 
             double new_cost = p.eval_set(merged);
             double saving = (p.groups[gi].cost + p.groups[gj].cost) - new_cost;
@@ -361,7 +402,7 @@ Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
         // Try merge — accept if subgraph is valid (feasible tiling exists)
         std::set<size_t> merged = p.groups[ga].ops;
         merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
-        if (p.creates_ephemeral_gap(merged, ga, gb)) continue;
+        if (inline_gap_check(p, merged, ga, gb)) continue;
         double new_cost = p.eval_set(merged);
         if (new_cost >= 1e17) continue; // infeasible
 
