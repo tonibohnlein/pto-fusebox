@@ -11,19 +11,23 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop)) any_internal = true;
+                else all_internal = false;
+            }
+            if (!any_internal) continue;
+            if (!all_internal) continue;
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
             for (auto cop : dag.tensor_consumers[t]) {
@@ -45,19 +49,23 @@ static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& m
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop)) any_internal = true;
+                else all_internal = false;
+            }
+            if (!any_internal) continue;
+            if (!all_internal) continue;
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (!p.groups[gj].alive || excl.count(gj)) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
             for (auto cop : dag.tensor_consumers[t]) {
@@ -84,10 +92,10 @@ static bool boundary_inputs_unavailable(const Partition& p,
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod)) {
                 if (!p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (!available) return true;
         }
