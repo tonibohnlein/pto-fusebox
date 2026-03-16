@@ -2609,8 +2609,8 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     pc.max_drift_fraction = eff_drift;
 
                     // Outer loop: more passes early (temp high), fewer late (temp low)
-                    int max_passes = std::max(3, (int)(10 * temp * heat));
-                    int max_no_imp_passes = std::max(2, (int)(4 * temp * heat));
+                    int max_passes = std::clamp((int)(200 * temp * heat), 100, 250);
+                    int max_no_imp_passes = std::clamp((int)(50 * temp * heat), 25, 50);
 
                     auto pr = solution_fm_outer(prob, dag, child_sol.steps(), pc, &fr,
                                                 max_passes, max_no_imp_passes);
