@@ -718,12 +718,82 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
     }
   }
 
+  // --- DE_RECOMPUTE: remove a recomputed op from this step ---
+  // Op must appear in at least one other step. Removing it here saves compute
+  // and possibly memory. If this step becomes empty, it's removed entirely.
+  {
+    // Check if op appears in another step
+    bool in_other_step = false;
+    for (size_t sj = 0; sj < state.size(); sj++) {
+      if (sj == si) continue;
+      for (auto o : state.steps[sj].subgraph.ops())
+        if (o == op) { in_other_step = true; break; }
+      if (in_other_step) break;
+    }
+    if (in_other_step) {
+      if (si_set.size() == 1) {
+        // Singleton step: removing it saves the entire step cost.
+        // Verify all boundary outputs are still available from other steps.
+        bool safe = true;
+        for (auto t : state.steps[si].subgraph.boundary_outputs()) {
+          bool avail = false;
+          for (size_t sj = 0; sj < state.size(); sj++) {
+            if (sj == si) continue;
+            if (state.steps[sj].subgraph.boundary_outputs().count(t)) {
+              avail = true; break;
+            }
+          }
+          if (!avail) { safe = false; break; }
+        }
+        if (safe) {
+          double saving = state.cost[si];
+          if (saving > -floor && saving > best.saving) {
+            best.type = SolutionMove::DE_RECOMPUTE;
+            best.step_a = si;
+            best.op = op;
+            best.saving = saving;
+          }
+        }
+      } else if (is_border &&
+                 is_connected_without(si_set, op, dag, prob.num_ops())) {
+        // Multi-op step: remove op, remainder must be connected + feasible.
+        // Verify all boundary outputs produced by op are available elsewhere.
+        std::set<size_t> remainder = si_set;
+        remainder.erase(op);
+        bool safe = true;
+        for (auto t : prob.ops[op].outputs) {
+          if (!state.steps[si].subgraph.boundary_outputs().count(t)) continue;
+          bool avail = false;
+          for (size_t sj = 0; sj < state.size(); sj++) {
+            if (sj == si) continue;
+            if (state.steps[sj].subgraph.boundary_outputs().count(t)) {
+              avail = true; break;
+            }
+          }
+          if (!avail) { safe = false; break; }
+        }
+        if (safe) {
+          auto sg_r = Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
+          if (sg_r) {
+            auto rr = filter_retain(state.steps[si].retain_these, *sg_r, state.ret_entering[si]);
+            auto cr = sg_r->best_cost(state.ret_entering[si], rr);
+            if (cr.feasible) {
+              double saving = state.cost[si] - cr.latency;
+              if (saving > -floor && saving > best.saving) {
+                best.type = SolutionMove::DE_RECOMPUTE;
+                best.step_a = si;
+                best.op = op;
+                best.saving = saving;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   return best;
 }
-
-// ============================================================================
-// Best move for a single TENSOR (retain-style moves)
-// ============================================================================
 
 static SolutionMove best_move_for_tensor(SolState &state, size_t t,
                                          const std::set<size_t> &locked_tensors,
@@ -1092,26 +1162,19 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     if (m.step_a >= state.size())
       return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
-    // Reject if tensor is already entering from the previous step —
-    // it would appear in both retained_from_prev and retain_these.
-    if (state.ret_entering[m.step_a].count(m.tensor))
-      return {SIZE_MAX, 0};
     auto nr = si.retain_these;
     nr.insert(m.tensor);
     auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
     if (!ci.feasible)
       return {SIZE_MAX, 0};
-    // Must also verify and update step_a+1 with new entering set.
-    // Strip new_ent from next step's retain_these to avoid overlap assertion.
+    // Verify and update step_a+1 with new entering set.
+    // Overlap between new entering and next step's retain is now safe.
     if (m.step_a + 1 < state.size()) {
-      auto new_ent = nr; // what exits step_a = its retain set
-      std::set<size_t> next_safe;
-      for (auto t2 : state.steps[m.step_a + 1].retain_these)
-          if (!new_ent.count(t2)) next_safe.insert(t2);
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(new_ent, next_safe);
+      auto new_ent = nr;
+      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
+          new_ent, state.steps[m.step_a + 1].retain_these);
       if (!cj.feasible)
         return {SIZE_MAX, 0};
-      state.steps[m.step_a + 1].retain_these = next_safe;
       state.steps[m.step_a + 1].config = cj.config;
     }
     si.retain_these = nr;
@@ -1127,22 +1190,67 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
     if (!ci.feasible)
       return {SIZE_MAX, 0};
-    // Must also verify and update step_a+1 with new entering set.
-    // Strip new_ent from next step's retain_these to avoid overlap assertion.
+    // Verify and update step_a+1 with new entering set.
     if (m.step_a + 1 < state.size()) {
       auto new_ent = nr;
-      std::set<size_t> next_safe;
-      for (auto t2 : state.steps[m.step_a + 1].retain_these)
-          if (!new_ent.count(t2)) next_safe.insert(t2);
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(new_ent, next_safe);
+      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
+          new_ent, state.steps[m.step_a + 1].retain_these);
       if (!cj.feasible)
         return {SIZE_MAX, 0};
-      state.steps[m.step_a + 1].retain_these = next_safe;
       state.steps[m.step_a + 1].config = cj.config;
     }
     si.retain_these = nr;
     si.config = ci.config;
     return {m.step_a, state.size()};
+  }
+  case SolutionMove::DE_RECOMPUTE: {
+    if (m.step_a >= state.size())
+      return {SIZE_MAX, 0};
+    auto &si = state.steps[m.step_a];
+    auto si_ops = si.subgraph.ops();
+    std::set<size_t> si_set(si_ops.begin(), si_ops.end());
+
+    // Re-verify: op is still in another step
+    bool in_other = false;
+    for (size_t sj = 0; sj < state.size(); sj++) {
+      if (sj == m.step_a) continue;
+      for (auto o : state.steps[sj].subgraph.ops())
+        if (o == m.op) { in_other = true; break; }
+      if (in_other) break;
+    }
+    if (!in_other) return {SIZE_MAX, 0};
+
+    // Re-verify: boundary outputs produced by op are available elsewhere
+    for (auto t : prob.ops[m.op].outputs) {
+      if (!si.subgraph.boundary_outputs().count(t)) continue;
+      bool avail = false;
+      for (size_t sj = 0; sj < state.size(); sj++) {
+        if (sj == m.step_a) continue;
+        if (state.steps[sj].subgraph.boundary_outputs().count(t)) {
+          avail = true; break;
+        }
+      }
+      if (!avail) return {SIZE_MAX, 0};
+    }
+
+    if (si_set.size() == 1) {
+      // Singleton: remove entire step
+      state.steps.erase(state.steps.begin() + m.step_a);
+      return {m.step_a > 0 ? m.step_a - 1 : 0, state.size()};
+    } else {
+      // Multi-op: remove op, rebuild remainder
+      std::set<size_t> remainder = si_set;
+      remainder.erase(m.op);
+      auto sg_r = Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
+      if (!sg_r) return {SIZE_MAX, 0};
+      auto rr = filter_retain(si.retain_these, *sg_r, state.ret_entering[m.step_a]);
+      auto cr = sg_r->best_cost(state.ret_entering[m.step_a], rr);
+      if (!cr.feasible) return {SIZE_MAX, 0};
+      si.subgraph = std::move(*sg_r);
+      si.config = cr.config;
+      si.retain_these = rr;
+      return {m.step_a, state.size()};
+    }
   }
   default:
     return {SIZE_MAX, 0};
