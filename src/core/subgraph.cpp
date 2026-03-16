@@ -139,6 +139,26 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
+    // Compute output_K_: the reduction dimension of the MatMul(s) that
+    // produce boundary outputs.  This K drives the temporal loop
+    // (nk = output_K / k).
+    //
+    // In a chain like (T0 @ T1) @ T2, the output-producing MatMul is Op1
+    // with K = T3.width (= Op1's LHS width).  ALL ops in the chain — 
+    // including upstream Op0 — produce k/output_K of their work per k-step,
+    // because each step computes k output columns of the final result.
+    //
+    // When has_pw_sink_ is true, k is forced to 1 and output_K_ is moot.
+    if (!sg.has_pw_sink_) {
+      for (auto t : sg.boundary_outputs_) {
+        int prod = tensor_producer_in_sg[t];
+        if (prod >= 0 && prob.ops[prod].type == OpType::MatMul) {
+          sg.output_K_ = sg.op_K(prod);
+          break;  // all boundary outputs have same dims; first suffices
+        }
+      }
+    }
+
     // ---- Collect role-based tiling constraints ----
     // For ephemeral tensors, determine slice type by following the consumer chain
     // iteratively (no std::function/recursion needed).
@@ -283,17 +303,28 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       const auto &op = prob.ops[i];
       if (op.type == OpType::MatMul) {
         size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
+        bool out_is_boundary = sg.boundary_outputs_.count(out) > 0;
+
         // Direct MM LHS boundary input: resident at h × K across all k-steps.
         if (sg.boundary_inputs_.count(lhs)) {
           size_t idx = ensure(lhs);
           auto &info = sg.boundary_tensor_info_[idx];
           info.resident_K = std::max(info.resident_K, prob.tensors[lhs].width);
         }
-        // Direct MM RHS boundary input: streamed at k × w per k-step.
+        // Direct MM RHS boundary input:
+        //   Output-producing MatMul (output is boundary): streamed at k × w.
+        //   Upstream MatMul (output is ephemeral): streamed at K_upstream × k
+        //     where K_upstream = tensor.height = reduction dim of this MatMul.
         if (sg.boundary_inputs_.count(rhs)) {
-          sg.boundary_tensor_info_[ensure(rhs)].is_streamed_k_by_w = true;
+          auto &info = sg.boundary_tensor_info_[ensure(rhs)];
+          if (out_is_boundary) {
+            info.is_streamed_k_by_w = true;
+          } else {
+            info.stream_fixed_by_k = std::max(
+                info.stream_fixed_by_k, prob.tensors[rhs].height);
+          }
         }
-        if (sg.boundary_outputs_.count(out)) {
+        if (out_is_boundary) {
           size_t idx = ensure(out);
           sg.boundary_tensor_info_[idx].is_mm_out = true;
           sg.boundary_tensor_info_[idx].is_boundary_out = true;
@@ -302,6 +333,15 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         // PW is element-wise: input shape = output shape. The output's shape
         // is determined by what it feeds downstream. Follow the ephemeral
         // chain to discover the role.
+        //
+        // TODO: This classification doesn't distinguish whether the downstream
+        // MatMul is the output-producing one or an upstream one. For PW feeding
+        // an upstream MatMul's RHS, the correct slice is fixed×k (not k×w),
+        // and for PW feeding an upstream MatMul's LHS, the correct slice is a
+        // once-per-tile h×K_upstream (not per-k-step h×k). This requires the
+        // eph_sw/eph_sh propagation to carry the downstream MatMul identity.
+        // In practice, the direct MatMul boundary RHS case (handled above) is
+        // far more common than PW→ephemeral→upstream-MatMul chains.
         size_t pw_out = op.outputs[0];
         bool feeds_mm_lhs = is_ephemeral[pw_out] &&
                             eph_sw[pw_out] == SliceW::K_param &&
@@ -324,6 +364,11 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
           sg.boundary_tensor_info_[ensure(t)].is_boundary_out = true;
     }
   }
+
+  // ---- Populate tensor_id_to_info_ for O(1) lookup in working_set ----
+  sg.tensor_id_to_info_.assign(num_tensors, -1);
+  for (size_t idx = 0; idx < sg.boundary_tensor_info_.size(); idx++)
+    sg.tensor_id_to_info_[sg.boundary_tensor_info_[idx].id] = (int)idx;
 
   // ---- Build tiling candidates ----
   auto gcd_of = [](const std::vector<int64_t>& vals) -> int64_t {
@@ -413,6 +458,8 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.k * cfg.w);
     if (info.is_streamed_h_by_k)
       max_size = std::max(max_size, cfg.h * cfg.k);
+    if (info.stream_fixed_by_k > 0)
+      max_size = std::max(max_size, info.stream_fixed_by_k * cfg.k);
     if (info.is_tile_input)
       max_size = std::max(max_size, cfg.h * cfg.w);
     if (info.is_mm_out)
@@ -426,11 +473,9 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   // A tensor carried from the previous step that this subgraph does not
   // directly use still occupies fast memory and must be counted.
   for (auto t : retained_from_prev) {
-    bool found = false;
-    for (auto &info : boundary_tensor_info_)
-      if (info.id == t) { found = true; break; }
-    if (!found)
-      ws += prob_->tensors[t].size();
+    if (t < tensor_id_to_info_.size() && tensor_id_to_info_[t] >= 0)
+      continue;  // already counted in the main boundary tensor loop above
+    ws += prob_->tensors[t].size();
   }
 
   // ---- Post-pass: retained output tensors ----
@@ -476,7 +521,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   int num_th = (int)(out_H_ / cfg.h);
   int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
-  result.num_k_passes = has_matmul_ ? (int)(max_K_ / cfg.k) : 1;
+  result.num_k_passes = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
   int nk = result.num_k_passes;
 
   auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
@@ -484,13 +529,23 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       ceil_div(cfg.w, prob_->native_w) * ceil_div(cfg.h, prob_->native_h);
 
   // Compute: separate MM (per k-step) from PW (once per tile)
+  //
+  // All MatMul ops in a fused chain share the same temporal fraction per
+  // k-step: k / output_K_.  This is because the unified temporal loop is
+  // driven by the output-producing MatMul's reduction dimension.  Each
+  // k-step, every op in the chain produces k / output_K_ of its output
+  // columns — upstream ops do full internal reduction but for fewer columns.
+  //
+  // Example: chain (T0 @ T1) @ T2, output_K_ = K1 = T3.width.
+  //   Per step, Op0 produces k columns of T3 (fraction k/K1).
+  //   Per step, Op1 does rank-k update of T4 (fraction k/K1).
+  //   Both ops: base_cost × k / output_K_ per step.
   double mm_comp = 0.0;
   double pw_comp = 0.0;
   for (auto i : ops_) {
     double c = (double)prob_->ops[i].base_cost;
     if (prob_->ops[i].type == OpType::MatMul) {
-      int64_t Ki = op_K(i);
-      mm_comp += c * ((double)cfg.k / Ki);
+      mm_comp += c * ((double)cfg.k / output_K_);
     } else {
       pw_comp += c;
     }
@@ -521,6 +576,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         stream_load += (double)(cfg.k * cfg.w) / B;
       if (info.is_streamed_h_by_k)
         stream_load += (double)(cfg.h * cfg.k) / B;
+      if (info.stream_fixed_by_k > 0)
+        stream_load += (double)(info.stream_fixed_by_k * cfg.k) / B;
       if (info.is_tile_input)
         tile_load += (double)(cfg.h * cfg.w) / B;
     }

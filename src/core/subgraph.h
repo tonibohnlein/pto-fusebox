@@ -59,6 +59,11 @@ public:
   // Maximum K across all MatMul ops in this subgraph.
   int64_t max_K() const { return max_K_; }
 
+  // Reduction dimension of the output-producing MatMul(s).
+  // This is the K that drives the temporal loop (nk = output_K / k).
+  // For PW-sink subgraphs, output_K_ == 1 (k is forced to 1).
+  int64_t output_K() const { return output_K_; }
+
   // --- Tiling validity ---
 
   bool is_valid_tiling(const TileConfig &cfg) const;
@@ -100,6 +105,7 @@ private:
   bool has_matmul_ = false;
   bool has_pw_sink_ = false;
   int64_t max_K_ = 1;
+  int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
 
   // Role-based tiling constraints.
   std::vector<int64_t> w_divides_;
@@ -116,8 +122,10 @@ private:
   //   Resident   (h × K) : loaded once per tile, kept across all k-steps.
   //                         Direct MatMul LHS boundary input only.
   //   Streamed   (per k) : fresh slice each k-step.
-  //        k × w          : feeds a MatMul RHS slot (directly or via chain).
-  //        h × k          : feeds a MatMul LHS slot via ephemeral chain.
+  //        k × w          : output-producing MatMul RHS (boundary output).
+  //        fixed × k      : upstream MatMul RHS (ephemeral output);
+  //                         fixed = tensor.height = upstream reduction dim.
+  //        h × k          : feeds a MatMul LHS slot via ephemeral PW chain.
   //   Tile-once  (h × w) : loaded once per tile.  PW input whose output is
   //                         a boundary tensor (no downstream MM in the chain).
   //   Output     (h × w) : boundary output, evicted per tile.
@@ -130,8 +138,10 @@ private:
 
     // --- Input roles ---
     int64_t resident_K = 0;          // >0: h×K resident across k-steps
-    bool is_streamed_k_by_w = false; // k×w per k-step
+    bool is_streamed_k_by_w = false; // k×w per k-step (output-level MatMul RHS)
     bool is_streamed_h_by_k = false; // h×k per k-step
+    int64_t stream_fixed_by_k = 0;   // fixed×k per k-step (upstream MatMul RHS;
+                                     // fixed = tensor.height = upstream reduction dim)
     bool is_tile_input = false;      // h×w once per tile
 
     // --- Output roles ---
