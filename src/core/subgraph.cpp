@@ -307,134 +307,147 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       return std::nullopt;
   }
 
-  // ---- Precompute per-boundary-tensor role info ----
+  // ---- Precompute per-boundary-tensor tiling via backward propagation ----
   //
-  // Each boundary tensor's role is determined by its position in the chain,
-  // not by what op type directly touches it. A tensor feeding a MatMul LHS
-  // via a PW chain has the same residency behavior as a direct MM LHS —
-  // except that the ephemeral chain means the full h×K is never resident
-  // (it's streamed at h×k per step instead).
+  // Matches the reference evaluator's h_tiles/v_tiles system exactly.
+  // Process ops in reverse topological order; for each op, propagate
+  // tiling from its output to its inputs.
   {
-    // Use vector indexed by tensor ID, then flatten to boundary_tensor_info_
-    std::vector<int> tensor_in_info(num_tensors, -1); // -1 = not in info
+    using TS = BoundaryTensorInfo::TileSource;
+
+    // Per-tensor tiling sources (for ALL tensors, not just boundary)
+    struct TilePair { TS h; TS v; bool assigned = false; };
+    std::vector<TilePair> tsrc(num_tensors);
+
+    // Determine is_sink per op (no internal consumer of output)
+    std::vector<bool> is_sink_op(num_ops, false);
+    for (auto i : sg.ops_) {
+      is_sink_op[i] = true;
+      for (auto t : prob.ops[i].outputs)
+        for (auto cop : dag.tensor_consumers[t])
+          if (is_in_sg[cop]) { is_sink_op[i] = false; break; }
+    }
+
+    // Seed: boundary output tensors get FROM_NTW × FROM_NTH
+    for (auto t : sg.boundary_outputs_)
+      tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
+
+    // Backward propagation through ops in reverse topological order
+    for (auto op_idx : dag.topological_order())
+      if (is_in_sg[op_idx]) {
+        // (will iterate forward; we need reverse — collect then reverse)
+      }
+    // Actually, collect subgraph ops in topo order, then iterate in reverse
+    std::vector<size_t> sg_topo;
+    for (auto op_idx : dag.topological_order())
+      if (is_in_sg[op_idx]) sg_topo.push_back(op_idx);
+
+    for (int ri = (int)sg_topo.size() - 1; ri >= 0; ri--) {
+      size_t op_idx = sg_topo[ri];
+      const auto &op = prob.ops[op_idx];
+      size_t out = op.outputs[0];
+
+      // Output's tiling must be assigned by now (seed or downstream propagation)
+      // If not (isolated op), default to NTW × NTH
+      if (!tsrc[out].assigned)
+        tsrc[out] = {TS::FROM_NTW, TS::FROM_NTH, true};
+
+      TS out_h = tsrc[out].h;
+      TS out_v = tsrc[out].v;
+
+      if (op.type == OpType::Pointwise) {
+        // PW: all inputs inherit output's tiling
+        for (auto t : op.inputs) {
+          if (!tsrc[t].assigned)
+            tsrc[t] = {out_h, out_v, true};
+          // else: already assigned by a downstream op — ref checks consistency
+        }
+      } else {
+        // MatMul: LHS = input[0], RHS = input[1]
+        size_t lhs = op.inputs[0], rhs = op.inputs[1];
+
+        if (is_sink_op[op_idx]) {
+          // Sink MM: depth-tiled (FROM_NK for the k-dimension)
+          // LHS: h_tiles = nk, v_tiles = output.v
+          // RHS: h_tiles = output.h, v_tiles = nk
+          if (!tsrc[lhs].assigned)
+            tsrc[lhs] = {TS::FROM_NK, out_v, true};
+          if (!tsrc[rhs].assigned)
+            tsrc[rhs] = {out_h, TS::FROM_NK, true};
+        } else {
+          // Non-sink MM: LHS full-width, RHS full-height
+          // LHS: h_tiles = 1 (full K), v_tiles = output.v
+          // RHS: h_tiles = output.h, v_tiles = 1 (full K)
+          if (!tsrc[lhs].assigned)
+            tsrc[lhs] = {TS::FIXED_1, out_v, true};
+          if (!tsrc[rhs].assigned)
+            tsrc[rhs] = {out_h, TS::FIXED_1, true};
+        }
+      }
+    }
+
+    // Build BoundaryTensorInfo from the propagated sources
+    std::vector<int> tensor_in_info(num_tensors, -1);
     auto ensure = [&](size_t t) -> size_t {
       if (tensor_in_info[t] < 0) {
         tensor_in_info[t] = (int)sg.boundary_tensor_info_.size();
-        sg.boundary_tensor_info_.push_back(
-          {t, prob.tensors[t].width * prob.tensors[t].height});
+        BoundaryTensorInfo info;
+        info.id = t;
+        info.full_size = prob.tensors[t].width * prob.tensors[t].height;
+        if (tsrc[t].assigned) {
+          info.h_source = tsrc[t].h;
+          info.v_source = tsrc[t].v;
+        }
+        sg.boundary_tensor_info_.push_back(info);
       }
       return (size_t)tensor_in_info[t];
     };
 
-    for (auto i : sg.ops_) {
-      const auto &op = prob.ops[i];
+    // Register all boundary inputs
+    for (auto t : sg.boundary_inputs_) {
+      size_t idx = ensure(t);
+      // Mark internally-produced boundary inputs (produced inside + external consumers)
+      if (is_produced[t])
+        sg.boundary_tensor_info_[idx].is_internally_produced = true;
+    }
+
+    // Register all boundary outputs
+    for (auto t : sg.boundary_outputs_) {
+      size_t idx = ensure(t);
+      sg.boundary_tensor_info_[idx].is_boundary_out = true;
+      if (is_produced[t])
+        sg.boundary_tensor_info_[idx].is_internally_produced =
+            sg.boundary_inputs_.count(t) > 0 ? false : false;
+      // Also: if produced internally AND is boundary input too (fan-out),
+      // the internally_produced flag was set above
+    }
+
+    // Mark MM accumulators (sink MM outputs that are boundary)
+    for (auto op_idx : sg.ops_) {
+      const auto &op = prob.ops[op_idx];
       if (op.type == OpType::MatMul) {
-        size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
-        bool out_is_boundary = sg.boundary_outputs_.count(out) > 0;
-
-        // Direct MM LHS: resident at h × K across all k-steps.
-        // Check both boundary inputs AND internally-produced boundary outputs.
-        // Special case: if this is the SINK MatMul (output is boundary) and
-        // nk > 1, the LHS is actually streamed at h×k per step, not resident.
-        // We mark is_sink_mm_lhs here; working_set/compute_cost switch at runtime.
-        if (sg.boundary_inputs_.count(lhs)) {
-          size_t idx = ensure(lhs);
-          auto &info = sg.boundary_tensor_info_[idx];
-          info.resident_K = std::max(info.resident_K, prob.tensors[lhs].width);
-          if (out_is_boundary) info.is_sink_mm_lhs = true;
-        } else if (sg.boundary_outputs_.count(lhs) && is_produced[lhs]) {
-          // LHS is produced internally but has external consumers →
-          // boundary output, NOT ephemeral. Still needs h×K in fast memory
-          // for this MatMul to consume it, but no slow memory read.
-          size_t idx = ensure(lhs);
-          auto &info = sg.boundary_tensor_info_[idx];
-          info.resident_K = std::max(info.resident_K, prob.tensors[lhs].width);
-          info.is_internally_produced = true;
-          if (out_is_boundary) info.is_sink_mm_lhs = true;
-        }
-
-        // Direct MM RHS:
-        //   Output-producing MatMul (output is boundary): streamed at k × w.
-        //   Upstream MatMul (output is ephemeral):
-        //     If ephemeral feeds another MatMul (width maps to k): K_upstream × k
-        //     If ephemeral feeds PW→boundary (width maps to w): K_upstream × w
-        if (sg.boundary_inputs_.count(rhs)) {
-          auto &info = sg.boundary_tensor_info_[ensure(rhs)];
-          if (out_is_boundary) {
-            info.is_streamed_k_by_w = true;
-          } else {
-            // Ephemeral output — check what its width maps to
-            if (is_ephemeral[out] && eph_sw[out] == SliceW::W_param) {
-              info.stream_fixed_by_w = std::max(
-                  info.stream_fixed_by_w, prob.tensors[rhs].height);
-            } else {
-              info.stream_fixed_by_k = std::max(
-                  info.stream_fixed_by_k, prob.tensors[rhs].height);
-            }
-          }
-        } else if (sg.boundary_outputs_.count(rhs) && is_produced[rhs]) {
-          // RHS is produced internally but has external consumers →
-          // boundary output, needs streaming footprint but no slow memory read.
-          auto &info = sg.boundary_tensor_info_[ensure(rhs)];
-          info.is_internally_produced = true;
-          if (out_is_boundary) {
-            info.is_streamed_k_by_w = true;
-          } else {
-            if (is_ephemeral[out] && eph_sw[out] == SliceW::W_param) {
-              info.stream_fixed_by_w = std::max(
-                  info.stream_fixed_by_w, prob.tensors[rhs].height);
-            } else {
-              info.stream_fixed_by_k = std::max(
-                  info.stream_fixed_by_k, prob.tensors[rhs].height);
-            }
-          }
-        }
-
-        if (out_is_boundary) {
+        size_t out = op.outputs[0];
+        if (sg.boundary_outputs_.count(out)) {
           size_t idx = ensure(out);
           sg.boundary_tensor_info_[idx].is_mm_out = true;
-          sg.boundary_tensor_info_[idx].is_boundary_out = true;
-        }
-      } else { // Pointwise
-        // PW is element-wise: input shape = output shape. The output's shape
-        // is determined by what it feeds downstream. Follow the ephemeral
-        // chain to discover the role.
-        //
-        // TODO: This classification doesn't distinguish whether the downstream
-        // MatMul is the output-producing one or an upstream one. For PW feeding
-        // an upstream MatMul's RHS, the correct slice is fixed×k (not k×w),
-        // and for PW feeding an upstream MatMul's LHS, the correct slice is a
-        // once-per-tile h×K_upstream (not per-k-step h×k). This requires the
-        // eph_sw/eph_sh propagation to carry the downstream MatMul identity.
-        // In practice, the direct MatMul boundary RHS case (handled above) is
-        // far more common than PW→ephemeral→upstream-MatMul chains.
-        size_t pw_out = op.outputs[0];
-        bool feeds_mm_lhs = is_ephemeral[pw_out] &&
-                            eph_sw[pw_out] == SliceW::K_param &&
-                            eph_sh[pw_out] == SliceH::H_param;
-        bool feeds_mm_rhs = is_ephemeral[pw_out] &&
-                            eph_sw[pw_out] == SliceW::W_param &&
-                            eph_sh[pw_out] == SliceH::K_param;
-
-        for (auto t : op.inputs) {
-          if (sg.boundary_inputs_.count(t)) {
-            auto &info = sg.boundary_tensor_info_[ensure(t)];
-            if (feeds_mm_lhs)       info.is_streamed_h_by_k = true;
-            else if (feeds_mm_rhs)  info.is_streamed_k_by_w = true;
-            else                    info.is_tile_input = true;
-          } else if (sg.boundary_outputs_.count(t) && is_produced[t]) {
-            // PW input is produced internally but has external consumers.
-            auto &info = sg.boundary_tensor_info_[ensure(t)];
-            info.is_internally_produced = true;
-            if (feeds_mm_lhs)       info.is_streamed_h_by_k = true;
-            else if (feeds_mm_rhs)  info.is_streamed_k_by_w = true;
-            else                    info.is_tile_input = true;
-          }
         }
       }
-      for (auto t : op.outputs)
-        if (sg.boundary_outputs_.count(t))
-          sg.boundary_tensor_info_[ensure(t)].is_boundary_out = true;
+    }
+
+    // Mark internally-produced boundary outputs (produced inside, has external consumers)
+    for (auto op_idx : sg.ops_) {
+      for (auto t : prob.ops[op_idx].outputs) {
+        if (sg.boundary_outputs_.count(t) && is_produced[t]) {
+          size_t idx = ensure(t);
+          // It's internally produced if it's also used as an input to some op
+          // in this subgraph (otherwise it's just a pure output)
+          bool used_internally = false;
+          for (auto cop : dag.tensor_consumers[t])
+            if (is_in_sg[cop]) { used_internally = true; break; }
+          if (used_internally)
+            sg.boundary_tensor_info_[idx].is_internally_produced = true;
+        }
+      }
     }
   }
 
@@ -492,78 +505,40 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
-  // A tensor may appear in BOTH retained_from_prev and retain_these when
-  // it passes through this step (entered from previous, forwarded to next).
-  // Working set: charge it once as full_size (from retained_from_prev).
-  // The retain_these post-pass skips tensors already in retained_from_prev
-  // to avoid double-counting.
-
   int64_t ws = 0;
-  int nk = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
+  int64_t ntw = out_W_ / cfg.w;
+  int64_t nth = out_H_ / cfg.h;
+  int64_t nk = has_matmul_ ? (output_K_ / cfg.k) : 1;
 
-  // ---- Main boundary tensor loop ----
-  // For each boundary tensor, charge the maximum fast-memory footprint it
-  // occupies during a single tile step:
-  //   • retained_from_prev  → full tensor is already resident; charge full_size.
-  //   • retain_these        → SKIP here; their full sizes are added in the
-  //                           post-pass below.  Removing them from the per-tile
-  //                           accounting avoids the role-based mismatch
-  //                           (LHS strips are h×K, not h×w) that plagued the
-  //                           old "full - tile" subtraction.
-  //   • everything else     → charge the role-based tile slice.
   for (auto &info : boundary_tensor_info_) {
     if (retained_from_prev.count(info.id)) {
       ws += info.full_size;
       continue;
     }
     if (retain_these.count(info.id)) {
-      // Handled in post-pass; skip per-tile slice accounting.
-      continue;
+      continue;  // handled in post-pass
     }
 
-    int64_t max_size = 0;
-    if (info.resident_K > 0) {
-      if (info.is_sink_mm_lhs && nk > 1) {
-        // Sink MatMul LHS with split-K: streamed h×k per step, not resident.
-        max_size = std::max(max_size, cfg.h * cfg.k);
-      } else {
-        // Upstream MatMul LHS or nk=1: resident h×K across all k-steps.
-        max_size = std::max(max_size, cfg.h * info.resident_K);
-      }
-    }
-    if (info.is_streamed_k_by_w)
-      max_size = std::max(max_size, cfg.k * cfg.w);
-    if (info.is_streamed_h_by_k)
-      max_size = std::max(max_size, cfg.h * cfg.k);
-    if (info.stream_fixed_by_k > 0)
-      max_size = std::max(max_size, info.stream_fixed_by_k * cfg.k);
-    if (info.stream_fixed_by_w > 0)
-      max_size = std::max(max_size, info.stream_fixed_by_w * cfg.w);
-    if (info.is_tile_input)
-      max_size = std::max(max_size, cfg.h * cfg.w);
-    if (info.is_mm_out)
-      max_size = std::max(max_size, cfg.h * cfg.w);
-    if (info.is_boundary_out)
-      max_size = std::max(max_size, cfg.h * cfg.w);
-    ws += max_size;
+    // Evaluate slice size from propagated tiling sources
+    int64_t ht = info.eval_h_tiles(ntw, nk);
+    int64_t vt = info.eval_v_tiles(nth, nk);
+    int64_t W = prob_->tensors[info.id].width;
+    int64_t H = prob_->tensors[info.id].height;
+    int64_t slice = (ht > 0 && vt > 0) ? (W / ht) * (H / vt) : info.full_size;
+
+    // For boundary outputs: slice = w × h (from NTW × NTH)
+    // For MM accumulator: also w × h, but kept resident across k-steps
+    ws += slice;
   }
 
-  // ---- retained_from_prev tensors NOT in boundary_tensor_info_ ----
-  // A tensor carried from the previous step that this subgraph does not
-  // directly use still occupies fast memory and must be counted.
+  // retained_from_prev tensors NOT in boundary_tensor_info_
   for (auto t : retained_from_prev) {
     if (t < tensor_id_to_info_.size() && tensor_id_to_info_[t] >= 0)
-      continue;  // already counted in the main boundary tensor loop above
+      continue;
     ws += prob_->tensors[t].size();
   }
 
-  // ---- Post-pass: retained output tensors ----
-  // Each tensor in retain_these must fit in its entirety in fast memory so
-  // that all completed tiles accumulate there while the next tile executes.
-  // Charging full_size is the correct peak occupancy model:
-  //   ws_peak = (all non-retained tile slices) + full_size(each retained tensor)
-  // Skip tensors already in retained_from_prev — they're already counted
-  // with full_size in the main loop above (pass-through case).
+  // Post-pass: retained output tensors (full size, not tile slice)
   for (auto t : retain_these)
     if (!retained_from_prev.count(t))
       ws += prob_->tensors[t].size();
@@ -636,50 +611,52 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   pw_comp *= (double)scale;
   result.compute_per_step = mm_comp;
 
-  // Memory transfer costs per role, iterated over boundary_tensor_info_
-  // (already deduplicated).
+  // Memory transfer costs categorized by timing, derived from h_source/v_source.
   //
-  // Four transfer categories by timing:
-  //   resident_load   : loaded once per tile when fresh (h×K for upstream MM LHS)
-  //   sink_lhs_load   : loaded per k-step when fresh (h×k for sink MM LHS with nk>1).
-  //                     Row-level reuse same as resident_load, but distributed
-  //                     across k-steps instead of concentrated at step 0.
-  //   stream_load     : loaded per k-step (k×w for RHS slot, h×k for LHS-chain)
-  //   tile_load       : loaded once per tile (h×w for tile-input PW)
-  //   out_evict       : evicted per tile at final k-step
-  double resident_load = 0, sink_lhs_load = 0;
-  double stream_load = 0, tile_load = 0, out_evict = 0;
+  // Transfer categories:
+  //   resident_load : loaded once per tile when row changes.
+  //                   Tensors with h=FIXED_1 (position only depends on v_pos).
+  //                   Includes: non-sink MM LHS (h×K), fully-resident tensors,
+  //                   and PW inputs propagated from MM LHS chains.
+  //   stream_load   : loaded every k-step (h or v source is FROM_NK).
+  //                   Includes: sink MM inputs with split-K.
+  //   tile_load     : loaded every tile (both dimensions change per tile).
+  //                   Includes: PW tile inputs, column-resident tensors
+  //                   (conservative: treating column-fresh as per-tile).
+  //   out_evict     : evicted per tile at final k-step.
+  double resident_load = 0, stream_load = 0, tile_load = 0, out_evict = 0;
 
   for (auto &info : boundary_tensor_info_) {
     bool retained_in = retained_from_prev.count(info.id);
     bool retained_out = retain_these.count(info.id);
 
-    // Input transfer costs (skip if retained from prev — already in fast mem,
-    // or if internally produced — data is produced within this subgraph)
+    // Input transfer costs
     if (!retained_in && !info.is_internally_produced) {
-      if (info.resident_K > 0) {
-        if (info.is_sink_mm_lhs && nk > 1) {
-          // Sink MatMul LHS with split-K: h×k loaded per step.
-          // Row reuse: same pattern as resident (reused within a row of tiles).
-          sink_lhs_load += (double)(cfg.h * cfg.k) / B;
-        } else {
-          // Upstream MatMul LHS or nk=1: h×K resident, loaded once per tile.
-          resident_load += (double)(cfg.h * info.resident_K) / B;
-        }
+      int64_t ht = info.eval_h_tiles(num_tw, nk);
+      int64_t vt = info.eval_v_tiles(num_th, nk);
+      int64_t W = prob_->tensors[info.id].width;
+      int64_t H = prob_->tensors[info.id].height;
+      double slice_io = (double)((W / std::max(ht, (int64_t)1)) *
+                                 (H / std::max(vt, (int64_t)1))) / B;
+
+      bool k_dep = (info.h_source == BoundaryTensorInfo::FROM_NK ||
+                    info.v_source == BoundaryTensorInfo::FROM_NK);
+      bool h_fixed = (info.h_source == BoundaryTensorInfo::FIXED_1);
+
+      if (k_dep) {
+        stream_load += slice_io;
+      } else if (h_fixed) {
+        // Row-resident: loaded when v_pos changes (row change).
+        // Also covers fully-resident (h=1,v=1) conservatively.
+        resident_load += slice_io;
+      } else {
+        // Tile: loaded every tile. Covers FROM_NTW×FROM_NTH
+        // and FROM_NTW×FIXED_1 (column-resident, conservative).
+        tile_load += slice_io;
       }
-      if (info.is_streamed_k_by_w)
-        stream_load += (double)(cfg.k * cfg.w) / B;
-      if (info.is_streamed_h_by_k)
-        stream_load += (double)(cfg.h * cfg.k) / B;
-      if (info.stream_fixed_by_k > 0)
-        stream_load += (double)(info.stream_fixed_by_k * cfg.k) / B;
-      if (info.stream_fixed_by_w > 0)
-        stream_load += (double)(info.stream_fixed_by_w * cfg.w) / B;
-      if (info.is_tile_input)
-        tile_load += (double)(cfg.h * cfg.w) / B;
     }
 
-    // Output eviction cost (skip if retained for next step)
+    // Output eviction cost
     if (info.is_boundary_out && !retained_out)
       out_evict += (double)(cfg.h * cfg.w) / B;
   }
@@ -691,22 +668,10 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   //   Steps 1..nk-2: load stream strip only
   //   Step nk-1:     load stream strip + evict output + PW compute
   // When nk=1, all three collapse into a single step.
-  //
-  // sink_lhs_load: loaded per k-step when resident_fresh (row-level reuse).
-  // Unlike stream_load (always fresh when nk>1), sink_lhs is reused across
-  // tiles within the same row — its position only depends on (d, row).
   auto tile_cost = [&](bool resident_fresh, bool stream_fresh) -> double {
-    // When k < K (nk > 1), the stream strip loaded in the last k-step of the
-    // previous tile covers a different k-range than step 0 of this tile.
-    // Resident reuse IS valid: the full h×K stays resident across k-steps.
     if (nk > 1) stream_fresh = true;
 
-    // sink_lhs follows resident freshness: reused within a row
-    double slhs = resident_fresh ? sink_lhs_load : 0.0;
-
     if (nk == 1) {
-      // Single step: everything happens at once
-      // (sink_lhs_load is 0 when nk=1 by construction)
       double mi = tile_load;
       if (resident_fresh) mi += resident_load;
       if (stream_fresh) mi += stream_load;
@@ -714,18 +679,18 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       return std::max(mm_comp + pw_comp, mi + mo);
     }
 
-    // Step 0: resident + first stream strip + tile inputs + sink_lhs, compute = mm only
-    double mi0 = tile_load + slhs;
+    // Step 0: resident + first stream strip + tile inputs, compute = mm only
+    double mi0 = tile_load;
     if (resident_fresh) mi0 += resident_load;
     if (stream_fresh) mi0 += stream_load;
     double step0 = std::max(mm_comp, mi0);
 
-    // Middle steps (1..nk-2): each loads one stream strip + sink_lhs, mm compute
-    double mid_step = std::max(mm_comp, stream_load + slhs);
+    // Middle steps (1..nk-2): each loads one stream strip, mm compute
+    double mid_step = std::max(mm_comp, stream_load);
     double mid_total = (nk >= 3) ? (double)(nk - 2) * mid_step : 0.0;
 
-    // Last step (nk-1): stream strip + sink_lhs + evict + PW compute
-    double last = std::max(mm_comp + pw_comp, stream_load + slhs + out_evict);
+    // Last step (nk-1): stream strip + evict output + PW compute
+    double last = std::max(mm_comp + pw_comp, stream_load + out_evict);
 
     return step0 + mid_total + last;
   };

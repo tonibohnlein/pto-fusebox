@@ -115,56 +115,72 @@ private:
   std::vector<int64_t> h_divides_;
   std::vector<int64_t> k_divides_;
 
-  // Precomputed per-boundary-tensor info for fast working_set/compute_cost.
+  // Precomputed per-boundary-tensor tiling info for working_set/compute_cost.
   //
-  // Each boundary tensor has a *residency role* that determines its slice
-  // shape, working-set footprint, and transfer timing.  The role is derived
-  // from the tensor's position in the chain — not from the op type that
-  // directly produces or consumes it.
+  // Each boundary tensor's slice dimensions are determined by backward
+  // propagation through the chain, exactly matching the reference evaluator's
+  // h_tiles/v_tiles system:
   //
-  //   Resident   (h × K) : loaded once per tile, kept across all k-steps.
-  //                         Direct MatMul LHS boundary input only.
-  //   Streamed   (per k) : fresh slice each k-step.
-  //        k × w          : output-producing MatMul RHS (boundary output).
-  //        fixed × k      : upstream MatMul RHS (ephemeral output);
-  //                         fixed = tensor.height = upstream reduction dim.
-  //        h × k          : feeds a MatMul LHS slot via ephemeral PW chain.
-  //   Tile-once  (h × w) : loaded once per tile.  PW input whose output is
-  //                         a boundary tensor (no downstream MM in the chain).
-  //   Output     (h × w) : boundary output, evicted per tile.
+  //   h_tiles divides tensor.width  → slice_w = tensor.width / h_tiles
+  //   v_tiles divides tensor.height → slice_h = tensor.height / v_tiles
+  //   slice_size = slice_w × slice_h
   //
-  // A tensor may have multiple roles (e.g., used as LHS by one MM and RHS
-  // by another).  Working set = max across roles.
+  // h_tiles and v_tiles depend on the tiling config (w, h, k). We store
+  // their SOURCE so they can be evaluated at runtime for any config.
+  //
+  // Propagation rules (from reference evaluator):
+  //   Output boundary: h = FROM_NTW (= W_out/w), v = FROM_NTH (= H_out/h)
+  //   PW:              inputs inherit output's (h, v)
+  //   Non-sink MM:     LHS: h = FIXED_1, v = output.v
+  //                    RHS: h = output.h, v = FIXED_1
+  //   Sink MM (nk>1):  LHS: h = FROM_NK (= K/k), v = output.v
+  //                    RHS: h = output.h, v = FROM_NK
+  //
+  // Transfer timing is derived from the sources:
+  //   FIXED_1 → position never changes in that dimension
+  //   FROM_NTW → position changes with output column (h_pos)
+  //   FROM_NTH → position changes with output row (v_pos)
+  //   FROM_NK → position changes every k-step
   struct BoundaryTensorInfo {
     size_t id;
     int64_t full_size;               // width * height (precomputed)
 
-    // --- Input roles ---
-    int64_t resident_K = 0;          // >0: h×K resident across k-steps
-    bool is_sink_mm_lhs = false;     // LHS of the output-producing MatMul.
-                                     // When nk>1: streamed h×k per step (NOT resident).
-                                     // When nk=1: resident h×K per tile (normal).
-                                     // resident_K stores K for both cases.
-    bool is_streamed_k_by_w = false; // k×w per k-step (output-level MatMul RHS)
-    bool is_streamed_h_by_k = false; // h×k per k-step
-    int64_t stream_fixed_by_k = 0;   // fixed×k per k-step (upstream MatMul RHS;
-                                     // fixed = tensor.height = upstream reduction dim)
-                                     // Used when ephemeral output feeds another MatMul
-    int64_t stream_fixed_by_w = 0;   // fixed×w per tile (upstream MatMul RHS;
-                                     // fixed = tensor.height = upstream reduction dim)
-                                     // Used when ephemeral output feeds PW→boundary
-    bool is_tile_input = false;      // h×w once per tile
+    // How this tensor's tiling is determined
+    enum TileSource : uint8_t {
+      FIXED_1  = 0,  // h_tiles or v_tiles = 1 (full extent in this dim)
+      FROM_NTW = 1,  // = W_out / w (output column tiling)
+      FROM_NTH = 2,  // = H_out / h (output row tiling)
+      FROM_NK  = 3   // = output_K / k (depth tiling for sink split-K)
+    };
+    TileSource h_source = FROM_NTW;  // determines h_tiles
+    TileSource v_source = FROM_NTH;  // determines v_tiles
 
-    // --- Output roles ---
+    // Output roles
     bool is_boundary_out = false;    // h×w evicted per tile
     bool is_mm_out = false;          // MatMul accumulator (h×w, resident)
 
-    // --- Internal production flag ---
-    // True when this tensor is produced by an op INSIDE the subgraph but also
-    // has external consumers (making it a boundary output, not ephemeral).
-    // Such tensors need their internal consumption role in the working set
-    // but must NOT be charged mem_in (they're already in fast memory).
+    // Internal production flag (no mem_in cost)
     bool is_internally_produced = false;
+
+    // Evaluate h_tiles for a given config
+    int64_t eval_h_tiles(int64_t ntw, int64_t nk) const {
+      switch (h_source) {
+        case FIXED_1:  return 1;
+        case FROM_NTW: return ntw;
+        case FROM_NTH: return 1; // shouldn't happen, but safe
+        case FROM_NK:  return nk;
+      }
+      return 1;
+    }
+    int64_t eval_v_tiles(int64_t nth, int64_t nk) const {
+      switch (v_source) {
+        case FIXED_1:  return 1;
+        case FROM_NTW: return 1; // shouldn't happen, but safe
+        case FROM_NTH: return nth;
+        case FROM_NK:  return nk;
+      }
+      return 1;
+    }
   };
   std::vector<BoundaryTensorInfo> boundary_tensor_info_;
 
