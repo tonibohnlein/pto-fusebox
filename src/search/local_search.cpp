@@ -17,10 +17,18 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            // New ephemeral rule: T is ephemeral only if ALL DAG consumers
+            // are inside the merged set. Any external consumer → boundary output.
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop))
+                    any_internal = true;
+                else
+                    all_internal = false;
+            }
+            if (!any_internal) continue;   // pure boundary output
+            if (!all_internal) continue;   // external consumer → boundary output
 
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
@@ -28,10 +36,11 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                // T is boundary output of gj if NOT all consumers are in gj
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
 
@@ -73,15 +82,16 @@ static bool boundary_inputs_unavailable(const Partition& p,
             if (proposed.count((size_t)prod)) continue;  // produced internally → fine
 
             // T is a boundary input of proposed. Is T available from slow memory?
-            // T is available if some alive group writes it as a boundary output
-            // (= has the producer, does NOT consume T internally).
+            // T is available if some alive group has T as a boundary output.
+            // Under the new rule: T is a boundary output of gj if gj has the
+            // producer AND NOT all of T's DAG consumers are inside gj.
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod)) {
                 if (!p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (!available) return true;  // T needed but not available → gap!
         }

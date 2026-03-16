@@ -33,21 +33,31 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            // New ephemeral rule: T is ephemeral only if ALL DAG consumers
+            // are inside the merged set. Any external consumer → boundary output.
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop))
+                    any_internal = true;
+                else
+                    all_internal = false;
+            }
+            if (!any_internal) continue;   // pure boundary output
+            if (!all_internal) continue;   // external consumer → boundary output
 
+            // T would be purely ephemeral in merged. Check partition-level availability.
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                // T is boundary output of gj if NOT all consumers are in gj
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
 
@@ -247,23 +257,42 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
                 std::set<size_t> expanded = group;
                 expanded.insert(cand);
 
-                // Check: would this expansion create an ephemeral tensor
-                // with external consumers? During init, unassigned ops will
-                // go to singleton groups without recomputation, so any
-                // external consumer of an ephemeral tensor = future gap.
+                // New ephemeral rule: T is ephemeral only if ALL DAG consumers
+                // are inside expanded. If any consumer is external, T becomes
+                // a boundary output → no gap possible from this tensor.
+                //
+                // During init, no recomputation exists (each op in at most one
+                // group), so if all consumers are internal, no external group
+                // can need T. Gap check is only needed for partition-level
+                // recomputation scenarios, which don't occur during init.
+                // We still check for safety in case future callers reuse this.
                 bool has_gap = false;
-                for (auto op : expanded) {
-                    for (auto t : prob.ops[op].outputs) {
-                        // Is T consumed internally in expanded?
-                        bool consumed_in = false;
-                        for (auto cop : dag.tensor_consumers[t])
-                            if (expanded.count(cop)) { consumed_in = true; break; }
-                        if (!consumed_in) continue;
-                        // T would be ephemeral. Any external consumer?
+                for (auto op_i : expanded) {
+                    for (auto t : prob.ops[op_i].outputs) {
+                        bool all_in = true;
+                        bool any_in = false;
                         for (auto cop : dag.tensor_consumers[t]) {
-                            if (!expanded.count(cop)) { has_gap = true; break; }
+                            if (expanded.count(cop)) any_in = true;
+                            else all_in = false;
                         }
-                        if (has_gap) break;
+                        if (!any_in || !all_in) continue;  // boundary output or pure output
+
+                        // T is purely ephemeral. During init (no recomputation),
+                        // this means no external group needs T. Safe.
+                        // With recomputation, check partition-level availability.
+                        int prod_op_t = dag.tensor_producer[t];
+                        if (prod_op_t < 0) continue;
+                        for (auto cop : dag.tensor_consumers[t]) {
+                            if (has_gap) break;
+                            for (auto gj : p.groups_of(cop)) {
+                                if (!p.groups[gj].alive) continue;
+                                // gj needs T unless gj also has the producer
+                                if (!p.groups[gj].ops.count((size_t)prod_op_t)) {
+                                    has_gap = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if (has_gap) break;
                 }
@@ -472,7 +501,7 @@ std::string verify_partition_feasibility(const Partition& part) {
                       std::vector<size_t>(g.ops.begin(), g.ops.end()));
         if (!sg) {
             return "G" + std::to_string(i) + ": Subgraph::create failed "
-                   "(disconnected or ephemeral fan-out)";
+                   "(disconnected or invalid structure)";
         }
         auto c = sg->best_cost();
         if (!c.feasible) {
@@ -492,20 +521,6 @@ std::string verify_partition_feasibility(const Partition& part) {
     // self-loop in the condensed DAG. That check belongs in try_merge / apply_move,
     // not here.
 
-    // ── 3. No ephemeral tensors with external consumers ───────────────────
-    // T is truly ephemeral in group G only if ALL of T's consumers are inside G.
-    // If any consumer is external, Subgraph::create classifies T as a boundary
-    // output and external consumers load it from slow memory — no gap possible.
-    //
-    // For an existing partition where every group passes eval_set < 1e18, this
-    // invariant is automatically satisfied: eval_set calls Subgraph::create which
-    // correctly classifies each tensor as ephemeral or boundary output based on
-    // whether all consumers are internal. External consumers are always served by
-    // boundary outputs. No further check is needed here.
-    //
-    // Note: creates_ephemeral_gap() is the correct pre-move check used during
-    // search to verify that a PROPOSED fusion would not strand any consumer.
-    // That check is distinct from verifying an existing partition.
 
     return "";  // all invariants satisfied
 }
