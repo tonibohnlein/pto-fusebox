@@ -82,10 +82,10 @@ static bool step_depends_on(const ScheduleStep &si, const ScheduleStep &sj,
 static std::set<size_t> filter_retain(const std::set<size_t> &retain,
                                       const Subgraph &sg,
                                       const std::set<size_t> &entering = {}) {
+  (void)entering;  // overlap with entering is now safe in working_set
   std::set<size_t> r;
   for (auto t : retain)
-    if ((sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
-        && !entering.count(t))  // tensor already entering must not also be in retain_these
+    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
       r.insert(t);
   return r;
 }
@@ -251,16 +251,24 @@ struct SolState {
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it.
+      // Pass-through allowed: T in both entering (cur) and retain_these.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
                      steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        bool not_already_entering = !cur.count(t);
-        if (valid && useful && not_already_entering) {
+        if (valid && useful) {
           useful_retain.insert(t);
         }
+      }
+      // Pass through entering tensors needed by next step
+      if (i + 1 < n) {
+        for (auto t : cur)
+          if (steps[i + 1].subgraph.boundary_inputs().count(t) &&
+              (steps[i].subgraph.boundary_inputs().count(t) ||
+               steps[i].subgraph.boundary_outputs().count(t)))
+            useful_retain.insert(t);
       }
       steps[i].retain_these = useful_retain;
 
@@ -301,16 +309,24 @@ struct SolState {
     for (size_t i = idx; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it
+      // PRUNE useless retentions: only keep if the NEXT step actually needs it.
+      // Pass-through allowed: T in both entering (cur) and retain_these.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
                      steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        bool not_already_entering = !cur.count(t);
-        if (valid && useful && not_already_entering) {
+        if (valid && useful) {
           useful_retain.insert(t);
         }
+      }
+      // Pass through entering tensors needed by next step
+      if (i + 1 < n) {
+        for (auto t : cur)
+          if (steps[i + 1].subgraph.boundary_inputs().count(t) &&
+              (steps[i].subgraph.boundary_inputs().count(t) ||
+               steps[i].subgraph.boundary_outputs().count(t)))
+            useful_retain.insert(t);
       }
       steps[i].retain_these = useful_retain;
 
@@ -1883,12 +1899,14 @@ static void recompute_costs(const Problem& prob, const DAG& dag,
                             std::vector<ScheduleStep>& steps) {
     std::set<size_t> entering;
     for (size_t i = 0; i < steps.size(); i++) {
-        // Strip tensors already in entering from retain_these — they are already
-        // resident and must not appear in both retained_from_prev and retain_these.
-        std::set<size_t> safe_retain;
+        // Validate retain_these: must be boundary tensors of this subgraph.
+        // Overlap with entering is safe (pass-through).
+        std::set<size_t> valid_retain;
         for (auto t : steps[i].retain_these)
-            if (!entering.count(t)) safe_retain.insert(t);
-        steps[i].retain_these = safe_retain;
+            if (steps[i].subgraph.boundary_inputs().count(t) ||
+                steps[i].subgraph.boundary_outputs().count(t))
+                valid_retain.insert(t);
+        steps[i].retain_these = valid_retain;
 
         auto bc = steps[i].subgraph.best_cost(entering, steps[i].retain_these);
         if (!bc.feasible) {

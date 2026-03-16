@@ -492,15 +492,11 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
-  // Sanity check: a tensor should never be in both sets simultaneously.
-  // retained_from_prev = carried into this step; retain_these = kept after this
-  // step. They refer to different step boundaries and must be disjoint.
-#ifndef NDEBUG
-  for (auto t : retain_these)
-    assert(!retained_from_prev.count(t) &&
-           "tensor appears in both retained_from_prev and retain_these — "
-           "double-counting would corrupt working set");
-#endif
+  // A tensor may appear in BOTH retained_from_prev and retain_these when
+  // it passes through this step (entered from previous, forwarded to next).
+  // Working set: charge it once as full_size (from retained_from_prev).
+  // The retain_these post-pass skips tensors already in retained_from_prev
+  // to avoid double-counting.
 
   int64_t ws = 0;
   int nk = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
@@ -566,8 +562,11 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   // that all completed tiles accumulate there while the next tile executes.
   // Charging full_size is the correct peak occupancy model:
   //   ws_peak = (all non-retained tile slices) + full_size(each retained tensor)
+  // Skip tensors already in retained_from_prev — they're already counted
+  // with full_size in the main loop above (pass-through case).
   for (auto t : retain_these)
-    ws += prob_->tensors[t].size();
+    if (!retained_from_prev.count(t))
+      ws += prob_->tensors[t].size();
 
   return ws;
 }

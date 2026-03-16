@@ -19,12 +19,15 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
     for (size_t i = 0; i < n; i++) {
         retained_entering_[i] = currently_retained;
 
-        // Defensive: retain_these must not overlap with currently_retained
-        // (would double-count in working set). Strip any overlap.
-        std::set<size_t> safe_retain;
+        // retain_these may overlap with currently_retained (pass-through).
+        // working_set handles this correctly by not double-counting.
+        // Only validate that retained tensors are boundary tensors of this subgraph.
+        std::set<size_t> valid_retain;
         for (auto t : steps_[i].retain_these)
-            if (!currently_retained.count(t)) safe_retain.insert(t);
-        steps_[i].retain_these = safe_retain;
+            if (steps_[i].subgraph.boundary_inputs().count(t) ||
+                steps_[i].subgraph.boundary_outputs().count(t))
+                valid_retain.insert(t);
+        steps_[i].retain_these = valid_retain;
 
         step_costs_[i] = steps_[i].subgraph.compute_cost(
             steps_[i].config,
@@ -64,14 +67,26 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         if (!g.sg) continue;
         const Subgraph& sg = *g.sg;
 
-        // Build retain_these: only keep tensors the next step will actually read
+        // Build retain_these: keep tensors the next step will actually read.
+        // Two sources:
+        //   a) tensors from retain_per_step that the next step needs (new retains)
+        //   b) tensors from entering that the next step also needs (pass-through)
+        // Both can overlap with entering; working_set handles that correctly.
         std::set<size_t> retain_these;
-        if (i + 1 < res.order.size() && i < res.retain_per_step.size()) {
+        if (i + 1 < res.order.size()) {
             size_t next_gi = res.order[i + 1];
             if (part.groups[next_gi].sg) {
                 const auto& next_inputs = part.groups[next_gi].sg->boundary_inputs();
-                for (auto t : res.retain_per_step[i])
-                    if (next_inputs.count(t) && !entering.count(t)) retain_these.insert(t);
+                // (a) New retains from ordering hint
+                if (i < res.retain_per_step.size()) {
+                    for (auto t : res.retain_per_step[i])
+                        if (next_inputs.count(t)) retain_these.insert(t);
+                }
+                // (b) Pass-through: entering tensors needed by next step
+                for (auto t : entering)
+                    if (next_inputs.count(t) &&
+                        (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t)))
+                        retain_these.insert(t);
             }
         }
 
