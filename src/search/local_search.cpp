@@ -547,176 +547,14 @@ Partition greedy_descent(Partition part) {
     return part;
 }
 
-// ============================================================================
-// Cleanup: remove redundant recomputation groups
-//
-// A group is redundant if every op in it also appears in at least one other
-// alive group, AND removing it doesn't create an ephemeral gap.
-// ============================================================================
-
-void cleanup_redundant_recomputation(Partition& part) {
-    bool changed = true;
-    int removed = 0;
-
-    while (changed) {
-        changed = false;
-        part.rebuild_index();
-
-        for (size_t gi = 0; gi < part.groups.size(); gi++) {
-            if (!part.groups[gi].alive) continue;
-
-            // Check: every op covered by another alive group
-            bool all_covered = true;
-            for (auto op : part.groups[gi].ops) {
-                bool in_other = false;
-                for (auto gj : part.groups_of(op))
-                    if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
-                if (!in_other) { all_covered = false; break; }
-            }
-            if (!all_covered) continue;
-
-            // Check: removing gi doesn't create an ephemeral gap.
-            // For each tensor T that is a boundary output of gi (produced but
-            // NOT consumed internally), verify some other group also writes T.
-            bool safe = true;
-            auto sg = Subgraph::create(*part.prob, *part.dag,
-                          std::vector<size_t>(part.groups[gi].ops.begin(),
-                                              part.groups[gi].ops.end()));
-            if (sg) {
-                for (auto t : sg->boundary_outputs()) {
-                    int prod = part.dag->tensor_producer[t];
-                    if (prod < 0) continue;
-                    bool available_elsewhere = false;
-                    for (auto gj : part.groups_of((size_t)prod)) {
-                        if (gj == gi || !part.groups[gj].alive) continue;
-                        auto sg_j = Subgraph::create(*part.prob, *part.dag,
-                                        std::vector<size_t>(part.groups[gj].ops.begin(),
-                                                            part.groups[gj].ops.end()));
-                        if (sg_j && sg_j->boundary_outputs().count(t)) {
-                            available_elsewhere = true; break;
-                        }
-                    }
-                    if (!available_elsewhere) { safe = false; break; }
-                }
-            }
-            if (!safe) continue;
-
-            part.groups[gi].alive = false;
-            part.groups[gi].gen++;
-            changed = true;
-            removed++;
-        }
-    }
-    if (removed > 0) {
-        part.rebuild_index();
-        std::cerr << "    cleanup: removed " << removed
-                  << " redundant recomputation group(s), cost="
-                  << part.total_cost() << "\n";
-    }
-}
+// cleanup_redundant_recomputation and repair_ephemeral_gaps removed.
+// Under the new ephemeral rule (tensor is ephemeral only if ALL DAG consumers
+// are internal), external consumers force boundary output materialization,
+// making recomputation rarely needed. DE_RECOMPUTE moves handle any
+// redundant groups during search. partition_has_gap remains for debug.
 
 // ============================================================================
-// Repair: fix any ephemeral gaps by splitting offending groups
-//
-// For each alive group, check if any ephemeral tensor T has an external
-// consumer that isn't served. If so, eject the producer op from the group
-// so that T becomes a boundary output instead of ephemeral.
-//
-// This is a safety net — with correct gap checks during search, this
-// should never fire. But it guarantees a valid partition regardless.
-// ============================================================================
-
-void repair_ephemeral_gaps(Partition& part) {
-    int repairs = 0;
-    bool changed = true;
-
-    while (changed) {
-        changed = false;
-        part.rebuild_index();
-
-        // Collect all boundary outputs across alive groups
-        std::set<size_t> all_boundary_outputs;
-        for (size_t gi = 0; gi < part.groups.size(); gi++) {
-            if (!part.groups[gi].alive) continue;
-            auto sg = Subgraph::create(*part.prob, *part.dag,
-                          std::vector<size_t>(part.groups[gi].ops.begin(),
-                                              part.groups[gi].ops.end()));
-            if (sg) for (auto t : sg->boundary_outputs())
-                all_boundary_outputs.insert(t);
-        }
-
-        for (size_t gi = 0; gi < part.groups.size(); gi++) {
-            if (!part.groups[gi].alive) continue;
-            auto sg = Subgraph::create(*part.prob, *part.dag,
-                          std::vector<size_t>(part.groups[gi].ops.begin(),
-                                              part.groups[gi].ops.end()));
-            if (!sg) continue;
-
-            for (auto t : sg->boundary_inputs()) {
-                if (part.dag->tensor_producer[t] < 0) continue;
-                if (all_boundary_outputs.count(t)) continue;
-
-
-
-                // T is needed but not available. Find which group makes it
-                // ephemeral and split it.
-                int prod_op = part.dag->tensor_producer[t];
-                for (auto gj : part.groups_of((size_t)prod_op)) {
-                    if (!part.groups[gj].alive) continue;
-                    // Check if T is ephemeral in gj
-                    auto sg_j = Subgraph::create(*part.prob, *part.dag,
-                                    std::vector<size_t>(part.groups[gj].ops.begin(),
-                                                        part.groups[gj].ops.end()));
-                    if (!sg_j || !sg_j->ephemeral().count(t)) continue;
-
-
-                    std::cerr << "    REPAIR: T" << t << " needed by G" << gi 
-                            << ", ephemeral in G" << gj
-                            << " (ops:";
-                    for (auto o : part.groups[gj].ops) std::cerr << " " << o;
-                    std::cerr << ")\n";
-
-                    // T is ephemeral in gj. Eject the producer to force T
-                    // to become a boundary output. Split gj into:
-                    //   {prod_op} (singleton) + remainder
-                    std::set<size_t> remainder = part.groups[gj].ops;
-                    remainder.erase((size_t)prod_op);
-
-                    double prod_cost = part.eval_set({(size_t)prod_op});
-
-                    if (!remainder.empty()) {
-                        auto comps = part.connected_components(remainder);
-                        part.groups[gj].ops = comps[0];
-                        part.groups[gj].cost = part.eval_set(comps[0]);
-                        part.groups[gj].gen++;
-                        for (size_t c = 1; c < comps.size(); c++)
-                            part.add_group(comps[c], part.eval_set(comps[c]));
-                    } else {
-                        part.groups[gj].alive = false;
-                        part.groups[gj].gen++;
-                    }
-                    part.add_group({(size_t)prod_op}, prod_cost);
-
-                    repairs++;
-                    changed = true;
-                    break;
-                }
-                if (changed) break;
-            }
-            if (changed) break;
-        }
-    }
-
-    if (repairs > 0) {
-        part.rebuild_index();
-        std::cerr << "    repair: fixed " << repairs
-                  << " ephemeral gap(s), cost="
-                  << part.total_cost() << "\n";
-    }
-}
-
-// ============================================================================
-// Quick full gap check
+// Quick full gap check (debug validation)
 // ============================================================================
 
 bool partition_has_gap(const Partition& part) {
@@ -770,10 +608,6 @@ Partition local_search(const Problem& prob, const DAG& dag) {
                   << init.total_cost() << "\n";
 
         auto result = greedy_descent(std::move(init));
-        cleanup_redundant_recomputation(result);
-        // Prevention-based gap checks in all move types should prevent gaps.
-        // repair_ephemeral_gaps is a final safety net — fires a warning if hit.
-        repair_ephemeral_gaps(result);
 
         if (result.total_cost() < best_cost - 0.001) {
             best_cost = result.total_cost();
@@ -800,10 +634,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
         best_cost = fm_result.best_cost;
     }
 
-    // Phase 3: post-search cleanup
-    cleanup_redundant_recomputation(best);
-    repair_ephemeral_gaps(best);
-
+    // Phase 3: done
     std::cerr << "  Final: " << best.num_alive() << " groups, cost="
               << best.total_cost() << "\n";
     return best;
