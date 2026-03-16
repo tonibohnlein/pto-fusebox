@@ -115,19 +115,43 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       for (auto t : prob.ops[i].outputs)
         tensor_producer_in_sg[t] = (int)i;
 
-    // All boundary outputs must have the same dimensions
-    auto it = sg.boundary_outputs_.begin();
-    sg.out_W_ = prob.tensors[*it].width;
-    sg.out_H_ = prob.tensors[*it].height;
-    for (++it; it != sg.boundary_outputs_.end(); ++it) {
-      if (prob.tensors[*it].width != sg.out_W_ ||
-          prob.tensors[*it].height != sg.out_H_)
-        return std::nullopt;
+    // Determine sink ops: ops with no internal successor.
+    // The reference evaluator seeds tiling from the sink's output tensor.
+    // Only sink outputs define the subgraph's spatial dimensions (out_W, out_H).
+    // Non-sink ops may produce boundary outputs with different dimensions
+    // (e.g., intermediate tensors consumed externally via recomputation).
+    std::vector<size_t> sink_ops;
+    for (auto i : sg.ops_) {
+      bool has_internal_succ = false;
+      for (auto t : prob.ops[i].outputs)
+        for (auto cop : dag.tensor_consumers[t])
+          if (is_in_sg[cop]) { has_internal_succ = true; break; }
+      if (!has_internal_succ)
+        sink_ops.push_back(i);
     }
 
-    for (auto t : sg.boundary_outputs_) {
-      int prod = tensor_producer_in_sg[t];
-      if (prod >= 0 && prob.ops[prod].type == OpType::Pointwise) {
+    // out_W, out_H from the first sink's output. All sinks must agree.
+    if (sink_ops.empty()) return std::nullopt;
+    size_t first_sink_out = prob.ops[sink_ops[0]].outputs[0];
+    sg.out_W_ = prob.tensors[first_sink_out].width;
+    sg.out_H_ = prob.tensors[first_sink_out].height;
+    for (size_t si = 1; si < sink_ops.size(); si++) {
+      size_t out = prob.ops[sink_ops[si]].outputs[0];
+      if (prob.tensors[out].width != sg.out_W_ ||
+          prob.tensors[out].height != sg.out_H_)
+        return std::nullopt;
+      // Also check K dimension agreement for MatMul sinks (ref line 277)
+      if (prob.ops[sink_ops[si]].type == OpType::MatMul &&
+          prob.ops[sink_ops[0]].type == OpType::MatMul) {
+        if (prob.tensors[prob.ops[sink_ops[si]].inputs[0]].width !=
+            prob.tensors[prob.ops[sink_ops[0]].inputs[0]].width)
+          return std::nullopt;
+      }
+    }
+
+    // Check for PW sinks
+    for (auto s : sink_ops) {
+      if (prob.ops[s].type == OpType::Pointwise) {
         sg.has_pw_sink_ = true;
         break;
       }
@@ -135,24 +159,11 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
     // Compute output_K_: the reduction dimension that drives the temporal
     // loop (nk = output_K / k).
-    //
-    // When the boundary output is produced by a MatMul, output_K_ is that
-    // MatMul's reduction dimension.  nk = output_K_ / k splits the
-    // reduction into temporal steps.
-    //
-    // When a Pointwise produces the boundary output (has_pw_sink_), k is
-    // forced to 1 and output_K_ = 1, giving nk = 1.  This means NO
-    // temporal splitting: the MatMul performs its full reduction in a
-    // single step, and the PW fires immediately after.
-    // Confirmed by organizer in issue #32: "With split-K, the MatMul
-    // takes 4 passes to accumulate its result, and the Pointwise cannot
-    // participate in those k-steps."
     if (!sg.has_pw_sink_) {
-      for (auto t : sg.boundary_outputs_) {
-        int prod = tensor_producer_in_sg[t];
-        if (prod >= 0 && prob.ops[prod].type == OpType::MatMul) {
-          sg.output_K_ = sg.op_K(prod);
-          break;  // all boundary outputs have same dims; first suffices
+      for (auto s : sink_ops) {
+        if (prob.ops[s].type == OpType::MatMul) {
+          sg.output_K_ = sg.op_K(s);
+          break;
         }
       }
     }
@@ -330,9 +341,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
           if (is_in_sg[cop]) { is_sink_op[i] = false; break; }
     }
 
-    // Seed: boundary output tensors get FROM_NTW × FROM_NTH
-    for (auto t : sg.boundary_outputs_)
-      tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
+    // Seed: only SINK ops' output tensors get FROM_NTW × FROM_NTH.
+    // Non-sink boundary outputs get their tiling from backward propagation
+    // (they're produced by internal ops whose tiling is set by the chain).
+    for (auto i : sg.ops_) {
+      if (!is_sink_op[i]) continue;
+      for (auto t : prob.ops[i].outputs)
+        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
+    }
 
     // Backward propagation through ops in reverse topological order.
     // If a tensor gets conflicting tiling requirements from two consumers,
@@ -494,12 +510,14 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (has_pw_sink_ && cfg.k > 1)
     return false;
 
+  // Reference allows granularity ≥ dimension (gives 1 tile = full extent).
+  // Divisibility only required when granularity < dimension.
   for (int64_t v : w_divides_)
-    if (v % cfg.w != 0) return false;
+    if (cfg.w < v && v % cfg.w != 0) return false;
   for (int64_t v : h_divides_)
-    if (v % cfg.h != 0) return false;
+    if (cfg.h < v && v % cfg.h != 0) return false;
   for (int64_t v : k_divides_)
-    if (v % cfg.k != 0) return false;
+    if (cfg.k < v && v % cfg.k != 0) return false;
 
   return true;
 }
@@ -527,9 +545,9 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
-  int64_t ntw = out_W_ / cfg.w;
-  int64_t nth = out_H_ / cfg.h;
-  int64_t nk = has_matmul_ ? (output_K_ / cfg.k) : 1;
+  int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
+  int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
+  int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
 
   int64_t ws = 0;
 
@@ -596,11 +614,11 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   result.feasible = true;
 
   double B = (double)prob_->slow_memory_bandwidth;
-  int num_tw = (int)(out_W_ / cfg.w);
-  int num_th = (int)(out_H_ / cfg.h);
+  int num_tw = std::max((int)(out_W_ / cfg.w), 1);
+  int num_th = std::max((int)(out_H_ / cfg.h), 1);
   int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
-  result.num_k_passes = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
+  result.num_k_passes = has_matmul_ ? std::max((int)(output_K_ / cfg.k), 1) : 1;
   int nk = result.num_k_passes;
 
   // Compute: per-op scale factor based on output tile size vs granularity.
@@ -644,11 +662,15 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   // position-based reuse model.
   //
   //   once_load   : FIXED_1 × FIXED_1  — loaded once (first tile only).
-  //   row_load    : FIXED_1 × FROM_NTH — loaded when output row changes.
-  //   col_load    : FROM_NTW × FIXED_1 — loaded when output column changes.
+  //   row_load    : FROM_NTW × FIXED_1 — position depends on row → loaded when row changes.
+  //   col_load    : FIXED_1 × FROM_NTH — position depends on column → loaded when column changes.
   //   tile_load   : FROM_NTW × FROM_NTH — loaded every tile.
   //   stream_load : FROM_NK in either   — loaded every k-step.
   //   out_evict   : boundary output evicted on last k-step per tile.
+  //
+  //   Reference semantics: h_pos = tile_idx // ntw = ROW, v_pos = tile_idx % ntw = COL.
+  //   FIXED_1 in h → h_pos constant → doesn't depend on row → depends on column (v_pos) → col_load.
+  //   FIXED_1 in v → v_pos constant → doesn't depend on column → depends on row (h_pos) → row_load.
   double once_load = 0, row_load = 0, col_load = 0;
   double tile_load = 0, stream_load = 0, out_evict = 0;
 
@@ -671,8 +693,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
       if (k_dep)                    stream_load += slice_io;
       else if (h_fixed && v_fixed)  once_load   += slice_io;
-      else if (h_fixed)             row_load    += slice_io;
-      else if (v_fixed)             col_load    += slice_io;
+      else if (h_fixed)             col_load    += slice_io;  // depends on col (v_pos)
+      else if (v_fixed)             row_load    += slice_io;  // depends on row (h_pos)
       else                          tile_load   += slice_io;
     }
 
