@@ -195,7 +195,7 @@ static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
         double nn_dist = 1.0;
         for (size_t j = 0; j < pool.size(); j++) {
             if (i == j) continue;
-            double d = partition_distance(pool[i].partition, pool[j].partition);
+            double d = partition_distance(pool[i].partition, pool[j].partition, mh);
             nn_dist = std::min(nn_dist, d);
         }
         if (nn_dist < least_unique_dist) {
@@ -365,16 +365,22 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     int gen = 1;
     int gens_no_improve = 0;
     double best_ever = pool[0].cost;
+    double heat = 1.0;  // adaptive perturbation intensity
 
     while (has_deadline && Clock::now() < deadline) {
         auto remaining = deadline - Clock::now();
         auto gen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
         if (gen_ms < 200) break;
 
+        // Adaptive FM parameters: scale floor/drift with heat
         FMOuterConfig gen_fm = cfg.fm;
         gen_fm.deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(remaining * 8 / 10);
         gen_fm.max_passes = std::min(gen_fm.max_passes, 50);
         gen_fm.max_no_improve = std::min(gen_fm.max_no_improve, 15);
+        gen_fm.pass_config.floor_fraction = std::clamp(
+            gen_fm.pass_config.floor_fraction * heat, 0.05, 1.0);
+        gen_fm.pass_config.max_drift_fraction = std::clamp(
+            gen_fm.pass_config.max_drift_fraction * heat, 0.10, 2.0);
 
         int mut_tasks = std::min(num_threads, std::max(2, (int)pool.size()));
         std::vector<PoolEntry> mut_results(mut_tasks);
@@ -414,7 +420,9 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     // Pick parent (uniform random — pool diversity maintained by insertion)
                     size_t pi = rng() % pool.size();
 
-                    int num_muts = 4 + (int)(rng() % 5);  // 4..8 mutations
+                    int num_muts = 4 + (int)(rng() % 5);  // base: 4..8
+                    // Scale with heat: stagnation → more mutations
+                    num_muts = std::max(2, (int)(num_muts * heat));
                     child = mutate_compound(Partition(pool[pi].partition), num_muts, rng);
                     child.cache = &shared_cache;
                     origin = "mutate(" + std::to_string(num_muts) + ")";
@@ -479,10 +487,12 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         if (pool[0].cost < best_ever - 0.01) {
             best_ever = pool[0].cost;
             gens_no_improve = 0;
+            heat = std::clamp(heat * 0.7, 0.3, 4.0);  // cool down on success
             std::cerr << "  Gen " << gen << ": best=" << best_ever
-                      << " (+" << accepted << ") ***\n";
+                      << " (+" << accepted << " heat=" << heat << ") ***\n";
         } else {
             gens_no_improve++;
+            heat = std::clamp(heat * 1.2, 0.3, 4.0);  // heat up on stagnation
         }
 
         if (cfg.early_stop && gens_no_improve >= 25) {

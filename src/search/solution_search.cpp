@@ -2576,7 +2576,9 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     child = solution_crossover(prob, dag, parent, parent2, rng);
                 if (child.empty()) {
                     // Mutation path (2/3 of the time, or crossover fallback)
-                    int n_moves = 3 + (int)(rng() % 4);  // 3..6 moves
+                    int n_moves = 3 + (int)(rng() % 4);  // base: 3..6
+                    // Scale with heat: stagnation → more mutations
+                    n_moves = std::max(2, (int)(n_moves * heat));
                     child = mutate_random(prob, dag, parent, rng, n_moves);
                 }
                 if (child.empty()) continue;
