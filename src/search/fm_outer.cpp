@@ -31,8 +31,6 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         }
 
         // Cooling schedule: temperature decays from 1.0 to ~0.1 over passes.
-        // Uses cosine annealing: smooth, well-behaved, no tunable decay rate.
-        // t=0 → temp=1.0, t=max_passes → temp=0.1
         double progress = (double)pass / std::max(1, cfg.max_passes - 1);
         double temperature = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
 
@@ -57,17 +55,33 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         result.total_passes++;
         result.total_moves += pass_result.moves_applied;
 
+        // Track the pass's best candidate (may be updated by greedy-kick below)
+        double pass_best_cost = pass_result.best_cost;
+        Partition pass_best_part = std::move(pass_result.best_partition);
+
+        // Greedy descent on end state — always, not just when FM didn't improve.
+        // The end state is the maximally perturbed partition; descending it
+        // explores a different basin than where FM's internal best came from.
+        // (Matches the solution_fm_outer pattern.)
+        if (pass_result.moves_applied > 0) {
+            auto end_copy = pass_result.end_partition;  // preserve for diversity
+            auto descended = greedy_descent(std::move(end_copy));
+            if (descended.total_cost() < pass_best_cost - 0.001) {
+                pass_best_cost = descended.total_cost();
+                pass_best_part = std::move(descended);
+            }
+        }
+
         // Keep the last perturbed state for diversity seeding
         if (pass_result.moves_applied > 0) {
-            result.end_partition = pass_result.end_partition;
+            result.end_partition = std::move(pass_result.end_partition);
             result.end_cost = pass_result.end_cost;
         }
 
-        if (pass_result.best_cost < result.best_cost - 0.001) {
-            // FM improved directly — cool down (narrow search near this basin)
-            double improvement = result.best_cost - pass_result.best_cost;
-            result.best_cost = pass_result.best_cost;
-            result.best_partition = std::move(pass_result.best_partition);
+        if (pass_best_cost < result.best_cost - 0.001) {
+            double improvement = result.best_cost - pass_best_cost;
+            result.best_cost = pass_best_cost;
+            result.best_partition = std::move(pass_best_part);
             result.improving_passes++;
             no_improve = 0;
             heat = std::clamp(heat * heat_down, heat_min, heat_max);
@@ -76,30 +90,6 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
                       << result.best_cost << " (delta=" << improvement
                       << " temp=" << temperature << " heat=" << heat << ")\n";
         } else {
-            // FM didn't improve. Try greedy-kick on the perturbed end state.
-            bool kicked = false;
-            if (pass_result.moves_applied > 0) {
-                auto greedy_kick = greedy_descent(std::move(pass_result.end_partition));
-                if (greedy_kick.total_cost() < result.best_cost - 0.001) {
-                    double improvement = result.best_cost - greedy_kick.total_cost();
-                    result.best_cost = greedy_kick.total_cost();
-                    result.best_partition = std::move(greedy_kick);
-                    result.improving_passes++;
-                    no_improve = 0;
-                    kicked = true;
-                    // Kick succeeded — moderate cooling (kick found a new basin,
-                    // but FM itself didn't improve, so don't cool too aggressively)
-                    heat = std::clamp(heat * 0.9, heat_min, heat_max);
-
-                    if (g_verbose) std::cerr << "    FM pass " << pass
-                              << ": greedy-kick escaped to " << result.best_cost
-                              << " (delta=" << improvement
-                              << " temp=" << temperature << " heat=" << heat << ")\n";
-                    continue;
-                }
-            }
-
-            // Neither FM nor kick improved — heat up (explore wider next time)
             no_improve++;
             heat = std::clamp(heat * heat_up, heat_min, heat_max);
 

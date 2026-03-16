@@ -82,10 +82,14 @@ static bool step_depends_on(const ScheduleStep &si, const ScheduleStep &sj,
 static std::set<size_t> filter_retain(const std::set<size_t> &retain,
                                       const Subgraph &sg,
                                       const std::set<size_t> &entering = {}) {
-  (void)entering;  // overlap with entering is now safe in working_set
+  (void)entering;
+  // Only boundary OUTPUTS can be retained. The organizer confirmed:
+  // "By specifying output tensors in tensors_to_retain, it is possible to
+  // keep output tensors in the fast memory."
+  // Boundary inputs cannot be retained — they are consumed and freed.
   std::set<size_t> r;
   for (auto t : retain)
-    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
+    if (sg.boundary_outputs().count(t))
       r.insert(t);
   return r;
 }
@@ -251,24 +255,13 @@ struct SolState {
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it.
-      // Pass-through allowed: T in both entering (cur) and retain_these.
+      // Only boundary OUTPUTS that the next step needs can be retained.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
-        bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
-                     steps[i].subgraph.boundary_outputs().count(t);
+        bool is_output = steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        if (valid && useful) {
+        if (is_output && useful)
           useful_retain.insert(t);
-        }
-      }
-      // Pass through entering tensors needed by next step
-      if (i + 1 < n) {
-        for (auto t : cur)
-          if (steps[i + 1].subgraph.boundary_inputs().count(t) &&
-              (steps[i].subgraph.boundary_inputs().count(t) ||
-               steps[i].subgraph.boundary_outputs().count(t)))
-            useful_retain.insert(t);
       }
       steps[i].retain_these = useful_retain;
 
@@ -309,24 +302,13 @@ struct SolState {
     for (size_t i = idx; i < n; i++) {
       ret_entering[i] = cur;
 
-      // PRUNE useless retentions: only keep if the NEXT step actually needs it.
-      // Pass-through allowed: T in both entering (cur) and retain_these.
+      // Only boundary OUTPUTS that the next step needs can be retained.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
-        bool valid = steps[i].subgraph.boundary_inputs().count(t) ||
-                     steps[i].subgraph.boundary_outputs().count(t);
+        bool is_output = steps[i].subgraph.boundary_outputs().count(t);
         bool useful = (i + 1 < n) && steps[i + 1].subgraph.boundary_inputs().count(t);
-        if (valid && useful) {
+        if (is_output && useful)
           useful_retain.insert(t);
-        }
-      }
-      // Pass through entering tensors needed by next step
-      if (i + 1 < n) {
-        for (auto t : cur)
-          if (steps[i + 1].subgraph.boundary_inputs().count(t) &&
-              (steps[i].subgraph.boundary_inputs().count(t) ||
-               steps[i].subgraph.boundary_outputs().count(t)))
-            useful_retain.insert(t);
       }
       steps[i].retain_these = useful_retain;
 
@@ -817,10 +799,8 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     if (state.ret_entering[i].count(t))
       continue;
 
-    // Step i must have t as a boundary tensor to retain it
-    bool si_boundary = si.subgraph.boundary_inputs().count(t) ||
-                       si.subgraph.boundary_outputs().count(t);
-    if (!si_boundary)
+    // Step i must have t as a boundary OUTPUT to retain it
+    if (!si.subgraph.boundary_outputs().count(t))
       continue;
     // Step i+1 must benefit from having t
     if (!sj.subgraph.boundary_inputs().count(t))
@@ -833,11 +813,8 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto ci = si.subgraph.best_cost(state.ret_entering[i], new_ret);
     if (!ci.feasible)
       continue;
-    // Strip new_ent from sj.retain_these before calling best_cost —
-    // a tensor can't appear in both retained_from_prev and retain_these.
-    std::set<size_t> sj_safe_retain;
-    for (auto t2 : sj.retain_these) if (!new_ent.count(t2)) sj_safe_retain.insert(t2);
-    auto cj = sj.subgraph.best_cost(new_ent, sj_safe_retain);
+    // Overlap between new_ent and sj.retain_these is safe in working_set.
+    auto cj = sj.subgraph.best_cost(new_ent, sj.retain_these);
     if (!cj.feasible)
       continue;
     double saving =
@@ -1976,10 +1953,9 @@ static std::vector<ScheduleStep> solution_crossover(
     // Apply where structurally valid
     for (size_t i = 0; i + 1 < child_steps.size(); i++) {
         for (auto t : retained_tensors) {
-            bool valid_here = child_steps[i].subgraph.boundary_inputs().count(t) ||
-                              child_steps[i].subgraph.boundary_outputs().count(t);
+            bool is_output = child_steps[i].subgraph.boundary_outputs().count(t);
             bool useful_next = child_steps[i+1].subgraph.boundary_inputs().count(t);
-            if (valid_here && useful_next && prob.retainable_tensors.count(t))
+            if (is_output && useful_next && prob.retainable_tensors.count(t))
                 child_steps[i].retain_these.insert(t);
         }
     }
@@ -2008,12 +1984,10 @@ static void recompute_costs(const Problem& prob, const DAG& dag,
                             std::vector<ScheduleStep>& steps) {
     std::set<size_t> entering;
     for (size_t i = 0; i < steps.size(); i++) {
-        // Validate retain_these: must be boundary tensors of this subgraph.
-        // Overlap with entering is safe (pass-through).
+        // Only boundary OUTPUTS can be retained.
         std::set<size_t> valid_retain;
         for (auto t : steps[i].retain_these)
-            if (steps[i].subgraph.boundary_inputs().count(t) ||
-                steps[i].subgraph.boundary_outputs().count(t))
+            if (steps[i].subgraph.boundary_outputs().count(t))
                 valid_retain.insert(t);
         steps[i].retain_these = valid_retain;
 

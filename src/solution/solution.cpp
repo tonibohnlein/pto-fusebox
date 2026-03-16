@@ -19,13 +19,12 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
     for (size_t i = 0; i < n; i++) {
         retained_entering_[i] = currently_retained;
 
-        // retain_these may overlap with currently_retained (pass-through).
-        // working_set handles this correctly by not double-counting.
-        // Only validate that retained tensors are boundary tensors of this subgraph.
+        // Only boundary OUTPUTS can be retained (organizer ruling).
+        // Overlap with currently_retained is possible (recomputation case)
+        // and handled correctly by working_set.
         std::set<size_t> valid_retain;
         for (auto t : steps_[i].retain_these)
-            if (steps_[i].subgraph.boundary_inputs().count(t) ||
-                steps_[i].subgraph.boundary_outputs().count(t))
+            if (steps_[i].subgraph.boundary_outputs().count(t))
                 valid_retain.insert(t);
         steps_[i].retain_these = valid_retain;
 
@@ -67,26 +66,20 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         if (!g.sg) continue;
         const Subgraph& sg = *g.sg;
 
-        // Build retain_these: keep tensors the next step will actually read.
-        // Two sources:
-        //   a) tensors from retain_per_step that the next step needs (new retains)
-        //   b) tensors from entering that the next step also needs (pass-through)
-        // Both can overlap with entering; working_set handles that correctly.
+        // Build retain_these: only boundary OUTPUTS of this step that the next
+        // step needs as input. No pass-through of boundary inputs — the organizer
+        // confirmed: "To keep a tensor alive for step k+2, step k+1 would need
+        // to also produce it."
         std::set<size_t> retain_these;
         if (i + 1 < res.order.size()) {
             size_t next_gi = res.order[i + 1];
             if (part.groups[next_gi].sg) {
                 const auto& next_inputs = part.groups[next_gi].sg->boundary_inputs();
-                // (a) New retains from ordering hint
                 if (i < res.retain_per_step.size()) {
                     for (auto t : res.retain_per_step[i])
-                        if (next_inputs.count(t)) retain_these.insert(t);
+                        if (next_inputs.count(t) && sg.boundary_outputs().count(t))
+                            retain_these.insert(t);
                 }
-                // (b) Pass-through: entering tensors needed by next step
-                for (auto t : entering)
-                    if (next_inputs.count(t) &&
-                        (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t)))
-                        retain_these.insert(t);
             }
         }
 
@@ -182,13 +175,13 @@ Solution::ValidationResult Solution::validate() const {
             for (auto t : prob_->ops[op].outputs) available.insert(t);
     }
 
-    // Retain validity
+    // Retain validity: only boundary OUTPUTS can be retained
     for (size_t i = 0; i < steps_.size(); i++) {
         const auto& sg = steps_[i].subgraph;
         for (auto t : steps_[i].retain_these)
-            if (!sg.boundary_inputs().count(t) && !sg.boundary_outputs().count(t)) {
+            if (!sg.boundary_outputs().count(t)) {
                 fail("Step " + std::to_string(i) + ": retained T"
-                     + std::to_string(t) + " is not a boundary tensor");
+                     + std::to_string(t) + " is not a boundary output");
                 return vr;
             }
     }

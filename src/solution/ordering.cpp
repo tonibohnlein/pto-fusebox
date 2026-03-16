@@ -205,13 +205,12 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                     if (part.groups[v].alive) next.in_deg[v]--;
                 next.total_latency = state.total_latency + best.latency;
 
-                // Only tensors that are boundary tensors of this group can
-                // physically remain in fast memory after it completes
+                // Only boundary OUTPUTS can be retained (organizer ruling).
+                // Boundary inputs from resident are consumed and freed.
                 std::set<size_t> exportable;
-                for (auto t : best_resident_in)
-                    if (sg.boundary_inputs().count(t) || sg.boundary_outputs().count(t))
+                for (auto t : best_retain_these)
+                    if (sg.boundary_outputs().count(t))
                         exportable.insert(t);
-                for (auto t : best_retain_these) exportable.insert(t);
 
                 next.resident = exportable;
                 next.retain_per_step = state.retain_per_step;
