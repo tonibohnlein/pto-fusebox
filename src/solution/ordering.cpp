@@ -1,5 +1,6 @@
 #include "solution/ordering.h"
 #include <algorithm>
+#include <iostream>
 #include <map>
 #include <set>
 
@@ -88,6 +89,17 @@ OrderingResult dfs_ordering(const Partition& part) {
 
         for (auto v : part.group_succs[chosen])
             if (part.groups[v].alive && --in_deg[v] == 0) ready.insert(v);
+    }
+
+    // Safety: if any alive group wasn't scheduled (cycle in group DAG),
+    // force-add it. This shouldn't happen with correct rebuild_group_dag.
+    for (size_t i = 0; i < ng; i++) {
+        if (part.groups[i].alive && !scheduled[i]) {
+            std::cerr << "WARNING: dfs_ordering: group " << i
+                      << " stuck (in_deg=" << in_deg[i] << "), force-adding\n";
+            result.order.push_back(i);
+            scheduled[i] = true;
+        }
     }
 
     // Populate retain_per_step: retain a tensor at step i if it is a boundary

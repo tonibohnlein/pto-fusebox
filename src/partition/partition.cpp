@@ -6,22 +6,8 @@
 // ============================================================================
 
 void Partition::finalize() {
-    // Re-populate Group::sg and Group::best_cfg for every alive group.
-    // Phase 1 search mutates ops/cost but never touches these fields — they
-    // are only needed when converting a Partition to a Solution via ordering.
-    //
-    // We intentionally do NOT use CostCache here.  The cache stores only
-    // scalars (doubles) for Phase 1 search performance.  Storing Subgraph
-    // objects in the cache would copy them on every one of the millions of
-    // cache hits during Phase 1, destroying search throughput.
-    // finalize() is called only once per partition in Phase 2 (O(pool *
-    // groups) total calls), so direct Subgraph::create is cheap.
     for (auto& g : groups) {
         if (!g.alive) continue;
-        // Always recreate from current ops — never skip based on g.sg.
-        // Phase 1 mutations change ops without clearing g.sg (too expensive
-        // to do at every mutation site), so any cached sg may be stale.
-        // finalize() is called only O(pool) times, so recreation is cheap.
         g.sg = std::nullopt;
 
         auto sg_opt = Subgraph::create(*prob, *dag,
@@ -29,10 +15,24 @@ void Partition::finalize() {
         if (sg_opt) {
             auto c = sg_opt->best_cost();
             if (c.feasible) {
-                g.cost     = c.latency;   // authoritative: may differ from search cost
+                g.cost     = c.latency;
                 g.best_cfg = c.config;
+            } else {
+                // Subgraph is structurally valid but no tiling fits in memory.
+                // Mark cost as infeasible so steps_from_ordering doesn't use
+                // stale g.cost/g.best_cfg from Phase 1.
+                g.cost = 1e18;
             }
             g.sg = std::move(*sg_opt);
+        } else {
+            // Subgraph::create failed (disconnected, dimension mismatch, etc.)
+            // Mark infeasible — from_partition will skip this group and
+            // the solution will fail coverage validation.
+            g.cost = 1e18;
+            std::cerr << "    WARNING: finalize: Subgraph::create failed for group with "
+                      << g.ops.size() << " ops:";
+            for (auto op : g.ops) std::cerr << " " << op;
+            std::cerr << "\n";
         }
     }
 
@@ -63,7 +63,15 @@ void Partition::rebuild_group_dag() {
     }
 
     // For each alive group i, for each boundary input tensor t, find which
-    // alive group produces t and add the directed edge producer → i.
+    // alive group produces t AS A BOUNDARY OUTPUT and add the directed edge
+    // producer → i.
+    //
+    // Critical: only add edges from groups where t is a boundary output, NOT
+    // from groups where t is ephemeral (produced + consumed internally).
+    // With recomputation, an op can be in multiple groups — t might be
+    // ephemeral in one and a boundary output in another. Adding edges from
+    // the ephemeral group creates spurious dependencies that can form cycles,
+    // causing the topological sort to miss groups ("Op X not covered").
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive || !groups[i].sg) continue;
         for (auto t : groups[i].sg->boundary_inputs()) {
@@ -71,6 +79,9 @@ void Partition::rebuild_group_dag() {
             if (prod_op < 0) continue;  // graph input — no producing group
             for (auto gj : op_to_groups_[(size_t)prod_op]) {
                 if (!groups[gj].alive || gj == i) continue;
+                // Only add edge if gj has t as a boundary output
+                if (!groups[gj].sg || !groups[gj].sg->boundary_outputs().count(t))
+                    continue;
                 if (group_preds[i].insert(gj).second)
                     group_succs[gj].insert(i);
             }

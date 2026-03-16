@@ -95,14 +95,38 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
                 partition_pool[tid].finalize();
                 const Partition& part = partition_pool[tid];
 
+                // Diagnostic: check for finalize issues
+                {
+                    int null_sg = 0, infeasible_sg = 0;
+                    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+                        if (!part.groups[gi].alive) continue;
+                        if (!part.groups[gi].sg) null_sg++;
+                        else if (part.groups[gi].cost >= 1e17) infeasible_sg++;
+                    }
+                    if (null_sg > 0 || infeasible_sg > 0) {
+                        std::lock_guard<std::mutex> lock(sol_mutex);
+                        std::cerr << "    Partition " << tid
+                                  << ": finalize issues: " << null_sg << " null sg, "
+                                  << infeasible_sg << " infeasible\n";
+                    }
+                }
+
                 // --- DFS + Beam via Solution::from_partition ---
                 // from_partition() will call finalize() again on its copy —
                 // idempotent and cheap (all sg cache hits at this point).
                 {
                     auto sol = Solution::from_partition(prob, dag, part);
+                    auto vr = sol.validate();
                     std::lock_guard<std::mutex> lock(sol_mutex);
-                    if (sol.validate().valid)
+                    if (vr.valid) {
                         solution_pool.push_back(std::move(sol));
+                    } else {
+                        std::cerr << "    Partition " << tid
+                                  << " (cost=" << part.total_cost()
+                                  << ", " << part.num_alive() << " groups)"
+                                  << " → solution REJECTED: " << vr.error
+                                  << " (latency=" << sol.total_latency() << ")\n";
+                    }
                 }
 
                 if (!has_retain) continue;
@@ -117,8 +141,9 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
                 Solution rand_sol(prob, dag, std::move(rand_steps));
                 {
+                    auto rvr = rand_sol.validate();
                     std::lock_guard<std::mutex> lock(sol_mutex);
-                    if (rand_sol.validate().valid)
+                    if (rvr.valid)
                         solution_pool.push_back(std::move(rand_sol));
                 }
             }
