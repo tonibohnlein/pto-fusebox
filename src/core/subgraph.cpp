@@ -458,11 +458,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     for (auto t : sg.boundary_outputs_) {
       size_t idx = ensure(t);
       sg.boundary_tensor_info_[idx].is_boundary_out = true;
-      if (is_produced[t])
-        sg.boundary_tensor_info_[idx].is_internally_produced =
-            sg.boundary_inputs_.count(t) > 0 ? false : false;
-      // Also: if produced internally AND is boundary input too (fan-out),
-      // the internally_produced flag was set above
+      sg.boundary_tensor_info_[idx].is_internally_produced = is_produced[t];
     }
 
     // Mark MM accumulators (sink MM outputs that are boundary)

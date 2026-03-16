@@ -118,13 +118,14 @@ int main(int argc, char* argv[]) {
         for (auto& t : ret_json[i]) retain.insert(t.get<size_t>());
 
         // Parse traversal → detect snake
-        SnakeDir snake = SnakeDir::None;
-        if (i < trav_json.size() && !trav_json[i].is_null()) {
-            // Create subgraph first to get output dims
+        // Default to "hsnake" (RowMajor) for all subgraphs.
+        // When traversal_order is empty or null, use RowMajor as default.
+        SnakeDir snake = SnakeDir::RowMajor;  // match reference default
+        if (i < trav_json.size() && !trav_json[i].is_null() && !trav_json[i].empty()) {
             auto sg_opt = Subgraph::create(prob, dag, ops);
             if (sg_opt) {
-                int ntw = (int)(sg_opt->output_width() / w);
-                int nth = (int)(sg_opt->output_height() / h);
+                int ntw = std::max((int)(sg_opt->output_width() / w), 1);
+                int nth = std::max((int)(sg_opt->output_height() / h), 1);
                 std::vector<int> trav;
                 for (auto& v : trav_json[i]) trav.push_back(v.get<int>());
                 snake = detect_snake(trav, ntw, nth);
