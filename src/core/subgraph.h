@@ -188,6 +188,15 @@ private:
   };
   std::vector<BoundaryTensorInfo> boundary_tensor_info_;
 
+  // Per-tensor tiling sources (for ALL tensors, not just boundary).
+  // Used by compute_cost to compute per-op scale factors.
+  // Indexed by tensor id; only entries for tensors in this subgraph are valid.
+  struct TilePair {
+    BoundaryTensorInfo::TileSource h = BoundaryTensorInfo::FROM_NTW;
+    BoundaryTensorInfo::TileSource v = BoundaryTensorInfo::FROM_NTH;
+  };
+  std::vector<TilePair> tensor_tiling_;
+
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;

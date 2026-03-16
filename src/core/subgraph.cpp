@@ -383,6 +383,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     if (tiling_conflict)
       return std::nullopt;
 
+    // Save per-tensor tiling for compute_cost scale factors
+    sg.tensor_tiling_.resize(num_tensors);
+    for (size_t t = 0; t < num_tensors; t++) {
+      if (tsrc[t].assigned) {
+        sg.tensor_tiling_[t] = {tsrc[t].h, tsrc[t].v};
+      }
+    }
+
     // Build BoundaryTensorInfo from the propagated sources
     std::vector<int> tensor_in_info(num_tensors, -1);
     auto ensure = [&](size_t t) -> size_t {
@@ -595,35 +603,42 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   result.num_k_passes = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
   int nk = result.num_k_passes;
 
-  auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
-  int64_t scale =
-      ceil_div(cfg.w, prob_->native_w) * ceil_div(cfg.h, prob_->native_h);
-
-  // Compute: separate MM (per k-step) from PW (once per tile)
+  // Compute: per-op scale factor based on output tile size vs granularity.
   //
-  // All MatMul ops in a fused chain share the same temporal fraction per
-  // k-step: k / output_K_.  This is because the unified temporal loop is
-  // driven by the output-producing MatMul's reduction dimension.  Each
-  // k-step, every op in the chain produces k / output_K_ of its output
-  // columns — upstream ops do full internal reduction but for fewer columns.
+  // Reference evaluator:
+  //   For EVERY op (MM and PW), at EVERY d-step:
+  //     compute_time += base_cost / d_tiles
+  //                   × max(output_slice_w / gran_w, 1.0)
+  //                   × max(output_slice_h / gran_h, 1.0)
   //
-  // Example: chain (T0 @ T1) @ T2, output_K_ = K1 = T3.width.
-  //   Per step, Op0 produces k columns of T3 (fraction k/K1).
-  //   Per step, Op1 does rank-k update of T4 (fraction k/K1).
-  //   Both ops: base_cost × k / output_K_ per step.
-  double mm_comp = 0.0;
-  double pw_comp = 0.0;
+  // There is NO distinction between MM and PW in compute timing.
+  // Both contribute equally to every d-step.
+  //
+  // comp_per_step = sum over all ops of (base_cost / nk × op_scale)
+  // Total compute per tile = nk × comp_per_step
+  double comp_per_step = 0.0;
   for (auto i : ops_) {
     double c = (double)prob_->ops[i].base_cost;
-    if (prob_->ops[i].type == OpType::MatMul) {
-      mm_comp += c * ((double)cfg.k / output_K_);
-    } else {
-      pw_comp += c;
+    size_t out_t = prob_->ops[i].outputs[0];
+
+    // Per-op scale: output tile slice relative to granularity
+    double op_scale = 1.0;
+    if (out_t < tensor_tiling_.size()) {
+      auto &tp = tensor_tiling_[out_t];
+      BoundaryTensorInfo tmpinfo;
+      tmpinfo.h_source = tp.h;
+      tmpinfo.v_source = tp.v;
+      int64_t ht = tmpinfo.eval_h_tiles(num_tw, nk);
+      int64_t vt = tmpinfo.eval_v_tiles(num_th, nk);
+      double slice_w = (double)prob_->tensors[out_t].width / std::max(ht, (int64_t)1);
+      double slice_h = (double)prob_->tensors[out_t].height / std::max(vt, (int64_t)1);
+      op_scale = std::max(slice_w / (double)cfg.w, 1.0) *
+                 std::max(slice_h / (double)cfg.h, 1.0);
     }
+
+    comp_per_step += c / (double)nk * op_scale;
   }
-  mm_comp *= (double)scale;
-  pw_comp *= (double)scale;
-  result.compute_per_step = mm_comp;
+  result.compute_per_step = comp_per_step;
 
   // Memory transfer costs: 5 categories matching the reference evaluator's
   // position-based reuse model.
@@ -661,8 +676,14 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       else                          tile_load   += slice_io;
     }
 
-    if (info.is_boundary_out && !retained_out)
-      out_evict += (double)(cfg.h * cfg.w) / B;
+    if (info.is_boundary_out && !retained_out) {
+      int64_t ht = info.eval_h_tiles(num_tw, nk);
+      int64_t vt = info.eval_v_tiles(num_th, nk);
+      int64_t W = prob_->tensors[info.id].width;
+      int64_t H = prob_->tensors[info.id].height;
+      out_evict += (double)((W / std::max(ht, (int64_t)1)) *
+                            (H / std::max(vt, (int64_t)1))) / B;
+    }
   }
 
   // Per-tile cost with 3 freshness flags:
@@ -670,7 +691,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   //   row_fresh:  true when output row changes
   //   col_fresh:  true when output column changes
   //
-  // stream_load is always fresh when nk > 1 (d changes every step).
+  // compute_time = comp_per_step at EVERY d-step (reference: no MM/PW distinction).
+  // io varies by step: d=0 loads fresh data, d=1..nk-2 only stream, d=nk-1 adds eviction.
   auto tile_cost = [&](bool once_fresh, bool row_fresh, bool col_fresh) -> double {
     double per_tile_io = tile_load;
     if (once_fresh) per_tile_io += once_load;
@@ -678,15 +700,15 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
     if (col_fresh)  per_tile_io += col_load;
 
     if (nk == 1) {
-      return std::max(mm_comp + pw_comp, per_tile_io + stream_load + out_evict);
+      return std::max(comp_per_step, per_tile_io + stream_load + out_evict);
     }
 
-    // Step 0: all per-tile IO + first stream strip
-    double step0 = std::max(mm_comp, per_tile_io + stream_load);
-    // Middle steps: stream only
-    double mid = (nk >= 3) ? (double)(nk - 2) * std::max(mm_comp, stream_load) : 0.0;
-    // Last step: stream + evict + PW compute
-    double last = std::max(mm_comp + pw_comp, stream_load + out_evict);
+    // d=0: all per-tile IO + first stream strip
+    double step0 = std::max(comp_per_step, per_tile_io + stream_load);
+    // d=1..nk-2: stream only (nk-2 copies)
+    double mid = (nk >= 3) ? (double)(nk - 2) * std::max(comp_per_step, stream_load) : 0.0;
+    // d=nk-1: stream + evict
+    double last = std::max(comp_per_step, stream_load + out_evict);
 
     return step0 + mid + last;
   };
