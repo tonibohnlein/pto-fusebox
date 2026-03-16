@@ -1,34 +1,37 @@
 #include "partition/partition.h"
 #include "core/cost_cache.h"
 #include <iostream>
+#include <queue>
 
 // ============================================================================
 // finalize()
 // ============================================================================
 
 void Partition::finalize() {
-    for (auto& g : groups) {
+    // Rebuild index first so compute_force_ephemeral can look up other groups.
+    rebuild_index();
+
+    for (size_t gi = 0; gi < groups.size(); gi++) {
+        auto& g = groups[gi];
         if (!g.alive) continue;
         g.sg = std::nullopt;
 
+        // Compute partition-aware ephemeral set: tensors whose external
+        // consumers are all served by recomputing groups.
+        auto fe = compute_force_ephemeral(gi);
+
         auto sg_opt = Subgraph::create(*prob, *dag,
-                          std::vector<size_t>(g.ops.begin(), g.ops.end()));
+                          std::vector<size_t>(g.ops.begin(), g.ops.end()), fe);
         if (sg_opt) {
             auto c = sg_opt->best_cost();
             if (c.feasible) {
                 g.cost     = c.latency;
                 g.best_cfg = c.config;
             } else {
-                // Subgraph is structurally valid but no tiling fits in memory.
-                // Mark cost as infeasible so steps_from_ordering doesn't use
-                // stale g.cost/g.best_cfg from Phase 1.
                 g.cost = 1e18;
             }
             g.sg = std::move(*sg_opt);
         } else {
-            // Subgraph::create failed (disconnected, dimension mismatch, etc.)
-            // Mark infeasible — from_partition will skip this group and
-            // the solution will fail coverage validation.
             g.cost = 1e18;
             std::cerr << "    WARNING: finalize: Subgraph::create failed for group with "
                       << g.ops.size() << " ops:";
@@ -37,7 +40,6 @@ void Partition::finalize() {
         }
     }
 
-    rebuild_index();
     rebuild_group_dag();
 }
 
@@ -91,6 +93,48 @@ void Partition::rebuild_group_dag() {
 
     for (size_t i = 0; i < ng; i++)
         group_in_deg[i] = (int)group_preds[i].size();
+
+    // Diagnostic: detect cycles in the group DAG
+    {
+        std::vector<int> deg = group_in_deg;
+        std::queue<size_t> q;
+        size_t visited = 0;
+        for (size_t i = 0; i < ng; i++)
+            if (groups[i].alive && deg[i] == 0) q.push(i);
+        while (!q.empty()) {
+            size_t u = q.front(); q.pop();
+            visited++;
+            for (auto v : group_succs[u])
+                if (--deg[v] == 0) q.push(v);
+        }
+        size_t alive = num_alive();
+        if (visited < alive) {
+            std::cerr << "    WARNING: group DAG has cycle! "
+                      << visited << "/" << alive << " groups reachable\n";
+            for (size_t i = 0; i < ng; i++) {
+                if (!groups[i].alive || deg[i] == 0) continue;
+                std::cerr << "      stuck G" << i << " (in_deg=" << deg[i]
+                          << ", ops:";
+                for (auto op : groups[i].ops) std::cerr << " " << op;
+                std::cerr << ") preds:";
+                for (auto p : group_preds[i]) std::cerr << " G" << p;
+                std::cerr << "\n";
+                // Show which tensors created the edges
+                if (groups[i].sg) {
+                    for (auto t : groups[i].sg->boundary_inputs()) {
+                        int prod_op = dag->tensor_producer[t];
+                        if (prod_op < 0) continue;
+                        for (auto gj : op_to_groups_[(size_t)prod_op]) {
+                            if (!groups[gj].alive || gj == i) continue;
+                            if (groups[gj].sg && groups[gj].sg->boundary_outputs().count(t))
+                                std::cerr << "        T" << t << " (prod op" << prod_op
+                                          << "): G" << gj << " → G" << i << "\n";
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -179,6 +223,56 @@ double Partition::eval_set(const std::set<size_t>& ops) const {
     if (ops.empty()) return 1e18;
     if (cache) return cache->evaluate(ops, *prob, *dag);
     auto sg = Subgraph::create(*prob, *dag, {ops.begin(), ops.end()});
+    if (!sg) return 1e18;
+    auto c = sg->best_cost();
+    return c.feasible ? c.latency : 1e18;
+}
+
+std::set<size_t> Partition::compute_force_ephemeral(size_t gi) const {
+    std::set<size_t> result;
+    if (!prob || !dag) return result;
+
+    for (auto op : groups[gi].ops) {
+        for (auto t : prob->ops[op].outputs) {
+            // Only consider tensors produced AND consumed inside this group
+            bool consumed_internally = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (groups[gi].ops.count(cop)) { consumed_internally = true; break; }
+            if (!consumed_internally) continue;
+
+            // Skip if already all-internal (no external consumers)
+            bool has_external = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (!groups[gi].ops.count(cop)) { has_external = true; break; }
+            if (!has_external) continue;
+
+            // T has external consumers. Check if EVERY external consumer is
+            // in a group that also contains the producer (recomputes it).
+            int prod = dag->tensor_producer[t];
+            if (prod < 0) continue;
+
+            bool all_served = true;
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (groups[gi].ops.count(cop)) continue; // internal
+                bool served = false;
+                for (auto gj : groups_of(cop)) {
+                    if (gj == gi || !groups[gj].alive) continue;
+                    if (groups[gj].ops.count((size_t)prod)) { served = true; break; }
+                }
+                if (!served) { all_served = false; break; }
+            }
+            if (all_served) result.insert(t);
+        }
+    }
+    return result;
+}
+
+double Partition::eval_group_in_context(size_t gi) const {
+    if (!groups[gi].alive) return 0;
+    auto fe = compute_force_ephemeral(gi);
+    auto sg = Subgraph::create(*prob, *dag,
+                  std::vector<size_t>(groups[gi].ops.begin(), groups[gi].ops.end()),
+                  fe);
     if (!sg) return 1e18;
     auto c = sg->best_cost();
     return c.feasible ? c.latency : 1e18;

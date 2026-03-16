@@ -26,7 +26,8 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // ============================================================================
 
 std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
-                                         std::vector<size_t> op_indices) {
+                                         std::vector<size_t> op_indices,
+                                         const std::set<size_t> &force_ephemeral) {
   if (op_indices.empty())
     return std::nullopt;
 
@@ -73,15 +74,16 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
     if (is_produced[t] && is_consumed[t]) {
-      // Ephemeral only if ALL consumers in the DAG are inside the subgraph.
-      // If any consumer is external, the tensor must be a boundary output
-      // so external consumers can access it from slow memory.
-      bool all_internal = true;
-      for (auto cop : dag.tensor_consumers[t])
-        if (!is_in_sg[cop]) { all_internal = false; break; }
+      // Ephemeral if ALL DAG consumers are inside, OR if force_ephemeral
+      // says all external consumers are served by recomputing groups.
+      bool all_internal = force_ephemeral.count(t) > 0;
+      if (!all_internal) {
+        all_internal = true;
+        for (auto cop : dag.tensor_consumers[t])
+          if (!is_in_sg[cop]) { all_internal = false; break; }
+      }
       if (all_internal)
         is_ephemeral[t] = true;
-      // else: has external consumer → will be boundary output below
     }
   }
   for (size_t t = 0; t < num_tensors; t++) {

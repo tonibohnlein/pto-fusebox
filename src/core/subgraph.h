@@ -34,8 +34,12 @@
 class Subgraph {
 public:
   // Factory: returns nullopt if ops don't form a valid subgraph.
+  // force_ephemeral: tensors to treat as ephemeral even if they have external
+  // DAG consumers. Used when partition context shows all external consumers
+  // are in groups that recompute the producer (no eviction needed).
   static std::optional<Subgraph> create(const Problem &prob, const DAG &dag,
-                                        std::vector<size_t> op_indices);
+                                        std::vector<size_t> op_indices,
+                                        const std::set<size_t> &force_ephemeral = {});
 
   // --- Accessors ---
 

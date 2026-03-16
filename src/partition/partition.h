@@ -112,6 +112,17 @@ struct Partition {
 
     double eval_set(const std::set<size_t>& ops) const;
 
+    // Partition-aware evaluation: computes which tensors can be treated as
+    // ephemeral because all external consumers are served by recomputing groups.
+    // Returns the set of tensors that should be force-ephemeral for group gi.
+    std::set<size_t> compute_force_ephemeral(size_t gi) const;
+
+    // Evaluate group gi with partition-aware ephemeral classification.
+    // Uses force_ephemeral to avoid unnecessary eviction costs.
+    // More accurate than eval_set but cannot use CostCache (result depends
+    // on what other groups contain, not just the op-set).
+    double eval_group_in_context(size_t gi) const;
+
     struct EjectResult {
         bool   feasible = false;
         double saving   = -1e18;
