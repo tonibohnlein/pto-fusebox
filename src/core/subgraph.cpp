@@ -726,15 +726,25 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       double slice_io = (double)((W / std::max(ht, (int64_t)1)) *
                                  (H / std::max(vt, (int64_t)1))) / B;
 
-      bool k_dep = (info.h_source == BoundaryTensorInfo::FROM_NK ||
-                    info.v_source == BoundaryTensorInfo::FROM_NK);
-      bool h_fixed = (info.h_source == BoundaryTensorInfo::FIXED_1);
-      bool v_fixed = (info.v_source == BoundaryTensorInfo::FIXED_1);
+      // For categorization: when nk=1, FROM_NK evaluates to 1 = FIXED_1.
+      // The reference uses the non-sink path (h_tiles=1) when d_tiles=1,
+      // so FROM_NK degenerates and the tensor gets reused like FIXED_1.
+      auto eff_h = info.h_source;
+      auto eff_v = info.v_source;
+      if (nk <= 1) {
+        if (eff_h == BoundaryTensorInfo::FROM_NK) eff_h = BoundaryTensorInfo::FIXED_1;
+        if (eff_v == BoundaryTensorInfo::FROM_NK) eff_v = BoundaryTensorInfo::FIXED_1;
+      }
+
+      bool k_dep = (eff_h == BoundaryTensorInfo::FROM_NK ||
+                    eff_v == BoundaryTensorInfo::FROM_NK);
+      bool h_fixed = (eff_h == BoundaryTensorInfo::FIXED_1);
+      bool v_fixed = (eff_v == BoundaryTensorInfo::FIXED_1);
 
       if (k_dep)                    stream_load += slice_io;
       else if (h_fixed && v_fixed)  once_load   += slice_io;
-      else if (h_fixed)             col_load    += slice_io;  // depends on col (v_pos)
-      else if (v_fixed)             row_load    += slice_io;  // depends on row (h_pos)
+      else if (h_fixed)             col_load    += slice_io;
+      else if (v_fixed)             row_load    += slice_io;
       else                          tile_load   += slice_io;
     }
 
