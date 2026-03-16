@@ -1,5 +1,6 @@
 #include "partition/partition.h"
 #include "core/cost_cache.h"
+#include <iostream>
 
 // ============================================================================
 // finalize()
