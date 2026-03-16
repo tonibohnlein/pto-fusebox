@@ -58,23 +58,15 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   // Classify tensors.
   //
-  // A tensor produced AND consumed within the subgraph is ephemeral — it lives
-  // only in the tile pipeline and never touches fast or slow memory.  Zero
-  // capacity, zero transfer cost.
+  // A tensor produced AND consumed within the subgraph is ephemeral ONLY IF
+  // all of its DAG consumers are inside the subgraph.  It lives only in the
+  // tile pipeline and never touches fast or slow memory.  Zero capacity,
+  // zero transfer cost.
   //
-  // External consumers of an ephemeral tensor are a PARTITION-level concern,
-  // not a subgraph-level one.  The partition layer (creates_ephemeral_gap)
-  // ensures every external consumer is served — either by recomputation
-  // (the producing op also appears in the consumer's group) or by T being
-  // a boundary output of some other group.
-  //
-  // Evidence: PROBLEM.md Example 3B — subgraph [0,1] treats T1 as ephemeral
-  // even though Op2 (external) also consumes T1.  Op2 is served by
-  // recomputation of Op0 in subgraph [0,2].  No eviction of T1, no
-  // boundary output cost.
-  //
-  // A tensor produced internally but NOT consumed internally is a pure
-  // boundary output (written to slow memory for downstream subgraphs).
+  // If ANY consumer is external, the tensor is a boundary output — it must
+  // be materialized to slow memory so external subgraphs can read it.
+  // Internally it still occupies fast memory for the consuming op (tracked
+  // via is_internally_produced in BoundaryTensorInfo).
   std::vector<bool> is_ephemeral(num_tensors, false);
 
   for (size_t t = 0; t < num_tensors; t++) {
@@ -340,13 +332,28 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         size_t lhs = op.inputs[0], rhs = op.inputs[1], out = op.outputs[0];
         bool out_is_boundary = sg.boundary_outputs_.count(out) > 0;
 
-        // Direct MM LHS boundary input: resident at h × K across all k-steps.
+        // Direct MM LHS: resident at h × K across all k-steps.
+        // Check both boundary inputs AND internally-produced boundary outputs.
+        // Special case: if this is the SINK MatMul (output is boundary) and
+        // nk > 1, the LHS is actually streamed at h×k per step, not resident.
+        // We mark is_sink_mm_lhs here; working_set/compute_cost switch at runtime.
         if (sg.boundary_inputs_.count(lhs)) {
           size_t idx = ensure(lhs);
           auto &info = sg.boundary_tensor_info_[idx];
           info.resident_K = std::max(info.resident_K, prob.tensors[lhs].width);
+          if (out_is_boundary) info.is_sink_mm_lhs = true;
+        } else if (sg.boundary_outputs_.count(lhs) && is_produced[lhs]) {
+          // LHS is produced internally but has external consumers →
+          // boundary output, NOT ephemeral. Still needs h×K in fast memory
+          // for this MatMul to consume it, but no slow memory read.
+          size_t idx = ensure(lhs);
+          auto &info = sg.boundary_tensor_info_[idx];
+          info.resident_K = std::max(info.resident_K, prob.tensors[lhs].width);
+          info.is_internally_produced = true;
+          if (out_is_boundary) info.is_sink_mm_lhs = true;
         }
-        // Direct MM RHS boundary input:
+
+        // Direct MM RHS:
         //   Output-producing MatMul (output is boundary): streamed at k × w.
         //   Upstream MatMul (output is ephemeral):
         //     If ephemeral feeds another MatMul (width maps to k): K_upstream × k
@@ -358,16 +365,31 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
           } else {
             // Ephemeral output — check what its width maps to
             if (is_ephemeral[out] && eph_sw[out] == SliceW::W_param) {
-              // Ephemeral width maps to w (feeds PW→boundary): K × w per tile
               info.stream_fixed_by_w = std::max(
                   info.stream_fixed_by_w, prob.tensors[rhs].height);
             } else {
-              // Ephemeral width maps to k (feeds MatMul): K × k per k-step
+              info.stream_fixed_by_k = std::max(
+                  info.stream_fixed_by_k, prob.tensors[rhs].height);
+            }
+          }
+        } else if (sg.boundary_outputs_.count(rhs) && is_produced[rhs]) {
+          // RHS is produced internally but has external consumers →
+          // boundary output, needs streaming footprint but no slow memory read.
+          auto &info = sg.boundary_tensor_info_[ensure(rhs)];
+          info.is_internally_produced = true;
+          if (out_is_boundary) {
+            info.is_streamed_k_by_w = true;
+          } else {
+            if (is_ephemeral[out] && eph_sw[out] == SliceW::W_param) {
+              info.stream_fixed_by_w = std::max(
+                  info.stream_fixed_by_w, prob.tensors[rhs].height);
+            } else {
               info.stream_fixed_by_k = std::max(
                   info.stream_fixed_by_k, prob.tensors[rhs].height);
             }
           }
         }
+
         if (out_is_boundary) {
           size_t idx = ensure(out);
           sg.boundary_tensor_info_[idx].is_mm_out = true;
@@ -397,6 +419,13 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         for (auto t : op.inputs) {
           if (sg.boundary_inputs_.count(t)) {
             auto &info = sg.boundary_tensor_info_[ensure(t)];
+            if (feeds_mm_lhs)       info.is_streamed_h_by_k = true;
+            else if (feeds_mm_rhs)  info.is_streamed_k_by_w = true;
+            else                    info.is_tile_input = true;
+          } else if (sg.boundary_outputs_.count(t) && is_produced[t]) {
+            // PW input is produced internally but has external consumers.
+            auto &info = sg.boundary_tensor_info_[ensure(t)];
+            info.is_internally_produced = true;
             if (feeds_mm_lhs)       info.is_streamed_h_by_k = true;
             else if (feeds_mm_rhs)  info.is_streamed_k_by_w = true;
             else                    info.is_tile_input = true;
@@ -474,6 +503,7 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
 #endif
 
   int64_t ws = 0;
+  int nk = has_matmul_ ? (int)(output_K_ / cfg.k) : 1;
 
   // ---- Main boundary tensor loop ----
   // For each boundary tensor, charge the maximum fast-memory footprint it
@@ -496,8 +526,15 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
     }
 
     int64_t max_size = 0;
-    if (info.resident_K > 0)
-      max_size = std::max(max_size, cfg.h * info.resident_K);
+    if (info.resident_K > 0) {
+      if (info.is_sink_mm_lhs && nk > 1) {
+        // Sink MatMul LHS with split-K: streamed h×k per step, not resident.
+        max_size = std::max(max_size, cfg.h * cfg.k);
+      } else {
+        // Upstream MatMul LHS or nk=1: resident h×K across all k-steps.
+        max_size = std::max(max_size, cfg.h * info.resident_K);
+      }
+    }
     if (info.is_streamed_k_by_w)
       max_size = std::max(max_size, cfg.k * cfg.w);
     if (info.is_streamed_h_by_k)
@@ -603,21 +640,34 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   // Memory transfer costs per role, iterated over boundary_tensor_info_
   // (already deduplicated).
   //
-  // Three transfer categories by timing:
-  //   resident_load : loaded once per tile when fresh (h×K for direct MM LHS)
-  //   stream_load   : loaded per k-step (k×w for RHS slot, h×k for LHS-chain)
-  //   tile_load     : loaded once per tile (h×w for tile-input PW)
-  //   out_evict     : evicted per tile at final k-step
-  double resident_load = 0, stream_load = 0, tile_load = 0, out_evict = 0;
+  // Four transfer categories by timing:
+  //   resident_load   : loaded once per tile when fresh (h×K for upstream MM LHS)
+  //   sink_lhs_load   : loaded per k-step when fresh (h×k for sink MM LHS with nk>1).
+  //                     Row-level reuse same as resident_load, but distributed
+  //                     across k-steps instead of concentrated at step 0.
+  //   stream_load     : loaded per k-step (k×w for RHS slot, h×k for LHS-chain)
+  //   tile_load       : loaded once per tile (h×w for tile-input PW)
+  //   out_evict       : evicted per tile at final k-step
+  double resident_load = 0, sink_lhs_load = 0;
+  double stream_load = 0, tile_load = 0, out_evict = 0;
 
   for (auto &info : boundary_tensor_info_) {
     bool retained_in = retained_from_prev.count(info.id);
     bool retained_out = retain_these.count(info.id);
 
-    // Input transfer costs (skip if retained from prev — already in fast mem)
-    if (!retained_in) {
-      if (info.resident_K > 0)
-        resident_load += (double)(cfg.h * info.resident_K) / B;
+    // Input transfer costs (skip if retained from prev — already in fast mem,
+    // or if internally produced — data is produced within this subgraph)
+    if (!retained_in && !info.is_internally_produced) {
+      if (info.resident_K > 0) {
+        if (info.is_sink_mm_lhs && nk > 1) {
+          // Sink MatMul LHS with split-K: h×k loaded per step.
+          // Row reuse: same pattern as resident (reused within a row of tiles).
+          sink_lhs_load += (double)(cfg.h * cfg.k) / B;
+        } else {
+          // Upstream MatMul LHS or nk=1: h×K resident, loaded once per tile.
+          resident_load += (double)(cfg.h * info.resident_K) / B;
+        }
+      }
       if (info.is_streamed_k_by_w)
         stream_load += (double)(cfg.k * cfg.w) / B;
       if (info.is_streamed_h_by_k)
@@ -642,14 +692,22 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   //   Steps 1..nk-2: load stream strip only
   //   Step nk-1:     load stream strip + evict output + PW compute
   // When nk=1, all three collapse into a single step.
+  //
+  // sink_lhs_load: loaded per k-step when resident_fresh (row-level reuse).
+  // Unlike stream_load (always fresh when nk>1), sink_lhs is reused across
+  // tiles within the same row — its position only depends on (d, row).
   auto tile_cost = [&](bool resident_fresh, bool stream_fresh) -> double {
     // When k < K (nk > 1), the stream strip loaded in the last k-step of the
     // previous tile covers a different k-range than step 0 of this tile.
     // Resident reuse IS valid: the full h×K stays resident across k-steps.
     if (nk > 1) stream_fresh = true;
 
+    // sink_lhs follows resident freshness: reused within a row
+    double slhs = resident_fresh ? sink_lhs_load : 0.0;
+
     if (nk == 1) {
       // Single step: everything happens at once
+      // (sink_lhs_load is 0 when nk=1 by construction)
       double mi = tile_load;
       if (resident_fresh) mi += resident_load;
       if (stream_fresh) mi += stream_load;
@@ -657,18 +715,18 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       return std::max(mm_comp + pw_comp, mi + mo);
     }
 
-    // Step 0: resident + first stream strip + tile inputs, compute = mm only
-    double mi0 = tile_load;
+    // Step 0: resident + first stream strip + tile inputs + sink_lhs, compute = mm only
+    double mi0 = tile_load + slhs;
     if (resident_fresh) mi0 += resident_load;
     if (stream_fresh) mi0 += stream_load;
     double step0 = std::max(mm_comp, mi0);
 
-    // Middle steps (1..nk-2): each loads one stream strip, mm compute
-    double mid_step = std::max(mm_comp, stream_load);
+    // Middle steps (1..nk-2): each loads one stream strip + sink_lhs, mm compute
+    double mid_step = std::max(mm_comp, stream_load + slhs);
     double mid_total = (nk >= 3) ? (double)(nk - 2) * mid_step : 0.0;
 
-    // Last step (nk-1): stream strip + evict + PW compute
-    double last = std::max(mm_comp + pw_comp, stream_load + out_evict);
+    // Last step (nk-1): stream strip + sink_lhs + evict + PW compute
+    double last = std::max(mm_comp + pw_comp, stream_load + slhs + out_evict);
 
     return step0 + mid_total + last;
   };

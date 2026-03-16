@@ -141,6 +141,10 @@ private:
 
     // --- Input roles ---
     int64_t resident_K = 0;          // >0: h×K resident across k-steps
+    bool is_sink_mm_lhs = false;     // LHS of the output-producing MatMul.
+                                     // When nk>1: streamed h×k per step (NOT resident).
+                                     // When nk=1: resident h×K per tile (normal).
+                                     // resident_K stores K for both cases.
     bool is_streamed_k_by_w = false; // k×w per k-step (output-level MatMul RHS)
     bool is_streamed_h_by_k = false; // h×k per k-step
     int64_t stream_fixed_by_k = 0;   // fixed×k per k-step (upstream MatMul RHS;
@@ -154,6 +158,13 @@ private:
     // --- Output roles ---
     bool is_boundary_out = false;    // h×w evicted per tile
     bool is_mm_out = false;          // MatMul accumulator (h×w, resident)
+
+    // --- Internal production flag ---
+    // True when this tensor is produced by an op INSIDE the subgraph but also
+    // has external consumers (making it a boundary output, not ephemeral).
+    // Such tensors need their internal consumption role in the working set
+    // but must NOT be charged mem_in (they're already in fast memory).
+    bool is_internally_produced = false;
   };
   std::vector<BoundaryTensorInfo> boundary_tensor_info_;
 
