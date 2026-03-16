@@ -359,13 +359,35 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
     bool tiling_conflict = false;
 
+    // Check if two tile sources are compatible.
+    // FROM_NK degenerates to FIXED_1 when nk=1. Both mean "full extent"
+    // in that dimension. They only differ when nk>1 (split-K), and configs
+    // with conflicting nk>1 tiling are rejected at eval time.
+    auto compatible = [](TS a, TS b) -> bool {
+      if (a == b) return true;
+      if ((a == TS::FROM_NK && b == TS::FIXED_1) ||
+          (a == TS::FIXED_1 && b == TS::FROM_NK))
+        return true;
+      return false;
+    };
+
+    // When merging FROM_NK with FIXED_1, keep FROM_NK (more general:
+    // evaluates to 1 when nk=1, to nk when nk>1).
+    auto merge_source = [](TS existing, TS incoming) -> TS {
+      if (existing == TS::FROM_NK || incoming == TS::FROM_NK)
+        return TS::FROM_NK;
+      return existing;
+    };
+
     auto assign_or_check = [&](size_t t, TS new_h, TS new_v) {
       if (!tsrc[t].assigned) {
         tsrc[t] = {new_h, new_v, true};
-      } else if (tsrc[t].h != new_h || tsrc[t].v != new_v) {
-        // Conflict: this tensor is consumed by two ops that need different
-        // tile shapes. The reference evaluator rejects this as SHAPES_MISALIGNED.
+      } else if (!compatible(tsrc[t].h, new_h) || !compatible(tsrc[t].v, new_v)) {
         tiling_conflict = true;
+      } else {
+        // Merge compatible sources (prefer FROM_NK over FIXED_1)
+        tsrc[t].h = merge_source(tsrc[t].h, new_h);
+        tsrc[t].v = merge_source(tsrc[t].v, new_v);
       }
     };
 
@@ -486,15 +508,37 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     return g;
   };
 
-  int64_t w_gcd = gcd_of(sg.w_divides_);
-  int64_t h_gcd = gcd_of(sg.h_divides_);
-  int64_t k_gcd = gcd_of(sg.k_divides_);
+  // Generate valid tiling candidates for each dimension.
+  //
+  // A candidate c is valid for dimension set S if for all v in S:
+  //   if c < v then v % c == 0   (divisibility when tiling)
+  //   if c >= v then skip         (granularity exceeds dim → 1 tile)
+  //
+  // The old GCD-based approach only generated divisors of GCD(S), missing
+  // values like 1024 for S={128, 2048} where GCD=128 but 1024 divides 2048
+  // and exceeds 128. The reference evaluator uses max(W/w, 1) to allow this.
+  //
+  // Fix: generate divisors of max(S), then filter to those valid for all of S.
+  auto valid_candidates = [](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
+    if (dims.empty()) return {1};
+    int64_t mx = *std::max_element(dims.begin(), dims.end());
+    if (mx <= 0) return {1};
+    auto divs = all_divisors(mx);
+    std::vector<int64_t> result;
+    for (auto c : divs) {
+      bool ok = true;
+      for (auto v : dims) {
+        if (c < v && v % c != 0) { ok = false; break; }
+      }
+      if (ok) result.push_back(c);
+    }
+    return result;
+  };
 
-  sg.ws_cand_ = w_gcd > 0 ? all_divisors(w_gcd) : std::vector<int64_t>{1};
-  sg.hs_cand_ = h_gcd > 0 ? all_divisors(h_gcd) : std::vector<int64_t>{1};
+  sg.ws_cand_ = valid_candidates(sg.w_divides_);
+  sg.hs_cand_ = valid_candidates(sg.h_divides_);
   sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{1}
-              : k_gcd > 0       ? all_divisors(k_gcd)
-                                : std::vector<int64_t>{1};
+                                 : valid_candidates(sg.k_divides_);
 
   return sg;
 }
