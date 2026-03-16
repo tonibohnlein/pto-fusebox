@@ -332,23 +332,30 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     for (auto t : sg.boundary_outputs_)
       tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
 
-    // Backward propagation through ops in reverse topological order
-    for (auto op_idx : dag.topological_order())
-      if (is_in_sg[op_idx]) {
-        // (will iterate forward; we need reverse — collect then reverse)
-      }
-    // Actually, collect subgraph ops in topo order, then iterate in reverse
+    // Backward propagation through ops in reverse topological order.
+    // If a tensor gets conflicting tiling requirements from two consumers,
+    // the subgraph is invalid (reference: SHAPES_MISALIGNED).
     std::vector<size_t> sg_topo;
     for (auto op_idx : dag.topological_order())
       if (is_in_sg[op_idx]) sg_topo.push_back(op_idx);
 
-    for (int ri = (int)sg_topo.size() - 1; ri >= 0; ri--) {
+    bool tiling_conflict = false;
+
+    auto assign_or_check = [&](size_t t, TS new_h, TS new_v) {
+      if (!tsrc[t].assigned) {
+        tsrc[t] = {new_h, new_v, true};
+      } else if (tsrc[t].h != new_h || tsrc[t].v != new_v) {
+        // Conflict: this tensor is consumed by two ops that need different
+        // tile shapes. The reference evaluator rejects this as SHAPES_MISALIGNED.
+        tiling_conflict = true;
+      }
+    };
+
+    for (int ri = (int)sg_topo.size() - 1; ri >= 0 && !tiling_conflict; ri--) {
       size_t op_idx = sg_topo[ri];
       const auto &op = prob.ops[op_idx];
       size_t out = op.outputs[0];
 
-      // Output's tiling must be assigned by now (seed or downstream propagation)
-      // If not (isolated op), default to NTW × NTH
       if (!tsrc[out].assigned)
         tsrc[out] = {TS::FROM_NTW, TS::FROM_NTH, true};
 
@@ -356,35 +363,23 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       TS out_v = tsrc[out].v;
 
       if (op.type == OpType::Pointwise) {
-        // PW: all inputs inherit output's tiling
-        for (auto t : op.inputs) {
-          if (!tsrc[t].assigned)
-            tsrc[t] = {out_h, out_v, true};
-          // else: already assigned by a downstream op — ref checks consistency
-        }
+        for (auto t : op.inputs)
+          assign_or_check(t, out_h, out_v);
       } else {
-        // MatMul: LHS = input[0], RHS = input[1]
         size_t lhs = op.inputs[0], rhs = op.inputs[1];
 
         if (is_sink_op[op_idx]) {
-          // Sink MM: depth-tiled (FROM_NK for the k-dimension)
-          // LHS: h_tiles = nk, v_tiles = output.v
-          // RHS: h_tiles = output.h, v_tiles = nk
-          if (!tsrc[lhs].assigned)
-            tsrc[lhs] = {TS::FROM_NK, out_v, true};
-          if (!tsrc[rhs].assigned)
-            tsrc[rhs] = {out_h, TS::FROM_NK, true};
+          assign_or_check(lhs, TS::FROM_NK, out_v);
+          assign_or_check(rhs, out_h, TS::FROM_NK);
         } else {
-          // Non-sink MM: LHS full-width, RHS full-height
-          // LHS: h_tiles = 1 (full K), v_tiles = output.v
-          // RHS: h_tiles = output.h, v_tiles = 1 (full K)
-          if (!tsrc[lhs].assigned)
-            tsrc[lhs] = {TS::FIXED_1, out_v, true};
-          if (!tsrc[rhs].assigned)
-            tsrc[rhs] = {out_h, TS::FIXED_1, true};
+          assign_or_check(lhs, TS::FIXED_1, out_v);
+          assign_or_check(rhs, out_h, TS::FIXED_1);
         }
       }
     }
+
+    if (tiling_conflict)
+      return std::nullopt;
 
     // Build BoundaryTensorInfo from the propagated sources
     std::vector<int> tensor_in_info(num_tensors, -1);
