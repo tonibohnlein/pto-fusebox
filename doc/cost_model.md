@@ -1,636 +1,411 @@
-# Cost Model Documentation
+# MLSys 2026 — Definitive Cost Model Reference
 
-This document explains how the solver computes the latency of a subgraph given a
-tiling configuration `[w, h, k]`, the constraints on forming valid subgraphs, and
-the constraints on valid tiling parameters.
-
-## Overview
-
-Each subgraph is a set of ops executed together. The tiling `[w, h, k]` splits
-the computation into a grid of spatial tiles, each producing a `w × h` output
-slice. The total latency is the sum of per-tile-step latencies, where each step's
-latency follows a roofline model: `max(compute, memory_in + memory_out)`.
+Based on PROBLEM.md, all 5 worked examples, and organizer responses in
+issues #3, #10, #14, #32, #34, #37, #38.
 
 ---
 
-## The Unified Execution Grid (issue #28)
+## 1. Problem Overview
 
-The central concept of the hardware model. A single `[w, h, k]` configuration
-applied to a subgraph deterministically defines:
+Given a DAG of MatMul and Pointwise operations over 2D tensors, produce an
+ordered sequence of subgraphs with execution granularities that covers every
+op at least once, respects memory constraints, and minimizes total latency.
 
-1. **The spatial tile grid** — the boundary output tensor (dimensions `W × H`)
-   is divided into `(W/w) × (H/h)` tiles, each of size `w × h`. All boundary
-   outputs must have the same `(W, H)` so they share the same grid.
-
-2. **The k-iteration count** — for MatMul ops with reduction dimension `K`,
-   each spatial tile is computed in `K/k` accumulation steps. PW ops have no
-   reduction dimension and execute once per spatial tile.
-
-3. **The slice shape of every tensor** — each tensor's slice is determined by
-   its role relative to the ops that use it:
-
-       MatMul output:  w × h       (one tile of the spatial grid)
-       MatMul LHS:     K × h       (full reduction-dimension row strip × height)
-       MatMul RHS:     w × k       (width × a strip of the reduction dimension)
-       PW output:      w × h       (same as the spatial tile)
-       PW input:       w × h       (same as the spatial tile)
-
-   **Important distinction for MatMul LHS**: the LHS row strip (`K × h`, where
-   `K` is the full reduction dimension of that MatMul) is loaded **once** at
-   k-step 0 and held resident in fast memory for all `K/k` k-steps of that
-   spatial tile. It is not re-loaded per k-step. This is why LHS contributes
-   `h × K` (not `h × k`) to the working set, and why LHS transfer is a fixed
-   cost per spatial tile rather than per k-step. The RHS strip (`w × k`), by
-   contrast, covers a different k-range each step and is reloaded every time.
-
-   For ephemeral tensors (internal to the subgraph), the slice shape propagates
-   from the consumer: if an ephemeral feeds a MatMul as LHS, its tiling
-   constraints are governed by `k` and `h` (not `w`), even though it was
-   produced by a PW op. The ephemeral itself is never resident in fast memory —
-   this propagation only determines which dimensions `w`, `h`, `k` must divide.
-
-4. **The execution loop** — the hardware iterates:
-
-       for each spatial tile (row, col) in traversal_order:
-           for each k-step d in 0..K/k-1:
-               - load boundary input slices that changed since last step
-               - execute all ops in subgraph chain order on this tile's slices
-               - if d == K/k-1: evict boundary output slices (unless retained)
-
-   All ops in the subgraph share the same loop. This is what "unified" means —
-   you cannot give different ops different tiling parameters.
-
-5. **The validity constraints that follow from this**:
-   - `w` must divide every tensor dimension that maps to the w-axis
-   - `h` must divide every tensor dimension that maps to the h-axis
-   - `k` must divide every reduction dimension K
-   - All boundary outputs must have the same `(W, H)` (single grid)
-   - Ephemeral tensors need not match `(W, H)` — their dimensions may differ
-     (e.g., 4096-wide ephemerals in a chain where the boundary output is 128-wide),
-     as long as `w`, `h`, `k` divide the appropriate dimensions per their role
+Three-tier memory hierarchy:
+- **Slow memory:** infinite capacity, finite bandwidth B. All graph inputs
+  start here; all graph outputs must end here.
+- **Fast memory:** finite capacity C, zero-cost access. Compute can only
+  touch data resident here.
+- **Ephemeral:** intermediate data within a fused subgraph. Zero capacity
+  cost, zero transfer cost.
 
 ---
 
-## Subgraph validity
+## 2. Tensors and Operations
 
-A set of ops forms a valid subgraph if ALL of the following hold:
+Each tensor has `width` (columns) and `height` (rows). Size = width × height.
 
-### 1. Non-empty
+**MatMul** `C = A @ B`:
+- A (LHS): height × K matrix (K = A.width = reduction dimension)
+- B (RHS): K × width matrix
+- C (output): height × width matrix
+- `inputs = [LHS_index, RHS_index]` — order matters
 
-At least one op.
+**Pointwise** `C = f(A, ...)`:
+- All inputs and the output have the same dimensions
+- No reduction dimension
 
-### 2. At least one boundary output
-
-Every subgraph must produce at least one tensor that is not consumed internally.
-
-### 3. All boundary outputs have the same dimensions
-
-If a subgraph has multiple boundary outputs, they must all have the same
-`(width, height)`. This is because the spatial tile grid is defined by the
-boundary output dimensions — all boundary outputs share the same grid.
-
-### 4. Connected
-
-Ops must form a connected group. Two ops are connected if they:
-- Have a producer-consumer edge (one produces a tensor the other consumes), OR
-- Share a common input tensor (co-consumers of the same boundary input)
-
-The second condition enables fusing parallel ops that share an expensive input
-(e.g., 16 MatMuls all reading the same large weight matrix in benchmark 13).
-
-### 5. Ephemeral tensors have exactly one consumer
-
-A tensor that is both produced and consumed within the subgraph is "ephemeral" —
-it flows directly between ops without touching fast memory. For this to work,
-each ephemeral tensor must have exactly **one** consumer op within the subgraph.
-Fan-out of ephemeral tensors is invalid because the data exists only momentarily
-and cannot be consumed twice.
-
-### 6. Ephemeral tensors with external consumers require recomputation (solution level)
-
-`Subgraph::create` does **not** reject a subgraph because an ephemeral tensor
-has consumers outside the subgraph. This is intentional: the external consumer
-is handled at the solution level via **recomputation** — the producing op is
-included in a second subgraph that re-derives the tensor from its own boundary
-inputs, treating it as ephemeral there too.
-
-Example (PROBLEM.md Example 3B, diamond graph): `{Op0, Op1}` makes `T1`
-ephemeral even though `Op2` also consumes `T1`. The second step `{Op0, Op2}`
-recomputes `T1` from `T0` and makes it ephemeral again. Neither subgraph needs
-`T1` to be a boundary output.
-
-**What IS enforced at subgraph level (constraint 5)**: each ephemeral tensor
-has exactly one *internal* consumer. Fan-out within a single subgraph is
-invalid because the data exists only momentarily and cannot be consumed twice.
-
-**What IS enforced at solution level**: every boundary input of every subgraph
-must either be a graph input (tensor with no producer) or appear as a boundary
-output of some earlier step in the schedule. A tensor that is only ever ephemeral
-in every subgraph that produces it can never satisfy this requirement for an
-external consumer — this is the "ephemeral gap" that `Solution::validate()`
-detects and rejects.
-
-Note: fan-out of **boundary** tensors is always fine — boundary tensors are
-materialized in slow memory (or retained in fast memory) and can be read by
-multiple subgraphs without restriction.
+**Graph inputs:** tensors with no producing op. Start in slow memory.
+**Graph outputs:** tensors with no consuming op. Must end in slow memory.
 
 ---
 
-## Tensor classification
+## 3. Subgraph Rules
 
-When a subgraph is created (`Subgraph::create`), tensors are classified into
-three categories:
+### 3.1 Composition
 
-- **Boundary inputs**: consumed by an op in the subgraph but NOT produced by any
-  op in the subgraph. These must be loaded from slow memory (unless retained from
-  a previous step).
-- **Boundary outputs**: produced by an op in the subgraph but NOT consumed by
-  any op in the subgraph. These must be evicted to slow memory (unless retained
-  for the next step).
-- **Ephemeral**: produced AND consumed within the subgraph. These pass directly
-  between ops without touching fast memory. They consume **zero capacity** and
-  incur **zero transfer cost**. This is the key benefit of fusion.
+A subgraph is a set of op indices. Requirements:
+- **Connected sub-DAG:** ops must be linked through tensors within the
+  subgraph (producer→consumer edges or co-consumer edges sharing an input).
+  Confirmed by organizer in #34.
+- **At least one boundary output.**
+- **All boundary outputs must have the same (width, height).**
+- **Every op must appear in at least one subgraph** across the schedule.
+  Ops MAY appear in multiple subgraphs (recomputation). See Example 3B.
 
----
+### 3.2 Tensor Classification
 
-## The tiling parameters `[w, h, k]`
+For a given subgraph S:
+- **Boundary input:** consumed by an op in S but not produced by any op in S.
+- **Boundary output:** produced by an op in S and NOT consumed by any op in S.
+- **Ephemeral:** produced AND consumed within S. Costs zero memory, zero
+  bandwidth. Passes directly between ops in the tile pipeline.
 
-### Role-based tiling constraints
+A tensor can be ephemeral in one subgraph and a boundary output of another.
+External consumers of an ephemeral tensor must be served by recomputation
+(producing op also in their subgraph) or by the tensor being a boundary
+output of a different subgraph. (Example 3B: T1 is ephemeral in [0,1] but
+Op2 is served by recomputation of Op0 in [0,2].)
 
-The tiling parameters constrain tensor dimensions based on **how each tensor is
-used** (its role), not based on a blanket rule. For each op in the subgraph:
+### 3.3 Ephemeral Single-Consumer Constraint
 
-**MatMul** with LHS=T1, RHS=T2, OUT=T3:
-
-| Tensor | Role    | Slice shape | Constraints              |
-|--------|---------|-------------|--------------------------|
-| T3     | Output  | `w × h`     | `w` divides W3, `h` divides H3 |
-| T1     | LHS     | `k × h`     | `k` divides W1, `h` divides H1 |
-| T2     | RHS     | `w × k`     | `w` divides W2, `k` divides H2 |
-
-Note: W1 and H2 are the reduction dimensions (they must be equal: W1 = H2 = K).
-So `k` divides W1 and `k` divides H2 is the same constraint: `k | K`.
-
-**Pointwise** with inputs T_i and output T_o:
-
-The slice shape for PW ops depends on context. If T_o is a boundary output, all
-slices are `w × h`. But if T_o is ephemeral and consumed by a downstream op, the
-PW adopts the slice shape demanded by its consumer:
-
-| Context                              | PW output slice | PW input slice |
-|--------------------------------------|-----------------|----------------|
-| T_o is boundary output               | `w × h`         | `w × h`        |
-| T_o feeds MatMul as LHS              | `k × h`         | `k × h`        |
-| T_o feeds MatMul as RHS              | `w × k`         | `w × k`        |
-| T_o feeds another PW (propagate)     | same as that PW | same as that PW|
-
-This propagation is computed recursively at subgraph creation time.
-
-### Constraint collection
-
-The code collects three sets of values:
-- `w_divides_`: w must divide every value in this set
-- `h_divides_`: h must divide every value in this set
-- `k_divides_`: k must divide every value in this set
-
-Each tensor contributes to these sets based on its role as described above.
-
-### PW sink constraint
-
-**If any boundary output is produced by a Pointwise op, k must be 1.**
-
-Rationale: PW ops execute once per spatial tile and have no reduction dimension.
-When k > 1, the subgraph's k-loop drives MatMul accumulation across multiple
-steps. If a PW op is a sink of the subgraph, the interaction between the MatMul's
-multi-step accumulation and the PW's single-shot execution creates ambiguity in
-the cost model (when does the PW fire? what memory does the intermediate occupy
-across k-steps?). Rather than model this complex interaction, we enforce k = 1
-for any subgraph with a PW sink. This is not restrictive in practice because:
-
-- PW-only subgraphs already have k = 1 (no MatMul, no reduction)
-- MatMul chains without PW sinks can still use k > 1
-- Mixed subgraphs like MM→PW will use k = 1, which means the MatMul fully
-  computes its output in one step, the PW fires immediately, and the intermediate
-  is truly ephemeral with zero memory cost — the simplest possible model.
-
-### Candidate generation
-
-Valid tiling candidates are divisors of the GCD of each constraint set:
-
-    w ∈ divisors(gcd(w_divides_))
-    h ∈ divisors(gcd(h_divides_))
-    k ∈ {1}                          if any boundary output is a PW output
-    k ∈ divisors(gcd(k_divides_))    otherwise
-
-This is efficient: the GCD captures the tightest common divisibility requirement.
-
-### Example: benchmark 13 chain
-
-    Op0: T2(4096×128 LHS) @ T0(4096×4096 RHS) → T34(4096×128 eph)
-    Op1: T34(4096×128 LHS) @ T1(4096×4096 RHS) → T35(4096×128 eph)
-    Op2: T35(4096×128 LHS) @ T18(128×4096 RHS) → T36(128×128 boundary)
-
-Constraints:
-- w_divides_: {W of T0=4096 (Op0 RHS), W of T1=4096 (Op1 RHS), W of T18=128 (Op2 RHS), W of T36=128 (boundary out)} → gcd = 128
-- h_divides_: {H of T2=128, H of T34=128, H of T35=128, H of T36=128, ...} → gcd = 128
-- k_divides_: {W of T2=4096 (Op0 LHS), W of T34=4096 (Op1 LHS), W of T35=4096 (Op2 LHS), H of T0=4096 (Op0 RHS), H of T1=4096 (Op1 RHS), H of T18=4096 (Op2 RHS)} → gcd = 4096
-
-Note that `w` need NOT divide the ephemeral tensor width (4096). The ephemeral
-tensors T34 and T35 are consumed as LHS, so their width is constrained by `k`,
-not `w`. This allows `w=128` even though ephemeral widths are 4096.
+An ephemeral tensor may have only ONE consumer within the subgraph. The tile
+exists momentarily in the pipeline and cannot fan out.
 
 ---
 
-## Working set (fast memory usage)
+## 4. Execution Granularity [w, h, k]
 
-The working set is the peak fast memory occupied during any single tile-step
-(`Subgraph::working_set`):
+A single `[w, h, k]` tuple governs the entire subgraph. It determines the
+output tile size and the shapes of all input/output slices.
 
-    ws = Σ (boundary input slices) + Σ (boundary output slices)
-         + Σ (retained-from-prev full tensors)
-         + Σ (retain-these output accumulation)
+### 4.1 Output Tile
 
-### Per-input contributions
+The subgraph's boundary output tensor (W × H) is divided into a grid:
+```
+num_tiles_w = W / w       (w must divide W)
+num_tiles_h = H / h       (h must divide H)
+num_spatial_tiles = num_tiles_w × num_tiles_h
+```
 
-For each boundary input tensor:
+Each spatial tile produces a `w × h` block of the output.
 
-| Input role             | Normal (not retained)  | Retained from prev step |
-|------------------------|------------------------|-------------------------|
-| PW input               | `h × w`                | `width × height` (full) |
-| MatMul LHS             | `h × K`                | `width × height` (full) |
-| MatMul RHS             | `k × w`                | `width × height` (full) |
+### 4.2 MatMul Slice Shapes (per the output-producing MatMul)
 
-A retained tensor occupies its **full size** (not a tile-sized slice) because
-the entire tensor is already resident in fast memory from the previous step.
+For the MatMul that directly produces a boundary output:
+```
+Output tile:   w × h
+LHS slice:     h × k     (k columns of the LHS per k-step)
+RHS slice:     k × w     (k rows of the RHS per k-step)
+```
 
-When a tensor serves multiple roles across different ops in the subgraph
-(e.g., used as LHS by one MatMul and as PW input by another), the **maximum**
-slice size across all roles is used.
+### 4.3 Upstream MatMul Slice Shapes
 
-### Output contribution
+For a MatMul whose output is ephemeral (feeding another op in the chain):
+the output tile shape is determined by what the downstream consumer needs.
+In a two-MatMul chain Op0→(ephemeral)→Op1→(output) with granularity
+[w, h, k]:
+```
+Op0 output (ephemeral):  h × k      (Op1's LHS slice per k-step)
+Op0 LHS:                 h × K0     (full reduction, resident)
+Op0 RHS:                 K0 × k     (k columns, streamed per k-step)
+```
+Note: Op0's RHS slice is `K0 × k`, NOT `k × w`. The dimensions are
+determined by what Op0 needs to produce its `h × k` output tile.
 
-- **MatMul output (accumulator)**: `h × w`. Required because the accumulator
-  must persist in fast memory across k-steps.
-- **PW output**: `h × w`. The output tile must be in fast memory to be written.
+### 4.4 Pointwise Slice Shapes
 
-In all cases, boundary outputs contribute `h × w` to the working set. For MatMul
-outputs this also serves as the accumulator across k-steps.
+Pointwise inputs and outputs all have the same shape as whatever the
+downstream chain demands. If the PW output feeds a MatMul LHS, the shape
+is `h × k`. If it's a boundary output, the shape is `w × h`.
 
-Note: for mixed MM→PW subgraphs, the PW sink constraint forces k = 1. This
-means the MatMul completes its output in a single step, so the ephemeral
-intermediate is never an accumulator — it flows directly to the PW. No extra
-memory is needed for ephemeral MM→PW intermediates.
+### 4.5 k Dimension Rules
 
-### Shared boundary inputs
+**k splits the reduction of the output-producing MatMul.** The number of
+temporal steps is:
+```
+nk = K_output / k       (k must divide K_output)
+```
+where K_output = reduction dimension of the MatMul producing the boundary
+output (= its LHS tensor width).
 
-When multiple ops in a subgraph share the same boundary input tensor, it is
-loaded **once** and counted **once** in both working set and transfer cost.
+**k > 1 is only valid if the boundary output is produced by a MatMul.**
+If a Pointwise produces the boundary output, k must be 1. The PW has no
+reduction dimension and cannot participate in k-steps.
+Confirmed by organizer in #32:
+> "No, this fusion is not valid with [128, 128, 32]. With split-K, the
+> MatMul takes 4 passes to accumulate its result, and the Pointwise
+> cannot participate in those k-steps."
 
-### Retained output accumulation
+Valid patterns for k > 1:
+- Pure MatMul chain (output produced by MatMul)
+- PW → MatMul chain (MatMul produces boundary output, PW produces
+  k-sized tiles per step)
 
-When a boundary output is in `retain_these`, its completed tiles accumulate in
-fast memory instead of being evicted. The implementation accounts for this by
-**excluding the retained tensor from the per-tile working-set accounting** and
-instead **adding its full size unconditionally** in a post-pass:
+Invalid patterns for k > 1:
+- MatMul → PW (PW produces boundary output) → k must be 1
+- Pure PW chain → k must be 1
 
-    ws_contribution = full_output_size   (width × height of the tensor)
+MatMul → PW fusion IS permitted with k = 1.
+Confirmed by organizer in #14 and #32.
 
-This replaces the per-tile contribution of `h × w` that the tensor would
-otherwise have. The net effect is that retaining an output always increases the
-working set by exactly `full_output_size - h × w` relative to the non-retained
-case — all completed tile slices stay pinned in fast memory simultaneously.
+### 4.6 Divisibility Constraints
 
-**Why this formulation**: an earlier incremental approach (`additional_ws =
-full_output_size - h × w`) assumed the main loop had already charged `h × w`
-for the tensor. This broke when the retained tensor was a MatMul LHS (charged
-`h × K`, not `h × w`) or RHS (charged `k × w`), producing wrong values in both
-directions. The current implementation sidesteps the mismatch entirely: skip in
-the main loop, add full size in the post-pass, regardless of role.
+- w must divide every boundary output width AND every ephemeral output width
+- h must divide every boundary output height AND every ephemeral output height
+- k must divide every MatMul's reduction dimension (LHS tensor width)
 
-### Unused retained tensors
-
-A tensor retained from a previous step that is NOT used by this subgraph still
-occupies its full `width × height` in fast memory.
-
-### Feasibility check
-
-    ws ≤ fast_memory_capacity
-
-If not, this tiling is infeasible (OOM).
-
-### Known conservatism in WS estimation
-
-Our code sums the working set contributions of ALL boundary tensors simultaneously.
-In reality, during a chained execution (e.g., Op0 → T_eph → Op1), the inputs of
-Op0 and the inputs of Op1 may not all be needed at the same instant. The true peak
-WS could be the maximum across ops rather than the sum. Our approach over-estimates,
-which means we may reject some technically feasible tilings, but we will never
-accept an infeasible one. The solver compensates by finding alternative tiling
-parameters (e.g., smaller k or smaller spatial tiles) that fit the conservative
-estimate.
+These ensure every op in the subgraph can tile at the unified grid.
 
 ---
 
-## Compute cost
+## 5. Memory Constraint: Working Set
 
-### Compute scale (padding)
+For any chosen `[w, h, k]`, the sum of all input slices and output slices
+that must coexist in fast memory during a single step must fit:
 
-    scale = ceil(w / native_w) × ceil(h / native_h)
+```
+WorkingSet ≤ fast_memory_capacity
+```
 
-- Below native (e.g., w=64, native=128): `ceil(64/128) = 1`. The hardware
-  processes a full native-sized block but only produces `w × h` of useful output.
-  Compute cost is the same as native, but you need more tiles to cover the
-  full output.
-- Above native (e.g., w=256, native=128): `ceil(256/128) = 2`. The hardware
-  needs 2 native passes per tile direction.
+Working set components (per spatial tile, during peak step):
 
-### Spatial vs temporal scaling (issue #38 clarification)
+| Tensor role                    | Size per step     | Timing          |
+|--------------------------------|-------------------|-----------------|
+| Output-MM LHS (boundary input) | h × K            | Resident: loaded once per tile, kept across k-steps |
+| Output-MM RHS (boundary input) | k × w            | Streamed: fresh slice each k-step |
+| Upstream-MM RHS (boundary input) | K_upstream × k  | Streamed: fresh slice each k-step |
+| PW input → boundary output     | w × h            | Tile-once: loaded once per tile |
+| PW input → feeds MM LHS chain  | h × k            | Streamed: per k-step |
+| PW input → feeds MM RHS chain  | k × w            | Streamed: per k-step |
+| Boundary output (non-retained) | w × h            | Evicted per tile |
+| Boundary output (MM accumulator) | w × h           | Resident across k-steps |
+| Retained from previous step    | full tensor size  | Already in fast memory |
+| Retained for next step         | full tensor size  | Must accumulate in fast memory |
 
-The key distinction is that **spatial tiling** and **k-splitting** scale compute
-differently:
+Ephemeral tensors: **zero** memory cost.
 
-- **Spatial tiling** (multiple tiles covering a large tensor): each tile pays
-  `base_cost × scale`. The full native array fires each time. Total compute =
-  `num_tiles × base_cost × scale`. More tiles means more total work — there is
-  no per-tile reduction. (Example 2: 4 tiles × 1000 = 4000 total.)
-- **K-splitting** (reduction dimension split into steps): each k-step pays
-  `base_cost × (k / K)`. Fewer cycles are streamed through the array. Total
-  compute = `base_cost × scale` (same as a single full-K step). Splitting K
-  into more steps does not increase total compute. (Example 5: 4 steps × 500 =
-  2000 per op, same as 1 step × 2000.)
-
-The organizers confirmed this after issue #38 and updated PROBLEM.md to call it
-out explicitly. They also enforced that `native_granularity` is the same across
-all dimensions in the benchmark datasets.
-
-### Per-k-step compute
-
-MatMul and PW compute are separated because they have different k-step behavior:
-
-    mm_comp = scale × Σ (base_cost_i × k / K_i)   for each MatMul op i
-    pw_comp = scale × Σ (base_cost_i)              for each PW op i
-
-- **MatMul**: `K_i` is the reduction dimension of MatMul op `i` (= width of its
-  LHS tensor). Compute per k-step is proportional to `k / K_i`. Summed across
-  all `K_i / k` k-steps, total = `base_cost_i × scale`.
-- **Pointwise**: compute is the full `base_cost × scale`, executed once per
-  tile (at the last k-step only), because PW has no reduction dimension.
+Note: retained tensors (both `retained_from_prev` and `retain_these`) are
+charged at **full tensor size**, not tile-slice size, because they persist
+across all tiles.
 
 ---
 
-## Memory transfer cost
+## 6. Latency Model
 
-### Transfer amounts (per tile, in time units = size / bandwidth)
+### 6.1 Per-Step Roofline
 
-    lhs_load   = Σ (h × K_i / B)     for each UNIQUE boundary MatMul LHS (not retained)
-    rhs_load   = Σ (k × w / B)       for each UNIQUE boundary MatMul RHS (not retained)
-    pw_in_load = Σ (h × w / B)       for each UNIQUE boundary PW input (not retained)
-    out_evict  = Σ (h × w / B)       for each UNIQUE boundary output (not retained-this-step)
+Each execution step (one tile × one k-step) has latency:
+```
+StepLatency = max(ComputeTime, MemoryTime_in + MemoryTime_out)
+```
 
-Each tensor is counted at most once across all ops (deduplicated via a `counted`
-set). This matters when multiple ops in a subgraph share the same boundary input.
+Compute and memory are overlapped (roofline model). Memory in and out are
+serialized (summed).
 
-Retained inputs have zero transfer cost (already in fast memory).
-Retained outputs have zero eviction cost (stay in fast memory).
+### 6.2 Compute Cost
 
-**Note on PW boundary inputs in mixed PW+MatMul subgraphs**: When a PW op's
-boundary input is loaded, we charge `h × w` for the slice. In principle, if the
-PW is producing ephemeral data for a MatMul LHS (slice `k × h`), the PW input
-should also be `k × h`. However, we conservatively use `h × w` because the PW
-input is a boundary tensor loaded from slow memory independently. This may
-over-estimate transfer cost slightly for mixed subgraphs, but no benchmark
-currently exercises this case.
+**Spatial tiling:** each tile pays the full `base_cost` per native-array
+execution. The hardware fires the full physical array each time.
 
-### Per-k-step transfer schedule
+```
+compute_per_tile = base_cost × scale
+scale = ceil(w / native_w) × ceil(h / native_h)
+```
 
-Within a single tile, transfers are distributed across k-steps:
+At or below native: scale = 1, full base_cost per tile.
+Above native: scale > 1, multiple hardware passes per tile.
+Confirmed by organizer in #38.
 
-| k-step     | Memory in                          | Memory out  |
-|------------|------------------------------------|-------------|
-| k = 0      | lhs_load + rhs_load + pw_in_load   | 0           |
-| k = 1..nk-2 | rhs_load                         | 0           |
-| k = nk-1   | rhs_load                           | out_evict   |
+**Reduction (k) splitting:** compute scales proportionally. Fewer cycles
+streamed through the array.
+```
+MatMul compute per k-step = base_cost × (k / K_output) × scale
+```
+All MatMul ops in a fused chain share the same fraction `k / K_output`
+per step, because each step produces k / K_output of the chain's output.
 
-- **k=0 (first)**: loads LHS strips (once per tile), first RHS strip, and all
-  PW inputs
-- **Middle k-steps**: only reload the RHS strips (LHS stays resident)
-- **k=nk-1 (last)**: loads final RHS strip and evicts the output(s)
+**Pointwise compute:** fires once per spatial tile (after all k-steps
+complete, if k > 1 and PW is upstream of a MatMul).
+```
+PW compute per tile = base_cost × scale
+```
 
-If `nk = 1` (no split-K), k=0 is also the last step, so all transfers happen
-together.
+### 6.3 Memory Transfer Cost
 
-**Note on LHS reuse across k-steps**: the MatMul LHS strip (`h × K_i`) is loaded
-once at k=0 and stays resident in fast memory for all subsequent k-steps. This is
-why `lhs_load` uses the full `h × K_i` (not `h × k`). The RHS strip changes each
-k-step (different `k`-wide column), so it's reloaded every time.
+```
+MemoryTime = tensor_slice_size / slow_memory_bandwidth
+```
 
----
+Sizes are in elements (not bytes). Bandwidth B is in elements/time.
 
-## Roofline model
+### 6.4 Per-Tile Latency Structure (with k-steps)
 
-Each k-step's latency is:
+For nk > 1 (split-k):
+```
+Step 0:         max(mm_comp, resident_load + stream_load + tile_load)
+Steps 1..nk-2:  max(mm_comp, stream_load)
+Step nk-1:      max(mm_comp + pw_comp, stream_load + out_evict)
+```
 
-    step_latency = max(step_compute, memory_in + memory_out)
+For nk = 1:
+```
+Single step:    max(mm_comp + pw_comp, all_loads + out_evict)
+```
 
-Where `step_compute` is `mm_comp` for k-steps 0..nk-2, and `mm_comp + pw_comp`
-for the last k-step (PW executes once per tile, after all MatMul accumulation
-is complete).
+Where:
+- `resident_load` = cost to load resident tensors (once per tile, first
+  k-step only)
+- `stream_load` = cost to load streamed tensors (every k-step)
+- `tile_load` = cost to load tile-once PW inputs
+- `out_evict` = cost to evict non-retained boundary outputs
+- `mm_comp` = MatMul compute per k-step
+- `pw_comp` = Pointwise compute per tile (added to last k-step)
 
-A tile's total latency is the sum of its k-step latencies.
+### 6.5 Intra-Subgraph Data Reuse (Traversal Order)
 
----
+The hardware automatically reuses input strips between consecutive spatial
+tiles that share them. This is implicit — no explicit control needed.
+Confirmed by organizer in #37:
+> "Intra-subgraph data reuse is managed automatically by the hardware."
 
-## Tile ordering and data reuse
+For MatMul with spatial tiling, consecutive tiles sharing a row index
+reuse the LHS row strip; tiles sharing a column index reuse the RHS
+column strip.
 
-The hardware implicitly reuses any tensor data that is still resident in fast
-memory from the previous tile step. This applies regardless of traversal order —
-raster order gets reuse too. The traversal order controls *which* strips are
-shared between consecutive tiles.
+**Raster order** (default, or `null`): row-major. Within each row, the
+LHS row strip is reused.
+```
+Raster [0,1,2,3] on 2×2 grid:
+  TL(0,0) → TR(0,1): reuse row strip 0
+  BL(1,0) → BR(1,1): reuse row strip 1
+  BUT TL→BL transition: new row, reload both strips
+  Result: 2 reuses
+```
 
-For **MatMul**, each tile loads an LHS row strip (identified by the output's row
-index) and an RHS column strip (identified by the output's column index). If
-consecutive tiles share the same row, the LHS strip is reused. If they share the
-same column, the RHS strip is reused.
+**Snake/zig-zag order**: alternating direction. Reuses both row and column
+strips across row boundaries.
+```
+Zig-zag [0,1,3,2]:
+  TL(0,0) → TR(0,1): reuse row strip 0
+  TR(0,1) → BR(1,1): reuse col strip 1
+  BR(1,1) → BL(1,0): reuse row strip 1
+  Result: 3 reuses
+```
 
-For **PW-only** subgraphs, all boundary inputs have shape `h × w` and change
-with every tile position, so there is no strip reuse regardless of traversal
-order.
+Note: when nk > 1 (split-k), stream strips from the previous tile's last
+k-step cover a different k-range than the new tile's first k-step. So
+stream reuse does NOT carry across tiles — stream_load is always fresh
+per tile. Resident reuse IS valid across tiles (same h×K stays resident).
 
-### Reuse constraint with k-splitting (nk > 1)
+### 6.6 Total Subgraph Latency
 
-When k < K (the reduction dimension is split), the RHS strip loaded in the last
-k-step of tile N covers k-range `[(nk-1)×k, K)`. Tile N+1's first k-step needs
-k-range `[0, k)` — a completely different strip. So **RHS reuse across spatial
-tiles is invalid when nk > 1**. LHS reuse remains valid because the full `h × K`
-LHS strip stays resident across all k-steps.
+```
+SubgraphLatency = Σ tile_latency(tile_i)  for all spatial tiles
+```
 
-In the code, `tile_cost()` forces `rhs_fresh = true` when `nk > 1`.
+Each tile's latency depends on whether resident/stream data is fresh or
+reused, which depends on the traversal order.
 
-### Raster order (default / `None`)
+### 6.7 Total Schedule Latency
 
-Standard row-major traversal: `(0,0), (0,1), ..., (0,ntw-1), (1,0), ...`
+```
+TotalLatency = Σ SubgraphLatency(step_i)  for all steps in order
+```
 
-Within each row, consecutive tiles share the LHS row strip. At the start of a
-new row, both LHS and RHS must be reloaded (the LHS row changes, and the RHS
-column jumps back to 0 — which was last loaded ntw-1 tiles ago and has been
-evicted).
-
-Tile classification for raster order:
-- **ff** (both fresh): `nth` tiles (first tile of each row)
-- **rf** (LHS reused, RHS fresh): `(ntw - 1) × nth` tiles (subsequent tiles in each row)
-
-This was confirmed by the updated Example 4A (issues #3, #15, #37): raster order
-on a 2×2 grid gives 2×2048 + 2×1500 = 7096, not 4×2048 = 8192.
-
-### RowMajor snake
-
-Traverses left→right on even rows, right→left on odd rows:
-
-    Row 0: (0,0) → (0,1) → (0,2) →
-    Row 1:                          (1,2) → (1,1) → (1,0) →
-    Row 2: (2,0) → (2,1) → (2,2) →  ...
-
-Consecutive tiles on the **same row** share the LHS strip (no reload needed).
-At row transitions (same column), the RHS strip is reused.
-
-Tile classification for RowMajor:
-- **ff** (both fresh): 1 tile (the first one)
-- **rf** (LHS reused, RHS fresh): `(ntw - 1) × nth` tiles (same-row transitions)
-- **fr** (LHS fresh, RHS reused): `nth - 1` tiles (row transitions)
-
-### ColMajor snake
-
-Traverses top→bottom on even columns, bottom→top on odd columns. The counts
-are transposed:
-- **ff**: 1
-- **rf** (LHS reused): `ntw - 1`
-- **fr** (RHS reused): `(nth - 1) × ntw`
-
-### Which traversal is best?
-
-**Raster vs snake**: Raster already gets LHS reuse within each row (same count
-as RowMajor: `(ntw-1)×nth` LHS-reuse tiles). The advantage of snake is the
-additional reuse at **row/column boundaries**:
-
-- **Raster**: `nth` fresh tiles (start of each row) + `(ntw-1)×nth` LHS-reuse
-- **RowMajor**: same LHS-reuse as raster, plus `nth-1` RHS-reuse tiles at row
-  boundaries (saves 1 fresh tile per transition). Strictly better by `nth-1`
-  tiles of RHS savings.
-- **ColMajor**: `ntw-1` LHS-reuse + `(nth-1)×ntw` RHS-reuse. Better than
-  RowMajor when RHS strips are more expensive than LHS strips.
-
-Choose RowMajor when LHS is large relative to RHS (wide grid), ColMajor when
-RHS is large (tall grid). For PW-only subgraphs, all three are identical.
-
-**With k-splitting (nk > 1)**: RHS reuse across spatial tiles is invalid (see
-above), so the fr (RHS-reuse) tiles in snake degrade to ff (both fresh). Snake
-still helps via LHS reuse, but the row/column-transition benefit disappears.
-In this case, raster and RowMajor snake produce the same cost.
+Execution between subgraphs is strictly serialized. Step k+1 cannot begin
+until step k has fully completed.
 
 ---
 
-## `retainable_tensors` — which tensors may be retained
+## 7. Inter-Subgraph Tensor Retention
 
-`Problem::retainable_tensors` is a precomputed set of tensor indices that are
-eligible to appear in `retain_these` at the solution level. A tensor is
-retainable if and only if its **full size** fits within `fast_memory_capacity`:
+### 7.1 Mechanism
 
-    retainable_tensors = { t : tensors[t].width × tensors[t].height ≤ fast_memory_capacity }
+`tensors_to_retain[k]` lists output tensors from step k to keep in fast
+memory for step k+1.
 
-**Why this constraint exists**: retaining a tensor keeps its entire `width ×
-height` resident in fast memory (not just one tile slice). If the full tensor
-exceeds the hardware's fast-memory capacity on its own, it can never be legally
-retained regardless of tiling choices, so the ordering layer filters such tensors
-out before attempting retention.
+### 7.2 Lifetime = Exactly One Step
 
-**Where it is used**: the ordering algorithms consult `retainable_tensors` when
-deciding which boundary outputs to include in `retain_these`. `Subgraph::working_set`
-and `compute_cost` do not enforce this constraint internally — they will accept
-any tensor in `retain_these` and compute the resulting working set. The
-constraint is purely a solution-construction heuristic to avoid generating
-obviously infeasible retention decisions.
+Confirmed by organizer in #34:
+> "The lifetime of a retained tensor extends exactly one step:
+> tensors_to_retain[k] keeps tensors resident from step k into step k+1.
+> After step k+1 completes, they are freed."
 
-**Interaction with tiling**: even a retainable tensor may become infeasible to
-retain under a specific tiling if the combined working set (input slices +
-retained-output full sizes + other retained-from-prev tensors) exceeds capacity.
-`best_cost()` handles this by enumerating tilings and checking feasibility for
-each; smaller tiles may be selected precisely to accommodate retained tensors.
+To keep a tensor alive for step k+2, step k+1 must produce it (via
+recomputation) and explicitly retain it in tensors_to_retain[k+1].
 
----
+**No accumulation of retained tensors across multiple steps.** The set
+of tensors in fast memory at the start of step k+1 is exactly
+`tensors_to_retain[k]` and nothing else from earlier steps.
 
-## Retain mechanics
+### 7.3 Effects on Cost
 
-### Retaining an output (this step)
+**Producing step (k):** retained output is NOT evicted to slow memory.
+Saves `evict_cost = tensor_size / B`.
 
-When a boundary output tensor is in `retain_these`:
-- **No eviction**: `out_evict` is 0 for that tensor (transfer savings)
-- **Full-size working set**: the tensor occupies `width × height` in the working
-  set (all completed tile slices stay pinned simultaneously). See "Retained
-  output accumulation" above for the implementation details.
-- **Tiling impact**: the larger working set may force smaller tiles
+**Consuming step (k+1):** retained tensor is already in fast memory.
+Saves `load_cost = tensor_slice_size / B` (or full tensor if used as
+tile-once or resident input). The full tensor size occupies fast memory
+capacity throughout step k+1.
 
-### Using a retained input (from previous step)
+**Non-consuming step:** if step k+1 doesn't use the retained tensor, it
+still occupies fast memory capacity during step k+1 (then freed after).
 
-When a boundary input is in `retained_from_prev`:
-- **No load cost**: that input's transfer is 0 (already in fast memory)
-- **Full-size capacity**: the tensor occupies `width × height` in working set
-  (the full tensor, not a tile-sized slice), because the entire tensor is
-  resident from the previous step
+### 7.4 Graph Outputs
 
-### When retain helps
-
-Retain is beneficial when:
-    transfer_savings > tiling_penalty
-
-The transfer savings come from eliminating one tensor's load/evict across all
-tiles. The penalty comes from larger working set potentially forcing smaller
-tiles (more tiles, more overhead, possible padding).
+Graph outputs (tensors with no consumers) must end in slow memory. If
+retained at step k, they are freed after step k+1 but were never evicted
+to slow memory — this may be a validity issue. Retention is typically
+only useful for tensors that will be consumed by a later subgraph.
 
 ---
 
-## The search: `best_cost()`
+## 8. Schedule Validity Requirements
 
-The optimizer enumerates all valid `[w, h, k]` combinations:
-- `w` ∈ divisors of `gcd(w_divides_)` — values w must divide, derived from
-  tensor roles (MatMul RHS widths, boundary output widths, etc.)
-- `h` ∈ divisors of `gcd(h_divides_)` — values h must divide (MatMul LHS
-  heights, boundary output heights, etc.)
-- `k` ∈ `{1}` if any boundary output is a PW output (PW sink constraint);
-  otherwise `k` ∈ divisors of `gcd(k_divides_)` (MatMul reduction dimensions)
-- Snake ∈ {RowMajor, ColMajor} for MatMul subgraphs, {None} for PW-only.
-  Raster (None) is not searched for MatMul because RowMajor is always ≥ raster
-  (same LHS reuse plus additional RHS reuse at row boundaries).
-
-Minimum tile size: `native_w/4 × native_h/4` (relaxed to 1×1 if nothing fits).
-
-For each combination, it computes working set, checks feasibility, computes
-latency, and keeps the minimum.
+1. Every op in the graph appears in at least one subgraph.
+2. Each subgraph is a connected sub-DAG.
+3. Each subgraph has a valid `[w, h, k]` (divisibility, PW sink → k=1).
+4. Each subgraph's working set fits in fast memory.
+5. Graph outputs end in slow memory (evicted at some point).
+6. The schedule's subgraph order respects data dependencies: if step j
+   needs a boundary input produced by step i (or retained from step i),
+   then i < j.
+7. The condensed DAG of subgraphs must be acyclic (no circular
+   dependencies between groups).
+8. Ephemeral tensors with external consumers must be served (either by
+   recomputation or by availability as a boundary output from another
+   subgraph).
 
 ---
 
-## Complete latency formula
+## 9. Verified Against Examples
 
-    total_latency = Σ over all tiles of Σ over all k-steps of
-                    max(step_compute, memory_in + memory_out)
+| Ex | Scenario                  | Strategy              | Expected | Model |
+|----|---------------------------|-----------------------|----------|-------|
+| 1  | PW chain 128×128          | A: Separate           | 6,553.6  | ✓     |
+| 1  |                           | B: Fused 128×128      | 3,276.8  | ✓     |
+| 1  |                           | C: Fused 64×64        | 4,400.0  | ✓     |
+| 2  | PW chain 256×256          | A: Separate           | 26,214.4 | ✓     |
+| 2  |                           | B: Fused 128×128      | 13,107.2 | ✓     |
+| 3  | Diamond PW graph          | A: Spill              | 11,468.8 | ✓     |
+| 3  |                           | B: Recompute          | 6,276.8  | ✓     |
+| 3  |                           | C: Retain             | 4,638.4  | ✓     |
+| 4  | MatMul traversal          | A: Raster (7,096*)    | 7,096    | ✓     |
+| 4  |                           | B: Zig-zag            | 6,548    | ✓     |
+| 5  | Chained MatMul split-k    | B: k=32               | 6,915.2  | ✓     |
 
-This simplifies analytically using reuse counts:
+*Example 4A was corrected from 8,192 to 7,096 per issue #37.
 
-    total = ff_count × tile_cost(true, true)
-          + rf_count × tile_cost(false, true)
-          + fr_count × tile_cost(true, false)
+---
 
-Where `tile_cost(lhs_fresh, rhs_fresh)` sums the k-step roofline values for
-one tile with the given reuse pattern. When `nk > 1`, `rhs_fresh` is forced
-`true` inside `tile_cost` (RHS reuse is invalid across tiles with k-splitting).
+## 10. Key Organizer Clarifications
 
-The counts for each traversal mode:
-
-| Mode | ff (both fresh) | rf (LHS reused) | fr (RHS reused) |
-|------|----------------|-----------------|-----------------|
-| Raster | nth | (ntw-1)×nth | 0 |
-| RowMajor | 1 | (ntw-1)×nth | nth-1 |
-| ColMajor | 1 | ntw-1 | (nth-1)×ntw |
-| PW-only | ntw×nth | 0 | 0 |
-
-For PW-only subgraphs, all inputs depend on both row and column, so there is
-no strip reuse and every tile pays the same cost.
+| Issue | Topic                          | Ruling |
+|-------|--------------------------------|--------|
+| #3,#37 | Raster order has implicit reuse | Yes. Hardware always reuses strips between consecutive same-row tiles. PROBLEM.md corrected. |
+| #10,#38 | Spatial vs k-split compute scaling | Spatial: full base_cost per tile (array fires fully). K-split: proportional (fewer cycles). |
+| #14   | MatMul + PW fusion allowed?    | Yes, with single [w,h,k]. Must be "mathematically valid." |
+| #32   | MatMul→PW with k>1?           | No. PW can't participate in k-steps. k must be 1 if PW produces boundary output. |
+| #34   | Retained tensor lifetime       | Exactly one step. Freed after step k+1 completes. No multi-step accumulation. |
+| #38   | Native granularity update      | All benchmarks updated to have same native granularity across all dimensions (square). |
