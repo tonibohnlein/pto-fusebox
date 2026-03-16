@@ -547,17 +547,16 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
-  if (has_pw_sink_ && cfg.k > 1)
-    return false;
-
-  // Reference allows granularity ≥ dimension (gives 1 tile = full extent).
-  // Divisibility only required when granularity < dimension.
+  // When sink is PW, k is irrelevant (d_tiles=1 regardless).
+  // The reference doesn't validate k at all for PW sinks.
   for (int64_t v : w_divides_)
     if (cfg.w < v && v % cfg.w != 0) return false;
   for (int64_t v : h_divides_)
     if (cfg.h < v && v % cfg.h != 0) return false;
-  for (int64_t v : k_divides_)
-    if (cfg.k < v && v % cfg.k != 0) return false;
+  if (!has_pw_sink_) {
+    for (int64_t v : k_divides_)
+      if (cfg.k < v && v % cfg.k != 0) return false;
+  }
 
   return true;
 }
