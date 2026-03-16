@@ -13,7 +13,10 @@
 //   1. At least one boundary output tensor
 //   2. All boundary outputs have the same (W, H) dimensions
 //   3. Connected: ops form a connected sub-DAG (via DAG edges or shared inputs)
-//   5. Ephemeral tensors have exactly one consumer within the subgraph
+//   4. Ephemeral tensors: produced + consumed internally + ALL DAG consumers
+//      are inside the subgraph.  Tensors with external consumers are boundary
+//      outputs (materialized to slow memory for external access).
+//   5. Ephemeral tensors may have multiple internal consumers (fan-out OK).
 //
 // Tiling validity constraints (derived from chain execution model):
 //   - w divides every output width (boundary AND ephemeral — the unified
@@ -142,6 +145,10 @@ private:
     bool is_streamed_h_by_k = false; // h×k per k-step
     int64_t stream_fixed_by_k = 0;   // fixed×k per k-step (upstream MatMul RHS;
                                      // fixed = tensor.height = upstream reduction dim)
+                                     // Used when ephemeral output feeds another MatMul
+    int64_t stream_fixed_by_w = 0;   // fixed×w per tile (upstream MatMul RHS;
+                                     // fixed = tensor.height = upstream reduction dim)
+                                     // Used when ephemeral output feeds PW→boundary
     bool is_tile_input = false;      // h×w once per tile
 
     // --- Output roles ---

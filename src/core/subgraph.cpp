@@ -80,8 +80,17 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t])
-      is_ephemeral[t] = true;
+    if (is_produced[t] && is_consumed[t]) {
+      // Ephemeral only if ALL consumers in the DAG are inside the subgraph.
+      // If any consumer is external, the tensor must be a boundary output
+      // so external consumers can access it from slow memory.
+      bool all_internal = true;
+      for (auto cop : dag.tensor_consumers[t])
+        if (!is_in_sg[cop]) { all_internal = false; break; }
+      if (all_internal)
+        is_ephemeral[t] = true;
+      // else: has external consumer → will be boundary output below
+    }
   }
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_produced[t] && !is_ephemeral[t])
@@ -90,18 +99,9 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.ephemeral_.insert(t);
   }
 
-  // Validate: ephemeral tensors must have exactly one INTERNAL consumer.
-  // (The tile exists momentarily — can't fan out within a subgraph.)
-  {
-    std::vector<int> eph_count(num_tensors, 0);
-    for (auto i : sg.ops_)
-      for (auto t : prob.ops[i].inputs)
-        if (is_ephemeral[t])
-          eph_count[t]++;
-    for (size_t t = 0; t < num_tensors; t++)
-      if (is_ephemeral[t] && eph_count[t] != 1)
-        return std::nullopt;
-  }
+  // Note: ephemeral tensors MAY have multiple internal consumers (fan-out
+  // within the subgraph is permitted). All consumers add tiling constraints;
+  // the GCD-based candidate generation ensures compatibility.
 
   // Must have at least one boundary output
   if (sg.boundary_outputs_.empty())
@@ -139,16 +139,20 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
-    // Compute output_K_: the reduction dimension of the MatMul(s) that
-    // produce boundary outputs.  This K drives the temporal loop
-    // (nk = output_K / k).
+    // Compute output_K_: the reduction dimension that drives the temporal
+    // loop (nk = output_K / k).
     //
-    // In a chain like (T0 @ T1) @ T2, the output-producing MatMul is Op1
-    // with K = T3.width (= Op1's LHS width).  ALL ops in the chain — 
-    // including upstream Op0 — produce k/output_K of their work per k-step,
-    // because each step computes k output columns of the final result.
+    // When the boundary output is produced by a MatMul, output_K_ is that
+    // MatMul's reduction dimension.  nk = output_K_ / k splits the
+    // reduction into temporal steps.
     //
-    // When has_pw_sink_ is true, k is forced to 1 and output_K_ is moot.
+    // When a Pointwise produces the boundary output (has_pw_sink_), k is
+    // forced to 1 and output_K_ = 1, giving nk = 1.  This means NO
+    // temporal splitting: the MatMul performs its full reduction in a
+    // single step, and the PW fires immediately after.
+    // Confirmed by organizer in issue #32: "With split-K, the MatMul
+    // takes 4 passes to accumulate its result, and the Pointwise cannot
+    // participate in those k-steps."
     if (!sg.has_pw_sink_) {
       for (auto t : sg.boundary_outputs_) {
         int prod = tensor_producer_in_sg[t];
@@ -160,63 +164,81 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
 
     // ---- Collect role-based tiling constraints ----
-    // For ephemeral tensors, determine slice type by following the consumer chain
-    // iteratively (no std::function/recursion needed).
+    //
+    // For each tensor (boundary or ephemeral), determine what tiling axes
+    // its dimensions map to, based on how it's consumed.  With multi-consumer
+    // ephemerals, a tensor may have MULTIPLE roles — each adds constraints.
+    //
+    // Role resolution for an ephemeral tensor: for each internal consumer,
+    // determine the demanded role.  If the consumer is a PW, propagate
+    // through the PW output (which may itself be ephemeral or boundary).
 
-    // For each ephemeral tensor: who produces it, who consumes it
-    std::vector<int> eph_consumer(num_tensors, -1);
+    // Build consumer lists for ephemeral tensors (may have multiple)
+    std::vector<std::vector<size_t>> eph_consumers(num_tensors);
     for (auto i : sg.ops_)
       for (auto t : prob.ops[i].inputs)
         if (is_ephemeral[t])
-          eph_consumer[t] = (int)i;
+          eph_consumers[t].push_back(i);
 
-    // Determine slice type for each ephemeral tensor by following consumer chain
-    std::vector<bool> eph_resolved(num_tensors, false);
+    // Resolve all (sw, sh) roles for an ephemeral tensor via DFS through
+    // PW chains.  Returns a vector of (SliceW, SliceH) pairs.
+    // Uses a visited set to prevent infinite loops in pathological cases.
+    std::vector<bool> resolving(num_tensors, false);
 
-    for (size_t t = 0; t < num_tensors; t++) {
-      if (!is_ephemeral[t] || eph_resolved[t]) continue;
+    // Forward declaration for mutual recursion (lambda captures itself)
+    struct RolePair { SliceW sw; SliceH sh; };
+    std::vector<std::vector<RolePair>> eph_roles(num_tensors);
+    std::vector<bool> eph_roles_computed(num_tensors, false);
 
-      // Follow chain: t → consumer_op → consumer_output → ...
-      // until we hit a boundary output or a MatMul consumer
-      size_t cur = t;
-      // Collect chain for back-propagation
-      std::vector<size_t> chain;
-      SliceW sw = SliceW::W_param;
-      SliceH sh = SliceH::H_param;
+    // Iterative role resolution using a worklist
+    // Process in reverse topological order of the subgraph ops so that
+    // downstream ephemeral roles are resolved before upstream ones.
+    {
+      // Collect all ephemeral tensors in reverse topo order of their consumers
+      std::vector<size_t> eph_order;
+      for (auto op_idx : dag.topological_order())
+        if (is_in_sg[op_idx])
+          for (auto t : prob.ops[op_idx].outputs)
+            if (is_ephemeral[t])
+              eph_order.push_back(t);
 
-      while (true) {
-        chain.push_back(cur);
-        int cop = eph_consumer[cur];
-        if (cop < 0) break; // shouldn't happen, but safety
+      // Process in reverse: sinks first, sources last
+      for (int ei = (int)eph_order.size() - 1; ei >= 0; ei--) {
+        size_t t = eph_order[ei];
+        if (eph_roles_computed[t]) continue;
 
-        const auto &op = prob.ops[cop];
-        if (op.type == OpType::MatMul) {
-          // Determine if cur is LHS or RHS
-          if (op.inputs[0] == cur)
-            { sw = SliceW::K_param; sh = SliceH::H_param; }
-          else
-            { sw = SliceW::W_param; sh = SliceH::K_param; }
-          break;
-        } else {
-          // PW: propagate from its output
-          size_t pw_out = op.outputs[0];
-          if (!is_ephemeral[pw_out]) {
-            // PW output is boundary → w×h
-            sw = SliceW::W_param; sh = SliceH::H_param;
-            break;
+        for (auto cop : eph_consumers[t]) {
+          const auto &op = prob.ops[cop];
+          if (op.type == OpType::MatMul) {
+            if (op.inputs[0] == t)
+              eph_roles[t].push_back({SliceW::K_param, SliceH::H_param});
+            else
+              eph_roles[t].push_back({SliceW::W_param, SliceH::K_param});
+          } else {
+            // PW: role is same as PW output's role
+            size_t pw_out = op.outputs[0];
+            if (sg.boundary_outputs_.count(pw_out)) {
+              eph_roles[t].push_back({SliceW::W_param, SliceH::H_param});
+            } else if (is_ephemeral[pw_out] && eph_roles_computed[pw_out]) {
+              // Propagate all roles from the PW output
+              for (auto &r : eph_roles[pw_out])
+                eph_roles[t].push_back(r);
+            } else {
+              // Fallback: boundary or unresolved → w×h
+              eph_roles[t].push_back({SliceW::W_param, SliceH::H_param});
+            }
           }
-          if (eph_resolved[pw_out]) {
-            sw = eph_sw[pw_out]; sh = eph_sh[pw_out];
-            break;
-          }
-          cur = pw_out;
         }
+        eph_roles_computed[t] = true;
       }
+    }
 
-      // Apply to all tensors in chain
-      for (auto ct : chain) {
-        eph_sw[ct] = sw; eph_sh[ct] = sh;
-        eph_resolved[ct] = true;
+    // For backward compatibility, store the first resolved role in eph_sw/eph_sh
+    // (used by BoundaryTensorInfo classification for PW inputs)
+    for (size_t t = 0; t < num_tensors; t++) {
+      if (is_ephemeral[t] && !eph_roles[t].empty()) {
+        eph_sw[t] = eph_roles[t][0].sw;
+        eph_sh[t] = eph_roles[t][0].sh;
       }
     }
 
@@ -236,20 +258,33 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         add_constraint(op.inputs[0], SliceW::K_param, SliceH::H_param);
         add_constraint(op.inputs[1], SliceW::W_param, SliceH::K_param);
         size_t out = op.outputs[0];
-        if (sg.boundary_outputs_.count(out))
+        if (sg.boundary_outputs_.count(out)) {
           add_constraint(out, SliceW::W_param, SliceH::H_param);
-        else
-          add_constraint(out, eph_sw[out], eph_sh[out]);
+        } else if (is_ephemeral[out]) {
+          // Add constraints for ALL roles this ephemeral serves
+          for (auto &r : eph_roles[out])
+            add_constraint(out, r.sw, r.sh);
+        }
       } else {
         size_t out = op.outputs[0];
-        SliceW sw; SliceH sh;
-        if (sg.boundary_outputs_.count(out))
-          { sw = SliceW::W_param; sh = SliceH::H_param; }
-        else
-          { sw = eph_sw[out]; sh = eph_sh[out]; }
-        add_constraint(out, sw, sh);
-        for (auto t : op.inputs)
-          add_constraint(t, sw, sh);
+        if (sg.boundary_outputs_.count(out)) {
+          add_constraint(out, SliceW::W_param, SliceH::H_param);
+          for (auto t : op.inputs)
+            add_constraint(t, SliceW::W_param, SliceH::H_param);
+        } else if (is_ephemeral[out]) {
+          // PW with ephemeral output: add constraints for ALL roles
+          for (auto &r : eph_roles[out]) {
+            add_constraint(out, r.sw, r.sh);
+            for (auto t : op.inputs)
+              add_constraint(t, r.sw, r.sh);
+          }
+          // Fallback: if no roles resolved, use w×h
+          if (eph_roles[out].empty()) {
+            add_constraint(out, SliceW::W_param, SliceH::H_param);
+            for (auto t : op.inputs)
+              add_constraint(t, SliceW::W_param, SliceH::H_param);
+          }
+        }
       }
     }
 
@@ -313,15 +348,24 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         }
         // Direct MM RHS boundary input:
         //   Output-producing MatMul (output is boundary): streamed at k × w.
-        //   Upstream MatMul (output is ephemeral): streamed at K_upstream × k
-        //     where K_upstream = tensor.height = reduction dim of this MatMul.
+        //   Upstream MatMul (output is ephemeral):
+        //     If ephemeral feeds another MatMul (width maps to k): K_upstream × k
+        //     If ephemeral feeds PW→boundary (width maps to w): K_upstream × w
         if (sg.boundary_inputs_.count(rhs)) {
           auto &info = sg.boundary_tensor_info_[ensure(rhs)];
           if (out_is_boundary) {
             info.is_streamed_k_by_w = true;
           } else {
-            info.stream_fixed_by_k = std::max(
-                info.stream_fixed_by_k, prob.tensors[rhs].height);
+            // Ephemeral output — check what its width maps to
+            if (is_ephemeral[out] && eph_sw[out] == SliceW::W_param) {
+              // Ephemeral width maps to w (feeds PW→boundary): K × w per tile
+              info.stream_fixed_by_w = std::max(
+                  info.stream_fixed_by_w, prob.tensors[rhs].height);
+            } else {
+              // Ephemeral width maps to k (feeds MatMul): K × k per k-step
+              info.stream_fixed_by_k = std::max(
+                  info.stream_fixed_by_k, prob.tensors[rhs].height);
+            }
           }
         }
         if (out_is_boundary) {
@@ -460,6 +504,8 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
       max_size = std::max(max_size, cfg.h * cfg.k);
     if (info.stream_fixed_by_k > 0)
       max_size = std::max(max_size, info.stream_fixed_by_k * cfg.k);
+    if (info.stream_fixed_by_w > 0)
+      max_size = std::max(max_size, info.stream_fixed_by_w * cfg.w);
     if (info.is_tile_input)
       max_size = std::max(max_size, cfg.h * cfg.w);
     if (info.is_mm_out)
@@ -578,6 +624,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         stream_load += (double)(cfg.h * cfg.k) / B;
       if (info.stream_fixed_by_k > 0)
         stream_load += (double)(info.stream_fixed_by_k * cfg.k) / B;
+      if (info.stream_fixed_by_w > 0)
+        stream_load += (double)(info.stream_fixed_by_w * cfg.w) / B;
       if (info.is_tile_input)
         tile_load += (double)(cfg.h * cfg.w) / B;
     }

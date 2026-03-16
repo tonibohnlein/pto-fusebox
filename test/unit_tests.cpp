@@ -642,10 +642,8 @@ void test_matmul_pw_fusion_K() {
 
   // With k=1, nk = 256 k-passes
   auto c = sg->compute_cost(N(128, 128, 1));
-  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 256);
-
-  // Compute per step: MatMul = 2000*1/256 per k-step ≈ 7.8125
-  CHECK_EQ("fused comp/step (MM only)", c.compute_per_step, 2000.0 * 1.0 / 256.0);
+  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 1);
+  CHECK_EQ("fused comp/step", c.compute_per_step, 2000.0);
 
   // best_cost should pick k=1 (only valid option)
   auto best = sg->best_cost();

@@ -214,14 +214,21 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                       size_t exclude_step2) {
     for (auto op : proposed_ops) {
         for (auto t : prob.ops[op].outputs) {
-            // T is ephemeral in proposed_ops iff produced AND consumed internally.
-            // External consumers do NOT make T a boundary output.
-            bool consumed_internally = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
-            if (!consumed_internally) continue;
+            // New ephemeral rule: T is ephemeral only if ALL DAG consumers
+            // are inside proposed_ops. If any consumer is external to the
+            // proposed group, T becomes a boundary output (materialized).
+            bool all_consumers_internal = true;
+            bool any_consumer_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (proposed_ops.count(cop))
+                    any_consumer_internal = true;
+                else
+                    all_consumers_internal = false;
+            }
+            if (!any_consumer_internal) continue;  // pure boundary output
+            if (!all_consumers_internal) continue;  // external consumer → boundary output
 
-            // T would be ephemeral. Is it available from some other step?
+            // T would be purely ephemeral. Is it available from some other step?
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
 

@@ -389,21 +389,23 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
-            // T is ephemeral in proposed_ops iff produced AND consumed internally.
-            // External consumers do NOT prevent T from being ephemeral — they are
-            // the partition's concern (recomputation or availability from elsewhere).
-            // (See PROBLEM.md Example 3B: T1 is ephemeral in [0,1] despite Op2 external.)
-            bool consumed_internally = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
-            if (!consumed_internally) continue;  // T is pure boundary output → no gap
+            // Under the new ephemeral rule: T is ephemeral in proposed_ops
+            // iff produced internally AND ALL DAG consumers are internal.
+            // If ANY consumer is external to proposed_ops, T is a boundary
+            // output (materialized) → no gap concern.
+            bool all_consumers_internal = true;
+            bool any_consumer_internal = false;
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (proposed_ops.count(cop))
+                    any_consumer_internal = true;
+                else
+                    all_consumers_internal = false;
+            }
+            if (!any_consumer_internal) continue;  // pure boundary output → no gap
+            if (!all_consumers_internal) continue;  // has external consumer → boundary output
 
-            // T would be ephemeral → never written to slow memory by this group.
-            // Is T available as a boundary output from some other group?
-            // Under the new ephemeral rule: T is ephemeral in gj whenever gj
-            // contains both the producer AND at least one consumer of T.
-            // T is a boundary output of gj only if gj has the producer but
-            // NO internal consumer.
+            // T would be purely ephemeral → never written to slow memory.
+            // Check if T is available as a boundary output from some other group.
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
 
@@ -411,10 +413,12 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             for (auto gj : groups_of((size_t)prod_op)) {
                 if (!groups[gj].alive) continue;
                 if (gj == exclude_ga || gj == exclude_gb) continue;
-                bool gj_consumes = false;
+                // T is a boundary output of gj if gj produces T and
+                // NOT all of T's consumers are in gj (new ephemeral rule).
+                bool all_in_gj = true;
                 for (auto cop : dag->tensor_consumers[t])
-                    if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available_from_other = true; break; }
+                    if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available_from_other = true; break; }
             }
             if (available_from_other) continue;
 
@@ -441,10 +445,16 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
-            bool consumed_internally = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (proposed_ops.count(cop)) { consumed_internally = true; break; }
-            if (!consumed_internally) continue;
+            bool all_consumers_internal = true;
+            bool any_consumer_internal = false;
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (proposed_ops.count(cop))
+                    any_consumer_internal = true;
+                else
+                    all_consumers_internal = false;
+            }
+            if (!any_consumer_internal) continue;
+            if (!all_consumers_internal) continue;  // external consumer → boundary output
 
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
@@ -452,10 +462,10 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
             bool available_from_other = false;
             for (auto gj : groups_of((size_t)prod_op)) {
                 if (!groups[gj].alive || excluded.count(gj)) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag->tensor_consumers[t])
-                    if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available_from_other = true; break; }
+                    if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available_from_other = true; break; }
             }
             if (available_from_other) continue;
 
@@ -493,33 +503,42 @@ bool Partition::split_creates_ephemeral_gap(
 
         for (auto op : comp) {
             for (auto t : prob->ops[op].outputs) {
-                bool consumed_in_comp = false;
-                for (auto cop : dag->tensor_consumers[t])
-                    if (comp.count(cop)) { consumed_in_comp = true; break; }
-                if (!consumed_in_comp) continue;
+                // New ephemeral rule: T is ephemeral only if ALL DAG
+                // consumers are inside this component.
+                bool all_consumers_in_comp = true;
+                bool any_consumer_in_comp = false;
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (comp.count(cop))
+                        any_consumer_in_comp = true;
+                    else
+                        all_consumers_in_comp = false;
+                }
+                if (!any_consumer_in_comp) continue;
+                if (!all_consumers_in_comp) continue;  // external → boundary output
 
                 int prod_op = dag->tensor_producer[t];
                 if (prod_op < 0) continue;
 
                 bool t_available = false;
 
-                // Check sibling components
+                // Check sibling components: T is boundary output of cj if
+                // cj has the producer and NOT all consumers are in cj.
                 for (size_t cj = 0; cj < components.size() && !t_available; cj++) {
                     if (cj == ci) continue;
                     if (!components[cj].count((size_t)prod_op)) continue;
-                    bool cj_consumes = false;
+                    bool all_in_cj = true;
                     for (auto cop : dag->tensor_consumers[t])
-                        if (components[cj].count(cop)) { cj_consumes = true; break; }
-                    if (!cj_consumes) t_available = true;
+                        if (!components[cj].count(cop)) { all_in_cj = false; break; }
+                    if (!all_in_cj) t_available = true;
                 }
                 // Check existing non-excluded groups
                 for (auto gj : groups_of((size_t)prod_op)) {
                     if (t_available) break;
                     if (!groups[gj].alive || excluded.count(gj)) continue;
-                    bool gj_consumes = false;
+                    bool all_in_gj = true;
                     for (auto cop : dag->tensor_consumers[t])
-                        if (groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                    if (!gj_consumes) t_available = true;
+                        if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                    if (!all_in_gj) t_available = true;
                 }
 
                 if (t_available) continue;
