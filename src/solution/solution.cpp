@@ -67,9 +67,7 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         const Subgraph& sg = *g.sg;
 
         // Build retain_these: only boundary OUTPUTS of this step that the next
-        // step needs as input. No pass-through of boundary inputs — the organizer
-        // confirmed: "To keep a tensor alive for step k+2, step k+1 would need
-        // to also produce it."
+        // step needs as input.
         std::set<size_t> retain_these;
         if (i + 1 < res.order.size()) {
             size_t next_gi = res.order[i + 1];
@@ -83,23 +81,37 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
             }
         }
 
-        // Attempt 1: full retention context
+        // Standalone baseline: no entering, no retain (= partition cost)
+        CostResult baseline;
+        baseline.feasible = (g.cost < 1e17);
+        baseline.latency  = g.cost;
+        baseline.config   = g.best_cfg;
+
+        // Attempt 1: full retention context (entering + retain)
         auto cost = sg.best_cost(entering, retain_these);
 
-        // Attempt 2: drop retain_these, keep entering
-        if (!cost.feasible) {
-            retain_these.clear();
-            cost = sg.best_cost(entering, {});
+        // Attempt 2: keep entering, drop retain
+        if (!cost.feasible || cost.latency > baseline.latency) {
+            auto cost2 = sg.best_cost(entering, {});
+            if (cost2.feasible && (!cost.feasible || cost2.latency < cost.latency)) {
+                cost = cost2;
+                retain_these.clear();
+            }
         }
 
-        // Attempt 3: clear everything, use cached no-retain baseline
-        if (!cost.feasible) {
-            entering.clear();
+        // Attempt 3: compare against standalone baseline.
+        // If retention/entering made things worse, use the standalone config.
+        if (cost.feasible && baseline.feasible && baseline.latency < cost.latency) {
+            cost = baseline;
             retain_these.clear();
-            // Use the stored baseline to avoid a full best_cost() enumeration
-            cost.feasible = (g.cost < 1e17);
-            cost.latency  = g.cost;
-            cost.config   = g.best_cfg;
+            entering.clear();
+        }
+
+        // Attempt 4: nothing feasible with entering — fall back to standalone
+        if (!cost.feasible && baseline.feasible) {
+            cost = baseline;
+            retain_these.clear();
+            entering.clear();
         }
 
         steps.push_back({Subgraph(sg), cost.config, retain_these});
@@ -128,12 +140,28 @@ Solution Solution::from_partition(const Problem& prob, const DAG& dag,
     auto dfs_steps  = steps_from_ordering(prob, dag, part, dfs_res);
     auto beam_steps = steps_from_ordering(prob, dag, part, beam_res);
 
+    // No-retention baseline: DFS order, each step uses standalone best_cost.
+    // Guarantees solution cost ≤ partition cost.
+    std::vector<ScheduleStep> bare_steps;
+    bare_steps.reserve(dfs_res.order.size());
+    for (size_t gi : dfs_res.order) {
+        const auto& g = part.groups[gi];
+        if (!g.sg) continue;
+        bare_steps.push_back({Subgraph(*g.sg), g.best_cfg, {}});
+    }
+
     Solution dfs_sol (prob, dag, std::move(dfs_steps));
     Solution beam_sol(prob, dag, std::move(beam_steps));
+    Solution bare_sol(prob, dag, std::move(bare_steps));
 
-    return (beam_sol.total_latency() < dfs_sol.total_latency() - 0.01)
-           ? std::move(beam_sol)
-           : std::move(dfs_sol);
+    // Pick the best valid solution
+    Solution* best = &bare_sol;
+    if (dfs_sol.validate().valid && dfs_sol.total_latency() < best->total_latency() - 0.01)
+        best = &dfs_sol;
+    if (beam_sol.validate().valid && beam_sol.total_latency() < best->total_latency() - 0.01)
+        best = &beam_sol;
+
+    return std::move(*best);
 }
 
 // ============================================================================

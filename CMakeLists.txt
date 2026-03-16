@@ -37,8 +37,8 @@ target_link_libraries(solver_lib Threads::Threads)
 add_executable(mlsys src/pipeline/main.cpp)
 target_link_libraries(mlsys solver_lib Threads::Threads)
 
-add_executable(partition_app src/pipeline/partition_app.cpp)
-target_link_libraries(partition_app solver_lib Threads::Threads)
+add_executable(evaluate src/pipeline/evaluate.cpp)
+target_link_libraries(evaluate solver_lib Threads::Threads)
 
 # --- Tests ---
 enable_testing()
