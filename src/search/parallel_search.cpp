@@ -428,12 +428,10 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     origin = "mutate(" + std::to_string(num_muts) + ")";
                 }
 
-                // Refine: greedy + FM
-                if (partition_has_gap(child)) {
-                    // Safety: mutation/crossover should not create gaps under new rule,
-                    // but partition_has_gap is cheap enough as a guard.
-                    std::cerr << "WARNING: gap after mutation/crossover\n";
-                }
+                // Skip if mutation/crossover created an ephemeral gap.
+                // With recomputation, a tensor can be ephemeral in all groups
+                // that produce it, leaving external consumers stranded.
+                if (partition_has_gap(child)) continue;
                 double after_mutate = child.total_cost();
                 child = greedy_descent(std::move(child));
                 double after_greedy = child.total_cost();

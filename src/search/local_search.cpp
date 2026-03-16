@@ -99,6 +99,38 @@ static bool boundary_inputs_unavailable(const Partition& p,
     return false;
 }
 
+// Check if removing op from group_ops would create topological straddling:
+// op has both predecessors AND successors in the remainder. If so, the
+// remainder must execute both before AND after the removed op → group-DAG cycle.
+static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
+                                const DAG& dag) {
+    bool has_pred = false, has_succ = false;
+    for (auto p : dag.op_preds[op])
+        if (p != op && group_ops.count(p)) { has_pred = true; break; }
+    if (!has_pred) return false;
+    for (auto s : dag.op_succs[op])
+        if (s != op && group_ops.count(s)) { has_succ = true; break; }
+    return has_succ;
+}
+
+static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
+                                      const std::set<size_t>& side_b,
+                                      const DAG& dag) {
+    bool a_to_b = false, b_to_a = false;
+    for (auto u : side_a) {
+        if (a_to_b) break;
+        for (auto v : dag.op_succs[u])
+            if (side_b.count(v)) { a_to_b = true; break; }
+    }
+    if (!a_to_b) return false;
+    for (auto u : side_b) {
+        if (b_to_a) break;
+        for (auto v : dag.op_succs[u])
+            if (side_a.count(v)) { b_to_a = true; break; }
+    }
+    return b_to_a;
+}
+
 // ============================================================================
 // Move generation (positive-saving only)
 // ============================================================================
@@ -148,9 +180,9 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 // Evaluate new_gi cost once — shared by STEAL and RECOMPUTE.
                 double new_gi_cost = part.eval_set(new_gi);
                 if (new_gi_cost < 1e17) {
-                    // STEAL: adj_op leaves gj. Gap check: both the expanded gi
-                    // and the shrunk gj may create ephemeral tensors.
-                    {
+                    // STEAL: adj_op leaves gj. 
+                    // Straddling: adj_op has preds AND succs in gj → cycle
+                    if (!creates_topo_cycle(adj_op, part.groups[gj].ops, *part.dag)) {
                         std::set<size_t> new_gj = part.groups[gj].ops;
                         new_gj.erase(adj_op);
                         std::vector<std::set<size_t>> components = {new_gi};
@@ -195,10 +227,11 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
     if (part.groups[gi].ops.size() >= 2) {
         auto ejectable = part.ejectable_ops(gi);
         for (auto op : ejectable) {
+            // Straddling check: op has preds AND succs in group → cycle
+            if (creates_topo_cycle(op, part.groups[gi].ops, *part.dag)) continue;
             auto er = part.eval_eject(op, gi);
             if (!er.feasible) continue;
 
-            // Gap check: would the split components strand any consumer?
             std::vector<std::set<size_t>> components = er.remainder_components;
             bool op_in_other = false;
             for (auto gj : part.groups_of(op))
@@ -219,6 +252,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             Move best;
             best.saving = -floor;
 
+            if (!creates_topo_cycle(op, part.groups[gi].ops, *part.dag)) {
             auto er = part.eval_eject(op, gi);
             if (er.feasible) {
                 std::vector<std::set<size_t>> components = er.remainder_components;
@@ -230,6 +264,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 if (!part.split_creates_ephemeral_gap(components, gi))
                     try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
             }
+            }
 
             for (auto v : part.dag->op_neighbors[op]) {
                 if (!part.groups[gi].ops.count(v)) continue;
@@ -237,7 +272,8 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 size_t u_hi = std::max(op, v);
                 auto sr = part.eval_split(u_lo, u_hi, gi);
                 if (sr.feasible) {
-                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gi))
+                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gi) &&
+                        !split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
                     {
                         Move m;
                         m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
@@ -325,6 +361,8 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             break;
         }
         case Move::STEAL: {
+            // Straddling re-check
+            if (creates_topo_cycle(m.op, part.groups[m.gb].ops, *part.dag)) return {};
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
 
@@ -397,14 +435,13 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         }
         case Move::EJECT:
         case Move::INTERNAL_EJECT: {
+            // Straddling re-check
+            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible || er.saving < -0.001) return {};
 
-            // Ephemeral gap check: splitting the group may make a tensor
-            // ephemeral in a remainder component, stranding external consumers.
             {
                 std::vector<std::set<size_t>> components = er.remainder_components;
-                // Add singleton if it will become a new group
                 bool op_in_other = false;
                 for (auto gj : part.groups_of(m.op))
                     if (gj != m.ga) { op_in_other = true; break; }
@@ -437,7 +474,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible || sr.saving < -0.001) return {};
 
-            // Ephemeral gap check on the two halves.
+            // Topo cycle + ephemeral gap checks on the two halves.
+            if (split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
+                return {};
             if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, m.ga))
                 return {};
 
@@ -554,35 +593,73 @@ Partition greedy_descent(Partition part) {
 // redundant groups during search. partition_has_gap remains for debug.
 
 // ============================================================================
-// Quick full gap check (debug validation)
+// Quick full gap + cycle check
+//
+// Returns true if ANY ephemeral gap exists OR the group DAG has a cycle.
+// O(groups * tensors) — use for validation, not hot path.
 // ============================================================================
 
 bool partition_has_gap(const Partition& part) {
     if (!part.prob || !part.dag) return false;
 
-    // Collect all boundary outputs across alive groups
-    std::set<size_t> all_boundary_outputs;
-    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+    size_t ng = part.groups.size();
+
+    // Build Subgraphs for all alive groups (once)
+    std::vector<std::optional<Subgraph>> sgs(ng);
+    for (size_t gi = 0; gi < ng; gi++) {
         if (!part.groups[gi].alive) continue;
-        auto sg = Subgraph::create(*part.prob, *part.dag,
+        sgs[gi] = Subgraph::create(*part.prob, *part.dag,
                       std::vector<size_t>(part.groups[gi].ops.begin(),
                                           part.groups[gi].ops.end()));
-        if (sg) for (auto t : sg->boundary_outputs())
-            all_boundary_outputs.insert(t);
     }
 
-    // Check every group's boundary inputs
-    for (size_t gi = 0; gi < part.groups.size(); gi++) {
-        if (!part.groups[gi].alive) continue;
-        auto sg = Subgraph::create(*part.prob, *part.dag,
-                      std::vector<size_t>(part.groups[gi].ops.begin(),
-                                          part.groups[gi].ops.end()));
-        if (!sg) continue;
-        for (auto t : sg->boundary_inputs()) {
+    // --- Gap check: every boundary input must be available as a boundary output ---
+    std::set<size_t> all_boundary_outputs;
+    for (size_t gi = 0; gi < ng; gi++)
+        if (sgs[gi])
+            for (auto t : sgs[gi]->boundary_outputs())
+                all_boundary_outputs.insert(t);
+
+    for (size_t gi = 0; gi < ng; gi++) {
+        if (!sgs[gi]) continue;
+        for (auto t : sgs[gi]->boundary_inputs()) {
             if (part.dag->tensor_producer[t] < 0) continue;
             if (!all_boundary_outputs.count(t)) return true;
         }
     }
+
+    // --- Cycle check: build temporary group DAG, run Kahn's algorithm ---
+    // Only add edges where tensor is a boundary output of the source group.
+    std::vector<std::set<size_t>> tmp_succs(ng);
+    std::vector<int> tmp_in_deg(ng, 0);
+
+    for (size_t i = 0; i < ng; i++) {
+        if (!part.groups[i].alive || !sgs[i]) continue;
+        for (auto t : sgs[i]->boundary_inputs()) {
+            int prod_op = part.dag->tensor_producer[t];
+            if (prod_op < 0) continue;
+            for (auto gj : part.groups_of((size_t)prod_op)) {
+                if (!part.groups[gj].alive || gj == i) continue;
+                if (!sgs[gj] || !sgs[gj]->boundary_outputs().count(t)) continue;
+                if (tmp_succs[gj].insert(i).second)
+                    tmp_in_deg[i]++;
+            }
+        }
+    }
+
+    std::vector<size_t> q;
+    size_t visited = 0;
+    for (size_t i = 0; i < ng; i++)
+        if (part.groups[i].alive && tmp_in_deg[i] == 0) q.push_back(i);
+    size_t qi = 0;
+    while (qi < q.size()) {
+        size_t u = q[qi++];
+        visited++;
+        for (auto v : tmp_succs[u])
+            if (--tmp_in_deg[v] == 0) q.push_back(v);
+    }
+    if (visited < part.num_alive()) return true;  // cycle!
+
     return false;
 }
 

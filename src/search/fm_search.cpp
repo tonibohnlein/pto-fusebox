@@ -103,6 +103,39 @@ static bool boundary_inputs_unavailable(const Partition& p,
     return false;
 }
 
+// Check if removing op from group_ops would create topological straddling:
+// op has both predecessors AND successors in the remainder. If so, the
+// remainder must execute both before AND after the removed op → group-DAG cycle.
+static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
+                                const DAG& dag) {
+    bool has_pred = false, has_succ = false;
+    for (auto p : dag.op_preds[op])
+        if (p != op && group_ops.count(p)) { has_pred = true; break; }
+    if (!has_pred) return false;
+    for (auto s : dag.op_succs[op])
+        if (s != op && group_ops.count(s)) { has_succ = true; break; }
+    return has_succ;
+}
+
+// Check if splitting into side_a and side_b creates a bidirectional dependency.
+static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
+                                      const std::set<size_t>& side_b,
+                                      const DAG& dag) {
+    bool a_to_b = false, b_to_a = false;
+    for (auto u : side_a) {
+        if (a_to_b) break;
+        for (auto v : dag.op_succs[u])
+            if (side_b.count(v)) { a_to_b = true; break; }
+    }
+    if (!a_to_b) return false;
+    for (auto u : side_b) {
+        if (b_to_a) break;
+        for (auto v : dag.op_succs[u])
+            if (side_a.count(v)) { b_to_a = true; break; }
+    }
+    return b_to_a;
+}
+
 // ============================================================================
 // best_move_for: evaluate all candidate moves for op x
 // ============================================================================
@@ -162,7 +195,9 @@ FMMove best_move_for(const Partition& part, size_t op,
 
                 if (new_gy_cost < 1e17) {
                     // STEAL: op leaves gx, joins gy.
-                    if (!inline_gap_check(part, new_gy, gx, gy) &&
+                    // Straddling check: op has preds AND succs in gx\{op} → cycle
+                    if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag) &&
+                        !inline_gap_check(part, new_gy, gx, gy) &&
                         !boundary_inputs_unavailable(part, new_gy)) {
                         std::set<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
@@ -197,6 +232,8 @@ FMMove best_move_for(const Partition& part, size_t op,
         }  // end for gy
 
         // --- Eject: remove op from gx (one per gx, not per gy) ---
+        // Straddling check first: op has preds AND succs in remainder → cycle
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving)) {
             std::vector<std::set<size_t>> components = er.remainder_components;
@@ -206,6 +243,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!op_in_other) components.push_back({op});
             if (!part.split_creates_ephemeral_gap(components, gx))
                 best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+        }
         }
     }  // end for gx
 
@@ -217,6 +255,8 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
         // INTERNAL_EJECT: remove op, remainder may split into components
+        // Straddling check: op has preds AND succs in group → cycle
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving)) {
             std::vector<std::set<size_t>> components = er.remainder_components;
@@ -232,11 +272,9 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (candidate.saving > best.saving) best = candidate;
             }
         }
+        }
 
         // SPLIT at each bridge edge incident to op.
-        // Use op_neighbors (DAG + co-consumer edges) so co-consumer bridges
-        // are also proposed, not just directed op_succs/op_preds edges.
-        // Canonicalise as (lo, hi) to avoid evaluating the same edge twice.
         {
             std::set<std::pair<size_t,size_t>> split_checked;
             for (auto v : part.dag->op_neighbors[op]) {
@@ -245,7 +283,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (!split_checked.insert(edge).second) continue;
                 auto sr = part.eval_split(edge.first, edge.second, gx);
                 if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gx))
+                    if (!part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gx) &&
+                        !split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
                         best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
                 }
             }
@@ -465,6 +504,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     switch (m.type) {
         case FMMove::STEAL: {
+            // Straddling re-check at apply time
+            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
             // Remove op from ga, add to gb
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.erase(m.op);
@@ -533,6 +574,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::EJECT: {
+            // Straddling re-check at apply time
+            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
@@ -575,6 +618,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::INTERNAL_EJECT: {
+            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
@@ -616,6 +660,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible) return {};
+            if (split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag)) return {};
             if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, m.ga))
                 return {};
 

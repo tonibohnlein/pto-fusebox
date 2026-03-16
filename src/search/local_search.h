@@ -52,17 +52,11 @@ Partition greedy_descent(Partition part);
 Partition local_search(const Problem& prob, const DAG& dag);
 
 // ============================================================================
-// Post-search cleanup utilities (also used by parallel_search, fm_outer)
+// Post-search validation (debug only)
 // ============================================================================
 
-// Remove groups where every op is covered by another alive group
-// and removal doesn't create an ephemeral gap.
-void cleanup_redundant_recomputation(Partition& part);
-
-// Fix any remaining ephemeral gaps by ejecting producer ops into singletons.
-// Safety net — with correct gap checks during search, should be a no-op.
-void repair_ephemeral_gaps(Partition& part);
-
-// Quick full gap check: returns true if ANY ephemeral gap exists.
-// O(groups * tensors) — use for validation, not hot path.
+// Quick full gap check: returns true if ANY ephemeral gap exists
+// OR the group DAG has a cycle. Builds fresh Subgraphs for all groups
+// and runs Kahn's algorithm on the resulting group DAG.
+// O(groups * tensors) — used as post-move safety check.
 bool partition_has_gap(const Partition& part);
