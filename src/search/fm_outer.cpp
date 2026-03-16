@@ -64,36 +64,22 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         }
 
         if (pass_result.best_cost < result.best_cost - 0.001) {
-            // Repair any gaps the FM pass may have introduced
-            cleanup_redundant_recomputation(pass_result.best_partition);
-            repair_ephemeral_gaps(pass_result.best_partition);
-            pass_result.best_cost = pass_result.best_partition.total_cost();
+            // FM improved directly — cool down (narrow search near this basin)
+            double improvement = result.best_cost - pass_result.best_cost;
+            result.best_cost = pass_result.best_cost;
+            result.best_partition = std::move(pass_result.best_partition);
+            result.improving_passes++;
+            no_improve = 0;
+            heat = std::clamp(heat * heat_down, heat_min, heat_max);
 
-            if (pass_result.best_cost < result.best_cost - 0.001) {
-                // FM improved directly — cool down (narrow search near this basin)
-                double improvement = result.best_cost - pass_result.best_cost;
-                result.best_cost = pass_result.best_cost;
-                result.best_partition = std::move(pass_result.best_partition);
-                result.improving_passes++;
-                no_improve = 0;
-                heat = std::clamp(heat * heat_down, heat_min, heat_max);
-
-                if (g_verbose) std::cerr << "    FM pass " << pass << ": improved to "
-                          << result.best_cost << " (delta=" << improvement
-                          << " temp=" << temperature << " heat=" << heat << ")\n";
-            } else {
-                // Repair negated the improvement
-                no_improve++;
-                heat = std::clamp(heat * heat_up, heat_min, heat_max);
-                if (no_improve >= cfg.max_no_improve) break;
-            }
+            if (g_verbose) std::cerr << "    FM pass " << pass << ": improved to "
+                      << result.best_cost << " (delta=" << improvement
+                      << " temp=" << temperature << " heat=" << heat << ")\n";
         } else {
             // FM didn't improve. Try greedy-kick on the perturbed end state.
             bool kicked = false;
             if (pass_result.moves_applied > 0) {
                 auto greedy_kick = greedy_descent(std::move(pass_result.end_partition));
-                cleanup_redundant_recomputation(greedy_kick);
-                repair_ephemeral_gaps(greedy_kick);
                 if (greedy_kick.total_cost() < result.best_cost - 0.001) {
                     double improvement = result.best_cost - greedy_kick.total_cost();
                     result.best_cost = greedy_kick.total_cost();

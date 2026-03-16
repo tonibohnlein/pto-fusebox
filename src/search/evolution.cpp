@@ -14,19 +14,23 @@ static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop)) any_internal = true;
+                else all_internal = false;
+            }
+            if (!any_internal) continue;
+            if (!all_internal) continue;
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
             for (auto cop : dag.tensor_consumers[t]) {
@@ -48,19 +52,23 @@ static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& m
     const DAG& dag = *p.dag;
     for (auto op : merged) {
         for (auto t : prob.ops[op].outputs) {
-            bool consumed_in = false;
-            for (auto cop : dag.tensor_consumers[t])
-                if (merged.count(cop)) { consumed_in = true; break; }
-            if (!consumed_in) continue;
+            bool all_internal = true;
+            bool any_internal = false;
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (merged.count(cop)) any_internal = true;
+                else all_internal = false;
+            }
+            if (!any_internal) continue;
+            if (!all_internal) continue;
             int prod_op = dag.tensor_producer[t];
             if (prod_op < 0) continue;
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod_op)) {
                 if (!p.groups[gj].alive || excl.count(gj)) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (available) continue;
             for (auto cop : dag.tensor_consumers[t]) {
@@ -87,10 +95,10 @@ static bool boundary_inputs_unavailable(const Partition& p,
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod)) {
                 if (!p.groups[gj].alive) continue;
-                bool gj_consumes = false;
+                bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
-                    if (p.groups[gj].ops.count(cop)) { gj_consumes = true; break; }
-                if (!gj_consumes) { available = true; break; }
+                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
+                if (!all_in_gj) { available = true; break; }
             }
             if (!available) return true;
         }
@@ -708,18 +716,14 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         auto would_gap = [&](const std::set<size_t>& proposed, size_t excl_gi) -> bool {
             if (inline_gap_check(child, proposed, excl_gi, SIZE_MAX)) return true;
             if (boundary_inputs_unavailable(child, proposed)) return true;
-            // Extra crossover check: unassigned ops that consume an ephemeral tensor
-            for (auto op : proposed) {
-                for (auto t : prob.ops[op].outputs) {
-                    bool consumed_in = false;
-                    for (auto cop : dag.tensor_consumers[t])
-                        if (proposed.count(cop)) { consumed_in = true; break; }
-                    if (!consumed_in) continue;
-                    for (auto cop : dag.tensor_consumers[t])
-                        if (!proposed.count(cop) && child.groups_of(cop).empty())
-                            return true;
-                }
-            }
+            // Extra crossover check: unassigned ops that consume a purely-ephemeral tensor.
+            // Under new rule: T is ephemeral only if ALL consumers are in proposed.
+            // If an unassigned op consumes T and T is ephemeral (all consumers in proposed),
+            // that's impossible — the unassigned op IS an external consumer, so T wouldn't
+            // be ephemeral. The check simplifies: if all consumers are in proposed, no
+            // unassigned op can consume T. If any consumer is unassigned, T has an external
+            // consumer → boundary output → no gap.
+            // So this extra check is no longer needed under the new rule.
             return false;
         };
 
