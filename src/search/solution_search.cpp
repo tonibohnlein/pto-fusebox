@@ -1788,8 +1788,9 @@ static SolutionFMPassResult solution_fm_outer(const Problem &prob, const DAG &da
     // The FM pass may have drifted to a worse state that has a different
     // local basin — greedy descent finds the bottom of that basin.
     if (pr.moves_applied > 0 && Clock::now() < base_cfg.deadline) {
+      auto end_copy = pr.end_steps;  // preserve end state for diversity
       auto descended = solution_greedy_descent(prob, dag,
-          std::move(pr.end_steps), base_cfg.deadline, fr);
+          std::move(end_copy), base_cfg.deadline, fr);
       Solution desc_sol(prob, dag, descended);
       if (desc_sol.total_latency() < pr.best_cost - 0.01) {
         pr.best_cost = desc_sol.total_latency();
@@ -2649,13 +2650,20 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                         }
                     }
 
-                    // Also insert perturbed end state for diversity.
-                    // FM explored this neighborhood but didn't find it best —
-                    // it may seed useful crossover/mutation from a different basin.
-                    if (pr.end_cost < 1e17 && pr.end_cost > pr.best_cost + 0.01) {
-                        Solution end_sol(prob, dag, pr.end_steps);
-                        if (end_sol.validate().valid)
-                            pool_insert(end_sol.steps(), end_sol.total_latency());
+                    // Greedy-kick on the perturbed end state — may escape to a
+                    // different basin than what FM found as best.
+                    if (pr.end_cost < 1e17 && pr.moves_applied > 0 &&
+                        Clock::now() < cfg.deadline) {
+                        auto kicked = solution_greedy_descent(
+                            prob, dag, std::move(pr.end_steps), cfg.deadline, &fr);
+                        Solution kick_sol(prob, dag, kicked);
+                        if (kick_sol.validate().valid) {
+                            pool_insert(kick_sol.steps(), kick_sol.total_latency());
+                            if (kick_sol.total_latency() < thread_best_cost - 0.01) {
+                                thread_best_cost = kick_sol.total_latency();
+                                improved = true;
+                            }
+                        }
                     }
                 }
 
