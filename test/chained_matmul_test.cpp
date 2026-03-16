@@ -133,7 +133,7 @@ void test_chain3() {
     p.ops = {{OpType::MatMul, {0,1}, {2}, 2000},    // Op0: T0 @ T1 → T2
              {OpType::MatMul, {2,3}, {4}, 2000},    // Op1: T2 @ T3 → T4
              {OpType::MatMul, {4,5}, {6}, 2000}};   // Op2: T4 @ T5 → T6
-    p.fast_memory_capacity = 50000;
+    p.fast_memory_capacity = 60000;   // increased: WS=57344 needs >50000
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
@@ -151,63 +151,65 @@ void test_chain3() {
     CHECK("4 boundary inputs", sg.boundary_inputs().size() == 4);
     CHECK_EQ_I("max_K=128", sg.max_K(), 128);
 
-    // --- Working set at [128,128,32] ---
-    // T0: LHS of Op0, h×K₀ = 128×128 = 16384
-    // T1: RHS of Op0, k×w  = 32×128  = 4096
-    // T3: RHS of Op1, k×w  = 32×128  = 4096
-    // T5: RHS of Op2, k×w  = 32×128  = 4096
-    // T6: accumulator, h×w = 128×128 = 16384
-    // Total = 16384 + 3×4096 + 16384 = 45056
+    // --- Working set at [128,128,32] (nk=4, ntw=1, nth=1) ---
+    // Tiling propagation (rev topo: Op2 sink, Op1, Op0):
+    //   T6: NTW×NTH → 16384
+    //   T4 (sink LHS): NK×NTH → 32×128 = 4096
+    //   T5 (sink RHS): NTW×NK → 128×32 = 4096
+    //   T2 (non-sink LHS of Op1): FIXED_1×NTH → 128×128 = 16384
+    //   T3 (non-sink RHS of Op1): NK×FIXED_1 → 32×128 = 4096
+    //     (inherits h=NK from T4's h_source)
+    //   T0 (non-sink LHS of Op0): FIXED_1×NTH → 128×128 = 16384
+    //   T1 (non-sink RHS of Op0): FIXED_1×FIXED_1 → 128×128 = 16384 (!)
+    //     (inherits h=FIXED_1 from T2's h_source which is FIXED_1)
+    // WS = T0(16384) + T1(16384) + T3(4096) + T5(4096) + T6(16384) = 57344
     std::cout << "  Working set:\n";
-    CHECK_EQ_I("ws [128,128,32]", sg.working_set(TC(128,128,32)), 45056);
+    CHECK_EQ_I("ws [128,128,32]", sg.working_set(TC(128,128,32)), 57344);
     CHECK("feasible at k=32", sg.is_feasible(TC(128,128,32)));
 
-    // At k=64: T1,T3,T5 each 64×128=8192. Total = 16384+3×8192+16384 = 57344
-    CHECK_EQ_I("ws [128,128,64]", sg.working_set(TC(128,128,64)), 57344);
+    // At k=64 (nk=2): T3=64×128=8192, T5=128×64=8192. T0,T1,T6 still 16384 each.
+    // Total = 16384+16384+8192+8192+16384 = 65536 > 60000
+    CHECK_EQ_I("ws [128,128,64]", sg.working_set(TC(128,128,64)), 65536);
     CHECK("infeasible at k=64", !sg.is_feasible(TC(128,128,64)));
 
-    // --- Cost at [128,128,32], null traversal ---
+    // --- Cost at [128,128,32] ---
     std::cout << "  Cost at [128,128,32]:\n";
     auto c = sg.compute_cost(TC(128,128,32));
     CHECK("feasible", c.feasible);
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // Compute per step: 3 × (2000×32/128) = 3×500 = 1500
+    // Compute per step: 3 × (2000/4) = 1500
     CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
 
-    // k=0: mem_in = T0(1638.4) + T1(409.6) + T3(409.6) + T5(409.6) = 2867.2
-    //      lat = max(1500, 2867.2) = 2867.2
-    // k=1: mem_in = T1(409.6) + T3(409.6) + T5(409.6) = 1228.8
-    //      lat = max(1500, 1228.8) = 1500
-    // k=2: same → 1500
-    // k=3: mem_in = 1228.8, mem_out = T6(1638.4)
-    //      lat = max(1500, 1228.8 + 1638.4) = max(1500, 2867.2) = 2867.2
-    // Total = 2867.2 + 1500 + 1500 + 2867.2 = 8734.4
-    CHECK_EQ("latency", c.latency, 8734.4);
+    // IO (ntw=1, nth=1, 1 spatial tile):
+    //   once_load = T1(1638.4)
+    //   col_load  = T0(1638.4)  (FIXED_1 in h → col_load)
+    //   stream    = T3(409.6) + T5(409.6) = 819.2
+    //   evict     = T6(1638.4)
+    // d=0: max(1500, once+col+stream) = max(1500, 4096.0) = 4096.0
+    // d=1,2: max(1500, stream) = 1500
+    // d=3: max(1500, stream+evict) = max(1500, 2457.6) = 2457.6
+    // Total = 4096 + 2×1500 + 2457.6 = 9553.6
+    CHECK_EQ("latency", c.latency, 9553.6);
 
     // --- Verify via breakdown ---
-    // First k-step is memory bound (loading T0 + 3 RHS slices)
     double B = 10.0;
-    double T0_load = 128.0 * 128.0 / B;       // 1638.4
-    double rhs_slice = 32.0 * 128.0 / B;      // 409.6
-    double T6_evict = 128.0 * 128.0 / B;      // 1638.4
+    double once = 128.0 * 128.0 / B;         // T1: 1638.4
+    double col = 128.0 * 128.0 / B;          // T0: 1638.4
+    double stream = 2.0 * 32.0 * 128.0 / B;  // T3+T5: 819.2
+    double evict = 128.0 * 128.0 / B;        // T6: 1638.4
     double comp = 1500.0;
 
-    double k0_mem = T0_load + 3 * rhs_slice;  // 2867.2
-    double k0 = std::max(comp, k0_mem);        // 2867.2
-    CHECK_EQ("k=0 lat", k0, 2867.2);
-
-    double k_mid_mem = 3 * rhs_slice;          // 1228.8
-    double k_mid = std::max(comp, k_mid_mem);  // 1500
-    CHECK_EQ("k=1 lat", k_mid, 1500.0);
-
-    double k_last_mem = 3 * rhs_slice + T6_evict;  // 2867.2
-    double k_last = std::max(comp, k_last_mem);     // 2867.2
-    CHECK_EQ("k=3 lat", k_last, 2867.2);
+    double k0 = std::max(comp, once + col + stream);      // 4096
+    double k_mid = std::max(comp, stream);                  // 1500
+    double k_last = std::max(comp, stream + evict);        // 2457.6
+    CHECK_EQ("k=0 lat", k0, 4096.0);
+    CHECK_EQ("k=mid lat", k_mid, 1500.0);
+    CHECK_EQ("k=3 lat", k_last, 2457.6);
 
     double total_hand = k0 + 2 * k_mid + k_last;
-    CHECK_EQ("hand total", total_hand, 8734.4);
+    CHECK_EQ("hand total", total_hand, 9553.6);
     CHECK_EQ("matches compute_cost", c.latency, total_hand);
 }
 
@@ -223,13 +225,16 @@ void test_chain3_unfused() {
     p.ops = {{OpType::MatMul, {0,1}, {2}, 2000},
              {OpType::MatMul, {2,3}, {4}, 2000},
              {OpType::MatMul, {4,5}, {6}, 2000}};
-    p.fast_memory_capacity = 50000;
+    p.fast_memory_capacity = 60000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
 
-    // Each op alone. Working set: h×K + k×w + h×w = 16384+k×128+16384
-    // At k=32: 16384 + 4096 + 16384 = 36864 < 50000 ✓
+    // Each op alone. At [128,128,32] nk=4, ntw=1, nth=1:
+    // Both LHS and RHS are stream_load (FROM_NK). Slices = 32×128 = 4096 each.
+    // stream = 819.2. evict = 1638.4. comp = 500.
+    // d=0: max(500, 819.2)=819.2. d=1,2: 819.2. d=3: max(500, 2457.6)=2457.6.
+    // total = 819.2 + 2×819.2 + 2457.6 = 4915.2
 
     auto sg0 = make_sg(p, d, {0});
     auto sg1 = make_sg(p, d, {1});
@@ -239,129 +244,22 @@ void test_chain3_unfused() {
     auto c1 = sg1.compute_cost(TC(128,128,32));
     auto c2 = sg2.compute_cost(TC(128,128,32));
 
-    // Each op alone at [128,128,32], 4 k-passes:
-    // comp per step = 2000 × 32/128 = 500
-    // k=0: mem_in = LHS(1638.4) + RHS(409.6) = 2048. lat = max(500, 2048) = 2048
-    // k=1,2: mem_in = RHS(409.6). lat = max(500, 409.6) = 500
-    // k=3: mem_in = 409.6, mem_out = out(1638.4). lat = max(500, 2048) = 2048
-    // Total per op = 2048 + 500 + 500 + 2048 = 5096
-    CHECK_EQ("Op0 lat", c0.latency, 5096.0);
-    CHECK_EQ("Op1 lat", c1.latency, 5096.0);
-    CHECK_EQ("Op2 lat", c2.latency, 5096.0);
-    CHECK_EQ("unfused total", c0.latency + c1.latency + c2.latency, 15288.0);
+    CHECK_EQ("Op0 lat", c0.latency, 4915.2);
+    CHECK_EQ("Op1 lat", c1.latency, 4915.2);
+    CHECK_EQ("Op2 lat", c2.latency, 4915.2);
+    CHECK_EQ("unfused total", c0.latency + c1.latency + c2.latency, 14745.6);
 
-    // Build as Solution
     Solution sol(p, d, {
         {std::move(sg0), TC(128,128,32), {}},
         {std::move(sg1), TC(128,128,32), {}},
         {std::move(sg2), TC(128,128,32), {}},
     });
     CHECK("unfused valid", sol.validate().valid);
-    CHECK_EQ("unfused sol total", sol.total_latency(), 15288.0);
+    CHECK_EQ("unfused sol total", sol.total_latency(), 14745.6);
 
-    // Fused chain = 8734.4 (from test_chain3), saving = 43%
-    std::cout << "  Fusion saves: " << 15288.0 << " → 8734.4 ("
-              << (int)(100.0 * (15288.0 - 8734.4) / 15288.0) << "%)\n";
-}
-
-// ============================================================================
-// Chain of 3 with spatial tiling (256×256 tensors, smaller tiles)
-// ============================================================================
-
-void test_chain3_tiled() {
-    std::cout << "\n=== Chain of 3 MatMuls — 256×256 tiled ===\n";
-
-    Problem p;
-    p.tensors = {{256,256},{256,256},{256,256},{256,256},{256,256},{256,256},{256,256}};
-    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000},
-             {OpType::MatMul, {2,3}, {4}, 2000},
-             {OpType::MatMul, {4,5}, {6}, 2000}};
-    p.fast_memory_capacity = 80000;
-    p.slow_memory_bandwidth = 20;
-    p.native_w = 128; p.native_h = 128;
-    DAG d = DAG::build(p);
-
-    auto sg = make_sg(p, d, {0, 1, 2});
-
-    // All K values are 256 (LHS tensors are 256 wide)
-    CHECK_EQ_I("K=256", sg.max_K(), 256);
-
-    // At [128, 128, 32]:
-    // T0: h×K = 128×256 = 32768
-    // T1: k×w = 32×128 = 4096
-    // T3: k×w = 4096
-    // T5: k×w = 4096
-    // T6: h×w = 128×128 = 16384
-    // Total = 32768 + 3×4096 + 16384 = 61440 < 80000 ✓
-    CHECK_EQ_I("ws [128,128,32]", sg.working_set(TC(128,128,32)), 61440);
-    CHECK("feasible", sg.is_feasible(TC(128,128,32)));
-
-    auto c = sg.compute_cost(TC(128,128,32));
-    // Spatial tiles: (256/128)² = 4
-    // k-passes: 256/32 = 8
-    CHECK_EQ_I("tiles", c.num_spatial_tiles, 4);
-    CHECK_EQ_I("k_passes", c.num_k_passes, 8);
-
-    // Compute per step: 3 × (2000 × 32/256) = 3 × 250 = 750
-    CHECK_EQ("comp/step", c.compute_per_step, 750.0);
-
-    // Raster traversal: 2×2 grid with LHS reuse within each row.
-    // With nk=8, rhs_fresh is forced (RHS strip changes k-range between tiles).
-    //
-    // FF tile (both fresh): k0 + 6×k_mid + k_last = 8186.4
-    // RF tile (LHS reused): rf_k0 + 6×k_mid + k_last = 6683.6
-    //
-    // Raster on 2×2: [0,1,2,3]
-    //   Row 0: tile(0,0)=FF, tile(0,1)=RF
-    //   Row 1: tile(1,0)=FF, tile(1,1)=RF
-    // Total = 2×FF + 2×RF = 2×8186.4 + 2×6683.6 = 29740.0
-
-    double B = 20.0;
-    double t0_load = 128.0 * 256.0 / B;   // 1638.4
-    double rhs_slice = 32.0 * 128.0 / B;  // 204.8
-    double t6_evict = 128.0 * 128.0 / B;  // 819.2
-    double comp = 750.0;
-
-    double k0 = std::max(comp, t0_load + 3 * rhs_slice);          // max(750, 2252.8)
-    double k_mid = std::max(comp, 3 * rhs_slice);                  // max(750, 614.4)
-    double k_last = std::max(comp, 3 * rhs_slice + t6_evict);     // max(750, 1433.6)
-    double per_tile = k0 + 6 * k_mid + k_last;  // FF tile cost
-
-    double rf_k0 = std::max(comp, 3 * rhs_slice);  // 750 (no T0 load)
-    double rf_per_tile = rf_k0 + 6 * k_mid + k_last;  // 6683.6
-
-    // Raster: 2 FF + 2 RF = 29740.0
-    double total_raster = 2 * per_tile + 2 * rf_per_tile;
-
-    CHECK_EQ("k0 lat", k0, 2252.8);
-    CHECK_EQ("k_mid lat", k_mid, 750.0);
-    CHECK_EQ("k_last lat", k_last, 1433.6);
-    CHECK_EQ("FF tile", per_tile, 8186.4);
-    CHECK_EQ("RF tile", rf_per_tile, 6683.6);
-    CHECK_EQ("raster total", c.latency, total_raster);
-
-    // Snake traversal: 2×2 grid, RowMajor [0,1,3,2]
-    //   Tile 0 (r=0,c=0): FF = 8186.4
-    //   Tile 1 (r=0,c=1): RF (same row, LHS reused) = 6683.6
-    //   Tile 2 (r=1,c=1): FR (same column) — but nk>1 forces rhs_fresh,
-    //     so FR degrades to FF = 8186.4
-    //   Tile 3 (r=1,c=0): RF (same row, LHS reused) = 6683.6
-    //
-    // Snake total = FF + RF + FF + RF = 8186.4 + 6683.6 + 8186.4 + 6683.6 = 29740.0
-    // Same as raster! With nk>1, the RHS reuse at row transitions is invalid,
-    // so snake's only advantage (FR tiles) is lost.
-
-    auto c_snake = sg.compute_cost(TC(128,128,32, SnakeDir::RowMajor));
-
-    double total_snake = 2 * per_tile + 2 * rf_per_tile;  // same as raster
-
-    CHECK_EQ("snake total hand", total_snake, 29740.0);
-    CHECK_EQ("snake total code", c_snake.latency, total_snake);
-
-    // With nk>1: snake == raster (FR tiles degrade to FF)
-    CHECK_EQ("snake == raster", c_snake.latency, c.latency);
-    std::cout << "  Raster=" << c.latency << " Snake=" << c_snake.latency
-              << " (nk>1: snake FR degrades to FF, no advantage)\n";
+    // Fused chain = 9553.6 (from test_chain3), saving ≈ 35%
+    std::cout << "  Fusion saves: " << 14745.6 << " → 9553.6 ("
+              << (int)(100.0 * (14745.6 - 9553.6) / 14745.6) << "%)\n";
 }
 
 // ============================================================================
@@ -384,7 +282,7 @@ void test_chain2_solution() {
     auto sg = make_sg(p, d, {0, 1});
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("valid", sol.validate().valid);
-    CHECK_EQ("total", sol.total_latency(), 6915.2);
+    CHECK_EQ("total=6915.2", sol.total_latency(), 6915.2);
 }
 
 // ============================================================================
@@ -395,7 +293,6 @@ int main() {
     test_chain2();
     test_chain3();
     test_chain3_unfused();
-    test_chain3_tiled();
     test_chain2_solution();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "

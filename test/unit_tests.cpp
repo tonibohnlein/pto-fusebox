@@ -197,8 +197,9 @@ void test_create_diamond_fusions() {
   CHECK("T3 boundary out in {0,2}", sg02->boundary_outputs().count(3));
 
   auto sg012 = Subgraph::create(p, d, {0, 1, 2});
-  // {0,1,2} is rejected: T1 is ephemeral but consumed by both Op1 and Op2 (fan-out)
-  CHECK("{0,1,2} rejected (eph fan-out)", !sg012.has_value());
+  // {0,1,2} is valid: T1 has fan-out (consumed by Op1 and Op2) but both
+  // assign compatible tiling (NTW×NTH), so no conflict.
+  CHECK("{0,1,2} valid (compatible fan-out)", sg012.has_value());
 }
 
 void test_create_empty_rejected() {
@@ -223,10 +224,13 @@ void test_ws_matmul() {
   auto p = make_single_mm(256, 100000);
   DAG d = DAG::build(p);
   auto sg = Subgraph::create(p, d, {0});
-  // h*K + k*w + h*w = 128*256 + 128*128 + 128*128
-  CHECK_EQ_I("MM ws [128,128,128]", sg->working_set(N(128, 128, 128)), 65536);
-  CHECK_EQ_I("MM ws [128,128,64]", sg->working_set(N(128, 128, 64)), 57344);
-  CHECK_EQ_I("MM ws [64,64,128]", sg->working_set(N(64, 64, 128)), 28672);
+  // Sink MM: T0→NK×NTH, T1→NTW×NK, T2→NTW×NTH
+  // [128,128,128]: nk=2. All slices 256/2 × 256/2 = 128×128 = 16384. WS=3×16384=49152.
+  CHECK_EQ_I("MM ws [128,128,128]", sg->working_set(N(128, 128, 128)), 49152);
+  // [128,128,64]: nk=4. T0=64×128=8192, T1=128×64=8192, T2=128×128=16384. WS=32768.
+  CHECK_EQ_I("MM ws [128,128,64]", sg->working_set(N(128, 128, 64)), 32768);
+  // [64,64,128]: ntw=4,nth=4,nk=2. T0=128×64=8192, T1=64×128=8192, T2=64×64=4096. WS=20480.
+  CHECK_EQ_I("MM ws [64,64,128]", sg->working_set(N(64, 64, 128)), 20480);
 }
 
 void test_ws_retained() {
@@ -245,27 +249,26 @@ void test_ws_retained() {
   DAG d = DAG::build(p);
   auto sg = Subgraph::create(p, d, {0});
 
-  // Base at [128,128,128]: T0_lhs(128*256=32768) + T1_rhs(128*128=16384) +
-  // T2_out(128*128=16384) = 65536
+  // Base at [128,128,128] nk=2: T0→NK(2)×NTH(2)=16384, T1→NTW(2)×NK(2)=16384,
+  // T2→NTW(2)×NTH(2)=16384. WS=3×16384=49152.
   int64_t base = sg->working_set(N(128, 128, 128));
-  CHECK_EQ_I("base ws", base, 65536);
+  CHECK_EQ_I("base ws", base, 49152);
 
   // Retain T3 (128x128=16384, not a boundary input): adds FULL tensor size
   CHECK_EQ_I("retained adds full size", sg->working_set(N(128, 128, 128), {3}),
              base + 128 * 128);
 
-  // Retain T0 (boundary input, LHS): full size 256×256 = 65536 replaces tile
-  // strip 128×256 = 32768 New ws = 65536 + 16384 + 16384 = 98304 (was 65536
-  // with tile strip)
+  // Retain T0 (boundary input, LHS): full 256×256=65536 replaces slice 16384.
+  // WS = 65536 + 16384 + 16384 = 98304.
   CHECK_EQ_I("retain boundary uses full size",
              sg->working_set(N(128, 128, 128), {0}),
-             256 * 256 + 128 * 128 + 128 * 128);
+             256 * 256 + 16384 + 16384);
 
-  // Retain T1 (boundary input, RHS): full size 256×256 = 65536 replaces tile
-  // strip 128×128 = 16384
+  // Retain T1 (boundary input, RHS): full 65536 replaces slice 16384.
+  // WS = 16384 + 65536 + 16384 = 98304. (same as retaining T0 in this case)
   CHECK_EQ_I("retain RHS uses full size",
              sg->working_set(N(128, 128, 128), {1}),
-             128 * 256 + 256 * 256 + 128 * 128);
+             16384 + 256 * 256 + 16384);
 }
 
 // ==================== Feasibility ====================
@@ -593,16 +596,16 @@ void test_mixed_K() {
   CHECK_EQ_I("Op1 K=128", sg1->op_K(1), 128);
   CHECK_EQ_I("Op1 max_K=128", sg1->max_K(), 128);
 
-  // Working sets use per-op K
-  // Op0 at [128,128,64]: LHS strip h*K_0 = 128*256 = 32768
-  //   RHS strip k*w = 64*128 = 8192. Output 128*128 = 16384.
-  //   Total = 57344
-  CHECK_EQ_I("Op0 ws [128,128,64]", sg0->working_set(N(128, 128, 64)), 57344);
+  // Working sets use tiling propagation.
+  // Op0 alone at [128,128,64]: sink MM with nk=256/64=4.
+  //   T0(LHS)→NK(4)×NTH(1)=64×128=8192. T1(RHS)→NTW(1)×NK(4)=128×64=8192.
+  //   T2(out)→NTW(1)×NTH(1)=128×128=16384. Total=32768.
+  CHECK_EQ_I("Op0 ws [128,128,64]", sg0->working_set(N(128, 128, 64)), 32768);
 
-  // Op1 at [128,128,64]: LHS strip h*K_1 = 128*128 = 16384
-  //   RHS strip k*w = 64*128 = 8192. Output 128*128 = 16384.
-  //   Total = 40960
-  CHECK_EQ_I("Op1 ws [128,128,64]", sg1->working_set(N(128, 128, 64)), 40960);
+  // Op1 alone at [128,128,64]: sink MM with nk=128/64=2.
+  //   T2(LHS)→NK(2)×NTH(1)=64×128=8192. T3(RHS)→NTW(1)×NK(2)=128×64=8192.
+  //   T4(out)→NTW(1)×NTH(1)=128×128=16384. Total=32768.
+  CHECK_EQ_I("Op1 ws [128,128,64]", sg1->working_set(N(128, 128, 64)), 32768);
 
   // Different num_k_passes
   auto c0 = sg0->compute_cost(N(128, 128, 64));
@@ -636,16 +639,17 @@ void test_matmul_pw_fusion_K() {
   CHECK_EQ_I("fused max_K", sg->max_K(), 256);
   CHECK("T2 ephemeral", sg->ephemeral().count(2));
 
-  // PW sink rule: k must be 1
-  CHECK("k=64 rejected (PW sink)", !sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
+  // Reference accepts any k for PW sinks (d_tiles=1 regardless).
+  CHECK("k=64 accepted (PW sink ignores k)", sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
   CHECK("k=1 accepted", sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
 
-  // With k=1, nk = 256 k-passes
+  // With any k, nk = 1 (PW sink → output_K=1)
   auto c = sg->compute_cost(N(128, 128, 1));
   CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 1);
-  CHECK_EQ("fused comp/step", c.compute_per_step, 2000.0);
+  // comp_per_step = (MM:2000 + PW:500) / 1 × scale(1) = 2500
+  CHECK_EQ("fused comp/step", c.compute_per_step, 2500.0);
 
-  // best_cost should pick k=1 (only valid option)
+  // best_cost picks k=1 (our search generates k=1 for PW sinks)
   auto best = sg->best_cost();
   CHECK("best feasible", best.feasible);
   CHECK_EQ_I("best k=1", best.config.k, 1);
@@ -825,16 +829,14 @@ void test_retain_forces_smaller_tiles() {
   auto sg = Subgraph::create(p, d, {0});
 
   // Without retain at [128,128,128]:
-  // ws = 128*256 + 128*128 + 128*128 = 32768+16384+16384 = 65536 <= 70000.
-  // Feasible.
+  // ws = 3×16384 = 49152 <= 70000. Feasible.
   auto c_no = sg->best_cost();
   CHECK("no retain feasible", c_no.feasible);
   std::cout << "    no retain: [" << c_no.config.w << "," << c_no.config.h
             << "," << c_no.config.k << "] lat=" << c_no.latency << "\n";
 
   // With T1 retained from prev: full T1 = 256*256 = 65536.
-  // ws = 65536 + h*256 + h*w + h*w. At h=128,w=128,k=128:
-  // 65536 + 32768 + 16384 + 16384 = 131072 > 70000. Infeasible!
+  // ws = 65536 + T0_slice(16384) + T2_slice(16384) = 98304 > 70000. Infeasible!
   CHECK("retain T1 infeasible at [128,128,128]",
         !sg->is_feasible(N(128, 128, 128), {1}));
 
