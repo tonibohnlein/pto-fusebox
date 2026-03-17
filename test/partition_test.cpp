@@ -433,19 +433,22 @@ void test_eph_chain_no_gap() {
 
 void test_eph_diamond_gap() {
     std::cout << "--- test_eph_diamond_gap ---\n";
-    // Merging {Op0,Op1}: T1 becomes ephemeral. Op2 (external) needs T1, has no other source.
+    // Merging {Op0,Op1}: T1 consumed by Op1 (internal) and Op2 (external).
+    // External consumer → T1 is boundary output, NOT ephemeral. No gap.
     auto p = make_diamond(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
-    CHECK("{0,1} gap for Op2",    part.creates_ephemeral_gap({0,1}, 0, 1));
-    CHECK("{0,2} gap for Op1",    part.creates_ephemeral_gap({0,2}, 0, 2));
+    CHECK("{0,1} no gap (T1 boundary out)", !part.creates_ephemeral_gap({0,1}, 0, 1));
+    CHECK("{0,2} no gap (T1 boundary out)", !part.creates_ephemeral_gap({0,2}, 0, 2));
 }
 
 void test_eph_diamond_full_no_gap() {
     std::cout << "--- test_eph_diamond_full_no_gap ---\n";
     // Merging all four ops: no external consumers exist. No gap possible.
+    // Must use vector overload to exclude all 4 groups.
     auto p = make_diamond(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
-    CHECK("all merged: no gap", !part.creates_ephemeral_gap({0,1,2,3}, 0, 1));
+    CHECK("all merged: no gap",
+          !part.creates_ephemeral_gap({0,1,2,3}, std::vector<size_t>{0,1,2,3}));
 }
 
 void test_eph_recomputation_resolves() {
@@ -485,7 +488,8 @@ void test_eph_vector_overload() {
     bool pair_result   = part.creates_ephemeral_gap({0,1}, 0, 1);
     bool vector_result = part.creates_ephemeral_gap({0,1}, std::vector<size_t>{0,1});
     CHECK("overloads agree", pair_result == vector_result);
-    CHECK("both detect gap", pair_result && vector_result);
+    // Both return false: T1 has external consumer Op2 → boundary output, no gap.
+    CHECK("both detect no gap", !pair_result && !vector_result);
 }
 
 // ============================================================================

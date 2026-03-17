@@ -22,36 +22,22 @@ static void CHECK(const char* l, bool c) {
     if (c) g_pass++; else { g_fail++; std::cout << "  FAIL: " << l << "\n"; }
 }
 
-// Tile-by-tile simulation for verification
+// Tile-by-tile simulation for verification.
+// With tiling propagation: sink MM at nk>1 has both LHS and RHS as stream_load.
+// They reload every d-step, no position-based reuse across tiles.
 static double simulate(int ntw, int nth, int nk,
                 double mm_comp, double pw_comp,
-                double lhs_load, double rhs_load, double out_evict,
-                SnakeDir snake, bool lhs_retained) {
+                double stream_load, double out_evict,
+                SnakeDir snake, bool lhs_retained, double lhs_stream) {
     auto tiles = make_traversal(ntw, nth, snake);
     double total = 0;
-    int pr = -1, pc = -1;
     for (int tp = 0; tp < (int)tiles.size(); tp++) {
-        int r = tiles[tp] / ntw, c = tiles[tp] % ntw;
-        bool lf, rf;
-        if (snake == SnakeDir::None) {
-            // Raster: LHS reuse within rows, RHS always fresh
-            lf = (tp == 0 || r != pr);
-            rf = true;
-        } else if (tp == 0) {
-            lf = true; rf = true;
-        } else {
-            lf = (r != pr); rf = (c != pc);
-            if (nk > 1) rf = true;  // nk>1 kills RHS reuse at column transitions
-        }
         for (int ks = 0; ks < nk; ks++) {
-            double mi = 0;
-            if (ks == 0) { if (lf && !lhs_retained) mi += lhs_load; if (rf) mi += rhs_load; }
-            else { mi += rhs_load; }
+            double mi = lhs_retained ? (stream_load - lhs_stream) : stream_load;
             double mo = (ks == nk - 1) ? out_evict : 0;
-            double sc = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
+            double sc = mm_comp + pw_comp;  // all ops every d-step
             total += std::max(sc, mi + mo);
         }
-        pr = r; pc = c;
     }
     return total;
 }
@@ -70,12 +56,13 @@ void test_retain_ws_matmul_lhs() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // No retain: ws = h*K + k*w + h*w = 128*256 + 128*128 + 128*128 = 65536
-    CHECK_EQ_I("no ret ws", sg->compute_cost({128,128,128,SnakeDir::None}).working_set, 65536);
-    // T0 retained: ws = full(65536) + k*w(16384) + h*w(16384) = 98304
+    // No retain: nk=2, ntw=2, nth=2. All slices 128×128=16384. WS=49152.
+    CHECK_EQ_I("no ret ws", sg->compute_cost({128,128,128,SnakeDir::None}).working_set, 49152);
+    // T0 retained: full(65536) + T1_slice(16384) + T2_slice(16384) = 98304
     CHECK_EQ_I("ret T0 ws", sg->compute_cost({128,128,128,SnakeDir::None},{0}).working_set, 98304);
-    // T1 retained: ws = h*K(32768) + full(65536) + h*w(16384) = 114688 > 100000
-    CHECK("ret T1 infeasible", !sg->compute_cost({128,128,128,SnakeDir::None},{1}).feasible);
+    // T1 retained: T0_slice(16384) + full(65536) + T2_slice(16384) = 98304
+    // 98304 < 100000 → feasible
+    CHECK("ret T1 feasible", sg->compute_cost({128,128,128,SnakeDir::None},{1}).feasible);
 }
 
 void test_retain_ws_pw() {
@@ -149,13 +136,13 @@ void test_retain_transfer_lhs() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // No retain, raster: 2×FF + 2×RF (LHS reuse within rows)
-    //   FF: max(1000,4915.2) + max(1000,3276.8) = 8192
-    //   RF: max(1000,1638.4) + max(1000,3276.8) = 4915.2
-    //   Total: 2×8192 + 2×4915.2 = 26214.4
-    CHECK_EQ("no ret lat", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 26214.4);
-    // T0 retained: LHS free → FF=RF. Each = max(1000,1638.4)+max(1000,3276.8) = 4915.2
-    //   Total: 4×4915.2 = 19660.8
+    // No retain, raster: nk=2. Both LHS and RHS are stream_load (NK×NTH, NTW×NK).
+    // Every tile: d=0: max(1000, stream(3276.8))=3276.8. d=1: max(1000, stream(3276.8)+evict(1638.4))=4915.2.
+    // Per tile = 8192. Total = 4 × 8192 = 32768.
+    CHECK_EQ("no ret lat", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 32768.0);
+    // T0 retained: T0 not loaded. stream = T1 only = 1638.4.
+    // d=0: max(1000, 1638.4) = 1638.4. d=1: max(1000, 1638.4+1638.4) = 3276.8.
+    // Per tile = 4915.2. Total = 4 × 4915.2 = 19660.8.
     CHECK_EQ("ret T0 lat", sg->compute_cost({128,128,128,SnakeDir::None},{0}).latency, 19660.8);
 }
 
@@ -225,14 +212,14 @@ void test_retain_fused_mm_pw_k1() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("has_pw_sink", sg.has_value());
 
-    // k>1 must be rejected (PW sink rule)
-    CHECK("k=32 rejected", !sg->is_valid_tiling({128,128,32,SnakeDir::None}));
-    CHECK("k=128 rejected", !sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+    // Reference accepts any k for PW sinks (nk=1 regardless)
+    CHECK("k=32 accepted", sg->is_valid_tiling({128,128,32,SnakeDir::None}));
+    CHECK("k=128 accepted", sg->is_valid_tiling({128,128,128,SnakeDir::None}));
 
-    // k=1 must be accepted
+    // k=1 also accepted
     CHECK("k=1 accepted", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
 
-    // best_cost should pick k=1
+    // best_cost picks k=1 (our search generates k=1 for PW sinks)
     auto best = sg->best_cost();
     CHECK("best feasible", best.feasible);
     CHECK("best k=1", best.config.k == 1);
@@ -253,21 +240,27 @@ void test_snake_3x2_no_retain() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // ff: k0=max(2500,4915.2)=4915.2, k1=max(2500,3276.8)=3276.8 → 8192
-    // rf: k0=max(2500,1638.4)=2500, k1=3276.8 → 5776.8
-    // fr: nk=2 → rhs_fresh → fr degrades to ff = 8192
-    double ff=8192, rf=5776.8;
+    // With tiling propagation: sink MM at nk=2.
+    // T0(LHS)→NK(2)×NTH(2)=stream, T1(RHS)→NTW(3)×NK(2)=stream.
+    // Both stream → reload every tile. No traversal reuse at all.
+    // Per tile: d=0: max(2500, stream(3276.8+1638.4))=4915.2.
+    //           d=1: max(2500, stream(4915.2)+evict(1638.4))=6553.6.
+    //           = 11468.8? No wait...
+    // Actually: stream per d-step = (128*256/nk + 384*128/nk) / B
+    //   T0 slice: 256/2 × 256/2 = 128×128 = 16384 → 1638.4
+    //   T1 slice: 384/3 × 256/2 = 128×128 = 16384 → 1638.4
+    //   evict T2: 384/3 × 256/2 = 128×128 = 16384 → 1638.4
+    // d=0: max(2500, 1638.4+1638.4) = max(2500, 3276.8) = 3276.8
+    // d=1: max(2500, 3276.8+1638.4) = max(2500, 4915.2) = 4915.2
+    // per tile = 8192. 6 tiles × 8192 = 49152.
+    double all_same = 49152.0;
 
-    // Raster (None): 3×2 grid, LHS reuse within rows.
-    //   Row 0: FF,RF,RF. Row 1: FF,RF,RF. = 2×FF + 4×RF
-    CHECK_EQ("None", sg->compute_cost({128,128,128,SnakeDir::None}).latency, 2*ff+4*rf);
-    // RM: [0,1,2,5,4,3]. FF,RF,RF,FF(was FR, nk>1),RF,RF = 2×FF + 4×RF (same as raster)
-    CHECK_EQ("RM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency, 2*ff+4*rf);
-    // CM: [0,3,4,1,2,5]. FF,FF(was FR),RF,FF(was FR),RF,FF(was FR) = 4×FF + 2×RF
-    CHECK_EQ("CM", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency, 4*ff+2*rf);
-    // RM < CM (nk>1: FR→FF kills CM's advantage; RM has more LHS reuses)
-    CHECK("RM < CM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency <
-                      sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency);
+    CHECK_EQ("None", sg->compute_cost({128,128,128,SnakeDir::None}).latency, all_same);
+    CHECK_EQ("RM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency, all_same);
+    CHECK_EQ("CM", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency, all_same);
+    // All equal (stream_load → no traversal reuse)
+    CHECK("RM == CM", std::abs(sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency -
+                                sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency) < 0.1);
 }
 
 void test_snake_3x2_lhs_retained() {
@@ -325,27 +318,22 @@ void test_snake_3x2_membound_no_retain() {
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
 
-    // ff: k0=max(250,4915.2)=4915.2, k1=3276.8 → 8192
-    // rf: k0=max(250,1638.4)=1638.4, k1=3276.8 → 4915.2
-    // fr: nk=2 → degrades to ff = 8192
-    double ff=8192, rf=4915.2;
+    // Stream_load for both LHS and RHS (nk=2). No traversal reuse.
+    // Per tile: d=0: max(250, 3276.8)=3276.8. d=1: max(250, 3276.8+1638.4)=4915.2.
+    // = 8192 per tile. 6 tiles = 49152.
+    double all_same = 49152.0;
 
-    // RM: 2×FF+4×RF (same as raster with nk>1)
-    CHECK_EQ("RM nret", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency,
-             2*ff+4*rf);
-    // CM: 4×FF+2×RF
-    CHECK_EQ("CM nret", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency,
-             4*ff+2*rf);
-    // RM wins: more LHS reuse tiles
-    CHECK("RM < CM", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency <
-                     sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency);
+    CHECK_EQ("RM nret", sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency, all_same);
+    CHECK_EQ("CM nret", sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency, all_same);
+    // All equal
+    CHECK("RM == CM", std::abs(sg->compute_cost({128,128,128,SnakeDir::RowMajor}).latency -
+                               sg->compute_cost({128,128,128,SnakeDir::ColMajor}).latency) < 0.1);
 }
 
 void test_snake_retain_preference_flip() {
     std::cout << "--- test_snake_retain_preference_flip ---\n";
-    // Without retain: RowMajor wins (more LHS reuse from wide grid)
-    // With LHS retained + nk>1: all tiles same (LHS free, RHS reuse killed by nk>1)
-    //   → CM == RM. The original "flip" only happens with nk=1.
+    // With tiling propagation at nk>1: both LHS and RHS are stream_load.
+    // No traversal reuse → all modes equal, with or without retain.
     Problem p;
     p.tensors = {{256,256},{384,256},{384,256}};
     p.ops = {{OpType::MatMul,{0,1},{2},500}};
@@ -360,8 +348,7 @@ void test_snake_retain_preference_flip() {
     auto rm_ret = sg->compute_cost({128,128,128,SnakeDir::RowMajor},{0}).latency;
     auto cm_ret = sg->compute_cost({128,128,128,SnakeDir::ColMajor},{0}).latency;
 
-    CHECK("no ret: RM wins", rm_nret < cm_nret);
-    // With retain + nk>1: CM == RM (FR→FF kills RHS reuse advantage)
+    CHECK("no ret: RM == CM", std::abs(rm_nret - cm_nret) < 0.1);
     CHECK("ret: CM == RM", std::abs(cm_ret - rm_ret) < 0.1);
     std::cout << "  no_ret: RM=" << rm_nret << " CM=" << cm_nret
               << " | ret: RM=" << rm_ret << " CM=" << cm_ret << "\n";
@@ -371,7 +358,6 @@ void test_snake_retain_preference_flip() {
 
 void test_simulation_matches_code() {
     std::cout << "--- test_simulation_matches_code ---\n";
-    // Run simulation for all 8 combinations and verify code matches
     Problem p;
     p.tensors = {{256,256},{384,256},{384,256}};
     p.ops = {{OpType::MatMul,{0,1},{2},500}};
@@ -382,12 +368,17 @@ void test_simulation_matches_code() {
     auto sg = Subgraph::create(p, d, {0});
 
     int ntw=3, nth=2, nk=2;
-    double B=10, mm=500.0*128/256, pw=0;
-    double lhs=128.0*256/B, rhs=128.0*128/B, out=128.0*128/B;
+    double B=10;
+    // comp_per_step = base_cost / nk = 500/2 = 250
+    double mm=250.0, pw=0;
+    // stream = T0_slice + T1_slice = (128*128 + 128*128) / B = 3276.8
+    double stream = (128.0*128 + 128.0*128) / B;
+    double lhs_stream = 128.0*128/B;  // T0 slice alone
+    double out = 128.0*128/B;
 
     for (auto snake : {SnakeDir::None, SnakeDir::RowMajor, SnakeDir::ColMajor}) {
         for (bool ret : {false, true}) {
-            double sim = simulate(ntw,nth,nk,mm,pw,lhs,rhs,out,snake,ret);
+            double sim = simulate(ntw,nth,nk,mm,pw,stream,out,snake,ret,lhs_stream);
             auto code = ret ? sg->compute_cost({128,128,128,snake},{0})
                             : sg->compute_cost({128,128,128,snake});
             const char* sn = snake==SnakeDir::None?"None":snake==SnakeDir::RowMajor?"RM":"CM";

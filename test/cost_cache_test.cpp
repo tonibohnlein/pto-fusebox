@@ -115,11 +115,12 @@ void test_different_sets() {
 
 void test_memory_infeasible_cached() {
     std::cout << "--- test_memory_infeasible_cached ---\n";
-    // 1024×1024 MatMul with cap=100 — working set >> capacity.
+    // 1024×1024 MatMul with cap=2 — even at [1,1,1], WS=3 > 2.
+    // (With tiling propagation, [1,1,1] gives three 1×1 slices.)
     Problem p;
     p.tensors = {{1024,1024},{1024,1024},{1024,1024}};
     p.ops = {{OpType::MatMul,{0,1},{2},5000}};
-    p.fast_memory_capacity = 100;
+    p.fast_memory_capacity = 2;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
@@ -171,7 +172,8 @@ void test_disconnected_cached() {
 void test_ephemeral_fanout_cached() {
     std::cout << "--- test_ephemeral_fanout_cached ---\n";
     // Diamond: T0→Op0→T1, T1→Op1→T2, T1→Op2→T3, T2+T3→Op3→T4.
-    // {0,1,2}: T1 has 2 internal consumers → Subgraph::create rejects it.
+    // {0,1,2}: T1 has 2 internal consumers. With tiling propagation,
+    // both assign compatible NTW×NTH tiling → subgraph IS valid.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::Pointwise,{0},{1},1000},
@@ -185,15 +187,15 @@ void test_ephemeral_fanout_cached() {
     CostCache cache;
 
     double c = cache.evaluate({0,1,2}, p, d);
-    CHECK("fan-out → 1e18", c >= 1e17);
+    CHECK("fan-out feasible (compatible tiling)", c < 1e17);
     CHECK_EQ_S("1 entry", cache.size(), 1);
 
-    // Valid subsets must still work.
+    // Valid subsets also work.
     CHECK("{0,1} feasible", cache.evaluate({0,1}, p, d) < 1e17);
     CHECK("{0,2} feasible", cache.evaluate({0,2}, p, d) < 1e17);
     CHECK_EQ_S("3 entries", cache.size(), 3);
 
-    // Fan-out entry still cached (not evicted by new inserts).
+    // Fan-out entry still cached.
     size_t m = cache.misses();
     cache.evaluate({0,1,2}, p, d);
     CHECK_EQ_S("fan-out still cached", cache.misses(), m);
