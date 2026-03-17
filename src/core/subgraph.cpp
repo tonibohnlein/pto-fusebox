@@ -827,8 +827,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
                      (double)n_within * within;
   } else { // ColMajor
     double first = tile_cost(true, true, true);          // first tile
-    double col_trans = tile_cost(false, true, false);     // col change, row reused
-    double within = tile_cost(false, false, true);        // row change
+    double col_trans = tile_cost(false, false, true);     // col change, row reused
+    double within = tile_cost(false, true, false);        // row change
     int n_col_trans = num_tw - 1;
     int n_within = (num_th - 1) * num_tw;
     result.latency = first +

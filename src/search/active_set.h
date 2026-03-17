@@ -1,21 +1,18 @@
 #pragma once
 
 #include "search/fm_search.h"
-#include <vector>
+#include "util/pairing_heap.h"
 #include <set>
 #include <optional>
 
 // ============================================================================
-// ActiveSet: indexed container of (op, best_move) entries for FM search.
+// ActiveSet: PairingHeap-backed container of (op, best_move) for FM search.
 //
 // Supports:
-//   - Activate: add an op with its computed best move
-//   - Pop best: find the unlocked op with highest saving, lock it
-//   - Update: recompute best moves for ops in affected groups
-//   - Activate neighbors: add new border ops from affected groups
-//
-// Implementation: flat vector with O(N) scan for max. N ≤ 200 ops in
-// practice, so this is faster than a heap with stale-entry management.
+//   - Activate: compute op's best move, insert/update in heap
+//   - Pop best: O(log N) extract-max of unlocked ops
+//   - Lock: prevent op from initiating further moves
+//   - Refresh: recompute moves for ops in affected groups
 // ============================================================================
 
 class ActiveSet {
@@ -23,55 +20,26 @@ public:
     ActiveSet(const Partition& part, double floor);
 
     // --- Activation ---
-
-    // Activate a single op: compute its best move, add to set.
-    // No-op if already active or locked.
     void activate(size_t op);
-
-    // Activate all border ops of a group.
-    void activate_border(size_t gi);
     void activate_group_ops(size_t gi);
 
     // --- Selection ---
-
-    // Pop the unlocked op with the highest saving. Locks it.
-    // Returns nullopt if no unlocked ops remain or all have saving < -floor.
     std::optional<FMMove> pop_best();
-
-    // Explicitly lock an op (prevents it from initiating moves).
-    // Used for merge partner locking.
     void lock(size_t op);
-
-    // --- Update + Activate (combined) ---
-
-    // After a move: recompute best moves for affected ops AND activate new
-    // border ops, in a single pass over affected + adjacent groups.
-    void refresh_after_move(const std::set<size_t>& affected_groups);
-
-    // Lock multiple ops at once (for tensor moves that touch many ops).
     void lock_all(const std::vector<size_t>& ops);
 
-    // --- Queries ---
+    // --- Update ---
+    void refresh_after_move(const std::set<size_t>& affected_groups);
 
-    bool is_active(size_t op) const;
-    bool is_locked(size_t op) const;
-    size_t num_active() const;
-    size_t num_unlocked() const;
+    // --- Queries ---
+    bool is_locked(size_t op) const { return locked_.count(op) > 0; }
     const std::set<size_t>& locked_ops() const { return locked_; }
 
 private:
     const Partition* part_;
     double floor_;
+    PairingHeap<FMMove> heap_;
+    std::set<size_t> locked_;
 
-    struct Entry {
-        size_t op;
-        FMMove move;
-    };
-
-    std::vector<Entry> entries_;
-    std::set<size_t> active_ops_;   // ops currently in the active set
-    std::set<size_t> locked_;       // ops that have been moved (can't initiate)
-
-    // Find groups that an op belongs to or is adjacent to
-    std::set<size_t> op_relevant_groups(size_t op) const;
+    void recompute_and_update(size_t op);
 };

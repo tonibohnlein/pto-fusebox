@@ -1,36 +1,32 @@
 #include "search/active_set.h"
 
 ActiveSet::ActiveSet(const Partition& part, double floor)
-    : part_(&part), floor_(floor) {}
+    : part_(&part), floor_(floor), heap_(part.prob->num_ops()) {}
 
 // ============================================================================
 // Activation
 // ============================================================================
 
-void ActiveSet::activate(size_t op) {
-    if (active_ops_.count(op) || locked_.count(op)) return;
-
+void ActiveSet::recompute_and_update(size_t op) {
+    if (locked_.count(op)) return;
     auto move = best_move_for(*part_, op, floor_, locked_);
-    // Add even if move is invalid — it might become valid after updates
-    active_ops_.insert(op);
-    entries_.push_back({op, move});
+    if (move.valid())
+        heap_.push_or_update(op, move);
+    else
+        heap_.remove(op);
 }
 
-void ActiveSet::activate_border(size_t gi) {
-    if (!part_->groups[gi].alive) return;
-    for (auto op : part_->border_ops(gi))
-        activate(op);
+void ActiveSet::activate(size_t op) {
+    recompute_and_update(op);
 }
 
 void ActiveSet::activate_group_ops(size_t gi) {
     if (!part_->groups[gi].alive) return;
-    // Activate border ops (for merge/steal/recompute/eject)
     for (auto op : part_->border_ops(gi))
-        activate(op);
-    // Also activate internal ops (for internal_eject/split) if group size is 3-15
+        recompute_and_update(op);
     if (part_->groups[gi].ops.size() >= 3 && part_->groups[gi].ops.size() <= 15) {
         for (auto op : part_->internal_ops(gi))
-            activate(op);
+            recompute_and_update(op);
     }
 }
 
@@ -39,48 +35,37 @@ void ActiveSet::activate_group_ops(size_t gi) {
 // ============================================================================
 
 std::optional<FMMove> ActiveSet::pop_best() {
-    int best_idx = -1;
-    double best_saving = -1e18;
-
-    for (size_t i = 0; i < entries_.size(); i++) {
-        auto& e = entries_[i];
-        if (locked_.count(e.op)) continue;
-        if (!e.move.valid()) continue;
-        if (e.move.saving > best_saving) {
-            best_saving = e.move.saving;
-            best_idx = (int)i;
+    // Pop until we find an unlocked op or heap is empty
+    while (!heap_.empty()) {
+        auto m = heap_.pop_best();
+        if (!m) return std::nullopt;
+        if (!locked_.count(m->op)) {
+            locked_.insert(m->op);
+            return m;
         }
+        // Locked op leaked into heap — discard and continue
     }
-
-    if (best_idx < 0) return std::nullopt;
-
-    auto& entry = entries_[best_idx];
-    FMMove result = entry.move;
-    locked_.insert(entry.op);
-    return result;
+    return std::nullopt;
 }
 
 void ActiveSet::lock(size_t op) {
     locked_.insert(op);
+    heap_.remove(op);
+}
+
+void ActiveSet::lock_all(const std::vector<size_t>& ops) {
+    for (auto op : ops) {
+        locked_.insert(op);
+        heap_.remove(op);
+    }
 }
 
 // ============================================================================
 // Update
 // ============================================================================
 
-std::set<size_t> ActiveSet::op_relevant_groups(size_t op) const {
-    std::set<size_t> groups;
-    for (auto gi : part_->groups_of(op))
-        groups.insert(gi);
-    // Also add groups of all neighbors (DAG edges + co-consumers)
-    for (auto nbr : part_->dag->op_neighbors[op])
-        for (auto gi : part_->groups_of(nbr))
-            groups.insert(gi);
-    return groups;
-}
-
 void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
-    // Step 1: Collect the full set of affected + adjacent groups (once)
+    // Collect relevant groups: affected + their adjacents
     std::set<size_t> relevant;
     for (auto gi : affected_groups) {
         relevant.insert(gi);
@@ -90,52 +75,22 @@ void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
         }
     }
 
-    // Step 2: Recompute best moves for active, unlocked ops that touch relevant groups
-    for (auto& entry : entries_) {
-        if (locked_.count(entry.op)) continue;
-
-        auto op_groups = op_relevant_groups(entry.op);
-        bool touches = false;
-        for (auto gi : op_groups) {
-            if (relevant.count(gi)) { touches = true; break; }
-        }
-
-        if (touches) {
-            entry.move = best_move_for(*part_, entry.op, floor_, locked_);
-        }
-    }
-
-    // Step 3: Activate new border/internal ops of relevant groups
+    // Collect all ops in relevant groups + their DAG neighbors
+    std::set<size_t> ops_to_refresh;
     for (auto gi : relevant) {
         if (!part_->groups[gi].alive) continue;
-        activate_group_ops(gi);
+        for (auto op : part_->groups[gi].ops) {
+            ops_to_refresh.insert(op);
+            for (auto nbr : part_->dag->op_neighbors[op])
+                ops_to_refresh.insert(nbr);
+        }
     }
-}
 
-void ActiveSet::lock_all(const std::vector<size_t>& ops) {
-    for (auto op : ops)
-        locked_.insert(op);
-}
+    // Recompute each affected op's best move
+    for (auto op : ops_to_refresh)
+        recompute_and_update(op);
 
-// ============================================================================
-// Queries
-// ============================================================================
-
-bool ActiveSet::is_active(size_t op) const {
-    return active_ops_.count(op) > 0;
-}
-
-bool ActiveSet::is_locked(size_t op) const {
-    return locked_.count(op) > 0;
-}
-
-size_t ActiveSet::num_active() const {
-    return active_ops_.size();
-}
-
-size_t ActiveSet::num_unlocked() const {
-    size_t n = 0;
-    for (auto op : active_ops_)
-        if (!locked_.count(op)) n++;
-    return n;
+    // Activate new border/internal ops of relevant groups
+    for (auto gi : relevant)
+        activate_group_ops(gi);
 }
