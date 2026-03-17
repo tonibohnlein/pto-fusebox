@@ -1984,11 +1984,16 @@ static void recompute_costs(const Problem& prob, const DAG& dag,
                             std::vector<ScheduleStep>& steps) {
     std::set<size_t> entering;
     for (size_t i = 0; i < steps.size(); i++) {
-        // Only boundary OUTPUTS can be retained.
+        // Only boundary OUTPUTS that the NEXT step needs can be retained.
+        // (One-step retention: retain at step i → available at step i+1 only.)
         std::set<size_t> valid_retain;
-        for (auto t : steps[i].retain_these)
-            if (steps[i].subgraph.boundary_outputs().count(t))
+        for (auto t : steps[i].retain_these) {
+            bool is_output = steps[i].subgraph.boundary_outputs().count(t);
+            bool useful_next = (i + 1 < steps.size()) &&
+                               steps[i + 1].subgraph.boundary_inputs().count(t);
+            if (is_output && useful_next)
                 valid_retain.insert(t);
+        }
         steps[i].retain_these = valid_retain;
 
         auto bc = steps[i].subgraph.best_cost(entering, steps[i].retain_these);
