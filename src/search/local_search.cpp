@@ -565,6 +565,7 @@ Partition greedy_descent(Partition part) {
         }
 
         Partition snapshot = part;
+        double total_before = part.total_cost();
         auto dirty = apply_move(part, m);
         if (dirty.empty()) {
             part = std::move(snapshot);
@@ -574,6 +575,23 @@ Partition greedy_descent(Partition part) {
             part = std::move(snapshot);
             continue;
         }
+
+#ifndef NDEBUG
+        {
+            double total_after = part.total_cost();
+            double actual_gain = total_before - total_after;
+            double discrepancy = m.saving - actual_gain;
+            if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m.saving)) + 1.0) {
+                if (g_verbose)
+                    std::cerr << "    GREEDY GAIN MISMATCH: predicted=" << m.saving
+                              << " actual=" << actual_gain
+                              << " Δ=" << discrepancy
+                              << " type=" << (int)m.type
+                              << " ga=" << m.ga << " gb=" << m.gb
+                              << " op=" << m.op << "\n";
+            }
+        }
+#endif
 
         applied++;
         for (auto gi : dirty)

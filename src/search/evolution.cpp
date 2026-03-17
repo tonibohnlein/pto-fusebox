@@ -1,4 +1,5 @@
 #include "search/evolution.h"
+#include "search/verbose.h"
 #include "search/local_search.h"  // partition_has_gap
 #include "search/merkle_hash.h"
 #include <algorithm>
@@ -633,6 +634,22 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
 
         if (part.num_alive() != before_groups || part.total_cost() != before_cost)
             applied++;
+
+#ifndef NDEBUG
+        // Verify cost consistency: each group's stored cost matches eval_set
+        if (g_verbose) {
+            for (size_t gi = 0; gi < part.groups.size(); gi++) {
+                if (!part.groups[gi].alive) continue;
+                double stored = part.groups[gi].cost;
+                double fresh = part.eval_set(part.groups[gi].ops);
+                if (std::abs(stored - fresh) > 0.1 * std::max(1.0, stored) + 1.0) {
+                    std::cerr << "    MUTATE COST INCONSISTENCY: G" << gi
+                              << " stored=" << stored << " eval=" << fresh
+                              << " mutation=" << choice << "\n";
+                }
+            }
+        }
+#endif
     }
     return part;
 }
@@ -764,5 +781,20 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         child.rebuild_index();
     }
     
+#ifndef NDEBUG
+    // Verify cost consistency after crossover
+    if (g_verbose) {
+        for (size_t gi = 0; gi < child.groups.size(); gi++) {
+            if (!child.groups[gi].alive) continue;
+            double stored = child.groups[gi].cost;
+            double fresh = child.eval_set(child.groups[gi].ops);
+            if (std::abs(stored - fresh) > 0.1 * std::max(1.0, stored) + 1.0) {
+                std::cerr << "    CROSSOVER COST INCONSISTENCY: G" << gi
+                          << " stored=" << stored << " eval=" << fresh << "\n";
+            }
+        }
+    }
+#endif
+
     return child;
 }

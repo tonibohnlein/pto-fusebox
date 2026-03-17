@@ -107,6 +107,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
 
         // Apply the move — snapshot for gap-revert
         Partition snapshot = part;
+        double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
             part = std::move(snapshot);
@@ -116,6 +117,23 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             part = std::move(snapshot);
             continue;
         }
+
+#ifndef NDEBUG
+        {
+            double total_after = part.total_cost();
+            double actual_gain = total_before - total_after;
+            double discrepancy = move.saving - actual_gain;
+            if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(move.saving)) + 1.0) {
+                if (g_verbose)
+                    std::cerr << "    FM GAIN MISMATCH: predicted=" << move.saving
+                              << " actual=" << actual_gain
+                              << " Δ=" << discrepancy
+                              << " type=" << (int)move.type
+                              << " op=" << move.op
+                              << " ga=" << move.ga << " gb=" << move.gb << "\n";
+            }
+        }
+#endif
 
         result.moves_applied++;
         if (move.saving > 0.001)
