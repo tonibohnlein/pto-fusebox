@@ -71,6 +71,7 @@ set(TEST_SOURCES
     test/cost_cache_test.cpp
     test/evolution_test.cpp
     test/solution_search_test.cpp
+    test/solution_gain_test.cpp
     test/sanity_test.cpp
     test/partition_fm_test.cpp
     test/more_unit_tests.cpp
