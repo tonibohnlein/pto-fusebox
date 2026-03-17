@@ -2,6 +2,9 @@
 #include "core/cost_cache.h"
 #include <iostream>
 #include <queue>
+#include <functional>
+#include <deque>
+#include <algorithm>
 
 // ============================================================================
 // finalize()
@@ -267,6 +270,133 @@ bool Partition::is_acyclic() const {
         }
     }
     return visited >= num_alive();
+}
+
+// ---------------------------------------------------------------------------
+// Kahn's on a temporary op_to_groups mapping + alive flags.
+// ---------------------------------------------------------------------------
+static bool kahn_with_mapping(
+    const Problem& prob, const DAG& dag,
+    const std::vector<std::vector<size_t>>& op_to_groups,
+    const std::vector<bool>& alive,
+    size_t num_alive_groups)
+{
+    size_t ng = alive.size();
+    std::vector<std::set<size_t>> deps(ng);
+    std::vector<std::vector<std::pair<size_t,size_t>>> frees(ng);
+
+    for (size_t op = 0; op < prob.ops.size(); op++) {
+        for (auto t : prob.ops[op].inputs) {
+            int prod = dag.tensor_producer[t];
+            if (prod < 0) continue;
+            for (auto target_gi : op_to_groups[op]) {
+                if (!alive[target_gi]) continue;
+                // Is producer in target_gi?
+                bool prod_internal = false;
+                for (auto g : op_to_groups[(size_t)prod])
+                    if (g == target_gi) { prod_internal = true; break; }
+                if (prod_internal) continue;
+                // Dependency: target_gi needs prod from outside
+                size_t dep_id = deps[target_gi].size();
+                deps[target_gi].insert(dep_id);
+                for (auto source_gj : op_to_groups[(size_t)prod]) {
+                    if (alive[source_gj])
+                        frees[source_gj].push_back({target_gi, dep_id});
+                }
+            }
+        }
+    }
+
+    std::deque<size_t> q;
+    size_t visited = 0;
+    for (size_t i = 0; i < ng; i++)
+        if (alive[i] && deps[i].empty()) q.push_back(i);
+    while (!q.empty()) {
+        size_t u = q.front(); q.pop_front();
+        visited++;
+        for (auto [gi, dep_id] : frees[u]) {
+            deps[gi].erase(dep_id);
+            if (deps[gi].empty()) q.push_back(gi);
+        }
+    }
+    return visited >= num_alive_groups;
+}
+
+bool Partition::is_acyclic_after_merge(size_t ga, size_t gb) const {
+    if (!prob || !dag) return true;
+    // Build temporary mapping: gb's ops move to ga, gb dies
+    auto tmp = op_to_groups_;
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive && i != gb) { alive[i] = true; na++; }
+
+    for (auto op : groups[gb].ops) {
+        auto& gs = tmp[op];
+        // Remove gb, add ga if not already present
+        gs.erase(std::remove(gs.begin(), gs.end(), gb), gs.end());
+        if (std::find(gs.begin(), gs.end(), ga) == gs.end())
+            gs.push_back(ga);
+    }
+    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+}
+
+bool Partition::is_acyclic_after_merge(const std::vector<size_t>& group_list) const {
+    if (!prob || !dag || group_list.size() < 2) return true;
+    // First group absorbs all, rest die
+    size_t survivor = group_list[0];
+    auto tmp = op_to_groups_;
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    std::set<size_t> killed(group_list.begin() + 1, group_list.end());
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive && !killed.count(i)) { alive[i] = true; na++; }
+
+    for (size_t k = 1; k < group_list.size(); k++) {
+        for (auto op : groups[group_list[k]].ops) {
+            auto& gs = tmp[op];
+            gs.erase(std::remove(gs.begin(), gs.end(), group_list[k]), gs.end());
+            if (std::find(gs.begin(), gs.end(), survivor) == gs.end())
+                gs.push_back(survivor);
+        }
+    }
+    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+}
+
+bool Partition::is_acyclic_after_steal(size_t op, size_t ga, size_t gb) const {
+    if (!prob || !dag) return true;
+    auto tmp = op_to_groups_;
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    auto& gs = tmp[op];
+    // Remove ga, add gb
+    gs.erase(std::remove(gs.begin(), gs.end(), ga), gs.end());
+    if (std::find(gs.begin(), gs.end(), gb) == gs.end())
+        gs.push_back(gb);
+
+    // If ga becomes empty, mark dead
+    if (groups[ga].ops.size() == 1 && groups[ga].ops.count(op)) {
+        alive[ga] = false;
+        na--;
+    }
+    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+}
+
+bool Partition::is_acyclic_after_recompute(size_t op, size_t gb) const {
+    if (!prob || !dag) return true;
+    auto tmp = op_to_groups_;
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    auto& gs = tmp[op];
+    if (std::find(gs.begin(), gs.end(), gb) == gs.end())
+        gs.push_back(gb);
+    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {

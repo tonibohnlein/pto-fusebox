@@ -4,6 +4,7 @@
 #include "core/cost_cache.h"
 #include "search/fm_outer.h"
 #include "util/pairing_heap.h"
+#include <cassert>
 #include <iostream>
 
 // Under the new ephemeral rule, gap checks are unnecessary for acyclicity.
@@ -179,12 +180,13 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
 // ============================================================================
 
 static std::set<size_t> apply_move(Partition& part, const Move& m) {
+    // Moves on the heap are guaranteed feasible (acyclic) by best_move_for_op.
+    // apply_move only re-verifies cost (which may have changed due to
+    // concurrent mutations in the greedy loop).
     std::set<size_t> dirty;
 
     switch (m.type) {
         case Move::MERGE: {
-            if (part.dag->merge_creates_cycle(part.groups[m.ga].ops, part.groups[m.gb].ops))
-                return {};
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(),
                           part.groups[m.gb].ops.end());
@@ -206,8 +208,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             break;
         }
         case Move::STEAL: {
-            if (creates_topo_cycle(m.op, part.groups[m.gb].ops, *part.dag)) return {};
-            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.ga].ops)) return {};
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
             std::set<size_t> new_gb = part.groups[m.gb].ops;
@@ -246,7 +246,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::RECOMPUTE: {
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
-            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.ga].ops)) return {};
             double new_cost = part.eval_set(new_ga);
             double actual_saving = part.groups[m.ga].cost - new_cost;
             if (actual_saving < 0.001) return {};
@@ -262,7 +261,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         }
         case Move::EJECT:
         case Move::INTERNAL_EJECT: {
-            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible || er.saving < 0.001) return {};
 
@@ -288,8 +286,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible || sr.saving < 0.001) return {};
-            if (split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
-                return {};
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);
@@ -320,6 +316,16 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
     }
 
     part.rebuild_index();
+
+#ifndef NDEBUG
+    if (!part.is_acyclic()) {
+        std::cerr << "    ASSERT FAIL: apply_move produced cyclic partition! type="
+                  << (int)m.type << " op=" << m.op
+                  << " ga=" << m.ga << " gb=" << m.gb << "\n";
+        assert(false && "apply_move produced cyclic partition");
+    }
+#endif
+
     return dirty;
 }
 
@@ -394,8 +400,6 @@ static Move best_move_for_op(const Partition& part, size_t op) {
 
     std::set<std::pair<size_t,size_t>> merge_checked;
     for (auto gi : adj_groups) {
-        if (part.dag->merge_creates_cycle({op}, part.groups[gi].ops)) continue;
-
         std::set<size_t> new_gi = part.groups[gi].ops;
         new_gi.insert(op);
         double new_gi_cost = part.eval_set(new_gi);
@@ -405,7 +409,8 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             if (gj == gi || !part.groups[gj].alive) continue;
 
             // STEAL: move op from gj into gi
-            if (!creates_topo_cycle(op, part.groups[gj].ops, dag)) {
+            if (!creates_topo_cycle(op, part.groups[gj].ops, dag) &&
+                part.is_acyclic_after_steal(op, gj, gi)) {
                 std::set<size_t> new_gj = part.groups[gj].ops;
                 new_gj.erase(op);
                 double new_gj_cost = new_gj.empty() ? 0 : part.eval_set(new_gj);
@@ -421,7 +426,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             auto pair_key = std::make_pair(std::min(gi, gj), std::max(gi, gj));
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
-                if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
+                if (part.is_acyclic_after_merge(gi, gj)) {
                     std::set<size_t> merged = part.groups[gi].ops;
                     merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                     double mc = part.eval_set(merged);
@@ -433,7 +438,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
         }
 
         // RECOMPUTE: copy op into gi
-        {
+        if (part.is_acyclic_after_recompute(op, gi)) {
             double rsaving = part.groups[gi].cost - new_gi_cost;
             size_t gb = groups_of_op.empty() ? 0 : groups_of_op[0];
             if (rsaving > best.saving)
@@ -465,24 +470,14 @@ Partition greedy_descent(Partition part) {
         if (!m_opt || m_opt->saving <= 0.001) break;
         Move m = *m_opt;
 
-        // Apply move. Local checks in apply_move should prevent infeasible moves.
-        [[maybe_unused]] double old_total = part.total_cost();
-        Partition snapshot = part;
+        // Apply move — heap guarantees feasibility (acyclicity checked in
+        // best_move_for_op). Cost may have changed, so apply_move re-verifies.
+        double old_total = part.total_cost();
         auto dirty = apply_move(part, m);
         if (dirty.empty()) {
-            part = std::move(snapshot);
+            // Cost no longer favorable — drop, will be re-evaluated if neighbors change
             continue;
         }
-
-#ifndef NDEBUG
-        if (!part.is_acyclic()) {
-            std::cerr << "    BUG: apply_move created infeasible partition! type="
-                      << (int)m.type << " op=" << m.op
-                      << " ga=" << m.ga << " gb=" << m.gb << "\n";
-            part = std::move(snapshot);
-            continue;
-        }
-#endif
 
 #ifndef NDEBUG
         {

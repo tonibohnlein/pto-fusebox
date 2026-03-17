@@ -1,6 +1,5 @@
 #include "search/verbose.h"
 #include "search/fm_pass.h"
-#include "search/local_search.h"  // partition_has_gap
 #include <algorithm>
 #include <iostream>
 
@@ -105,15 +104,12 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
                         extra_locks.push_back(cop);
         }
 
-        // Apply the move — snapshot for gap-revert
+        // Apply the move — apply_fm_move returns empty on infeasibility
+        // (local cycle checks + RECOMPUTE-specific is_acyclic).
         Partition snapshot = part;
         double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
-            part = std::move(snapshot);
-            continue;
-        }
-        if (partition_has_gap(part)) {
             part = std::move(snapshot);
             continue;
         }

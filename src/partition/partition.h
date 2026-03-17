@@ -117,6 +117,25 @@ struct Partition {
     // that's the cost model's job (ephemeral classification at finalization).
     bool is_acyclic() const;
 
+    // Check acyclicity of a hypothetical partition state after a move.
+    // These are called by best_move_for_op / best_move_for to guarantee
+    // that ONLY feasible moves go on the heap.
+    //
+    // Each builds a temporary op→groups mapping reflecting the move, then
+    // runs the reference Kahn's algorithm. O(ops * inputs * groups_per_op).
+
+    // After MERGE: ga absorbs gb's ops, gb dies.
+    bool is_acyclic_after_merge(size_t ga, size_t gb) const;
+
+    // After multi-group MERGE: first group absorbs all, rest die.
+    bool is_acyclic_after_merge(const std::vector<size_t>& group_list) const;
+
+    // After STEAL: op removed from ga, added to gb.
+    bool is_acyclic_after_steal(size_t op, size_t ga, size_t gb) const;
+
+    // After RECOMPUTE: op added to gb (stays in all existing groups too).
+    bool is_acyclic_after_recompute(size_t op, size_t gb) const;
+
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;
