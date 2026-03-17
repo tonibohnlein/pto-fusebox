@@ -223,43 +223,48 @@ bool Partition::is_acyclic() const {
     if (!prob || !dag) return true;
     size_t ng = groups.size();
 
-    // Build Subgraphs for all alive groups
-    std::vector<std::optional<Subgraph>> sgs(ng);
-    for (size_t gi = 0; gi < ng; gi++) {
-        if (!groups[gi].alive) continue;
-        sgs[gi] = Subgraph::create(*prob, *dag,
-                      std::vector<size_t>(groups[gi].ops.begin(),
-                                          groups[gi].ops.end()));
-    }
+    // Reference-style acyclicity check: for each (consumer_op, input_tensor,
+    // producer_op), if producer_op is NOT in the consumer's group, that group
+    // depends on some group containing the producer. Any such group can
+    // satisfy the dependency.
+    //
+    // This checks topological ordering only — not whether tensors are
+    // actually materialized (that's the cost model's job via ephemeral
+    // classification).
 
-    // Build group DAG: edge gj→gi if gi needs a boundary input that gj produces
-    std::vector<int> in_deg(ng, 0);
-    std::vector<std::set<size_t>> succs(ng);
+    std::vector<std::set<size_t>> deps(ng);       // deps[gi] = unsatisfied dep IDs
+    std::vector<std::vector<std::pair<size_t,size_t>>> frees(ng); // frees[gj] = {(gi, dep_id)}
 
-    for (size_t i = 0; i < ng; i++) {
-        if (!groups[i].alive || !sgs[i]) continue;
-        for (auto t : sgs[i]->boundary_inputs()) {
-            int prod_op = dag->tensor_producer[t];
-            if (prod_op < 0) continue;
-            for (auto gj : groups_of((size_t)prod_op)) {
-                if (!groups[gj].alive || gj == i) continue;
-                if (!sgs[gj] || !sgs[gj]->boundary_outputs().count(t)) continue;
-                if (succs[gj].insert(i).second)
-                    in_deg[i]++;
+    for (size_t op = 0; op < prob->ops.size(); op++) {
+        for (auto t : prob->ops[op].inputs) {
+            int prod = dag->tensor_producer[t];
+            if (prod < 0) continue;  // graph input
+            for (auto target_gi : groups_of(op)) {
+                if (!groups[target_gi].alive) continue;
+                if (groups[target_gi].ops.count((size_t)prod)) continue; // internal
+                // target_gi needs prod from outside
+                size_t dep_id = deps[target_gi].size();
+                deps[target_gi].insert(dep_id);
+                for (auto source_gj : groups_of((size_t)prod)) {
+                    if (!groups[source_gj].alive) continue;
+                    frees[source_gj].push_back({target_gi, dep_id});
+                }
             }
         }
     }
 
     // Kahn's algorithm
-    std::vector<size_t> q;
+    std::deque<size_t> q;
+    size_t visited = 0;
     for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive && in_deg[i] == 0) q.push_back(i);
-    size_t visited = 0, qi = 0;
-    while (qi < q.size()) {
-        size_t u = q[qi++];
+        if (groups[i].alive && deps[i].empty()) q.push_back(i);
+    while (!q.empty()) {
+        size_t u = q.front(); q.pop_front();
         visited++;
-        for (auto v : succs[u])
-            if (--in_deg[v] == 0) q.push_back(v);
+        for (auto [gi, dep_id] : frees[u]) {
+            deps[gi].erase(dep_id);
+            if (deps[gi].empty()) q.push_back(gi);
+        }
     }
     return visited >= num_alive();
 }

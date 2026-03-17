@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <iostream>
 
-// Under the new ephemeral rule (tensor ephemeral only if ALL DAG consumers
-// are internal), gap checks are unnecessary. Only acyclicity matters.
+// Under the new ephemeral rule, gap checks are unnecessary for acyclicity.
+// Tensor materialization is handled by the cost model (ephemeral classification
+// at finalization via compute_force_ephemeral / eval_group_in_context).
+// Only topological ordering matters for feasibility.
 
 static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
                                 const DAG& dag) {
@@ -135,7 +137,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                         }
                     }
 
-                    // RECOMPUTE
+                    // RECOMPUTE: copies op into gy, gx keeps it.
                     {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
@@ -521,12 +523,13 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     part.rebuild_index();
 
-#ifndef NDEBUG
+    // Verify the group DAG is still acyclic after the mutation.
+    // RECOMPUTE (copying op into gb while ga keeps it) can create cycles
+    // that local merge_creates_cycle checks don't catch — the cycle is
+    // between ga and the new gb via tensor dependencies through op.
     if (!part.is_acyclic()) {
-        std::cerr << "    BUG: apply_fm_move created cycle! type=" << (int)m.type
-                  << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb << "\n";
+        return {};  // caller reverts via snapshot
     }
-#endif
 
     return affected;
 }

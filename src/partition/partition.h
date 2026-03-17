@@ -108,9 +108,13 @@ struct Partition {
     // scheduled[i] == true means group i has already been placed in the order.
     bool future_needs(size_t t, const std::vector<bool>& scheduled) const;
 
-    // Check if the group DAG is acyclic. Builds boundary tensors for all alive
-    // groups, constructs the group-level DAG, runs Kahn's algorithm.
-    // O(groups * tensors). Used for validation and debug assertions.
+    // Check if the group DAG has a valid topological ordering.
+    // Uses the reference approach: for each (consumer_op, input_tensor,
+    // producer_op), if the producer is not in the consumer's group, that
+    // group depends on any group containing the producer. Kahn's algorithm
+    // verifies all dependencies can be resolved.
+    // O(ops * inputs * groups). Does NOT check tensor materialization —
+    // that's the cost model's job (ephemeral classification at finalization).
     bool is_acyclic() const;
 
     // --- Evaluation ---

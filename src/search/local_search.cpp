@@ -6,10 +6,9 @@
 #include "util/pairing_heap.h"
 #include <iostream>
 
-// Under the new ephemeral rule (tensor ephemeral only if ALL DAG consumers
-// are internal), gap checks are unnecessary: any tensor needed by another
-// group automatically has an external consumer → boundary output → available.
-// Only acyclicity of the group DAG matters.
+// Under the new ephemeral rule, gap checks are unnecessary for acyclicity.
+// Tensor materialization is the cost model's job (at finalization via
+// compute_force_ephemeral / eval_group_in_context).
 
 // Check if removing op from group_ops would create topological straddling:
 // op has both predecessors AND successors in the remainder. If so, the
@@ -321,14 +320,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
     }
 
     part.rebuild_index();
-
-#ifndef NDEBUG
-    if (!part.is_acyclic()) {
-        std::cerr << "    BUG: apply_move created cycle! type=" << (int)m.type
-                  << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb << "\n";
-    }
-#endif
-
     return dirty;
 }
 
@@ -474,18 +465,24 @@ Partition greedy_descent(Partition part) {
         if (!m_opt || m_opt->saving <= 0.001) break;
         Move m = *m_opt;
 
-        // Apply — should never fail since best_move_for_op checks feasibility
-        // on the current partition state, and we refresh after every move.
+        // Apply move. Local checks in apply_move should prevent infeasible moves.
         [[maybe_unused]] double old_total = part.total_cost();
+        Partition snapshot = part;
         auto dirty = apply_move(part, m);
         if (dirty.empty()) {
-            // This should not happen. Log and skip.
-            std::cerr << "    BUG: apply_move rejected feasible move type="
-                      << (int)m.type << " op=" << m.op
-                      << " ga=" << m.ga << " gb=" << m.gb
-                      << " saving=" << m.saving << "\n";
+            part = std::move(snapshot);
             continue;
         }
+
+#ifndef NDEBUG
+        if (!part.is_acyclic()) {
+            std::cerr << "    BUG: apply_move created infeasible partition! type="
+                      << (int)m.type << " op=" << m.op
+                      << " ga=" << m.ga << " gb=" << m.gb << "\n";
+            part = std::move(snapshot);
+            continue;
+        }
+#endif
 
 #ifndef NDEBUG
         {
