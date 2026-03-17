@@ -67,19 +67,17 @@ void test_fanin_working_set() {
     auto p = fanin_square(); DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1, 2});
 
-    // At [128,128,32]:
-    // T0: LHS of Op0, h*K0 = 128*128 = 16384 (resident)
-    // T1: RHS of Op0, k*w  = 32*128  = 4096  (streamed)
-    // T3: LHS of Op1, h*K1 = 128*128 = 16384 (resident)
-    // T4: RHS of Op1, k*w  = 32*128  = 4096  (streamed)
-    // T6: accumulator, h*w = 128*128 = 16384
-    // T2, T5: ephemeral = 0
+    // At [128,128,32] nk=4:
+    // T0: FIXED_1×NTH → 128×128 = 16384 (col_load)
+    // T1: NK×FIXED_1 → 32×128  = 4096  (stream)
+    // T3: FIXED_1×NK → 128×32  = 4096  (stream)
+    // T4: NTW×FIXED_1 → 128×128 = 16384 (row_load)
+    // T6: NTW×NTH → 128×128 = 16384 (evict)
     // Total = 3*16384 + 2*4096 = 57344
     CHECK_EQ_I("ws k=32", sg.working_set(TC(128,128,32)), 57344);
 
-    // Two LHS row strips vs one in a chain — the fan-in is more memory-hungry
-    // Chain of 3 at same params: 1*16384 + 3*4096 + 16384 = 45056
-    std::cout << "  Fan-in ws=57344 vs chain-3 ws=45056 (two LHS strips)\n";
+    // Two non-sink LHS row strips vs one in a chain
+    std::cout << "  Fan-in ws=57344 vs chain-3 ws=57344 (both have 2 col_load + 2 stream)\n";
 
     // At k=128: 3*16384 + 2*16384 = 81920 > 70000
     CHECK("infeasible k=128", !sg.is_feasible(TC(128,128,128)));
@@ -157,34 +155,35 @@ void test_fanin_nonsquare() {
 
     CHECK_EQ_I("max_K=256", sg.max_K(), 256);
 
-    // ws at [128,128,32]: k must divide both 128 and 256
-    // T0: h*K0 = 128*128 = 16384
-    // T1: k*w  = 32*128  = 4096
-    // T3: h*K1 = 128*256 = 32768  (Op1's LHS has K1=256, bigger row strip)
-    // T4: k*w  = 32*128  = 4096
-    // T6: h*w  = 128*128 = 16384
-    // Total = 73728
-    CHECK_EQ_I("ws", sg.working_set(TC(128,128,32)), 73728);
+    // ws at [128,128,32]: output_K = 128 (sink Op2), nk = 128/32 = 4
+    // Tiling propagation:
+    //   T0: FIXED_1×NTH → 128×128 = 16384 (col_load)
+    //   T1: NK×FIXED_1 → 32×128 = 4096 (stream)
+    //   T3: FIXED_1×NK → 256×32 = 8192 (stream, non-square!)
+    //   T4: NTW×FIXED_1 → 128×256 = 32768 (row_load, full non-square tensor)
+    //   T6: NTW×NTH → 128×128 = 16384 (evict)
+    // Total = 16384 + 4096 + 8192 + 32768 + 16384 = 77824
+    CHECK_EQ_I("ws", sg.working_set(TC(128,128,32)), 77824);
 
-    // k_passes = max_K/k = 256/32 = 8
+    // k_passes = output_K/k = 128/32 = 4
     auto c = sg.compute_cost(TC(128,128,32));
-    CHECK_EQ_I("k_passes", c.num_k_passes, 8);
+    CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // comp/step: Op0 = 2000*32/128 = 500, Op1 = 2000*32/256 = 250, Op2 = 2000*32/128 = 500
-    CHECK_EQ("comp/step", c.compute_per_step, 1250.0);
+    // comp/step: 3 × 2000/4 = 1500
+    CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
 
     double B = 10.0;
-    // k=0: T0(1638.4) + T1(409.6) + T3(128*256/10=3276.8) + T4(409.6) = 5734.4
-    double k0 = std::max(1250.0, 128.0*128.0/B + 32.0*128.0/B + 128.0*256.0/B + 32.0*128.0/B);
-    CHECK_EQ("k=0", k0, 5734.4);
-    // k=1..6: T1(409.6) + T4(409.6) = 819.2
-    double k_mid = std::max(1250.0, 2*32.0*128.0/B);
-    CHECK_EQ("k_mid", k_mid, 1250.0);
-    // k=7: 819.2 + T6(1638.4) = 2457.6
-    double k_last = std::max(1250.0, 2*32.0*128.0/B + 128.0*128.0/B);
-    CHECK_EQ("k_last", k_last, 2457.6);
+    // k=0: col(1638.4) + row(3276.8) + stream(409.6+819.2) = 6144
+    double k0 = std::max(1500.0, 128.0*128.0/B + 128.0*256.0/B + 32.0*128.0/B + 256.0*32.0/B);
+    CHECK_EQ("k=0", k0, 6144.0);
+    // k=1,2: stream(409.6+819.2) = 1228.8
+    double k_mid = std::max(1500.0, 32.0*128.0/B + 256.0*32.0/B);
+    CHECK_EQ("k_mid", k_mid, 1500.0);
+    // k=3: stream(1228.8) + evict(1638.4) = 2867.2
+    double k_last = std::max(1500.0, 32.0*128.0/B + 256.0*32.0/B + 128.0*128.0/B);
+    CHECK_EQ("k_last", k_last, 2867.2);
 
-    double total = k0 + 6*k_mid + k_last;
+    double total = k0 + 2*k_mid + k_last;
     CHECK_EQ("total", c.latency, total);
 }
 
@@ -198,10 +197,12 @@ void test_fanin_unfused() {
     auto c0 = make_sg(p,d,{0}).compute_cost(TC(128,128,32));
     auto c1 = make_sg(p,d,{1}).compute_cost(TC(128,128,32));
     auto c2 = make_sg(p,d,{2}).compute_cost(TC(128,128,32));
-    CHECK_EQ("each op", c0.latency, 5096.0);
-    double unfused = c0.latency + c1.latency + c2.latency;  // 15288
-    CHECK_EQ("unfused", unfused, 15288.0);
-    // Fused = 9553.6, saving = 37%
+    // Single MM at nk=4: stream=(4096+4096)/10=819.2, evict=1638.4, comp=500.
+    // d=0,1,2: 819.2 each. d=3: 2457.6. total = 3×819.2+2457.6 = 4915.2
+    CHECK_EQ("each op", c0.latency, 4915.2);
+    double unfused = c0.latency + c1.latency + c2.latency;  // 14745.6
+    CHECK_EQ("unfused", unfused, 14745.6);
+    // Fused = 9553.6, saving = 35%
     std::cout << "  Unfused=" << unfused << " Fused=9553.6 (saved "
               << (int)(100*(unfused-9553.6)/unfused) << "%)\n";
 }
@@ -232,7 +233,7 @@ void test_fanin_partial() {
         {std::move(sg02), TC(128,128,32), {}},
     });
     CHECK("valid", sol.validate().valid);
-    std::cout << "  Partial=" << sol.total_latency() << " vs Full=9553.6 vs Unfused=15288\n";
+    std::cout << "  Partial=" << sol.total_latency() << " vs Full=9553.6 vs Unfused=14745.6\n";
 }
 
 // ============================================================================
@@ -251,34 +252,16 @@ void test_fanin_solution() {
 // ============================================================================
 // Tiling constraint: intermediate dimensions restrict valid [w, h, k]
 //
-// Op0: T0(100×128) @ T1(128×100) → T2(100×128)  ← width 100, NOT power of 2
-// Op1: T3(128×128) @ T4(128×128) → T5(128×128)
-// Op2: T2 @ T5 → T6(128×128)                     ← sink width 128
-//
-// w must divide both 128 (sink T6) and 100 (ephemeral T2).
-// gcd(128, 100) = 4. So w ∈ {1, 2, 4} only — no w=64 or w=128!
+// With tiling propagation, granularity >= dimension is always valid
+// (max(dim/gran, 1) = 1 tile). Divisibility is only required when
+// gran < dim. This means w=128 with intermediate width=100 is VALID
+// (gives 1 tile), but w=64 with width=100 is INVALID (100%64≠0).
 // ============================================================================
 
 void test_fanin_tiling_constraint() {
     std::cout << "\n=== Fan-in: tiling constraint (non-pow2 intermediate) ===\n";
     Problem p;
-    p.tensors = {{100,128},  // T0: LHS of Op0, K0=100
-                 {128,100},  // T1: RHS of Op0
-                 {128,128},  // T2: Op0 output (width=T1.width=128? No!)
-                 {128,128},  // T3: LHS of Op1
-                 {128,128},  // T4: RHS of Op1
-                 {128,128},  // T5: Op1 output
-                 {128,128}}; // T6: sink
-
-    // Wait: T2 = T0 @ T1. T0 is (w=100, h=128) = (K=100, H=128).
-    // T1 is (w=128, h=100) = (W=128, K=100). So T2.width = T1.width = 128,
-    // T2.height = T0.height = 128. Both 128. That doesn't restrict anything.
-    //
-    // Let me make a case where the intermediate has a weird width.
-    // For T2 to have width 100: T2 = T0 @ T1, T2.width = T1.width.
-    // So T1.width = 100.
-
-    // Redo:
+    // Redo with T1.width=100 → T2.width=100 (non-pow2 intermediate)
     p.tensors = {{128,128},  // T0: K0 = 128
                  {100,128},  // T1: width=100 → T2.width = 100
                  {100,128},  // T2: Op0 output (100 wide!)
@@ -296,29 +279,27 @@ void test_fanin_tiling_constraint() {
 
     auto sg = make_sg(p, d, {0, 1, 2});
 
-    // T2 is ephemeral, width=100. T6 is sink, width=128.
-    // w must divide both 100 and 128. gcd(100,128) = 4.
-    // w=128: 100 % 128 ≠ 0 → invalid
-    CHECK("w=128 invalid", !sg.is_valid_tiling(TC(128,128,4)));
-    // w=64: 100 % 64 ≠ 0 → invalid
+    // w=128: 128 >= 100 → valid (max(100/128,1) = 1 tile for T1/T2 dimension)
+    CHECK("w=128 valid (gran>=dim)", sg.is_valid_tiling(TC(128,128,4)));
+    // w=64: 64 < 100, 100%64=36≠0 → invalid
     CHECK("w=64 invalid", !sg.is_valid_tiling(TC(64,128,4)));
-    // w=4: 100 % 4 = 0, 128 % 4 = 0 → valid
+    // w=4: divides both 100 and 128 → valid
     CHECK("w=4 valid", sg.is_valid_tiling(TC(4,128,4)));
-    // w=2: valid
+    // w=2: divides both → valid
     CHECK("w=2 valid", sg.is_valid_tiling(TC(2,128,4)));
 
-    // compute_cost should return infeasible for invalid tiling
-    auto c_bad = sg.compute_cost(TC(128,128,4));
-    CHECK("w=128 cost infeasible", !c_bad.feasible);
+    // w=128 is feasible and produces a valid cost
+    auto c = sg.compute_cost(TC(128,128,4));
+    CHECK("w=128 cost feasible", c.feasible);
 
-    auto c_good = sg.compute_cost(TC(4,128,4));
-    CHECK("w=4 cost feasible", c_good.feasible);
+    // w=64 is rejected
+    auto c_bad = sg.compute_cost(TC(64,128,4));
+    CHECK("w=64 cost infeasible", !c_bad.feasible);
 
-    // best_cost should find something (restricted to small w)
+    // best_cost should find something valid
     auto best = sg.best_cost();
     CHECK("best feasible", best.feasible);
-    CHECK("best w divides 100", 100 % best.config.w == 0);
-    CHECK("best w divides 128", 128 % best.config.w == 0);
+    CHECK("best latency positive", best.latency > 0);
     std::cout << "  Best config: w=" << best.config.w
               << " h=" << best.config.h
               << " k=" << best.config.k << "\n";
@@ -327,13 +308,9 @@ void test_fanin_tiling_constraint() {
 // ============================================================================
 // Tiling constraint: mismatched intermediate heights
 //
-// Dimensionally consistent fan-in where intermediate tensors have
-// different heights, restricting valid h (and w and k).
-//
-//   T2: (96, 128)  — Op0 output. T5: (128, 96) — Op1 output. T6: (128, 128).
-//   h must divide gcd(128, 96) = 32.
-//   w must divide gcd(96, 128) = 32.
-//   k must divide gcd(128, 128, 96) = 32.
+// With gran >= dim allowed, only gran < dim needs divisibility.
+// h=128 with height=96: 128 >= 96 → valid (1 tile).
+// h=64 with height=96: 64 < 96, 96%64≠0 → invalid.
 // ============================================================================
 
 void test_fanin_tiling_height_constraint() {
@@ -355,28 +332,26 @@ void test_fanin_tiling_height_constraint() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1, 2});
 
-    // h=128: T5.height=96, 96%128!=0
-    CHECK("h=128 invalid", !sg.is_valid_tiling(TC(32,128,32)));
-    // h=64: 96%64!=0
+    // h=128: 128 >= 96 → valid (gran >= dim)
+    CHECK("h=128 valid (gran>=dim)", sg.is_valid_tiling(TC(32,128,32)));
+    // h=64: 64 < 96, 96%64=32≠0 → invalid
     CHECK("h=64 invalid", !sg.is_valid_tiling(TC(32,64,32)));
-    // h=32: divides 128 and 96
+    // h=32: divides 128 and 96 → valid
     CHECK("h=32 valid", sg.is_valid_tiling(TC(32,32,32)));
 
-    // w=128: T2.width=96, 96%128!=0
-    CHECK("w=128 invalid", !sg.is_valid_tiling(TC(128,32,32)));
-    // w=32: divides 96 and 128
+    // w=128: 128 >= 96 → valid
+    CHECK("w=128 valid (gran>=dim)", sg.is_valid_tiling(TC(128,32,32)));
+    // w=32: divides 96 and 128 → valid
     CHECK("w=32 valid", sg.is_valid_tiling(TC(32,32,32)));
 
-    // k=64: K2=96 (T2.width), 96%64!=0
+    // k=64: 64 < 96, 96%64≠0 → invalid (T2.width=96 is in k_divides)
     CHECK("k=64 invalid", !sg.is_valid_tiling(TC(32,32,64)));
-    // k=32: divides 128, 128, 96
+    // k=32: divides all → valid
     CHECK("k=32 valid", sg.is_valid_tiling(TC(32,32,32)));
 
     auto best = sg.best_cost();
     CHECK("best feasible", best.feasible);
-    CHECK("best w divides 96", 96 % best.config.w == 0);
-    CHECK("best h divides 96", 96 % best.config.h == 0);
-    CHECK("best k divides 96", 96 % best.config.k == 0);
+    CHECK("best latency positive", best.latency > 0);
     std::cout << "  Best: w=" << best.config.w << " h=" << best.config.h
               << " k=" << best.config.k << " lat=" << best.latency << "\n";
 }

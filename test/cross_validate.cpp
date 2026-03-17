@@ -1,4 +1,6 @@
 // cross_validate.cpp — analytical vs tile-by-tile simulation
+// Verifies compute_cost() against a step-by-step simulation that
+// mirrors the reference evaluator (main.cpp) exactly.
 // Build: make cross_validate
 
 #include "core/types.h"
@@ -7,8 +9,11 @@
 #include "core/cost.h"
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <set>
+#include <vector>
 
+// Tile-by-tile simulation matching the reference evaluator's logic.
 static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     const std::set<size_t>& rfp, const std::set<size_t>& rt)
 {
@@ -20,78 +25,157 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     result.feasible = true;
 
     double B = (double)prob.slow_memory_bandwidth;
-    int ntw = (int)(sg.output_width() / cfg.w);
-    int nth = (int)(sg.output_height() / cfg.h);
-    int nk = sg.has_matmul() ? (int)(sg.max_K() / cfg.k) : 1;
-    result.num_spatial_tiles = ntw * nth;
-    result.num_k_passes = nk;
-
-    auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
-    int64_t scale = ceil_div(cfg.w, prob.native_w)
-                  * ceil_div(cfg.h, prob.native_h);
-
-    // Separate MM compute (per k-step) from PW compute (once per tile)
-    double mm_comp = 0, pw_comp = 0;
-    for (auto i : sg.ops()) {
-        double c = (double)prob.ops[i].base_cost;
-        if (prob.ops[i].type == OpType::MatMul)
-            mm_comp += c * ((double)cfg.k / sg.op_K(i));
-        else
-            pw_comp += c;
-    }
-    mm_comp *= (double)scale;
-    pw_comp *= (double)scale;
-
-    auto tiles = make_traversal(ntw, nth, cfg.snake);
     const auto& bi = sg.boundary_inputs();
-    double total = 0; int pr = -1, pc = -1;
+    const auto& bo = sg.boundary_outputs();
 
-    for (int tp = 0; tp < (int)tiles.size(); tp++) {
-        int tr = tiles[tp] / ntw, tc = tiles[tp] % ntw;
-        for (int ks = 0; ks < nk; ks++) {
-            double mi = 0, mo = 0;
-            std::set<size_t> xfer_done;  // dedup shared boundary inputs
-            for (auto i : sg.ops()) {
-                const auto& op = prob.ops[i];
-                if (op.type == OpType::MatMul) {
-                    size_t lhs = op.inputs[0], rhs = op.inputs[1];
-                    // LHS: load at k=0 if row changed (or first tile)
-                    if (bi.count(lhs) && !rfp.count(lhs) && !xfer_done.count(lhs)) {
-                        if (ks == 0 && (tp == 0 || tr != pr)) {
-                            mi += (double)(cfg.h * sg.op_K(i)) / B;
-                            xfer_done.insert(lhs);
-                        }
-                    }
-                    // RHS: load every k-step, but reuse if column unchanged
-                    // (only valid when nk==1; with nk>1 the k-range changes)
-                    if (bi.count(rhs) && !rfp.count(rhs) && !xfer_done.count(rhs)) {
-                        bool rhs_fresh = (ks > 0) ||
-                                         (tp == 0) ||
-                                         (tc != pc) ||
-                                         (nk > 1);
-                        if (rhs_fresh) {
-                            mi += (double)(cfg.k * cfg.w) / B;
-                            xfer_done.insert(rhs);
-                        }
-                    }
-                } else {
-                    if (ks == 0) for (auto t : op.inputs)
-                        if (bi.count(t) && !rfp.count(t) && !xfer_done.count(t)) {
-                            mi += (double)(cfg.h * cfg.w) / B;
-                            xfer_done.insert(t);
-                        }
-                }
-            }
-            if (ks == nk - 1) {
-                for (auto t : sg.boundary_outputs())
-                    if (!rt.count(t))
-                        mo += (double)(cfg.h * cfg.w) / B;
-            }
-            double step_comp = (ks == nk - 1) ? mm_comp + pw_comp : mm_comp;
-            total += std::max(step_comp, mi + mo);
-        }
-        pr = tr; pc = tc;
+    // Build internal topology
+    std::set<size_t> ops_set(sg.ops().begin(), sg.ops().end());
+    std::map<size_t, std::set<size_t>> op_succs;
+    for (auto i : sg.ops()) {
+        op_succs[i] = {};
+        for (auto t : prob.ops[i].outputs)
+            for (auto j : sg.ops())
+                if (j != i)
+                    for (auto it : prob.ops[j].inputs)
+                        if (it == t) op_succs[i].insert(j);
     }
+
+    // Find sinks
+    std::vector<size_t> sinks;
+    for (auto i : sg.ops())
+        if (op_succs[i].empty()) sinks.push_back(i);
+
+    size_t sink_out = prob.ops[sinks[0]].outputs[0];
+    int ntw = std::max((int)(prob.tensors[sink_out].width / cfg.w), 1);
+    int nth = std::max((int)(prob.tensors[sink_out].height / cfg.h), 1);
+
+    bool has_pw_sink = false;
+    for (auto s : sinks)
+        if (prob.ops[s].type == OpType::Pointwise) has_pw_sink = true;
+
+    int64_t output_K = 1;
+    if (!has_pw_sink)
+        for (auto s : sinks)
+            if (prob.ops[s].type == OpType::MatMul) {
+                output_K = prob.tensors[prob.ops[s].inputs[0]].width;
+                break;
+            }
+
+    int d_tiles = has_pw_sink ? 1 : std::max((int)(output_K / cfg.k), 1);
+    result.num_spatial_tiles = ntw * nth;
+    result.num_k_passes = d_tiles;
+
+    // Build reverse topo (sinks first)
+    std::map<size_t, int> out_deg;
+    for (auto i : sg.ops()) out_deg[i] = (int)op_succs[i].size();
+    std::vector<size_t> rev_topo;
+    {
+        std::vector<size_t> q;
+        for (auto i : sg.ops()) if (out_deg[i] == 0) q.push_back(i);
+        while (!q.empty()) {
+            size_t u = q.back(); q.pop_back();
+            rev_topo.push_back(u);
+            for (auto j : sg.ops())
+                if (op_succs[j].count(u)) {
+                    out_deg[j]--;
+                    if (out_deg[j] == 0) q.push_back(j);
+                }
+        }
+    }
+
+    // Reference-style tile-by-tile simulation
+    std::map<size_t, int> h_tiles, v_tiles;
+    std::map<size_t, int> h_pos, v_pos, h_last, v_last;
+
+    // Seed sink output
+    h_tiles[sink_out] = ntw;
+    v_tiles[sink_out] = nth;
+
+    bool first_tile = true;
+    double total = 0;
+    auto traversal = make_traversal(ntw, nth, cfg.snake);
+
+    for (int tp = 0; tp < (int)traversal.size(); tp++) {
+        h_pos[sink_out] = traversal[tp] / ntw;
+        v_pos[sink_out] = traversal[tp] % ntw;
+
+        double regular_cost = 0;
+        for (int d = 0; d < d_tiles; d++) {
+            if (d >= 2 && d < d_tiles - 1) continue;  // optimization
+
+            double io = 0, compute = 0;
+            for (auto op_idx : rev_topo) {
+                const auto& op = prob.ops[op_idx];
+                size_t out = op.outputs[0];
+                bool is_sink = op_succs[op_idx].empty();
+
+                // Propagate h/v tiles and positions
+                if (op.type == OpType::Pointwise) {
+                    for (auto t : op.inputs) {
+                        if (first_tile) { h_tiles[t] = h_tiles[out]; v_tiles[t] = v_tiles[out]; }
+                        h_pos[t] = h_pos[out]; v_pos[t] = v_pos[out];
+                    }
+                } else if (!is_sink || d_tiles == 1) {
+                    size_t lhs = op.inputs[0], rhs = op.inputs[1];
+                    if (first_tile) {
+                        h_tiles[lhs] = 1; v_tiles[lhs] = v_tiles[out];
+                        h_tiles[rhs] = h_tiles[out]; v_tiles[rhs] = 1;
+                    }
+                    h_pos[lhs] = 0; v_pos[lhs] = v_pos[out];
+                    h_pos[rhs] = h_pos[out]; v_pos[rhs] = 0;
+                } else {
+                    size_t lhs = op.inputs[0], rhs = op.inputs[1];
+                    if (first_tile) {
+                        h_tiles[lhs] = d_tiles; v_tiles[lhs] = v_tiles[out];
+                        h_tiles[rhs] = h_tiles[out]; v_tiles[rhs] = d_tiles;
+                    }
+                    h_pos[lhs] = d; v_pos[lhs] = v_pos[out];
+                    h_pos[rhs] = h_pos[out]; v_pos[rhs] = d;
+                }
+
+                // IO: input loads
+                for (auto t : op.inputs) {
+                    if (!bi.count(t) || rfp.count(t)) continue;
+                    bool needs_load = first_tile;
+                    if (!first_tile && h_last.count(t))
+                        needs_load = (h_last[t] != h_pos[t] || v_last[t] != v_pos[t]);
+                    if (needs_load) {
+                        int ht = std::max(h_tiles.count(t) ? h_tiles[t] : 1, 1);
+                        int vt = std::max(v_tiles.count(t) ? v_tiles[t] : 1, 1);
+                        io += (double)(prob.tensors[t].width / ht) *
+                              (double)(prob.tensors[t].height / vt) / B;
+                    }
+                }
+                // IO: output evictions
+                for (auto t : op.outputs) {
+                    if (!bo.count(t) || rt.count(t)) continue;
+                    if (d_tiles > 1 && d < d_tiles - 1) continue;
+                    int ht = std::max(h_tiles.count(t) ? h_tiles[t] : 1, 1);
+                    int vt = std::max(v_tiles.count(t) ? v_tiles[t] : 1, 1);
+                    io += (double)(prob.tensors[t].width / ht) *
+                          (double)(prob.tensors[t].height / vt) / B;
+                }
+
+                // Compute: ALL ops, every d-step, base_cost/d_tiles × scale
+                size_t co = op.outputs[0];
+                int ht = std::max(h_tiles.count(co) ? h_tiles[co] : 1, 1);
+                int vt = std::max(v_tiles.count(co) ? v_tiles[co] : 1, 1);
+                double sw = (double)prob.tensors[co].width / ht;
+                double sh = (double)prob.tensors[co].height / vt;
+                double scale = std::max(sw / cfg.w, 1.0) * std::max(sh / cfg.h, 1.0);
+                compute += (double)op.base_cost / d_tiles * scale;
+
+                for (auto t : op.inputs) { h_last[t] = h_pos[t]; v_last[t] = v_pos[t]; }
+            }
+
+            double step = std::max(compute, io);
+            total += step;
+            if (d == 1) regular_cost = step;
+            first_tile = false;
+        }
+        if (d_tiles > 3) total += (double)(d_tiles - 3) * regular_cost;
+    }
+
     result.latency = total;
     return result;
 }
@@ -106,12 +190,9 @@ int main() {
         if (!sg) { std::cout << "SKIP " << tc.nm << "\n"; return; }
         auto a = sg->compute_cost(tc.cfg, tc.rfp, tc.rt);
         auto s = simulate(*sg, tc.cfg, tc.rfp, tc.rt);
-        // Both infeasible → agree
         if (!a.feasible && !s.feasible) { pass++; return; }
-        // One feasible, other not → disagree
         if (a.feasible != s.feasible) { fail++; std::cout << "FAIL " << tc.nm
             << ": feasibility mismatch a=" << a.feasible << " s=" << s.feasible << "\n"; return; }
-        // Both feasible → compare latency
         if (std::abs(a.latency - s.latency) < 0.01) pass++;
         else { fail++; std::cout << "FAIL " << tc.nm << ": a=" << a.latency << " s=" << s.latency << "\n"; }
     };
@@ -142,12 +223,10 @@ int main() {
       p.ops={{OpType::MatMul,{0,1},{3},2000},{OpType::MatMul,{3,2},{4},2000}};
       p.fast_memory_capacity=45000;p.slow_memory_bandwidth=10;p.native_w=128;p.native_h=128;
       run({"5B",p,{0,1},{128,128,32,N},{},{}}); }
-
     // Larger grids
     auto mm=[](int64_t sz,int64_t c,int64_t b){Problem p;p.tensors={{sz,sz},{sz,sz},{sz,sz}};
       p.ops={{OpType::MatMul,{0,1},{2},2000}};p.fast_memory_capacity=c;p.slow_memory_bandwidth=b;
       p.native_w=128;p.native_h=128;return p;};
-
     { auto p=mm(256,30000,10);
       run({"m256n",p,{0},{64,64,128,N},{},{}});run({"m256r",p,{0},{64,64,128,R},{},{}});
       run({"m256c",p,{0},{64,64,128,C},{},{}});run({"m256k64",p,{0},{64,64,64,R},{},{}});
@@ -170,12 +249,13 @@ int main() {
       run({"rectn",p,{0},{128,128,128,N},{},{}});run({"rectr",p,{0},{128,128,128,R},{},{}});
       run({"rectc",p,{0},{128,128,128,C},{},{}});run({"rect64r",p,{0},{64,128,128,R},{},{}});
       run({"rect64c",p,{0},{64,128,128,C},{},{}}); }
-    // Fused MM+PW (PW sink rule forces k=1)
+    // Fused MM+PW (PW sink, nk=1)
     { Problem p;p.tensors={{256,256},{256,256},{256,256},{256,256}};
       p.ops={{OpType::MatMul,{0,1},{2},2000},{OpType::Pointwise,{2},{3},500}};
       p.fast_memory_capacity=100000;p.slow_memory_bandwidth=15;p.native_w=128;p.native_h=128;
       run({"fusen",p,{0,1},{128,128,1,N},{},{}});run({"fuser",p,{0,1},{128,128,1,R},{},{}});
-      run({"fusec",p,{0,1},{128,128,1,C},{},{}});run({"fuse64",p,{0,1},{64,64,1,R},{},{}}); }
+      run({"fusec",p,{0,1},{128,128,1,C},{},{}});run({"fuse64",p,{0,1},{64,64,1,R},{},{}});
+      run({"fusek128",p,{0,1},{128,128,128,R},{},{}}); }
     // Retained
     { Problem p;p.tensors={{256,256},{256,256},{256,256}};
       p.ops={{OpType::MatMul,{0,1},{2},2000}};p.fast_memory_capacity=200000;p.slow_memory_bandwidth=10;
@@ -189,6 +269,16 @@ int main() {
       p.native_w=128;p.native_h=128;
       run({"pwn",p,{0},{128,128,1,N},{},{}});run({"pwr",p,{0},{128,128,1,R},{},{}});
       run({"pwc",p,{0},{128,128,1,C},{},{}}); }
+    // Fan-in and chain of 3
+    { Problem p;p.tensors={{128,128},{128,128},{128,128},{128,128},{128,128},{128,128},{128,128}};
+      p.ops={{OpType::MatMul,{0,1},{2},2000},{OpType::MatMul,{3,4},{5},2000},{OpType::MatMul,{2,5},{6},2000}};
+      p.fast_memory_capacity=70000;p.slow_memory_bandwidth=10;p.native_w=128;p.native_h=128;
+      run({"fanin32",p,{0,1,2},{128,128,32,N},{},{}});
+      run({"fanin64",p,{0,1,2},{128,128,64,N},{},{}}); }
+    { Problem p;p.tensors={{128,128},{128,128},{128,128},{128,128},{128,128},{128,128},{128,128}};
+      p.ops={{OpType::MatMul,{0,1},{2},2000},{OpType::MatMul,{2,3},{4},2000},{OpType::MatMul,{4,5},{6},2000}};
+      p.fast_memory_capacity=60000;p.slow_memory_bandwidth=10;p.native_w=128;p.native_h=128;
+      run({"chain3k32",p,{0,1,2},{128,128,32,N},{},{}}); }
 
     std::cout << "\n" << pass << " passed, " << fail << " failed out of " << (pass+fail) << " tests\n";
     return fail > 0 ? 1 : 0;

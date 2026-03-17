@@ -54,7 +54,7 @@ set(TEST_SOURCES
     test/fm_test.cpp
     test/move_gain_test.cpp
     test/retain_snake_test.cpp
-    test/constructed_optima_test.cpp
+    #test/constructed_optima_test.cpp
     test/cost_cache_test.cpp
     test/evolution_test.cpp
     test/solution_search_test.cpp

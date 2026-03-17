@@ -71,51 +71,41 @@ void test_retain_these_lhs_input() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0});
 
-    // Config [64, 64, 32]: tile is below native (h=64, w=64, k=32).
-    //   T0 LHS slice  = h * max_lhs_K = 64 * 128 = 8192
-    //   T1 RHS slice  = k * w         = 32 * 64  = 2048
-    //   T2 out tile   = h * w         =  64 * 64  = 4096
-    //   ws_base = 8192 + 2048 + 4096 = 14336
+    // Config [64, 64, 32]: nk=4, ntw=2, nth=2.
+    //   T0 (LHS): NK(4)×NTH(2) → 128/4 × 128/2 = 32 × 64 = 2048
+    //   T1 (RHS): NTW(2)×NK(4) → 128/2 × 128/4 = 64 × 32 = 2048
+    //   T2 (out): NTW(2)×NTH(2) → 128/2 × 128/2 = 64 × 64 = 4096
+    //   ws_base = 2048 + 2048 + 4096 = 8192
     int64_t ws_base = sg.working_set(TC(64,64,32));
-    CHECK_EQ_I("ws base [64,64,32]", ws_base, 14336);
+    CHECK_EQ_I("ws base [64,64,32]", ws_base, 8192);
 
     // retain_these = {T0} (LHS input).
-    // Correct: skip T0's strip in main loop, add full T0 = 128*128 = 16384.
+    // Correct: skip T0's slice in main loop, add full T0 = 128*128 = 16384.
     //   ws = T1(2048) + T2(4096) + T0_full(16384) = 22528
-    //
-    // Old bug: T0 was NOT skipped in main (charges 8192), then retain loop added
-    //   full - h*w = 16384 - 4096 = 12288 extra → ws = 14336 + 12288 = 26624.
-    //   Over-count of 4096 (= h*K - h*w = 64*(128-64)).
     int64_t ws_ret_lhs = sg.working_set(TC(64,64,32), {}, {0});
     int64_t expected_lhs = 2048 + 4096 + /*T0_full=*/128*128;  // 22528
     CHECK_EQ_I("ws retain_these T0 (LHS)", ws_ret_lhs, expected_lhs);
 
     // retain_these = {T1} (RHS input).
-    // Correct: skip T1's strip, add full T1 = 128*128 = 16384.
-    //   ws = T0(8192) + T2(4096) + T1_full(16384) = 28672
-    //
-    // Old bug: T1 NOT skipped in main (charges k*w=2048), retain loop added
-    //   full - h*w = 16384 - 4096 = 12288 extra → ws = 14336 + 12288 = 26624.
-    //   Under-count of 2048 (= T1_full - (T1_tile + extra) = 16384 - 14336 = 2048).
+    // Correct: skip T1's slice (2048), add full T1 = 16384.
+    //   ws = T0(2048) + T2(4096) + T1_full(16384) = 22528
     int64_t ws_ret_rhs = sg.working_set(TC(64,64,32), {}, {1});
-    int64_t expected_rhs = 8192 + 4096 + /*T1_full=*/128*128;  // 28672
+    int64_t expected_rhs = 2048 + 4096 + /*T1_full=*/128*128;  // 22528
     CHECK_EQ_I("ws retain_these T1 (RHS)", ws_ret_rhs, expected_rhs);
 
-    // Sanity: retain_these with output T2 (boundary out, h*w tile).
-    // Both old and new code agree here: T2 SKIP, add full T2 = 16384.
-    //   ws = T0(8192) + T1(2048) + T2_full(16384) = 26624
+    // Sanity: retain_these with output T2 (boundary out).
+    // Both old and new code agree: T2 SKIP, add full T2 = 16384.
+    //   ws = T0(2048) + T1(2048) + T2_full(16384) = 20480
     int64_t ws_ret_out = sg.working_set(TC(64,64,32), {}, {2});
-    int64_t expected_out = 8192 + 2048 + /*T2_full=*/128*128;  // 26624
+    int64_t expected_out = 2048 + 2048 + /*T2_full=*/128*128;  // 20480
     CHECK_EQ_I("ws retain_these T2 (output)", ws_ret_out, expected_out);
 
-    // Corner case: k == w (so k*w == h*w when h==k).
-    // At [64, 64, 64]: k=64=w. T1 RHS slice = k*w = 64*64 = 4096 = h*w.
-    // Old and new should agree for RHS retain here.
-    //   T0: 8192, T1: k*w=4096 → (old) full-h*w=16384-4096=12288 extra → 8192+4096+4096+12288=28672
-    //   New: T1 skip, T1_full=16384. ws=8192+4096+16384=28672. Same ✓
+    // Corner case: k == w (so slices are symmetric).
+    // At [64, 64, 64]: nk=2, ntw=2, nth=2. All slices = 64×64 = 4096.
+    //   retain T1: T0(4096) + T2(4096) + T1_full(16384) = 24576.
     int64_t ws_ret_rhs_sq = sg.working_set(TC(64,64,64), {}, {1});
     CHECK_EQ_I("ws retain_these T1 (RHS, k==w)", ws_ret_rhs_sq,
-               64*128 /*T0*/ + 64*64 /*T2*/ + 128*128 /*T1_full*/);  // 28672
+               4096 /*T0*/ + 4096 /*T2*/ + 128*128 /*T1_full*/);  // 24576
 }
 
 void test_retain_these_asymmetric_rhs() {
@@ -134,24 +124,18 @@ void test_retain_these_asymmetric_rhs() {
     auto sg = make_sg(p, d, {0});
 
     // Use cfg.w = 256 (full output width) so the tile covers the whole row:
-    //   one spatial tile, cfg = [256, 128, 32].
-    //   T0 LHS: h * K   = 128 * 128 = 16384
-    //   T1 RHS: k * w   = 32  * 256 = 8192
-    //   T2 out: h * w   = 128 * 256 = 32768
-    //   ws_base = 57344
-    CHECK_EQ_I("ws base [256,128,32]", sg.working_set(TC(256,128,32)), 16384+8192+32768);
+    //   one spatial tile, cfg = [256, 128, 32]. nk=4, ntw=1, nth=1.
+    //   T0 (LHS, sink): NK(4)×NTH(1) → 128/4 × 128/1 = 32×128 = 4096
+    //   T1 (RHS, sink): NTW(1)×NK(4) → 256/1 × 128/4 = 256×32 = 8192
+    //   T2 (out):        NTW(1)×NTH(1) → 256×128 = 32768
+    //   ws_base = 4096 + 8192 + 32768 = 45056
+    CHECK_EQ_I("ws base [256,128,32]", sg.working_set(TC(256,128,32)), 4096+8192+32768);
 
-    // retain_these = {T1} (RHS, asymmetric: full=256*128=32768, tile=k*w=8192).
+    // retain_these = {T1} (RHS, asymmetric: full=256*128=32768, slice=8192).
     // Correct: skip T1(8192) in main loop, add full T1 = 256*128 = 32768 in post-pass.
-    //   ws = T0(16384) + T2(32768) + T1_full(32768) = 81920
-    //
-    // Old bug: T1 NOT skipped in main (charges k*w=8192), retain loop adds
-    //   full - h*w = 32768 - (128*256) = 32768 - 32768 = 0  (!!)
-    //   because full(T1) == full(T2) == h*w at this config, so the top-up
-    //   disappears entirely → old ws = 57344 + 0 = 57344.
-    //   Under-count by 32768 - 8192 = 24576.
+    //   ws = T0(4096) + T2(32768) + T1_full(32768) = 69632
     int64_t ws_ret_rhs = sg.working_set(TC(256,128,32), {}, {1});
-    int64_t expected_rhs = 16384 /*T0*/ + 32768 /*T2*/ + 256*128 /*T1_full*/;  // 81920
+    int64_t expected_rhs = 4096 /*T0*/ + 32768 /*T2*/ + 256*128 /*T1_full*/;  // 69632
     CHECK_EQ_I("ws retain_these T1 (asymmetric RHS)", ws_ret_rhs, expected_rhs);
 
     // Transfer cost: when T1 is retained (from prev), no RHS load cost.

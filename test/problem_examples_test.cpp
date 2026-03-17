@@ -176,7 +176,7 @@ static Problem ex3_problem() {
     p.ops = {{OpType::Pointwise,{0},{1},1500},
              {OpType::Pointwise,{1},{2},1500},
              {OpType::Pointwise,{1,2},{3},1500}};
-    p.fast_memory_capacity = 50000;
+    p.fast_memory_capacity = 70000;  // increased: 3B needs 65536 for sg1
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     return p;
@@ -220,31 +220,32 @@ void test_ex3_strategy_b() {
     DAG d = DAG::build(p);
 
     // Step 0: {Op0, Op1} → T2 (sink). Retain T2.
+    // T1 is boundary output (Op2 is external consumer), NOT ephemeral.
     auto sg0 = make_sg(p, d, {0, 1});
     CHECK("3B sg0 valid", sg0.num_ops() == 2);
-    CHECK("3B T1 ephemeral", sg0.ephemeral().count(1));
+    CHECK("3B T1 boundary out", sg0.boundary_outputs().count(1));
     auto c0 = sg0.compute_cost(TC(128,128,1), {}, {2});
-    // mem_in = T0/B = 1638.4. No eviction (T2 retained). comp = 3000.
-    // lat = max(3000, 1638.4) = 3000
-    CHECK_EQ("3B step0", c0.latency, 3000.0);
+    // mem_in = T0/B = 1638.4. T1 evicted (1638.4). T2 not evicted (retained).
+    // comp = 3000. lat = max(3000, 1638.4+1638.4) = 3276.8
+    CHECK_EQ("3B step0", c0.latency, 3276.8);
 
     // Step 1: {Op0, Op2} → T3 (sink). T2 retained from step 0.
+    // T1 is boundary output (Op1 is external consumer).
     auto sg1 = make_sg(p, d, {0, 2});
     CHECK("3B sg1 valid", sg1.num_ops() == 2);
-    CHECK("3B T1 ephemeral in sg1", sg1.ephemeral().count(1));
+    CHECK("3B T1 boundary out in sg1", sg1.boundary_outputs().count(1));
     auto c1 = sg1.compute_cost(TC(128,128,1), {2}, {});
-    // mem_in = T0/B = 1638.4 (T2 retained, not loaded). comp = 3000.
-    // mem_out = T3/B = 1638.4.
-    // lat = max(3000, 1638.4 + 1638.4) = max(3000, 3276.8) = 3276.8
-    CHECK_EQ("3B step1", c1.latency, 3276.8);
-    CHECK_EQ("3B total", c0.latency + c1.latency, 6276.8);
+    // mem_in = T0/B=1638.4 (T2 retained=free). T1 evict=1638.4. T3 evict=1638.4.
+    // comp = 3000. lat = max(3000, 1638.4+1638.4+1638.4) = max(3000,4915.2) = 4915.2
+    CHECK_EQ("3B step1", c1.latency, 4915.2);
+    CHECK_EQ("3B total", c0.latency + c1.latency, 8192.0);
 
     Solution sol(p, d, {
         {std::move(sg0), TC(128,128,1), {2}},
         {std::move(sg1), TC(128,128,1), {}},
     });
     CHECK("3B solution valid", sol.validate().valid);
-    CHECK_EQ("3B solution total", sol.total_latency(), 6276.8);
+    CHECK_EQ("3B solution total", sol.total_latency(), 8192.0);
 }
 
 void test_ex3_strategy_c() {
