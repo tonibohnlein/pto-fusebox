@@ -582,8 +582,7 @@ Partition greedy_descent(Partition part) {
             double actual_gain = total_before - total_after;
             double discrepancy = m.saving - actual_gain;
             if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m.saving)) + 1.0) {
-                if (g_verbose)
-                    std::cerr << "    GREEDY GAIN MISMATCH: predicted=" << m.saving
+                std::cerr << "    GREEDY GAIN MISMATCH: predicted=" << m.saving
                               << " actual=" << actual_gain
                               << " Δ=" << discrepancy
                               << " type=" << (int)m.type

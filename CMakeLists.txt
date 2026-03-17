@@ -12,6 +12,19 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
 
+# Option: keep O2 but enable gain-mismatch verification (no ASAN overhead)
+# Usage: cmake -DGAIN_CHECK=ON -DCMAKE_BUILD_TYPE=Release ..
+option(GAIN_CHECK "Enable gain-mismatch verification at O2" OFF)
+if(GAIN_CHECK)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g")
+    # CMake adds -DNDEBUG for Release via COMPILE_DEFINITIONS; override it
+    foreach(flag_var CMAKE_CXX_FLAGS_RELEASE CMAKE_C_FLAGS_RELEASE)
+        string(REPLACE "-DNDEBUG" "" ${flag_var} "${${flag_var}}")
+    endforeach()
+    # Also strip from the per-config property CMake uses internally
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -UNDEBUG")
+endif()
+
 # Threading support
 find_package(Threads REQUIRED)
 

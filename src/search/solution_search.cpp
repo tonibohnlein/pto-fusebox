@@ -607,20 +607,88 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
     auto sg_r =
         Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
     auto sg_s = Subgraph::create(prob, dag, {op});
-    if (sg_r && sg_s) {
+    if (sg_r && sg_s) do {
+      // Determine placement: singleton before or after remainder
+      bool must_be_before = false, must_be_after = false;
+      for (auto succ : dag.op_succs[op])
+          if (remainder.count(succ)) must_be_before = true;
+      for (auto pred : dag.op_preds[op])
+          if (remainder.count(pred)) must_be_after = true;
+      if (must_be_before && must_be_after) break;
+
       auto rr = filter_retain(state.steps[si].retain_these, *sg_r, state.ret_entering[si]);
-      auto cr = sg_r->best_cost(state.ret_entering[si], rr);
-      auto cs = sg_s->best_cost({}, {});
-      if (cr.feasible && cs.feasible) {
-        double saving = state.cost[si] - (cr.latency + cs.latency);
-        if (saving > -floor && saving > best.saving) {
-          best.type = SolutionMove::EJECT;
-          best.step_a = si;
-          best.op = op;
-          best.saving = saving;
-        }
+
+      // Compute costs based on placement order
+      CostResult cr, cs;
+      if (must_be_before) {
+        // singleton first, remainder second
+        cs = sg_s->best_cost(state.ret_entering[si], {});
+        cr = sg_r->best_cost({}, rr);  // remainder loses entering
+      } else {
+        // remainder first (common case), singleton second
+        cr = sg_r->best_cost(state.ret_entering[si], rr);
+        cs = sg_s->best_cost({}, {});  // singleton has no entering
       }
-    }
+      if (!cr.feasible || !cs.feasible) break;
+
+      double saving = 0;
+      // Build temporary step vector with the insertion and cascade forward
+      // to get accurate total cost including downstream retention effects.
+      {
+        auto tmp_steps = state.steps;
+        ScheduleStep step_r; step_r.subgraph = *sg_r; step_r.config = cr.config; step_r.retain_these = rr;
+        ScheduleStep step_s; step_s.subgraph = *sg_s; step_s.config = cs.config;
+        if (must_be_before) {
+          tmp_steps[si] = std::move(step_s);
+          tmp_steps.insert(tmp_steps.begin() + si + 1, std::move(step_r));
+        } else {
+          tmp_steps[si] = std::move(step_r);
+          tmp_steps.insert(tmp_steps.begin() + si + 1, std::move(step_s));
+        }
+        double old_cost_from_si = 0;
+        for (size_t j = si; j < state.size(); j++)
+          old_cost_from_si += state.cost[j];
+
+        double new_cost_from_si = 0;
+        std::set<size_t> cur;
+        if (si > 0) cur = tmp_steps[si - 1].retain_these;
+        for (size_t j = si; j < tmp_steps.size(); j++) {
+          std::set<size_t> useful;
+          for (auto tt : tmp_steps[j].retain_these) {
+            bool is_out = tmp_steps[j].subgraph.boundary_outputs().count(tt);
+            bool needed = (j + 1 < tmp_steps.size()) &&
+                          tmp_steps[j + 1].subgraph.boundary_inputs().count(tt);
+            if (is_out && needed) useful.insert(tt);
+          }
+          auto c = tmp_steps[j].subgraph.compute_cost(tmp_steps[j].config, cur, useful);
+          double cost_j;
+          if (c.latency < 1e17) {
+            cost_j = c.latency;
+          } else {
+            auto bc = tmp_steps[j].subgraph.best_cost(cur, useful);
+            if (bc.feasible) cost_j = bc.latency;
+            else { useful.clear(); auto bc2 = tmp_steps[j].subgraph.best_cost(cur, {}); cost_j = bc2.feasible ? bc2.latency : 1e18; }
+          }
+          new_cost_from_si += cost_j;
+          cur = useful;
+          // Early exit: past insertion, entering converges with original
+          if (j >= si + 2 && (j - 1) < state.size() &&
+              cur == state.ret_entering[j - 1]) {
+            for (size_t k = j - 1; k < state.size(); k++)
+              new_cost_from_si += state.cost[k];
+            break;
+          }
+        }
+        saving = old_cost_from_si - new_cost_from_si;
+      }
+
+      if (saving > -floor && saving > best.saving) {
+        best.type = SolutionMove::EJECT;
+        best.step_a = si;
+        best.op = op;
+        best.saving = saving;
+      }
+    } while (false);
   }
 
   // --- INTERNAL_EJECT: extract internal op ---
@@ -631,11 +699,31 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
     tmp.groups.push_back({si_set, state.cost[si], true, 0});
     tmp.rebuild_index();
     auto er = tmp.eval_eject(op, 0);
-    if (er.feasible && er.saving > -floor && er.saving > best.saving) {
-      best.type = SolutionMove::INTERNAL_EJECT;
-      best.step_a = si;
-      best.op = op;
-      best.saving = er.saving;
+    if (er.feasible && er.saving > -floor) {
+      double saving = er.saving;
+
+      // Account for downstream step losing its entering set.
+      // eval_eject computes all components with best_cost({}, {}).
+      // After insertion, the last component retains nothing → old si+1
+      // loses its entering.
+      if (si + 1 < state.size() && !state.ret_entering[si + 1].empty()) {
+        auto &sj = state.steps[si + 1];
+        // The last component has no retain → old si+1 enters with {}
+        auto cj_new = sj.subgraph.best_cost({}, sj.retain_these);
+        if (!cj_new.feasible)
+          cj_new = sj.subgraph.best_cost({}, {});
+        if (cj_new.feasible)
+          saving -= (cj_new.latency - state.cost[si + 1]);
+        else
+          saving = -1e18;  // can't evaluate → skip
+      }
+
+      if (saving > -floor && saving > best.saving) {
+        best.type = SolutionMove::INTERNAL_EJECT;
+        best.step_a = si;
+        best.op = op;
+        best.saving = saving;
+      }
     }
   }
 
@@ -678,6 +766,27 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         if (!c2.feasible)
           continue;
         double saving = state.cost[si] - (c1.latency + c2.latency);
+
+        // Account for downstream step (si+1) if the second half's retain
+        // differs from what the original step was passing.
+        if (si + 1 < state.size() && !state.ret_entering[si + 1].empty()) {
+          // What will old si+1 actually enter with?
+          std::set<size_t> new_sj_entering;
+          for (auto tt : sr2)
+            if (second->boundary_outputs().count(tt) &&
+                state.steps[si + 1].subgraph.boundary_inputs().count(tt))
+              new_sj_entering.insert(tt);
+          if (new_sj_entering != state.ret_entering[si + 1]) {
+            auto &sj = state.steps[si + 1];
+            auto cj_new = sj.subgraph.best_cost(new_sj_entering, sj.retain_these);
+            if (!cj_new.feasible)
+              cj_new = sj.subgraph.best_cost(new_sj_entering, {});
+            if (!cj_new.feasible)
+              continue;
+            saving -= (cj_new.latency - state.cost[si + 1]);
+          }
+        }
+
         if (saving > -floor && saving > best.saving) {
           best.type = SolutionMove::SPLIT;
           best.step_a = si;
@@ -777,6 +886,60 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
   return best;
 }
 
+// ============================================================================
+// Cascade cost delta: simulate rebuild_from for steps [start..end) and return
+// the total cost change relative to state.cost[].
+//
+// This propagates the retention chain forward from `start`, using the modified
+// steps (caller should have already changed retain_these/config on the steps
+// in the temporary copy). Early-exits when entering set converges with state.
+//
+// Returns the sum of (new_cost[j] - state.cost[j]) for all affected steps.
+// ============================================================================
+static double cascade_cost_delta(const SolState &state,
+                                 const std::vector<ScheduleStep> &steps,
+                                 size_t start) {
+  double delta = 0;
+  std::set<size_t> cur;
+  if (start > 0)
+    cur = steps[start - 1].retain_these;
+
+  for (size_t j = start; j < steps.size(); j++) {
+    // Filter useful_retain (same logic as rebuild_from)
+    std::set<size_t> useful;
+    for (auto t : steps[j].retain_these) {
+      bool is_out = steps[j].subgraph.boundary_outputs().count(t);
+      bool needed = (j + 1 < steps.size()) &&
+                    steps[j + 1].subgraph.boundary_inputs().count(t);
+      if (is_out && needed) useful.insert(t);
+    }
+
+    auto c = steps[j].subgraph.compute_cost(steps[j].config, cur, useful);
+    double new_cost;
+    if (c.latency < 1e17) {
+      new_cost = c.latency;
+    } else {
+      auto bc = steps[j].subgraph.best_cost(cur, useful);
+      if (bc.feasible)
+        new_cost = bc.latency;
+      else {
+        auto bc2 = steps[j].subgraph.best_cost(cur, {});
+        useful.clear();
+        new_cost = bc2.feasible ? bc2.latency : 1e18;
+      }
+    }
+
+    delta += new_cost - state.cost[j];
+    cur = useful;
+
+    // Early exit: if entering matches the stored entering for next step,
+    // no further cascade (all downstream costs stay the same)
+    if (j + 1 < steps.size() && cur == state.ret_entering[j + 1])
+      break;
+  }
+  return delta;
+}
+
 static SolutionMove best_move_for_tensor(SolState &state, size_t t,
                                          const std::set<size_t> &locked_tensors,
                                          double floor) {
@@ -793,32 +956,18 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto &sj = state.steps[i + 1];
     if (si.retain_these.count(t))
       continue; // already retained
-    // t must not already be entering this step from the previous step's retain —
-    // if it is, it's already resident and adding it to retain_these too would
-    // double-count it in the working set (assertion in Subgraph::working_set).
     if (state.ret_entering[i].count(t))
       continue;
-
-    // Step i must have t as a boundary OUTPUT to retain it
     if (!si.subgraph.boundary_outputs().count(t))
       continue;
-    // Step i+1 must benefit from having t
     if (!sj.subgraph.boundary_inputs().count(t))
       continue;
 
-    auto new_ret = si.retain_these;
-    new_ret.insert(t);
-    auto new_ent = state.ret_entering[i + 1];
-    new_ent.insert(t);
-    auto ci = si.subgraph.best_cost(state.ret_entering[i], new_ret);
-    if (!ci.feasible)
-      continue;
-    // Overlap between new_ent and sj.retain_these is safe in working_set.
-    auto cj = sj.subgraph.best_cost(new_ent, sj.retain_these);
-    if (!cj.feasible)
-      continue;
-    double saving =
-        (state.cost[i] + state.cost[i + 1]) - (ci.latency + cj.latency);
+    // Simulate: add t to step i's retain, then cascade forward.
+    auto tmp_steps = state.steps; // shallow copy
+    tmp_steps[i].retain_these.insert(t);
+    double delta = cascade_cost_delta(state, tmp_steps, i);
+    double saving = -delta;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_ADD;
       best.step_a = i;
@@ -831,23 +980,16 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
   for (size_t i = 0; i + 1 < state.size(); i++) {
     if (!state.steps[i].retain_these.count(t))
       continue;
-    auto &si = state.steps[i];
-    auto &sj = state.steps[i + 1];
-    auto new_ret = si.retain_these;
-    new_ret.erase(t);
-    auto new_ent = state.ret_entering[i + 1];
-    new_ent.erase(t);
-    auto ci = si.subgraph.best_cost(state.ret_entering[i], new_ret);
-    if (!ci.feasible)
-      continue;
-    // Strip new_ent from sj.retain_these before calling best_cost.
-    std::set<size_t> sj_safe_retain_r;
-    for (auto t2 : sj.retain_these) if (!new_ent.count(t2)) sj_safe_retain_r.insert(t2);
-    auto cj = sj.subgraph.best_cost(new_ent, sj_safe_retain_r);
-    if (!cj.feasible)
-      continue;
-    double saving =
-        (state.cost[i] + state.cost[i + 1]) - (ci.latency + cj.latency);
+    bool is_output = state.steps[i].subgraph.boundary_outputs().count(t);
+    bool useful_next = state.steps[i + 1].subgraph.boundary_inputs().count(t);
+    if (!is_output || !useful_next)
+      continue;  // already pruned by rebuild_from → saving=0
+
+    // Simulate: remove t from step i's retain, then cascade forward.
+    auto tmp_steps = state.steps; // shallow copy
+    tmp_steps[i].retain_these.erase(t);
+    double delta = cascade_cost_delta(state, tmp_steps, i);
+    double saving = -delta;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_REMOVE;
       best.step_a = i;
@@ -1525,8 +1667,7 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
       double actual_gain = total_before - state.total;
       double discrepancy = m.saving - actual_gain;
       if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m.saving)) + 1.0) {
-        if (g_verbose)
-          std::cerr << "    GAIN MISMATCH: predicted=" << m.saving
+        std::cerr << "    GAIN MISMATCH: predicted=" << m.saving
                     << " actual=" << actual_gain
                     << " Δ=" << discrepancy
                     << " type=" << (int)m.type
@@ -1649,8 +1790,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
       double actual_gain = total_before - state.total;
       double discrepancy = m_opt->saving - actual_gain;
       if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m_opt->saving)) + 1.0) {
-        if (g_verbose)
-          std::cerr << "    FM GAIN MISMATCH: predicted=" << m_opt->saving
+        std::cerr << "    FM GAIN MISMATCH: predicted=" << m_opt->saving
                     << " actual=" << actual_gain
                     << " Δ=" << discrepancy
                     << " type=" << (int)m_opt->type

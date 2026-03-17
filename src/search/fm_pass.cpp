@@ -124,8 +124,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             double actual_gain = total_before - total_after;
             double discrepancy = move.saving - actual_gain;
             if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(move.saving)) + 1.0) {
-                if (g_verbose)
-                    std::cerr << "    FM GAIN MISMATCH: predicted=" << move.saving
+                std::cerr << "    FM GAIN MISMATCH: predicted=" << move.saving
                               << " actual=" << actual_gain
                               << " Δ=" << discrepancy
                               << " type=" << (int)move.type
