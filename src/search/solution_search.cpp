@@ -1510,6 +1510,7 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
     if (is_stale(m, state))
       continue;
 
+    double total_before = state.total;
     auto [lo, hi] = apply_move(state, m);
     if (lo == SIZE_MAX)
       continue;
@@ -1518,6 +1519,21 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
     bump_affected(state, lo, hi, structural);
     state.rebuild_from(lo);
     applied++;
+
+#ifndef NDEBUG
+    {
+      double actual_gain = total_before - state.total;
+      double discrepancy = m.saving - actual_gain;
+      if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m.saving)) + 1.0) {
+        if (g_verbose)
+          std::cerr << "    GAIN MISMATCH: predicted=" << m.saving
+                    << " actual=" << actual_gain
+                    << " Δ=" << discrepancy
+                    << " type=" << (int)m.type
+                    << " steps=" << m.step_a << "," << m.step_b << "\n";
+      }
+    }
+#endif
 
     // Regenerate moves for affected + neighbor steps
     size_t regen_lo = (lo > 0) ? lo - 1 : 0;
@@ -1621,11 +1637,27 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     if (!m_opt) break;
     if (m_opt->saving < -floor) break;
 
+    double total_before = state.total;
     auto [lo, hi] = apply_move(state, *m_opt);
     if (lo == SIZE_MAX)
       continue;
     result.moves_applied++;
     state.rebuild_from(lo);
+
+#ifndef NDEBUG
+    {
+      double actual_gain = total_before - state.total;
+      double discrepancy = m_opt->saving - actual_gain;
+      if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m_opt->saving)) + 1.0) {
+        if (g_verbose)
+          std::cerr << "    FM GAIN MISMATCH: predicted=" << m_opt->saving
+                    << " actual=" << actual_gain
+                    << " Δ=" << discrepancy
+                    << " type=" << (int)m_opt->type
+                    << " steps=" << m_opt->step_a << "," << m_opt->step_b << "\n";
+      }
+    }
+#endif
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
