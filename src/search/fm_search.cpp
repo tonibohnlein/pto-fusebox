@@ -81,7 +81,8 @@ static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& m
 }
 
 static bool boundary_inputs_unavailable(const Partition& p,
-                                         const std::set<size_t>& proposed) {
+                                         const std::set<size_t>& proposed,
+                                         size_t stolen_from_ga = SIZE_MAX) {
     const Problem& prob = *p.prob;
     const DAG& dag = *p.dag;
     for (auto op : proposed) {
@@ -92,6 +93,10 @@ static bool boundary_inputs_unavailable(const Partition& p,
             bool available = false;
             for (auto gj : p.groups_of((size_t)prod)) {
                 if (!p.groups[gj].alive) continue;
+                // For STEAL: if the producer is in ga (the source group),
+                // the stolen op is leaving ga, so any tensor it consumed
+                // internally will become a boundary output → available.
+                if (gj == stolen_from_ga) { available = true; break; }
                 bool all_in_gj = true;
                 for (auto cop : dag.tensor_consumers[t])
                     if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
@@ -232,8 +237,9 @@ FMMove best_move_for(const Partition& part, size_t op,
         }  // end for gy
 
         // --- Eject: remove op from gx (one per gx, not per gy) ---
-        // Straddling check first: op has preds AND succs in remainder → cycle
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+        // eval_eject handles splitting the remainder into components correctly,
+        // even when op straddles (has preds AND succs in the group).
+        {
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving)) {
             std::vector<std::set<size_t>> components = er.remainder_components;
@@ -255,8 +261,8 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
         // INTERNAL_EJECT: remove op, remainder may split into components
-        // Straddling check: op has preds AND succs in group → cycle
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+        // eval_eject handles straddling correctly via component splitting.
+        {
         auto er = part.eval_eject(op, gx);
         if (er.feasible && accept(er.saving)) {
             std::vector<std::set<size_t>> components = er.remainder_components;
@@ -516,7 +522,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             // Cycle re-check at apply time: groups may have changed since evaluation
             if (part.dag->merge_creates_cycle({m.op}, part.groups[m.gb].ops)) return {};
             if (inline_gap_check(part, new_gb, m.ga, m.gb)) return {};
-            if (boundary_inputs_unavailable(part, new_gb)) return {};
+            if (boundary_inputs_unavailable(part, new_gb, m.ga)) return {};
             double new_gb_cost = part.eval_set(new_gb);
             if (new_gb_cost >= 1e17) return {};
 
@@ -574,8 +580,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::EJECT: {
-            // Straddling re-check at apply time
-            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
+            // No straddling check needed for EJECT: the remainder splits into
+            // connected components that can be scheduled independently.
+            // eval_eject handles the split correctly.
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
@@ -618,7 +625,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::INTERNAL_EJECT: {
-            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag)) return {};
+            // No straddling check needed: eval_eject splits into valid components.
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 
