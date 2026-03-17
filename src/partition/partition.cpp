@@ -219,6 +219,51 @@ bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const
     return false;
 }
 
+bool Partition::is_acyclic() const {
+    if (!prob || !dag) return true;
+    size_t ng = groups.size();
+
+    // Build Subgraphs for all alive groups
+    std::vector<std::optional<Subgraph>> sgs(ng);
+    for (size_t gi = 0; gi < ng; gi++) {
+        if (!groups[gi].alive) continue;
+        sgs[gi] = Subgraph::create(*prob, *dag,
+                      std::vector<size_t>(groups[gi].ops.begin(),
+                                          groups[gi].ops.end()));
+    }
+
+    // Build group DAG: edge gj→gi if gi needs a boundary input that gj produces
+    std::vector<int> in_deg(ng, 0);
+    std::vector<std::set<size_t>> succs(ng);
+
+    for (size_t i = 0; i < ng; i++) {
+        if (!groups[i].alive || !sgs[i]) continue;
+        for (auto t : sgs[i]->boundary_inputs()) {
+            int prod_op = dag->tensor_producer[t];
+            if (prod_op < 0) continue;
+            for (auto gj : groups_of((size_t)prod_op)) {
+                if (!groups[gj].alive || gj == i) continue;
+                if (!sgs[gj] || !sgs[gj]->boundary_outputs().count(t)) continue;
+                if (succs[gj].insert(i).second)
+                    in_deg[i]++;
+            }
+        }
+    }
+
+    // Kahn's algorithm
+    std::vector<size_t> q;
+    for (size_t i = 0; i < ng; i++)
+        if (groups[i].alive && in_deg[i] == 0) q.push_back(i);
+    size_t visited = 0, qi = 0;
+    while (qi < q.size()) {
+        size_t u = q[qi++];
+        visited++;
+        for (auto v : succs[u])
+            if (--in_deg[v] == 0) q.push_back(v);
+    }
+    return visited >= num_alive();
+}
+
 double Partition::eval_set(const std::set<size_t>& ops) const {
     if (ops.empty()) return 1e18;
     if (cache) return cache->evaluate(ops, *prob, *dag);

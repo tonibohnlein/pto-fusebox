@@ -184,6 +184,8 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
 
     switch (m.type) {
         case Move::MERGE: {
+            if (part.dag->merge_creates_cycle(part.groups[m.ga].ops, part.groups[m.gb].ops))
+                return {};
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(),
                           part.groups[m.gb].ops.end());
@@ -206,6 +208,7 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         }
         case Move::STEAL: {
             if (creates_topo_cycle(m.op, part.groups[m.gb].ops, *part.dag)) return {};
+            if (part.dag->merge_creates_cycle({m.op}, part.groups[m.ga].ops)) return {};
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
             std::set<size_t> new_gb = part.groups[m.gb].ops;
@@ -318,6 +321,14 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
     }
 
     part.rebuild_index();
+
+#ifndef NDEBUG
+    if (!part.is_acyclic()) {
+        std::cerr << "    BUG: apply_move created cycle! type=" << (int)m.type
+                  << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb << "\n";
+    }
+#endif
+
     return dirty;
 }
 
@@ -527,60 +538,9 @@ Partition greedy_descent(Partition part) {
 // cleanup_redundant_recomputation and repair_ephemeral_gaps removed.
 // Under the new ephemeral rule (tensor is ephemeral only if ALL DAG consumers
 // are internal), external consumers force boundary output materialization,
-// Under the new ephemeral rule, gaps cannot occur: any tensor needed by
-// another group automatically has an external consumer → boundary output.
-// Only acyclicity of the group DAG matters.
-
-// ============================================================================
-// Cycle check: build group DAG, run Kahn's algorithm.
-// Returns true if the group DAG has a cycle.
-// O(groups * tensors) — used by FM pass for safety, not greedy hot path.
-// ============================================================================
-
+// Cycle check used by FM pass as safety net.
 bool partition_has_gap(const Partition& part) {
-    if (!part.prob || !part.dag) return false;
-
-    size_t ng = part.groups.size();
-
-    // Build Subgraphs for all alive groups
-    std::vector<std::optional<Subgraph>> sgs(ng);
-    for (size_t gi = 0; gi < ng; gi++) {
-        if (!part.groups[gi].alive) continue;
-        sgs[gi] = Subgraph::create(*part.prob, *part.dag,
-                      std::vector<size_t>(part.groups[gi].ops.begin(),
-                                          part.groups[gi].ops.end()));
-    }
-
-    // Build group DAG edges via boundary tensors, run Kahn's
-    std::vector<std::set<size_t>> tmp_succs(ng);
-    std::vector<int> tmp_in_deg(ng, 0);
-
-    for (size_t i = 0; i < ng; i++) {
-        if (!part.groups[i].alive || !sgs[i]) continue;
-        for (auto t : sgs[i]->boundary_inputs()) {
-            int prod_op = part.dag->tensor_producer[t];
-            if (prod_op < 0) continue;
-            for (auto gj : part.groups_of((size_t)prod_op)) {
-                if (!part.groups[gj].alive || gj == i) continue;
-                if (!sgs[gj] || !sgs[gj]->boundary_outputs().count(t)) continue;
-                if (tmp_succs[gj].insert(i).second)
-                    tmp_in_deg[i]++;
-            }
-        }
-    }
-
-    std::vector<size_t> q;
-    size_t visited = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (part.groups[i].alive && tmp_in_deg[i] == 0) q.push_back(i);
-    size_t qi = 0;
-    while (qi < q.size()) {
-        size_t u = q[qi++];
-        visited++;
-        for (auto v : tmp_succs[u])
-            if (--tmp_in_deg[v] == 0) q.push_back(v);
-    }
-    return visited < part.num_alive();  // cycle!
+    return !part.is_acyclic();
 }
 
 // ============================================================================

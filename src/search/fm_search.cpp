@@ -1,5 +1,6 @@
 #include "search/fm_search.h"
 #include <algorithm>
+#include <iostream>
 
 // Under the new ephemeral rule (tensor ephemeral only if ALL DAG consumers
 // are internal), gap checks are unnecessary. Only acyclicity matters.
@@ -519,5 +520,13 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     }
 
     part.rebuild_index();
+
+#ifndef NDEBUG
+    if (!part.is_acyclic()) {
+        std::cerr << "    BUG: apply_fm_move created cycle! type=" << (int)m.type
+                  << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb << "\n";
+    }
+#endif
+
     return affected;
 }

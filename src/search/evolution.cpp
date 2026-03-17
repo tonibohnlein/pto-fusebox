@@ -1,111 +1,13 @@
 #include "search/evolution.h"
 #include "search/verbose.h"
-#include "search/local_search.h"  // partition_has_gap
+#include "search/local_search.h"  // partition_has_gap (cycle check)
 #include "search/merkle_hash.h"
 #include <algorithm>
 #include <iostream>
 
-// ============================================================================
-// Inline gap checks — same as in local_search.cpp / fm_search.cpp
-// ============================================================================
+// Under the new ephemeral rule, gap checks are unnecessary.
+// Only acyclicity matters. partition_has_gap now checks cycles only.
 
-static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
-                              size_t ga, size_t gb) {
-    const Problem& prob = *p.prob;
-    const DAG& dag = *p.dag;
-    for (auto op : merged) {
-        for (auto t : prob.ops[op].outputs) {
-            bool all_internal = true;
-            bool any_internal = false;
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (merged.count(cop)) any_internal = true;
-                else all_internal = false;
-            }
-            if (!any_internal) continue;
-            if (!all_internal) continue;
-            int prod_op = dag.tensor_producer[t];
-            if (prod_op < 0) continue;
-            bool available = false;
-            for (auto gj : p.groups_of((size_t)prod_op)) {
-                if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                bool all_in_gj = true;
-                for (auto cop : dag.tensor_consumers[t])
-                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available = true; break; }
-            }
-            if (available) continue;
-            for (auto cop : dag.tensor_consumers[t]) {
-                for (auto gj : p.groups_of(cop)) {
-                    if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                    if (!p.groups[gj].ops.count((size_t)prod_op))
-                        return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-static bool inline_gap_check_multi(const Partition& p, const std::set<size_t>& merged,
-                                    const std::vector<size_t>& exclude) {
-    std::set<size_t> excl(exclude.begin(), exclude.end());
-    const Problem& prob = *p.prob;
-    const DAG& dag = *p.dag;
-    for (auto op : merged) {
-        for (auto t : prob.ops[op].outputs) {
-            bool all_internal = true;
-            bool any_internal = false;
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (merged.count(cop)) any_internal = true;
-                else all_internal = false;
-            }
-            if (!any_internal) continue;
-            if (!all_internal) continue;
-            int prod_op = dag.tensor_producer[t];
-            if (prod_op < 0) continue;
-            bool available = false;
-            for (auto gj : p.groups_of((size_t)prod_op)) {
-                if (!p.groups[gj].alive || excl.count(gj)) continue;
-                bool all_in_gj = true;
-                for (auto cop : dag.tensor_consumers[t])
-                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available = true; break; }
-            }
-            if (available) continue;
-            for (auto cop : dag.tensor_consumers[t]) {
-                for (auto gj : p.groups_of(cop)) {
-                    if (!p.groups[gj].alive || excl.count(gj)) continue;
-                    if (!p.groups[gj].ops.count((size_t)prod_op))
-                        return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-static bool boundary_inputs_unavailable(const Partition& p,
-                                         const std::set<size_t>& proposed) {
-    const Problem& prob = *p.prob;
-    const DAG& dag = *p.dag;
-    for (auto op : proposed) {
-        for (auto t : prob.ops[op].inputs) {
-            int prod = dag.tensor_producer[t];
-            if (prod < 0) continue;
-            if (proposed.count((size_t)prod)) continue;
-            bool available = false;
-            for (auto gj : p.groups_of((size_t)prod)) {
-                if (!p.groups[gj].alive) continue;
-                bool all_in_gj = true;
-                for (auto cop : dag.tensor_consumers[t])
-                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available = true; break; }
-            }
-            if (!available) return true;
-        }
-    }
-    return false;
-}
 #include <functional>
 
 // ============================================================================
@@ -195,7 +97,6 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     for (auto op : part.groups[gb].ops)
         merged.insert(op);
     
-    if (inline_gap_check(part, merged, ga, gb)) return part;
     double cost = part.eval_set(merged);
     if (cost >= 1e17) return part;
     
@@ -232,7 +133,6 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
     auto [op_a, op_b] = bridges[rng() % bridges.size()];
     auto sr = part.eval_split(op_a, op_b, gi);
     if (!sr.feasible) return part;
-    if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, gi)) return part;
     
     // Apply split
     Partition saved = part;
@@ -723,32 +623,10 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         double best_cost = 1e18;
         size_t best_gi = SIZE_MAX;
         
-        // Gap check for crossover: child is only partially built, so external
-        // consumers of an ephemeral tensor may not yet be in any child group.
-        // child.creates_ephemeral_gap() is blind to those unassigned ops
-        // (groups_of returns empty).  Add a second pass: if any external consumer
-        // of an ephemeral tensor is unassigned, treat it as a definite gap —
-        // crossover never creates recompute groups, so that consumer will end up
-        // in a group that does not contain the producer.
-        auto would_gap = [&](const std::set<size_t>& proposed, size_t excl_gi) -> bool {
-            if (inline_gap_check(child, proposed, excl_gi, SIZE_MAX)) return true;
-            if (boundary_inputs_unavailable(child, proposed)) return true;
-            // Extra crossover check: unassigned ops that consume a purely-ephemeral tensor.
-            // Under new rule: T is ephemeral only if ALL consumers are in proposed.
-            // If an unassigned op consumes T and T is ephemeral (all consumers in proposed),
-            // that's impossible — the unassigned op IS an external consumer, so T wouldn't
-            // be ephemeral. The check simplifies: if all consumers are in proposed, no
-            // unassigned op can consume T. If any consumer is unassigned, T has an external
-            // consumer → boundary output → no gap.
-            // So this extra check is no longer needed under the new rule.
-            return false;
-        };
-
         for (auto gi : adj_child_groups) {
             if (child.dag->merge_creates_cycle(cluster, child.groups[gi].ops)) continue;
             std::set<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
-            if (would_gap(merged, gi)) continue;
             double c = child.eval_set(merged);
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;
@@ -758,13 +636,12 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         
         // Also evaluate the cluster as standalone
         double standalone = child.eval_set(cluster);
-        bool standalone_gap = would_gap(cluster, SIZE_MAX);
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
-        } else if (standalone < 1e17 && !standalone_gap) {
+        } else if (standalone < 1e17) {
             child.add_group(cluster, standalone);
         } else if (best_gi != SIZE_MAX) {
             for (auto op : cluster) child.groups[best_gi].ops.insert(op);
