@@ -584,6 +584,9 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 int64_t Subgraph::working_set(const TileConfig &cfg,
                               const std::set<size_t> &retained_from_prev,
                               const std::set<size_t> &retain_these) const {
+  if (!is_valid_tiling(cfg))
+    return INT64_MAX;
+
   int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
   int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
