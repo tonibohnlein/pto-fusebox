@@ -300,6 +300,9 @@ struct SolState {
     for (size_t i = 0; i < idx; i++)
       total += cost[i];
     for (size_t i = idx; i < n; i++) {
+      // Save old entering for convergence check BEFORE overwriting
+      std::set<size_t> old_entering;
+      if (i < ret_entering.size()) old_entering = ret_entering[i];
       ret_entering[i] = cur;
 
       // Only boundary OUTPUTS that the next step needs can be retained.
@@ -312,27 +315,42 @@ struct SolState {
       }
       steps[i].retain_these = useful_retain;
 
-      auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
-                                              steps[i].retain_these);
-      if (c.latency >= 1e17) {
-        // Config infeasible with new entering set — find new optimal config
+      // If entering set hasn't changed from previous rebuild,
+      // stored config is still optimal → use compute_cost (fast).
+      // Only call best_cost when entering actually changed.
+      double lat;
+      if (cur == old_entering && i > idx) {
+        // Entering unchanged from last rebuild → stored config is optimal
+        auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
+                                                steps[i].retain_these);
+        lat = c.latency;
+        if (lat >= 1e17) {
+          auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+          if (bc.feasible) { steps[i].config = bc.config; lat = bc.latency; }
+          else {
+            auto bc2 = steps[i].subgraph.best_cost(cur, {});
+            if (bc2.feasible) { steps[i].config = bc2.config; steps[i].retain_these.clear(); lat = bc2.latency; }
+          }
+        }
+      } else {
+        // Entering changed → re-optimize config
         auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
         if (bc.feasible) {
           steps[i].config = bc.config;
-          c.latency = bc.latency;
+          lat = bc.latency;
         } else {
-          // Try without retain
           auto bc2 = steps[i].subgraph.best_cost(cur, {});
           if (bc2.feasible) {
             steps[i].config = bc2.config;
             steps[i].retain_these.clear();
-            c.latency = bc2.latency;
+            lat = bc2.latency;
+          } else {
+            lat = 1e18;
           }
-          // else: leave as infeasible, will be caught by validation
         }
       }
-      cost[i] = c.latency;
-      total += c.latency;
+      cost[i] = lat;
+      total += lat;
       cur = steps[i].retain_these;
     }
     rebuild_op_index();
@@ -396,10 +414,13 @@ std::set<size_t> compute_feasibly_retainable(const Problem &prob, const DAG &dag
 // ============================================================================
 
 // ============================================================================
-// simulate_rebuild_cost: run the exact same logic as rebuild_from on a
-// temporary step vector, returning the total cost from `start` onward.
-// This matches rebuild_from exactly: prunes retain_these, tries compute_cost
-// with stored config, falls back to best_cost, updates config.
+// simulate_rebuild_cost: predict the total cost from `start` onward after
+// a modification to retain_these or step structure.
+//
+// Always uses best_cost to find the optimal config for each step given its
+// entering/retain context. This matches apply_move's behavior (which calls
+// best_cost for modified steps). For unmodified downstream steps, best_cost
+// typically finds the same config that's already stored.
 // ============================================================================
 static double simulate_rebuild_cost(std::vector<ScheduleStep> &steps,
                                     size_t start) {
@@ -409,6 +430,7 @@ static double simulate_rebuild_cost(std::vector<ScheduleStep> &steps,
     cur = steps[start - 1].retain_these;
 
   for (size_t i = start; i < steps.size(); i++) {
+    // Prune retain_these to useful set (same as rebuild_from)
     std::set<size_t> useful;
     for (auto t : steps[i].retain_these) {
       bool is_out = steps[i].subgraph.boundary_outputs().count(t);
@@ -418,23 +440,25 @@ static double simulate_rebuild_cost(std::vector<ScheduleStep> &steps,
     }
     steps[i].retain_these = useful;
 
-    auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
-                                            steps[i].retain_these);
-    if (c.latency >= 1e17) {
-      auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
-      if (bc.feasible) {
-        steps[i].config = bc.config;
-        c.latency = bc.latency;
+    // Always use best_cost to find optimal config for this context.
+    // This matches what apply_move does for directly affected steps,
+    // and for unchanged downstream steps, best_cost typically returns
+    // the same config that's already stored.
+    auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+    if (bc.feasible) {
+      steps[i].config = bc.config;
+      total += bc.latency;
+    } else {
+      // Try without retain
+      auto bc2 = steps[i].subgraph.best_cost(cur, {});
+      if (bc2.feasible) {
+        steps[i].config = bc2.config;
+        steps[i].retain_these.clear();
+        total += bc2.latency;
       } else {
-        auto bc2 = steps[i].subgraph.best_cost(cur, {});
-        if (bc2.feasible) {
-          steps[i].config = bc2.config;
-          steps[i].retain_these.clear();
-          c.latency = bc2.latency;
-        }
+        total += 1e18;
       }
     }
-    total += c.latency;
     cur = steps[i].retain_these;
   }
   return total;
@@ -928,7 +952,7 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     double old_cost = 0;
     for (size_t j = i; j < state.size(); j++) old_cost += state.cost[j];
 
-    // Simulate: add t, run exact rebuild logic, get new cost
+    // Simulate: add t, rebuild with optimal configs
     auto tmp = state.steps;
     tmp[i].retain_these.insert(t);
     double new_cost = simulate_rebuild_cost(tmp, i);
@@ -954,7 +978,7 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     double old_cost = 0;
     for (size_t j = i; j < state.size(); j++) old_cost += state.cost[j];
 
-    // Simulate: remove t, run exact rebuild logic, get new cost
+    // Simulate: remove t, rebuild with optimal configs
     auto tmp = state.steps;
     tmp[i].retain_these.erase(t);
     double new_cost = simulate_rebuild_cost(tmp, i);
@@ -1076,40 +1100,33 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     std::set<size_t> rem = si_set;
     rem.erase(m.op);
 
-    // ====================================================================
-    // TOPOLOGICAL TIMELINE CHECK
-    // We cannot blindly put the ejected op after the remainder!
-    // ====================================================================
     bool must_be_before = false;
-    for (auto succ : dag.op_succs[m.op]) {
+    for (auto succ : dag.op_succs[m.op])
         if (rem.count(succ)) must_be_before = true;
-    }
     bool must_be_after = false;
-    for (auto pred : dag.op_preds[m.op]) {
+    for (auto pred : dag.op_preds[m.op])
         if (rem.count(pred)) must_be_after = true;
-    }
-    if (must_be_before && must_be_after) return {SIZE_MAX, 0}; // Paradox!
-    // ====================================================================
+    if (must_be_before && must_be_after) return {SIZE_MAX, 0};
 
     auto sg_r = Subgraph::create(prob, dag, {rem.begin(), rem.end()});
     auto sg_s = Subgraph::create(prob, dag, {m.op});
     if (!sg_r || !sg_s) return {SIZE_MAX, 0};
     
-    auto rr = filter_retain(si.retain_these, *sg_r, state.ret_entering[m.step_a]);
-    auto cr = sg_r->best_cost(state.ret_entering[m.step_a], rr);
-    auto cs = sg_s->best_cost({}, {});
-    if (!cr.feasible || !cs.feasible) return {SIZE_MAX, 0};
+    // Basic feasibility check (any config works at all?)
+    if (!sg_r->best_cost({}, {}).feasible) return {SIZE_MAX, 0};
+    if (!sg_s->best_cost({}, {}).feasible) return {SIZE_MAX, 0};
     
+    // Set retain from old step (rebuild_from will prune to useful_retain)
+    auto rr = filter_retain(si.retain_these, *sg_r, state.ret_entering[m.step_a]);
+
     ScheduleStep step_r;
     step_r.subgraph = std::move(*sg_r);
-    step_r.config = cr.config;
     step_r.retain_these = rr;
+    // Config will be set by rebuild_from
 
     ScheduleStep step_s;
     step_s.subgraph = std::move(*sg_s);
-    step_s.config = cs.config;
 
-    // Apply strict chronological order
     if (must_be_before) {
         state.steps[m.step_a] = std::move(step_s);
         state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(step_r));
@@ -1250,53 +1267,24 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     if (m.step_a >= state.size())
       return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
-    // Staleness: tensor may already have been added, or step structure changed
     if (si.retain_these.count(m.tensor))
       return {SIZE_MAX, 0};
     if (!si.subgraph.boundary_outputs().count(m.tensor))
       return {SIZE_MAX, 0};
-    auto nr = si.retain_these;
-    nr.insert(m.tensor);
-    auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
-    if (!ci.feasible)
-      return {SIZE_MAX, 0};
-    // Verify and update step_a+1 with new entering set.
-    // Overlap between new entering and next step's retain is now safe.
-    if (m.step_a + 1 < state.size()) {
-      auto new_ent = nr;
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
-          new_ent, state.steps[m.step_a + 1].retain_these);
-      if (!cj.feasible)
-        return {SIZE_MAX, 0};
-      state.steps[m.step_a + 1].config = cj.config;
-    }
-    si.retain_these = nr;
-    si.config = ci.config;
+    // Just modify retain_these. rebuild_from will:
+    //  1. Prune to useful_retain
+    //  2. Call best_cost with pruned retain to find optimal config
+    //  3. Propagate downstream
+    si.retain_these.insert(m.tensor);
     return {m.step_a, state.size()};
   }
   case SolutionMove::RETAIN_REMOVE: {
     if (m.step_a >= state.size())
       return {SIZE_MAX, 0};
     auto &si = state.steps[m.step_a];
-    // Staleness: rebuild_from may have already pruned this tensor
     if (!si.retain_these.count(m.tensor))
       return {SIZE_MAX, 0};
-    auto nr = si.retain_these;
-    nr.erase(m.tensor);
-    auto ci = si.subgraph.best_cost(state.ret_entering[m.step_a], nr);
-    if (!ci.feasible)
-      return {SIZE_MAX, 0};
-    // Verify and update step_a+1 with new entering set.
-    if (m.step_a + 1 < state.size()) {
-      auto new_ent = nr;
-      auto cj = state.steps[m.step_a + 1].subgraph.best_cost(
-          new_ent, state.steps[m.step_a + 1].retain_these);
-      if (!cj.feasible)
-        return {SIZE_MAX, 0};
-      state.steps[m.step_a + 1].config = cj.config;
-    }
-    si.retain_these = nr;
-    si.config = ci.config;
+    si.retain_these.erase(m.tensor);
     return {m.step_a, state.size()};
   }
   case SolutionMove::DE_RECOMPUTE: {

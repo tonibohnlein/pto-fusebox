@@ -39,17 +39,20 @@ static double simulate_rebuild_cost(std::vector<ScheduleStep> &steps,
             if (is_out && needed) useful.insert(t);
         }
         steps[i].retain_these = useful;
-        auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
-                                                steps[i].retain_these);
-        if (c.latency >= 1e17) {
-            auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
-            if (bc.feasible) { steps[i].config = bc.config; c.latency = bc.latency; }
-            else {
-                auto bc2 = steps[i].subgraph.best_cost(cur, {});
-                if (bc2.feasible) { steps[i].config = bc2.config; steps[i].retain_these.clear(); c.latency = bc2.latency; }
+        auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+        if (bc.feasible) {
+            steps[i].config = bc.config;
+            total += bc.latency;
+        } else {
+            auto bc2 = steps[i].subgraph.best_cost(cur, {});
+            if (bc2.feasible) {
+                steps[i].config = bc2.config;
+                steps[i].retain_these.clear();
+                total += bc2.latency;
+            } else {
+                total += 1e18;
             }
         }
-        total += c.latency;
         cur = steps[i].retain_these;
     }
     return total;
