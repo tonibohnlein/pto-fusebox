@@ -255,7 +255,6 @@ struct SolState {
     for (size_t i = 0; i < n; i++) {
       ret_entering[i] = cur;
 
-      // Only boundary OUTPUTS that the next step needs can be retained.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool is_output = steps[i].subgraph.boundary_outputs().count(t);
@@ -265,24 +264,21 @@ struct SolState {
       }
       steps[i].retain_these = useful_retain;
 
-      auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
-                                              steps[i].retain_these);
-      if (c.latency >= 1e17) {
-        auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
-        if (bc.feasible) {
-          steps[i].config = bc.config;
-          c.latency = bc.latency;
+      auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+      if (bc.feasible) {
+        steps[i].config = bc.config;
+        cost[i] = bc.latency;
+      } else {
+        auto bc2 = steps[i].subgraph.best_cost(cur, {});
+        if (bc2.feasible) {
+          steps[i].config = bc2.config;
+          steps[i].retain_these.clear();
+          cost[i] = bc2.latency;
         } else {
-          auto bc2 = steps[i].subgraph.best_cost(cur, {});
-          if (bc2.feasible) {
-            steps[i].config = bc2.config;
-            steps[i].retain_these.clear();
-            c.latency = bc2.latency;
-          }
+          cost[i] = 1e18;
         }
       }
-      cost[i] = c.latency;
-      total += c.latency;
+      total += cost[i];
       cur = steps[i].retain_these;
     }
     rebuild_op_index();
@@ -300,12 +296,8 @@ struct SolState {
     for (size_t i = 0; i < idx; i++)
       total += cost[i];
     for (size_t i = idx; i < n; i++) {
-      // Save old entering for convergence check BEFORE overwriting
-      std::set<size_t> old_entering;
-      if (i < ret_entering.size()) old_entering = ret_entering[i];
       ret_entering[i] = cur;
 
-      // Only boundary OUTPUTS that the next step needs can be retained.
       std::set<size_t> useful_retain;
       for (auto t : steps[i].retain_these) {
         bool is_output = steps[i].subgraph.boundary_outputs().count(t);
@@ -315,42 +307,25 @@ struct SolState {
       }
       steps[i].retain_these = useful_retain;
 
-      // If entering set hasn't changed from previous rebuild,
-      // stored config is still optimal → use compute_cost (fast).
-      // Only call best_cost when entering actually changed.
-      double lat;
-      if (cur == old_entering && i > idx) {
-        // Entering unchanged from last rebuild → stored config is optimal
-        auto c = steps[i].subgraph.compute_cost(steps[i].config, cur,
-                                                steps[i].retain_these);
-        lat = c.latency;
-        if (lat >= 1e17) {
-          auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
-          if (bc.feasible) { steps[i].config = bc.config; lat = bc.latency; }
-          else {
-            auto bc2 = steps[i].subgraph.best_cost(cur, {});
-            if (bc2.feasible) { steps[i].config = bc2.config; steps[i].retain_these.clear(); lat = bc2.latency; }
-          }
-        }
+      // Always use best_cost to find optimal config for current context.
+      // This matches simulate_rebuild_cost exactly and avoids stale-config
+      // issues after structural moves (EJECT/SPLIT insert steps, shifting
+      // ret_entering indices).
+      auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
+      if (bc.feasible) {
+        steps[i].config = bc.config;
+        cost[i] = bc.latency;
       } else {
-        // Entering changed → re-optimize config
-        auto bc = steps[i].subgraph.best_cost(cur, steps[i].retain_these);
-        if (bc.feasible) {
-          steps[i].config = bc.config;
-          lat = bc.latency;
+        auto bc2 = steps[i].subgraph.best_cost(cur, {});
+        if (bc2.feasible) {
+          steps[i].config = bc2.config;
+          steps[i].retain_these.clear();
+          cost[i] = bc2.latency;
         } else {
-          auto bc2 = steps[i].subgraph.best_cost(cur, {});
-          if (bc2.feasible) {
-            steps[i].config = bc2.config;
-            steps[i].retain_these.clear();
-            lat = bc2.latency;
-          } else {
-            lat = 1e18;
-          }
+          cost[i] = 1e18;
         }
       }
-      cost[i] = lat;
-      total += lat;
+      total += cost[i];
       cur = steps[i].retain_these;
     }
     rebuild_op_index();
@@ -657,7 +632,16 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       auto ce = sg->best_cost(state.ret_entering[sj], ret);
       if (!ce.feasible)
         continue;
-      double saving = state.cost[sj] - ce.latency;
+
+      // Use simulate_rebuild_cost for cascade-accurate prediction
+      double old_cost = 0;
+      for (size_t j = sj; j < state.size(); j++) old_cost += state.cost[j];
+      auto tmp = state.steps;
+      tmp[sj].subgraph = *sg;
+      tmp[sj].config = ce.config;
+      tmp[sj].retain_these = ret;
+      double new_cost = simulate_rebuild_cost(tmp, sj);
+      double saving = old_cost - new_cost;
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::RECOMPUTE;
         best.step_a = sj;
