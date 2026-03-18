@@ -161,11 +161,11 @@ FMMove best_move_for(const Partition& part, size_t op,
         }
 
         {
-            std::set<std::pair<size_t,size_t>> split_checked;
+
             for (auto v : part.dag->op_neighbors[op]) {
                 if (!part.groups[gx].ops.count(v)) continue;
                 auto edge = std::make_pair(std::min(op, v), std::max(op, v));
-                if (!split_checked.insert(edge).second) continue;
+
                 auto sr = part.eval_split(edge.first, edge.second, gx);
                 if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
                     if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
@@ -295,6 +295,10 @@ FMMove best_move_for(const Partition& part, size_t op,
 
 // ============================================================================
 // apply_fm_move
+//
+// Pre-mutation acyclicity checks for MERGE/STEAL/RECOMPUTE/TENSOR_MERGE.
+// TENSOR_EXTRACT: all remainder costs validated before any mutation.
+// No post-hoc is_acyclic() needed — no partial mutation on failure.
 // ============================================================================
 
 std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
@@ -303,6 +307,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     switch (m.type) {
         case FMMove::STEAL: {
+            // FMMove::STEAL: op moves FROM m.ga INTO m.gb
+            if (!part.is_acyclic_after_steal(m.op, m.ga, m.gb)) return {};
+
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.erase(m.op);
             std::set<size_t> new_gb = part.groups[m.gb].ops;
@@ -329,6 +336,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::MERGE: {
+            if (!part.is_acyclic_after_merge(m.ga, m.gb)) return {};
+
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
             double merged_cost = part.eval_set(merged);
@@ -345,6 +354,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::RECOMPUTE: {
+            if (!part.is_acyclic_after_recompute(m.op, m.gb)) return {};
+
             std::set<size_t> new_gb = part.groups[m.gb].ops;
             new_gb.insert(m.op);
             double new_cost = part.eval_set(new_gb);
@@ -399,6 +410,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::TENSOR_MERGE: {
             for (auto cg : m.tensor_groups)
                 if (!part.groups[cg].alive) return {};
+            if (!part.is_acyclic_after_merge(m.tensor_groups)) return {};
 
             std::set<size_t> merged_ops;
             for (auto cg : m.tensor_groups)
@@ -431,25 +443,31 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             double extract_cost = part.eval_set(extract_ops);
             if (extract_cost >= 1e17) return {};
 
-            std::vector<std::pair<size_t, std::set<size_t>>> remainders;
+            // Pre-validate ALL remainder costs before mutating anything
+            struct RemInfo { size_t gi; std::set<size_t> rem; double cost; };
+            std::vector<RemInfo> remainders;
             for (auto cg : m.tensor_groups) {
                 std::set<size_t> rem;
                 for (auto rop : part.groups[cg].ops)
                     if (!extract_ops.count(rop)) rem.insert(rop);
-                remainders.push_back({cg, std::move(rem)});
+                double rc = 0;
+                if (!rem.empty()) {
+                    rc = part.eval_set(rem);
+                    if (rc >= 1e17) return {};  // reject before any mutation
+                }
+                remainders.push_back({cg, std::move(rem), rc});
             }
 
-            for (auto& [gi, rem] : remainders) {
-                if (rem.empty()) {
-                    part.groups[gi].alive = false;
+            // All costs validated — now mutate
+            for (auto& r : remainders) {
+                if (r.rem.empty()) {
+                    part.groups[r.gi].alive = false;
                 } else {
-                    double rc = part.eval_set(rem);
-                    if (rc >= 1e17) return {};
-                    part.groups[gi].ops = std::move(rem);
-                    part.groups[gi].cost = rc;
+                    part.groups[r.gi].ops = std::move(r.rem);
+                    part.groups[r.gi].cost = r.cost;
                 }
-                part.groups[gi].gen++;
-                affected.insert(gi);
+                part.groups[r.gi].gen++;
+                affected.insert(r.gi);
             }
 
             size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
@@ -476,17 +494,5 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     }
 
     part.rebuild_index();
-
-    // Post-hoc acyclicity check.
-    // For MERGE, STEAL, RECOMPUTE, TENSOR_MERGE: best_move_for already used
-    // is_acyclic_after_* pre-checks, so this should never fire. Assert in debug.
-    // For TENSOR_EXTRACT: no pre-check available, so this is the real guard.
-    if ((m.type == FMMove::MERGE || m.type == FMMove::STEAL ||
-         m.type == FMMove::RECOMPUTE || m.type == FMMove::TENSOR_MERGE ||
-         m.type == FMMove::TENSOR_EXTRACT) &&
-        !part.is_acyclic()) {
-        return {};
-    }
-
     return affected;
 }

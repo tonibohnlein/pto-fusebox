@@ -180,13 +180,13 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
 // ============================================================================
 
 static std::set<size_t> apply_move(Partition& part, const Move& m) {
-    // Moves on the heap are guaranteed feasible (acyclic) by best_move_for_op.
-    // apply_move only re-verifies cost (which may have changed due to
-    // concurrent mutations in the greedy loop).
     std::set<size_t> dirty;
 
     switch (m.type) {
         case Move::MERGE: {
+            // Pre-mutation acyclicity check (cheap hypothetical Kahn's)
+            if (!part.is_acyclic_after_merge(m.ga, m.gb)) return {};
+
             std::set<size_t> merged = part.groups[m.ga].ops;
             merged.insert(part.groups[m.gb].ops.begin(),
                           part.groups[m.gb].ops.end());
@@ -208,6 +208,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             break;
         }
         case Move::STEAL: {
+            // Move::STEAL: op goes FROM m.gb INTO m.ga
+            if (!part.is_acyclic_after_steal(m.op, m.gb, m.ga)) return {};
+
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
             std::set<size_t> new_gb = part.groups[m.gb].ops;
@@ -244,6 +247,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
             break;
         }
         case Move::RECOMPUTE: {
+            // Move::RECOMPUTE: op added to m.ga
+            if (!part.is_acyclic_after_recompute(m.op, m.ga)) return {};
+
             std::set<size_t> new_ga = part.groups[m.ga].ops;
             new_ga.insert(m.op);
             double new_cost = part.eval_set(new_ga);
@@ -316,16 +322,6 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
     }
 
     part.rebuild_index();
-
-#ifndef NDEBUG
-    if (!part.is_acyclic()) {
-        std::cerr << "    ASSERT FAIL: apply_move produced cyclic partition! type="
-                  << (int)m.type << " op=" << m.op
-                  << " ga=" << m.ga << " gb=" << m.gb << "\n";
-        assert(false && "apply_move produced cyclic partition");
-    }
-#endif
-
     return dirty;
 }
 
