@@ -1525,19 +1525,32 @@ struct SolActiveSet {
       activate_step(state, i);
   }
 
-  std::optional<SolutionMove> pop_best() {
-    // Drain locked entries from tops of both heaps
+  std::optional<SolutionMove> pop_best(SolState &state) {
+    // Drain locked and stale entries from tops of both heaps.
+    // Stale entries are lazily recomputed and pushed back.
     while (!op_heap.empty()) {
       auto top = op_heap.peek_best();
       if (!top || !top->second.valid()) { op_heap.pop_best(); continue; }
       if (locked_ops.count(top->second.op)) { op_heap.pop_best(); continue; }
-      break;  // valid unlocked op at top
+      if (is_stale(top->second, state)) {
+        size_t op = top->second.op;
+        op_heap.pop_best();
+        recompute_op(state, op);  // pushes fresh move back into heap
+        continue;
+      }
+      break;  // valid, unlocked, fresh op at top
     }
     while (!tensor_heap.empty()) {
       auto top = tensor_heap.peek_best();
       if (!top || !top->second.valid()) { tensor_heap.pop_best(); continue; }
       if (locked_tensors.count(top->second.tensor)) { tensor_heap.pop_best(); continue; }
-      break;  // valid unlocked tensor at top
+      if (is_stale(top->second, state)) {
+        size_t t = top->second.tensor;
+        tensor_heap.pop_best();
+        recompute_tensor(state, t);
+        continue;
+      }
+      break;  // valid, unlocked, fresh tensor at top
     }
 
     // Compare tops, pop the winner
@@ -1605,9 +1618,29 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
     if (m.saving <= 0.01)
       break;
 
-    // Staleness check
-    if (is_stale(m, state))
+    // Staleness check → lazy recomputation
+    if (is_stale(m, state)) {
+      std::set<size_t> empty;
+      if (m.type == SolutionMove::RETAIN_ADD || m.type == SolutionMove::RETAIN_REMOVE) {
+        if (m.tensor != SIZE_MAX) {
+          auto new_m = best_move_for_tensor(state, m.tensor, empty, 0.0);
+          if (new_m.valid() && new_m.saving > 0.01) {
+            new_m.gen_a = (new_m.step_a < state.size()) ? state.gen[new_m.step_a] : -1;
+            new_m.gen_b = (new_m.step_a + 1 < state.size()) ? state.gen[new_m.step_a + 1] : -1;
+            heap.push(new_m);
+          }
+        }
+      } else if (m.op != SIZE_MAX) {
+        auto new_m = best_move_for_op(state, m.op, empty, 0.0);
+        if (new_m.valid() && new_m.saving > 0.01) {
+          new_m.gen_a = (new_m.step_a < state.size()) ? state.gen[new_m.step_a] : -1;
+          new_m.gen_b = (new_m.step_b != SIZE_MAX && new_m.step_b < state.size())
+                        ? state.gen[new_m.step_b] : -1;
+          heap.push(new_m);
+        }
+      }
       continue;
+    }
 
     double total_before = state.total;
     auto [lo, hi] = apply_move(state, m);
@@ -1730,7 +1763,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     if (Clock::now() >= cfg.deadline) break;
     if (no_improve >= max_no_improve) break;
 
-    auto m_opt = active.pop_best();
+    auto m_opt = active.pop_best(state);
     // Active set empty or best move below floor → stop
     if (!m_opt) break;
     if (m_opt->saving < -floor) break;
