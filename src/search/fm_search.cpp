@@ -99,7 +99,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             bool x_in_gy = part.groups[gy].ops.count(op);
 
             // MERGE
-            if (part.is_acyclic_after_merge(gx, gy)) {
+            if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
                 double merged_cost = part.eval_set(merged);
@@ -111,15 +111,14 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
 
             // STEAL + RECOMPUTE
-            if (!x_in_gy) {
+            if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
                 double new_gy_cost = part.eval_set(new_gy);
 
                 if (new_gy_cost < 1e17) {
                     // STEAL
-                    if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag) &&
-                        part.is_acyclic_after_steal(op, gx, gy)) {
+                    if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
                         std::set<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
                         double new_gx_cost = 0;
@@ -139,7 +138,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                     }
 
                     // RECOMPUTE
-                    if (part.is_acyclic_after_recompute(op, gy)) {
+                    {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
                             best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
@@ -232,6 +231,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 {
                     std::set<size_t> merged_ops;
                     double old_cost = 0;
+                    bool cycle = false;
 
                     for (auto cg : group_list) {
                         old_cost += part.groups[cg].cost;
@@ -239,7 +239,14 @@ FMMove best_move_for(const Partition& part, size_t op,
                                           part.groups[cg].ops.end());
                     }
 
-                    if (part.is_acyclic_after_merge(group_list)) {
+                    for (size_t a = 0; a < group_list.size() && !cycle; a++)
+                        for (size_t b = a + 1; b < group_list.size() && !cycle; b++)
+                            if (part.dag->merge_creates_cycle(
+                                    part.groups[group_list[a]].ops,
+                                    part.groups[group_list[b]].ops))
+                                cycle = true;
+
+                    if (!cycle) {
                         double new_cost = part.eval_set(merged_ops);
                         if (new_cost < 1e17) {
                             double saving = old_cost - new_cost;

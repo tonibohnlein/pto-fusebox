@@ -4,8 +4,8 @@
 #include "core/cost_cache.h"
 #include "search/fm_outer.h"
 #include "util/pairing_heap.h"
-#include <cassert>
 #include <iostream>
+#include <cassert>
 
 // Under the new ephemeral rule, gap checks are unnecessary for acyclicity.
 // Tensor materialization is the cost model's job (at finalization via
@@ -400,6 +400,8 @@ static Move best_move_for_op(const Partition& part, size_t op) {
 
     std::set<std::pair<size_t,size_t>> merge_checked;
     for (auto gi : adj_groups) {
+        if (part.dag->merge_creates_cycle({op}, part.groups[gi].ops)) continue;
+
         std::set<size_t> new_gi = part.groups[gi].ops;
         new_gi.insert(op);
         double new_gi_cost = part.eval_set(new_gi);
@@ -409,8 +411,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             if (gj == gi || !part.groups[gj].alive) continue;
 
             // STEAL: move op from gj into gi
-            if (!creates_topo_cycle(op, part.groups[gj].ops, dag) &&
-                part.is_acyclic_after_steal(op, gj, gi)) {
+            if (!creates_topo_cycle(op, part.groups[gj].ops, dag)) {
                 std::set<size_t> new_gj = part.groups[gj].ops;
                 new_gj.erase(op);
                 double new_gj_cost = new_gj.empty() ? 0 : part.eval_set(new_gj);
@@ -426,7 +427,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             auto pair_key = std::make_pair(std::min(gi, gj), std::max(gi, gj));
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
-                if (part.is_acyclic_after_merge(gi, gj)) {
+                if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
                     std::set<size_t> merged = part.groups[gi].ops;
                     merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                     double mc = part.eval_set(merged);
@@ -438,7 +439,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
         }
 
         // RECOMPUTE: copy op into gi
-        if (part.is_acyclic_after_recompute(op, gi)) {
+        {
             double rsaving = part.groups[gi].cost - new_gi_cost;
             size_t gb = groups_of_op.empty() ? 0 : groups_of_op[0];
             if (rsaving > best.saving)
@@ -465,17 +466,40 @@ Partition greedy_descent(Partition part) {
     }
 
     int applied = 0;
-    while (!heap.empty()) {
+    int rejected = 0;
+    int iterations = 0;
+    const int MAX_ITERATIONS = 100000;  // safety cap
+    while (!heap.empty() && iterations < MAX_ITERATIONS) {
+        iterations++;
+        if (iterations % 500 == 0) {
+            std::cerr << "    greedy iter=" << iterations
+                      << " applied=" << applied << " rejected=" << rejected
+                      << " cost=" << part.total_cost() << "\n";
+        }
         auto m_opt = heap.pop_best();
         if (!m_opt || m_opt->saving <= 0.001) break;
         Move m = *m_opt;
+
+        if (iterations <= 50 || iterations % 100 == 0) {
+            std::cerr << "    [" << iterations << "] pop op=" << m.op
+                      << " type=" << (int)m.type
+                      << " ga=" << m.ga << " gb=" << m.gb
+                      << " saving=" << m.saving << "\n";
+        }
 
         // Apply move — heap guarantees feasibility (acyclicity checked in
         // best_move_for_op). Cost may have changed, so apply_move re-verifies.
         double old_total = part.total_cost();
         auto dirty = apply_move(part, m);
         if (dirty.empty()) {
-            // Cost no longer favorable — drop, will be re-evaluated if neighbors change
+            rejected++;
+            if (iterations <= 50 || rejected % 100 == 0) {
+                std::cerr << "    [" << iterations << "] REJECTED op=" << m.op
+                          << " type=" << (int)m.type
+                          << " ga=" << m.ga << " gb=" << m.gb
+                          << " saving=" << m.saving
+                          << " cost=" << part.total_cost() << "\n";
+            }
             continue;
         }
 
@@ -495,6 +519,17 @@ Partition greedy_descent(Partition part) {
 #endif
 
         applied++;
+
+        if (g_verbose || applied <= 20 || applied % 100 == 0) {
+            std::cerr << "    greedy #" << applied
+                      << " type=" << (int)m.type
+                      << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb
+                      << " predicted=" << m.saving
+                      << " actual=" << (old_total - part.total_cost())
+                      << " cost=" << part.total_cost()
+                      << " affected=" << 0 // placeholder
+                      << "\n";
+        }
 
         // Collect affected ops: ops in dirty groups + their DAG neighbors
         // Always include the moved op itself (may be in a killed group)
@@ -519,11 +554,24 @@ Partition greedy_descent(Partition part) {
             else
                 heap.remove(op);
         }
+
+        if (iterations <= 50 || iterations % 100 == 0) {
+            std::cerr << "    [" << iterations << "] APPLIED #" << applied
+                      << " actual_gain=" << (old_total - part.total_cost())
+                      << " cost=" << part.total_cost()
+                      << " refreshed=" << affected_ops.size() << "\n";
+        }
     }
 
-    if (g_verbose && applied > 0)
-        std::cerr << "    greedy: " << applied << " moves, cost="
+    if (iterations >= MAX_ITERATIONS) {
+        std::cerr << "    greedy: HIT ITERATION CAP at " << MAX_ITERATIONS
+                  << " applied=" << applied << " rejected=" << rejected
+                  << " cost=" << part.total_cost() << "\n";
+    } else {
+        std::cerr << "    greedy: " << iterations << " iters, "
+                  << applied << " applied, " << rejected << " rejected, cost="
                   << part.total_cost() << "\n";
+    }
     return part;
 }
 

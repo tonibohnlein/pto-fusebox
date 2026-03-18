@@ -55,6 +55,15 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         result.total_passes++;
         result.total_moves += pass_result.moves_applied;
 
+        std::cerr << "    FM outer pass " << pass
+                  << ": " << pass_result.moves_applied << " moves"
+                  << " (" << pass_result.moves_positive << "+, "
+                  << pass_result.moves_negative << "-)"
+                  << " best=" << pass_result.best_cost
+                  << " end=" << pass_result.end_cost
+                  << " floor=" << effective_floor
+                  << " drift=" << effective_drift << "\n";
+
         // Track the pass's best candidate (may be updated by greedy-kick below)
         double pass_best_cost = pass_result.best_cost;
         Partition pass_best_part = std::move(pass_result.best_partition);
@@ -65,6 +74,7 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         // (Matches the solution_fm_outer pattern.)
         if (pass_result.moves_applied > 0) {
             auto end_copy = pass_result.end_partition;  // preserve for diversity
+            std::cerr << "    FM outer pass " << pass << ": running greedy on end state...\n";
             auto descended = greedy_descent(std::move(end_copy));
             if (descended.total_cost() < pass_best_cost - 0.001) {
                 pass_best_cost = descended.total_cost();

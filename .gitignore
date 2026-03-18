@@ -4,6 +4,7 @@
 build/*
 build-debug/*
 build-rel-dbg/*
+.vscode/*
 
 # Compiled Object files
 *.slo

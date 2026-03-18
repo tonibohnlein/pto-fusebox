@@ -80,13 +80,22 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     // Step 2: main loop
     double cumulative_gain = 0;
     double best_cumulative_gain = 0;
+    int fm_iters = 0;
 
     while (true) {
+        fm_iters++;
         // Pop the best unlocked move
         auto move_opt = active.pop_best();
         if (!move_opt.has_value()) break;
 
         FMMove move = *move_opt;
+
+        if (fm_iters <= 30 || fm_iters % 50 == 0) {
+            std::cerr << "      FM[" << fm_iters << "] pop op=" << move.op
+                      << " type=" << (int)move.type
+                      << " ga=" << move.ga << " gb=" << move.gb
+                      << " saving=" << move.saving << "\n";
+        }
 
         // Additional locking: collect ops that should be locked BEFORE apply
         // (since apply changes the groups)
@@ -111,7 +120,16 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
             part = std::move(snapshot);
+            if (fm_iters <= 30 || fm_iters % 50 == 0) {
+                std::cerr << "      FM[" << fm_iters << "] REJECTED\n";
+            }
             continue;
+        }
+
+        if (fm_iters <= 30 || fm_iters % 50 == 0) {
+            std::cerr << "      FM[" << fm_iters << "] APPLIED"
+                      << " actual=" << (total_before - part.total_cost())
+                      << " cost=" << part.total_cost() << "\n";
         }
 
 #ifndef NDEBUG
@@ -161,6 +179,12 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     // Capture the final (maximally perturbed) state
     result.end_partition = part;
     result.end_cost = part.total_cost();
+
+    std::cerr << "      FM pass done: " << fm_iters << " iters, "
+              << result.moves_applied << " applied ("
+              << result.moves_positive << "+, " << result.moves_negative << "-), "
+              << "best=" << result.best_cost
+              << " end=" << result.end_cost << "\n";
 
     return result;
 }
