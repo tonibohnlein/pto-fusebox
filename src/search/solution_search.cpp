@@ -720,6 +720,7 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::EJECT;
         best.step_a = si; best.step_b = SIZE_MAX; best.op = op;
+        best.op2 = must_be_before ? 0 : 1;  // 0=singleton before, 1=singleton after
         best.saving = saving;
       }
     } while (false);
@@ -1084,7 +1085,12 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     ScheduleStep step_s;
     step_s.subgraph = std::move(*sg_s);
 
-    if (must_be_before) {
+    // Use the direction recorded by best_move_for_op:
+    // m.op2 == 0: singleton BEFORE remainder
+    // m.op2 == 1: singleton AFTER remainder (default)
+    bool singleton_before = (m.op2 == 0);
+
+    if (singleton_before) {
         state.steps[m.step_a] = std::move(step_s);
         state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(step_r));
     } else {

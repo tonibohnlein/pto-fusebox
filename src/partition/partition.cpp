@@ -78,7 +78,10 @@ void Partition::rebuild_group_dag() {
 
     std::vector<size_t> topo_order;
     {
-        // Build OR-node dependency structure (same as is_acyclic / kahn_with_delta)
+        // Use the SAME op-based OR-node Kahn's as is_acyclic() for ordering.
+        // This guarantees all alive groups get a valid topological position
+        // (is_acyclic validated this partition). The boundary-based edge filter
+        // in Step 3 ensures only real data dependencies become edges.
         std::vector<int> unsatisfied(ng, 0);
         std::vector<bool> dep_met;
         std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
@@ -91,7 +94,6 @@ void Partition::rebuild_group_dag() {
                 for (auto target_gi : op_to_groups_[op_idx]) {
                     if (!groups[target_gi].alive) continue;
 
-                    // Is producer internal to target group?
                     bool prod_internal = false;
                     for (auto g : op_to_groups_[(size_t)prod])
                         if (g == target_gi) { prod_internal = true; break; }
@@ -135,7 +137,7 @@ void Partition::rebuild_group_dag() {
         }
     }
 
-    // Step 2: Assign topological position to each group
+    // Step 2: Assign topological position to each group.
     std::vector<int> topo_pos(ng, -1);
     for (size_t i = 0; i < topo_order.size(); i++)
         topo_pos[topo_order[i]] = (int)i;
@@ -520,22 +522,26 @@ std::set<size_t> Partition::compute_force_ephemeral(size_t gi) const {
                 if (!groups[gi].ops.count(cop)) { has_external = true; break; }
             if (!has_external) continue;
 
-            // T has external consumers. Check if EVERY external consumer is
-            // in a group that also contains the producer (recomputes it).
+            // T has external consumers. Check if EVERY alive group that
+            // contains a consumer of T also contains the producer.
+            // If ANY group has the consumer but NOT the producer, that group
+            // needs T from slow memory — we cannot force-ephemeralize it.
             int prod = dag->tensor_producer[t];
             if (prod < 0) continue;
 
-            bool all_served = true;
+            bool has_stranded = false;
             for (auto cop : dag->tensor_consumers[t]) {
-                if (groups[gi].ops.count(cop)) continue; // internal
-                bool served = false;
+                if (groups[gi].ops.count(cop)) continue; // internal to gi
                 for (auto gj : groups_of(cop)) {
                     if (gj == gi || !groups[gj].alive) continue;
-                    if (groups[gj].ops.count((size_t)prod)) { served = true; break; }
+                    if (!groups[gj].ops.count((size_t)prod)) {
+                        has_stranded = true;
+                        break;
+                    }
                 }
-                if (!served) { all_served = false; break; }
+                if (has_stranded) break;
             }
-            if (all_served) result.insert(t);
+            if (!has_stranded) result.insert(t);
         }
     }
     return result;

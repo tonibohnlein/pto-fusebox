@@ -669,6 +669,12 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     // Single rebuild at the end for cleanup (removes dead entries, etc.)
     child.rebuild_index();
     
+    // Safety: crossover can accidentally create cycles when splicing clusters
+    // from two parents. Reject cyclic children — fall back to better parent.
+    if (!child.is_acyclic()) {
+        return (parent_a.total_cost() <= parent_b.total_cost()) ? parent_a : parent_b;
+    }
+    
 #ifndef NDEBUG
     // Verify cost consistency after crossover
     if (g_verbose) {
