@@ -440,6 +440,35 @@ static double simulate_rebuild_cost(std::vector<ScheduleStep> &steps,
   return total;
 }
 
+// ============================================================================
+// downstream_penalty: compute the cost delta on the step immediately after
+// a modified range, given the new retain set of the last modified step.
+//
+// When a structural move changes which tensors the last modified step retains,
+// the following step's entering set changes. This helper evaluates that
+// cost delta so the saving calculation is faithful to rebuild_from's behavior.
+//
+// Returns: (new_cost - old_cost) of the following step. Positive = penalty.
+// Returns 0 if there is no following step.
+// ============================================================================
+static double downstream_penalty(const SolState &state, size_t next_si,
+                                  const std::set<size_t> &new_entering) {
+  if (next_si >= state.size()) return 0;
+
+  double old_cost = state.cost[next_si];
+  auto &next_step = state.steps[next_si];
+
+  // Re-evaluate next step with the new entering set
+  auto cost = next_step.subgraph.best_cost(new_entering, next_step.retain_these);
+  if (!cost.feasible) {
+    // Try without retain
+    cost = next_step.subgraph.best_cost(new_entering, {});
+  }
+  if (!cost.feasible) return 1e18;  // makes parent move infeasible
+
+  return cost.latency - old_cost;
+}
+
 static SolutionMove best_move_for_op(SolState &state, size_t op,
                                      const std::set<size_t> &locked_ops,
                                      double floor) {
@@ -534,6 +563,11 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         continue;
       double saving =
           (state.cost[si] + state.cost[sj]) - (cs.latency + cd.latency);
+      // 1-step lookahead: the step after the modified pair may see a
+      // different entering set (the higher step's new retain).
+      size_t last_step = std::max(si, sj);
+      const auto &last_retain = (last_step == si) ? sr : dr;
+      saving -= downstream_penalty(state, last_step + 1, last_retain);
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::STEAL;
         best.step_a = si;
@@ -582,6 +616,8 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!cm.feasible)
         continue;
       double saving = (state.cost[si] + state.cost[sj]) - cm.latency;
+      // 1-step lookahead: step after hi (hi+1) now enters with merged retain
+      saving -= downstream_penalty(state, hi + 1, retain);
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::MERGE;
         best.step_a = lo;
@@ -635,10 +671,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         continue;
 
       // Direct cost comparison: the expanded step replaces step sj.
-      // ce.latency already has the optimal config for the expanded set.
-      // Downstream cascade (retain propagation) is handled at apply time
-      // by rebuild_from.
       double saving = state.cost[sj] - ce.latency;
+      // 1-step lookahead: step sj+1 now enters with new retain
+      saving -= downstream_penalty(state, sj + 1, ret);
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::RECOMPUTE;
         best.step_a = sj;
@@ -682,8 +717,11 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!cr.feasible || !cs.feasible) break;
 
       // Direct cost comparison: step si splits into two steps.
-      // Downstream cascade handled by rebuild_from at apply time.
+      // 1-step lookahead: original step si+1 now enters with the
+      // last new step's retain (singleton retains nothing, remainder retains rr).
       double saving = state.cost[si] - (cr.latency + cs.latency);
+      const auto &last_retain = must_be_before ? rr : std::set<size_t>{};
+      saving -= downstream_penalty(state, si + 1, last_retain);
 
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::EJECT;
@@ -841,6 +879,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
         }
         if (safe) {
           double saving = state.cost[si];
+          // 1-step lookahead: step si+1 now enters with ret_entering[si]
+          // (previous step's retain) instead of state.steps[si].retain_these
+          saving -= downstream_penalty(state, si + 1, state.ret_entering[si]);
           if (saving > -floor && saving > best.saving) {
             best.type = SolutionMove::DE_RECOMPUTE;
             best.step_a = si;
@@ -873,6 +914,8 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
             auto cr = sg_r->best_cost(state.ret_entering[si], rr);
             if (cr.feasible) {
               double saving = state.cost[si] - cr.latency;
+              // 1-step lookahead: step si+1 now enters with rr
+              saving -= downstream_penalty(state, si + 1, rr);
               if (saving > -floor && saving > best.saving) {
                 best.type = SolutionMove::DE_RECOMPUTE;
                 best.step_a = si;
