@@ -120,13 +120,15 @@ static Problem make_tight_chain3() {
 static Solution make_solution(const Problem& p, const DAG& d) {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
-    return Solution::from_partition(p, d, std::move(part));
+    part.finalize();
+    return Solution::from_partition(p, d, part);
 }
 
 static Solution make_fused_solution(const Problem& p, const DAG& d) {
     CostCache cache;
     auto part = best_initial(p, d, &cache);
-    return Solution::from_partition(p, d, std::move(part));
+    part.finalize();
+    return Solution::from_partition(p, d, part);
 }
 
 static void check_solution_valid(const char* label, const Solution& sol) {
@@ -424,7 +426,8 @@ void test_steal_from_2op_group() {
     part.groups[0].cost = cache.evaluate({0,1},p,d);
     part.groups[1].alive = false;
     part.rebuild_index();
-    auto initial = Solution::from_partition(p, d, std::move(part));
+    part.finalize();
+    auto initial = Solution::from_partition(p, d, part);
 
     // Run greedy — it should be willing to STEAL Op1 from {Op0,Op1} to {Op2}
     auto steps = solution_greedy_descent(p, d, initial.steps(), {}, &fr);
@@ -456,7 +459,8 @@ void test_split_co_consumer_bridge() {
     Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
     part.add_group({0,1,2}, cache.evaluate({0,1,2},p,d));
     part.rebuild_index();
-    auto initial = Solution::from_partition(p, d, std::move(part));
+    part.finalize();
+    auto initial = Solution::from_partition(p, d, part);
 
     // Run greedy — with the fix it can now propose the Op0<->Op1 bridge SPLIT
     auto steps = solution_greedy_descent(p, d, initial.steps(), {}, &fr);
@@ -481,24 +485,22 @@ void test_split_co_consumer_bridge() {
 
 void test_validate_catches_infeasible_config() {
     std::cout << "--- test_validate_catches_infeasible_config ---\n";
-    // Use a real tensor that exists but is NOT a boundary tensor of step 0.
-    // chain3 trivial: step 0 = {Op0}, boundary_outputs = {T1}, boundary_inputs = {T0}.
-    // T2 is produced by Op1 (step 1) — it is not a boundary tensor of step 0.
-    // Adding T2 to step 0's retain_these should be caught by validate().
+    // chain3 trivial: step 0 = {Op0}, boundary_outputs = {T1}.
+    // T2 is produced by Op1 (step 1) — not a boundary output of step 0.
+    // The Solution constructor strips non-boundary tensors from retain_these,
+    // so validate() won't see T2. Verify the strip works correctly.
     auto p = make_chain3(); DAG d = DAG::build(p);
     auto initial = make_solution(p, d);
     auto steps = initial.steps();
-    // steps[0].subgraph = {Op0}: boundary_outputs={T1}, boundary_inputs={T0}
-    // T2 is a real tensor (index 2) but not in either boundary set of step 0.
     if (!steps.empty())
-        steps[0].retain_these.insert(2);  // T2: real tensor, not a boundary of step 0
-    // Construct directly (bypass Solution constructor's strip) via raw access
-    // by calling validate() on the result — the strip in the constructor
-    // won't remove T2 (it's not in currently_retained), so validate() will
-    // see it and flag it.
+        steps[0].retain_these.insert(2);  // T2: not a boundary output of step 0
     Solution bad(p, d, std::move(steps));
+    // Constructor strips T2 from retain_these (not a boundary output)
+    CHECK("constructor strips non-boundary retain tensor",
+          bad.step(0).retain_these.find(2) == bad.step(0).retain_these.end());
+    // Solution is valid because the constructor cleaned it
     auto vr = bad.validate();
-    CHECK("validate catches non-boundary retain tensor", !vr.valid);
+    CHECK("validate passes after strip", vr.valid);
 }
 
 void test_validate_catches_missing_op() {
