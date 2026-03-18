@@ -103,14 +103,14 @@ static double partition_distance(const Partition& a, const Partition& b,
     if (mh) merkle_canonicalise(*mh, ga_map, gb_map);
 
     // Build contingency table: n_ij = |group_i_in_a ∩ group_j_in_b|
-    // Also track row/col totals.
-    std::vector<std::vector<int>> table(num_ga, std::vector<int>(num_gb, 0));
+    // Flat 1D vector: single allocation instead of num_ga+1 heap allocations.
+    std::vector<int> table(num_ga * num_gb, 0);
     std::vector<int> row_sum(num_ga, 0), col_sum(num_gb, 0);
     int total = 0;
 
     for (size_t op = 0; op < n; op++) {
         if (ga_map[op] < 0 || gb_map[op] < 0) continue;
-        table[ga_map[op]][gb_map[op]]++;
+        table[ga_map[op] * num_gb + gb_map[op]]++;
         row_sum[ga_map[op]]++;
         col_sum[gb_map[op]]++;
         total++;
@@ -119,8 +119,6 @@ static double partition_distance(const Partition& a, const Partition& b,
 
     // Adjusted Rand Index (ARI) via contingency table.
     // ARI corrects for chance: random partitions → ARI ≈ 0, identical → ARI = 1.
-    // Unadjusted Rand index has a floor effect (~0.85-0.95 for random partitions
-    // of typical sizes), compressing meaningful variation into a narrow band.
     // We return 1 - ARI as a distance (0 = identical, 1 = maximally different).
     auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
 
@@ -129,7 +127,7 @@ static double partition_distance(const Partition& a, const Partition& b,
     for (int j = 0; j < num_gb; j++) same_b += choose2(col_sum[j]);
     for (int i = 0; i < num_ga; i++)
         for (int j = 0; j < num_gb; j++)
-            agree += choose2(table[i][j]);
+            agree += choose2(table[i * num_gb + j]);
 
     int64_t total_pairs = choose2(total);
     if (total_pairs == 0) return 0.0;

@@ -112,8 +112,8 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
                 }
 
                 // --- DFS + Beam via Solution::from_partition ---
-                // from_partition() will call finalize() again on its copy —
-                // idempotent and cheap (all sg cache hits at this point).
+                // Partition is already finalized above; from_partition takes
+                // a const reference (no deep copy, no redundant finalize).
                 {
                     auto sol = Solution::from_partition(prob, dag, part);
                     auto vr = sol.validate();
@@ -162,6 +162,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
               });
 
     if (solution_pool.empty()) {
+        partition_pool[0].finalize();  // may not have been finalized if all workers timed out
         solution_pool.push_back(Solution::from_partition(prob, dag, partition_pool[0]));
     }
 

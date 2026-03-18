@@ -33,11 +33,11 @@ public:
 
     // --- Construction from a Partition ---
     //
-    // Takes ownership of the partition, calls finalize() to re-populate Group::sg
-    // and the group-level DAG (stale after Phase 1 search mutations), then runs
-    // DFS and beam search ordering and returns the lower-latency result.
+    // Takes a const reference to a FINALIZED partition (caller must have called
+    // finalize() already). Runs DFS and beam search ordering, returns the
+    // lower-latency result. No deep copy, no redundant finalize.
     static Solution from_partition(const Problem& prob, const DAG& dag,
-                                   Partition part);
+                                   const Partition& part);
 
     // Lower-level: build ScheduleSteps from a pre-computed OrderingResult.
     // Performs per-step feasibility fallback (drop retains until feasible).

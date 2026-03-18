@@ -422,8 +422,9 @@ void test_from_partition_recompute() {
     part.add_group({0, 1}, cost_01);
     part.add_group({0, 2}, cost_02);
 
-    // from_partition calls finalize() which applies force_ephemeral,
+    // finalize() populates Group::sg and applies force_ephemeral,
     // bringing each group's actual cost down to 3276.8
+    part.finalize();
     Solution sol = Solution::from_partition(p, d, part);
 
     CHECK("sol not empty", !sol.steps().empty());
@@ -468,6 +469,7 @@ void test_from_partition_gap_is_invalid() {
     part.add_group({0, 1}, cost_01);
     part.add_group({2},    cost_2);
 
+    part.finalize();
     Solution sol = Solution::from_partition(p, d, part);
     auto vr = sol.validate();
 

@@ -90,24 +90,18 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         // Attempt 1: full retention context (entering + retain)
         auto cost = sg.best_cost(entering, retain_these);
 
-        // Attempt 2: keep entering, drop retain
-        if (!cost.feasible || cost.latency > baseline.latency) {
+        // Attempt 2: keep entering, drop retain — ONLY if infeasible.
+        // A local latency increase from retention is often worth it when it
+        // saves the next step a massive slow-memory load.
+        if (!cost.feasible) {
             auto cost2 = sg.best_cost(entering, {});
-            if (cost2.feasible && (!cost.feasible || cost2.latency < cost.latency)) {
+            if (cost2.feasible) {
                 cost = cost2;
                 retain_these.clear();
             }
         }
 
-        // Attempt 3: compare against standalone baseline.
-        // If retention/entering made things worse, use the standalone config.
-        if (cost.feasible && baseline.feasible && baseline.latency < cost.latency) {
-            cost = baseline;
-            retain_these.clear();
-            entering.clear();
-        }
-
-        // Attempt 4: nothing feasible with entering — fall back to standalone
+        // Attempt 3: drop entering too — ONLY if still infeasible.
         if (!cost.feasible && baseline.feasible) {
             cost = baseline;
             retain_these.clear();
@@ -128,10 +122,9 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
 // ============================================================================
 
 Solution Solution::from_partition(const Problem& prob, const DAG& dag,
-                                   Partition part) {
-    // Re-populate Group::sg / best_cfg and rebuild the group-level DAG.
-    // Phase 1 search mutates ops/costs but never touches these fields.
-    part.finalize();
+                                   const Partition& part) {
+    // Caller must have called part.finalize() already.
+    // No deep copy, no redundant finalize.
 
     auto dfs_res  = dfs_ordering(part);
     int  bw       = std::min(20, std::max(5, (int)part.num_alive()));
