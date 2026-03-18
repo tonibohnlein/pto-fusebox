@@ -1044,7 +1044,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     state.steps[m.step_a].config = cm.config;
     state.steps[m.step_a].retain_these = ret;
     state.steps.erase(state.steps.begin() + m.step_b);
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + 1};
   }
   case SolutionMove::RECOMPUTE: {
     if (m.step_a >= state.size())
@@ -1112,7 +1112,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
         state.steps[m.step_a] = std::move(step_r);
         state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(step_s));
     }
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + 2};
   }
   case SolutionMove::INTERNAL_EJECT: {
     if (m.step_a >= state.size()) return {SIZE_MAX, 0};
@@ -1177,7 +1177,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     for (size_t i = 0; i < new_steps.size(); i++)
       state.steps.insert(state.steps.begin() + m.step_a + i, std::move(new_steps[i]));
       
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + new_steps.size()};
   }
   case SolutionMove::SPLIT: {
     if (m.step_a >= state.size()) return {SIZE_MAX, 0};
@@ -1239,7 +1239,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     ns.config = c_b.config;
     ns.retain_these = vr;
     state.steps.insert(state.steps.begin() + m.step_a + 1, std::move(ns));
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + 2};
   }
   case SolutionMove::RETAIN_ADD: {
     if (m.step_a >= state.size())
@@ -1254,7 +1254,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     //  2. Call best_cost with pruned retain to find optimal config
     //  3. Propagate downstream
     si.retain_these.insert(m.tensor);
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + 2};
   }
   case SolutionMove::RETAIN_REMOVE: {
     if (m.step_a >= state.size())
@@ -1263,7 +1263,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     if (!si.retain_these.count(m.tensor))
       return {SIZE_MAX, 0};
     si.retain_these.erase(m.tensor);
-    return {m.step_a, state.size()};
+    return {m.step_a, m.step_a + 2};
   }
   case SolutionMove::DE_RECOMPUTE: {
     if (m.step_a >= state.size())
@@ -1298,7 +1298,8 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     if (si_set.size() == 1) {
       // Singleton: remove entire step
       state.steps.erase(state.steps.begin() + m.step_a);
-      return {m.step_a > 0 ? m.step_a - 1 : 0, state.size()};
+      size_t lo = m.step_a > 0 ? m.step_a - 1 : 0;
+      return {lo, lo + 1};
     } else {
       // Multi-op: remove op, rebuild remainder
       std::set<size_t> remainder = si_set;
@@ -1311,7 +1312,7 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
       si.subgraph = std::move(*sg_r);
       si.config = cr.config;
       si.retain_these = rr;
-      return {m.step_a, state.size()};
+      return {m.step_a, m.step_a + 1};
     }
   }
   default:
@@ -1404,7 +1405,8 @@ static void bump_affected(SolState &state, size_t lo, size_t hi,
 // Check if a move type changes step count
 static bool is_structural(SolutionMove::Type t) {
   return t == SolutionMove::SPLIT || t == SolutionMove::MERGE ||
-         t == SolutionMove::EJECT || t == SolutionMove::INTERNAL_EJECT;
+         t == SolutionMove::EJECT || t == SolutionMove::INTERNAL_EJECT ||
+         t == SolutionMove::DE_RECOMPUTE;
 }
 
 // Staleness check for a heap move
@@ -1527,43 +1529,42 @@ struct SolActiveSet {
 
   std::optional<SolutionMove> pop_best(SolState &state) {
     // Drain locked and stale entries from tops of both heaps.
-    // Stale entries are lazily recomputed and pushed back.
     while (!op_heap.empty()) {
       auto top = op_heap.peek_best();
-      if (!top || !top->second.valid()) { op_heap.pop_best(); continue; }
-      if (locked_ops.count(top->second.op)) { op_heap.pop_best(); continue; }
-      if (is_stale(top->second, state)) {
-        size_t op = top->second.op;
+      if (!top || !top->valid()) { op_heap.pop_best(); continue; }
+      if (locked_ops.count(top->op)) { op_heap.pop_best(); continue; }
+      if (is_stale(*top, state)) {
+        size_t op = top->op;
         op_heap.pop_best();
-        recompute_op(state, op);  // pushes fresh move back into heap
+        recompute_op(state, op);
         continue;
       }
-      break;  // valid, unlocked, fresh op at top
+      break;
     }
     while (!tensor_heap.empty()) {
       auto top = tensor_heap.peek_best();
-      if (!top || !top->second.valid()) { tensor_heap.pop_best(); continue; }
-      if (locked_tensors.count(top->second.tensor)) { tensor_heap.pop_best(); continue; }
-      if (is_stale(top->second, state)) {
-        size_t t = top->second.tensor;
+      if (!top || !top->valid()) { tensor_heap.pop_best(); continue; }
+      if (locked_tensors.count(top->tensor)) { tensor_heap.pop_best(); continue; }
+      if (is_stale(*top, state)) {
+        size_t t = top->tensor;
         tensor_heap.pop_best();
         recompute_tensor(state, t);
         continue;
       }
-      break;  // valid, unlocked, fresh tensor at top
+      break;
     }
 
     // Compare tops, pop the winner
-    auto op_top = op_heap.empty() ? std::nullopt : op_heap.peek_best();
-    auto tn_top = tensor_heap.empty() ? std::nullopt : tensor_heap.peek_best();
+    auto op_top = op_heap.peek_best();
+    auto tn_top = tensor_heap.peek_best();
 
-    bool use_op = op_top.has_value() && op_top->second.valid();
-    bool use_tn = tn_top.has_value() && tn_top->second.valid();
+    bool use_op = op_top.has_value() && op_top->valid();
+    bool use_tn = tn_top.has_value() && tn_top->valid();
 
     if (!use_op && !use_tn) return std::nullopt;
 
     if (use_op && use_tn) {
-      if (tn_top->second.saving > op_top->second.saving) {
+      if (tn_top->saving > op_top->saving) {
         auto m = tensor_heap.pop_best();
         locked_tensors.insert(m->tensor);
         return m;
@@ -1792,6 +1793,12 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     auto [lo, hi] = apply_move(state, *m_opt);
     if (lo == SIZE_MAX)
       continue;
+
+    // Bump generation counters for affected + downstream steps.
+    // Structural moves shift indices → bump_all; non-structural → local bump.
+    bool structural = is_structural(m_opt->type);
+    bump_affected(state, lo, hi, structural);
+
     result.moves_applied++;
     state.rebuild_from(lo);
 

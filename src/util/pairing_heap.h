@@ -76,9 +76,9 @@ public:
 
     // Peek at the best element without removing it.
     // Returns nullopt if heap is empty.
-    std::optional<std::pair<size_t, const MoveType&>> peek_best() const {
+    std::optional<MoveType> peek_best() const {
         if (root_ == -1) return std::nullopt;
-        return std::pair<size_t, const MoveType&>{(size_t)root_, nodes_[root_].move};
+        return nodes_[root_].move;
     }
 
     void clear() {
