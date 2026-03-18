@@ -400,8 +400,6 @@ static Move best_move_for_op(const Partition& part, size_t op) {
 
     std::set<std::pair<size_t,size_t>> merge_checked;
     for (auto gi : adj_groups) {
-        if (part.dag->merge_creates_cycle({op}, part.groups[gi].ops)) continue;
-
         std::set<size_t> new_gi = part.groups[gi].ops;
         new_gi.insert(op);
         double new_gi_cost = part.eval_set(new_gi);
@@ -411,7 +409,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             if (gj == gi || !part.groups[gj].alive) continue;
 
             // STEAL: move op from gj into gi
-            if (!creates_topo_cycle(op, part.groups[gj].ops, dag)) {
+            if (part.is_acyclic_after_steal(op, gj, gi)) {
                 std::set<size_t> new_gj = part.groups[gj].ops;
                 new_gj.erase(op);
                 double new_gj_cost = new_gj.empty() ? 0 : part.eval_set(new_gj);
@@ -427,7 +425,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             auto pair_key = std::make_pair(std::min(gi, gj), std::max(gi, gj));
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
-                if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
+                if (part.is_acyclic_after_merge(gi, gj)) {
                     std::set<size_t> merged = part.groups[gi].ops;
                     merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                     double mc = part.eval_set(merged);
@@ -439,7 +437,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
         }
 
         // RECOMPUTE: copy op into gi
-        {
+        if (part.is_acyclic_after_recompute(op, gi)) {
             double rsaving = part.groups[gi].cost - new_gi_cost;
             size_t gb = groups_of_op.empty() ? 0 : groups_of_op[0];
             if (rsaving > best.saving)
@@ -471,35 +469,14 @@ Partition greedy_descent(Partition part) {
     const int MAX_ITERATIONS = 100000;  // safety cap
     while (!heap.empty() && iterations < MAX_ITERATIONS) {
         iterations++;
-        if (iterations % 500 == 0) {
-            std::cerr << "    greedy iter=" << iterations
-                      << " applied=" << applied << " rejected=" << rejected
-                      << " cost=" << part.total_cost() << "\n";
-        }
         auto m_opt = heap.pop_best();
         if (!m_opt || m_opt->saving <= 0.001) break;
         Move m = *m_opt;
 
-        if (iterations <= 50 || iterations % 100 == 0) {
-            std::cerr << "    [" << iterations << "] pop op=" << m.op
-                      << " type=" << (int)m.type
-                      << " ga=" << m.ga << " gb=" << m.gb
-                      << " saving=" << m.saving << "\n";
-        }
-
-        // Apply move — heap guarantees feasibility (acyclicity checked in
-        // best_move_for_op). Cost may have changed, so apply_move re-verifies.
         double old_total = part.total_cost();
         auto dirty = apply_move(part, m);
         if (dirty.empty()) {
             rejected++;
-            if (iterations <= 50 || rejected % 100 == 0) {
-                std::cerr << "    [" << iterations << "] REJECTED op=" << m.op
-                          << " type=" << (int)m.type
-                          << " ga=" << m.ga << " gb=" << m.gb
-                          << " saving=" << m.saving
-                          << " cost=" << part.total_cost() << "\n";
-            }
             continue;
         }
 
@@ -510,9 +487,7 @@ Partition greedy_descent(Partition part) {
             if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(m.saving)) + 1.0) {
                 std::cerr << "    GREEDY GAIN MISMATCH: predicted=" << m.saving
                           << " actual=" << actual_gain
-                          << " Δ=" << discrepancy
                           << " type=" << (int)m.type
-                          << " ga=" << m.ga << " gb=" << m.gb
                           << " op=" << m.op << "\n";
             }
         }
@@ -521,7 +496,6 @@ Partition greedy_descent(Partition part) {
         applied++;
 
         // Collect affected ops: ops in dirty groups + their DAG neighbors
-        // Always include the moved op itself (may be in a killed group)
         std::set<size_t> affected_ops;
         affected_ops.insert(m.op);
         for (auto nbr : part.dag->op_neighbors[m.op])
@@ -545,11 +519,7 @@ Partition greedy_descent(Partition part) {
         }
     }
 
-    if (iterations >= MAX_ITERATIONS) {
-        std::cerr << "    greedy: HIT ITERATION CAP at " << MAX_ITERATIONS
-                  << " applied=" << applied << " rejected=" << rejected
-                  << " cost=" << part.total_cost() << "\n";
-    } else {
+    if (g_verbose) {
         std::cerr << "    greedy: " << iterations << " iters, "
                   << applied << " applied, " << rejected << " rejected, cost="
                   << part.total_cost() << "\n";
@@ -604,7 +574,7 @@ Partition local_search(const Problem& prob, const DAG& dag) {
     fm_cfg.pass_config.max_drift_fraction = 0.50;
     fm_cfg.pass_config.init_count = 3;
     fm_cfg.max_passes = 1000;
-    fm_cfg.max_no_improve = 15;
+    fm_cfg.max_no_improve = 5;
 
     auto fm_result = fm_outer_loop(best, fm_cfg);
 

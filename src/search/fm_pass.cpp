@@ -46,7 +46,6 @@ static std::vector<size_t> random_subset_n(const std::vector<size_t>& ops,
 static std::vector<size_t> merge_lock_ops(const Partition& part, const FMMove& m) {
     std::vector<size_t> to_lock = {m.op};
 
-    // Find ops in gb that are neighbors of m.op (DAG edges + co-consumers)
     if (m.gb < part.groups.size() && part.groups[m.gb].alive) {
         for (auto nbr : part.dag->op_neighbors[m.op]) {
             if (part.groups[m.gb].ops.count(nbr))
@@ -84,37 +83,25 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
 
     while (true) {
         fm_iters++;
-        // Pop the best unlocked move
         auto move_opt = active.pop_best();
         if (!move_opt.has_value()) break;
 
         FMMove move = *move_opt;
 
-        if (fm_iters <= 30 || fm_iters % 50 == 0) {
-            std::cerr << "      FM[" << fm_iters << "] pop op=" << move.op
-                      << " type=" << (int)move.type
-                      << " ga=" << move.ga << " gb=" << move.gb
-                      << " saving=" << move.saving << "\n";
-        }
-
         // Additional locking: collect ops that should be locked BEFORE apply
-        // (since apply changes the groups)
         std::vector<size_t> extra_locks;
         if (move.type == FMMove::MERGE) {
             extra_locks = merge_lock_ops(part, move);
         } else if (move.type == FMMove::TENSOR_MERGE
                 || move.type == FMMove::TENSOR_EXTRACT) {
-            // Lock ALL ops in ALL groups involved in the tensor move.
-            // These ops are all being relocated — they must not initiate
-            // further moves this pass.
             for (auto cg : move.tensor_groups)
                 if (part.groups[cg].alive)
                     for (auto cop : part.groups[cg].ops)
                         extra_locks.push_back(cop);
         }
 
-        // Apply the move — apply_fm_move returns empty on infeasibility
-        // (local cycle checks + RECOMPUTE-specific is_acyclic).
+        // Apply the move — snapshot needed because apply_fm_move mutates
+        // partition before potentially detecting infeasibility.
         Partition snapshot = part;
         double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
@@ -123,19 +110,16 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             continue;
         }
 
-
 #ifndef NDEBUG
         {
-            double total_after = part.total_cost();
-            double actual_gain = total_before - total_after;
+            double actual_gain = total_before - part.total_cost();
             double discrepancy = move.saving - actual_gain;
             if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(move.saving)) + 1.0) {
                 std::cerr << "    FM GAIN MISMATCH: predicted=" << move.saving
-                              << " actual=" << actual_gain
-                              << " Δ=" << discrepancy
-                              << " type=" << (int)move.type
-                              << " op=" << move.op
-                              << " ga=" << move.ga << " gb=" << move.gb << "\n";
+                          << " actual=" << actual_gain
+                          << " type=" << (int)move.type
+                          << " op=" << move.op
+                          << " ga=" << move.ga << " gb=" << move.gb << "\n";
             }
         }
 #endif
@@ -146,37 +130,31 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         else if (move.saving < -0.001)
             result.moves_negative++;
 
-        // Update cumulative gain
         double new_cost = part.total_cost();
         cumulative_gain = result.start_cost - new_cost;
 
-        // Check for new best in this pass
         if (new_cost < result.best_cost - 0.001) {
             result.best_cost = new_cost;
-            result.best_partition = part;  // snapshot
+            result.best_partition = part;
             best_cumulative_gain = cumulative_gain;
         }
 
-        // Check max drift: if we've dropped too far below the pass-best, abort
         if (best_cumulative_gain - cumulative_gain > max_drift) break;
 
-        // Lock extra ops (merge/tensor partners).
-        // active.pop_best() already locked move.op.
         active.lock_all(extra_locks);
-
-        // Update affected ops + activate new border ops (combined)
         active.refresh_after_move(affected);
     }
 
-    // Capture the final (maximally perturbed) state
     result.end_partition = part;
     result.end_cost = part.total_cost();
 
-    std::cerr << "      FM pass done: " << fm_iters << " iters, "
-              << result.moves_applied << " applied ("
-              << result.moves_positive << "+, " << result.moves_negative << "-), "
-              << "best=" << result.best_cost
-              << " end=" << result.end_cost << "\n";
+    if (g_verbose) {
+        std::cerr << "      FM pass: " << fm_iters << " iters, "
+                  << result.moves_applied << " applied ("
+                  << result.moves_positive << "+, " << result.moves_negative << "-), "
+                  << "best=" << result.best_cost
+                  << " end=" << result.end_cost << "\n";
+    }
 
     return result;
 }

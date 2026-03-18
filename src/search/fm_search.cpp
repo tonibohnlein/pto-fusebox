@@ -1,22 +1,13 @@
 #include "search/fm_search.h"
 #include <algorithm>
 #include <iostream>
+#include <cassert>
 
-// Under the new ephemeral rule, gap checks are unnecessary for acyclicity.
-// Tensor materialization is handled by the cost model (ephemeral classification
-// at finalization via compute_force_ephemeral / eval_group_in_context).
-// Only topological ordering matters for feasibility.
-
-static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
-                                const DAG& dag) {
-    bool has_pred = false, has_succ = false;
-    for (auto p : dag.op_preds[op])
-        if (p != op && group_ops.count(p)) { has_pred = true; break; }
-    if (!has_pred) return false;
-    for (auto s : dag.op_succs[op])
-        if (s != op && group_ops.count(s)) { has_succ = true; break; }
-    return has_succ;
-}
+// ============================================================================
+// Local cycle check for SPLIT: are the two new sides in a mutual dependency?
+// This is correct for splits because both sides come from the same parent
+// group — no third-party groups can create indirect cycles.
+// ============================================================================
 
 static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
                                       const std::set<size_t>& side_b,
@@ -63,12 +54,10 @@ FMMove best_move_for(const Partition& part, size_t op,
         for (auto gx : groups_of_x) {
             if (!part.groups[gx].alive) continue;
             if (part.groups[gx].ops.size() == 1) {
-                // Singleton: always removable if op is elsewhere
                 double saving = part.groups[gx].cost;
                 if (accept(saving))
                     best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, saving};
             } else {
-                // Multi-op: removable only if ALL ops covered elsewhere
                 bool all_covered = true;
                 for (auto o : part.groups[gx].ops) {
                     bool in_other = false;
@@ -98,8 +87,8 @@ FMMove best_move_for(const Partition& part, size_t op,
         for (auto gy : neighbor_groups) {
             bool x_in_gy = part.groups[gy].ops.count(op);
 
-            // MERGE
-            if (!part.dag->merge_creates_cycle(part.groups[gx].ops, part.groups[gy].ops)) {
+            // MERGE: use hypothetical acyclicity check
+            if (part.is_acyclic_after_merge(gx, gy)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
                 double merged_cost = part.eval_set(merged);
@@ -111,14 +100,14 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
 
             // STEAL + RECOMPUTE
-            if (!x_in_gy && !part.dag->merge_creates_cycle({op}, part.groups[gy].ops)) {
+            if (!x_in_gy) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
                 double new_gy_cost = part.eval_set(new_gy);
 
                 if (new_gy_cost < 1e17) {
-                    // STEAL
-                    if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+                    // STEAL: use hypothetical acyclicity check
+                    if (part.is_acyclic_after_steal(op, gx, gy)) {
                         std::set<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
                         double new_gx_cost = 0;
@@ -137,8 +126,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                         }
                     }
 
-                    // RECOMPUTE
-                    {
+                    // RECOMPUTE: use hypothetical acyclicity check
+                    if (part.is_acyclic_after_recompute(op, gy)) {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
                             best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
@@ -147,7 +136,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
         }
 
-        // EJECT
+        // EJECT: cannot create cycles
         {
             auto er = part.eval_eject(op, gx);
             if (er.feasible && accept(er.saving))
@@ -227,11 +216,10 @@ FMMove best_move_for(const Partition& part, size_t op,
                 std::vector<size_t> group_list(consumer_groups.begin(),
                                                consumer_groups.end());
 
-                // TENSOR_MERGE
+                // TENSOR_MERGE: use hypothetical multi-group merge check
                 {
                     std::set<size_t> merged_ops;
                     double old_cost = 0;
-                    bool cycle = false;
 
                     for (auto cg : group_list) {
                         old_cost += part.groups[cg].cost;
@@ -239,14 +227,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                                           part.groups[cg].ops.end());
                     }
 
-                    for (size_t a = 0; a < group_list.size() && !cycle; a++)
-                        for (size_t b = a + 1; b < group_list.size() && !cycle; b++)
-                            if (part.dag->merge_creates_cycle(
-                                    part.groups[group_list[a]].ops,
-                                    part.groups[group_list[b]].ops))
-                                cycle = true;
-
-                    if (!cycle) {
+                    if (part.is_acyclic_after_merge(group_list)) {
                         double new_cost = part.eval_set(merged_ops);
                         if (new_cost < 1e17) {
                             double saving = old_cost - new_cost;
@@ -263,7 +244,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                     }
                 }
 
-                // TENSOR_EXTRACT
+                // TENSOR_EXTRACT: no cheap hypothetical check available.
+                // Use post-hoc is_acyclic() in apply_fm_move as safety net.
                 {
                     std::set<size_t> extract_ops(consumer_ops_vec.begin(),
                                                  consumer_ops_vec.end());
@@ -287,31 +269,19 @@ FMMove best_move_for(const Partition& part, size_t op,
                     }
 
                     if (feasible) {
-                        bool extract_cycle = false;
-                        for (auto cg : group_list) {
-                            std::set<size_t> rem;
-                            for (auto rop : part.groups[cg].ops)
-                                if (!extract_ops.count(rop)) rem.insert(rop);
-                            if (!rem.empty() &&
-                                part.dag->merge_creates_cycle(extract_ops, rem)) {
-                                extract_cycle = true; break;
-                            }
-                        }
-                        if (!extract_cycle) {
-                            double extract_cost = part.eval_set(extract_ops);
-                            if (extract_cost < 1e17) {
-                                double saving = old_cost - (extract_cost + remainder_cost);
-                                if (accept(saving)) {
-                                    FMMove candidate;
-                                    candidate.type = FMMove::TENSOR_EXTRACT;
-                                    candidate.op = op;
-                                    candidate.op2 = t;
-                                    candidate.saving = saving;
-                                    candidate.tensor_groups = group_list;
-                                    candidate.tensor_consumer_ops.assign(
-                                        extract_ops.begin(), extract_ops.end());
-                                    if (candidate.saving > best.saving) best = candidate;
-                                }
+                        double extract_cost = part.eval_set(extract_ops);
+                        if (extract_cost < 1e17) {
+                            double saving = old_cost - (extract_cost + remainder_cost);
+                            if (accept(saving)) {
+                                FMMove candidate;
+                                candidate.type = FMMove::TENSOR_EXTRACT;
+                                candidate.op = op;
+                                candidate.op2 = t;
+                                candidate.saving = saving;
+                                candidate.tensor_groups = group_list;
+                                candidate.tensor_consumer_ops.assign(
+                                    extract_ops.begin(), extract_ops.end());
+                                if (candidate.saving > best.saving) best = candidate;
                             }
                         }
                     }
@@ -458,14 +428,6 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
 
-            for (auto cg : m.tensor_groups) {
-                std::set<size_t> rem;
-                for (auto rop : part.groups[cg].ops)
-                    if (!extract_ops.count(rop)) rem.insert(rop);
-                if (!rem.empty() && part.dag->merge_creates_cycle(extract_ops, rem))
-                    return {};
-            }
-
             double extract_cost = part.eval_set(extract_ops);
             if (extract_cost >= 1e17) return {};
 
@@ -515,11 +477,13 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     part.rebuild_index();
 
-    // Global acyclicity check for moves that can create indirect cycles:
-    // MERGE, STEAL, RECOMPUTE, TENSOR_MERGE.
-    // EJECT, SPLIT, DE_RECOMPUTE, TENSOR_EXTRACT cannot.
+    // Post-hoc acyclicity check.
+    // For MERGE, STEAL, RECOMPUTE, TENSOR_MERGE: best_move_for already used
+    // is_acyclic_after_* pre-checks, so this should never fire. Assert in debug.
+    // For TENSOR_EXTRACT: no pre-check available, so this is the real guard.
     if ((m.type == FMMove::MERGE || m.type == FMMove::STEAL ||
-         m.type == FMMove::RECOMPUTE || m.type == FMMove::TENSOR_MERGE) &&
+         m.type == FMMove::RECOMPUTE || m.type == FMMove::TENSOR_MERGE ||
+         m.type == FMMove::TENSOR_EXTRACT) &&
         !part.is_acyclic()) {
         return {};
     }

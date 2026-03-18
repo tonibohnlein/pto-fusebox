@@ -154,61 +154,52 @@ void test_best_move_proposes_eject() {
 void test_best_move_recompute_not_blocked_by_gap() {
     std::cout << "--- test_best_move_recompute_not_blocked_by_gap ---\n";
     // Diamond4 trivial. T1 is produced by Op0, consumed by BOTH Op1 and Op2.
-    // Merging {Op0,Op1}: T1 ephemeral but Op2 has no backup → gap → MERGE blocked.
-    // Stealing Op0 into G1: same reasoning → STEAL blocked.
-    // RECOMPUTE of Op0 into G1: safe because new_G1={Op0,Op1} exports T1 as
-    // boundary output. After Fix 4/5, there is NO gap check on RECOMPUTE.
     //
-    // For PW ops, all tensors have the same shape, so RECOMPUTE saving = 0
-    // (load_T1 - load_T0 = 0) — filtered by EPSILON. We therefore verify the
-    // fix indirectly: confirm MERGE and STEAL are correctly blocked, and that
-    // whatever move best_move_for proposes (if any) is feasible.
-    // The direct RECOMPUTE apply test is test_apply_recompute_no_gap_check.
+    // Under the new ephemeral rule, gap checks are the cost model's job.
+    // Only acyclicity matters for feasibility. MERGE of {Op0,Op1} is acyclic
+    // (no cycle between merged group and G2/G3), so it IS allowed.
+    //
+    // Verify: whatever best_move_for proposes is feasible after apply.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    // Direct gap check: both MERGE and STEAL on {Op0,Op1} must be blocked.
-    std::set<size_t> new_g1_merge = {0,1};
-    CHECK("MERGE {Op0,Op1} blocked by gap (T1 ephemeral, Op2 stranded)",
-          part.creates_ephemeral_gap(new_g1_merge, 0, 1));
-    CHECK("STEAL Op0 into G1 blocked by gap (excludes G0 source correctly)",
-          part.creates_ephemeral_gap(new_g1_merge, 0, 1));
-
-    // best_move_for must not propose MERGE or STEAL (both create gaps).
     auto m = best_move_for(part, 0, 1e18);
-    CHECK("MERGE not proposed", m.type != FMMove::MERGE);
-    CHECK("STEAL not proposed", m.type != FMMove::STEAL);
+    CHECK("Op0 proposes a move", m.valid());
 
-    // If any move IS proposed, applying it must produce a feasible partition.
+    // Whatever move is proposed, applying it must produce a feasible partition.
     if (m.valid()) {
         auto part2 = part;
         auto affected = apply_fm_move(part2, m);
+        CHECK("move applied successfully", !affected.empty());
         if (!affected.empty()) {
             check_feasible("post-move diamond4", part2);
-            std::cout << "    move type=" << m.type << " saving=" << m.saving << "\n";
+            CHECK("partition acyclic after move", part2.is_acyclic());
         }
-    } else {
-        std::cout << "    no move proposed (RECOMPUTE saving=0 < EPSILON) — correct\n";
-        g_pass++;
+        std::cout << "    move type=" << m.type << " saving=" << m.saving << "\n";
     }
 }
 void test_best_move_steal_gap_check_excludes_source() {
     std::cout << "--- test_best_move_steal_gap_check_excludes_source ---\n";
     // Diamond4 trivial. Op0 produces T1. Both Op1 and Op2 consume T1.
-    // STEAL of Op0 from G0 to G1 would make T1 ephemeral in new_G1={Op0,Op1}.
-    // Op2 (in G2) needs T1 — after steal, G0 no longer has Op0, so no backup.
-    // The corrected gap check (Bug 1 fix) must exclude G0 (losing Op0) AND G1.
-    // STEAL must be blocked; RECOMPUTE must be allowed.
+    // Under the new ephemeral rule, gap checks are removed — only acyclicity
+    // matters. STEAL of Op0 from G0 to G1 is acyclic, so it may be proposed.
+    // Verify that whatever is proposed produces a feasible, acyclic partition.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    // Check all moves with low floor from Op0's perspective
     auto m = best_move_for(part, 0, 1e18);
-    // STEAL should not be proposed since it creates a gap
-    CHECK("STEAL not proposed (gap check excludes source correctly)",
-          m.type != FMMove::STEAL);
+    CHECK("Op0 proposes a move", m.valid());
+    if (m.valid()) {
+        auto part2 = part;
+        auto affected = apply_fm_move(part2, m);
+        if (!affected.empty()) {
+            check_feasible("post-move diamond4 steal", part2);
+            CHECK("partition acyclic", part2.is_acyclic());
+        }
+        std::cout << "    type=" << m.type << " saving=" << m.saving << "\n";
+    }
 }
 
 void test_best_move_split_co_consumer_bridge() {
@@ -411,19 +402,24 @@ void test_apply_steal_gap_from_source_excluded() {
     std::cout << "--- test_apply_steal_gap_from_source_excluded ---\n";
     // Diamond4 trivial. STEAL Op0 from G0 to G1:
     // new_G1 = {Op0, Op1}. T1 becomes ephemeral.
-    // Op2 in G2 needs T1. After steal, G0 has no Op0 → no backup.
-    // apply_fm_move must reject this (Bug 2 fix: excludes ga=G0).
+    // Under the new ephemeral rule, this is allowed (no cycle created).
+    // The cost model handles ephemeral classification at finalization.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
     FMMove m;
     m.type = FMMove::STEAL; m.op = 0; m.ga = 0; m.gb = 1;
-    m.saving = 999.0;  // claim positive saving
+    m.saving = 999.0;
 
     auto affected = apply_fm_move(part, m);
-    CHECK("STEAL rejected: Op0 stolen leaves Op2 without T1 (Bug 2 fix)",
-          affected.empty());
+    // Under new ephemeral rule, STEAL is acyclic → accepted
+    CHECK("STEAL accepted (no cycle, ephemeral handled by cost model)",
+          !affected.empty());
+    if (!affected.empty()) {
+        check_feasible("post-STEAL diamond4", part);
+        CHECK("partition acyclic after STEAL", part.is_acyclic());
+    }
 }
 
 // ============================================================================
