@@ -389,12 +389,12 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
         auto evo_worker = [&]() {
             g_verbose = false;
+            std::mt19937 rng(std::random_device{}());
             while (true) {
                 int tid = next_task.fetch_add(1);
                 if (tid >= mut_tasks) break;
                 if (Clock::now() >= deadline) break;
 
-                std::mt19937 rng(std::random_device{}());
                 auto start = Clock::now();
 
                 Partition child;

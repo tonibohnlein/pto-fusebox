@@ -216,6 +216,17 @@ struct Partition {
         const std::vector<std::set<size_t>>& components,
         const std::set<size_t>& excluded_groups) const;
 
+    // Merge ops into an existing group, updating op_to_groups_ incrementally.
+    // Does NOT recompute cost — caller must set groups[gi].cost.
+    void merge_ops_into(size_t gi, const std::set<size_t>& ops) {
+        if (op_to_groups_.size() < prob->num_ops())
+            op_to_groups_.resize(prob->num_ops());
+        for (auto op : ops) {
+            groups[gi].ops.insert(op);
+            op_to_groups_[op].push_back(gi);
+        }
+    }
+
 private:
     std::vector<std::vector<size_t>> op_to_groups_;
 };

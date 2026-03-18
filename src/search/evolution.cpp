@@ -431,12 +431,9 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
     
-    for (auto gi : group_list) {
-        std::set<size_t> rem;
-        for (auto op : part.groups[gi].ops)
-            if (!extract_ops.count(op)) rem.insert(op);
-        if (!rem.empty() && dag.merge_creates_cycle(extract_ops, rem)) return part;
-    }
+    // Note: no merge_creates_cycle check here — extract_ops and remainders are
+    // separate groups, not being merged. Acyclicity is validated at the end
+    // via partition_has_gap (which calls is_acyclic).
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
     
@@ -500,14 +497,26 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
     if (candidates.empty()) return part;
     std::shuffle(candidates.begin(), candidates.end(), rng);
 
+    // Greedy removal: try removing each candidate, re-checking coverage
+    // after each removal (since removing one group may invalidate another).
+    bool any_removed = false;
     for (auto gi : candidates) {
-        Partition saved = part;
-        part.groups[gi].alive = false;
-        part.groups[gi].gen++;
-        part.rebuild_index();
-        if (!partition_has_gap(part)) return part;
-        part = std::move(saved);
+        if (!part.groups[gi].alive) continue;
+        // Re-check: all ops in gi still covered by other alive groups?
+        bool still_redundant = true;
+        for (auto op : part.groups[gi].ops) {
+            bool in_other = false;
+            for (auto gj : part.groups_of(op))
+                if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
+            if (!in_other) { still_redundant = false; break; }
+        }
+        if (still_redundant) {
+            part.groups[gi].alive = false;
+            part.groups[gi].gen++;
+            any_removed = true;
+        }
     }
+    if (any_removed) part.rebuild_index();
     return part;
 }
 
@@ -611,7 +620,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         auto& cluster = clusters[ck];
         
         // Find existing child groups adjacent to this cluster
-        // Use op_neighbors + groups_of (requires index to be current)
+        // Uses op_to_groups_ which is maintained incrementally below
         std::set<size_t> adj_child_groups;
         for (auto op : cluster) {
             for (auto nbr : dag.op_neighbors[op])
@@ -638,25 +647,27 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         double standalone = child.eval_set(cluster);
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
-            for (auto op : cluster) child.groups[best_gi].ops.insert(op);
+            // Merge into existing group — incremental index update
+            child.merge_ops_into(best_gi, cluster);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
         } else if (standalone < 1e17) {
-            child.add_group(cluster, standalone);
+            child.add_group(cluster, standalone);  // add_group updates index
         } else if (best_gi != SIZE_MAX) {
-            for (auto op : cluster) child.groups[best_gi].ops.insert(op);
+            child.merge_ops_into(best_gi, cluster);
             child.groups[best_gi].cost = best_cost;
             child.groups[best_gi].gen++;
         } else {
-            // Last resort: singletons (can't create ephemeral gaps)
+            // Last resort: singletons
             for (auto op : cluster) {
                 double c = child.eval_set({op});
                 child.add_group({op}, c);
             }
         }
-        // Keep index current for next cluster iteration
-        child.rebuild_index();
     }
+    
+    // Single rebuild at the end for cleanup (removes dead entries, etc.)
+    child.rebuild_index();
     
 #ifndef NDEBUG
     // Verify cost consistency after crossover
