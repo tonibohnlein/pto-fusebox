@@ -738,15 +738,14 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         if (eff_v == BoundaryTensorInfo::FROM_NK) eff_v = BoundaryTensorInfo::FIXED_1;
       }
 
-      bool k_dep = (eff_h == BoundaryTensorInfo::FROM_NK ||
-                    eff_v == BoundaryTensorInfo::FROM_NK);
+      bool k_dep = (eff_h == BoundaryTensorInfo::FROM_NK || eff_v == BoundaryTensorInfo::FROM_NK);
       bool h_fixed = (eff_h == BoundaryTensorInfo::FIXED_1);
       bool v_fixed = (eff_v == BoundaryTensorInfo::FIXED_1);
 
       if (k_dep)                    stream_load += slice_io;
       else if (h_fixed && v_fixed)  once_load   += slice_io;
-      else if (h_fixed)             col_load    += slice_io;
-      else if (v_fixed)             row_load    += slice_io;
+      else if (h_fixed)             row_load    += slice_io; // FIX: Fixed horizontally (LHS). Only changes when ROW changes.
+      else if (v_fixed)             col_load    += slice_io; // FIX: Fixed vertically (RHS). Only changes when COL changes.
       else                          tile_load   += slice_io;
     }
 
