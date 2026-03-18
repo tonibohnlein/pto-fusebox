@@ -67,67 +67,33 @@ void Partition::rebuild_group_dag() {
             tensor_to_group[t] = i;
     }
 
-    // Step 1: Get a valid topological order using BOUNDARY-BASED OR-node Kahn's.
-    // Dependencies are: group i needs tensor t as boundary_input, which must come
-    // from some group gj that has t as boundary_output. OR-semantics: any ONE
-    // such gj satisfying the dep unlocks group i.
+    // Step 1: Get a valid topological order using OP-BASED OR-node Kahn's.
+    // This always resolves all groups (matches is_acyclic). We use it ONLY
+    // to pick which source to draw an edge from for each boundary input.
     std::vector<int> topo_pos(ng, -1);
     {
         std::vector<int> unsatisfied(ng, 0);
         std::vector<bool> dep_met;
         std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
 
-        for (size_t i = 0; i < ng; i++) {
-            if (!groups[i].alive || !groups[i].sg) continue;
-            for (auto t : groups[i].sg->boundary_inputs()) {
+        for (size_t op_idx = 0; op_idx < prob->ops.size(); op_idx++) {
+            for (auto t : prob->ops[op_idx].inputs) {
                 int prod = dag->tensor_producer[t];
-                if (prod < 0) continue;  // graph input
-
-                // Find all alive groups that export t as boundary output
-                bool any_source = false;
-                size_t dep_id = dep_met.size();
-
-                for (auto source_gj : op_to_groups_[(size_t)prod]) {
-                    if (!groups[source_gj].alive || source_gj == i) continue;
-                    if (!groups[source_gj].sg ||
-                        !groups[source_gj].sg->boundary_outputs().count(t))
-                        continue;
-                    if (!any_source) {
-                        dep_met.push_back(false);
-                        unsatisfied[i]++;
-                        any_source = true;
+                if (prod < 0) continue;
+                for (auto target_gi : op_to_groups_[op_idx]) {
+                    if (!groups[target_gi].alive) continue;
+                    bool prod_internal = false;
+                    for (auto g : op_to_groups_[(size_t)prod])
+                        if (g == target_gi) { prod_internal = true; break; }
+                    if (prod_internal) continue;
+                    size_t dep_id = dep_met.size();
+                    dep_met.push_back(false);
+                    unsatisfied[target_gi]++;
+                    for (auto source_gj : op_to_groups_[(size_t)prod]) {
+                        if (groups[source_gj].alive)
+                            frees[source_gj].push_back({target_gi, dep_id});
                     }
-                    frees[source_gj].push_back({i, dep_id});
                 }
-            }
-        }
-
-        // DIAG: count dependencies found
-        int total_deps = 0, total_frees = 0;
-        for (size_t i = 0; i < ng; i++) {
-            total_deps += unsatisfied[i];
-            total_frees += frees[i].size();
-        }
-        if (total_deps == 0) {
-            std::cerr << "  DIAG rebuild_group_dag: ZERO dependencies found! ng=" << ng << "\n";
-            // Trace a specific case
-            for (size_t i = 0; i < ng; i++) {
-                if (!groups[i].alive || !groups[i].sg) continue;
-                for (auto t : groups[i].sg->boundary_inputs()) {
-                    int prod = dag->tensor_producer[t];
-                    if (prod < 0) continue;
-                    std::cerr << "  DIAG:   G" << i << " needs T" << t
-                              << " from op" << prod
-                              << " op_to_groups[" << prod << "]={";
-                    for (auto gj : op_to_groups_[(size_t)prod])
-                        std::cerr << gj << "(alive=" << groups[gj].alive
-                                  << ",has_sg=" << (groups[gj].sg ? 1 : 0)
-                                  << ",exports=" << (groups[gj].sg ? groups[gj].sg->boundary_outputs().count(t) : 0)
-                                  << ") ";
-                    std::cerr << "}\n";
-                    break; // just one example
-                }
-                break; // just one group
             }
         }
 
@@ -157,24 +123,32 @@ void Partition::rebuild_group_dag() {
         }
     }
 
-    // Step 2: Build group DAG edges using BOUNDARY information, filtered by
-    // the boundary-based topological order. Since Kahn's and this loop use the
-    // same boundary view, every dependency has at least one source with
-    // topo_pos < consumer. No fallback needed.
+    // Step 2: Build group DAG edges from boundary information.
+    // For each boundary input tensor T of group i, find alive groups that
+    // export T as boundary output. Pick the ONE source with the EARLIEST
+    // op-based topo position. This guarantees:
+    // - OR-semantics: only one edge per dependency (no AND-cycles)
+    // - Consistency: source always precedes consumer in the op-based order
+    //   (which is guaranteed cycle-free)
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive || !groups[i].sg) continue;
-        if (topo_pos[i] < 0) continue;
         for (auto t : groups[i].sg->boundary_inputs()) {
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
+            size_t best_gj = SIZE_MAX;
+            int best_pos = INT_MAX;
             for (auto gj : op_to_groups_[(size_t)prod_op]) {
                 if (!groups[gj].alive || gj == i) continue;
                 if (!groups[gj].sg || !groups[gj].sg->boundary_outputs().count(t))
                     continue;
-                if (topo_pos[gj] >= 0 && topo_pos[gj] < topo_pos[i]) {
-                    if (group_preds[i].insert(gj).second)
-                        group_succs[gj].insert(i);
+                if (topo_pos[gj] >= 0 && topo_pos[gj] < best_pos) {
+                    best_pos = topo_pos[gj];
+                    best_gj = gj;
                 }
+            }
+            if (best_gj != SIZE_MAX) {
+                if (group_preds[i].insert(best_gj).second)
+                    group_succs[best_gj].insert(i);
             }
         }
     }
@@ -396,28 +370,7 @@ static bool kahn_with_delta(
                 unsatisfied_deps[target_gi]++;
 
                 for_virtual_groups((size_t)prod, [&](size_t source_gj) {
-                    if (!alive[source_gj]) return;
-
-                    // Would source_gj actually export tensor t?
-                    // Only if at least one DAG consumer of t is outside source_gj.
-                    // If ALL consumers are inside, t is ephemeral → not exported.
-                    bool would_export = false;
-                    if (dag.tensor_consumers[t].empty()) {
-                        would_export = true;  // graph output, always exported
-                    } else {
-                        for (auto cop : dag.tensor_consumers[t]) {
-                            bool cop_in_source = false;
-                            for_virtual_groups(cop, [&](size_t g) {
-                                if (g == source_gj) cop_in_source = true;
-                            });
-                            if (!cop_in_source) {
-                                would_export = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (would_export)
+                    if (alive[source_gj])
                         frees[source_gj].push_back({target_gi, dep_id});
                 });
             });
