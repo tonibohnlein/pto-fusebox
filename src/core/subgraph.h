@@ -119,6 +119,9 @@ private:
   std::vector<int64_t> h_divides_;
   std::vector<int64_t> k_divides_;
 
+  std::vector<size_t> reverse_topo_ops_;
+  std::vector<bool> is_sink_op_vec_;
+
   // Precomputed per-boundary-tensor tiling info for working_set/compute_cost.
   //
   // Each boundary tensor's slice dimensions are determined by backward

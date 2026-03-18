@@ -102,6 +102,35 @@ void Partition::rebuild_group_dag() {
             }
         }
 
+        // DIAG: count dependencies found
+        int total_deps = 0, total_frees = 0;
+        for (size_t i = 0; i < ng; i++) {
+            total_deps += unsatisfied[i];
+            total_frees += frees[i].size();
+        }
+        if (total_deps == 0) {
+            std::cerr << "  DIAG rebuild_group_dag: ZERO dependencies found! ng=" << ng << "\n";
+            // Trace a specific case
+            for (size_t i = 0; i < ng; i++) {
+                if (!groups[i].alive || !groups[i].sg) continue;
+                for (auto t : groups[i].sg->boundary_inputs()) {
+                    int prod = dag->tensor_producer[t];
+                    if (prod < 0) continue;
+                    std::cerr << "  DIAG:   G" << i << " needs T" << t
+                              << " from op" << prod
+                              << " op_to_groups[" << prod << "]={";
+                    for (auto gj : op_to_groups_[(size_t)prod])
+                        std::cerr << gj << "(alive=" << groups[gj].alive
+                                  << ",has_sg=" << (groups[gj].sg ? 1 : 0)
+                                  << ",exports=" << (groups[gj].sg ? groups[gj].sg->boundary_outputs().count(t) : 0)
+                                  << ") ";
+                    std::cerr << "}\n";
+                    break; // just one example
+                }
+                break; // just one group
+            }
+        }
+
         std::vector<size_t> q;
         q.reserve(ng);
         std::vector<bool> enqueued(ng, false);
