@@ -74,6 +74,13 @@ public:
     bool empty() const { return root_ == -1; }
     bool contains(size_t key) const { return key < in_heap_.size() && in_heap_[key]; }
 
+    // Peek at the best element without removing it.
+    // Returns nullopt if heap is empty.
+    std::optional<std::pair<size_t, const MoveType&>> peek_best() const {
+        if (root_ == -1) return std::nullopt;
+        return std::pair<size_t, const MoveType&>{(size_t)root_, nodes_[root_].move};
+    }
+
     void clear() {
         if (root_ == -1) return;
         std::fill(in_heap_.begin(), in_heap_.end(), false);

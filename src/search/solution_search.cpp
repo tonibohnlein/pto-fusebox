@@ -2,6 +2,7 @@
 #include "search/merkle_hash.h"
 #include "partition/partition.h"
 #include "search/verbose.h"
+#include "util/pairing_heap.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -633,15 +634,11 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       if (!ce.feasible)
         continue;
 
-      // Use simulate_rebuild_cost for cascade-accurate prediction
-      double old_cost = 0;
-      for (size_t j = sj; j < state.size(); j++) old_cost += state.cost[j];
-      auto tmp = state.steps;
-      tmp[sj].subgraph = *sg;
-      tmp[sj].config = ce.config;
-      tmp[sj].retain_these = ret;
-      double new_cost = simulate_rebuild_cost(tmp, sj);
-      double saving = old_cost - new_cost;
+      // Direct cost comparison: the expanded step replaces step sj.
+      // ce.latency already has the optimal config for the expanded set.
+      // Downstream cascade (retain propagation) is handled at apply time
+      // by rebuild_from.
+      double saving = state.cost[sj] - ce.latency;
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::RECOMPUTE;
         best.step_a = sj;
@@ -684,25 +681,9 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
       }
       if (!cr.feasible || !cs.feasible) break;
 
-      double saving = 0;
-      // Build temporary step vector with the insertion, then run exact
-      // rebuild simulation to get accurate total cost.
-      {
-        auto tmp = state.steps;
-        ScheduleStep step_r; step_r.subgraph = *sg_r; step_r.config = cr.config; step_r.retain_these = rr;
-        ScheduleStep step_s; step_s.subgraph = *sg_s; step_s.config = cs.config;
-        if (must_be_before) {
-          tmp[si] = std::move(step_s);
-          tmp.insert(tmp.begin() + si + 1, std::move(step_r));
-        } else {
-          tmp[si] = std::move(step_r);
-          tmp.insert(tmp.begin() + si + 1, std::move(step_s));
-        }
-        double old_cost = 0;
-        for (size_t j = si; j < state.size(); j++) old_cost += state.cost[j];
-        double new_cost = simulate_rebuild_cost(tmp, si);
-        saving = old_cost - new_cost;
-      }
+      // Direct cost comparison: step si splits into two steps.
+      // Downstream cascade handled by rebuild_from at apply time.
+      double saving = state.cost[si] - (cr.latency + cs.latency);
 
       if (saving > -floor && saving > best.saving) {
         best.type = SolutionMove::EJECT;
@@ -919,7 +900,9 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
   if (!state.is_feasibly_retainable(t))
     return best;
 
-  // RETAIN_ADD: find step pairs where adding t to retain helps
+  // RETAIN_ADD: find step pairs where adding t to retain helps.
+  // Paired evaluation: only evaluate (si, si+1) — the step that pays the
+  // memory penalty and the step that reaps the IO saving.
   for (size_t i = 0; i + 1 < state.size(); i++) {
     auto &si = state.steps[i];
     auto &sj = state.steps[i + 1];
@@ -932,14 +915,19 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     if (!sj.subgraph.boundary_inputs().count(t))
       continue;
 
-    // Compute original cost from i onward
-    double old_cost = 0;
-    for (size_t j = i; j < state.size(); j++) old_cost += state.cost[j];
+    // Evaluate step i with t added to retain
+    auto new_retain_i = si.retain_these;
+    new_retain_i.insert(t);
+    auto cost_i = si.subgraph.best_cost(state.ret_entering[i], new_retain_i);
+    if (!cost_i.feasible) continue;
 
-    // Simulate: add t, rebuild with optimal configs
-    auto tmp = state.steps;
-    tmp[i].retain_these.insert(t);
-    double new_cost = simulate_rebuild_cost(tmp, i);
+    // Evaluate step i+1 with t entering (saves the once_load)
+    auto new_entering = new_retain_i;  // retained outputs become next step's entering
+    auto cost_j = sj.subgraph.best_cost(new_entering, sj.retain_these);
+    if (!cost_j.feasible) continue;
+
+    double old_cost = state.cost[i] + state.cost[i + 1];
+    double new_cost = cost_i.latency + cost_j.latency;
     double saving = old_cost - new_cost;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_ADD;
@@ -949,23 +937,29 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     }
   }
 
-  // RETAIN_REMOVE: find steps where removing t from retain helps
+  // RETAIN_REMOVE: find steps where removing t from retain helps.
   for (size_t i = 0; i + 1 < state.size(); i++) {
     if (!state.steps[i].retain_these.count(t))
       continue;
     bool is_output = state.steps[i].subgraph.boundary_outputs().count(t);
     bool useful_next = state.steps[i + 1].subgraph.boundary_inputs().count(t);
     if (!is_output || !useful_next)
-      continue;  // already pruned by rebuild_from → saving=0
+      continue;
 
-    // Compute original cost from i onward
-    double old_cost = 0;
-    for (size_t j = i; j < state.size(); j++) old_cost += state.cost[j];
+    // Evaluate step i without t in retain
+    auto new_retain_i = state.steps[i].retain_these;
+    new_retain_i.erase(t);
+    auto cost_i = state.steps[i].subgraph.best_cost(state.ret_entering[i], new_retain_i);
+    if (!cost_i.feasible) continue;
 
-    // Simulate: remove t, rebuild with optimal configs
-    auto tmp = state.steps;
-    tmp[i].retain_these.erase(t);
-    double new_cost = simulate_rebuild_cost(tmp, i);
+    // Evaluate step i+1 without t entering (must reload from slow memory)
+    auto new_entering = new_retain_i;
+    auto cost_j = state.steps[i + 1].subgraph.best_cost(
+        new_entering, state.steps[i + 1].retain_these);
+    if (!cost_j.feasible) continue;
+
+    double old_cost = state.cost[i] + state.cost[i + 1];
+    double new_cost = cost_i.latency + cost_j.latency;
     double saving = old_cost - new_cost;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_REMOVE;
@@ -1439,41 +1433,58 @@ static bool is_stale(const SolutionMove &m, const SolState &state) {
 // ============================================================================
 
 struct SolActiveSet {
-  struct Entry {
-    bool is_tensor;
-    size_t id;
-    SolutionMove move;
-  };
-
-  std::vector<Entry> entries;
-  std::set<size_t> active_ops, active_tensors;
+  PairingHeap<SolutionMove> op_heap;
+  PairingHeap<SolutionMove> tensor_heap;
   std::set<size_t> locked_ops, locked_tensors;
   double floor = 0;
   Clock::time_point deadline = Clock::time_point::max();
 
+  SolActiveSet(size_t num_ops, size_t num_tensors)
+      : op_heap(num_ops), tensor_heap(num_tensors) {}
+
   void activate_op(SolState &state, size_t op) {
-    if (active_ops.count(op) || locked_ops.count(op))
+    if (locked_ops.count(op) || op_heap.contains(op))
       return;
     if (Clock::now() >= deadline)
       return;
-    active_ops.insert(op);
     auto m = best_move_for_op(state, op, locked_ops, floor);
-    entries.push_back({false, op, m});
+    if (m.valid())
+      op_heap.push_or_update(op, m);
   }
 
   void activate_tensor(SolState &state, size_t t) {
-    if (active_tensors.count(t) || locked_tensors.count(t))
+    if (locked_tensors.count(t) || tensor_heap.contains(t))
       return;
     if (!state.is_feasibly_retainable(t))
-      return;  // precomputed: can never be retained
+      return;
     if (Clock::now() >= deadline)
       return;
-    active_tensors.insert(t);
     auto m = best_move_for_tensor(state, t, locked_tensors, floor);
-    entries.push_back({true, t, m});
+    if (m.valid())
+      tensor_heap.push_or_update(t, m);
   }
 
-  // Activate ops and tensors associated with a step
+  void recompute_op(SolState &state, size_t op) {
+    if (locked_ops.count(op)) return;
+    if (Clock::now() >= deadline) return;
+    auto m = best_move_for_op(state, op, locked_ops, floor);
+    if (m.valid())
+      op_heap.push_or_update(op, m);
+    else
+      op_heap.remove(op);
+  }
+
+  void recompute_tensor(SolState &state, size_t t) {
+    if (locked_tensors.count(t)) return;
+    if (!state.is_feasibly_retainable(t)) return;
+    if (Clock::now() >= deadline) return;
+    auto m = best_move_for_tensor(state, t, locked_tensors, floor);
+    if (m.valid())
+      tensor_heap.push_or_update(t, m);
+    else
+      tensor_heap.remove(t);
+  }
+
   void activate_step(SolState &state, size_t si) {
     if (si >= state.size())
       return;
@@ -1488,47 +1499,26 @@ struct SolActiveSet {
       activate_tensor(state, t);
   }
 
-  // Re-evaluate entries that touch affected steps
   void update_affected(SolState &state, size_t lo, size_t hi) {
-    // Collect ops and tensors in the affected range
     std::set<size_t> affected_ops, affected_tensors;
-    for (size_t i = lo; i < std::min(hi, state.size()); i++) {
+    // Expand range to include neighbors
+    size_t elo = (lo > 0) ? lo - 1 : lo;
+    size_t ehi = std::min(hi + 1, state.size());
+    for (size_t i = elo; i < ehi; i++) {
       for (auto op : state.steps[i].subgraph.ops())
         affected_ops.insert(op);
       for (auto t : state.steps[i].subgraph.boundary_inputs())
         affected_tensors.insert(t);
       for (auto t : state.steps[i].subgraph.boundary_outputs())
         affected_tensors.insert(t);
-    }
-    // Neighbors: one step before lo and after hi
-    if (lo > 0) {
-      for (auto op : state.steps[lo - 1].subgraph.ops())
-        affected_ops.insert(op);
-      for (auto t : state.steps[lo - 1].subgraph.boundary_outputs())
-        affected_tensors.insert(t);
-    }
-    if (hi < state.size()) {
-      for (auto op : state.steps[hi].subgraph.ops())
-        affected_ops.insert(op);
-      for (auto t : state.steps[hi].subgraph.boundary_inputs())
+      for (auto t : state.steps[i].retain_these)
         affected_tensors.insert(t);
     }
 
-    for (auto &e : entries) {
-      if (Clock::now() >= deadline)
-        break;
-      if (e.is_tensor) {
-        if (locked_tensors.count(e.id))
-          continue;
-        if (affected_tensors.count(e.id))
-          e.move = best_move_for_tensor(state, e.id, locked_tensors, floor);
-      } else {
-        if (locked_ops.count(e.id))
-          continue;
-        if (affected_ops.count(e.id))
-          e.move = best_move_for_op(state, e.id, locked_ops, floor);
-      }
-    }
+    for (auto op : affected_ops)
+      recompute_op(state, op);
+    for (auto t : affected_tensors)
+      recompute_tensor(state, t);
 
     // Activate new ops/tensors in affected range
     for (size_t i = lo; i < std::min(hi + 1, state.size()); i++)
@@ -1536,30 +1526,48 @@ struct SolActiveSet {
   }
 
   std::optional<SolutionMove> pop_best() {
-    int best_idx = -1;
-    double best_saving = -1e18;
-    for (size_t i = 0; i < entries.size(); i++) {
-      auto &e = entries[i];
-      if (e.is_tensor && locked_tensors.count(e.id))
-        continue;
-      if (!e.is_tensor && locked_ops.count(e.id))
-        continue;
-      if (!e.move.valid())
-        continue;
-      if (e.move.saving > best_saving) {
-        best_saving = e.move.saving;
-        best_idx = (int)i;
+    // Drain locked entries from tops of both heaps
+    while (!op_heap.empty()) {
+      auto top = op_heap.peek_best();
+      if (!top || !top->second.valid()) { op_heap.pop_best(); continue; }
+      if (locked_ops.count(top->second.op)) { op_heap.pop_best(); continue; }
+      break;  // valid unlocked op at top
+    }
+    while (!tensor_heap.empty()) {
+      auto top = tensor_heap.peek_best();
+      if (!top || !top->second.valid()) { tensor_heap.pop_best(); continue; }
+      if (locked_tensors.count(top->second.tensor)) { tensor_heap.pop_best(); continue; }
+      break;  // valid unlocked tensor at top
+    }
+
+    // Compare tops, pop the winner
+    auto op_top = op_heap.empty() ? std::nullopt : op_heap.peek_best();
+    auto tn_top = tensor_heap.empty() ? std::nullopt : tensor_heap.peek_best();
+
+    bool use_op = op_top.has_value() && op_top->second.valid();
+    bool use_tn = tn_top.has_value() && tn_top->second.valid();
+
+    if (!use_op && !use_tn) return std::nullopt;
+
+    if (use_op && use_tn) {
+      if (tn_top->second.saving > op_top->second.saving) {
+        auto m = tensor_heap.pop_best();
+        locked_tensors.insert(m->tensor);
+        return m;
+      } else {
+        auto m = op_heap.pop_best();
+        locked_ops.insert(m->op);
+        return m;
       }
     }
-    if (best_idx < 0)
-      return std::nullopt;
-    auto &e = entries[best_idx];
-    auto result = e.move;
-    if (e.is_tensor)
-      locked_tensors.insert(e.id);
-    else
-      locked_ops.insert(e.id);
-    return result;
+    if (use_op) {
+      auto m = op_heap.pop_best();
+      locked_ops.insert(m->op);
+      return m;
+    }
+    auto m = tensor_heap.pop_best();
+    locked_tensors.insert(m->tensor);
+    return m;
   }
 };
 
@@ -1653,7 +1661,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
   double floor = result.start_cost * cfg.floor_fraction;
   double max_drift = result.start_cost * cfg.max_drift_fraction;
 
-  SolActiveSet active;
+  SolActiveSet active(prob.num_ops(), prob.num_tensors());
   active.floor = floor;
   active.deadline = cfg.deadline;
 
