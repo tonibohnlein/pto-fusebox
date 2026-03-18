@@ -115,7 +115,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             double actual_gain = total_before - part.total_cost();
             double discrepancy = move.saving - actual_gain;
             if (std::abs(discrepancy) > 0.1 * std::max(1.0, std::abs(move.saving)) + 1.0) {
-                std::cerr << "    FM GAIN MISMATCH: predicted=" << move.saving
+                std::cerr << "    PARTITION FM GAIN MISMATCH: predicted=" << move.saving
                           << " actual=" << actual_gain
                           << " type=" << (int)move.type
                           << " op=" << move.op
