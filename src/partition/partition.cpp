@@ -258,15 +258,22 @@ bool Partition::is_acyclic() const {
 
     // Kahn's algorithm
     std::deque<size_t> q;
+    std::vector<bool> enqueued(ng, false);
     size_t visited = 0;
     for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive && deps[i].empty()) q.push_back(i);
+        if (groups[i].alive && deps[i].empty()) {
+            q.push_back(i);
+            enqueued[i] = true;
+        }
     while (!q.empty()) {
         size_t u = q.front(); q.pop_front();
         visited++;
         for (auto [gi, dep_id] : frees[u]) {
             deps[gi].erase(dep_id);
-            if (deps[gi].empty()) q.push_back(gi);
+            if (deps[gi].empty() && !enqueued[gi]) {
+                q.push_back(gi);
+                enqueued[gi] = true;
+            }
         }
     }
     return visited >= num_alive();
@@ -308,15 +315,22 @@ static bool kahn_with_mapping(
     }
 
     std::deque<size_t> q;
+    std::vector<bool> enqueued(ng, false);
     size_t visited = 0;
     for (size_t i = 0; i < ng; i++)
-        if (alive[i] && deps[i].empty()) q.push_back(i);
+        if (alive[i] && deps[i].empty()) {
+            q.push_back(i);
+            enqueued[i] = true;
+        }
     while (!q.empty()) {
         size_t u = q.front(); q.pop_front();
         visited++;
         for (auto [gi, dep_id] : frees[u]) {
             deps[gi].erase(dep_id);
-            if (deps[gi].empty()) q.push_back(gi);
+            if (deps[gi].empty() && !enqueued[gi]) {
+                q.push_back(gi);
+                enqueued[gi] = true;
+            }
         }
     }
     return visited >= num_alive_groups;

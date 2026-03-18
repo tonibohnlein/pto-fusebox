@@ -120,17 +120,9 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
             part = std::move(snapshot);
-            if (fm_iters <= 30 || fm_iters % 50 == 0) {
-                std::cerr << "      FM[" << fm_iters << "] REJECTED\n";
-            }
             continue;
         }
 
-        if (fm_iters <= 30 || fm_iters % 50 == 0) {
-            std::cerr << "      FM[" << fm_iters << "] APPLIED"
-                      << " actual=" << (total_before - part.total_cost())
-                      << " cost=" << part.total_cost() << "\n";
-        }
 
 #ifndef NDEBUG
         {

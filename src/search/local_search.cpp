@@ -520,17 +520,6 @@ Partition greedy_descent(Partition part) {
 
         applied++;
 
-        if (g_verbose || applied <= 20 || applied % 100 == 0) {
-            std::cerr << "    greedy #" << applied
-                      << " type=" << (int)m.type
-                      << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb
-                      << " predicted=" << m.saving
-                      << " actual=" << (old_total - part.total_cost())
-                      << " cost=" << part.total_cost()
-                      << " affected=" << 0 // placeholder
-                      << "\n";
-        }
-
         // Collect affected ops: ops in dirty groups + their DAG neighbors
         // Always include the moved op itself (may be in a killed group)
         std::set<size_t> affected_ops;
@@ -553,13 +542,6 @@ Partition greedy_descent(Partition part) {
                 heap.push_or_update(op, fresh);
             else
                 heap.remove(op);
-        }
-
-        if (iterations <= 50 || iterations % 100 == 0) {
-            std::cerr << "    [" << iterations << "] APPLIED #" << applied
-                      << " actual_gain=" << (old_total - part.total_cost())
-                      << " cost=" << part.total_cost()
-                      << " refreshed=" << affected_ops.size() << "\n";
         }
     }
 
