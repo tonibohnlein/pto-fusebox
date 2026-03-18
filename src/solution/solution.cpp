@@ -2,6 +2,7 @@
 #include "partition/partition.h"
 #include <algorithm>
 #include <sstream>
+#include <iostream>
 
 // ============================================================================
 // Construction: evaluate costs with inter-step retain propagation
@@ -153,6 +154,46 @@ Solution Solution::from_partition(const Problem& prob, const DAG& dag,
         best = &dfs_sol;
     if (beam_sol.validate().valid && beam_sol.total_latency() < best->total_latency() - 0.01)
         best = &beam_sol;
+
+    // Diagnostic: if best is invalid, dump group DAG info
+    auto vr = best->validate();
+    if (!vr.valid) {
+        std::cerr << "  DIAG: " << vr.error << "\n";
+        std::cerr << "  DIAG: " << part.num_alive() << " alive groups\n";
+        // Find groups with in_deg==0
+        for (size_t gi = 0; gi < part.groups.size(); gi++) {
+            if (!part.groups[gi].alive) continue;
+            if (part.group_in_deg[gi] != 0) continue;
+            if (!part.groups[gi].sg) continue;
+            for (auto t : part.groups[gi].sg->boundary_inputs()) {
+                int prod = dag.tensor_producer[t];
+                if (prod < 0) continue;
+                std::cerr << "  DIAG: G" << gi << " (in_deg=0) needs T" << t
+                          << " from op" << prod << ". ";
+                // Which groups export T?
+                bool any_export = false;
+                for (size_t gj = 0; gj < part.groups.size(); gj++) {
+                    if (!part.groups[gj].alive || gj == gi) continue;
+                    if (part.groups[gj].sg && part.groups[gj].sg->boundary_outputs().count(t)) {
+                        std::cerr << "G" << gj << "(pos=" << part.group_in_deg[gj] << ") exports. ";
+                        any_export = true;
+                    }
+                    if (part.groups[gj].ops.count(prod)) {
+                        auto fe = part.compute_force_ephemeral(gj);
+                        if (fe.count(t))
+                            std::cerr << "G" << gj << " FORCE-EPHEMERAL! ";
+                    }
+                }
+                if (!any_export)
+                    std::cerr << "NO GROUP EXPORTS T" << t << "!";
+                std::cerr << "\n";
+            }
+        }
+        // Dump DFS order
+        std::cerr << "  DIAG dfs_order: ";
+        for (auto gi : dfs_res.order) std::cerr << gi << " ";
+        std::cerr << "\n";
+    }
 
     return std::move(*best);
 }

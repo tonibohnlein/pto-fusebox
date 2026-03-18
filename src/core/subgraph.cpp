@@ -845,10 +845,6 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
 CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
                                const std::set<size_t> &retain_these) const {
-  int64_t min_w = std::max<int64_t>(1, prob_->native_w / 4);
-  int64_t min_h = std::max<int64_t>(1, prob_->native_h / 4);
-
-  // For MatMul: snake always ties or beats None. For PW-only: snake has no effect.
   std::vector<SnakeDir> snakes;
   if (has_matmul_) {
     snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};
@@ -856,34 +852,66 @@ CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
     snakes = {SnakeDir::None};
   }
 
-  // FIX #1: call compute_cost directly (it already checks validity + feasibility
-  // internally). Avoids redundant working_set computation from is_feasible.
-  auto search = [&](const std::vector<int64_t> &ws,
-                    const std::vector<int64_t> &hs,
-                    const std::vector<int64_t> &ks, int64_t mw, int64_t mh) {
-    CostResult best;
-    for (int64_t ww : ws) {
-      if (ww < mw)
-        continue;
-      for (int64_t hh : hs) {
-        if (hh < mh)
-          continue;
-        for (int64_t kk : ks) {
-          for (auto sd : snakes) {
-            TileConfig cfg{ww, hh, kk, sd};
-            auto r = compute_cost(cfg, retained_from_prev, retain_these);
-            if (r.feasible && r.latency < best.latency)
-              best = r;
+  CostResult best;
+
+  for (int64_t ww : ws_cand_) {
+    for (int64_t hh : hs_cand_) {
+      for (int64_t kk : ks_cand_) {
+        for (auto sd : snakes) {
+          TileConfig cfg{ww, hh, kk, sd};
+          auto r = compute_cost(cfg, retained_from_prev, retain_these);
+          if (r.feasible && r.latency < best.latency) {
+            best = r;
           }
         }
       }
     }
-    return best;
-  };
-
-  CostResult best = search(ws_cand_, hs_cand_, ks_cand_, min_w, min_h);
-  if (!best.feasible)
-    best = search(ws_cand_, hs_cand_, ks_cand_, 1, 1);
+  }
 
   return best;
 }
+
+// CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
+//                                const std::set<size_t> &retain_these) const {
+//   int64_t min_w = std::max<int64_t>(1, prob_->native_w / 4);
+//   int64_t min_h = std::max<int64_t>(1, prob_->native_h / 4);
+
+//   // For MatMul: snake always ties or beats None. For PW-only: snake has no effect.
+//   std::vector<SnakeDir> snakes;
+//   if (has_matmul_) {
+//     snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};
+//   } else {
+//     snakes = {SnakeDir::None};
+//   }
+
+//   // FIX #1: call compute_cost directly (it already checks validity + feasibility
+//   // internally). Avoids redundant working_set computation from is_feasible.
+//   auto search = [&](const std::vector<int64_t> &ws,
+//                     const std::vector<int64_t> &hs,
+//                     const std::vector<int64_t> &ks, int64_t mw, int64_t mh) {
+//     CostResult best;
+//     for (int64_t ww : ws) {
+//       if (ww < mw)
+//         continue;
+//       for (int64_t hh : hs) {
+//         if (hh < mh)
+//           continue;
+//         for (int64_t kk : ks) {
+//           for (auto sd : snakes) {
+//             TileConfig cfg{ww, hh, kk, sd};
+//             auto r = compute_cost(cfg, retained_from_prev, retain_these);
+//             if (r.feasible && r.latency < best.latency)
+//               best = r;
+//           }
+//         }
+//       }
+//     }
+//     return best;
+//   };
+
+//   CostResult best = search(ws_cand_, hs_cand_, ks_cand_, min_w, min_h);
+//   if (!best.feasible)
+//     best = search(ws_cand_, hs_cand_, ks_cand_, 1, 1);
+
+//   return best;
+// }

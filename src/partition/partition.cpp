@@ -61,57 +61,47 @@ void Partition::rebuild_group_dag() {
     group_in_deg.assign(ng, 0);
     tensor_to_group.clear();
 
-    // Map: boundary output tensor → group index (alive groups only)
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive || !groups[i].sg) continue;
         for (auto t : groups[i].sg->boundary_outputs())
             tensor_to_group[t] = i;
     }
 
-    // Step 1: Get a valid topological order using OR-node Kahn's algorithm.
-    // is_acyclic() already handles recomputation correctly (any ONE producer
-    // satisfying a dependency unlocks the consumer). We use the same algorithm
-    // to get the ordering, then only add edges consistent with it.
-    //
-    // This avoids the false cycle problem: if G_A needs T from G_B, but G_C
-    // also produces T and executes before G_A, we don't need the G_B→G_A edge.
-
-    std::vector<size_t> topo_order;
+    // Step 1: Get a valid topological order using BOUNDARY-BASED OR-node Kahn's.
+    // Dependencies are: group i needs tensor t as boundary_input, which must come
+    // from some group gj that has t as boundary_output. OR-semantics: any ONE
+    // such gj satisfying the dep unlocks group i.
+    std::vector<int> topo_pos(ng, -1);
     {
-        // Use the SAME op-based OR-node Kahn's as is_acyclic() for ordering.
-        // This guarantees all alive groups get a valid topological position
-        // (is_acyclic validated this partition). The boundary-based edge filter
-        // in Step 3 ensures only real data dependencies become edges.
         std::vector<int> unsatisfied(ng, 0);
         std::vector<bool> dep_met;
         std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
 
-        for (size_t op_idx = 0; op_idx < prob->ops.size(); op_idx++) {
-            for (auto t : prob->ops[op_idx].inputs) {
+        for (size_t i = 0; i < ng; i++) {
+            if (!groups[i].alive || !groups[i].sg) continue;
+            for (auto t : groups[i].sg->boundary_inputs()) {
                 int prod = dag->tensor_producer[t];
-                if (prod < 0) continue;
+                if (prod < 0) continue;  // graph input
 
-                for (auto target_gi : op_to_groups_[op_idx]) {
-                    if (!groups[target_gi].alive) continue;
+                // Find all alive groups that export t as boundary output
+                bool any_source = false;
+                size_t dep_id = dep_met.size();
 
-                    bool prod_internal = false;
-                    for (auto g : op_to_groups_[(size_t)prod])
-                        if (g == target_gi) { prod_internal = true; break; }
-                    if (prod_internal) continue;
-
-                    size_t dep_id = dep_met.size();
-                    dep_met.push_back(false);
-                    unsatisfied[target_gi]++;
-
-                    for (auto source_gj : op_to_groups_[(size_t)prod]) {
-                        if (groups[source_gj].alive)
-                            frees[source_gj].push_back({target_gi, dep_id});
+                for (auto source_gj : op_to_groups_[(size_t)prod]) {
+                    if (!groups[source_gj].alive || source_gj == i) continue;
+                    if (!groups[source_gj].sg ||
+                        !groups[source_gj].sg->boundary_outputs().count(t))
+                        continue;
+                    if (!any_source) {
+                        dep_met.push_back(false);
+                        unsatisfied[i]++;
+                        any_source = true;
                     }
+                    frees[source_gj].push_back({i, dep_id});
                 }
             }
         }
 
-        // Kahn's traversal
         std::vector<size_t> q;
         q.reserve(ng);
         std::vector<bool> enqueued(ng, false);
@@ -120,10 +110,11 @@ void Partition::rebuild_group_dag() {
                 q.push_back(i);
                 enqueued[i] = true;
             }
+        int pos = 0;
         size_t head = 0;
         while (head < q.size()) {
             size_t u = q[head++];
-            topo_order.push_back(u);
+            topo_pos[u] = pos++;
             for (auto [gi, dep_id] : frees[u]) {
                 if (!dep_met[dep_id]) {
                     dep_met[dep_id] = true;
@@ -137,18 +128,13 @@ void Partition::rebuild_group_dag() {
         }
     }
 
-    // Step 2: Assign topological position to each group.
-    std::vector<int> topo_pos(ng, -1);
-    for (size_t i = 0; i < topo_order.size(); i++)
-        topo_pos[topo_order[i]] = (int)i;
-
-    // Step 3: Build group DAG edges, only adding edges consistent with the
-    // topological order. For each boundary input tensor T of group i, find
-    // producer groups gj where T is a boundary output. Only add edge gj→i
-    // if gj appears before i in the topological order.
+    // Step 2: Build group DAG edges using BOUNDARY information, filtered by
+    // the boundary-based topological order. Since Kahn's and this loop use the
+    // same boundary view, every dependency has at least one source with
+    // topo_pos < consumer. No fallback needed.
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive || !groups[i].sg) continue;
-        if (topo_pos[i] < 0) continue;  // not in topo order (shouldn't happen)
+        if (topo_pos[i] < 0) continue;
         for (auto t : groups[i].sg->boundary_inputs()) {
             int prod_op = dag->tensor_producer[t];
             if (prod_op < 0) continue;
@@ -156,7 +142,6 @@ void Partition::rebuild_group_dag() {
                 if (!groups[gj].alive || gj == i) continue;
                 if (!groups[gj].sg || !groups[gj].sg->boundary_outputs().count(t))
                     continue;
-                // Only add edge if gj precedes i in the OR-node topological order
                 if (topo_pos[gj] >= 0 && topo_pos[gj] < topo_pos[i]) {
                     if (group_preds[i].insert(gj).second)
                         group_succs[gj].insert(i);
@@ -168,6 +153,7 @@ void Partition::rebuild_group_dag() {
     for (size_t i = 0; i < ng; i++)
         group_in_deg[i] = (int)group_preds[i].size();
 }
+
 
 // ============================================================================
 // Construction
@@ -381,7 +367,28 @@ static bool kahn_with_delta(
                 unsatisfied_deps[target_gi]++;
 
                 for_virtual_groups((size_t)prod, [&](size_t source_gj) {
-                    if (alive[source_gj])
+                    if (!alive[source_gj]) return;
+
+                    // Would source_gj actually export tensor t?
+                    // Only if at least one DAG consumer of t is outside source_gj.
+                    // If ALL consumers are inside, t is ephemeral → not exported.
+                    bool would_export = false;
+                    if (dag.tensor_consumers[t].empty()) {
+                        would_export = true;  // graph output, always exported
+                    } else {
+                        for (auto cop : dag.tensor_consumers[t]) {
+                            bool cop_in_source = false;
+                            for_virtual_groups(cop, [&](size_t g) {
+                                if (g == source_gj) cop_in_source = true;
+                            });
+                            if (!cop_in_source) {
+                                would_export = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (would_export)
                         frees[source_gj].push_back({target_gi, dep_id});
                 });
             });
@@ -531,7 +538,9 @@ std::set<size_t> Partition::compute_force_ephemeral(size_t gi) const {
 
             bool has_stranded = false;
             for (auto cop : dag->tensor_consumers[t]) {
-                if (groups[gi].ops.count(cop)) continue; // internal to gi
+                // Check ALL groups containing this consumer (not just external ones).
+                // A consumer cop can be in gi AND in gj. If gj lacks the producer,
+                // T is stranded in gj — we cannot force-ephemeralize it.
                 for (auto gj : groups_of(cop)) {
                     if (gj == gi || !groups[gj].alive) continue;
                     if (!groups[gj].ops.count((size_t)prod)) {
