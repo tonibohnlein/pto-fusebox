@@ -68,76 +68,103 @@ void Partition::rebuild_group_dag() {
             tensor_to_group[t] = i;
     }
 
-    // For each alive group i, for each boundary input tensor t, find which
-    // alive group produces t AS A BOUNDARY OUTPUT and add the directed edge
-    // producer → i.
+    // Step 1: Get a valid topological order using OR-node Kahn's algorithm.
+    // is_acyclic() already handles recomputation correctly (any ONE producer
+    // satisfying a dependency unlocks the consumer). We use the same algorithm
+    // to get the ordering, then only add edges consistent with it.
     //
-    // Critical: only add edges from groups where t is a boundary output, NOT
-    // from groups where t is ephemeral (produced + consumed internally).
-    // With recomputation, an op can be in multiple groups — t might be
-    // ephemeral in one and a boundary output in another. Adding edges from
-    // the ephemeral group creates spurious dependencies that can form cycles,
-    // causing the topological sort to miss groups ("Op X not covered").
+    // This avoids the false cycle problem: if G_A needs T from G_B, but G_C
+    // also produces T and executes before G_A, we don't need the G_B→G_A edge.
+
+    std::vector<size_t> topo_order;
+    {
+        // Build OR-node dependency structure (same as is_acyclic / kahn_with_delta)
+        std::vector<int> unsatisfied(ng, 0);
+        std::vector<bool> dep_met;
+        std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
+
+        for (size_t op_idx = 0; op_idx < prob->ops.size(); op_idx++) {
+            for (auto t : prob->ops[op_idx].inputs) {
+                int prod = dag->tensor_producer[t];
+                if (prod < 0) continue;
+
+                for (auto target_gi : op_to_groups_[op_idx]) {
+                    if (!groups[target_gi].alive) continue;
+
+                    // Is producer internal to target group?
+                    bool prod_internal = false;
+                    for (auto g : op_to_groups_[(size_t)prod])
+                        if (g == target_gi) { prod_internal = true; break; }
+                    if (prod_internal) continue;
+
+                    size_t dep_id = dep_met.size();
+                    dep_met.push_back(false);
+                    unsatisfied[target_gi]++;
+
+                    for (auto source_gj : op_to_groups_[(size_t)prod]) {
+                        if (groups[source_gj].alive)
+                            frees[source_gj].push_back({target_gi, dep_id});
+                    }
+                }
+            }
+        }
+
+        // Kahn's traversal
+        std::vector<size_t> q;
+        q.reserve(ng);
+        std::vector<bool> enqueued(ng, false);
+        for (size_t i = 0; i < ng; i++)
+            if (groups[i].alive && unsatisfied[i] == 0) {
+                q.push_back(i);
+                enqueued[i] = true;
+            }
+        size_t head = 0;
+        while (head < q.size()) {
+            size_t u = q[head++];
+            topo_order.push_back(u);
+            for (auto [gi, dep_id] : frees[u]) {
+                if (!dep_met[dep_id]) {
+                    dep_met[dep_id] = true;
+                    unsatisfied[gi]--;
+                    if (unsatisfied[gi] == 0 && !enqueued[gi]) {
+                        q.push_back(gi);
+                        enqueued[gi] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: Assign topological position to each group
+    std::vector<int> topo_pos(ng, -1);
+    for (size_t i = 0; i < topo_order.size(); i++)
+        topo_pos[topo_order[i]] = (int)i;
+
+    // Step 3: Build group DAG edges, only adding edges consistent with the
+    // topological order. For each boundary input tensor T of group i, find
+    // producer groups gj where T is a boundary output. Only add edge gj→i
+    // if gj appears before i in the topological order.
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive || !groups[i].sg) continue;
+        if (topo_pos[i] < 0) continue;  // not in topo order (shouldn't happen)
         for (auto t : groups[i].sg->boundary_inputs()) {
             int prod_op = dag->tensor_producer[t];
-            if (prod_op < 0) continue;  // graph input — no producing group
+            if (prod_op < 0) continue;
             for (auto gj : op_to_groups_[(size_t)prod_op]) {
                 if (!groups[gj].alive || gj == i) continue;
-                // Only add edge if gj has t as a boundary output
                 if (!groups[gj].sg || !groups[gj].sg->boundary_outputs().count(t))
                     continue;
-                if (group_preds[i].insert(gj).second)
-                    group_succs[gj].insert(i);
+                // Only add edge if gj precedes i in the OR-node topological order
+                if (topo_pos[gj] >= 0 && topo_pos[gj] < topo_pos[i]) {
+                    if (group_preds[i].insert(gj).second)
+                        group_succs[gj].insert(i);
+                }
             }
         }
     }
 
     for (size_t i = 0; i < ng; i++)
         group_in_deg[i] = (int)group_preds[i].size();
-
-    // Diagnostic: detect cycles in the group DAG
-    {
-        std::vector<int> deg = group_in_deg;
-        std::queue<size_t> q;
-        size_t visited = 0;
-        for (size_t i = 0; i < ng; i++)
-            if (groups[i].alive && deg[i] == 0) q.push(i);
-        while (!q.empty()) {
-            size_t u = q.front(); q.pop();
-            visited++;
-            for (auto v : group_succs[u])
-                if (--deg[v] == 0) q.push(v);
-        }
-        size_t alive = num_alive();
-        if (visited < alive) {
-            std::cerr << "    WARNING: group DAG has cycle! "
-                      << visited << "/" << alive << " groups reachable\n";
-            for (size_t i = 0; i < ng; i++) {
-                if (!groups[i].alive || deg[i] == 0) continue;
-                std::cerr << "      stuck G" << i << " (in_deg=" << deg[i]
-                          << ", ops:";
-                for (auto op : groups[i].ops) std::cerr << " " << op;
-                std::cerr << ") preds:";
-                for (auto p : group_preds[i]) std::cerr << " G" << p;
-                std::cerr << "\n";
-                // Show which tensors created the edges
-                if (groups[i].sg) {
-                    for (auto t : groups[i].sg->boundary_inputs()) {
-                        int prod_op = dag->tensor_producer[t];
-                        if (prod_op < 0) continue;
-                        for (auto gj : op_to_groups_[(size_t)prod_op]) {
-                            if (!groups[gj].alive || gj == i) continue;
-                            if (groups[gj].sg && groups[gj].sg->boundary_outputs().count(t))
-                                std::cerr << "        T" << t << " (prod op" << prod_op
-                                          << "): G" << gj << " → G" << i << "\n";
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ============================================================================
