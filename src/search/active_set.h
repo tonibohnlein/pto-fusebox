@@ -22,6 +22,7 @@ public:
     // --- Activation ---
     void activate(size_t op);
     void activate_group_ops(size_t gi);
+    void activate_border(size_t gi);
 
     // --- Selection ---
     std::optional<FMMove> pop_best();
@@ -32,7 +33,10 @@ public:
     void refresh_after_move(const std::set<size_t>& affected_groups);
 
     // --- Queries ---
+    bool is_active(size_t op) const { return active_ops_.count(op) > 0; }
     bool is_locked(size_t op) const { return locked_.count(op) > 0; }
+    size_t num_active() const { return active_ops_.size(); }
+    size_t num_unlocked() const;
     const std::set<size_t>& locked_ops() const { return locked_; }
 
 private:
@@ -40,6 +44,7 @@ private:
     double floor_;
     PairingHeap<FMMove> heap_;
     std::set<size_t> locked_;
+    std::set<size_t> active_ops_;  // all ops ever activated (for queries)
 
     void recompute_and_update(size_t op);
 };

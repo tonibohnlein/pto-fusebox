@@ -9,6 +9,7 @@ ActiveSet::ActiveSet(const Partition& part, double floor)
 
 void ActiveSet::recompute_and_update(size_t op) {
     if (locked_.count(op)) return;
+    active_ops_.insert(op);
     auto move = best_move_for(*part_, op, floor_, locked_);
     if (move.valid())
         heap_.push_or_update(op, move);
@@ -17,6 +18,8 @@ void ActiveSet::recompute_and_update(size_t op) {
 }
 
 void ActiveSet::activate(size_t op) {
+    if (locked_.count(op)) return;
+    active_ops_.insert(op);
     recompute_and_update(op);
 }
 
@@ -28,6 +31,12 @@ void ActiveSet::activate_group_ops(size_t gi) {
         for (auto op : part_->internal_ops(gi))
             recompute_and_update(op);
     }
+}
+
+void ActiveSet::activate_border(size_t gi) {
+    if (!part_->groups[gi].alive) return;
+    for (auto op : part_->border_ops(gi))
+        recompute_and_update(op);
 }
 
 // ============================================================================
@@ -58,6 +67,17 @@ void ActiveSet::lock_all(const std::vector<size_t>& ops) {
         locked_.insert(op);
         heap_.remove(op);
     }
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+size_t ActiveSet::num_unlocked() const {
+    size_t n = 0;
+    for (auto op : active_ops_)
+        if (!locked_.count(op)) n++;
+    return n;
 }
 
 // ============================================================================
