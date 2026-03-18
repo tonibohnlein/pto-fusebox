@@ -222,195 +222,248 @@ bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const
     return false;
 }
 
-bool Partition::is_acyclic() const {
-    if (!prob || !dag) return true;
-    size_t ng = groups.size();
+// ============================================================================
+// MoveDelta: describes a hypothetical partition move for acyclicity checking.
+// Passed into kahn_with_delta so we can check acyclicity WITHOUT copying
+// op_to_groups_.
+// ============================================================================
 
-    // Reference-style acyclicity check: for each (consumer_op, input_tensor,
-    // producer_op), if producer_op is NOT in the consumer's group, that group
-    // depends on some group containing the producer. Any such group can
-    // satisfy the dependency.
-    //
-    // This checks topological ordering only — not whether tensors are
-    // actually materialized (that's the cost model's job via ephemeral
-    // classification).
+struct MoveDelta {
+    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE } type = NONE;
+    size_t op = SIZE_MAX;
+    size_t ga = SIZE_MAX;  // source group (dies in MERGE_PAIR, loses op in STEAL)
+    size_t gb = SIZE_MAX;  // target group (absorbs in MERGE_PAIR, gains op in STEAL/RECOMPUTE)
+    const std::vector<size_t>* merge_list = nullptr;  // for MERGE_MULTI
+};
 
-    std::vector<std::set<size_t>> deps(ng);       // deps[gi] = unsatisfied dep IDs
-    std::vector<std::vector<std::pair<size_t,size_t>>> frees(ng); // frees[gj] = {(gi, dep_id)}
+// ============================================================================
+// kahn_with_delta: zero-allocation Kahn's algorithm with virtual group mapping.
+//
+// Instead of copying op_to_groups_ and mutating it, we use a lambda that
+// iterates over an op's groups AS IF the move had been applied. Dependencies
+// are tracked with flat vectors (no std::set, no std::deque).
+//
+// OR-node semantics: when a tensor is produced by multiple groups (recompute),
+// any ONE producer satisfying the dependency unlocks the consumer. This is
+// tracked via dep_met[] booleans and unsatisfied_deps[] counters.
+// ============================================================================
 
-    for (size_t op = 0; op < prob->ops.size(); op++) {
-        for (auto t : prob->ops[op].inputs) {
-            int prod = dag->tensor_producer[t];
-            if (prod < 0) continue;  // graph input
-            for (auto target_gi : groups_of(op)) {
-                if (!groups[target_gi].alive) continue;
-                if (groups[target_gi].ops.count((size_t)prod)) continue; // internal
-                // target_gi needs prod from outside
-                size_t dep_id = deps[target_gi].size();
-                deps[target_gi].insert(dep_id);
-                for (auto source_gj : groups_of((size_t)prod)) {
-                    if (!groups[source_gj].alive) continue;
-                    frees[source_gj].push_back({target_gi, dep_id});
-                }
-            }
-        }
-    }
-
-    // Kahn's algorithm
-    std::deque<size_t> q;
-    std::vector<bool> enqueued(ng, false);
-    size_t visited = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive && deps[i].empty()) {
-            q.push_back(i);
-            enqueued[i] = true;
-        }
-    while (!q.empty()) {
-        size_t u = q.front(); q.pop_front();
-        visited++;
-        for (auto [gi, dep_id] : frees[u]) {
-            deps[gi].erase(dep_id);
-            if (deps[gi].empty() && !enqueued[gi]) {
-                q.push_back(gi);
-                enqueued[gi] = true;
-            }
-        }
-    }
-    return visited >= num_alive();
-}
-
-// ---------------------------------------------------------------------------
-// Kahn's on a temporary op_to_groups mapping + alive flags.
-// ---------------------------------------------------------------------------
-static bool kahn_with_mapping(
-    const Problem& prob, const DAG& dag,
+static bool kahn_with_delta(
+    const Problem& prob,
+    const DAG& dag,
     const std::vector<std::vector<size_t>>& op_to_groups,
     const std::vector<bool>& alive,
-    size_t num_alive_groups)
+    size_t num_alive_groups,
+    const MoveDelta& delta)
 {
     size_t ng = alive.size();
-    std::vector<std::set<size_t>> deps(ng);
-    std::vector<std::vector<std::pair<size_t,size_t>>> frees(ng);
 
-    for (size_t op = 0; op < prob.ops.size(); op++) {
-        for (auto t : prob.ops[op].inputs) {
+    // For MERGE_MULTI: build killed lookup once
+    std::vector<bool> is_killed;
+    size_t survivor = 0;
+    if (delta.type == MoveDelta::MERGE_MULTI && delta.merge_list) {
+        is_killed.resize(ng, false);
+        survivor = (*delta.merge_list)[0];
+        for (size_t k = 1; k < delta.merge_list->size(); k++)
+            is_killed[(*delta.merge_list)[k]] = true;
+    }
+
+    // Lambda: iterate over an op's groups as if the move had been applied
+    auto for_virtual_groups = [&](size_t op_idx, auto&& callback) {
+        switch (delta.type) {
+        case MoveDelta::NONE:
+            for (size_t g : op_to_groups[op_idx]) callback(g);
+            return;
+
+        case MoveDelta::MERGE_PAIR: {
+            bool yielded_survivor = false;
+            for (size_t g : op_to_groups[op_idx]) {
+                if (g == delta.ga || g == delta.gb) {
+                    if (!yielded_survivor) { callback(delta.ga); yielded_survivor = true; }
+                } else {
+                    callback(g);
+                }
+            }
+            return;
+        }
+        case MoveDelta::MERGE_MULTI: {
+            bool yielded_survivor = false;
+            for (size_t g : op_to_groups[op_idx]) {
+                if (g == survivor || (g < ng && is_killed[g])) {
+                    if (!yielded_survivor) { callback(survivor); yielded_survivor = true; }
+                } else {
+                    callback(g);
+                }
+            }
+            return;
+        }
+        case MoveDelta::STEAL:
+            if (op_idx == delta.op) {
+                bool gb_added = false;
+                for (size_t g : op_to_groups[op_idx]) {
+                    if (g == delta.ga) continue;  // op removed from ga
+                    if (g == delta.gb) gb_added = true;
+                    callback(g);
+                }
+                if (!gb_added) callback(delta.gb);  // op added to gb
+                return;
+            }
+            for (size_t g : op_to_groups[op_idx]) callback(g);
+            return;
+
+        case MoveDelta::RECOMPUTE:
+            if (op_idx == delta.op) {
+                bool gb_added = false;
+                for (size_t g : op_to_groups[op_idx]) {
+                    if (g == delta.gb) gb_added = true;
+                    callback(g);
+                }
+                if (!gb_added) callback(delta.gb);  // op copied to gb
+                return;
+            }
+            for (size_t g : op_to_groups[op_idx]) callback(g);
+            return;
+        }
+    };
+
+    // 1. Build dependencies using flat vectors
+    std::vector<int> unsatisfied_deps(ng, 0);
+    std::vector<bool> dep_met;
+    std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
+
+    for (size_t op_idx = 0; op_idx < prob.ops.size(); op_idx++) {
+        for (auto t : prob.ops[op_idx].inputs) {
             int prod = dag.tensor_producer[t];
-            if (prod < 0) continue;
-            for (auto target_gi : op_to_groups[op]) {
-                if (!alive[target_gi]) continue;
-                // Is producer in target_gi?
+            if (prod < 0) continue;  // graph input
+
+            for_virtual_groups(op_idx, [&](size_t target_gi) {
+                if (!alive[target_gi]) return;
+
+                // Is producer internal to target group?
                 bool prod_internal = false;
-                for (auto g : op_to_groups[(size_t)prod])
-                    if (g == target_gi) { prod_internal = true; break; }
-                if (prod_internal) continue;
-                // Dependency: target_gi needs prod from outside
-                size_t dep_id = deps[target_gi].size();
-                deps[target_gi].insert(dep_id);
-                for (auto source_gj : op_to_groups[(size_t)prod]) {
+                for_virtual_groups((size_t)prod, [&](size_t g) {
+                    if (g == target_gi) prod_internal = true;
+                });
+                if (prod_internal) return;
+
+                // External dependency: target_gi needs prod from outside
+                size_t dep_id = dep_met.size();
+                dep_met.push_back(false);
+                unsatisfied_deps[target_gi]++;
+
+                for_virtual_groups((size_t)prod, [&](size_t source_gj) {
                     if (alive[source_gj])
                         frees[source_gj].push_back({target_gi, dep_id});
+                });
+            });
+        }
+    }
+
+    // 2. Kahn's traversal with flat vector queue
+    std::vector<size_t> q;
+    q.reserve(ng);
+    std::vector<bool> enqueued(ng, false);
+    size_t visited = 0;
+
+    for (size_t i = 0; i < ng; i++) {
+        if (alive[i] && unsatisfied_deps[i] == 0) {
+            q.push_back(i);
+            enqueued[i] = true;
+        }
+    }
+
+    size_t head = 0;
+    while (head < q.size()) {
+        size_t u = q[head++];
+        visited++;
+
+        for (auto [gi, dep_id] : frees[u]) {
+            if (!dep_met[dep_id]) {
+                dep_met[dep_id] = true;
+                unsatisfied_deps[gi]--;
+
+                if (unsatisfied_deps[gi] == 0 && !enqueued[gi]) {
+                    q.push_back(gi);
+                    enqueued[gi] = true;
                 }
             }
         }
     }
 
-    std::deque<size_t> q;
-    std::vector<bool> enqueued(ng, false);
-    size_t visited = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (alive[i] && deps[i].empty()) {
-            q.push_back(i);
-            enqueued[i] = true;
-        }
-    while (!q.empty()) {
-        size_t u = q.front(); q.pop_front();
-        visited++;
-        for (auto [gi, dep_id] : frees[u]) {
-            deps[gi].erase(dep_id);
-            if (deps[gi].empty() && !enqueued[gi]) {
-                q.push_back(gi);
-                enqueued[gi] = true;
-            }
-        }
-    }
     return visited >= num_alive_groups;
+}
+
+// ============================================================================
+// Public acyclicity methods — thin wrappers around kahn_with_delta
+// ============================================================================
+
+bool Partition::is_acyclic() const {
+    if (!prob || !dag) return true;
+
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    MoveDelta delta;  // NONE
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
 bool Partition::is_acyclic_after_merge(size_t ga, size_t gb) const {
     if (!prob || !dag) return true;
-    // Build temporary mapping: gb's ops move to ga, gb dies
-    auto tmp = op_to_groups_;
+
     std::vector<bool> alive(groups.size(), false);
     size_t na = 0;
     for (size_t i = 0; i < groups.size(); i++)
         if (groups[i].alive && i != gb) { alive[i] = true; na++; }
 
-    for (auto op : groups[gb].ops) {
-        auto& gs = tmp[op];
-        // Remove gb, add ga if not already present
-        gs.erase(std::remove(gs.begin(), gs.end(), gb), gs.end());
-        if (std::find(gs.begin(), gs.end(), ga) == gs.end())
-            gs.push_back(ga);
-    }
-    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+    MoveDelta delta{MoveDelta::MERGE_PAIR, SIZE_MAX, ga, gb, nullptr};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
 bool Partition::is_acyclic_after_merge(const std::vector<size_t>& group_list) const {
     if (!prob || !dag || group_list.size() < 2) return true;
-    // First group absorbs all, rest die
-    size_t survivor = group_list[0];
-    auto tmp = op_to_groups_;
+
     std::vector<bool> alive(groups.size(), false);
     size_t na = 0;
-    std::set<size_t> killed(group_list.begin() + 1, group_list.end());
+    std::vector<bool> killed(groups.size(), false);
+    for (size_t k = 1; k < group_list.size(); k++)
+        killed[group_list[k]] = true;
     for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive && !killed.count(i)) { alive[i] = true; na++; }
+        if (groups[i].alive && !killed[i]) { alive[i] = true; na++; }
 
-    for (size_t k = 1; k < group_list.size(); k++) {
-        for (auto op : groups[group_list[k]].ops) {
-            auto& gs = tmp[op];
-            gs.erase(std::remove(gs.begin(), gs.end(), group_list[k]), gs.end());
-            if (std::find(gs.begin(), gs.end(), survivor) == gs.end())
-                gs.push_back(survivor);
-        }
-    }
-    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+    MoveDelta delta{MoveDelta::MERGE_MULTI, SIZE_MAX, SIZE_MAX, SIZE_MAX, &group_list};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
 bool Partition::is_acyclic_after_steal(size_t op, size_t ga, size_t gb) const {
     if (!prob || !dag) return true;
-    auto tmp = op_to_groups_;
+
     std::vector<bool> alive(groups.size(), false);
     size_t na = 0;
     for (size_t i = 0; i < groups.size(); i++)
         if (groups[i].alive) { alive[i] = true; na++; }
 
-    auto& gs = tmp[op];
-    // Remove ga, add gb
-    gs.erase(std::remove(gs.begin(), gs.end(), ga), gs.end());
-    if (std::find(gs.begin(), gs.end(), gb) == gs.end())
-        gs.push_back(gb);
-
-    // If ga becomes empty, mark dead
+    // If ga becomes empty after losing op, it virtually dies
     if (groups[ga].ops.size() == 1 && groups[ga].ops.count(op)) {
         alive[ga] = false;
         na--;
     }
-    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+
+    MoveDelta delta{MoveDelta::STEAL, op, ga, gb, nullptr};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
 bool Partition::is_acyclic_after_recompute(size_t op, size_t gb) const {
     if (!prob || !dag) return true;
-    auto tmp = op_to_groups_;
+
     std::vector<bool> alive(groups.size(), false);
     size_t na = 0;
     for (size_t i = 0; i < groups.size(); i++)
         if (groups[i].alive) { alive[i] = true; na++; }
 
-    auto& gs = tmp[op];
-    if (std::find(gs.begin(), gs.end(), gb) == gs.end())
-        gs.push_back(gb);
-    return kahn_with_mapping(*prob, *dag, tmp, alive, na);
+    MoveDelta delta{MoveDelta::RECOMPUTE, op, SIZE_MAX, gb, nullptr};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {
