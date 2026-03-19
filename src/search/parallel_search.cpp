@@ -288,6 +288,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
     std::vector<PoolEntry> gen0_results(gen0_tasks);
     std::vector<PoolEntry> gen0_end_partitions(gen0_tasks);  // perturbed states for diversity
+    std::vector<PoolEntry> gen0_greedy_results(gen0_tasks);  // pre-FM greedy results as fallback
     std::atomic<int> next_task{0};
 
     auto gen0_worker = [&]() {
@@ -304,6 +305,11 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             part = greedy_descent(std::move(part));
             double greedy_cost = part.total_cost();
 
+            // Save greedy result as fallback (always acyclic — greedy_descent
+            // uses is_acyclic_after_* for all moves).
+            gen0_greedy_results[tid] = {Partition(part), greedy_cost,
+                                         "greedy+" + strategies[task.strategy_idx].name};
+
             FMOuterConfig fc = gen0_fm;
             fc.pass_config.seed = task.seed;
             auto fm = fm_outer_loop(std::move(part), fc);
@@ -316,9 +322,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             // can introduce cycles that slip past per-move checks.
             gen0_results[tid].partition.rebuild_index();
             if (!gen0_results[tid].partition.is_acyclic()) {
-                std::lock_guard<std::mutex> lock(log_mutex);
-                std::cerr << "    gen0 [" << strategies[task.strategy_idx].name
-                          << "]: FM result is CYCLIC, discarding\n";
                 gen0_results[tid].cost = 1e18;  // mark as invalid
             }
 
@@ -359,23 +362,15 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
     std::vector<PoolEntry> pool;
     for (auto& r : gen0_results)
-        if (r.cost < 1e17)  // guard: task may have been cancelled before storing a result
+        if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size, mhp);
     for (auto& r : gen0_end_partitions)
         if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size, mhp);
-
-    // If all FM results were cyclic, fall back to trivial partition
-    if (pool.empty()) {
-        std::cerr << "  WARNING: all gen0 FM results were cyclic, "
-                  << "falling back to trivial partition\n";
-        auto fallback = Partition::trivial(prob, dag);
-        fallback.cache = &shared_cache;
-        fallback = greedy_descent(std::move(fallback));
-        double fc = fallback.total_cost();
-        pool_insert(pool, PoolEntry(std::move(fallback), fc, "trivial_fallback"),
-                    cfg.pool_size, mhp);
-    }
+    // Greedy results as fallback: always acyclic, ensures pool is never empty.
+    for (auto& r : gen0_greedy_results)
+        if (r.cost < 1e17)
+            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
 
     pool_sort(pool);
 
@@ -489,14 +484,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - start).count();
-                if (after_fm < best_ever - 0.01) {
-                    std::lock_guard<std::mutex> lock(log_mutex);
-                    std::cerr << "    gen" << gen << " [" << origin
-                              << "]: mutated=" << after_mutate
-                              << " → greedy=" << after_greedy
-                              << " → FM=" << after_fm
-                              << " (" << ms << "ms) ***NEW BEST***\n";
-                }
+                (void)ms; // available for debug logging if needed
             }
         };
 

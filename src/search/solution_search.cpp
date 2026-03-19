@@ -900,8 +900,6 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     return best;
 
   // RETAIN_ADD: find step pairs where adding t to retain helps.
-  // Paired evaluation: only evaluate (si, si+1) — the step that pays the
-  // memory penalty and the step that reaps the IO saving.
   for (size_t i = 0; i + 1 < state.size(); i++) {
     auto &si = state.steps[i];
     auto &sj = state.steps[i + 1];
@@ -920,14 +918,12 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto cost_i = si.subgraph.best_cost(state.ret_entering[i], new_retain_i);
     if (!cost_i.feasible) continue;
 
-    // Evaluate step i+1 with t entering (saves the once_load)
-    auto new_entering = new_retain_i;  // retained outputs become next step's entering
-    auto cost_j = sj.subgraph.best_cost(new_entering, sj.retain_these);
-    if (!cost_j.feasible) continue;
+    // Full downstream cascade from i+1 with new entering = new_retain_i.
+    // This accounts for step i+1 AND any further ripple effects.
+    double cascade = downstream_cascade_penalty(state, i + 1, new_retain_i);
+    if (cascade >= 1e17) continue;
 
-    double old_cost = state.cost[i] + state.cost[i + 1];
-    double new_cost = cost_i.latency + cost_j.latency;
-    double saving = old_cost - new_cost;
+    double saving = (state.cost[i] - cost_i.latency) - cascade;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_ADD;
       best.step_a = i;
@@ -951,15 +947,11 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     auto cost_i = state.steps[i].subgraph.best_cost(state.ret_entering[i], new_retain_i);
     if (!cost_i.feasible) continue;
 
-    // Evaluate step i+1 without t entering (must reload from slow memory)
-    auto new_entering = new_retain_i;
-    auto cost_j = state.steps[i + 1].subgraph.best_cost(
-        new_entering, state.steps[i + 1].retain_these);
-    if (!cost_j.feasible) continue;
+    // Full downstream cascade from i+1 with new entering = new_retain_i.
+    double cascade = downstream_cascade_penalty(state, i + 1, new_retain_i);
+    if (cascade >= 1e17) continue;
 
-    double old_cost = state.cost[i] + state.cost[i + 1];
-    double new_cost = cost_i.latency + cost_j.latency;
-    double saving = old_cost - new_cost;
+    double saving = (state.cost[i] - cost_i.latency) - cascade;
     if (saving > -floor && saving > best.saving) {
       best.type = SolutionMove::RETAIN_REMOVE;
       best.step_a = i;

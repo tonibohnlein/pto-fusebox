@@ -346,12 +346,13 @@ bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const
 // ============================================================================
 
 struct MoveDelta {
-    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE, SPLIT_MOVE } type = NONE;
+    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE, SPLIT_MOVE, EXTRACT_MOVE } type = NONE;
     size_t op = SIZE_MAX;
     size_t ga = SIZE_MAX;  // source group (dies in MERGE_PAIR, loses op in STEAL)
     size_t gb = SIZE_MAX;  // target group (absorbs in MERGE_PAIR, gains op in STEAL/RECOMPUTE)
-    const std::vector<size_t>* merge_list = nullptr;  // for MERGE_MULTI
+    const std::vector<size_t>* merge_list = nullptr;  // for MERGE_MULTI; also source groups for EXTRACT
     const std::set<size_t>* split_ops = nullptr;       // for SPLIT_MOVE: ops moving from ga to gb
+                                                        // for EXTRACT_MOVE: ops being extracted
 };
 
 // ============================================================================
@@ -452,6 +453,28 @@ static bool kahn_with_delta(
                     callback(g);
                 }
                 if (!gb_added) callback(delta.gb);  // added to gb
+                return;
+            }
+            for (size_t g : op_to_groups[op_idx]) callback(g);
+            return;
+
+        case MoveDelta::EXTRACT_MOVE:
+            // Ops in split_ops move from source groups (merge_list) to gb
+            if (delta.split_ops && delta.split_ops->count(op_idx)) {
+                bool gb_added = false;
+                for (size_t g : op_to_groups[op_idx]) {
+                    bool is_source = false;
+                    if (delta.merge_list)
+                        for (auto sg : *delta.merge_list)
+                            if (sg == g) { is_source = true; break; }
+                    if (is_source) {
+                        if (!gb_added) { callback(delta.gb); gb_added = true; }
+                    } else {
+                        if (g == delta.gb) gb_added = true;
+                        callback(g);
+                    }
+                }
+                if (!gb_added) callback(delta.gb);
                 return;
             }
             for (size_t g : op_to_groups[op_idx]) callback(g);
@@ -651,6 +674,40 @@ bool Partition::is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga
     delta.ga = ga;
     delta.gb = virtual_gb;
     delta.split_ops = &side_b;
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+}
+
+bool Partition::is_acyclic_after_extract(const std::set<size_t>& extract_ops,
+                                          const std::vector<size_t>& source_groups) const {
+    if (!prob || !dag) return true;
+
+    size_t ng = groups.size();
+    size_t virtual_gb = ng;  // virtual new group for extracted ops
+
+    std::vector<bool> alive(ng + 1, false);
+    size_t na = 0;
+    for (size_t i = 0; i < ng; i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    // Source groups that become empty after extraction die
+    for (auto sg : source_groups) {
+        bool all_extracted = true;
+        for (auto op : groups[sg].ops)
+            if (!extract_ops.count(op)) { all_extracted = false; break; }
+        if (all_extracted) {
+            alive[sg] = false;
+            na--;
+        }
+    }
+
+    alive[virtual_gb] = true;
+    na++;
+
+    MoveDelta delta;
+    delta.type = MoveDelta::EXTRACT_MOVE;
+    delta.gb = virtual_gb;
+    delta.merge_list = &source_groups;
+    delta.split_ops = &extract_ops;
     return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 

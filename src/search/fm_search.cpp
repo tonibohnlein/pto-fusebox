@@ -265,13 +265,16 @@ FMMove best_move_for(const Partition& part, size_t op,
                     }
                 }
 
-                // TENSOR_EXTRACT: no cheap hypothetical check available.
-                // Use post-hoc is_acyclic() in apply_fm_move as safety net.
+                // TENSOR_EXTRACT: use hypothetical acyclicity check.
                 {
                     std::set<size_t> extract_ops(consumer_ops_vec.begin(),
                                                  consumer_ops_vec.end());
                     if (prod >= 0) extract_ops.insert((size_t)prod);
 
+                    if (!part.is_acyclic_after_extract(extract_ops, group_list))
+                        goto skip_extract;
+
+                    {
                     double old_cost = 0;
                     double remainder_cost = 0;
                     bool feasible = true;
@@ -306,6 +309,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                             }
                         }
                     }
+                    }
+                    skip_extract:;
                 }
             }
         }
@@ -467,6 +472,10 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
 
+            // Pre-mutation acyclicity check
+            if (!part.is_acyclic_after_extract(extract_ops, m.tensor_groups))
+                return {};
+
             double extract_cost = part.eval_set(extract_ops);
             if (extract_cost >= 1e17) return {};
 
@@ -499,14 +508,6 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
             size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
             affected.insert(new_gi);
-
-            // Post-hoc acyclicity check: TENSOR_EXTRACT has no cheap
-            // hypothetical check (unlike MERGE/STEAL/RECOMPUTE), so we
-            // verify the result after mutation. The caller holds a snapshot
-            // and reverts on empty return.
-            part.rebuild_index();
-            if (!part.is_acyclic()) return {};
-
             break;
         }
         case FMMove::DE_RECOMPUTE: {

@@ -144,6 +144,11 @@ struct Partition {
     // Uses SPLIT_MOVE delta with a virtual group index beyond groups.size().
     bool is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga) const;
 
+    // After TENSOR_EXTRACT: extract_ops removed from source_groups into a
+    // virtual new group. Source groups that become empty virtually die.
+    bool is_acyclic_after_extract(const std::set<size_t>& extract_ops,
+                                   const std::vector<size_t>& source_groups) const;
+
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;

@@ -2,7 +2,6 @@
 
 #include "partition/partition.h"
 #include <cmath>
-#include <queue>
 
 // ============================================================================
 // Move: a candidate partition modification for greedy descent
@@ -23,16 +22,6 @@ struct Move {
         return ga > o.ga;
     }
 };
-
-using MoveHeap = std::priority_queue<Move>;
-
-// ============================================================================
-// Generate moves involving group gi with saving > -floor.
-// floor=0 (default) means only positive-saving moves.
-// ============================================================================
-
-void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
-                    double floor = 0.0);
 
 // ============================================================================
 // Greedy descent: repeatedly apply the best positive move until no
