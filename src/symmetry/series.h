@@ -209,11 +209,20 @@ public:
                 if (ie_prev != ie_curr) continue;
 
                 // 3. Back-edge structure match (incoming from previous block)
-                // This is the key inter-block check: each block receives
-                // the same inputs from its predecessor.
                 auto be_prev = get_back_edges(base_prev, K);
                 auto be_curr = get_back_edges(base_curr, K);
                 if (be_prev != be_curr) continue;
+
+                // 4. Require inter-block data flow: at least one
+                // back-edge must exist (previous block feeds current).
+                if (be_curr.empty()) continue;
+
+                // 5. Require internal connectivity: ops within each
+                // block must form a connected subgraph (via internal
+                // edges). This prevents interleaved parallel branches
+                // from being detected as a series block — 10 ops from
+                // 10 independent heads have no internal edges and fail.
+                if (ie_curr.empty() && K > 1) continue;
 
                 matches[bi] = true;
             }
