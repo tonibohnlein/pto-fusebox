@@ -5,7 +5,7 @@
 #include "search/fm_outer.h"
 #include "search/evolution.h"
 #include "core/cost_cache.h"
-#include "search/merkle_hash.h"
+#include "symmetry/merkle_hash.h"
 #include <thread>
 #include <mutex>
 #include <vector>

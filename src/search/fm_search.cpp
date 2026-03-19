@@ -472,6 +472,14 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
             size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
             affected.insert(new_gi);
+
+            // Post-hoc acyclicity check: TENSOR_EXTRACT has no cheap
+            // hypothetical check (unlike MERGE/STEAL/RECOMPUTE), so we
+            // verify the result after mutation. The caller holds a snapshot
+            // and reverts on empty return.
+            part.rebuild_index();
+            if (!part.is_acyclic()) return {};
+
             break;
         }
         case FMMove::DE_RECOMPUTE: {

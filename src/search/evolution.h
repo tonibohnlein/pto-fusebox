@@ -1,5 +1,5 @@
 #pragma once
-#include "search/merkle_hash.h"
+#include "symmetry/merkle_hash.h"
 
 #include "partition/partition.h"
 #include <random>

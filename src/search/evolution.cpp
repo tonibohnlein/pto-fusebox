@@ -1,7 +1,7 @@
 #include "search/evolution.h"
 #include "search/verbose.h"
 #include "search/local_search.h"  // partition_has_gap (cycle check)
-#include "search/merkle_hash.h"
+#include "symmetry/merkle_hash.h"
 #include <algorithm>
 #include <iostream>
 

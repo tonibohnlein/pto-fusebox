@@ -1,5 +1,5 @@
 #include "search/solution_search.h"
-#include "search/merkle_hash.h"
+#include "symmetry/merkle_hash.h"
 #include "partition/partition.h"
 #include "search/verbose.h"
 #include "util/pairing_heap.h"

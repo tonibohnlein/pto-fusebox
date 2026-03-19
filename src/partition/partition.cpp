@@ -189,6 +189,71 @@ void Partition::rebuild_group_dag() {
 
     for (size_t i = 0; i < ng; i++)
         group_in_deg[i] = (int)group_preds[i].size();
+
+    // =========================================================================
+    // Validation: cross-check group DAG edges against subgraph boundary inputs.
+    // For every alive group i with a subgraph, every boundary input tensor T
+    // whose producer op P is in some other alive group gj should have an edge
+    // gj → i in the group DAG. If not, the DFS ordering will be wrong.
+    // =========================================================================
+    for (size_t i = 0; i < ng; i++) {
+        if (!groups[i].alive || !groups[i].sg) continue;
+        for (auto t : groups[i].sg->boundary_inputs()) {
+            int prod = dag->tensor_producer[t];
+            if (prod < 0) continue;  // graph input — no edge needed
+
+            // Find any alive group that exports T as a boundary output
+            bool has_edge_from_producer = false;
+            size_t exporting_gj = SIZE_MAX;
+            for (size_t gj = 0; gj < ng; gj++) {
+                if (!groups[gj].alive || gj == i || !groups[gj].sg) continue;
+                if (groups[gj].sg->boundary_outputs().count(t)) {
+                    exporting_gj = gj;
+                    if (group_preds[i].count(gj)) {
+                        has_edge_from_producer = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!has_edge_from_producer && exporting_gj != SIZE_MAX) {
+                // Edge is missing! Dump diagnostic info.
+                std::cerr << "  EDGE_MISSING: G" << i << " needs T" << t
+                          << " (prod=op" << prod << "), G" << exporting_gj
+                          << " exports it, but no edge G" << exporting_gj
+                          << "→G" << i << " exists.\n";
+
+                // Why was the edge not created? Check Step 2 conditions:
+                bool prod_in_i = groups[i].ops.count((size_t)prod);
+                std::cerr << "    op" << prod << " in G" << i << ".ops? "
+                          << (prod_in_i ? "YES (skipped as internal)" : "no") << "\n";
+
+                std::cerr << "    op_to_groups_[" << prod << "] = {";
+                for (auto gx : op_to_groups_[(size_t)prod])
+                    std::cerr << " G" << gx
+                              << (groups[gx].alive ? "" : "(dead)");
+                std::cerr << " }\n";
+
+                // Check if any op in group i actually consumes T in its raw inputs
+                bool any_op_consumes_t = false;
+                for (auto op : groups[i].ops) {
+                    for (auto inp : prob->ops[op].inputs) {
+                        if (inp == t) {
+                            any_op_consumes_t = true;
+                            std::cerr << "    op" << op << " in G" << i
+                                      << " consumes T" << t << " as raw input\n";
+                        }
+                    }
+                }
+                if (!any_op_consumes_t) {
+                    std::cerr << "    NO op in G" << i
+                              << " consumes T" << t << " as raw input!"
+                              << " (subgraph reports it as boundary input — "
+                              << "possible force_ephemeral mismatch)\n";
+                }
+            }
+        }
+    }
 }
 
 
