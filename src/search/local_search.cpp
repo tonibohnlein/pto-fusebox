@@ -118,6 +118,7 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
         auto ejectable = part.ejectable_ops(gi);
         for (auto op : ejectable) {
             if (creates_topo_cycle(op, part.groups[gi].ops, *part.dag)) continue;
+            if (!part.is_acyclic_after_eject(op, gi)) continue;
             auto er = part.eval_eject(op, gi);
             if (!er.feasible) continue;
             if (er.saving > -floor)
@@ -132,7 +133,8 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
             Move best;
             best.saving = -floor;
 
-            if (!creates_topo_cycle(op, part.groups[gi].ops, *part.dag)) {
+            if (!creates_topo_cycle(op, part.groups[gi].ops, *part.dag)
+                && part.is_acyclic_after_eject(op, gi)) {
                 auto er = part.eval_eject(op, gi);
                 if (er.feasible)
                     try_better(best, {Move::INTERNAL_EJECT, gi, 0, op, er.saving, gen_i, 0});
@@ -144,7 +146,8 @@ void generate_moves(const Partition& part, size_t gi, MoveHeap& heap,
                 size_t u_hi = std::max(op, v);
                 auto sr = part.eval_split(u_lo, u_hi, gi);
                 if (sr.feasible &&
-                    !split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag)) {
+                    !split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag) &&
+                    part.is_acyclic_after_split(sr.side_b, gi)) {
                     Move m;
                     m.type = Move::SPLIT; m.ga = gi; m.gb = 0;
                     m.op = u_lo; m.saving = sr.saving;
@@ -267,6 +270,9 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         }
         case Move::EJECT:
         case Move::INTERNAL_EJECT: {
+            // Pre-mutation acyclicity check (hypothetical Kahn's)
+            if (!part.is_acyclic_after_eject(m.op, m.ga)) return {};
+
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible || er.saving < 0.001) return {};
 
@@ -292,6 +298,8 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
         case Move::SPLIT: {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible || sr.saving < 0.001) return {};
+            // Pre-mutation acyclicity check (hypothetical Kahn's)
+            if (!part.is_acyclic_after_split(sr.side_b, m.ga)) return {};
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);
@@ -357,6 +365,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
     for (auto gi : groups_of_op) {
         if (!part.groups[gi].alive || part.groups[gi].ops.size() < 2) continue;
         if (creates_topo_cycle(op, part.groups[gi].ops, dag)) continue;
+        if (!part.is_acyclic_after_eject(op, gi)) continue;
         auto er = part.eval_eject(op, gi);
         if (!er.feasible) continue;
 
@@ -379,6 +388,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             auto sr = part.eval_split(u_lo, u_hi, gi);
             if (!sr.feasible) continue;
             if (split_creates_topo_cycle(sr.side_a, sr.side_b, dag)) continue;
+            if (!part.is_acyclic_after_split(sr.side_b, gi)) continue;
             if (sr.saving > best.saving) {
                 best.type = Move::SPLIT; best.ga = gi; best.gb = 0;
                 best.op = u_lo; best.op2 = u_hi;

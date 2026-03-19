@@ -150,10 +150,11 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
         }
 
-        // EJECT: can create cycles if op has both predecessors and successors
-        // in the remainder (the remainder group would need to execute both
-        // before and after the singleton).
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+        // EJECT: use hypothetical acyclicity check.
+        // creates_topo_cycle is a fast pre-filter (intra-group straddling),
+        // is_acyclic_after_eject catches inter-group cycles too.
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)
+            && part.is_acyclic_after_eject(op, gx)) {
             auto er = part.eval_eject(op, gx);
             if (er.feasible && accept(er.saving))
                 best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
@@ -166,7 +167,8 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
         {
-            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)
+                && part.is_acyclic_after_eject(op, gx)) {
                 auto er = part.eval_eject(op, gx);
                 if (er.feasible && accept(er.saving)) {
                     FMMove candidate;
@@ -186,7 +188,8 @@ FMMove best_move_for(const Partition& part, size_t op,
 
                 auto sr = part.eval_split(edge.first, edge.second, gx);
                 if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                    if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
+                    if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag)
+                        && part.is_acyclic_after_split(sr.side_b, gx))
                         best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
                 }
             }
@@ -387,10 +390,8 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         }
         case FMMove::EJECT:
         case FMMove::INTERNAL_EJECT: {
-            // Re-verify: ejecting op with both predecessors and successors
-            // in the remainder creates a cycle (remainder ↔ singleton).
-            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag))
-                return {};
+            // Pre-mutation acyclicity check
+            if (!part.is_acyclic_after_eject(m.op, m.ga)) return {};
 
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
@@ -419,6 +420,9 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             if (!sr.feasible) return {};
             if (split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
+                return {};
+            // Full hypothetical acyclicity check (inter-group cycles)
+            if (!part.is_acyclic_after_split(sr.side_b, m.ga))
                 return {};
 
             part.groups[m.ga].ops = std::move(sr.side_a);

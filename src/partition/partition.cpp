@@ -346,11 +346,12 @@ bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const
 // ============================================================================
 
 struct MoveDelta {
-    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE } type = NONE;
+    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE, SPLIT_MOVE } type = NONE;
     size_t op = SIZE_MAX;
     size_t ga = SIZE_MAX;  // source group (dies in MERGE_PAIR, loses op in STEAL)
     size_t gb = SIZE_MAX;  // target group (absorbs in MERGE_PAIR, gains op in STEAL/RECOMPUTE)
     const std::vector<size_t>* merge_list = nullptr;  // for MERGE_MULTI
+    const std::set<size_t>* split_ops = nullptr;       // for SPLIT_MOVE: ops moving from ga to gb
 };
 
 // ============================================================================
@@ -436,6 +437,21 @@ static bool kahn_with_delta(
                     callback(g);
                 }
                 if (!gb_added) callback(delta.gb);  // op copied to gb
+                return;
+            }
+            for (size_t g : op_to_groups[op_idx]) callback(g);
+            return;
+
+        case MoveDelta::SPLIT_MOVE:
+            // All ops in split_ops move from ga to gb; others stay
+            if (delta.split_ops && delta.split_ops->count(op_idx)) {
+                bool gb_added = false;
+                for (size_t g : op_to_groups[op_idx]) {
+                    if (g == delta.ga) continue;  // removed from ga
+                    if (g == delta.gb) gb_added = true;
+                    callback(g);
+                }
+                if (!gb_added) callback(delta.gb);  // added to gb
                 return;
             }
             for (size_t g : op_to_groups[op_idx]) callback(g);
@@ -580,6 +596,61 @@ bool Partition::is_acyclic_after_recompute(size_t op, size_t gb) const {
         if (groups[i].alive) { alive[i] = true; na++; }
 
     MoveDelta delta{MoveDelta::RECOMPUTE, op, SIZE_MAX, gb, nullptr};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+}
+
+bool Partition::is_acyclic_after_eject(size_t op, size_t ga) const {
+    if (!prob || !dag) return true;
+
+    size_t ng = groups.size();
+    size_t virtual_gb = ng;  // virtual new group for the singleton
+
+    // Extend alive by 1 to accommodate virtual_gb
+    std::vector<bool> alive(ng + 1, false);
+    size_t na = 0;
+    for (size_t i = 0; i < ng; i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    // If ga becomes empty after losing op, it dies
+    if (groups[ga].ops.size() == 1 && groups[ga].ops.count(op)) {
+        alive[ga] = false;
+        na--;
+    }
+
+    // Singleton needed only if op isn't covered by another alive group
+    bool needs_singleton = true;
+    for (auto gj : groups_of(op))
+        if (gj != ga && groups[gj].alive) { needs_singleton = false; break; }
+
+    if (needs_singleton) {
+        alive[virtual_gb] = true;
+        na++;
+    }
+
+    // Reuse STEAL delta: op moves from ga to virtual_gb
+    MoveDelta delta{MoveDelta::STEAL, op, ga, virtual_gb, nullptr};
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+}
+
+bool Partition::is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga) const {
+    if (!prob || !dag) return true;
+
+    size_t ng = groups.size();
+    size_t virtual_gb = ng;  // virtual new group for side_b
+
+    std::vector<bool> alive(ng + 1, false);
+    size_t na = 0;
+    for (size_t i = 0; i < ng; i++)
+        if (groups[i].alive) { alive[i] = true; na++; }
+
+    alive[virtual_gb] = true;
+    na++;
+
+    MoveDelta delta;
+    delta.type = MoveDelta::SPLIT_MOVE;
+    delta.ga = ga;
+    delta.gb = virtual_gb;
+    delta.split_ops = &side_b;
     return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 

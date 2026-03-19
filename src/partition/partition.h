@@ -136,6 +136,14 @@ struct Partition {
     // After RECOMPUTE: op added to gb (stays in all existing groups too).
     bool is_acyclic_after_recompute(size_t op, size_t gb) const;
 
+    // After EJECT: op removed from ga into a virtual new singleton group.
+    // Uses STEAL delta with a virtual group index beyond groups.size().
+    bool is_acyclic_after_eject(size_t op, size_t ga) const;
+
+    // After SPLIT: side_b ops moved from ga into a virtual new group.
+    // Uses SPLIT_MOVE delta with a virtual group index beyond groups.size().
+    bool is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga) const;
+
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;

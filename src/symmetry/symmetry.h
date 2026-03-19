@@ -67,14 +67,30 @@ public:
         if (num_ops == 0) return {};
 
         // ================================================================
-        // 1. Build orbits from Merkle equivalence classes
+        // 1. Build orbits from FORWARD Merkle hash only
         // ================================================================
+        //
+        // The full combined hash (fwd ⊕ bwd) is too discriminative for
+        // orbit formation: the backward pass sees chain-end effects
+        // (ops near the end of a sequential aggregation chain hash
+        // differently from those at the beginning, even though their
+        // LOCAL structure is identical).
+        //
+        // Using forward-only hash: ops with the same input-side structure
+        // (same type, shapes, and predecessor chain) are grouped together.
+        // The local component_hash used during merging handles the fine-
+        // grained isomorphism check, so coarser orbits are safe — they
+        // just give the merge algorithm more material to work with.
+
+        std::map<size_t, std::vector<size_t>> fwd_classes;
+        for (size_t i = 0; i < num_ops; i++)
+            fwd_classes[merkle.fwd[i]].push_back(i);
 
         size_t num_orbits = 0;
         std::vector<size_t> op_to_orbit(num_ops, SIZE_MAX);
         std::vector<std::vector<size_t>> orbit_ops;
 
-        for (auto& [hash, ops] : merkle.equiv_classes) {
+        for (auto& [hash, ops] : fwd_classes) {
             size_t oid = num_orbits++;
             orbit_ops.push_back(ops);
             for (auto op : ops)
@@ -523,75 +539,36 @@ public:
         };
 
         // ================================================================
-        // 6. Phase 1: merge same-symmetry adjacent orbits, preserving sym
+        // 6. Unified merge loop
         // ================================================================
         //
-        // Only consider pairs where both have the same symmetry and the
-        // merged result keeps it.  Pick the merge that produces the
-        // largest region (most ops).  Record each merge as a pattern.
-
-        std::vector<SymmetricPattern> patterns;
-
-        {
-            bool merged = true;
-            while (merged) {
-                merged = false;
-                auto pairs = get_adjacent_pairs();
-
-                size_t best_a = SIZE_MAX, best_b = SIZE_MAX;
-                std::vector<std::set<size_t>> best_comps;
-                size_t best_sym = 0;
-                size_t best_ops = 0;
-
-                for (auto [ia, ib] : pairs) {
-                    auto& a = snodes[ia];
-                    auto& b = snodes[ib];
-                    if (a.symmetry != b.symmetry) continue;
-
-                    size_t target_sym = a.symmetry;
-                    if (target_sym <= 1) continue;
-
-                    std::set<size_t> union_ops = a.all_ops;
-                    union_ops.insert(b.all_ops.begin(), b.all_ops.end());
-                    auto comps = compute_cc(union_ops);
-                    size_t sym = compute_symmetry(comps);
-
-                    if (sym < target_sym) continue;
-
-                    size_t score = union_ops.size();
-                    if (score > best_ops) {
-                        best_a = ia;
-                        best_b = ib;
-                        best_comps = std::move(comps);
-                        best_sym = sym;
-                        best_ops = score;
-                    }
-                }
-
-                if (best_a != SIZE_MAX) {
-                    size_t new_id = do_merge(best_a, best_b,
-                                             std::move(best_comps), best_sym);
-                    auto pat = extract_pattern(snodes[new_id]);
-                    if (verbose)
-                        std::cerr << "[symmetry] phase1 merge: "
-                                  << pat.to_string() << "\n";
-                    if (pat.symmetry > 1)
-                        patterns.push_back(std::move(pat));
-                    merged = true;
-                }
-            }
-        }
-
-        // ================================================================
-        // 7. Phase 2: greedy extension, accepting symmetry drops > 1
-        // ================================================================
+        // Two phases executed sequentially:
+        //   Phase 1: only accept merges that preserve symmetry
+        //   Phase 2: accept merges that reduce symmetry (but stay > 1)
         //
-        // For every adjacent pair, compute merged symmetry.  Accept the
-        // merge with the best (symmetry desc, component_size desc).
-        // Record each intermediate pattern.  Stop when every remaining
-        // merge would collapse symmetry to 1.
+        // Throughout both phases, track EVERY super-node state with
+        // sym > 1 and component_size > 1.  Multiple independent patterns
+        // can exist at the same symmetry level (e.g., attention heads
+        // and MLP blocks both at sym=8).  Dominance filtering at the
+        // end removes redundant patterns.
+        // ================================================================
 
-        {
+        // All tracked patterns (raw, before filtering)
+        std::vector<SymmetricPattern> all_tracked;
+
+        auto track_snode = [&](size_t sid) {
+            auto& sn = snodes[sid];
+            if (sn.symmetry <= 1) return;
+            auto pat = extract_pattern(sn);
+            if (pat.symmetry <= 1 || pat.component_size() <= 1) return;
+            all_tracked.push_back(std::move(pat));
+        };
+
+        // Track initial super-nodes (individual orbits)
+        for (size_t i = 0; i < snodes.size(); i++)
+            if (snodes[i].alive) track_snode(i);
+
+        for (int phase = 1; phase <= 2; phase++) {
             bool merged = true;
             while (merged) {
                 merged = false;
@@ -601,17 +578,25 @@ public:
                 std::vector<std::set<size_t>> best_comps;
                 size_t best_sym = 0;
                 size_t best_comp_size = 0;
+                size_t best_ops = 0;
 
                 for (auto [ia, ib] : pairs) {
-                    std::set<size_t> union_ops = snodes[ia].all_ops;
-                    union_ops.insert(snodes[ib].all_ops.begin(),
-                                    snodes[ib].all_ops.end());
+                    auto& a = snodes[ia];
+                    auto& b = snodes[ib];
+
+                    if (phase == 1) {
+                        if (a.symmetry != b.symmetry) continue;
+                        if (a.symmetry <= 1) continue;
+                    }
+
+                    std::set<size_t> union_ops = a.all_ops;
+                    union_ops.insert(b.all_ops.begin(), b.all_ops.end());
                     auto comps = compute_cc(union_ops);
                     size_t sym = compute_symmetry(comps);
 
+                    if (phase == 1 && sym < a.symmetry) continue;
                     if (sym <= 1) continue;
 
-                    // Find the representative component size for this sym
                     size_t comp_size = 0;
                     {
                         std::map<size_t, std::vector<size_t>> hg;
@@ -625,77 +610,140 @@ public:
                         }
                     }
 
-                    // Lexicographic: symmetry desc, then component size desc
-                    if (sym > best_sym ||
-                        (sym == best_sym && comp_size > best_comp_size)) {
+                    bool better = false;
+                    if (phase == 1) {
+                        better = union_ops.size() > best_ops;
+                    } else {
+                        better = sym > best_sym ||
+                                 (sym == best_sym && comp_size > best_comp_size);
+                    }
+
+                    if (better) {
                         best_a = ia;
                         best_b = ib;
                         best_comps = std::move(comps);
                         best_sym = sym;
                         best_comp_size = comp_size;
+                        best_ops = union_ops.size();
                     }
                 }
 
                 if (best_a != SIZE_MAX) {
+                    track_snode(best_a);
+                    track_snode(best_b);
+
                     size_t new_id = do_merge(best_a, best_b,
                                              std::move(best_comps), best_sym);
-                    auto pat = extract_pattern(snodes[new_id]);
+                    track_snode(new_id);
+
                     if (verbose)
-                        std::cerr << "[symmetry] phase2 merge: "
-                                  << pat.to_string() << "\n";
-                    if (pat.symmetry > 1)
-                        patterns.push_back(std::move(pat));
+                        std::cerr << "[symmetry] phase" << phase
+                                  << " merge: sym=" << best_sym
+                                  << " comp_size=" << best_comp_size << "\n";
                     merged = true;
                 }
             }
         }
 
-        // ================================================================
-        // 8. Sort and deduplicate
-        // ================================================================
+        // Track any remaining alive super-nodes
+        for (size_t i = 0; i < snodes.size(); i++)
+            if (snodes[i].alive) track_snode(i);
 
+        // ================================================================
+        // 7. Dominance filter
+        // ================================================================
+        //
+        // Pattern P is dominated by pattern Q iff:
+        //   - Every op in P also appears in Q
+        //   - Q.component_size >= P.component_size
+        //
+        // This removes:
+        //   - Singleton patterns (already filtered by component_size > 1)
+        //   - Intermediate growth stages (sym=3×3 dominated by sym=3×5)
+        //   - High-sym but tiny patterns (sym=16×1 dominated by sym=8×6
+        //     which covers the same ops in larger components)
+        //
+        // It keeps independent patterns at the same symmetry level
+        // (e.g., attention sym=8×6 and MLP sym=8×5 cover disjoint ops).
+
+        // Compute the union of all ops per pattern
+        struct PatternInfo {
+            size_t idx;
+            std::set<size_t> all_ops;
+        };
+        std::vector<PatternInfo> pinfos;
+        for (size_t i = 0; i < all_tracked.size(); i++) {
+            PatternInfo pi;
+            pi.idx = i;
+            for (auto& comp : all_tracked[i].components)
+                pi.all_ops.insert(comp.begin(), comp.end());
+            pinfos.push_back(std::move(pi));
+        }
+
+        std::vector<bool> dominated(all_tracked.size(), false);
+        for (size_t i = 0; i < pinfos.size(); i++) {
+            if (dominated[i]) continue;
+            for (size_t j = 0; j < pinfos.size(); j++) {
+                if (i == j || dominated[j]) continue;
+                // Q=j dominates P=i iff Q has >= symmetry, >= component size,
+                // and covers all of P's ops.
+                if (all_tracked[j].symmetry < all_tracked[i].symmetry)
+                    continue;
+                if (all_tracked[j].component_size() < all_tracked[i].component_size())
+                    continue;
+                if (pinfos[j].all_ops.size() < pinfos[i].all_ops.size())
+                    continue;
+                bool covers = std::includes(
+                    pinfos[j].all_ops.begin(), pinfos[j].all_ops.end(),
+                    pinfos[i].all_ops.begin(), pinfos[i].all_ops.end());
+                if (covers) {
+                    dominated[i] = true;
+                    break;
+                }
+            }
+        }
+
+        std::vector<SymmetricPattern> patterns;
+        for (size_t i = 0; i < all_tracked.size(); i++) {
+            if (!dominated[i])
+                patterns.push_back(std::move(all_tracked[i]));
+        }
+
+        // Deduplicate: same sym + same ops → keep largest component_size
+        {
+            std::vector<bool> dup(patterns.size(), false);
+            for (size_t i = 0; i < patterns.size(); i++) {
+                if (dup[i]) continue;
+                for (size_t j = i + 1; j < patterns.size(); j++) {
+                    if (dup[j]) continue;
+                    if (patterns[i].symmetry != patterns[j].symmetry) continue;
+                    // Same ops?
+                    std::set<size_t> ops_i, ops_j;
+                    for (auto& c : patterns[i].components)
+                        ops_i.insert(c.begin(), c.end());
+                    for (auto& c : patterns[j].components)
+                        ops_j.insert(c.begin(), c.end());
+                    if (ops_i == ops_j) {
+                        // Keep the one with larger component_size
+                        if (patterns[j].component_size() > patterns[i].component_size())
+                            dup[i] = true;
+                        else
+                            dup[j] = true;
+                    }
+                }
+            }
+            std::vector<SymmetricPattern> deduped;
+            for (size_t i = 0; i < patterns.size(); i++)
+                if (!dup[i]) deduped.push_back(std::move(patterns[i]));
+            patterns = std::move(deduped);
+        }
+
+        // Sort output: symmetry desc, then component size desc
         std::sort(patterns.begin(), patterns.end(),
                   [](const SymmetricPattern& a, const SymmetricPattern& b) {
             if (a.symmetry != b.symmetry) return a.symmetry > b.symmetry;
             return a.component_size() > b.component_size();
         });
-
-        // Remove subsumed patterns: if P has the same symmetry as Q and
-        // every component of P is a subset of a component of Q, drop P.
-        // After sorting (largest first), check each pattern against all
-        // earlier (larger) patterns at the same symmetry level.
-        std::vector<bool> subsumed(patterns.size(), false);
-        for (size_t i = 1; i < patterns.size(); i++) {
-            for (size_t j = 0; j < i; j++) {
-                if (subsumed[j]) continue;
-                if (patterns[j].symmetry != patterns[i].symmetry) continue;
-                if (patterns[j].component_size() <= patterns[i].component_size())
-                    continue;
-
-                // Check if every component of P[i] is a subset of
-                // some component of P[j].
-                bool all_subsets = true;
-                for (auto& ci : patterns[i].components) {
-                    bool found = false;
-                    for (auto& cj : patterns[j].components) {
-                        if (std::includes(cj.begin(), cj.end(),
-                                          ci.begin(), ci.end())) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) { all_subsets = false; break; }
-                }
-                if (all_subsets) { subsumed[i] = true; break; }
-            }
-        }
-        {
-            std::vector<SymmetricPattern> filtered;
-            for (size_t i = 0; i < patterns.size(); i++)
-                if (!subsumed[i])
-                    filtered.push_back(std::move(patterns[i]));
-            patterns = std::move(filtered);
-        }
 
         if (verbose) {
             std::cerr << "[symmetry] discovered " << patterns.size()
