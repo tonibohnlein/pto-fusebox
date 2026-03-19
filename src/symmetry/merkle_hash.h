@@ -17,9 +17,20 @@
 // Ops with the same combined hash are structurally interchangeable.
 // This is a directed-graph Merkle hash — more precise than WL color
 // refinement because it respects edge direction and tensor dimensions.
+//
+// Iteration count controls the propagation depth:
+//   iter=0: only local info (type, cost, shapes) — "init hash"
+//   iter=k: encodes depth-k predecessor/successor trees
+//   iter=longest_chain: full propagation, every op gets a unique
+//          fingerprint if its global position is unique.
+//
+// For parallel symmetry detection, the forward hash with full
+// propagation is used for orbit formation. For series pattern
+// detection, init_hash (iter=0) is used.
 // ============================================================================
 
 struct MerkleHashes {
+    std::vector<size_t> init;      // iteration-0 hash (type + cost + shapes only)
     std::vector<size_t> fwd;       // forward (input-side) hash per op
     std::vector<size_t> bwd;       // backward (output-side) hash per op
     std::vector<size_t> combined;  // fwd ⊕ bwd
@@ -38,19 +49,28 @@ struct MerkleHashes {
         return count;
     }
 
-    static MerkleHashes compute(const Problem& prob, const DAG& dag) {
+    // Compute Merkle hashes.
+    // num_iters: number of propagation iterations.
+    //   0 = use dag.longest_chain() (full propagation, default).
+    //   Any positive value = use exactly that many iterations.
+    static MerkleHashes compute(const Problem& prob, const DAG& dag,
+                                size_t num_iters = 0) {
         size_t n = prob.num_ops();
         MerkleHashes mh;
+        mh.init.resize(n);
         mh.fwd.resize(n);
         mh.bwd.resize(n);
         mh.combined.resize(n);
+
+        int iters = (num_iters > 0)
+                    ? (int)num_iters
+                    : std::max((int)dag.longest_chain(), 1);
 
         auto hash_combine = [](size_t seed, size_t v) -> size_t {
             return seed ^ (v * 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
         };
 
         // Initial hash per op: type + input/output tensor shapes
-        std::vector<size_t> init_hash(n);
         for (size_t i = 0; i < n; i++) {
             size_t h = (prob.ops[i].type == OpType::MatMul) ? 0xAA55AA55ULL : 0x55AA55AAULL;
             h = hash_combine(h, (size_t)prob.ops[i].base_cost);
@@ -75,7 +95,7 @@ struct MerkleHashes {
                 h = hash_combine(h, (size_t)w);
                 h = hash_combine(h, (size_t)ht);
             }
-            init_hash[i] = h;
+            mh.init[i] = h;
         }
 
         // ================================================================
@@ -87,12 +107,12 @@ struct MerkleHashes {
         // get different forward hashes.
         // ================================================================
         auto topo = dag.topo_sort();
-        mh.fwd = init_hash;
+        mh.fwd = mh.init;
 
-        for (int iter = 0; iter < 3; iter++) {  // iterate for deeper propagation
+        for (int iter = 0; iter < iters; iter++) {
             std::vector<size_t> new_fwd(n);
             for (auto op : topo) {
-                size_t h = init_hash[op];
+                size_t h = mh.init[op];
 
                 // Collect predecessor hashes via input tensors
                 std::vector<size_t> pred_hashes;
@@ -127,13 +147,13 @@ struct MerkleHashes {
         // For graph-output tensors (no consumer), hash their dimensions
         // as a "virtual successor".
         // ================================================================
-        mh.bwd = init_hash;
+        mh.bwd = mh.init;
 
-        for (int iter = 0; iter < 3; iter++) {
+        for (int iter = 0; iter < iters; iter++) {
             std::vector<size_t> new_bwd(n);
             for (int idx = (int)topo.size() - 1; idx >= 0; idx--) {
                 size_t op = topo[idx];
-                size_t h = init_hash[op];
+                size_t h = mh.init[op];
 
                 // Collect successor hashes via output tensors
                 std::vector<size_t> succ_hashes;

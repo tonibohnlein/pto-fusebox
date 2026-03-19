@@ -46,6 +46,13 @@ struct DAG {
     std::vector<size_t> topo_order_;
     std::vector<size_t> topo_pos_;
 
+    // Longest directed path in the DAG (number of edges, not nodes).
+    // Computed via forward DP on topo order in build().
+    // Used by MerkleHashes to set the iteration count: enough iterations
+    // to propagate boundary signals across the entire DAG, ensuring that
+    // ops at different chain positions get distinct forward hashes.
+    size_t longest_chain_ = 0;
+
     // Build the DAG from a problem specification.
     // Also calls precompute_reachability().
     static DAG build(const Problem& prob);
@@ -73,6 +80,9 @@ struct DAG {
 
     // Return the cached topological order (topo_order_[i] = op at step i). O(1).
     const std::vector<size_t>& topological_order() const { return topo_order_; }
+
+    // Longest directed path length (number of edges). O(1).
+    size_t longest_chain() const { return longest_chain_; }
 
     // Compute the union of everything reachable from all ops in the given
     // bitmask. Returns a bitmask of the same width (words_per_row_ words).

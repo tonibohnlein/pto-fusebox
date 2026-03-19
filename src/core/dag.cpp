@@ -63,6 +63,19 @@ DAG DAG::build(const Problem& prob) {
     for (size_t i = 0; i < d.topo_order_.size(); i++)
         d.topo_pos_[d.topo_order_[i]] = i;
 
+    // Longest directed path (number of edges) via forward DP on topo order.
+    // dist[u] = length of longest path ending at u.
+    {
+        std::vector<size_t> dist(d.num_ops, 0);
+        for (auto u : d.topo_order_)
+            for (auto v : d.op_succs[u])
+                if (dist[u] + 1 > dist[v])
+                    dist[v] = dist[u] + 1;
+        d.longest_chain_ = 0;
+        for (auto v : dist)
+            if (v > d.longest_chain_) d.longest_chain_ = v;
+    }
+
     return d;
 }
 
