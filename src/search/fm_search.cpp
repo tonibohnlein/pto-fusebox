@@ -27,6 +27,20 @@ static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
     return b_to_a;
 }
 
+// Check if removing op from group_ops would create topological straddling:
+// op has both predecessors AND successors in the remainder. If so, the
+// remainder must execute both before AND after the removed op → group-DAG cycle.
+static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
+                                const DAG& dag) {
+    bool has_pred = false, has_succ = false;
+    for (auto p : dag.op_preds[op])
+        if (p != op && group_ops.count(p)) { has_pred = true; break; }
+    if (!has_pred) return false;
+    for (auto s : dag.op_succs[op])
+        if (s != op && group_ops.count(s)) { has_succ = true; break; }
+    return has_succ;
+}
+
 // ============================================================================
 // best_move_for: evaluate all candidate moves for op
 // ============================================================================
@@ -136,8 +150,10 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
         }
 
-        // EJECT: cannot create cycles
-        {
+        // EJECT: can create cycles if op has both predecessors and successors
+        // in the remainder (the remainder group would need to execute both
+        // before and after the singleton).
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
             auto er = part.eval_eject(op, gx);
             if (er.feasible && accept(er.saving))
                 best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
@@ -150,13 +166,15 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
         {
-            auto er = part.eval_eject(op, gx);
-            if (er.feasible && accept(er.saving)) {
-                FMMove candidate;
-                candidate.type = FMMove::INTERNAL_EJECT;
-                candidate.op = op; candidate.ga = gx;
-                candidate.saving = er.saving;
-                if (candidate.saving > best.saving) best = candidate;
+            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+                auto er = part.eval_eject(op, gx);
+                if (er.feasible && accept(er.saving)) {
+                    FMMove candidate;
+                    candidate.type = FMMove::INTERNAL_EJECT;
+                    candidate.op = op; candidate.ga = gx;
+                    candidate.saving = er.saving;
+                    if (candidate.saving > best.saving) best = candidate;
+                }
             }
         }
 
@@ -369,6 +387,11 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         }
         case FMMove::EJECT:
         case FMMove::INTERNAL_EJECT: {
+            // Re-verify: ejecting op with both predecessors and successors
+            // in the remainder creates a cycle (remainder ↔ singleton).
+            if (creates_topo_cycle(m.op, part.groups[m.ga].ops, *part.dag))
+                return {};
+
             auto er = part.eval_eject(m.op, m.ga);
             if (!er.feasible) return {};
 

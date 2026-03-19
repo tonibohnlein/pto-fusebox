@@ -236,19 +236,182 @@ public:
             return result;
         };
 
-        // Hash a component by sorted Merkle combined hashes of its ops
         auto hash_combine = [](size_t seed, size_t v) -> size_t {
             return seed ^ (v * 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
         };
 
+        // ============================================================
+        // Local structural hash for a component.
+        //
+        // Uses a mini Merkle hash that only considers edges WITHIN
+        // the component. External inputs/outputs are hashed by their
+        // tensor shape (not by which specific op produces/consumes
+        // them globally). This makes Op4 in {0,1,2,3,4} hash the
+        // same as Op14 in {10,11,12,13,14} because their LOCAL roles
+        // are identical — the difference (Op4→Op15 vs Op14→Op16) is
+        // external and irrelevant for partition isomorphism.
+        // ============================================================
         auto component_hash = [&](const std::set<size_t>& comp) -> size_t {
-            std::vector<size_t> hashes;
-            hashes.reserve(comp.size());
+            if (comp.empty()) return 0;
+
+            // Build local init hash per op (type + cost + shapes)
+            std::map<size_t, size_t> init_h;
+            for (auto op : comp) {
+                size_t h = (prob.ops[op].type == OpType::MatMul)
+                           ? 0xAA55AA55ULL : 0x55AA55AAULL;
+                h = hash_combine(h, (size_t)prob.ops[op].base_cost);
+                std::vector<std::pair<int64_t,int64_t>> in_shapes;
+                for (auto t : prob.ops[op].inputs)
+                    in_shapes.push_back({prob.tensors[t].width,
+                                         prob.tensors[t].height});
+                std::sort(in_shapes.begin(), in_shapes.end());
+                for (auto [w, ht] : in_shapes) {
+                    h = hash_combine(h, (size_t)w);
+                    h = hash_combine(h, (size_t)ht);
+                }
+                h = hash_combine(h, 0xDEADBEEF);
+                std::vector<std::pair<int64_t,int64_t>> out_shapes;
+                for (auto t : prob.ops[op].outputs)
+                    out_shapes.push_back({prob.tensors[t].width,
+                                          prob.tensors[t].height});
+                std::sort(out_shapes.begin(), out_shapes.end());
+                for (auto [w, ht] : out_shapes) {
+                    h = hash_combine(h, (size_t)w);
+                    h = hash_combine(h, (size_t)ht);
+                }
+                init_h[op] = h;
+            }
+
+            // Build local predecessor/successor maps (only within comp)
+            std::map<size_t, std::vector<std::pair<size_t,size_t>>> local_preds;
+            std::map<size_t, std::vector<std::pair<size_t,size_t>>> local_succs;
+            // Track external input/output counts per op (for boundary role)
+            std::map<size_t, size_t> ext_in_count, ext_out_count;
+            for (auto op : comp) {
+                ext_in_count[op] = 0;
+                ext_out_count[op] = 0;
+                for (auto t : prob.ops[op].inputs) {
+                    int prod = dag.tensor_producer[t];
+                    if (prod >= 0 && comp.count((size_t)prod)) {
+                        local_preds[op].push_back({(size_t)prod, t});
+                    } else {
+                        ext_in_count[op]++;
+                    }
+                }
+                for (auto t : prob.ops[op].outputs) {
+                    for (auto cons : dag.tensor_consumers[t]) {
+                        if (comp.count(cons)) {
+                            local_succs[op].push_back({cons, t});
+                        }
+                    }
+                    // Count external consumers
+                    bool has_ext = false;
+                    for (auto cons : dag.tensor_consumers[t])
+                        if (!comp.count(cons)) { has_ext = true; break; }
+                    if (has_ext || dag.tensor_consumers[t].empty())
+                        ext_out_count[op]++;
+                }
+            }
+
+            // Topo sort within the component
+            std::vector<size_t> local_topo;
+            {
+                std::map<size_t, int> in_deg;
+                for (auto op : comp) in_deg[op] = 0;
+                for (auto op : comp)
+                    for (auto& [pred, t] : local_preds[op])
+                        in_deg[op]++;
+                std::queue<size_t> q;
+                for (auto op : comp)
+                    if (in_deg[op] == 0) q.push(op);
+                while (!q.empty()) {
+                    auto u = q.front(); q.pop();
+                    local_topo.push_back(u);
+                    for (auto& [succ, t] : local_succs[u])
+                        if (--in_deg[succ] == 0) q.push(succ);
+                }
+            }
+
+            // Forward local Merkle: 3 iterations
+            std::map<size_t, size_t> fwd;
+            for (auto op : comp) fwd[op] = init_h[op];
+            for (int iter = 0; iter < 3; iter++) {
+                std::map<size_t, size_t> new_fwd;
+                for (auto op : local_topo) {
+                    size_t h = init_h[op];
+                    // External input count as structural feature
+                    h = hash_combine(h, ext_in_count[op] + 0xEE00);
+                    std::vector<size_t> pred_hashes;
+                    for (auto& [pred, t] : local_preds[op]) {
+                        size_t th = hash_combine(fwd[pred],
+                                    (size_t)prob.tensors[t].width);
+                        th = hash_combine(th,
+                                    (size_t)prob.tensors[t].height);
+                        pred_hashes.push_back(th);
+                    }
+                    // Hash external inputs by shape (not identity)
+                    for (auto t : prob.ops[op].inputs) {
+                        int prod = dag.tensor_producer[t];
+                        if (prod < 0 || !comp.count((size_t)prod)) {
+                            size_t th = hash_combine(0xFEEDFACEULL,
+                                        (size_t)prob.tensors[t].width);
+                            th = hash_combine(th,
+                                        (size_t)prob.tensors[t].height);
+                            pred_hashes.push_back(th);
+                        }
+                    }
+                    std::sort(pred_hashes.begin(), pred_hashes.end());
+                    for (auto ph : pred_hashes) h = hash_combine(h, ph);
+                    new_fwd[op] = h;
+                }
+                fwd = new_fwd;
+            }
+
+            // Backward local Merkle: 3 iterations
+            std::map<size_t, size_t> bwd;
+            for (auto op : comp) bwd[op] = init_h[op];
+            for (int iter = 0; iter < 3; iter++) {
+                std::map<size_t, size_t> new_bwd;
+                for (int i = (int)local_topo.size() - 1; i >= 0; i--) {
+                    size_t op = local_topo[i];
+                    size_t h = init_h[op];
+                    h = hash_combine(h, ext_out_count[op] + 0xFF00);
+                    std::vector<size_t> succ_hashes;
+                    for (auto& [succ, t] : local_succs[op]) {
+                        size_t th = hash_combine(bwd[succ],
+                                    (size_t)prob.tensors[t].width);
+                        th = hash_combine(th,
+                                    (size_t)prob.tensors[t].height);
+                        succ_hashes.push_back(th);
+                    }
+                    // Hash external outputs by shape
+                    for (auto t : prob.ops[op].outputs) {
+                        bool has_ext = false;
+                        for (auto cons : dag.tensor_consumers[t])
+                            if (!comp.count(cons)) { has_ext = true; break; }
+                        if (has_ext || dag.tensor_consumers[t].empty()) {
+                            size_t th = hash_combine(0xCAFEBABEULL,
+                                        (size_t)prob.tensors[t].width);
+                            th = hash_combine(th,
+                                        (size_t)prob.tensors[t].height);
+                            succ_hashes.push_back(th);
+                        }
+                    }
+                    std::sort(succ_hashes.begin(), succ_hashes.end());
+                    for (auto sh : succ_hashes) h = hash_combine(h, sh);
+                    new_bwd[op] = h;
+                }
+                bwd = new_bwd;
+            }
+
+            // Component fingerprint = sorted(fwd ⊕ bwd) for all ops
+            std::vector<size_t> combined;
+            combined.reserve(comp.size());
             for (auto op : comp)
-                hashes.push_back(merkle.combined[op]);
-            std::sort(hashes.begin(), hashes.end());
-            size_t h = hashes.size();
-            for (auto v : hashes)
+                combined.push_back(hash_combine(fwd[op], bwd[op]));
+            std::sort(combined.begin(), combined.end());
+            size_t h = combined.size();
+            for (auto v : combined)
                 h = hash_combine(h, v);
             return h;
         };
@@ -488,7 +651,7 @@ public:
         }
 
         // ================================================================
-        // 8. Sort: symmetry desc, then component size desc
+        // 8. Sort and deduplicate
         // ================================================================
 
         std::sort(patterns.begin(), patterns.end(),
@@ -496,6 +659,43 @@ public:
             if (a.symmetry != b.symmetry) return a.symmetry > b.symmetry;
             return a.component_size() > b.component_size();
         });
+
+        // Remove subsumed patterns: if P has the same symmetry as Q and
+        // every component of P is a subset of a component of Q, drop P.
+        // After sorting (largest first), check each pattern against all
+        // earlier (larger) patterns at the same symmetry level.
+        std::vector<bool> subsumed(patterns.size(), false);
+        for (size_t i = 1; i < patterns.size(); i++) {
+            for (size_t j = 0; j < i; j++) {
+                if (subsumed[j]) continue;
+                if (patterns[j].symmetry != patterns[i].symmetry) continue;
+                if (patterns[j].component_size() <= patterns[i].component_size())
+                    continue;
+
+                // Check if every component of P[i] is a subset of
+                // some component of P[j].
+                bool all_subsets = true;
+                for (auto& ci : patterns[i].components) {
+                    bool found = false;
+                    for (auto& cj : patterns[j].components) {
+                        if (std::includes(cj.begin(), cj.end(),
+                                          ci.begin(), ci.end())) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) { all_subsets = false; break; }
+                }
+                if (all_subsets) { subsumed[i] = true; break; }
+            }
+        }
+        {
+            std::vector<SymmetricPattern> filtered;
+            for (size_t i = 0; i < patterns.size(); i++)
+                if (!subsumed[i])
+                    filtered.push_back(std::move(patterns[i]));
+            patterns = std::move(filtered);
+        }
 
         if (verbose) {
             std::cerr << "[symmetry] discovered " << patterns.size()

@@ -364,6 +364,19 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     for (auto& r : gen0_end_partitions)
         if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size, mhp);
+
+    // If all FM results were cyclic, fall back to trivial partition
+    if (pool.empty()) {
+        std::cerr << "  WARNING: all gen0 FM results were cyclic, "
+                  << "falling back to trivial partition\n";
+        auto fallback = Partition::trivial(prob, dag);
+        fallback.cache = &shared_cache;
+        fallback = greedy_descent(std::move(fallback));
+        double fc = fallback.total_cost();
+        pool_insert(pool, PoolEntry(std::move(fallback), fc, "trivial_fallback"),
+                    cfg.pool_size, mhp);
+    }
+
     pool_sort(pool);
 
     std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
