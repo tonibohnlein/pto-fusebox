@@ -960,6 +960,135 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
     }
   }
 
+  // RETAIN_REORDER: move a consumer step adjacent to a producer step so
+  // tensor T can be retained across the boundary.
+  {
+    const auto &dag = *state.dag;
+    const auto &prob = *state.prob;
+
+    for (size_t pi = 0; pi < state.size(); pi++) {
+      if (!state.steps[pi].subgraph.boundary_outputs().count(t)) continue;
+
+      // Look for consumer steps ci > pi + 1 (adjacent handled by RETAIN_ADD)
+      size_t max_ci = std::min(pi + 8, state.size());
+      for (size_t ci = pi + 2; ci < max_ci; ci++) {
+        if (!state.steps[ci].subgraph.boundary_inputs().count(t)) continue;
+
+        // Can ci move to pi+1? All ops in ci must have DAG preds in steps 0..pi
+        bool can_move = true;
+        for (auto op : state.steps[ci].subgraph.ops()) {
+          for (auto pred : dag.op_preds[op]) {
+            size_t pred_step = state.step_of(pred);
+            if (pred_step == SIZE_MAX) continue;
+            if (pred_step > pi) { can_move = false; break; }
+          }
+          if (!can_move) break;
+        }
+        if (!can_move) continue;
+
+        // Build reordered sequence for range [pi, ci]:
+        // [step_pi + retain T, step_ci, step_{pi+1}, ..., step_{ci-1}]
+        std::vector<ScheduleStep> new_steps;
+        ScheduleStep step_pi = state.steps[pi];
+        step_pi.retain_these.insert(t);
+        new_steps.push_back(step_pi);
+        new_steps.push_back(state.steps[ci]);
+        for (size_t k = pi + 1; k < ci; k++)
+          new_steps.push_back(state.steps[k]);
+
+        double saving = evaluate_structural_saving(state, pi, ci, new_steps);
+        if (saving > -floor && saving > best.saving) {
+          best.type = SolutionMove::RETAIN_REORDER;
+          best.step_a = pi;
+          best.step_b = ci;
+          best.tensor = t;
+          best.saving = saving;
+        }
+      }
+    }
+  }
+
+  // RETAIN_FORCE_SPLIT: split a step to reduce working set, enabling retain.
+  // Applicable when T is a boundary output of step si, step si+1 needs T,
+  // but retaining T at step si is infeasible (working set too large).
+  {
+    const auto &dag = *state.dag;
+    const auto &prob = *state.prob;
+    int prod = dag.tensor_producer[t];
+    if (prod >= 0) {
+      size_t producer_op = (size_t)prod;
+      size_t si = state.step_of(producer_op);
+      if (si != SIZE_MAX && si < state.size() &&
+          state.steps[si].subgraph.ops().size() >= 2 &&
+          state.steps[si].subgraph.boundary_outputs().count(t) &&
+          si + 1 < state.size() &&
+          state.steps[si + 1].subgraph.boundary_inputs().count(t)) {
+
+        // BFS backwards from producer_op to find minimal side_a
+        auto &ops_vec = state.steps[si].subgraph.ops();
+        std::set<size_t> step_ops(ops_vec.begin(), ops_vec.end());
+        std::set<size_t> side_a_ops;
+        {
+          std::vector<size_t> q = {producer_op};
+          side_a_ops.insert(producer_op);
+          for (size_t qi = 0; qi < q.size(); qi++) {
+            for (auto pred : dag.op_preds[q[qi]]) {
+              if (step_ops.count(pred) && !side_a_ops.count(pred)) {
+                side_a_ops.insert(pred);
+                q.push_back(pred);
+              }
+            }
+          }
+        }
+
+        if (side_a_ops.size() < step_ops.size()) {
+          std::set<size_t> side_b_ops;
+          for (auto op : step_ops)
+            if (!side_a_ops.count(op)) side_b_ops.insert(op);
+
+          auto sg_a = Subgraph::create(prob, dag, {side_a_ops.begin(), side_a_ops.end()});
+          auto sg_b = Subgraph::create(prob, dag, {side_b_ops.begin(), side_b_ops.end()});
+          if (sg_a && sg_b) {
+            bool a_before_b = false, b_before_a = false;
+            for (auto oa : side_a_ops)
+              for (auto succ : dag.op_succs[oa])
+                if (side_b_ops.count(succ)) { a_before_b = true; break; }
+            for (auto ob : side_b_ops)
+              for (auto succ : dag.op_succs[ob])
+                if (side_a_ops.count(succ)) { b_before_a = true; break; }
+
+            if (!(a_before_b && b_before_a)) {
+              ScheduleStep step_a;
+              step_a.subgraph = *sg_a;
+              step_a.retain_these = filter_retain(state.steps[si].retain_these, *sg_a);
+              step_a.retain_these.insert(t);
+
+              ScheduleStep step_b;
+              step_b.subgraph = *sg_b;
+              step_b.retain_these = filter_retain(state.steps[si].retain_these, *sg_b);
+
+              std::vector<ScheduleStep> new_steps;
+              if (b_before_a)
+                new_steps = {step_b, step_a};
+              else
+                new_steps = {step_a, step_b};
+
+              double saving = evaluate_structural_saving(state, si, si, new_steps);
+              if (saving > -floor && saving > best.saving) {
+                best.type = SolutionMove::RETAIN_FORCE_SPLIT;
+                best.step_a = si;
+                best.tensor = t;
+                best.op = producer_op;
+                best.op2 = b_before_a ? 1 : 0;
+                best.saving = saving;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   return best;
 }
 
@@ -1278,6 +1407,81 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
       return {m.step_a, m.step_a + 1};
     }
   }
+  case SolutionMove::RETAIN_REORDER: {
+    if (m.step_a >= state.size() || m.step_b >= state.size()) return {SIZE_MAX, 0};
+    if (m.step_b <= m.step_a + 1) return {SIZE_MAX, 0};
+
+    // Re-verify: can step_b still move to step_a+1?
+    for (auto op : state.steps[m.step_b].subgraph.ops()) {
+      for (auto pred : dag.op_preds[op]) {
+        size_t pred_step = state.step_of(pred);
+        if (pred_step != SIZE_MAX && pred_step > m.step_a)
+          return {SIZE_MAX, 0};
+      }
+    }
+
+    // Add T to producer step's retain
+    state.steps[m.step_a].retain_these.insert(m.tensor);
+
+    // Move step_b to position step_a + 1
+    auto moved = std::move(state.steps[m.step_b]);
+    state.steps.erase(state.steps.begin() + (ptrdiff_t)m.step_b);
+    state.steps.insert(state.steps.begin() + (ptrdiff_t)(m.step_a + 1), std::move(moved));
+
+    // Step count unchanged but positions shuffled
+    return {m.step_a, m.step_b + 1};
+  }
+  case SolutionMove::RETAIN_FORCE_SPLIT: {
+    if (m.step_a >= state.size()) return {SIZE_MAX, 0};
+    if (state.steps[m.step_a].subgraph.ops().size() < 2) return {SIZE_MAX, 0};
+
+    auto &ops_vec = state.steps[m.step_a].subgraph.ops();
+    std::set<size_t> step_ops(ops_vec.begin(), ops_vec.end());
+
+    // BFS backwards from producer op to find side_a
+    std::set<size_t> side_a_ops;
+    {
+      std::vector<size_t> q = {m.op};
+      side_a_ops.insert(m.op);
+      for (size_t qi = 0; qi < q.size(); qi++) {
+        for (auto pred : dag.op_preds[q[qi]]) {
+          if (step_ops.count(pred) && !side_a_ops.count(pred)) {
+            side_a_ops.insert(pred);
+            q.push_back(pred);
+          }
+        }
+      }
+    }
+
+    std::set<size_t> side_b_ops;
+    for (auto op : step_ops)
+      if (!side_a_ops.count(op)) side_b_ops.insert(op);
+    if (side_b_ops.empty()) return {SIZE_MAX, 0};
+
+    auto sg_a = Subgraph::create(prob, dag, {side_a_ops.begin(), side_a_ops.end()});
+    auto sg_b = Subgraph::create(prob, dag, {side_b_ops.begin(), side_b_ops.end()});
+    if (!sg_a || !sg_b) return {SIZE_MAX, 0};
+
+    bool b_before_a = (m.op2 == 1);
+
+    ScheduleStep step_a;
+    step_a.subgraph = std::move(*sg_a);
+    step_a.retain_these = filter_retain(state.steps[m.step_a].retain_these, step_a.subgraph);
+    step_a.retain_these.insert(m.tensor);
+
+    ScheduleStep step_b;
+    step_b.subgraph = std::move(*sg_b);
+    step_b.retain_these = filter_retain(state.steps[m.step_a].retain_these, step_b.subgraph);
+
+    if (b_before_a) {
+      state.steps[m.step_a] = std::move(step_b);
+      state.steps.insert(state.steps.begin() + (ptrdiff_t)(m.step_a + 1), std::move(step_a));
+    } else {
+      state.steps[m.step_a] = std::move(step_a);
+      state.steps.insert(state.steps.begin() + (ptrdiff_t)(m.step_a + 1), std::move(step_b));
+    }
+    return {m.step_a, m.step_a + 2};
+  }
   default:
     return {SIZE_MAX, 0};
   }
@@ -1321,7 +1525,12 @@ generate_step_moves(SolState &state, size_t si, SolMoveHeap &heap, double floor,
     auto m = best_move_for_tensor(state, t, empty, floor);
     if (m.valid() && m.saving > -floor) {
       m.gen_a = (m.step_a < state.size()) ? state.gen[m.step_a] : -1;
-      m.gen_b = (m.step_a + 1 < state.size()) ? state.gen[m.step_a + 1] : -1;
+      if (m.step_b != SIZE_MAX && m.step_b < state.size())
+        m.gen_b = state.gen[m.step_b];
+      else if (m.step_a + 1 < state.size())
+        m.gen_b = state.gen[m.step_a + 1];
+      else
+        m.gen_b = -1;
       heap.push(m);
     }
   }
@@ -1333,7 +1542,12 @@ generate_step_moves(SolState &state, size_t si, SolMoveHeap &heap, double floor,
     auto m = best_move_for_tensor(state, t, empty, floor);
     if (m.valid() && m.saving > -floor) {
       m.gen_a = (m.step_a < state.size()) ? state.gen[m.step_a] : -1;
-      m.gen_b = (m.step_a + 1 < state.size()) ? state.gen[m.step_a + 1] : -1;
+      if (m.step_b != SIZE_MAX && m.step_b < state.size())
+        m.gen_b = state.gen[m.step_b];
+      else if (m.step_a + 1 < state.size())
+        m.gen_b = state.gen[m.step_a + 1];
+      else
+        m.gen_b = -1;
       heap.push(m);
     }
   }
@@ -1342,7 +1556,12 @@ generate_step_moves(SolState &state, size_t si, SolMoveHeap &heap, double floor,
     auto mr = best_move_for_tensor(state, t, empty, floor);
     if (mr.valid() && mr.saving > -floor) {
       mr.gen_a = (mr.step_a < state.size()) ? state.gen[mr.step_a] : -1;
-      mr.gen_b = (mr.step_a + 1 < state.size()) ? state.gen[mr.step_a + 1] : -1;
+      if (mr.step_b != SIZE_MAX && mr.step_b < state.size())
+        mr.gen_b = state.gen[mr.step_b];
+      else if (mr.step_a + 1 < state.size())
+        mr.gen_b = state.gen[mr.step_a + 1];
+      else
+        mr.gen_b = -1;
       heap.push(mr);
     }
   }
@@ -1365,11 +1584,13 @@ static void bump_affected(SolState &state, size_t lo, size_t hi,
   }
 }
 
-// Check if a move type changes step count
+// Check if a move type changes step count or reorders steps
 static bool is_structural(SolutionMove::Type t) {
   return t == SolutionMove::SPLIT || t == SolutionMove::MERGE ||
          t == SolutionMove::EJECT || t == SolutionMove::INTERNAL_EJECT ||
-         t == SolutionMove::DE_RECOMPUTE;
+         t == SolutionMove::DE_RECOMPUTE ||
+         t == SolutionMove::RETAIN_REORDER ||
+         t == SolutionMove::RETAIN_FORCE_SPLIT;
 }
 
 // Staleness check for a heap move
@@ -1897,6 +2118,27 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     } else if (m.type == SolutionMove::STEAL) {
       if (m.op != SIZE_MAX)
         active.locked_ops.insert(m.op);
+    } else if (m.type == SolutionMove::RETAIN_REORDER) {
+      // Lock producer op + consumer ops of the retained tensor
+      int prod = dag.tensor_producer[m.tensor];
+      if (prod >= 0)
+        active.locked_ops.insert((size_t)prod);
+      // Lock all ops in the moved step to prevent undoing the reorder
+      if (m.step_a + 1 < state.size()) {
+        for (auto op : state.steps[m.step_a + 1].subgraph.ops())
+          active.locked_ops.insert(op);
+      }
+    } else if (m.type == SolutionMove::RETAIN_FORCE_SPLIT) {
+      // Lock producer op + bridge ops between split halves (same as SPLIT)
+      if (m.op != SIZE_MAX)
+        active.locked_ops.insert(m.op);
+      if (m.step_a + 1 < state.size()) {
+        std::set<size_t> sb(state.steps[m.step_a + 1].subgraph.ops().begin(),
+                            state.steps[m.step_a + 1].subgraph.ops().end());
+        for (auto op : state.steps[m.step_a].subgraph.ops())
+          for (auto s : dag.op_succs[op])
+            if (sb.count(s)) { active.locked_ops.insert(op); break; }
+      }
     }
 
     active.update_affected(state, lo, hi);

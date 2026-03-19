@@ -16,7 +16,8 @@
 
 struct SolutionMove {
     enum Type { NONE=-1, STEAL=0, SPLIT=1, MERGE=2, RETAIN_ADD=3, RETAIN_REMOVE=4,
-                RECOMPUTE=5, EJECT=6, INTERNAL_EJECT=7, DE_RECOMPUTE=8 };
+                RECOMPUTE=5, EJECT=6, INTERNAL_EJECT=7, DE_RECOMPUTE=8,
+                RETAIN_REORDER=9, RETAIN_FORCE_SPLIT=10 };
     Type type = NONE;
     size_t step_a = SIZE_MAX;  // primary step
     size_t step_b = SIZE_MAX;  // secondary step
