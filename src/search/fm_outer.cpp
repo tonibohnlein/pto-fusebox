@@ -38,6 +38,7 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         pass_cfg.seed = (unsigned)(pass_cfg.seed + pass * 7);
         pass_cfg.floor_fraction = effective_floor;
         pass_cfg.max_drift_fraction = effective_drift;
+        pass_cfg.deadline = cfg.deadline;  // propagate wall-clock cutoff
 
         auto pass_result = fm_inner_pass(std::move(current), pass_cfg);
         result.total_passes++;

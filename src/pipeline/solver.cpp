@@ -101,7 +101,9 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
             while (true) {
                 int tid = next_task.fetch_add(1);
                 if (tid >= n_tasks) break;
-                if (SteadyClock::now() >= phase2_dl) break;
+                // Respect both phase deadline and hard deadline
+                if (SteadyClock::now() >= phase2_dl ||
+                    SteadyClock::now() >= effective_dl) break;
 
                 // Pre-finalize acyclicity check: reject partitions that Phase 1
                 // left in a broken state (e.g., TENSOR_EXTRACT introduced a cycle).

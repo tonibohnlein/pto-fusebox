@@ -2,6 +2,7 @@
 
 #include "partition/partition.h"
 #include "search/active_set.h"
+#include <chrono>
 #include <random>
 
 // ============================================================================
@@ -13,6 +14,8 @@ struct FMConfig {
     double max_drift_fraction = 0.50; // abort if cumulative gain drops this % below best
     int init_count = 3;               // number of border ops to activate initially
     unsigned seed = 42;               // RNG seed for random initial subset
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::time_point::max();  // wall-clock cutoff
 };
 
 // ============================================================================

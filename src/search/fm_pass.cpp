@@ -80,9 +80,14 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     double cumulative_gain = 0;
     double best_cumulative_gain = 0;
     int fm_iters = 0;
+    using SteadyClock = std::chrono::steady_clock;
 
     while (true) {
         fm_iters++;
+
+        // Check deadline every 32 iterations (clock syscall amortization)
+        if ((fm_iters & 31) == 0 && SteadyClock::now() >= cfg.deadline) break;
+
         auto move_opt = active.pop_best();
         if (!move_opt.has_value()) break;
 
