@@ -95,17 +95,28 @@ static std::set<size_t> filter_retain(const std::set<size_t> &retain,
   return r;
 }
 
-// Quick check: does a solution have any ephemeral gaps?
-static bool has_ephemeral_gaps(const DAG &dag,
-                                const std::vector<ScheduleStep> &steps) {
-  for (auto &step : steps)
-    for (auto t : step.subgraph.boundary_inputs()) {
-      if (dag.tensor_producer[t] < 0) continue;
-      bool found = false;
-      for (auto &s : steps)
-        if (s.subgraph.boundary_outputs().count(t)) { found = true; break; }
-      if (!found) return true;
+// Check solution ordering validity: every boundary input tensor must be
+// produced as a boundary output by some EARLIER step.
+// Under the new ephemeral rule, if a step needs T as boundary input, T's
+// producer step must expose it as boundary output (because the consumer is
+// external). So this only detects ordering violations (cycles).
+static bool has_ordering_violation(const DAG &dag,
+                                    const std::vector<ScheduleStep> &steps) {
+  for (size_t si = 0; si < steps.size(); si++) {
+    for (auto t : steps[si].subgraph.boundary_inputs()) {
+      if (dag.tensor_producer[t] < 0) continue;  // graph input
+
+      // Must be produced as boundary output by some step sj < si
+      bool found_before = false;
+      for (size_t sj = 0; sj < si; sj++) {
+        if (steps[sj].subgraph.boundary_outputs().count(t)) {
+          found_before = true;
+          break;
+        }
+      }
+      if (!found_before) return true;
     }
+  }
   return false;
 }
 
@@ -846,8 +857,16 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
           }
           if (!avail) { safe = false; break; }
         }
+
+        // Cycle check: simulate removing the step and verify ordering
         if (safe) {
-          // Empty new_steps = step deleted entirely
+          std::vector<ScheduleStep> hypo;
+          for (size_t k = 0; k < state.size(); k++)
+            if (k != si) hypo.push_back(state.steps[k]);
+          if (has_ordering_violation(dag, hypo)) safe = false;
+        }
+
+        if (safe) {
           double saving = evaluate_structural_saving(state, si, si, {});
           if (saving > -floor && saving > best.saving) {
             best.type = SolutionMove::DE_RECOMPUTE;
@@ -868,16 +887,28 @@ static SolutionMove best_move_for_op(SolState &state, size_t op,
           }
           if (!avail) { safe = false; break; }
         }
+
         if (safe) {
           auto sg_r = Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
           if (sg_r) {
             auto rr = filter_retain(state.steps[si].retain_these, *sg_r);
             ScheduleStep step_r; step_r.subgraph = *sg_r; step_r.retain_these = rr;
-            double saving = evaluate_structural_saving(state, si, si, {step_r});
-            if (saving > -floor && saving > best.saving) {
-              best.type = SolutionMove::DE_RECOMPUTE;
-              best.step_a = si; best.step_b = SIZE_MAX; best.op = op;
-              best.saving = saving;
+
+            // Cycle check: simulate replacing step with remainder
+            std::vector<ScheduleStep> hypo;
+            for (size_t k = 0; k < state.size(); k++) {
+              if (k == si) hypo.push_back(step_r);
+              else hypo.push_back(state.steps[k]);
+            }
+            if (has_ordering_violation(dag, hypo)) safe = false;
+
+            if (safe) {
+              double saving = evaluate_structural_saving(state, si, si, {step_r});
+              if (saving > -floor && saving > best.saving) {
+                best.type = SolutionMove::DE_RECOMPUTE;
+                best.step_a = si; best.step_b = SIZE_MAX; best.op = op;
+                best.saving = saving;
+              }
             }
           }
         }
@@ -1392,16 +1423,33 @@ static std::pair<size_t, size_t> apply_move(SolState &state,
     }
 
     if (si_set.size() == 1) {
-      // Singleton: remove entire step
+      // Singleton: remove entire step — verify no ordering violation
+      std::vector<ScheduleStep> hypo;
+      for (size_t k = 0; k < state.size(); k++)
+        if (k != m.step_a) hypo.push_back(state.steps[k]);
+      if (has_ordering_violation(dag, hypo)) return {SIZE_MAX, 0};
+
       state.steps.erase(state.steps.begin() + m.step_a);
       size_t lo = m.step_a > 0 ? m.step_a - 1 : 0;
       return {lo, lo + 1};
     } else {
-      // Multi-op: remove op, set subgraph and retain — rebuild_from handles cost
+      // Multi-op: remove op — verify no ordering violation
       std::set<size_t> remainder = si_set;
       remainder.erase(m.op);
       auto sg_r = Subgraph::create(prob, dag, {remainder.begin(), remainder.end()});
       if (!sg_r) return {SIZE_MAX, 0};
+
+      ScheduleStep step_r;
+      step_r.subgraph = *sg_r;
+      step_r.retain_these = filter_retain(si.retain_these, *sg_r);
+
+      std::vector<ScheduleStep> hypo;
+      for (size_t k = 0; k < state.size(); k++) {
+        if (k == m.step_a) hypo.push_back(step_r);
+        else hypo.push_back(state.steps[k]);
+      }
+      if (has_ordering_violation(dag, hypo)) return {SIZE_MAX, 0};
+
       si.subgraph = std::move(*sg_r);
       si.retain_these = filter_retain(si.retain_these, si.subgraph);
       return {m.step_a, m.step_a + 1};
@@ -1778,6 +1826,7 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
                         std::vector<ScheduleStep> steps,
                         Clock::time_point deadline,
                         const std::set<size_t> *fr) {
+  auto steps_backup = steps;  // save for fallback if descent creates ordering violation
   SolState state;
   state.init(prob, dag, std::move(steps), fr);
   SolMoveHeap heap;
@@ -1855,6 +1904,15 @@ solution_greedy_descent(const Problem &prob, const DAG &dag,
     size_t regen_hi = std::min(hi + 1, state.size());
     for (size_t i = regen_lo; i < regen_hi; i++)
       generate_step_moves(state, i, heap, 0.0, deadline);
+  }
+
+  // Final validation: reject if the result has ordering violations.
+  // A structural move (EJECT/SPLIT) during descent can create a step
+  // sequence where a consumer step precedes its producer step.
+  if (has_ordering_violation(*state.dag, state.steps)) {
+    // Rebuild from scratch to fix ordering, or return original
+    // For safety, return the input steps (before any moves)
+    return steps_backup;
   }
   return state.steps;
 }
@@ -2032,7 +2090,7 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
 
     cumul_gain = result.start_cost - state.total;
     if (state.total < result.best_cost - 0.01) {
-      if (!has_ephemeral_gaps(dag, state.steps)) {
+      if (!has_ordering_violation(dag, state.steps)) {
         result.best_cost = state.total;
         result.best_steps = state.steps;
         best_cumul_gain = cumul_gain;
@@ -2193,7 +2251,8 @@ static SolutionFMPassResult solution_fm_outer(const Problem &prob, const DAG &da
       auto descended = solution_greedy_descent(prob, dag,
           std::move(end_copy), base_cfg.deadline, fr);
       Solution desc_sol(prob, dag, descended);
-      if (desc_sol.total_latency() < pr.best_cost - 0.01) {
+      if (desc_sol.total_latency() < pr.best_cost - 0.01 &&
+          !has_ordering_violation(dag, descended)) {
         pr.best_cost = desc_sol.total_latency();
         pr.best_steps = std::move(descended);
       }
@@ -2385,7 +2444,7 @@ static std::vector<ScheduleStep> solution_crossover(
     }
 
     recompute_costs(prob, dag, child_steps);
-    if (has_ephemeral_gaps(dag, child_steps)) return {};
+    if (has_ordering_violation(dag, child_steps)) return {};
     return child_steps;
 }
 
@@ -2737,7 +2796,7 @@ std::vector<ScheduleStep> mutate_random(const Problem& prob, const DAG& dag,
         }
     }
     if (applied == 0) return {};
-    if (has_ephemeral_gaps(dag, result)) return {};
+    if (has_ordering_violation(dag, result)) return {};
     return result;
 }
 
@@ -2860,7 +2919,7 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
     // Pool insert is defined before initialization so we can use it
     // for diversity-aware seeding too.
     auto pool_insert = [&](std::vector<ScheduleStep> steps, double cost) -> bool {
-        if (has_ephemeral_gaps(dag, steps)) return false;
+        if (has_ordering_violation(dag, steps)) return false;
 
         std::lock_guard<std::mutex> lock(pool_mutex);
 
@@ -3048,10 +3107,12 @@ Solution solution_evo_search(const Problem &prob, const DAG &dag,
                     if (pr.best_cost < child_cost - 0.01) {
                         total_fm_improvements++;
                         Solution fm_sol(prob, dag, pr.best_steps);
-                        pool_insert(fm_sol.steps(), fm_sol.total_latency());
-                        if (fm_sol.total_latency() < thread_best_cost - 0.01) {
-                            thread_best_cost = fm_sol.total_latency();
-                            improved = true;
+                        if (fm_sol.validate().valid) {
+                            pool_insert(fm_sol.steps(), fm_sol.total_latency());
+                            if (fm_sol.total_latency() < thread_best_cost - 0.01) {
+                                thread_best_cost = fm_sol.total_latency();
+                                improved = true;
+                            }
                         }
                     }
 
