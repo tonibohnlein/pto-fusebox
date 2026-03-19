@@ -312,12 +312,25 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             gen0_results[tid] = {std::move(fm.best_partition), fm_cost,
                                   strategies[task.strategy_idx].name};
 
+            // Reject cyclic partitions — FM moves (especially TENSOR_EXTRACT)
+            // can introduce cycles that slip past per-move checks.
+            gen0_results[tid].partition.rebuild_index();
+            if (!gen0_results[tid].partition.is_acyclic()) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cerr << "    gen0 [" << strategies[task.strategy_idx].name
+                          << "]: FM result is CYCLIC, discarding\n";
+                gen0_results[tid].cost = 1e18;  // mark as invalid
+            }
+
             // Greedy-kick end state for pool diversity
             if (fm.end_cost < 1e17 && fm.end_cost > fm_cost + 0.01) {
                 auto kicked = greedy_descent(std::move(fm.end_partition));
                 double kick_cost = kicked.total_cost();
-                gen0_end_partitions[tid] = {std::move(kicked), kick_cost,
-                    "kick+" + strategies[task.strategy_idx].name};
+                kicked.rebuild_index();
+                if (kicked.is_acyclic()) {
+                    gen0_end_partitions[tid] = {std::move(kicked), kick_cost,
+                        "kick+" + strategies[task.strategy_idx].name};
+                }
             }
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - start).count();
@@ -441,14 +454,24 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
                 mut_results[tid] = {std::move(fm.best_partition), after_fm, origin};
 
+                // Reject cyclic partitions — FM moves (especially TENSOR_EXTRACT)
+                // can introduce cycles that slip past per-move checks.
+                mut_results[tid].partition.rebuild_index();
+                if (!mut_results[tid].partition.is_acyclic()) {
+                    mut_results[tid].cost = 1e18;
+                }
+
                 // Greedy-kick the FM end state for pool diversity
                 // (matches solution_evo_search pattern)
                 if (fm.end_cost < 1e17 && fm.end_cost > after_fm + 0.01 &&
                     Clock::now() < deadline) {
                     auto kicked = greedy_descent(std::move(fm.end_partition));
                     double kick_cost = kicked.total_cost();
-                    mut_end_partitions[tid] = {std::move(kicked),
-                        kick_cost, "kick+" + origin};
+                    kicked.rebuild_index();
+                    if (kicked.is_acyclic()) {
+                        mut_end_partitions[tid] = {std::move(kicked),
+                            kick_cost, "kick+" + origin};
+                    }
                 }
 
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

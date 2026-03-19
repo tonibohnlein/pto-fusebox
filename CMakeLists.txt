@@ -53,6 +53,9 @@ target_link_libraries(mlsys solver_lib Threads::Threads)
 add_executable(evaluate src/pipeline/evaluate.cpp)
 target_link_libraries(evaluate solver_lib Threads::Threads)
 
+add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
+target_link_libraries(symmetry_app solver_lib Threads::Threads)
+
 # --- Tests ---
 enable_testing()
 

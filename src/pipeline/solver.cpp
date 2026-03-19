@@ -89,6 +89,17 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
                 if (tid >= n_tasks) break;
                 if (SteadyClock::now() >= phase2_dl) break;
 
+                // Pre-finalize acyclicity check: reject partitions that Phase 1
+                // left in a broken state (e.g., TENSOR_EXTRACT introduced a cycle).
+                // rebuild_index is needed for is_acyclic's Kahn's algorithm.
+                partition_pool[tid].rebuild_index();
+                if (!partition_pool[tid].is_acyclic()) {
+                    std::lock_guard<std::mutex> lock(sol_mutex);
+                    std::cerr << "    Partition " << tid
+                              << " SKIPPED: is_acyclic() failed before finalize\n";
+                    continue;
+                }
+
                 // Finalize once: re-populates Group::sg, best_cfg, and the
                 // group-level DAG (all stale after Phase 1 search mutations).
                 // Each thread owns its own tid slot, so this mutation is safe.
@@ -108,6 +119,36 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
                         std::cerr << "    Partition " << tid
                                   << ": finalize issues: " << null_sg << " null sg, "
                                   << infeasible_sg << " infeasible\n";
+                    }
+                }
+
+                // Post-finalize: verify group DAG has correct edges.
+                // Count groups with in_deg=0 that have boundary inputs from
+                // other groups — these would cause ordering failures.
+                {
+                    int bad_roots = 0;
+                    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+                        if (!part.groups[gi].alive || !part.groups[gi].sg) continue;
+                        if (part.group_in_deg[gi] != 0) continue;
+                        for (auto t : part.groups[gi].sg->boundary_inputs()) {
+                            if (dag.tensor_producer[t] < 0) continue;
+                            // T needs to come from somewhere — is it produced by any other step?
+                            bool has_source = false;
+                            for (size_t gj = 0; gj < part.groups.size(); gj++) {
+                                if (gj == gi || !part.groups[gj].alive || !part.groups[gj].sg) continue;
+                                if (part.groups[gj].sg->boundary_outputs().count(t)) {
+                                    has_source = true; break;
+                                }
+                            }
+                            if (has_source) { bad_roots++; break; }
+                        }
+                    }
+                    if (bad_roots > 0) {
+                        std::lock_guard<std::mutex> lock(sol_mutex);
+                        std::cerr << "    Partition " << tid
+                                  << " WARNING: " << bad_roots
+                                  << " root group(s) with unsatisfied boundary inputs"
+                                  << " (group DAG edges missing)\n";
                     }
                 }
 

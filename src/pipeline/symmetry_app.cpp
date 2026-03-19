@@ -13,7 +13,7 @@
 #include "io/io.h"
 #include "core/dag.h"
 #include "symmetry/merkle_hash.h"
-#include "core/symmetry.h"
+#include "symmetry/symmetry.h"
 #include <iostream>
 #include <iomanip>
 #include <string>
