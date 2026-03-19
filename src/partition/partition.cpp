@@ -123,32 +123,32 @@ void Partition::rebuild_group_dag() {
         }
     }
 
-    // Step 2: Build group DAG edges from boundary information.
-    // For each boundary input tensor T of group i, find alive groups that
-    // export T as boundary output. Pick the ONE source with the EARLIEST
-    // op-based topo position. This guarantees:
-    // - OR-semantics: only one edge per dependency (no AND-cycles)
-    // - Consistency: source always precedes consumer in the op-based order
-    //   (which is guaranteed cycle-free)
+    // Step 2: Build group DAG edges at the OP level (matching is_acyclic).
+    // For each group i, for each op's input tensor T, if T's producer is
+    // external to i, find the source group with earliest topo_pos and draw edge.
+    // This avoids the force_ephemeral problem: boundary_outputs may hide
+    // tensors, but op_to_groups_ always knows who has the producer.
     for (size_t i = 0; i < ng; i++) {
-        if (!groups[i].alive || !groups[i].sg) continue;
-        for (auto t : groups[i].sg->boundary_inputs()) {
-            int prod_op = dag->tensor_producer[t];
-            if (prod_op < 0) continue;
-            size_t best_gj = SIZE_MAX;
-            int best_pos = INT_MAX;
-            for (auto gj : op_to_groups_[(size_t)prod_op]) {
-                if (!groups[gj].alive || gj == i) continue;
-                if (!groups[gj].sg || !groups[gj].sg->boundary_outputs().count(t))
-                    continue;
-                if (topo_pos[gj] >= 0 && topo_pos[gj] < best_pos) {
-                    best_pos = topo_pos[gj];
-                    best_gj = gj;
+        if (!groups[i].alive) continue;
+        for (auto op : groups[i].ops) {
+            for (auto t : prob->ops[op].inputs) {
+                int prod = dag->tensor_producer[t];
+                if (prod < 0) continue;
+                if (groups[i].ops.count((size_t)prod)) continue;  // internal
+
+                size_t best_gj = SIZE_MAX;
+                int best_pos = INT_MAX;
+                for (auto gj : op_to_groups_[(size_t)prod]) {
+                    if (!groups[gj].alive || gj == i) continue;
+                    if (topo_pos[gj] >= 0 && topo_pos[gj] < best_pos) {
+                        best_gj = gj;
+                        best_pos = topo_pos[gj];
+                    }
                 }
-            }
-            if (best_gj != SIZE_MAX) {
-                if (group_preds[i].insert(best_gj).second)
-                    group_succs[best_gj].insert(i);
+                if (best_gj != SIZE_MAX) {
+                    if (group_preds[i].insert(best_gj).second)
+                        group_succs[best_gj].insert(i);
+                }
             }
         }
     }
@@ -499,30 +499,21 @@ std::set<size_t> Partition::compute_force_ephemeral(size_t gi) const {
 
     for (auto op : groups[gi].ops) {
         for (auto t : prob->ops[op].outputs) {
-            // Only consider tensors produced AND consumed inside this group
             bool consumed_internally = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (groups[gi].ops.count(cop)) { consumed_internally = true; break; }
             if (!consumed_internally) continue;
 
-            // Skip if already all-internal (no external consumers)
             bool has_external = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (!groups[gi].ops.count(cop)) { has_external = true; break; }
             if (!has_external) continue;
 
-            // T has external consumers. Check if EVERY alive group that
-            // contains a consumer of T also contains the producer.
-            // If ANY group has the consumer but NOT the producer, that group
-            // needs T from slow memory — we cannot force-ephemeralize it.
             int prod = dag->tensor_producer[t];
             if (prod < 0) continue;
 
             bool has_stranded = false;
             for (auto cop : dag->tensor_consumers[t]) {
-                // Check ALL groups containing this consumer (not just external ones).
-                // A consumer cop can be in gi AND in gj. If gj lacks the producer,
-                // T is stranded in gj — we cannot force-ephemeralize it.
                 for (auto gj : groups_of(cop)) {
                     if (gj == gi || !groups[gj].alive) continue;
                     if (!groups[gj].ops.count((size_t)prod)) {
