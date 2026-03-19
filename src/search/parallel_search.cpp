@@ -372,6 +372,14 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
         if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size, mhp);
 
+    if (pool.empty()) {
+        // Absolute last resort — should never happen since trivial init always works
+        auto fallback = Partition::trivial(prob, dag);
+        fallback.cache = &shared_cache;
+        pool_insert(pool, PoolEntry(std::move(fallback), fallback.total_cost(), "trivial"),
+                    cfg.pool_size, mhp);
+    }
+
     pool_sort(pool);
 
     std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";

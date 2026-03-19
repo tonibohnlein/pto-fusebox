@@ -271,46 +271,42 @@ FMMove best_move_for(const Partition& part, size_t op,
                                                  consumer_ops_vec.end());
                     if (prod >= 0) extract_ops.insert((size_t)prod);
 
-                    if (!part.is_acyclic_after_extract(extract_ops, group_list))
-                        goto skip_extract;
+                    if (part.is_acyclic_after_extract(extract_ops, group_list)) {
+                        double old_cost = 0;
+                        double remainder_cost = 0;
+                        bool feasible = true;
 
-                    {
-                    double old_cost = 0;
-                    double remainder_cost = 0;
-                    bool feasible = true;
-
-                    for (auto cg : group_list) {
-                        old_cost += part.groups[cg].cost;
-                        std::set<size_t> remainder;
-                        for (auto rop : part.groups[cg].ops)
-                            if (!extract_ops.count(rop))
-                                remainder.insert(rop);
-                        if (!remainder.empty()) {
-                            double rc = part.eval_set(remainder);
-                            if (rc >= 1e17) { feasible = false; break; }
-                            remainder_cost += rc;
+                        for (auto cg : group_list) {
+                            old_cost += part.groups[cg].cost;
+                            std::set<size_t> remainder;
+                            for (auto rop : part.groups[cg].ops)
+                                if (!extract_ops.count(rop))
+                                    remainder.insert(rop);
+                            if (!remainder.empty()) {
+                                double rc = part.eval_set(remainder);
+                                if (rc >= 1e17) { feasible = false; break; }
+                                remainder_cost += rc;
+                            }
                         }
-                    }
 
-                    if (feasible) {
-                        double extract_cost = part.eval_set(extract_ops);
-                        if (extract_cost < 1e17) {
-                            double saving = old_cost - (extract_cost + remainder_cost);
-                            if (accept(saving)) {
-                                FMMove candidate;
-                                candidate.type = FMMove::TENSOR_EXTRACT;
-                                candidate.op = op;
-                                candidate.op2 = t;
-                                candidate.saving = saving;
-                                candidate.tensor_groups = group_list;
-                                candidate.tensor_consumer_ops.assign(
-                                    extract_ops.begin(), extract_ops.end());
-                                if (candidate.saving > best.saving) best = candidate;
+                        if (feasible) {
+                            double extract_cost = part.eval_set(extract_ops);
+                            if (extract_cost < 1e17) {
+                                double saving = old_cost - (extract_cost + remainder_cost);
+                                if (accept(saving)) {
+                                    FMMove candidate;
+                                    candidate.type = FMMove::TENSOR_EXTRACT;
+                                    candidate.op = op;
+                                    candidate.op2 = t;
+                                    candidate.saving = saving;
+                                    candidate.tensor_groups = group_list;
+                                    candidate.tensor_consumer_ops.assign(
+                                        extract_ops.begin(), extract_ops.end());
+                                    if (candidate.saving > best.saving) best = candidate;
+                                }
                             }
                         }
                     }
-                    }
-                    skip_extract:;
                 }
             }
         }
