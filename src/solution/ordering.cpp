@@ -10,19 +10,31 @@
 
 OrderingResult dfs_ordering(const Partition& part) {
     const Problem& prob = *part.prob;
+    const DAG& dag = *part.dag;
     size_t ng = part.groups.size();
 
     std::vector<bool> scheduled(ng, false);
     for (size_t i = 0; i < ng; i++)
         if (!part.groups[i].alive) scheduled[i] = true;
 
-    // 1. Initialize the ready queue STRICTLY using the DAG's in_deg
-    std::vector<int> in_deg = part.group_in_deg;
-    std::vector<size_t> ready;
-    for (size_t i = 0; i < ng; i++)
-        if (part.groups[i].alive && in_deg[i] == 0) ready.push_back(i);
+    // Track physical tensors in DRAM
+    std::set<size_t> available(dag.graph_inputs.begin(), dag.graph_inputs.end());
 
-    // Score function: prefer groups that share tensors with the previous step
+    // A group is physically ready if ALL its boundary inputs are in DRAM
+    auto is_ready = [&](size_t gi) -> bool {
+        if (!part.groups[gi].sg) return true;
+        for (auto t : part.groups[gi].sg->boundary_inputs()) {
+            if (!available.count(t)) return false;
+        }
+        return true;
+    };
+
+    std::set<size_t> ready;
+    for (size_t i = 0; i < ng; i++) {
+        if (part.groups[i].alive && !scheduled[i] && is_ready(i))
+            ready.insert(i);
+    }
+
     auto retain_score = [&](size_t cand, size_t prev) -> int64_t {
         if (prev >= ng || !part.groups[prev].sg || !part.groups[cand].sg) return 0;
         const auto& prev_sg = *part.groups[prev].sg;
@@ -45,67 +57,57 @@ OrderingResult dfs_ordering(const Partition& part) {
         return s;
     };
 
-    std::vector<size_t> order;
-    order.reserve(part.num_alive());
+    OrderingResult result;
     size_t prev = SIZE_MAX;
     std::mt19937 rng(42);
 
-    // 2. Pure Topological Sort
     while (!ready.empty()) {
-        size_t best_idx = 0;
+        size_t chosen    = SIZE_MAX;
         int64_t best_sc  = -1;
         int64_t best_inp = -1;
 
-        // Pick ready group that maximises retain score with prev
-        for (size_t i = 0; i < ready.size(); i++) {
-            size_t cand = ready[i];
-            int64_t sc  = retain_score(cand, prev);
-            int64_t inp = input_size(cand);
+        for (auto gi : ready) {
+            int64_t sc  = retain_score(gi, prev);
+            int64_t inp = input_size(gi);
             if (sc > best_sc || (sc == best_sc && inp > best_inp) || 
                 (sc == best_sc && inp == best_inp && (rng() % 2))) {
-                best_idx = i;
-                best_sc = sc;
-                best_inp = inp;
+                chosen = gi; best_sc = sc; best_inp = inp;
             }
         }
 
-        size_t chosen = ready[best_idx];
-        
-        // Fast removal from ready queue
-        ready[best_idx] = ready.back();
-        ready.pop_back();
-
-        order.push_back(chosen);
+        ready.erase(chosen);
+        result.order.push_back(chosen);
         scheduled[chosen] = true;
         prev = chosen;
 
-        // 3. Unlock successors natively using the fixed DAG
-        for (auto v : part.group_succs[chosen]) {
-            if (part.groups[v].alive) {
-                in_deg[v]--;
-                if (in_deg[v] == 0) ready.push_back(v);
+        // When scheduled, this group physically writes its boundary outputs to DRAM
+        if (part.groups[chosen].sg) {
+            for (auto t : part.groups[chosen].sg->boundary_outputs()) {
+                available.insert(t);
+            }
+        }
+
+        // Check if any blocked groups are now physically ready
+        for (size_t i = 0; i < ng; i++) {
+            if (!scheduled[i] && !ready.count(i) && part.groups[i].alive && is_ready(i)) {
+                ready.insert(i);
             }
         }
     }
 
-    // Fallback safety (Should never trigger with the new partition.cpp)
     for (size_t i = 0; i < ng; i++) {
         if (part.groups[i].alive && !scheduled[i]) {
             std::cerr << "WARNING: dfs_ordering: group " << i << " stuck, force-adding\n";
-            order.push_back(i);
+            result.order.push_back(i);
             scheduled[i] = true;
         }
     }
 
-    OrderingResult result;
-    result.order = order;
-
-    // 4. Build retain_per_step
-    size_t n_steps = order.size();
+    size_t n_steps = result.order.size();
     result.retain_per_step.resize(n_steps);
     for (size_t i = 0; i + 1 < n_steps; i++) {
-        size_t ga = order[i];
-        size_t gb = order[i + 1];
+        size_t ga = result.order[i];
+        size_t gb = result.order[i + 1];
         if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
         const auto& out_a = part.groups[ga].sg->boundary_outputs();
         const auto& in_b  = part.groups[gb].sg->boundary_inputs();
@@ -123,19 +125,21 @@ OrderingResult dfs_ordering(const Partition& part) {
 
 OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
     const Problem& prob = *part.prob;
+    const DAG& dag = *part.dag;
     size_t ng      = part.groups.size();
     size_t n_alive = part.num_alive();
 
     struct State {
         std::vector<size_t>           order;
-        std::vector<int>              in_deg;           // Pure DAG tracking
-        std::set<size_t>              resident;         // tensors in fast memory
+        std::set<size_t>              available;        
+        std::set<size_t>              resident;         
         std::vector<std::set<size_t>> retain_per_step;
         double                        total_latency = 0;
     };
 
     State init;
-    init.in_deg = part.group_in_deg;
+    init.available.insert(dag.graph_inputs.begin(), dag.graph_inputs.end());
+
     std::vector<State> beam = {init};
 
     for (size_t step = 0; step < n_alive; step++) {
@@ -149,15 +153,19 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
 
             std::vector<size_t> ready;
             for (size_t i = 0; i < ng; i++) {
-                if (!scheduled[i] && part.groups[i].alive && state.in_deg[i] == 0) {
-                    ready.push_back(i);
+                if (scheduled[i] || !part.groups[i].alive) continue;
+                bool rdy = true;
+                if (part.groups[i].sg) {
+                    for (auto t : part.groups[i].sg->boundary_inputs()) {
+                        if (!state.available.count(t)) { rdy = false; break; }
+                    }
                 }
+                if (rdy) ready.push_back(i);
             }
 
             for (auto gi : ready) {
                 if (!part.groups[gi].sg) continue;
                 const Subgraph& sg = *part.groups[gi].sg;
-
                 scheduled[gi] = true;
 
                 std::set<size_t> useful_resident;
@@ -181,8 +189,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 for (auto t : useful_resident)
                     if (sg.boundary_inputs().count(t)) only_used.insert(t);
 
-                auto try_option = [&](const std::set<size_t>& res_in,
-                                      const std::set<size_t>& ret_out) {
+                auto try_option = [&](const std::set<size_t>& res_in, const std::set<size_t>& ret_out) {
                     auto c = sg.best_cost(res_in, ret_out);
                     if (c.feasible && c.latency < best.latency) {
                         best             = c;
@@ -198,22 +205,18 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                     try_option(useful_resident, retainable_out);
                 }
 
-                // Build next state utilizing the DAG
                 State next;
                 next.order = state.order;
                 next.order.push_back(gi);
-                
-                next.in_deg = state.in_deg;
-                for (auto v : part.group_succs[gi]) {
-                    if (part.groups[v].alive) next.in_deg[v]--;
+                next.available = state.available;
+                for (auto t : sg.boundary_outputs()) {
+                    next.available.insert(t);
                 }
-
                 next.total_latency = state.total_latency + best.latency;
 
                 std::set<size_t> exportable;
                 for (auto t : best_retain_these)
-                    if (sg.boundary_outputs().count(t))
-                        exportable.insert(t);
+                    if (sg.boundary_outputs().count(t)) exportable.insert(t);
 
                 next.resident = exportable;
                 next.retain_per_step = state.retain_per_step;
@@ -227,9 +230,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
         if (candidates.empty()) break;
 
         std::sort(candidates.begin(), candidates.end(),
-                  [](const State& a, const State& b) {
-                      return a.total_latency < b.total_latency;
-                  });
+                  [](const State& a, const State& b) { return a.total_latency < b.total_latency; });
         if ((int)candidates.size() > beam_width)
             candidates.resize(beam_width);
         beam = std::move(candidates);
@@ -252,6 +253,8 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
 OrderingResult random_ordering(const Partition& part,
                                const std::set<size_t>& feasibly_ret,
                                std::mt19937& rng) {
+    const Problem& prob = *part.prob;
+    const DAG& dag = *part.dag;
     size_t ng      = part.groups.size();
     size_t n_alive = part.num_alive();
 
@@ -279,25 +282,34 @@ OrderingResult random_ordering(const Partition& part,
     for (auto& rc : cands)
         wants_from[rc.cons_group].push_back({rc.prod_group, rc.tensor});
 
-    // Pure DAG Topological Sort
-    std::vector<int> in_deg = part.group_in_deg;
     std::vector<bool> scheduled(ng, false);
     for (size_t i = 0; i < ng; i++)
         if (!part.groups[i].alive) scheduled[i] = true;
 
-    std::vector<size_t> ready;
+    std::set<size_t> available(dag.graph_inputs.begin(), dag.graph_inputs.end());
+
+    auto is_ready = [&](size_t gi) -> bool {
+        if (!part.groups[gi].sg) return true;
+        for (auto t : part.groups[gi].sg->boundary_inputs()) {
+            if (!available.count(t)) return false;
+        }
+        return true;
+    };
+
+    std::set<size_t> ready;
     for (size_t i = 0; i < ng; i++)
-        if (part.groups[i].alive && in_deg[i] == 0) ready.push_back(i);
+        if (part.groups[i].alive && !scheduled[i] && is_ready(i))
+            ready.insert(i);
 
     std::vector<size_t> order;
     order.reserve(n_alive);
     size_t last = SIZE_MAX;
 
     while (!ready.empty()) {
-        size_t best_idx = 0;
+        size_t chosen = SIZE_MAX;
         int best_score = -1;
-        for (size_t i = 0; i < ready.size(); i++) {
-            size_t gi = ready[i];
+        
+        for (auto gi : ready) {
             int score = 0;
             if (last != SIZE_MAX) {
                 auto it = wants_from.find(gi);
@@ -307,22 +319,24 @@ OrderingResult random_ordering(const Partition& part,
             }
             if (score > best_score || (score == best_score && rng() % 2)) {
                 best_score = score;
-                best_idx = i;
+                chosen = gi;
             }
         }
 
-        size_t best_gi = ready[best_idx];
-        ready[best_idx] = ready.back();
-        ready.pop_back();
+        ready.erase(chosen);
+        order.push_back(chosen);
+        scheduled[chosen] = true;
+        last = chosen;
 
-        order.push_back(best_gi);
-        scheduled[best_gi] = true;
-        last = best_gi;
+        if (part.groups[chosen].sg) {
+            for (auto t : part.groups[chosen].sg->boundary_outputs()) {
+                available.insert(t);
+            }
+        }
 
-        for (auto v : part.group_succs[best_gi]) {
-            if (part.groups[v].alive) {
-                in_deg[v]--;
-                if (in_deg[v] == 0) ready.push_back(v);
+        for (size_t i = 0; i < ng; i++) {
+            if (!scheduled[i] && !ready.count(i) && part.groups[i].alive && is_ready(i)) {
+                ready.insert(i);
             }
         }
     }
