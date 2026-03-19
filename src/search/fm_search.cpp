@@ -27,17 +27,6 @@ static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
     return b_to_a;
 }
 
-// Fast check: does op have any DAG predecessor or successor OUTSIDE group ga?
-// If not, ejecting op creates a singleton with no cross-group edges,
-// so inter-group cycles are impossible — creates_topo_cycle suffices.
-static bool has_external_deps(size_t op, size_t ga, const Partition& part) {
-    for (auto p : part.dag->op_preds[op])
-        if (!part.groups[ga].ops.count(p)) return true;
-    for (auto s : part.dag->op_succs[op])
-        if (!part.groups[ga].ops.count(s)) return true;
-    return false;
-}
-
 // Check if removing op from group_ops would create topological straddling:
 // op has both predecessors AND successors in the remainder. If so, the
 // remainder must execute both before AND after the removed op → group-DAG cycle.
@@ -100,6 +89,9 @@ FMMove best_move_for(const Partition& part, size_t op,
     }
 
     // --- Border moves: MERGE, STEAL, RECOMPUTE, EJECT ---
+    // Acyclicity is verified at apply time (is_acyclic_after_* in apply_fm_move).
+    // Here we only use cheap O(degree) or O(ops/64) pre-filters to avoid
+    // evaluating obviously infeasible moves.
     for (auto gx : groups_of_x) {
         if (!part.is_border_op(op, gx)) continue;
 
@@ -112,8 +104,9 @@ FMMove best_move_for(const Partition& part, size_t op,
         for (auto gy : neighbor_groups) {
             bool x_in_gy = part.groups[gy].ops.count(op);
 
-            // MERGE: use hypothetical acyclicity check
-            if (part.is_acyclic_after_merge(gx, gy)) {
+            // MERGE: cheap bitwise reachability pre-filter
+            if (!part.dag->merge_creates_cycle(part.groups[gx].ops,
+                                                part.groups[gy].ops)) {
                 std::set<size_t> merged = part.groups[gx].ops;
                 merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
                 double merged_cost = part.eval_set(merged);
@@ -124,15 +117,15 @@ FMMove best_move_for(const Partition& part, size_t op,
                 }
             }
 
-            // STEAL + RECOMPUTE
+            // STEAL + RECOMPUTE: no cheap pre-filter needed, defer to apply
             if (!x_in_gy) {
                 std::set<size_t> new_gy = part.groups[gy].ops;
                 new_gy.insert(op);
                 double new_gy_cost = part.eval_set(new_gy);
 
                 if (new_gy_cost < 1e17) {
-                    // STEAL: use hypothetical acyclicity check
-                    if (part.is_acyclic_after_steal(op, gx, gy)) {
+                    // STEAL
+                    {
                         std::set<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
                         double new_gx_cost = 0;
@@ -151,8 +144,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                         }
                     }
 
-                    // RECOMPUTE: use hypothetical acyclicity check
-                    if (part.is_acyclic_after_recompute(op, gy)) {
+                    // RECOMPUTE
+                    {
                         double saving = part.groups[gy].cost - new_gy_cost;
                         if (accept(saving))
                             best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
@@ -161,16 +154,11 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
         }
 
-        // EJECT: cheap filter first, eval second, expensive Kahn's last.
+        // EJECT: cheap O(degree) pre-filters only
         if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
             auto er = part.eval_eject(op, gx);
-            if (er.feasible && accept(er.saving)) {
-                // Only run expensive Kahn's if the move is actually improving
-                bool acyclic = !has_external_deps(op, gx, part)
-                             || part.is_acyclic_after_eject(op, gx);
-                if (acyclic)
-                    best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
-            }
+            if (er.feasible && accept(er.saving))
+                best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
         }
     }
 
@@ -179,35 +167,27 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.is_border_op(op, gx)) continue;
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
-        {
-            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
-                auto er = part.eval_eject(op, gx);
-                if (er.feasible && accept(er.saving)) {
-                    bool acyclic = !has_external_deps(op, gx, part)
-                                 || part.is_acyclic_after_eject(op, gx);
-                    if (acyclic) {
-                        FMMove candidate;
-                        candidate.type = FMMove::INTERNAL_EJECT;
-                        candidate.op = op; candidate.ga = gx;
-                        candidate.saving = er.saving;
-                        if (candidate.saving > best.saving) best = candidate;
-                    }
-                }
+        // INTERNAL_EJECT: cheap pre-filter only
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+            auto er = part.eval_eject(op, gx);
+            if (er.feasible && accept(er.saving)) {
+                FMMove candidate;
+                candidate.type = FMMove::INTERNAL_EJECT;
+                candidate.op = op; candidate.ga = gx;
+                candidate.saving = er.saving;
+                if (candidate.saving > best.saving) best = candidate;
             }
         }
 
-        {
+        // SPLIT: cheap O(|side|) pre-filter only
+        for (auto v : part.dag->op_neighbors[op]) {
+            if (!part.groups[gx].ops.count(v)) continue;
+            auto edge = std::make_pair(std::min(op, v), std::max(op, v));
 
-            for (auto v : part.dag->op_neighbors[op]) {
-                if (!part.groups[gx].ops.count(v)) continue;
-                auto edge = std::make_pair(std::min(op, v), std::max(op, v));
-
-                auto sr = part.eval_split(edge.first, edge.second, gx);
-                if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                    if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag)
-                        && part.is_acyclic_after_split(sr.side_b, gx))
-                        best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
-                }
+            auto sr = part.eval_split(edge.first, edge.second, gx);
+            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
+                if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
+                    best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
             }
         }
     }
@@ -530,6 +510,10 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
                     if (gj != m.ga && part.groups[gj].alive) { in_other = true; break; }
                 if (!in_other) return {};
             }
+            // Acyclicity check: removing a recompute group can break a dependency
+            // chain. E.g., group {13} bridges {14}→{13,15} — killing {13} makes
+            // {14} depend on {13,15} which depends back on {14}.
+            if (!part.is_acyclic_without_group(m.ga)) return {};
             auto adj = part.adjacent_groups(m.ga);
             part.groups[m.ga].alive = false;
             part.groups[m.ga].gen++;

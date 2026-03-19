@@ -363,10 +363,19 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             part = greedy_descent(std::move(part));
             double greedy_cost = part.total_cost();
 
-            // Save greedy result as fallback (always acyclic — greedy_descent
-            // uses is_acyclic_after_* for all moves).
-            gen0_greedy_results[tid] = {Partition(part), greedy_cost,
-                                         "greedy+" + strategies[task.strategy_idx].name};
+            // Save greedy result as fallback.
+            // NOTE: init strategies can create cyclic partitions (e.g., seed+grow
+            // may group ops that straddle an external dependency). greedy_descent
+            // prevents creating NEW cycles but doesn't fix existing ones.
+            // Check acyclicity before accepting.
+            {
+                Partition greedy_copy(part);
+                greedy_copy.rebuild_index();
+                if (greedy_copy.is_acyclic()) {
+                    gen0_greedy_results[tid] = {std::move(greedy_copy), greedy_cost,
+                                                 "greedy+" + strategies[task.strategy_idx].name};
+                }
+            }
 
             FMOuterConfig fc = gen0_fm;
             fc.pass_config.seed = task.seed;

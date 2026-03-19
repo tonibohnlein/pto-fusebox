@@ -332,6 +332,21 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
     
     auto er = part.eval_eject(op, gi);
     if (!er.feasible) return part;
+
+    // Acyclicity check: ejecting an op with both preds and succs in the
+    // remainder creates a cycle. Also check inter-group cycles via Kahn's.
+    {
+        bool has_pred = false, has_succ = false;
+        for (auto p : part.dag->op_preds[op])
+            if (p != op && part.groups[gi].ops.count(p)) { has_pred = true; break; }
+        for (auto s : part.dag->op_succs[op])
+            if (s != op && part.groups[gi].ops.count(s)) { has_succ = true; break; }
+        if (has_pred && has_succ) return part;  // straddling → cycle
+        if (has_pred || has_succ) {
+            // Has external deps — check full partition acyclicity
+            if (!part.is_acyclic_after_eject(op, gi)) return part;
+        }
+    }
     
     // Apply: replace group with components + singleton
     Partition saved = part;
@@ -430,10 +445,10 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         extract_ops.insert(cop);
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
-    
-    // Note: no merge_creates_cycle check here — extract_ops and remainders are
-    // separate groups, not being merged. Acyclicity is validated at the end
-    // via partition_has_gap (which calls is_acyclic).
+
+    // Acyclicity check before mutation
+    if (!part.is_acyclic_after_extract(extract_ops, group_list)) return part;
+
     double extract_cost = part.eval_set(extract_ops);
     if (extract_cost >= 1e17) return part;
     
@@ -511,6 +526,8 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
             if (!in_other) { still_redundant = false; break; }
         }
         if (still_redundant) {
+            // Check that removing this group doesn't create a cycle
+            if (!part.is_acyclic_without_group(gi)) continue;
             part.groups[gi].alive = false;
             part.groups[gi].gen++;
             any_removed = true;

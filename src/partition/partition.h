@@ -149,6 +149,10 @@ struct Partition {
     bool is_acyclic_after_extract(const std::set<size_t>& extract_ops,
                                    const std::vector<size_t>& source_groups) const;
 
+    // After DE_RECOMPUTE: group ga is killed (all its ops are covered elsewhere).
+    // Check that removing ga doesn't break a dependency chain.
+    bool is_acyclic_without_group(size_t ga) const;
+
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;

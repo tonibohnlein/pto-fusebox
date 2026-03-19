@@ -711,6 +711,18 @@ bool Partition::is_acyclic_after_extract(const std::set<size_t>& extract_ops,
     return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
+bool Partition::is_acyclic_without_group(size_t ga) const {
+    if (!prob || !dag) return true;
+
+    std::vector<bool> alive(groups.size(), false);
+    size_t na = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive && i != ga) { alive[i] = true; na++; }
+
+    MoveDelta delta;  // NONE — just check with ga dead
+    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+}
+
 double Partition::eval_set(const std::set<size_t>& ops) const {
     if (ops.empty()) return 1e18;
     if (cache) return cache->evaluate(ops, *prob, *dag);

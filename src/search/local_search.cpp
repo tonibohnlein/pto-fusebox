@@ -25,15 +25,6 @@ static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
     return has_succ;
 }
 
-// Fast check: does op have any DAG predecessor or successor OUTSIDE group ga?
-static bool has_external_deps(size_t op, size_t ga, const Partition& part) {
-    for (auto p : part.dag->op_preds[op])
-        if (!part.groups[ga].ops.count(p)) return true;
-    for (auto s : part.dag->op_succs[op])
-        if (!part.groups[ga].ops.count(s)) return true;
-    return false;
-}
-
 static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
                                       const std::set<size_t>& side_b,
                                       const DAG& dag) {
@@ -194,6 +185,10 @@ static std::set<size_t> apply_move(Partition& part, const Move& m) {
                     if (gj != m.ga && part.groups[gj].alive) { in_other = true; break; }
                 if (!in_other) return {};
             }
+            // Acyclicity check: removing a recompute group can break a
+            // dependency chain (e.g., bridging singleton between two groups
+            // that have a mutual data dependency through the bridging op).
+            if (!part.is_acyclic_without_group(m.ga)) return {};
 
             dirty = part.adjacent_groups(m.ga);
             dirty.erase(m.ga);
@@ -236,16 +231,13 @@ static Move best_move_for_op(const Partition& part, size_t op) {
     }
 
     // --- EJECT / INTERNAL_EJECT: remove op from a multi-op group ---
+    // Acyclicity verified at apply time. Cheap O(degree) pre-filter here.
     for (auto gi : groups_of_op) {
         if (!part.groups[gi].alive || part.groups[gi].ops.size() < 2) continue;
         if (creates_topo_cycle(op, part.groups[gi].ops, dag)) continue;
         auto er = part.eval_eject(op, gi);
         if (!er.feasible) continue;
-        if (er.saving <= best.saving) continue;  // not improving — skip Kahn's
-
-        bool acyclic = !has_external_deps(op, gi, part)
-                     || part.is_acyclic_after_eject(op, gi);
-        if (!acyclic) continue;
+        if (er.saving <= best.saving) continue;
 
         bool is_border = false;
         for (auto nbr : dag.op_neighbors[op])
@@ -256,6 +248,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
     }
 
     // --- SPLIT: split op's group at edge incident to op ---
+    // Acyclicity verified at apply time. Cheap O(|side|) pre-filter here.
     for (auto gi : groups_of_op) {
         if (!part.groups[gi].alive) continue;
         if (part.groups[gi].ops.size() < 3 || part.groups[gi].ops.size() > 15) continue;
@@ -264,9 +257,8 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             size_t u_lo = std::min(op, v), u_hi = std::max(op, v);
             auto sr = part.eval_split(u_lo, u_hi, gi);
             if (!sr.feasible) continue;
-            if (sr.saving <= best.saving) continue;  // not improving — skip Kahn's
+            if (sr.saving <= best.saving) continue;
             if (split_creates_topo_cycle(sr.side_a, sr.side_b, dag)) continue;
-            if (!part.is_acyclic_after_split(sr.side_b, gi)) continue;
             best.type = Move::SPLIT; best.ga = gi; best.gb = 0;
             best.op = u_lo; best.op2 = u_hi;
             best.saving = sr.saving; best.gen_a = 0; best.gen_b = 0;
@@ -274,6 +266,7 @@ static Move best_move_for_op(const Partition& part, size_t op) {
     }
 
     // --- STEAL / RECOMPUTE / MERGE: op pulled into adjacent group ---
+    // Acyclicity verified at apply time. Cheap merge_creates_cycle for MERGE.
     std::set<size_t> adj_groups;
     for (auto nbr : dag.op_neighbors[op])
         for (auto gi : part.groups_of(nbr))
@@ -290,8 +283,8 @@ static Move best_move_for_op(const Partition& part, size_t op) {
         for (auto gj : groups_of_op) {
             if (gj == gi || !part.groups[gj].alive) continue;
 
-            // STEAL: move op from gj into gi
-            if (part.is_acyclic_after_steal(op, gj, gi)) {
+            // STEAL: move op from gj into gi (defer Kahn's to apply)
+            {
                 std::set<size_t> new_gj = part.groups[gj].ops;
                 new_gj.erase(op);
                 double new_gj_cost = new_gj.empty() ? 0 : part.eval_set(new_gj);
@@ -303,11 +296,11 @@ static Move best_move_for_op(const Partition& part, size_t op) {
                 }
             }
 
-            // MERGE: merge gi with gj (once per pair)
+            // MERGE: merge gi with gj (cheap bitwise pre-filter)
             auto pair_key = std::make_pair(std::min(gi, gj), std::max(gi, gj));
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
-                if (part.is_acyclic_after_merge(gi, gj)) {
+                if (!dag.merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
                     std::set<size_t> merged = part.groups[gi].ops;
                     merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                     double mc = part.eval_set(merged);
@@ -318,8 +311,8 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             }
         }
 
-        // RECOMPUTE: copy op into gi
-        if (part.is_acyclic_after_recompute(op, gi)) {
+        // RECOMPUTE: copy op into gi (defer Kahn's to apply)
+        {
             double rsaving = part.groups[gi].cost - new_gi_cost;
             size_t gb = groups_of_op.empty() ? 0 : groups_of_op[0];
             if (rsaving > best.saving)

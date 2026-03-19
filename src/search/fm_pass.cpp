@@ -105,13 +105,12 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
                         extra_locks.push_back(cop);
         }
 
-        // Apply the move — snapshot needed because apply_fm_move mutates
-        // partition before potentially detecting infeasibility.
-        Partition snapshot = part;
+        // Apply the move. All validation (acyclicity, cost feasibility)
+        // happens inside apply_fm_move BEFORE any mutation. If validation
+        // fails, it returns {} without side effects — no snapshot needed.
         double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
-            part = std::move(snapshot);
             continue;
         }
 
