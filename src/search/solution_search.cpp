@@ -962,19 +962,21 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
 
   // RETAIN_REORDER: move a consumer step adjacent to a producer step so
   // tensor T can be retained across the boundary.
-  {
+  // Only worthwhile for tensors large enough that the IO saving matters.
+  if (prob.tensors[t].size() > prob.fast_memory_capacity / 16) {
     const auto &dag = *state.dag;
-    const auto &prob = *state.prob;
 
-    for (size_t pi = 0; pi < state.size(); pi++) {
-      if (!state.steps[pi].subgraph.boundary_outputs().count(t)) continue;
+    // Find the single producer step
+    int prod_op = dag.tensor_producer[t];
+    size_t pi = (prod_op >= 0) ? state.step_of((size_t)prod_op) : SIZE_MAX;
+    if (pi != SIZE_MAX && pi < state.size() &&
+        state.steps[pi].subgraph.boundary_outputs().count(t) &&
+        !state.steps[pi].retain_these.count(t)) {
 
-      // Look for consumer steps ci > pi + 1 (adjacent handled by RETAIN_ADD)
-      size_t max_ci = std::min(pi + 8, state.size());
+      size_t max_ci = std::min(pi + 5, state.size());
       for (size_t ci = pi + 2; ci < max_ci; ci++) {
         if (!state.steps[ci].subgraph.boundary_inputs().count(t)) continue;
 
-        // Can ci move to pi+1? All ops in ci must have DAG preds in steps 0..pi
         bool can_move = true;
         for (auto op : state.steps[ci].subgraph.ops()) {
           for (auto pred : dag.op_preds[op]) {
@@ -986,8 +988,6 @@ static SolutionMove best_move_for_tensor(SolState &state, size_t t,
         }
         if (!can_move) continue;
 
-        // Build reordered sequence for range [pi, ci]:
-        // [step_pi + retain T, step_ci, step_{pi+1}, ..., step_{ci-1}]
         std::vector<ScheduleStep> new_steps;
         ScheduleStep step_pi = state.steps[pi];
         step_pi.retain_these.insert(t);

@@ -25,6 +25,15 @@ static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
     return has_succ;
 }
 
+// Fast check: does op have any DAG predecessor or successor OUTSIDE group ga?
+static bool has_external_deps(size_t op, size_t ga, const Partition& part) {
+    for (auto p : part.dag->op_preds[op])
+        if (!part.groups[ga].ops.count(p)) return true;
+    for (auto s : part.dag->op_succs[op])
+        if (!part.groups[ga].ops.count(s)) return true;
+    return false;
+}
+
 static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
                                       const std::set<size_t>& side_b,
                                       const DAG& dag) {
@@ -230,17 +239,20 @@ static Move best_move_for_op(const Partition& part, size_t op) {
     for (auto gi : groups_of_op) {
         if (!part.groups[gi].alive || part.groups[gi].ops.size() < 2) continue;
         if (creates_topo_cycle(op, part.groups[gi].ops, dag)) continue;
-        if (!part.is_acyclic_after_eject(op, gi)) continue;
         auto er = part.eval_eject(op, gi);
         if (!er.feasible) continue;
+        if (er.saving <= best.saving) continue;  // not improving — skip Kahn's
+
+        bool acyclic = !has_external_deps(op, gi, part)
+                     || part.is_acyclic_after_eject(op, gi);
+        if (!acyclic) continue;
 
         bool is_border = false;
         for (auto nbr : dag.op_neighbors[op])
             if (!part.groups[gi].ops.count(nbr)) { is_border = true; break; }
 
         Move::Type mtype = is_border ? Move::EJECT : Move::INTERNAL_EJECT;
-        if (er.saving > best.saving)
-            best = {mtype, gi, 0, op, er.saving, 0, 0};
+        best = {mtype, gi, 0, op, er.saving, 0, 0};
     }
 
     // --- SPLIT: split op's group at edge incident to op ---
@@ -252,13 +264,12 @@ static Move best_move_for_op(const Partition& part, size_t op) {
             size_t u_lo = std::min(op, v), u_hi = std::max(op, v);
             auto sr = part.eval_split(u_lo, u_hi, gi);
             if (!sr.feasible) continue;
+            if (sr.saving <= best.saving) continue;  // not improving — skip Kahn's
             if (split_creates_topo_cycle(sr.side_a, sr.side_b, dag)) continue;
             if (!part.is_acyclic_after_split(sr.side_b, gi)) continue;
-            if (sr.saving > best.saving) {
-                best.type = Move::SPLIT; best.ga = gi; best.gb = 0;
-                best.op = u_lo; best.op2 = u_hi;
-                best.saving = sr.saving; best.gen_a = 0; best.gen_b = 0;
-            }
+            best.type = Move::SPLIT; best.ga = gi; best.gb = 0;
+            best.op = u_lo; best.op2 = u_hi;
+            best.saving = sr.saving; best.gen_a = 0; best.gen_b = 0;
         }
     }
 

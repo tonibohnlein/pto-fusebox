@@ -27,6 +27,17 @@ static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
     return b_to_a;
 }
 
+// Fast check: does op have any DAG predecessor or successor OUTSIDE group ga?
+// If not, ejecting op creates a singleton with no cross-group edges,
+// so inter-group cycles are impossible — creates_topo_cycle suffices.
+static bool has_external_deps(size_t op, size_t ga, const Partition& part) {
+    for (auto p : part.dag->op_preds[op])
+        if (!part.groups[ga].ops.count(p)) return true;
+    for (auto s : part.dag->op_succs[op])
+        if (!part.groups[ga].ops.count(s)) return true;
+    return false;
+}
+
 // Check if removing op from group_ops would create topological straddling:
 // op has both predecessors AND successors in the remainder. If so, the
 // remainder must execute both before AND after the removed op → group-DAG cycle.
@@ -150,14 +161,16 @@ FMMove best_move_for(const Partition& part, size_t op,
             }
         }
 
-        // EJECT: use hypothetical acyclicity check.
-        // creates_topo_cycle is a fast pre-filter (intra-group straddling),
-        // is_acyclic_after_eject catches inter-group cycles too.
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)
-            && part.is_acyclic_after_eject(op, gx)) {
+        // EJECT: cheap filter first, eval second, expensive Kahn's last.
+        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
             auto er = part.eval_eject(op, gx);
-            if (er.feasible && accept(er.saving))
-                best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+            if (er.feasible && accept(er.saving)) {
+                // Only run expensive Kahn's if the move is actually improving
+                bool acyclic = !has_external_deps(op, gx, part)
+                             || part.is_acyclic_after_eject(op, gx);
+                if (acyclic)
+                    best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
+            }
         }
     }
 
@@ -167,15 +180,18 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
         {
-            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)
-                && part.is_acyclic_after_eject(op, gx)) {
+            if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
                 auto er = part.eval_eject(op, gx);
                 if (er.feasible && accept(er.saving)) {
-                    FMMove candidate;
-                    candidate.type = FMMove::INTERNAL_EJECT;
-                    candidate.op = op; candidate.ga = gx;
-                    candidate.saving = er.saving;
-                    if (candidate.saving > best.saving) best = candidate;
+                    bool acyclic = !has_external_deps(op, gx, part)
+                                 || part.is_acyclic_after_eject(op, gx);
+                    if (acyclic) {
+                        FMMove candidate;
+                        candidate.type = FMMove::INTERNAL_EJECT;
+                        candidate.op = op; candidate.ga = gx;
+                        candidate.saving = er.saving;
+                        if (candidate.saving > best.saving) best = candidate;
+                    }
                 }
             }
         }
