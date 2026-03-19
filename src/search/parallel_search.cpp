@@ -1,11 +1,14 @@
 #include "search/parallel_search.h"
 #include "search/verbose.h"
 #include "init/init_strategies.h"
+#include "init/symm_init.h"
 #include "search/local_search.h"
 #include "search/fm_outer.h"
 #include "search/evolution.h"
 #include "core/cost_cache.h"
 #include "symmetry/merkle_hash.h"
+#include "symmetry/symmetry.h"
+#include "symmetry/series.h"
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -271,24 +274,34 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     for (int s = 0; s < num_strategies; s++)
         if (strategies[s].name == "random") { random_idx = s; break; }
 
-    struct Gen0Task { int strategy_idx; unsigned seed; };
+    struct Gen0Task { int strategy_idx; unsigned seed; bool is_symm = false; };
     std::vector<Gen0Task> gen0_task_list;
     for (int s = 0; s < num_strategies; s++)
         for (int t = 0; t < tasks_per_strategy; t++)
             gen0_task_list.push_back({s, (unsigned)(42 + s * 100 + t * 7)});
 
-    // Pad up to num_threads with random inits
+    // Pad up to num_threads with random inits, reserving the last slot for symm
     if (random_idx >= 0) {
         int extra = num_threads - (int)gen0_task_list.size();
-        for (int i = 0; i < extra; i++)
+        // Leave one slot for symm init
+        for (int i = 0; i < extra - 1; i++)
             gen0_task_list.push_back({random_idx,
                 (unsigned)(9999 + i * 31)});
     }
+    // Last task: symmetry-aware initialization
+    gen0_task_list.push_back({random_idx >= 0 ? random_idx : 0, 10061, true});
     gen0_tasks = (int)gen0_task_list.size();
 
     std::vector<PoolEntry> gen0_results(gen0_tasks);
     std::vector<PoolEntry> gen0_end_partitions(gen0_tasks);  // perturbed states for diversity
     std::vector<PoolEntry> gen0_greedy_results(gen0_tasks);  // pre-FM greedy results as fallback
+    std::vector<PoolEntry> gen0_symm_results;                // symm init results (variable count)
+    std::mutex symm_mutex;                                    // protects gen0_symm_results
+
+    // Discovered patterns — stored for export to caller
+    std::vector<SymmetricPattern> discovered_parallel;
+    std::vector<SeriesPattern> discovered_series;
+
     std::atomic<int> next_task{0};
 
     auto gen0_worker = [&]() {
@@ -298,6 +311,51 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             if (tid >= gen0_tasks) break;
             auto start = Clock::now();
             auto& task = gen0_task_list[tid];
+
+            // ============================================================
+            // Symmetry-aware initialization task
+            // ============================================================
+            if (task.is_symm) {
+                auto symm_parts = init_from_patterns(prob, dag, &shared_cache);
+
+                if (!symm_parts.empty()) {
+                    // Store discovered patterns for export
+                    {
+                        std::lock_guard<std::mutex> lock(symm_mutex);
+                        auto par_pats = SymmetryDetector::discover(prob, dag, mh, false);
+                        auto ser_pats = SeriesDetector::discover(prob, dag, mh, false);
+                        discovered_parallel = std::move(par_pats);
+                        discovered_series = std::move(ser_pats);
+
+                        for (size_t i = 0; i < symm_parts.size(); i++) {
+                            double cost = symm_parts[i].total_cost();
+                            std::string name = "symm_" + std::to_string(i);
+                            gen0_symm_results.push_back(
+                                PoolEntry(std::move(symm_parts[i]), cost, name));
+                        }
+                    }
+
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - start).count();
+                    {
+                        std::lock_guard<std::mutex> lock(log_mutex);
+                        std::cerr << "    gen0 [symm]: " << gen0_symm_results.size()
+                                  << " partitions in " << ms << "ms\n";
+                    }
+                    continue;
+                }
+
+                // No patterns found — fallback to random + greedy + FM
+                {
+                    std::lock_guard<std::mutex> lock(log_mutex);
+                    std::cerr << "    gen0 [symm]: no patterns, falling back to random\n";
+                }
+                // Fall through to standard path with random strategy
+            }
+
+            // ============================================================
+            // Standard initialization task
+            // ============================================================
 
             auto part = strategies[task.strategy_idx].init(prob, dag, &shared_cache);
             double init_cost = part.total_cost();
@@ -371,6 +429,16 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     for (auto& r : gen0_greedy_results)
         if (r.cost < 1e17)
             pool_insert(pool, std::move(r), cfg.pool_size, mhp);
+    // Symmetry-initialized partitions (already greedy-optimized, no FM needed)
+    for (auto& r : gen0_symm_results)
+        if (r.cost < 1e17)
+            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
+
+    // Export discovered patterns to caller (for symmetry-aware mutations)
+    if (cfg.out_parallel_patterns)
+        *cfg.out_parallel_patterns = std::move(discovered_parallel);
+    if (cfg.out_series_patterns)
+        *cfg.out_series_patterns = std::move(discovered_series);
 
     if (pool.empty()) {
         // Absolute last resort — should never happen since trivial init always works

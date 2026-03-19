@@ -3,6 +3,8 @@
 #include "search/parallel_search.h"
 #include "search/solution_search.h"
 #include "solution/ordering.h"
+#include "symmetry/symmetry.h"
+#include "symmetry/series.h"
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
@@ -55,7 +57,19 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
     // keeps running until the deadline rather than quitting after 25 stagnant
     // generations (~1s) and leaving 12s unused.
     pcfg.early_stop = has_retain;
+
+    // Collect discovered symmetry patterns for later use (mutations, etc.)
+    std::vector<SymmetricPattern> parallel_patterns;
+    std::vector<SeriesPattern> series_patterns;
+    pcfg.out_parallel_patterns = &parallel_patterns;
+    pcfg.out_series_patterns = &series_patterns;
+
     auto partition_pool = parallel_search(prob, dag, pcfg);
+
+    if (!parallel_patterns.empty() || !series_patterns.empty())
+        std::cerr << "  Discovered: " << parallel_patterns.size()
+                  << " parallel + " << series_patterns.size()
+                  << " series patterns\n";
 
     std::cerr << "  Partition pool: " << partition_pool.size()
               << " entries, best=" << partition_pool[0].total_cost() << "\n";
