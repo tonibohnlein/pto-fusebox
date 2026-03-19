@@ -61,6 +61,7 @@ enable_testing()
 
 set(TEST_SOURCES
     test/cross_validate.cpp
+    test/symm_init_test.cpp
     test/unit_tests.cpp
     test/problem_examples_test.cpp
     test/chained_matmul_test.cpp

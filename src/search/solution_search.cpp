@@ -1738,6 +1738,8 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
     bool pre_in_retain = false, pre_in_ent_next = false;
     bool pre_is_output = false, pre_next_needs = false;
     double pre_cost_a = 0, pre_cost_a1 = 0;
+    double fresh_prediction = m_opt->saving;  // will be overwritten for structural
+
     if ((m_opt->type == SolutionMove::RETAIN_REMOVE ||
          m_opt->type == SolutionMove::RETAIN_ADD) &&
         m_opt->step_a < state.size()) {
@@ -1749,6 +1751,15 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
       pre_next_needs = (sa + 1 < state.size()) && state.steps[sa + 1].subgraph.boundary_inputs().count(t);
       pre_cost_a = state.cost[sa];
       if (sa + 1 < state.size()) pre_cost_a1 = state.cost[sa + 1];
+    }
+
+    // Re-evaluate structural moves at current state to detect staleness
+    if (m_opt->type == SolutionMove::EJECT || m_opt->type == SolutionMove::INTERNAL_EJECT ||
+        m_opt->type == SolutionMove::SPLIT || m_opt->type == SolutionMove::MERGE ||
+        m_opt->type == SolutionMove::DE_RECOMPUTE) {
+      auto fresh = best_move_for_op(state, m_opt->op, {}, floor);
+      fresh_prediction = (fresh.valid() && fresh.type == m_opt->type &&
+                          fresh.step_a == m_opt->step_a) ? fresh.saving : -9e18;
     }
 #endif
 
@@ -1783,6 +1794,15 @@ SolutionFMPassResult solution_fm_pass(const Problem &prob, const DAG &dag,
                     << " next_needs=" << pre_next_needs
                     << " cost_a=" << pre_cost_a
                     << " cost_a1=" << pre_cost_a1;
+        }
+        // For structural moves: was the heap entry stale?
+        double fresh_disc = fresh_prediction - actual_gain;
+        if (std::abs(fresh_prediction - m_opt->saving) > 1.0) {
+          std::cerr << " [STALE: heap=" << m_opt->saving
+                    << " fresh=" << fresh_prediction << "]";
+        } else if (std::abs(fresh_disc) > 0.1 * std::max(1.0, std::abs(fresh_prediction)) + 1.0) {
+          std::cerr << " [ALGO_BUG: fresh=" << fresh_prediction
+                    << " actual=" << actual_gain << " fresh_Δ=" << fresh_disc << "]";
         }
         std::cerr << "\n";
       }
