@@ -68,9 +68,10 @@ void Partition::rebuild_group_dag() {
     }
 
     // Step 1: Get a valid topological order using OP-BASED OR-node Kahn's.
-    // This always resolves all groups (matches is_acyclic). We use it ONLY
-    // to pick which source to draw an edge from for each boundary input.
+    // Used to disambiguate which source group to draw an edge from when a
+    // producer op is in multiple alive groups (recomputation).
     std::vector<int> topo_pos(ng, -1);
+    bool kahn_complete = false;
     {
         std::vector<int> unsatisfied(ng, 0);
         std::vector<bool> dep_met;
@@ -86,6 +87,15 @@ void Partition::rebuild_group_dag() {
                     for (auto g : op_to_groups_[(size_t)prod])
                         if (g == target_gi) { prod_internal = true; break; }
                     if (prod_internal) continue;
+
+                    // Check if ANY alive source exists for this dep.
+                    // If not, the dep is permanently unsatisfied — skip it
+                    // to avoid poisoning the Kahn's traversal.
+                    bool has_source = false;
+                    for (auto source_gj : op_to_groups_[(size_t)prod])
+                        if (groups[source_gj].alive) { has_source = true; break; }
+                    if (!has_source) continue;
+
                     size_t dep_id = dep_met.size();
                     dep_met.push_back(false);
                     unsatisfied[target_gi]++;
@@ -121,13 +131,27 @@ void Partition::rebuild_group_dag() {
                 }
             }
         }
+
+        size_t n_resolved = (size_t)pos;
+        size_t n_alive = num_alive();
+        kahn_complete = (n_resolved >= n_alive);
+        if (!kahn_complete) {
+            std::cerr << "WARNING: rebuild_group_dag: Kahn's resolved "
+                      << n_resolved << "/" << n_alive
+                      << " groups — falling back to DAG topo order\n";
+        }
     }
 
-    // Step 2: Build group DAG edges at the OP level (matching is_acyclic).
+    // Step 2: Build group DAG edges.
+    //
     // For each group i, for each op's input tensor T, if T's producer is
-    // external to i, find the source group with earliest topo_pos and draw edge.
-    // This avoids the force_ephemeral problem: boundary_outputs may hide
-    // tensors, but op_to_groups_ always knows who has the producer.
+    // external to i, find the best source group and draw an edge.
+    //
+    // Source priority (best to worst):
+    //   1. Kahn's topo_pos (available when Step 1 resolves the group)
+    //   2. DAG-level topo position of the producer op within the group
+    //      (always available — the op DAG is guaranteed acyclic)
+    //   3. Arbitrary (smallest group index)
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive) continue;
         for (auto op : groups[i].ops) {
@@ -140,9 +164,19 @@ void Partition::rebuild_group_dag() {
                 int best_pos = INT_MAX;
                 for (auto gj : op_to_groups_[(size_t)prod]) {
                     if (!groups[gj].alive || gj == i) continue;
-                    if (topo_pos[gj] >= 0 && topo_pos[gj] < best_pos) {
+                    // Use Kahn's topo_pos if available; otherwise fall back
+                    // to DAG topo position of the producer op (deterministic,
+                    // always valid). The offset by ng ensures resolved groups
+                    // are always preferred over unresolved ones.
+                    int pos;
+                    if (topo_pos[gj] >= 0) {
+                        pos = topo_pos[gj];
+                    } else {
+                        pos = (int)ng + (int)dag->topo_position((size_t)prod);
+                    }
+                    if (pos < best_pos) {
                         best_gj = gj;
-                        best_pos = topo_pos[gj];
+                        best_pos = pos;
                     }
                 }
                 if (best_gj != SIZE_MAX) {
