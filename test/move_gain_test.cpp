@@ -59,8 +59,7 @@ static std::pair<int,int> verify_all_moves(const char* label, Partition& part,
 }
 
 // Verify FM moves for all border ops
-static std::pair<int,int> verify_all_fm(const char* label, Partition& part,
-                                         double floor = 1e18) {
+static std::pair<int,int> verify_all_fm(const char* label, Partition& part) {
     int checked = 0, bad = 0;
     const char* names[] = {"STEAL", "EJECT", "RECOMPUTE", "MERGE", "INT_EJECT", "SPLIT"};
     int type_counts[6] = {};
@@ -75,7 +74,7 @@ static std::pair<int,int> verify_all_fm(const char* label, Partition& part,
     }
 
     for (auto op : ops_to_check) {
-        auto m = best_move_for(part, op, floor);
+        auto m = best_move_for(part, op);
         if (!m.valid()) continue;
         Partition p2 = part;
         double before = p2.total_cost();
@@ -181,7 +180,10 @@ void test_merge_forces_smaller_tiles() {
     auto [nf, badf] = verify_all_fm("tile_change", part);
     tally({nf, badf});
     
-    // Check that some moves are negative (merge makes things worse)
+    // Check that some moves are negative (merge forces smaller tiles → worse cost).
+    // Under the new cost model (only sink ops divide by nk), non-sink ops in a fused
+    // group no longer receive the nk discount, so merging these compute-heavy MM ops
+    // is unprofitable — all merge moves from the trivial partition are negative.
     int pos = 0, neg = 0;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
@@ -190,7 +192,6 @@ void test_merge_forces_smaller_tiles() {
             else if (m.saving < -0.01) neg++;
         }
     }
-    CHECK("has positive moves", pos > 0);
     CHECK("has negative moves", neg > 0);
     std::cout << "  " << pos << " positive, " << neg << " negative moves\n";
 }
@@ -495,7 +496,7 @@ void test_fm_steal_preferred() {
     
     // Check what FM picks for border ops
     for (auto op : {1, 2}) {
-        auto m = best_move_for(part, op, part.total_cost());
+        auto m = best_move_for(part, op);
         const char* names[] = {"STEAL", "EJECT", "RECOMPUTE", "MERGE"};
         if (m.valid())
             std::cout << "  Op" << op << " best FM: " << names[m.type]

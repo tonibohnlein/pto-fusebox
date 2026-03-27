@@ -12,6 +12,7 @@
 #include "core/subgraph.h"
 #include "core/types.h"
 #include "solution/solution.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -275,10 +276,10 @@ void test_cycle_diamond() {
     DAG d = DAG::build(p);
 
     // Verify DAG structure.
-    CHECK("Op0 succ is Op2", d.op_succs[0].count(2));
-    CHECK("Op1 succ is Op2", d.op_succs[1].count(2));
-    CHECK("Op2 preds has Op0", d.op_preds[2].count(0));
-    CHECK("Op2 preds has Op1", d.op_preds[2].count(1));
+    CHECK("Op0 succ is Op2", std::find(d.op_succs[0].begin(), d.op_succs[0].end(), (size_t)2) != d.op_succs[0].end());
+    CHECK("Op1 succ is Op2", std::find(d.op_succs[1].begin(), d.op_succs[1].end(), (size_t)2) != d.op_succs[1].end());
+    CHECK("Op2 preds has Op0", std::find(d.op_preds[2].begin(), d.op_preds[2].end(), (size_t)0) != d.op_preds[2].end());
+    CHECK("Op2 preds has Op1", std::find(d.op_preds[2].begin(), d.op_preds[2].end(), (size_t)1) != d.op_preds[2].end());
 
     // Adjacent (Op0 → Op2 directly): no cycle.
     CHECK("{0,2} no cycle", !d.merge_creates_cycle({0}, {2}));
@@ -507,13 +508,12 @@ void test_ephemeral_gap_graph_input_exempt() {
 
 void test_ephemeral_fanout_rejected_at_creation() {
     std::cout << "--- test_ephemeral_fanout_rejected_at_creation ---\n";
-    // The subgraph creation already rejects a group where an ephemeral tensor
-    // has more than one internal consumer (fan-out). This is the constraint that
-    // drives the need for recomputation in diamond graphs.
+    // Ephemeral fan-out (a tensor produced AND consumed internally by multiple ops)
+    // is VALID at the subgraph level — T1 is passed in-register to both consumers
+    // within the same tile. The partition-level gap check (creates_ephemeral_gap)
+    // handles the case where external consumers would be stranded.
     //
     // Diamond: T0→Op0→T1→Op1→T2, T1→Op2→T3, T2+T3→Op3→T4.
-    // If we try to fuse {Op0, Op1, Op2}: T1 is produced by Op0 and consumed by
-    // BOTH Op1 and Op2 internally → ephemeral fan-out → rejected.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 100},    // Op0: T0→T1
@@ -525,8 +525,9 @@ void test_ephemeral_fanout_rejected_at_creation() {
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
 
-    // {Op0, Op1, Op2}: T1 has 2 internal consumers (Op1 and Op2) → rejected
-    CHECK("{0,1,2} rejected (T1 fan-out)", !Subgraph::create(p, d, {0,1,2}).has_value());
+    // {Op0, Op1, Op2}: T1 ephemeral with fan-out (Op1 and Op2 both consume it
+    // internally). Accepted — T1 is passed in-register to both in the same tile.
+    CHECK("{0,1,2} accepted (T1 fan-out ok)", Subgraph::create(p, d, {0,1,2}).has_value());
 
     // {Op0, Op1}: T1 consumed only by Op1 internally. Op2 is external.
     // Subgraph is accepted; T1 is ephemeral (solution must handle Op2 separately).
@@ -541,8 +542,8 @@ void test_ephemeral_fanout_rejected_at_creation() {
     // {Op0, Op2}: T1 consumed only by Op2 internally. Valid.
     CHECK("{0,2} accepted", Subgraph::create(p, d, {0,2}).has_value());
 
-    // Full fused {Op0,Op1,Op2,Op3}: T1 still has 2 internal consumers → rejected.
-    CHECK("{0,1,2,3} rejected", !Subgraph::create(p, d, {0,1,2,3}).has_value());
+    // Full fused {Op0,Op1,Op2,Op3}: all consumers internal, T4 is boundary out. Accepted.
+    CHECK("{0,1,2,3} accepted", Subgraph::create(p, d, {0,1,2,3}).has_value());
 
     // Valid full schedule using recomputation:
     // Step 0: {Op0,Op1} → T2 boundary out

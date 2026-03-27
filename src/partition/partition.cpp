@@ -1,5 +1,7 @@
 #include "partition/partition.h"
 #include "core/cost_cache.h"
+#include "search/feasibility.h"
+#include "search/structural_ops.h"
 #include <iostream>
 #include <queue>
 #include <functional>
@@ -10,8 +12,7 @@
 // finalize()
 // ============================================================================
 
-void Partition::finalize() {
-    // Rebuild index first so compute_force_ephemeral can look up other groups.
+void Partition::finalize(CostCache* ext_cache) {
     rebuild_index();
 
     for (size_t gi = 0; gi < groups.size(); gi++) {
@@ -19,14 +20,14 @@ void Partition::finalize() {
         if (!g.alive) continue;
         g.sg = std::nullopt;
 
-        // Compute partition-aware ephemeral set: tensors whose external
-        // consumers are all served by recomputing groups.
-        auto fe = compute_force_ephemeral(gi);
-
         auto sg_opt = Subgraph::create(*prob, *dag,
-                          std::vector<size_t>(g.ops.begin(), g.ops.end()), fe);
+                          std::vector<size_t>(g.ops.begin(), g.ops.end()));
         if (sg_opt) {
-            auto c = sg_opt->best_cost();
+            CostResult c;
+            if (ext_cache)
+                c = ext_cache->evaluate_with_context(*sg_opt, {}, {});
+            else
+                c = sg_opt->best_cost();
             if (c.feasible) {
                 g.cost     = c.latency;
                 g.best_cfg = c.config;
@@ -62,16 +63,16 @@ void Partition::rebuild_group_dag() {
     tensor_to_group.clear();
 
     for (size_t i = 0; i < ng; i++) {
-        if (!groups[i].alive || !groups[i].sg) continue;
-        for (auto t : groups[i].sg->boundary_outputs())
-            tensor_to_group[t] = i;
+        if (!groups[i].alive) continue;
+        for (size_t t = 0; t < dag->tensor_producer.size(); t++)
+            if (is_boundary_output_of(groups[i].ops, t, *dag))
+                tensor_to_group[t] = i;
     }
 
     // Step 1: Get a valid topological order using OP-BASED OR-node Kahn's.
     // Used to disambiguate which source group to draw an edge from when a
     // producer op is in multiple alive groups (recomputation).
     std::vector<int> topo_pos(ng, -1);
-    bool kahn_complete = false;
     {
         std::vector<int> unsatisfied(ng, 0);
         std::vector<bool> dep_met;
@@ -132,14 +133,6 @@ void Partition::rebuild_group_dag() {
             }
         }
 
-        size_t n_resolved = (size_t)pos;
-        size_t n_alive = num_alive();
-        kahn_complete = (n_resolved >= n_alive);
-        if (!kahn_complete) {
-            std::cerr << "WARNING: rebuild_group_dag: Kahn's resolved "
-                      << n_resolved << "/" << n_alive
-                      << " groups — falling back to DAG topo order\n";
-        }
     }
 
     // Step 2: Build group DAG edges.
@@ -190,70 +183,24 @@ void Partition::rebuild_group_dag() {
     for (size_t i = 0; i < ng; i++)
         group_in_deg[i] = (int)group_preds[i].size();
 
-    // =========================================================================
-    // Validation: cross-check group DAG edges against subgraph boundary inputs.
-    // For every alive group i with a subgraph, every boundary input tensor T
-    // whose producer op P is in some other alive group gj should have an edge
-    // gj → i in the group DAG. If not, the DFS ordering will be wrong.
-    // =========================================================================
-    for (size_t i = 0; i < ng; i++) {
-        if (!groups[i].alive || !groups[i].sg) continue;
-        for (auto t : groups[i].sg->boundary_inputs()) {
-            int prod = dag->tensor_producer[t];
-            if (prod < 0) continue;  // graph input — no edge needed
-
-            // Find any alive group that exports T as a boundary output
-            bool has_edge_from_producer = false;
-            size_t exporting_gj = SIZE_MAX;
-            for (size_t gj = 0; gj < ng; gj++) {
-                if (!groups[gj].alive || gj == i || !groups[gj].sg) continue;
-                if (groups[gj].sg->boundary_outputs().count(t)) {
-                    exporting_gj = gj;
-                    if (group_preds[i].count(gj)) {
-                        has_edge_from_producer = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!has_edge_from_producer && exporting_gj != SIZE_MAX) {
-                // Edge is missing! Dump diagnostic info.
+#ifndef NDEBUG
+    // Validation: for every exported tensor, check that consuming groups have
+    // the corresponding DAG edge.  Uses tensor_to_group (freshly built above)
+    // and is_boundary_input_of (DAG-based) to avoid stale .sg reads.
+    for (auto& [t, exporting_gj] : tensor_to_group) {
+        int prod = (int)dag->tensor_producer[t];
+        for (size_t i = 0; i < ng; i++) {
+            if (!groups[i].alive || i == exporting_gj) continue;
+            if (!is_boundary_input_of(groups[i].ops, t, *dag)) continue;
+            if (!group_preds[i].count(exporting_gj)) {
                 std::cerr << "  EDGE_MISSING: G" << i << " needs T" << t
                           << " (prod=op" << prod << "), G" << exporting_gj
                           << " exports it, but no edge G" << exporting_gj
                           << "→G" << i << " exists.\n";
-
-                // Why was the edge not created? Check Step 2 conditions:
-                bool prod_in_i = groups[i].ops.count((size_t)prod);
-                std::cerr << "    op" << prod << " in G" << i << ".ops? "
-                          << (prod_in_i ? "YES (skipped as internal)" : "no") << "\n";
-
-                std::cerr << "    op_to_groups_[" << prod << "] = {";
-                for (auto gx : op_to_groups_[(size_t)prod])
-                    std::cerr << " G" << gx
-                              << (groups[gx].alive ? "" : "(dead)");
-                std::cerr << " }\n";
-
-                // Check if any op in group i actually consumes T in its raw inputs
-                bool any_op_consumes_t = false;
-                for (auto op : groups[i].ops) {
-                    for (auto inp : prob->ops[op].inputs) {
-                        if (inp == t) {
-                            any_op_consumes_t = true;
-                            std::cerr << "    op" << op << " in G" << i
-                                      << " consumes T" << t << " as raw input\n";
-                        }
-                    }
-                }
-                if (!any_op_consumes_t) {
-                    std::cerr << "    NO op in G" << i
-                              << " consumes T" << t << " as raw input!"
-                              << " (subgraph reports it as boundary input — "
-                              << "possible force_ephemeral mismatch)\n";
-                }
             }
         }
     }
+#endif
 }
 
 
@@ -270,13 +217,11 @@ Partition Partition::trivial(const Problem& prob, const DAG& dag) {
     for (size_t i = 0; i < prob.num_ops(); i++) {
         p.groups[i].ops   = {i};
         p.groups[i].alive = true;
-        auto sg = Subgraph::create(prob, dag, {i});
-        if (sg) {
-            auto c = sg->best_cost();
-            p.groups[i].cost     = c.feasible ? c.latency : 1e18;
-            p.groups[i].best_cfg = c.config;
-            p.groups[i].sg       = std::move(*sg);
-        }
+        // Compute cost only — sg/best_cfg populated later by finalize()
+        // when the partition is actually used for solution building.
+        // This avoids Subgraph::create overhead for strategies that
+        // immediately mutate the partition (chain+edge, seed+grow, etc.).
+        p.groups[i].cost = p.eval_set({i});
     }
 
     p.rebuild_index();
@@ -340,221 +285,15 @@ bool Partition::future_needs(size_t t, const std::vector<bool>& scheduled) const
 }
 
 // ============================================================================
-// MoveDelta: describes a hypothetical partition move for acyclicity checking.
-// Passed into kahn_with_delta so we can check acyclicity WITHOUT copying
-// op_to_groups_.
-// ============================================================================
-
-struct MoveDelta {
-    enum Type { NONE, MERGE_PAIR, MERGE_MULTI, STEAL, RECOMPUTE, SPLIT_MOVE, EXTRACT_MOVE } type = NONE;
-    size_t op = SIZE_MAX;
-    size_t ga = SIZE_MAX;  // source group (dies in MERGE_PAIR, loses op in STEAL)
-    size_t gb = SIZE_MAX;  // target group (absorbs in MERGE_PAIR, gains op in STEAL/RECOMPUTE)
-    const std::vector<size_t>* merge_list = nullptr;  // for MERGE_MULTI; also source groups for EXTRACT
-    const std::set<size_t>* split_ops = nullptr;       // for SPLIT_MOVE: ops moving from ga to gb
-                                                        // for EXTRACT_MOVE: ops being extracted
-};
-
-// ============================================================================
-// kahn_with_delta: zero-allocation Kahn's algorithm with virtual group mapping.
-//
-// Instead of copying op_to_groups_ and mutating it, we use a lambda that
-// iterates over an op's groups AS IF the move had been applied. Dependencies
-// are tracked with flat vectors (no std::set, no std::deque).
-//
-// OR-node semantics: when a tensor is produced by multiple groups (recompute),
-// any ONE producer satisfying the dependency unlocks the consumer. This is
-// tracked via dep_met[] booleans and unsatisfied_deps[] counters.
-// ============================================================================
-
-static bool kahn_with_delta(
-    const Problem& prob,
-    const DAG& dag,
-    const std::vector<std::vector<size_t>>& op_to_groups,
-    const std::vector<bool>& alive,
-    size_t num_alive_groups,
-    const MoveDelta& delta)
-{
-    size_t ng = alive.size();
-
-    // For MERGE_MULTI: build killed lookup once
-    std::vector<bool> is_killed;
-    size_t survivor = 0;
-    if (delta.type == MoveDelta::MERGE_MULTI && delta.merge_list) {
-        is_killed.resize(ng, false);
-        survivor = (*delta.merge_list)[0];
-        for (size_t k = 1; k < delta.merge_list->size(); k++)
-            is_killed[(*delta.merge_list)[k]] = true;
-    }
-
-    // Lambda: iterate over an op's groups as if the move had been applied
-    auto for_virtual_groups = [&](size_t op_idx, auto&& callback) {
-        switch (delta.type) {
-        case MoveDelta::NONE:
-            for (size_t g : op_to_groups[op_idx]) callback(g);
-            return;
-
-        case MoveDelta::MERGE_PAIR: {
-            bool yielded_survivor = false;
-            for (size_t g : op_to_groups[op_idx]) {
-                if (g == delta.ga || g == delta.gb) {
-                    if (!yielded_survivor) { callback(delta.ga); yielded_survivor = true; }
-                } else {
-                    callback(g);
-                }
-            }
-            return;
-        }
-        case MoveDelta::MERGE_MULTI: {
-            bool yielded_survivor = false;
-            for (size_t g : op_to_groups[op_idx]) {
-                if (g == survivor || (g < ng && is_killed[g])) {
-                    if (!yielded_survivor) { callback(survivor); yielded_survivor = true; }
-                } else {
-                    callback(g);
-                }
-            }
-            return;
-        }
-        case MoveDelta::STEAL:
-            if (op_idx == delta.op) {
-                bool gb_added = false;
-                for (size_t g : op_to_groups[op_idx]) {
-                    if (g == delta.ga) continue;  // op removed from ga
-                    if (g == delta.gb) gb_added = true;
-                    callback(g);
-                }
-                if (!gb_added) callback(delta.gb);  // op added to gb
-                return;
-            }
-            for (size_t g : op_to_groups[op_idx]) callback(g);
-            return;
-
-        case MoveDelta::RECOMPUTE:
-            if (op_idx == delta.op) {
-                bool gb_added = false;
-                for (size_t g : op_to_groups[op_idx]) {
-                    if (g == delta.gb) gb_added = true;
-                    callback(g);
-                }
-                if (!gb_added) callback(delta.gb);  // op copied to gb
-                return;
-            }
-            for (size_t g : op_to_groups[op_idx]) callback(g);
-            return;
-
-        case MoveDelta::SPLIT_MOVE:
-            // All ops in split_ops move from ga to gb; others stay
-            if (delta.split_ops && delta.split_ops->count(op_idx)) {
-                bool gb_added = false;
-                for (size_t g : op_to_groups[op_idx]) {
-                    if (g == delta.ga) continue;  // removed from ga
-                    if (g == delta.gb) gb_added = true;
-                    callback(g);
-                }
-                if (!gb_added) callback(delta.gb);  // added to gb
-                return;
-            }
-            for (size_t g : op_to_groups[op_idx]) callback(g);
-            return;
-
-        case MoveDelta::EXTRACT_MOVE:
-            // Ops in split_ops move from source groups (merge_list) to gb
-            if (delta.split_ops && delta.split_ops->count(op_idx)) {
-                bool gb_added = false;
-                for (size_t g : op_to_groups[op_idx]) {
-                    bool is_source = false;
-                    if (delta.merge_list)
-                        for (auto sg : *delta.merge_list)
-                            if (sg == g) { is_source = true; break; }
-                    if (is_source) {
-                        if (!gb_added) { callback(delta.gb); gb_added = true; }
-                    } else {
-                        if (g == delta.gb) gb_added = true;
-                        callback(g);
-                    }
-                }
-                if (!gb_added) callback(delta.gb);
-                return;
-            }
-            for (size_t g : op_to_groups[op_idx]) callback(g);
-            return;
-        }
-    };
-
-    // 1. Build dependencies using flat vectors
-    std::vector<int> unsatisfied_deps(ng, 0);
-    std::vector<bool> dep_met;
-    std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
-
-    for (size_t op_idx = 0; op_idx < prob.ops.size(); op_idx++) {
-        for (auto t : prob.ops[op_idx].inputs) {
-            int prod = dag.tensor_producer[t];
-            if (prod < 0) continue;  // graph input
-
-            for_virtual_groups(op_idx, [&](size_t target_gi) {
-                if (!alive[target_gi]) return;
-
-                // Is producer internal to target group?
-                bool prod_internal = false;
-                for_virtual_groups((size_t)prod, [&](size_t g) {
-                    if (g == target_gi) prod_internal = true;
-                });
-                if (prod_internal) return;
-
-                // External dependency: target_gi needs prod from outside
-                size_t dep_id = dep_met.size();
-                dep_met.push_back(false);
-                unsatisfied_deps[target_gi]++;
-
-                for_virtual_groups((size_t)prod, [&](size_t source_gj) {
-                    if (alive[source_gj])
-                        frees[source_gj].push_back({target_gi, dep_id});
-                });
-            });
-        }
-    }
-
-    // 2. Kahn's traversal with flat vector queue
-    std::vector<size_t> q;
-    q.reserve(ng);
-    std::vector<bool> enqueued(ng, false);
-    size_t visited = 0;
-
-    for (size_t i = 0; i < ng; i++) {
-        if (alive[i] && unsatisfied_deps[i] == 0) {
-            q.push_back(i);
-            enqueued[i] = true;
-        }
-    }
-
-    size_t head = 0;
-    while (head < q.size()) {
-        size_t u = q[head++];
-        visited++;
-
-        for (auto [gi, dep_id] : frees[u]) {
-            if (!dep_met[dep_id]) {
-                dep_met[dep_id] = true;
-                unsatisfied_deps[gi]--;
-
-                if (unsatisfied_deps[gi] == 0 && !enqueued[gi]) {
-                    q.push_back(gi);
-                    enqueued[gi] = true;
-                }
-            }
-        }
-    }
-
-    return visited >= num_alive_groups;
-}
-
-// ============================================================================
-// Public acyclicity methods — thin wrappers around kahn_with_delta
+// is_acyclic — reference full Kahn's check used for debug/validation.
 // ============================================================================
 
 bool Partition::is_acyclic() const {
     if (!prob || !dag) return true;
+    if (op_to_groups_.size() < prob->num_ops()) return false;  // stale index
+
+    using feasibility::MoveDelta;
+    using feasibility::kahn_with_delta;
 
     std::vector<bool> alive(groups.size(), false);
     size_t na = 0;
@@ -565,215 +304,335 @@ bool Partition::is_acyclic() const {
     return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
 }
 
-bool Partition::is_acyclic_after_merge(size_t ga, size_t gb) const {
-    if (!prob || !dag) return true;
+// ============================================================================
+// Local acyclicity checks
+//
+// Exploit the invariant that the current group DAG is acyclic: adding edge
+// A→B creates a cycle iff B can already reach A (B →* A).
+//
+// With OR-node recomputation semantics: a group gB needs tensor T from AT
+// LEAST ONE of its producer groups.  A new constraint on gB is only
+// unsatisfiable (cyclic) if ALL producer options are forward-reachable from
+// gB (meaning every option is downstream of gB).  If even one producer is
+// not reachable from gB, we can place it before gB without creating a cycle.
+// ============================================================================
 
-    std::vector<bool> alive(groups.size(), false);
-    size_t na = 0;
-    for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive && i != gb) { alive[i] = true; na++; }
-
-    MoveDelta delta{MoveDelta::MERGE_PAIR, SIZE_MAX, ga, gb, nullptr};
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
-}
-
-bool Partition::is_acyclic_after_merge(const std::vector<size_t>& group_list) const {
-    if (!prob || !dag || group_list.size() < 2) return true;
-
-    std::vector<bool> alive(groups.size(), false);
-    size_t na = 0;
-    std::vector<bool> killed(groups.size(), false);
-    for (size_t k = 1; k < group_list.size(); k++)
-        killed[group_list[k]] = true;
-    for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive && !killed[i]) { alive[i] = true; na++; }
-
-    MoveDelta delta{MoveDelta::MERGE_MULTI, SIZE_MAX, SIZE_MAX, SIZE_MAX, &group_list};
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
-}
-
-bool Partition::is_acyclic_after_steal(size_t op, size_t ga, size_t gb) const {
-    if (!prob || !dag) return true;
-
-    std::vector<bool> alive(groups.size(), false);
-    size_t na = 0;
-    for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive) { alive[i] = true; na++; }
-
-    // If ga becomes empty after losing op, it virtually dies
-    if (groups[ga].ops.size() == 1 && groups[ga].ops.count(op)) {
-        alive[ga] = false;
-        na--;
+// Forward BFS from `start` following output→consumer group edges.
+// Returns vis[] where vis[g] == true iff g is forward-reachable from start.
+static std::vector<bool> forward_reachable(const Partition& p, size_t start)
+{
+    size_t ng = p.groups.size();
+    std::vector<bool> vis(ng, false);
+    std::queue<size_t> q;
+    vis[start] = true;
+    q.push(start);
+    while (!q.empty()) {
+        size_t cur = q.front(); q.pop();
+        for (auto op : p.groups[cur].ops) {
+            for (auto t : p.prob->ops[op].outputs) {
+                for (auto cop : p.dag->tensor_consumers[t]) {
+                    if (p.groups[cur].ops.count(cop)) continue;
+                    for (auto gj : p.groups_of(cop)) {
+                        if (!p.groups[gj].alive || vis[gj]) continue;
+                        vis[gj] = true;
+                        q.push(gj);
+                    }
+                }
+            }
+        }
     }
-
-    MoveDelta delta{MoveDelta::STEAL, op, ga, gb, nullptr};
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+    return vis;
 }
 
-bool Partition::is_acyclic_after_recompute(size_t op, size_t gb) const {
-    if (!prob || !dag) return true;
+bool Partition::acyclic_merge_local(const std::vector<size_t>& G) const {
+    if (!prob || !dag || G.size() < 2) return true;
 
-    std::vector<bool> alive(groups.size(), false);
-    size_t na = 0;
-    for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive) { alive[i] = true; na++; }
+    // A merge creates a cycle iff there is a directed path from G to G that
+    // passes through at least one external group (a direct gi→gj edge between
+    // two members of G just becomes internal after merge — not a cycle).
+    //
+    // Algorithm: BFS from external successors of all groups in G.  If we ever
+    // reach a group that is itself in G, the merge would create a cycle.
 
-    MoveDelta delta{MoveDelta::RECOMPUTE, op, SIZE_MAX, gb, nullptr};
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
-}
+    std::vector<bool> in_G(groups.size(), false);
+    for (auto g : G)
+        if (g < groups.size()) in_G[g] = true;
 
-bool Partition::is_acyclic_after_eject(size_t op, size_t ga) const {
-    if (!prob || !dag) return true;
+    std::vector<bool> vis(groups.size(), false);
+    std::queue<size_t> q;
 
-    size_t ng = groups.size();
-    size_t virtual_gb = ng;  // virtual new group for the singleton
-
-    // Extend alive by 1 to accommodate virtual_gb
-    std::vector<bool> alive(ng + 1, false);
-    size_t na = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive) { alive[i] = true; na++; }
-
-    // If ga becomes empty after losing op, it dies
-    if (groups[ga].ops.size() == 1 && groups[ga].ops.count(op)) {
-        alive[ga] = false;
-        na--;
-    }
-
-    // Singleton needed only if op isn't covered by another alive group
-    bool needs_singleton = true;
-    for (auto gj : groups_of(op))
-        if (gj != ga && groups[gj].alive) { needs_singleton = false; break; }
-
-    if (needs_singleton) {
-        alive[virtual_gb] = true;
-        na++;
-    }
-
-    // Reuse STEAL delta: op moves from ga to virtual_gb
-    MoveDelta delta{MoveDelta::STEAL, op, ga, virtual_gb, nullptr};
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
-}
-
-bool Partition::is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga) const {
-    if (!prob || !dag) return true;
-
-    size_t ng = groups.size();
-    size_t virtual_gb = ng;  // virtual new group for side_b
-
-    std::vector<bool> alive(ng + 1, false);
-    size_t na = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive) { alive[i] = true; na++; }
-
-    alive[virtual_gb] = true;
-    na++;
-
-    MoveDelta delta;
-    delta.type = MoveDelta::SPLIT_MOVE;
-    delta.ga = ga;
-    delta.gb = virtual_gb;
-    delta.split_ops = &side_b;
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
-}
-
-bool Partition::is_acyclic_after_extract(const std::set<size_t>& extract_ops,
-                                          const std::vector<size_t>& source_groups) const {
-    if (!prob || !dag) return true;
-
-    size_t ng = groups.size();
-    size_t virtual_gb = ng;  // virtual new group for extracted ops
-
-    std::vector<bool> alive(ng + 1, false);
-    size_t na = 0;
-    for (size_t i = 0; i < ng; i++)
-        if (groups[i].alive) { alive[i] = true; na++; }
-
-    // Source groups that become empty after extraction die
-    for (auto sg : source_groups) {
-        bool all_extracted = true;
-        for (auto op : groups[sg].ops)
-            if (!extract_ops.count(op)) { all_extracted = false; break; }
-        if (all_extracted) {
-            alive[sg] = false;
-            na--;
+    // Seed with external direct successors of each group in G.
+    for (auto gi : G) {
+        if (!groups[gi].alive) continue;
+        for (auto op : groups[gi].ops) {
+            for (auto t : prob->ops[op].outputs) {
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (groups[gi].ops.count(cop)) continue;  // internal to gi
+                    for (auto gj : groups_of(cop)) {
+                        if (!groups[gj].alive || vis[gj]) continue;
+                        if (in_G[gj]) continue;  // direct G→G edge, fine
+                        vis[gj] = true;
+                        q.push(gj);
+                    }
+                }
+            }
         }
     }
 
-    alive[virtual_gb] = true;
-    na++;
-
-    MoveDelta delta;
-    delta.type = MoveDelta::EXTRACT_MOVE;
-    delta.gb = virtual_gb;
-    delta.merge_list = &source_groups;
-    delta.split_ops = &extract_ops;
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+    // BFS through external groups; cycle if we reach back into G.
+    while (!q.empty()) {
+        size_t cur = q.front(); q.pop();
+        for (auto op : groups[cur].ops) {
+            for (auto t : prob->ops[op].outputs) {
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (groups[cur].ops.count(cop)) continue;
+                    for (auto gj : groups_of(cop)) {
+                        if (!groups[gj].alive) continue;
+                        if (in_G[gj]) return false;  // external path back into G
+                        if (!vis[gj]) { vis[gj] = true; q.push(gj); }
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
-bool Partition::is_acyclic_without_group(size_t ga) const {
+bool Partition::acyclic_merge_local(size_t ga, size_t gb) const {
+    return acyclic_merge_local(std::vector<size_t>{ga, gb});
+}
+
+bool Partition::acyclic_add_ops_into(const std::set<size_t>& new_ops, size_t gi) const {
+    if (!prob || !dag || new_ops.empty() || gi >= groups.size()) return true;
+    // Treat new_ops as a virtual group gnew (no group index yet).
+    // Merged set = new_ops ∪ groups[gi].ops.
+    // Cycle iff there is a directed path from the merged set back into itself
+    // through at least one external group.
+    // Same BFS as acyclic_merge_local but seeds from both new_ops and gi.ops.
+    auto in_merged = [&](size_t op) {
+        return new_ops.count(op) || groups[gi].ops.count(op);
+    };
+
+    std::vector<bool> vis(groups.size(), false);
+    vis[gi] = true;  // gi is in the merged set, skip it during BFS
+    std::queue<size_t> q;
+
+    auto seed = [&](size_t op) {
+        for (auto t : prob->ops[op].outputs) {
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (in_merged(cop)) continue;
+                for (auto gc : groups_of(cop)) {
+                    if (!groups[gc].alive || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push(gc);
+                }
+            }
+        }
+    };
+    for (auto op : new_ops)         seed(op);
+    for (auto op : groups[gi].ops)  seed(op);
+
+    while (!q.empty()) {
+        size_t cur = q.front(); q.pop();
+        for (auto cur_op : groups[cur].ops) {
+            for (auto t : prob->ops[cur_op].outputs) {
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (in_merged(cop)) return false;  // path back into merged set
+                    for (auto gc : groups_of(cop)) {
+                        if (!groups[gc].alive || vis[gc]) continue;
+                        vis[gc] = true;
+                        q.push(gc);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool Partition::acyclic_extract_local(const std::set<size_t>& extract_ops) const {
+    if (!prob || !dag || extract_ops.empty()) return true;
+    // gnew = virtual group containing extract_ops.
+    // Seed BFS with external successors of gnew: consumer groups of extract_ops outputs
+    // that are NOT themselves extract_ops.
+    std::vector<bool> vis(groups.size(), false);
+    std::queue<size_t> q;
+
+    for (auto op : extract_ops) {
+        for (auto t : prob->ops[op].outputs) {
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (extract_ops.count(cop)) continue;  // internal to gnew
+                for (auto gc : groups_of(cop)) {
+                    if (!groups[gc].alive || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push(gc);
+                }
+            }
+        }
+    }
+
+    // BFS through external groups. A cycle exists if we find a group that
+    // contains an op (not in extract_ops) whose output is consumed by extract_ops —
+    // meaning gnew depends on that group, completing a cycle.
+    while (!q.empty()) {
+        size_t cur = q.front(); q.pop();
+        for (auto cur_op : groups[cur].ops) {
+            if (extract_ops.count(cur_op)) continue;
+            for (auto t : prob->ops[cur_op].outputs) {
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (extract_ops.count(cop)) return false;  // path back into gnew
+                    for (auto gc : groups_of(cop)) {
+                        if (!groups[gc].alive || vis[gc]) continue;
+                        vis[gc] = true;
+                        q.push(gc);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool Partition::acyclic_recompute_local(size_t op, size_t gb) const {
+    if (!prob || !dag) return true;
+    // Adding op to gb: for each input T of op not already consumed in gb,
+    // gb gains a new OR-constraint: at least one producer group must precede gb.
+    // Cycle iff ALL producer groups are forward-reachable from gb.
+    // Outputs are only new options for consumers (never forced) → no new cycle.
+
+    auto fwd_gb = forward_reachable(*this, gb);
+
+    for (auto t : prob->ops[op].inputs) {
+        // Skip if T already consumed by another op in gb (constraint exists).
+        bool already = false;
+        for (auto cop : dag->tensor_consumers[t])
+            if (cop != op && groups[gb].ops.count(cop)) { already = true; break; }
+        if (already) continue;
+
+        int prod = dag->tensor_producer[t];
+        if (prod < 0) continue;
+        if (groups[gb].ops.count((size_t)prod)) continue;  // internal
+
+        // OR constraint: need at least one producer group NOT in fwd(gb).
+        bool any_free = false;
+        for (auto gp : groups_of((size_t)prod)) {
+            if (gp != gb && groups[gp].alive && !fwd_gb[gp]) { any_free = true; break; }
+        }
+        if (!any_free) return false;
+    }
+    return true;
+}
+
+bool Partition::acyclic_de_recompute_local(size_t op, size_t ga) const {
+    if (!prob || !dag) return true;
+    // Removing op from ga: for each output T of op consumed in ga (T ephemeral),
+    // ga gains a new OR-constraint: must come after at least one remaining copy.
+    // Cycle iff ALL remaining groups containing op are forward-reachable from ga.
+
+    // Build source set S = groups_of(op) − {ga}  (remaining copies of op)
+    std::vector<size_t> S;
+    for (auto gother : groups_of(op))
+        if (gother != ga && groups[gother].alive) S.push_back(gother);
+
+    auto fwd_ga = forward_reachable(*this, ga);
+
+    for (auto t : prob->ops[op].outputs) {
+        // Part 1: internal consumers in ga lose their ephemeral source.
+        bool consumed_in_ga = false;
+        for (auto cop : dag->tensor_consumers[t])
+            if (cop != op && groups[ga].ops.count(cop)) { consumed_in_ga = true; break; }
+        if (consumed_in_ga) {
+            // OR constraint on ga: need at least one gP ∈ S not in fwd(ga).
+            bool any_free = false;
+            for (auto gP : S)
+                if (!fwd_ga[gP]) { any_free = true; break; }
+            if (!any_free) return false;
+        }
+
+        // Part 2: external consumers that were getting T from ga now must get
+        // it from S.  For each such consumer group gc, at least one gP ∈ S
+        // must not be forward-reachable from gc (can be placed before gc).
+        // This mirrors Part 3 of acyclic_steal_local.
+        if (S.empty()) continue;
+        for (auto cop : dag->tensor_consumers[t]) {
+            if (groups[ga].ops.count(cop)) continue;  // internal, handled above
+            for (auto gc : groups_of(cop)) {
+                if (!groups[gc].alive || gc == ga) continue;
+                auto fwd_gc = forward_reachable(*this, gc);
+                bool any_free = false;
+                for (auto gP : S)
+                    if (!fwd_gc[gP]) { any_free = true; break; }
+                if (!any_free) return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
     if (!prob || !dag) return true;
 
-    std::vector<bool> alive(groups.size(), false);
-    size_t na = 0;
-    for (size_t i = 0; i < groups.size(); i++)
-        if (groups[i].alive && i != ga) { alive[i] = true; na++; }
+    // Part 1: gb gains op → check gb's new input OR-constraints (same as recompute).
+    if (!acyclic_recompute_local(op, gb)) return false;
 
-    MoveDelta delta;  // NONE — just check with ga dead
-    return kahn_with_delta(*prob, *dag, op_to_groups_, alive, na, delta);
+    // Part 2: ga loses op → for each output T of op consumed in ga (T was ephemeral),
+    // ga now needs T from {gb} ∪ (groups_of(op) − {ga}).
+    // Cycle iff ALL sources in that set are forward-reachable from ga.
+    {
+        auto fwd_ga = forward_reachable(*this, ga);
+        for (auto t : prob->ops[op].outputs) {
+            bool consumed_in_ga = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (cop != op && groups[ga].ops.count(cop)) { consumed_in_ga = true; break; }
+            if (!consumed_in_ga) continue;
+
+            // Source options: gb (op's new home) ∪ any other existing copy.
+            bool any_free = (gb < groups.size() && groups[gb].alive && !fwd_ga[gb]);
+            if (!any_free) {
+                for (auto gother : groups_of(op))
+                    if (gother != ga && groups[gother].alive && !fwd_ga[gother])
+                        { any_free = true; break; }
+            }
+            if (!any_free) return false;
+        }
+    }
+
+    // Part 3: external consumers of op's boundary outputs from ga lose ga as a source.
+    // After steal, T is available from S = {gb} ∪ (groups_of(op) − {ga}).
+    // For each external consumer group gc: need at least one gP ∈ S that gc cannot
+    // forward-reach (i.e., gP can be placed before gc without forming a cycle).
+    // Cycle iff ALL gP ∈ S are forward-reachable from gc (gc →* all options).
+    {
+        // Build S once.
+        std::vector<size_t> S;
+        if (gb < groups.size() && groups[gb].alive) S.push_back(gb);
+        for (auto gother : groups_of(op))
+            if (gother != ga && groups[gother].alive) S.push_back(gother);
+        if (S.empty()) return false;  // op has no copy left → no source for T
+
+        for (auto t : prob->ops[op].outputs) {
+            // Check external consumers of T (not in ga, not in gb).
+            for (auto cop : dag->tensor_consumers[t]) {
+                for (auto gc : groups_of(cop)) {
+                    if (!groups[gc].alive || gc == ga || gc == gb) continue;
+                    // Is there at least one gP ∈ S that gc cannot reach?
+                    auto fwd_gc = forward_reachable(*this, gc);
+                    bool any_free = false;
+                    for (auto gP : S)
+                        if (!fwd_gc[gP]) { any_free = true; break; }
+                    if (!any_free) return false;
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {
     if (ops.empty()) return 1e18;
     if (cache) return cache->evaluate(ops, *prob, *dag);
     auto sg = Subgraph::create(*prob, *dag, {ops.begin(), ops.end()});
-    if (!sg) return 1e18;
-    auto c = sg->best_cost();
-    return c.feasible ? c.latency : 1e18;
-}
-
-std::set<size_t> Partition::compute_force_ephemeral(size_t gi) const {
-    std::set<size_t> result;
-    if (!prob || !dag) return result;
-
-    for (auto op : groups[gi].ops) {
-        for (auto t : prob->ops[op].outputs) {
-            bool consumed_internally = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (groups[gi].ops.count(cop)) { consumed_internally = true; break; }
-            if (!consumed_internally) continue;
-
-            bool has_external = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (!groups[gi].ops.count(cop)) { has_external = true; break; }
-            if (!has_external) continue;
-
-            int prod = dag->tensor_producer[t];
-            if (prod < 0) continue;
-
-            bool has_stranded = false;
-            for (auto cop : dag->tensor_consumers[t]) {
-                for (auto gj : groups_of(cop)) {
-                    if (gj == gi || !groups[gj].alive) continue;
-                    if (!groups[gj].ops.count((size_t)prod)) {
-                        has_stranded = true;
-                        break;
-                    }
-                }
-                if (has_stranded) break;
-            }
-            if (!has_stranded) result.insert(t);
-        }
-    }
-    return result;
-}
-
-double Partition::eval_group_in_context(size_t gi) const {
-    if (!groups[gi].alive) return 0;
-    auto fe = compute_force_ephemeral(gi);
-    auto sg = Subgraph::create(*prob, *dag,
-                  std::vector<size_t>(groups[gi].ops.begin(), groups[gi].ops.end()),
-                  fe);
     if (!sg) return 1e18;
     auto c = sg->best_cost();
     return c.feasible ? c.latency : 1e18;
@@ -832,25 +691,7 @@ std::vector<size_t> Partition::internal_ops(size_t gi) const {
 
 std::vector<std::set<size_t>> Partition::connected_components(
         const std::set<size_t>& ops) const {
-    std::vector<std::set<size_t>> components;
-    std::vector<bool> in_set(prob->num_ops(), false);
-    std::vector<bool> visited(prob->num_ops(), false);
-    for (auto op : ops) in_set[op] = true;
-
-    for (auto seed : ops) {
-        if (visited[seed]) continue;
-        std::set<size_t> comp;
-        std::vector<size_t> queue = {seed};
-        visited[seed] = true;
-        while (!queue.empty()) {
-            size_t u = queue.back(); queue.pop_back();
-            comp.insert(u);
-            for (auto v : dag->op_neighbors[u])
-                if (in_set[v] && !visited[v]) { visited[v] = true; queue.push_back(v); }
-        }
-        components.push_back(std::move(comp));
-    }
-    return components;
+    return structural_ops::connected_components(ops, *dag);
 }
 
 // ============================================================================
@@ -862,9 +703,8 @@ Partition::EjectResult Partition::eval_eject(size_t op, size_t gi) const {
     if (!groups[gi].alive || !groups[gi].ops.count(op)) return result;
     if (groups[gi].ops.size() <= 1) return result;
 
-    std::set<size_t> remainder = groups[gi].ops;
-    remainder.erase(op);
-    result.remainder_components = connected_components(remainder);
+    auto analysis = structural_ops::analyze_eject(op, groups[gi].ops, *dag);
+    result.remainder_components = std::move(analysis.remainder_components);
 
     double total_remainder = 0;
     result.component_costs.reserve(result.remainder_components.size());
@@ -895,35 +735,60 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     SplitResult result;
     if (!groups[gi].alive) return result;
     if (!groups[gi].ops.count(op_a) || !groups[gi].ops.count(op_b)) return result;
-    // No size guard: a 2-op group {A,B} where the single edge is a bridge is
-    // a valid split into {A} and {B}. Let the BFS determine feasibility.
 
-    const auto& ops = groups[gi].ops;
-    std::vector<bool> visited(prob->num_ops(), false);
-    std::vector<size_t> queue = {op_a};
-    visited[op_a] = true;
+    auto analysis = structural_ops::analyze_split(op_a, op_b, groups[gi].ops, *dag);
+    if (!analysis.is_bridge) return result;
 
-    while (!queue.empty()) {
-        size_t u = queue.back(); queue.pop_back();
-        for (auto v : dag->op_neighbors[u]) {
-            if (!ops.count(v) || visited[v]) continue;
-            if ((u == op_a && v == op_b) || (u == op_b && v == op_a)) continue;
-            visited[v] = true;
-            queue.push_back(v);
-        }
-    }
-    if (visited[op_b]) return result;
-
-    for (auto op : ops) {
-        if (visited[op]) result.side_a.insert(op);
-        else             result.side_b.insert(op);
-    }
+    result.side_a = std::move(analysis.side_a);
+    result.side_b = std::move(analysis.side_b);
     if (result.side_a.empty() || result.side_b.empty()) return result;
 
     result.cost_a = eval_set(result.side_a);
     if (result.cost_a >= 1e17) return result;
     result.cost_b = eval_set(result.side_b);
     if (result.cost_b >= 1e17) return result;
+
+    // Ephemeral gap: check that the split doesn't make a tensor unavailable.
+    if (split_creates_ephemeral_gap({result.side_a, result.side_b}, gi))
+        return result;
+
+    // Acyclicity: splitting can create a cycle when a recomputed op (with a
+    // copy in another group) ends up on one side while its outputs are consumed
+    // by the other side.  The other side then depends on the external copy,
+    // which may be downstream → cycle.  Check both directions.
+    for (auto opR : groups[gi].ops) {
+        bool in_other_group = false;
+        for (auto gj : groups_of(opR))
+            if (gj != gi && groups[gj].alive) { in_other_group = true; break; }
+        if (!in_other_group) continue;
+
+        bool opR_in_a = result.side_a.count(opR);
+        const auto& my_side = opR_in_a ? result.side_a : result.side_b;
+        const auto& other_side = opR_in_a ? result.side_b : result.side_a;
+
+        for (auto t : prob->ops[opR].outputs) {
+            bool consumed_by_other = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (other_side.count(cop)) { consumed_by_other = true; break; }
+            if (!consumed_by_other) continue;
+
+            // other_side needs T from opR's external group(s).
+            // Cycle iff ALL external copies are forward-reachable from other_side.
+            // Use a conservative check: treat other_side as gi (same group slot).
+            auto fwd = forward_reachable(*this, gi);
+            bool any_free = false;
+            for (auto gother : groups_of(opR))
+                if (gother != gi && groups[gother].alive && !fwd[gother])
+                    { any_free = true; break; }
+            if (!any_free) {
+#ifndef NDEBUG
+                std::cerr << "  DBG eval_split: rejecting split of G" << gi
+                          << " (recomp op" << opR << " would create cycle)\n";
+#endif
+                return result;  // would create cycle
+            }
+        }
+    }
 
     result.feasible = true;
     result.saving   = groups[gi].cost - (result.cost_a + result.cost_b);
@@ -936,53 +801,7 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
 
 std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
     if (!groups[gi].alive || groups[gi].ops.size() < 2) return {};
-
-    std::vector<std::pair<size_t,size_t>> bridges;
-    const auto& ops  = groups[gi].ops;
-    size_t       nops = prob->num_ops();
-
-    std::vector<bool>   visited(nops, false);
-    std::vector<size_t> to_clear;
-
-    // Iterate all edges in op_neighbors (DAG edges + co-consumer edges).
-    // The old code only iterated op_succs, which missed co-consumer bridges.
-    // A co-consumer bridge is an undirected edge u-v where both ops share a
-    // common boundary input tensor, and severing that connection would split
-    // the group into two disconnected components.
-    // We canonicalise as (min,max) to avoid double-reporting each undirected
-    // edge as both (u,v) and (v,u).
-    std::set<std::pair<size_t,size_t>> seen_edges;
-
-    for (auto u : ops) {
-        for (auto v : dag->op_neighbors[u]) {
-            if (!ops.count(v)) continue;
-            // Canonicalise undirected edge to avoid duplicates
-            auto edge = std::make_pair(std::min(u,v), std::max(u,v));
-            if (!seen_edges.insert(edge).second) continue;
-
-            for (auto idx : to_clear) visited[idx] = false;
-            to_clear.clear();
-
-            std::vector<size_t> queue = {u};
-            visited[u] = true;
-            to_clear.push_back(u);
-            bool found = false;
-
-            while (!queue.empty() && !found) {
-                size_t w = queue.back(); queue.pop_back();
-                for (auto x : dag->op_neighbors[w]) {
-                    if (!ops.count(x) || visited[x]) continue;
-                    if ((w == u && x == v) || (w == v && x == u)) continue;
-                    if (x == v) { found = true; break; }
-                    visited[x] = true;
-                    to_clear.push_back(x);
-                    queue.push_back(x);
-                }
-            }
-            if (!found) bridges.push_back({u, v});
-        }
-    }
-    return bridges;
+    return structural_ops::bridge_edges(groups[gi].ops, *dag);
 }
 
 // ============================================================================
@@ -996,49 +815,49 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
-            // Under the new ephemeral rule: T is ephemeral in proposed_ops
-            // iff produced internally AND ALL DAG consumers are internal.
-            // If ANY consumer is external to proposed_ops, T is a boundary
-            // output (materialized) → no gap concern.
-            bool all_consumers_internal = true;
+            // New ephemeral rule: T is ephemeral in proposed_ops iff it is
+            // produced AND consumed internally. External consumers are irrelevant
+            // to the ephemeral classification — but they DO need T from somewhere.
             bool any_consumer_internal = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
+            if (!any_consumer_internal) continue;  // pure boundary output → safe
+
+            // T is ephemeral in proposed_ops → not written to slow memory.
+            // Any external consumer needs T from another group.
             for (auto cop : dag->tensor_consumers[t]) {
-                if (proposed_ops.count(cop))
-                    any_consumer_internal = true;
-                else
-                    all_consumers_internal = false;
-            }
-            if (!any_consumer_internal) continue;  // pure boundary output → no gap
-            if (!all_consumers_internal) continue;  // has external consumer → boundary output
+                if (proposed_ops.count(cop)) continue;  // internal → served
 
-            // T would be purely ephemeral → never written to slow memory.
-            // Check if T is available as a boundary output from some other group.
-            int prod_op = dag->tensor_producer[t];
-            if (prod_op < 0) continue;
+                // cop is external — does it have access to T?
+                // T is available if some alive group (not excluded) produces T
+                // as a boundary output (= produces T but does NOT consume T internally)
+                int prod_op = dag->tensor_producer[t];
+                if (prod_op < 0) continue;
 
-            bool available_from_other = false;
-            for (auto gj : groups_of((size_t)prod_op)) {
-                if (!groups[gj].alive) continue;
-                if (gj == exclude_ga || gj == exclude_gb) continue;
-                // T is a boundary output of gj if gj produces T and
-                // NOT all of T's consumers are in gj (new ephemeral rule).
-                bool all_in_gj = true;
-                for (auto cop : dag->tensor_consumers[t])
-                    if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available_from_other = true; break; }
-            }
-            if (available_from_other) continue;
-
-            // T is ephemeral in every group that produces it.
-            // Any consumer in a non-excluded alive group that does NOT
-            // recompute the producer is stranded.
-            for (auto cop : dag->tensor_consumers[t]) {
-                for (auto gj : groups_of(cop)) {
+                bool available = false;
+                for (auto gj : groups_of((size_t)prod_op)) {
                     if (!groups[gj].alive) continue;
                     if (gj == exclude_ga || gj == exclude_gb) continue;
-                    if (groups[gj].ops.count((size_t)prod_op)) continue;
-                    return true;
+
+                    // Is T a boundary output of gj?
+                    // Under new rule: T is ephemeral in gj iff gj consumes T internally.
+                    // T is boundary output of gj iff gj produces T but does NOT consume it.
+                    bool consumed_in_gj = false;
+                    for (auto c2 : dag->tensor_consumers[t])
+                        if (groups[gj].ops.count(c2)) { consumed_in_gj = true; break; }
+                    if (!consumed_in_gj) { available = true; break; }
                 }
+
+                // Also check if cop's own group recomputes the producer
+                if (!available) {
+                    for (auto gj : groups_of(cop)) {
+                        if (!groups[gj].alive) continue;
+                        if (gj == exclude_ga || gj == exclude_gb) continue;
+                        if (groups[gj].ops.count((size_t)prod_op)) { available = true; break; }
+                    }
+                }
+
+                if (!available) return true;
             }
         }
     }
@@ -1052,36 +871,35 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
-            bool all_consumers_internal = true;
             bool any_consumer_internal = false;
+            for (auto cop : dag->tensor_consumers[t])
+                if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
+            if (!any_consumer_internal) continue;  // pure boundary output → safe
+
+            // T is ephemeral → external consumers need it from elsewhere
             for (auto cop : dag->tensor_consumers[t]) {
-                if (proposed_ops.count(cop))
-                    any_consumer_internal = true;
-                else
-                    all_consumers_internal = false;
-            }
-            if (!any_consumer_internal) continue;
-            if (!all_consumers_internal) continue;  // external consumer → boundary output
+                if (proposed_ops.count(cop)) continue;
 
-            int prod_op = dag->tensor_producer[t];
-            if (prod_op < 0) continue;
+                int prod_op = dag->tensor_producer[t];
+                if (prod_op < 0) continue;
 
-            bool available_from_other = false;
-            for (auto gj : groups_of((size_t)prod_op)) {
-                if (!groups[gj].alive || excluded.count(gj)) continue;
-                bool all_in_gj = true;
-                for (auto cop : dag->tensor_consumers[t])
-                    if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available_from_other = true; break; }
-            }
-            if (available_from_other) continue;
-
-            for (auto cop : dag->tensor_consumers[t]) {
-                for (auto gj : groups_of(cop)) {
+                bool available = false;
+                // Check non-excluded groups for boundary output of T
+                for (auto gj : groups_of((size_t)prod_op)) {
                     if (!groups[gj].alive || excluded.count(gj)) continue;
-                    if (groups[gj].ops.count((size_t)prod_op)) continue;
-                    return true;
+                    bool consumed_in_gj = false;
+                    for (auto c2 : dag->tensor_consumers[t])
+                        if (groups[gj].ops.count(c2)) { consumed_in_gj = true; break; }
+                    if (!consumed_in_gj) { available = true; break; }
                 }
+                // Check if cop's group recomputes producer
+                if (!available) {
+                    for (auto gj : groups_of(cop)) {
+                        if (!groups[gj].alive || excluded.count(gj)) continue;
+                        if (groups[gj].ops.count((size_t)prod_op)) { available = true; break; }
+                    }
+                }
+                if (!available) return true;
             }
         }
     }
@@ -1110,61 +928,55 @@ bool Partition::split_creates_ephemeral_gap(
 
         for (auto op : comp) {
             for (auto t : prob->ops[op].outputs) {
-                // New ephemeral rule: T is ephemeral only if ALL DAG
-                // consumers are inside this component.
-                bool all_consumers_in_comp = true;
+                // T is ephemeral in this component if any consumer is internal
                 bool any_consumer_in_comp = false;
-                for (auto cop : dag->tensor_consumers[t]) {
-                    if (comp.count(cop))
-                        any_consumer_in_comp = true;
-                    else
-                        all_consumers_in_comp = false;
-                }
-                if (!any_consumer_in_comp) continue;
-                if (!all_consumers_in_comp) continue;  // external → boundary output
+                for (auto cop : dag->tensor_consumers[t])
+                    if (comp.count(cop)) { any_consumer_in_comp = true; break; }
+                if (!any_consumer_in_comp) continue;  // pure boundary output → safe
 
                 int prod_op = dag->tensor_producer[t];
                 if (prod_op < 0) continue;
 
-                bool t_available = false;
-
-                // Check sibling components: T is boundary output of cj if
-                // cj has the producer and NOT all consumers are in cj.
-                for (size_t cj = 0; cj < components.size() && !t_available; cj++) {
-                    if (cj == ci) continue;
-                    if (!components[cj].count((size_t)prod_op)) continue;
-                    bool all_in_cj = true;
-                    for (auto cop : dag->tensor_consumers[t])
-                        if (!components[cj].count(cop)) { all_in_cj = false; break; }
-                    if (!all_in_cj) t_available = true;
-                }
-                // Check existing non-excluded groups
-                for (auto gj : groups_of((size_t)prod_op)) {
-                    if (t_available) break;
-                    if (!groups[gj].alive || excluded.count(gj)) continue;
-                    bool all_in_gj = true;
-                    for (auto cop : dag->tensor_consumers[t])
-                        if (!groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                    if (!all_in_gj) t_available = true;
-                }
-
-                if (t_available) continue;
-
+                // External consumers need T from elsewhere
                 for (auto cop : dag->tensor_consumers[t]) {
+                    if (comp.count(cop)) continue;  // internal → served
+
                     bool served = false;
+
+                    // Check sibling components: T is boundary output of cj if
+                    // cj produces T and does NOT consume T internally
+                    for (size_t cj = 0; cj < components.size() && !served; cj++) {
+                        if (cj == ci) continue;
+                        if (!components[cj].count((size_t)prod_op)) continue;
+                        bool consumed_in_cj = false;
+                        for (auto c2 : dag->tensor_consumers[t])
+                            if (components[cj].count(c2)) { consumed_in_cj = true; break; }
+                        if (!consumed_in_cj) served = true;
+                    }
+
+                    // Check if cop's sibling component recomputes producer
                     for (size_t cj = 0; cj < components.size() && !served; cj++)
                         if (components[cj].count(cop) && components[cj].count((size_t)prod_op))
                             served = true;
-                    if (served) continue;
 
+                    // Check existing non-excluded groups
+                    for (auto gj : groups_of((size_t)prod_op)) {
+                        if (served) break;
+                        if (!groups[gj].alive || excluded.count(gj)) continue;
+                        bool consumed_in_gj = false;
+                        for (auto c2 : dag->tensor_consumers[t])
+                            if (groups[gj].ops.count(c2)) { consumed_in_gj = true; break; }
+                        if (!consumed_in_gj) served = true;
+                    }
+
+                    // Check if cop's existing group recomputes producer
                     for (auto gj : groups_of(cop)) {
                         if (served) break;
                         if (!groups[gj].alive || excluded.count(gj)) continue;
                         if (groups[gj].ops.count((size_t)prod_op)) served = true;
                     }
-                    if (served) continue;
 
-                    return true;
+                    if (!served) return true;
                 }
             }
         }

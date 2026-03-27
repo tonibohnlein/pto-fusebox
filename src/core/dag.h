@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/types.h"
+#include <bit>
 #include <cstdint>
 #include <set>
 #include <vector>
@@ -14,8 +15,8 @@ struct DAG {
 
     std::vector<int> tensor_producer;                  // tensor -> producing op (-1 = graph input)
     std::vector<std::vector<size_t>> tensor_consumers; // tensor -> consuming ops
-    std::vector<std::set<size_t>> op_preds;            // op -> predecessor ops
-    std::vector<std::set<size_t>> op_succs;            // op -> successor ops
+    std::vector<std::vector<size_t>> op_preds;         // op -> predecessor ops (sorted, unique)
+    std::vector<std::vector<size_t>> op_succs;         // op -> successor ops (sorted, unique)
 
     // Expanded adjacency: DAG edges + co-consumer edges (undirected).
     // op_neighbors[i] includes all ops j such that i→j, j→i, or i and j
@@ -71,7 +72,7 @@ struct DAG {
     // Returns false if either index is out of bounds.
     bool can_reach(size_t u, size_t v) const {
         if (u >= num_ops || v >= num_ops) return false;
-        return (reachable_[u * words_per_row_ + v / 64] >> (v % 64)) & 1u;
+        return (reachable_[u * words_per_row_ + v / 64] >> (v % 64)) & 1ULL;
     }
 
     // Return the cached topological position of op. O(1).
@@ -83,12 +84,6 @@ struct DAG {
 
     // Longest directed path length (number of edges). O(1).
     size_t longest_chain() const { return longest_chain_; }
-
-    // Compute the union of everything reachable from all ops in the given
-    // bitmask. Returns a bitmask of the same width (words_per_row_ words).
-    // Used by the partition layer to answer "what lies between group A and B?"
-    // without the set → bitmask conversion overhead.
-    std::vector<uint64_t> reachable_from_mask(const std::vector<uint64_t>& mask) const;
 
 private:
     // Fills reachable_ using a reverse-topo DP pass.  Called once by build().

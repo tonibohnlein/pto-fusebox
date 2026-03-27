@@ -21,59 +21,8 @@ static std::vector<int> build_op_to_group(const Partition& p) {
     return m;
 }
 
-// Try merging groups ga and gb. Returns true if merge improved cost.
-// Standalone inline ephemeral gap check for a proposed merged op-set.
-// Checks at PARTITION level (not just DAG level) whether any alive group
-// would be stranded by T becoming ephemeral. This handles recomputation:
-// Op3 might be in both merged AND in G3, so the DAG-level "no ext consumer"
-// shortcut is wrong — G3 still needs T from slow memory.
-static bool inline_gap_check(const Partition& p, const std::set<size_t>& merged,
-                              size_t ga, size_t gb) {
-    const Problem& prob = *p.prob;
-    const DAG& dag = *p.dag;
-    for (auto op : merged) {
-        for (auto t : prob.ops[op].outputs) {
-            // New ephemeral rule: T is ephemeral only if ALL DAG consumers
-            // are inside the merged set. Any external consumer → boundary output.
-            bool all_internal = true;
-            bool any_internal = false;
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (merged.count(cop))
-                    any_internal = true;
-                else
-                    all_internal = false;
-            }
-            if (!any_internal) continue;   // pure boundary output
-            if (!all_internal) continue;   // external consumer → boundary output
-
-            // T would be purely ephemeral in merged. Check partition-level availability.
-            int prod_op = dag.tensor_producer[t];
-            if (prod_op < 0) continue;
-
-            bool available = false;
-            for (auto gj : p.groups_of((size_t)prod_op)) {
-                if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                // T is boundary output of gj if NOT all consumers are in gj
-                bool all_in_gj = true;
-                for (auto cop : dag.tensor_consumers[t])
-                    if (!p.groups[gj].ops.count(cop)) { all_in_gj = false; break; }
-                if (!all_in_gj) { available = true; break; }
-            }
-            if (available) continue;
-
-            for (auto cop : dag.tensor_consumers[t]) {
-                for (auto gj : p.groups_of(cop)) {
-                    if (gj == ga || gj == gb || !p.groups[gj].alive) continue;
-                    if (!p.groups[gj].ops.count((size_t)prod_op))
-                        return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-static bool try_merge(Partition& p, size_t ga, size_t gb) {
+static bool try_merge(Partition& p, size_t ga, size_t gb,
+                      std::vector<int>& op_grp) {
     if (ga == gb || !p.groups[ga].alive || !p.groups[gb].alive) return false;
 
     if (p.dag->merge_creates_cycle(p.groups[ga].ops, p.groups[gb].ops)) return false;
@@ -81,7 +30,7 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
     std::set<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
 
-    if (inline_gap_check(p, merged, ga, gb)) return false;
+    if (p.creates_ephemeral_gap(merged, ga, gb)) return false;
 
     double new_cost = p.eval_set(merged);
 
@@ -92,6 +41,9 @@ static bool try_merge(Partition& p, size_t ga, size_t gb) {
         p.groups[gb].alive = false;
         p.groups[gb].gen++;
         p.rebuild_index();
+        // Incremental op_grp update: all ops in the merged group now map to ga.
+        for (auto op : p.groups[ga].ops)
+            op_grp[op] = (int)ga;
         return true;
     }
     return false;
@@ -139,8 +91,7 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag, CostCache* c
             for (size_t j = 1; j < chain.size(); j++) {
                 size_t ga = op_grp[chain[0]];
                 size_t gb = op_grp[chain[j]];
-                if (try_merge(p, ga, gb))
-                    op_grp = build_op_to_group(p);
+                if (try_merge(p, ga, gb, op_grp)) {}
             }
             for (auto op : chain) in_chain[op] = true;
         }
@@ -163,19 +114,14 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag, CostCache* c
     std::sort(edges.begin(), edges.end(),
               [](const Edge& a, const Edge& b) { return a.size > b.size; });
 
-    op_grp = build_op_to_group(p);
     for (auto& e : edges) {
         int ga = op_grp[e.producer];
         int gb = op_grp[e.consumer];
         if (ga < 0 || gb < 0) continue;
-        if (try_merge(p, (size_t)ga, (size_t)gb))
-            op_grp = build_op_to_group(p);
+        try_merge(p, (size_t)ga, (size_t)gb, op_grp);
     }
 
     // Phase C: co-consumer merging by shared tensor size
-    // For each tensor (including graph inputs), try merging pairs of consumer
-    // groups. This captures the benchmark-13 pattern where parallel ops share
-    // a large input tensor.
     struct SharedTensor {
         size_t tensor;
         int64_t size;
@@ -192,7 +138,6 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag, CostCache* c
                   return a.size > b.size;
               });
 
-    op_grp = build_op_to_group(p);
     for (auto& st : shared_tensors) {
         auto& consumers = dag.tensor_consumers[st.tensor];
         for (size_t i = 0; i < consumers.size(); i++) {
@@ -200,8 +145,7 @@ Partition init_chain_then_edge(const Problem& prob, const DAG& dag, CostCache* c
                 int ga = op_grp[consumers[i]];
                 int gb = op_grp[consumers[j]];
                 if (ga < 0 || gb < 0 || ga == gb) continue;
-                if (try_merge(p, (size_t)ga, (size_t)gb))
-                    op_grp = build_op_to_group(p);
+                try_merge(p, (size_t)ga, (size_t)gb, op_grp);
             }
         }
     }
@@ -254,55 +198,49 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
             for (auto cand : neighbors) {
                 if (p.dag->merge_creates_cycle({cand}, group)) continue;
 
-                std::set<size_t> expanded = group;
-                expanded.insert(cand);
+                // Insert candidate in place, evaluate, then erase (avoids
+                // heap-allocating a copy of the entire set for each candidate).
+                group.insert(cand);
 
-                // New ephemeral rule: T is ephemeral only if ALL DAG consumers
-                // are inside expanded. If any consumer is external, T becomes
-                // a boundary output → no gap possible from this tensor.
-                //
-                // During init, no recomputation exists (each op in at most one
-                // group), so if all consumers are internal, no external group
-                // can need T. Gap check is only needed for partition-level
-                // recomputation scenarios, which don't occur during init.
-                // We still check for safety in case future callers reuse this.
+                // Ephemeral gap check: T is ephemeral if produced AND consumed
+                // inside group. If T also has external consumers, those are
+                // stranded (T never in slow memory). During init, no
+                // recomputation exists, so this is always invalid.
                 bool has_gap = false;
-                for (auto op_i : expanded) {
+                for (auto op_i : group) {
                     for (auto t : prob.ops[op_i].outputs) {
-                        bool all_in = true;
                         bool any_in = false;
+                        bool any_out = false;
                         for (auto cop : dag.tensor_consumers[t]) {
-                            if (expanded.count(cop)) any_in = true;
-                            else all_in = false;
+                            if (group.count(cop)) any_in = true;
+                            else any_out = true;
                         }
-                        if (!any_in || !all_in) continue;  // boundary output or pure output
-
-                        // T is purely ephemeral. During init (no recomputation),
-                        // this means no external group needs T. Safe.
-                        // With recomputation, check partition-level availability.
-                        int prod_op_t = dag.tensor_producer[t];
-                        if (prod_op_t < 0) continue;
-                        for (auto cop : dag.tensor_consumers[t]) {
-                            if (has_gap) break;
-                            for (auto gj : p.groups_of(cop)) {
-                                if (!p.groups[gj].alive) continue;
-                                // gj needs T unless gj also has the producer
-                                if (!p.groups[gj].ops.count((size_t)prod_op_t)) {
-                                    has_gap = true;
-                                    break;
+                        if (any_in && any_out) {
+                            int prod_op_t = dag.tensor_producer[t];
+                            if (prod_op_t < 0) continue;
+                            for (auto cop : dag.tensor_consumers[t]) {
+                                if (has_gap) break;
+                                if (group.count(cop)) continue;
+                                bool served = false;
+                                for (auto gj : p.groups_of(cop)) {
+                                    if (!p.groups[gj].alive) continue;
+                                    if (p.groups[gj].ops.count((size_t)prod_op_t))
+                                        { served = true; break; }
                                 }
+                                if (!served) has_gap = true;
                             }
                         }
                     }
                     if (has_gap) break;
                 }
-                if (has_gap) continue;
 
-                double cost = p.eval_set(expanded);
-                if (cost < best_cost - 0.01) {
+                double cost = has_gap ? 1e18 : p.eval_set(group);
+                if (!has_gap && cost < best_cost - 0.01) {
                     best_cost = cost;
                     best_op = cand;
                 }
+
+                group.erase(cand);  // backtrack
             }
 
             if (best_op != SIZE_MAX) {
@@ -349,13 +287,18 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
         size_t best_gj = SIZE_MAX;
         double best_saving = 0;
 
-        // Collect candidate groups from all neighbors (DAG edges + shared inputs)
-        std::set<int> candidate_groups;
+        // Collect candidate groups from all neighbors (DAG edges + shared inputs).
+        // Use a flat vector + sort/unique — typically only 1-5 entries.
+        std::vector<int> candidate_groups;
         for (auto v : dag.op_neighbors[op]) {
             int gj = op_grp[v];
             if (gj >= 0 && (size_t)gj != (size_t)gi)
-                candidate_groups.insert(gj);
+                candidate_groups.push_back(gj);
         }
+        std::sort(candidate_groups.begin(), candidate_groups.end());
+        candidate_groups.erase(std::unique(candidate_groups.begin(),
+                                            candidate_groups.end()),
+                               candidate_groups.end());
 
         for (int gj : candidate_groups) {
 
@@ -364,7 +307,7 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
             std::set<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[gj].ops.begin(), p.groups[gj].ops.end());
 
-            if (inline_gap_check(p, merged, (size_t)gi, (size_t)gj)) continue;
+            if (p.creates_ephemeral_gap(merged, (size_t)gi, (size_t)gj)) continue;
 
             double new_cost = p.eval_set(merged);
             double saving = (p.groups[gi].cost + p.groups[gj].cost) - new_cost;
@@ -376,8 +319,21 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
         }
 
         if (best_gj != SIZE_MAX) {
-            try_merge(p, (size_t)gi, best_gj);
-            op_grp = build_op_to_group(p);
+            // Inline the merge directly — we already verified cycle/gap/cost above.
+            // try_merge would re-evaluate (cache hit but redundant).
+            std::set<size_t> merged = p.groups[gi].ops;
+            merged.insert(p.groups[best_gj].ops.begin(), p.groups[best_gj].ops.end());
+            double new_cost = p.eval_set(merged);  // cache hit from above
+            if (new_cost < p.groups[gi].cost + p.groups[best_gj].cost - 0.01) {
+                p.groups[gi].ops = std::move(merged);
+                p.groups[gi].cost = new_cost;
+                p.groups[gi].gen++;
+                p.groups[best_gj].alive = false;
+                p.groups[best_gj].gen++;
+                p.rebuild_index();
+                // Incremental op_grp update
+                for (auto o : p.groups[gi].ops) op_grp[o] = (int)gi;
+            }
         }
     }
 
@@ -411,7 +367,8 @@ Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
     std::shuffle(edges.begin(), edges.end(), rng);
 
     // Try merging a random fraction of edges (30-70%)
-    int target_merges = (int)(edges.size() * (0.3 + 0.4 * (rng() % 1000) / 1000.0));
+    std::uniform_real_distribution<double> frac_dist(0.3, 0.7);
+    int target_merges = (int)(edges.size() * frac_dist(rng));
     int merges_done = 0;
 
     for (auto& e : edges) {
@@ -431,7 +388,7 @@ Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
         // Try merge — accept if subgraph is valid (feasible tiling exists)
         std::set<size_t> merged = p.groups[ga].ops;
         merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
-        if (inline_gap_check(p, merged, ga, gb)) continue;
+        if (p.creates_ephemeral_gap(merged, ga, gb)) continue;
         double new_cost = p.eval_set(merged);
         if (new_cost >= 1e17) continue; // infeasible
 
@@ -491,6 +448,15 @@ std::string verify_partition_feasibility(const Partition& part) {
     const Problem& prob = *part.prob;
     const DAG&     dag  = *part.dag;
 
+    // ── 0. Coverage: every op must be in at least one alive group ─────
+    for (size_t op = 0; op < prob.num_ops(); op++) {
+        bool covered = false;
+        for (auto gi : part.groups_of(op))
+            if (part.groups[gi].alive) { covered = true; break; }
+        if (!covered)
+            return "Op " + std::to_string(op) + " not covered by any alive group";
+    }
+
     // ── 1. Memory feasibility: every alive group must have a valid tiling ──
     for (size_t i = 0; i < part.groups.size(); i++) {
         if (!part.groups[i].alive) continue;
@@ -511,16 +477,57 @@ std::string verify_partition_feasibility(const Partition& part) {
     }
 
     // ── 2. No cycles in the condensed group DAG ───────────────────────────
-    // The condensed group DAG of any partition of a DAG is always acyclic —
-    // this is a direct consequence of the original graph being a DAG.
-    // No check is needed here.
-    //
-    // Note: merge_creates_cycle(A, B) is a *move pre-condition*, not a partition
-    // invariant. It returns true when there is a directed path between op-sets A
-    // and B through intermediate groups; merging them would then create a
-    // self-loop in the condensed DAG. That check belongs in try_merge / apply_move,
-    // not here.
+    if (!part.is_acyclic())
+        return "Partition has a cycle in the condensed group DAG";
 
+    // ── 3. No mixed-consumer violations (ephemeral gap) ─────────────────
+    // A tensor produced AND consumed inside a group is ephemeral (never in
+    // slow memory). Any external consumer must either:
+    //   (a) have the producer recomputed in its own group, OR
+    //   (b) another alive group exports the tensor as a boundary output
+    //       (produced but not consumed internally → written to slow memory).
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        for (auto op : part.groups[gi].ops) {
+            for (auto t : prob.ops[op].outputs) {
+                bool consumed_internal = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (cop != op && part.groups[gi].ops.count(cop))
+                        { consumed_internal = true; break; }
+                if (!consumed_internal) continue;
+
+                for (auto cop : dag.tensor_consumers[t]) {
+                    if (part.groups[gi].ops.count(cop)) continue;
+                    bool covered = false;
+
+                    // (a) consumer's group recomputes the producer
+                    for (auto gj : part.groups_of(cop)) {
+                        if (!part.groups[gj].alive) continue;
+                        if (part.groups[gj].ops.count(op)) { covered = true; break; }
+                    }
+
+                    // (b) another group exports T as boundary output
+                    if (!covered) {
+                        for (auto gj : part.groups_of(op)) {
+                            if (gj == gi || !part.groups[gj].alive) continue;
+                            // T is boundary output of gj if gj produces T
+                            // but doesn't consume T internally
+                            bool consumed_in_gj = false;
+                            for (auto c2 : dag.tensor_consumers[t])
+                                if (part.groups[gj].ops.count(c2))
+                                    { consumed_in_gj = true; break; }
+                            if (!consumed_in_gj) { covered = true; break; }
+                        }
+                    }
+
+                    if (!covered)
+                        return "G" + std::to_string(gi) + ": T" + std::to_string(t)
+                             + " is ephemeral but has uncovered external consumer op"
+                             + std::to_string(cop);
+                }
+            }
+        }
+    }
 
     return "";  // all invariants satisfied
 }

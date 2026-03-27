@@ -30,7 +30,8 @@
 // Feasibility invariants enforced by every strategy:
 //   1. Memory: every alive group has eval_set() < 1e18 (valid tiling exists).
 //   2. No cycles: merge_creates_cycle checked before every merge.
-//   3. No ephemeral gap: creates_ephemeral_gap checked before every merge.
+//   3. No ephemeral gap: produced+consumed tensors are ephemeral; any
+//      external consumer must have the producer recomputed in its group.
 //   (PW-sink k=1 constraint is enforced inside Subgraph::is_valid_tiling,
 //    automatically respected by best_cost/eval_set.)
 // ============================================================================
@@ -74,15 +75,13 @@ Partition best_initial(const Problem& prob, const DAG& dag,
 // ============================================================================
 // Feasibility validator
 //
-// Checks the two meaningful invariants for a partition produced by any init strategy:
+// Checks the four invariants for a valid partition:
+//   0. Coverage: every op is in at least one alive group.
 //   1. Memory: every alive group has a feasible tiling (eval_set < 1e18).
-//   2. No ephemeral gap: no tensor would be ephemeral in its producing group
-//      while an external consumer group has no other source.
-//
-// Note: a "no cycles in condensed DAG" check is NOT included here because the
-// condensed group DAG of any partition of a DAG is always acyclic by definition.
-// merge_creates_cycle is a pre-condition on MERGE moves in the search, not a
-// partition invariant.
+//   2. Acyclicity: the condensed group DAG has no cycles.
+//   3. No ephemeral gap: if a tensor is ephemeral (produced + consumed in
+//      a group), every external consumer has the producer recomputed in
+//      its own group.
 //
 // Returns an empty string on success, or a description of the first violation.
 // Primarily for testing and debug assertions; not called on the hot path.

@@ -75,11 +75,16 @@ struct MerkleHashes {
             size_t h = (prob.ops[i].type == OpType::MatMul) ? 0xAA55AA55ULL : 0x55AA55AAULL;
             h = hash_combine(h, (size_t)prob.ops[i].base_cost);
 
-            // Hash input tensor shapes (sorted for permutation invariance)
+            // Hash input tensor shapes.
+            // For MatMul, input order matters (inputs[0]=LHS, inputs[1]=RHS,
+            // different K dimensions). Hash in declaration order.
+            // For Pointwise, input order is interchangeable — sort for
+            // permutation invariance.
             std::vector<std::pair<int64_t,int64_t>> in_shapes;
             for (auto t : prob.ops[i].inputs)
                 in_shapes.push_back({prob.tensors[t].width, prob.tensors[t].height});
-            std::sort(in_shapes.begin(), in_shapes.end());
+            if (prob.ops[i].type != OpType::MatMul)
+                std::sort(in_shapes.begin(), in_shapes.end());
             for (auto [w, ht] : in_shapes) {
                 h = hash_combine(h, (size_t)w);
                 h = hash_combine(h, (size_t)ht);
@@ -109,35 +114,38 @@ struct MerkleHashes {
         auto topo = dag.topo_sort();
         mh.fwd = mh.init;
 
-        for (int iter = 0; iter < iters; iter++) {
+        {
             std::vector<size_t> new_fwd(n);
-            for (auto op : topo) {
-                size_t h = mh.init[op];
+            std::vector<size_t> pred_hashes;  // reused across ops
+            for (int iter = 0; iter < iters; iter++) {
+                bool changed = false;
+                for (auto op : topo) {
+                    size_t h = mh.init[op];
 
-                // Collect predecessor hashes via input tensors
-                std::vector<size_t> pred_hashes;
-                for (auto t : prob.ops[op].inputs) {
-                    int prod = dag.tensor_producer[t];
-                    if (prod >= 0) {
-                        // Internal tensor: hash = fwd[producer] + tensor shape
-                        size_t th = hash_combine(mh.fwd[prod], (size_t)prob.tensors[t].width);
-                        th = hash_combine(th, (size_t)prob.tensors[t].height);
-                        pred_hashes.push_back(th);
-                    } else {
-                        // Graph input: hash tensor identity (shape + number of consumers)
-                        size_t th = hash_combine(0xFEEDFACEULL, (size_t)prob.tensors[t].width);
-                        th = hash_combine(th, (size_t)prob.tensors[t].height);
-                        th = hash_combine(th, dag.tensor_consumers[t].size());
-                        pred_hashes.push_back(th);
+                    pred_hashes.clear();
+                    for (auto t : prob.ops[op].inputs) {
+                        int prod = dag.tensor_producer[t];
+                        if (prod >= 0) {
+                            size_t th = hash_combine(mh.fwd[prod], (size_t)prob.tensors[t].width);
+                            th = hash_combine(th, (size_t)prob.tensors[t].height);
+                            pred_hashes.push_back(th);
+                        } else {
+                            size_t th = hash_combine(0xFEEDFACEULL, (size_t)prob.tensors[t].width);
+                            th = hash_combine(th, (size_t)prob.tensors[t].height);
+                            th = hash_combine(th, dag.tensor_consumers[t].size());
+                            pred_hashes.push_back(th);
+                        }
                     }
-                }
-                std::sort(pred_hashes.begin(), pred_hashes.end());
-                for (auto ph : pred_hashes)
-                    h = hash_combine(h, ph);
+                    std::sort(pred_hashes.begin(), pred_hashes.end());
+                    for (auto ph : pred_hashes)
+                        h = hash_combine(h, ph);
 
-                new_fwd[op] = h;
+                    new_fwd[op] = h;
+                    if (h != mh.fwd[op]) changed = true;
+                }
+                if (!changed) break;
+                std::swap(mh.fwd, new_fwd);
             }
-            mh.fwd = new_fwd;
         }
 
         // ================================================================
@@ -149,37 +157,40 @@ struct MerkleHashes {
         // ================================================================
         mh.bwd = mh.init;
 
-        for (int iter = 0; iter < iters; iter++) {
+        {
             std::vector<size_t> new_bwd(n);
-            for (int idx = (int)topo.size() - 1; idx >= 0; idx--) {
-                size_t op = topo[idx];
-                size_t h = mh.init[op];
+            std::vector<size_t> succ_hashes;  // reused across ops
+            for (int iter = 0; iter < iters; iter++) {
+                bool changed = false;
+                for (int idx = (int)topo.size() - 1; idx >= 0; idx--) {
+                    size_t op = topo[idx];
+                    size_t h = mh.init[op];
 
-                // Collect successor hashes via output tensors
-                std::vector<size_t> succ_hashes;
-                for (auto t : prob.ops[op].outputs) {
-                    auto& consumers = dag.tensor_consumers[t];
-                    if (consumers.empty()) {
-                        // Graph output: terminal tensor
-                        size_t th = hash_combine(0xCAFEBABEULL, (size_t)prob.tensors[t].width);
-                        th = hash_combine(th, (size_t)prob.tensors[t].height);
-                        succ_hashes.push_back(th);
-                    } else {
-                        // Internal: hash each consumer's bwd hash + tensor shape
-                        for (auto cons : consumers) {
-                            size_t th = hash_combine(mh.bwd[cons], (size_t)prob.tensors[t].width);
+                    succ_hashes.clear();
+                    for (auto t : prob.ops[op].outputs) {
+                        auto& consumers = dag.tensor_consumers[t];
+                        if (consumers.empty()) {
+                            size_t th = hash_combine(0xCAFEBABEULL, (size_t)prob.tensors[t].width);
                             th = hash_combine(th, (size_t)prob.tensors[t].height);
                             succ_hashes.push_back(th);
+                        } else {
+                            for (auto cons : consumers) {
+                                size_t th = hash_combine(mh.bwd[cons], (size_t)prob.tensors[t].width);
+                                th = hash_combine(th, (size_t)prob.tensors[t].height);
+                                succ_hashes.push_back(th);
+                            }
                         }
                     }
-                }
-                std::sort(succ_hashes.begin(), succ_hashes.end());
-                for (auto sh : succ_hashes)
-                    h = hash_combine(h, sh);
+                    std::sort(succ_hashes.begin(), succ_hashes.end());
+                    for (auto sh : succ_hashes)
+                        h = hash_combine(h, sh);
 
-                new_bwd[op] = h;
+                    new_bwd[op] = h;
+                    if (h != mh.bwd[op]) changed = true;
+                }
+                if (!changed) break;
+                std::swap(mh.bwd, new_bwd);
             }
-            mh.bwd = new_bwd;
         }
 
         // ================================================================
@@ -195,3 +206,43 @@ struct MerkleHashes {
         return mh;
     }
 };
+
+// ============================================================================
+// Merkle-aware ARI canonicalisation
+//
+// Within each Merkle equivalence class (structurally symmetric ops), sort ops
+// by their assignment in map_a, then match them rank-for-rank to ops sorted
+// by their assignment in map_b.  This makes symmetric variants have distance 0
+// instead of a spurious non-zero ARI distance.
+//
+// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
+// ============================================================================
+inline void merkle_canonicalise(
+        const MerkleHashes& mh,
+        const std::vector<int>& map_a,
+        std::vector<int>& map_b)   // modified in-place
+{
+    for (auto& [hash, ops] : mh.equiv_classes) {
+        if (ops.size() <= 1) continue;
+
+        std::vector<size_t> by_a(ops.begin(), ops.end());
+        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
+            int gx = (x < map_a.size()) ? map_a[x] : -1;
+            int gy = (y < map_a.size()) ? map_a[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        std::vector<size_t> by_b(ops.begin(), ops.end());
+        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
+            int gx = (x < map_b.size()) ? map_b[x] : -1;
+            int gy = (y < map_b.size()) ? map_b[y] : -1;
+            return gx != gy ? gx < gy : x < y;
+        });
+
+        std::vector<int> new_b(ops.size());
+        for (size_t i = 0; i < ops.size(); i++)
+            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
+        for (size_t i = 0; i < ops.size(); i++)
+            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
+    }
+}

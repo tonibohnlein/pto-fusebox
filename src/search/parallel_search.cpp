@@ -1,5 +1,7 @@
 #include "search/parallel_search.h"
 #include "search/verbose.h"
+#include "search/pool.h"
+#include "search/symm_mutations.h"
 #include "init/init_strategies.h"
 #include "init/symm_init.h"
 #include "search/local_search.h"
@@ -21,49 +23,6 @@
 #include <atomic>
 
 using Clock = std::chrono::steady_clock;
-
-// ============================================================================
-// Merkle-aware ARI canonicalisation
-//
-// Within each Merkle equivalence class (structurally symmetric ops), sort ops
-// by their assignment in map_a, then match them rank-for-rank to ops sorted
-// by their assignment in map_b.  This makes symmetric variants have distance 0
-// instead of a spurious non-zero ARI distance.
-//
-// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
-// ============================================================================
-static void merkle_canonicalise(
-        const MerkleHashes& mh,
-        const std::vector<int>& map_a,
-        std::vector<int>& map_b)   // modified in-place
-{
-    for (auto& [hash, ops] : mh.equiv_classes) {
-        if (ops.size() <= 1) continue;
-
-        // Sort ops by their assignment in A (break ties by op index for stability)
-        std::vector<size_t> by_a(ops.begin(), ops.end());
-        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
-            int gx = (x < map_a.size()) ? map_a[x] : -1;
-            int gy = (y < map_a.size()) ? map_a[y] : -1;
-            return gx != gy ? gx < gy : x < y;
-        });
-
-        // Sort ops by their assignment in B
-        std::vector<size_t> by_b(ops.begin(), ops.end());
-        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
-            int gx = (x < map_b.size()) ? map_b[x] : -1;
-            int gy = (y < map_b.size()) ? map_b[y] : -1;
-            return gx != gy ? gx < gy : x < y;
-        });
-
-        // Match rank-for-rank: A's i-th op gets B's i-th op's assignment
-        std::vector<int> new_b(ops.size());
-        for (size_t i = 0; i < ops.size(); i++)
-            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
-        for (size_t i = 0; i < ops.size(); i++)
-            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
-    }
-}
 
 // ============================================================================
 // Pool entry
@@ -152,77 +111,8 @@ static double partition_distance(const Partition& a, const Partition& b,
 // Pool management
 // ============================================================================
 
-static bool pool_insert(std::vector<PoolEntry>& pool, PoolEntry entry,
-                         size_t max_pool,
-                         const MerkleHashes* mh = nullptr) {
-    // Compute min distance to existing entries
-    double min_dist = 1.0;
-    size_t closest_idx = 0;
-    for (size_t i = 0; i < pool.size(); i++) {
-        double dist = partition_distance(pool[i].partition, entry.partition, mh);
-        if (dist < min_dist) {
-            min_dist = dist;
-            closest_idx = i;
-        }
-    }
-
-    // Near-duplicate: only replace if strictly better
-    // ARI distance: 0 = identical, 1 = maximally different
-    if (min_dist < 0.05) {
-        if (entry.cost < pool[closest_idx].cost - 0.01) {
-            pool[closest_idx] = std::move(entry);
-            return true;
-        }
-        return false;
-    }
-
-    // Pool not full: always add
-    if (pool.size() < max_pool) {
-        pool.push_back(std::move(entry));
-        return true;
-    }
-
-    // Pool full: diversity-aware eviction.
-    // Never evict the best-cost entry.
-    size_t best_cost_idx = 0;
-    for (size_t i = 1; i < pool.size(); i++)
-        if (pool[i].cost < pool[best_cost_idx].cost) best_cost_idx = i;
-
-    // Find the least-unique entry (smallest nearest-neighbor distance), excluding best
-    size_t least_unique = SIZE_MAX;
-    double least_unique_dist = 2.0;
-    for (size_t i = 0; i < pool.size(); i++) {
-        if (i == best_cost_idx) continue;
-        double nn_dist = 1.0;
-        for (size_t j = 0; j < pool.size(); j++) {
-            if (i == j) continue;
-            double d = partition_distance(pool[i].partition, pool[j].partition, mh);
-            nn_dist = std::min(nn_dist, d);
-        }
-        if (nn_dist < least_unique_dist) {
-            least_unique_dist = nn_dist;
-            least_unique = i;
-        }
-    }
-
-    if (least_unique == SIZE_MAX) return false;
-
-    // Replace least-unique if candidate brings more diversity or better cost with diversity
-    bool more_diverse = (min_dist > least_unique_dist + 0.05);
-    bool better_cost = (entry.cost < pool[least_unique].cost - 0.01);
-    bool decent_diversity = (min_dist > 0.10);
-
-    if (more_diverse || (better_cost && decent_diversity)) {
-        pool[least_unique] = std::move(entry);
-        return true;
-    }
-    return false;
-}
-
-static void pool_sort(std::vector<PoolEntry>& pool) {
-    std::sort(pool.begin(), pool.end(),
-              [](const PoolEntry& a, const PoolEntry& b) { return a.cost < b.cost; });
-}
+// Pool management is handled by DiversityPool<PoolEntry> (see pool.h).
+// partition_distance() is passed as the distance function at construction.
 
 // ============================================================================
 // Parallel generational search
@@ -237,7 +127,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     if (hw_threads <= 0) hw_threads = 4;
     int num_threads = cfg.num_threads > 0 ? cfg.num_threads : hw_threads;
 
-    CostCache shared_cache;
+    CostCache local_cache;
+    CostCache& shared_cache = cfg.cache ? *cfg.cache : local_cache;
     std::mutex log_mutex;
 
     // Compute Merkle hashes once — used for symmetry-aware pool deduplication
@@ -252,24 +143,11 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     bool has_deadline = (deadline != TimePoint::max());
 
     // ================================================================
-    // Generation 0: init strategies → greedy+tabu+FM
-    // Fill all threads: multiple seeds per strategy if we have spare threads.
+    // Task list: init strategies for gen0, then evo work
     // ================================================================
 
-    auto gen0_deadline = deadline;
-    if (has_deadline) {
-        auto total = deadline - Clock::now();
-        gen0_deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(total * 5 / 10);
-    }
-
-    FMOuterConfig gen0_fm = cfg.fm;
-    gen0_fm.deadline = gen0_deadline;
-
     int tasks_per_strategy = std::max(1, num_threads / num_strategies);
-    int gen0_tasks = num_strategies * tasks_per_strategy;
 
-    // If we still have spare threads, fill with extra random inits
-    // (random strategy produces different results each call)
     int random_idx = -1;
     for (int s = 0; s < num_strategies; s++)
         if (strategies[s].name == "random") { random_idx = s; break; }
@@ -283,342 +161,390 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     // Pad up to num_threads with random inits, reserving the last slot for symm
     if (random_idx >= 0) {
         int extra = num_threads - (int)gen0_task_list.size();
-        // Leave one slot for symm init
         for (int i = 0; i < extra - 1; i++)
-            gen0_task_list.push_back({random_idx,
-                (unsigned)(9999 + i * 31)});
+            gen0_task_list.push_back({random_idx, (unsigned)(9999 + i * 31)});
     }
     // Last task: symmetry-aware initialization
     gen0_task_list.push_back({random_idx >= 0 ? random_idx : 0, 10061, true});
-    gen0_tasks = (int)gen0_task_list.size();
+    int gen0_tasks = (int)gen0_task_list.size();
 
-    std::vector<PoolEntry> gen0_results(gen0_tasks);
-    std::vector<PoolEntry> gen0_end_partitions(gen0_tasks);  // perturbed states for diversity
-    std::vector<PoolEntry> gen0_greedy_results(gen0_tasks);  // pre-FM greedy results as fallback
-    std::vector<PoolEntry> gen0_symm_results;                // symm init results (variable count)
-    std::mutex symm_mutex;                                    // protects gen0_symm_results
+    FMOuterConfig gen0_fm = cfg.fm;
+    gen0_fm.max_passes = std::min(gen0_fm.max_passes, 50);
+    gen0_fm.deadline = deadline;
 
-    // Discovered patterns — stored for export to caller
+    // ================================================================
+    // Pool + shared state (created before workers launch)
+    // ================================================================
+
+    PoolConfig pool_cfg;
+    pool_cfg.hard_cap = cfg.pool_size;
+    DiversityPool<PoolEntry> pool(pool_cfg,
+        [&mhp](const PoolEntry& a, const PoolEntry& b) {
+            return partition_distance(a.partition, b.partition, mhp);
+        },
+        [](const PoolEntry& e) { return e.cost; }
+    );
+
+    // Symmetry context — built by the symm worker, published via atomic flag.
+    // Workers read symm_ctx only after symm_ready is true (acquire/release).
+    symm_mutations::PatternContext symm_ctx;
+    std::atomic<bool> symm_ready{false};
+
+    // Discovered patterns — written by symm worker, read after join.
     std::vector<SymmetricPattern> discovered_parallel;
     std::vector<SeriesPattern> discovered_series;
 
-    std::atomic<int> next_task{0};
+    std::atomic<int> next_gen0{0};
+    std::atomic<double> best_ever{1e18};
+    std::atomic<int> tasks_since_improve{0};
+    std::atomic<int> total_tasks{0};
+    std::atomic<int> init_tasks_done{0};
+    std::atomic<int> evo_tasks_done{0};
+    std::atomic<int> evo_improving{0};
+    std::atomic<int64_t> evo_fm_ms_total{0};      // total FM time across all evo tasks
+    std::atomic<int> evo_fm_passes_total{0};       // total FM inner passes across evo
+    int early_stop_threshold = num_threads * 25;
 
-    auto gen0_worker = [&]() {
-        g_verbose = false;  // suppress per-move output from worker threads
-        while (true) {
-            int tid = next_task.fetch_add(1);
-            if (tid >= gen0_tasks) break;
+    std::cerr << "  Init: " << gen0_tasks << " tasks on " << num_threads << " threads\n";
+
+    // ================================================================
+    // Unified async worker: gen0 task → evo loop
+    // ================================================================
+
+    auto worker = [&]() {
+        // VERBOSE=2 enables per-pass FM detail in worker threads
+        const char* venv = std::getenv("VERBOSE");
+        g_verbose = (venv && venv[0] == '2');
+        std::mt19937 rng(std::random_device{}());
+
+        // --- Phase A: pick a gen0 init task (if any remain) ---
+        int tid = next_gen0.fetch_add(1);
+        if (tid < gen0_tasks) {
             auto start = Clock::now();
             auto& task = gen0_task_list[tid];
 
-            // ============================================================
-            // Symmetry-aware initialization task
-            // ============================================================
+            // Symmetry-aware initialization
             if (task.is_symm) {
                 auto symm_parts = init_from_patterns(prob, dag, &shared_cache);
 
                 if (!symm_parts.empty()) {
-                    // Store discovered patterns for export
-                    {
-                        std::lock_guard<std::mutex> lock(symm_mutex);
-                        auto par_pats = SymmetryDetector::discover(prob, dag, mh, false);
-                        auto ser_pats = SeriesDetector::discover(prob, dag, mh, false);
-                        discovered_parallel = std::move(par_pats);
-                        discovered_series = std::move(ser_pats);
+                    // Discover patterns + build symm_ctx
+                    auto par_pats = SymmetryDetector::discover(prob, dag, mh, false);
+                    auto ser_pats = SeriesDetector::discover(prob, dag, mh, false);
 
-                        for (size_t i = 0; i < symm_parts.size(); i++) {
-                            double cost = symm_parts[i].total_cost();
-                            std::string name = "symm_" + std::to_string(i);
-                            gen0_symm_results.push_back(
-                                PoolEntry(std::move(symm_parts[i]), cost, name));
+                    symm_ctx = symm_mutations::build_context(prob, dag,
+                        par_pats, ser_pats, mh);
+
+                    // Extract representative solutions from symm partitions
+                    for (size_t pi = 0; pi < par_pats.size(); pi++) {
+                        auto& pat = par_pats[pi];
+                        if (pat.symmetry < 2) continue;
+                        const auto& rep = pat.components[0];
+                        for (auto& sp : symm_parts) {
+                            auto config = symm_mutations::extract_config_from_partition(sp, rep);
+                            if (!config.empty()) {
+                                symm_mutations::RepSolution sol;
+                                sol.groups = std::move(config);
+                                if (pi < symm_ctx.parallel_solutions.size())
+                                    symm_ctx.parallel_solutions[pi].push_back(std::move(sol));
+                                break;
+                            }
                         }
                     }
 
+                    discovered_parallel = std::move(par_pats);
+                    discovered_series = std::move(ser_pats);
+
+                    // Insert symm partitions into pool
+                    {
+                        std::unique_lock lock(pool.mutex());
+                        for (size_t i = 0; i < symm_parts.size(); i++) {
+                            double cost = symm_parts[i].total_cost();
+                            pool.insert(PoolEntry(std::move(symm_parts[i]), cost,
+                                "symm_" + std::to_string(i)));
+                        }
+                    }
+
+                    // Publish symm_ctx — all writes above are visible after release
+                    symm_ready.store(true, std::memory_order_release);
+
                     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         Clock::now() - start).count();
-                    {
-                        std::lock_guard<std::mutex> lock(log_mutex);
-                        std::cerr << "    gen0 [symm]: " << gen0_symm_results.size()
-                                  << " partitions in " << ms << "ms\n";
-                    }
-                    continue;
-                }
-
-                // No patterns found — fallback to random + greedy + FM
-                {
                     std::lock_guard<std::mutex> lock(log_mutex);
-                    std::cerr << "    gen0 [symm]: no patterns, falling back to random\n";
+                    std::cerr << "    init [symm]: " << symm_parts.size()
+                              << " partitions in " << ms << "ms\n";
+                } else {
+                    // No patterns — publish empty symm_ctx so workers don't wait
+                    symm_ready.store(true, std::memory_order_release);
+
+                    std::lock_guard<std::mutex> lock(log_mutex);
+                    std::cerr << "    init [symm]: no patterns, falling back to random\n";
+                    // Fall through to standard init
+                    goto standard_init;
                 }
-                // Fall through to standard path with random strategy
+                goto evo_phase;
             }
 
-            // ============================================================
-            // Standard initialization task
-            // ============================================================
+            standard_init: {
+                auto part = strategies[task.strategy_idx].init(prob, dag, &shared_cache);
+                double init_cost = part.total_cost();
 
-            auto part = strategies[task.strategy_idx].init(prob, dag, &shared_cache);
-            double init_cost = part.total_cost();
+                part = greedy_descent(std::move(part));
+                double greedy_cost = part.total_cost();
 
-            part = greedy_descent(std::move(part));
-            double greedy_cost = part.total_cost();
+                // Save greedy result as fallback
+                {
+                    Partition greedy_copy(part);
+                    greedy_copy.rebuild_index();
+                    if (!partition_has_gap(greedy_copy)) {
+                        std::unique_lock lock(pool.mutex());
+                        pool.insert(PoolEntry(std::move(greedy_copy), greedy_cost,
+                            "greedy+" + strategies[task.strategy_idx].name));
+                    }
+                }
 
-            // Save greedy result as fallback.
-            // NOTE: init strategies can create cyclic partitions (e.g., seed+grow
-            // may group ops that straddle an external dependency). greedy_descent
-            // prevents creating NEW cycles but doesn't fix existing ones.
-            // Check acyclicity before accepting.
+                FMOuterConfig fc = gen0_fm;
+                fc.pass_config.seed = task.seed;
+                auto fm = fm_outer_loop(std::move(part), fc);
+
+                // Insert FM best
+                PoolEntry fm_result(std::move(fm.best_partition), fm.best_cost,
+                    strategies[task.strategy_idx].name);
+                fm_result.partition.rebuild_index();
+                if (partition_has_gap(fm_result.partition))
+                    fm_result.cost = 1e18;
+
+                // Greedy-kick end state for diversity
+                PoolEntry kick_result;
+                if (fm.end_cost < 1e17 && fm.end_cost > fm.best_cost + 0.01) {
+                    auto kicked = greedy_descent(std::move(fm.end_partition));
+                    double kick_cost = kicked.total_cost();
+                    kicked.rebuild_index();
+                    if (!partition_has_gap(kicked))
+                        kick_result = {std::move(kicked), kick_cost,
+                            "kick+" + strategies[task.strategy_idx].name};
+                }
+
+                {
+                    std::unique_lock lock(pool.mutex());
+                    if (fm_result.cost < 1e17) pool.insert(std::move(fm_result));
+                    if (kick_result.cost < 1e17) pool.insert(std::move(kick_result));
+                }
+
+                if (init_tasks_done.fetch_add(1) + 1 >= gen0_tasks)
+                    shared_cache.freeze_base();
+
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - start).count();
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cerr << "    init [" << strategies[task.strategy_idx].name
+                          << " s=" << task.seed << "]: init=" << init_cost
+                          << " → greedy=" << greedy_cost;
+                if (fm.best_cost < greedy_cost - 0.01)
+                    std::cerr << " → FM=" << fm.best_cost
+                              << " (-" << std::fixed << std::setprecision(1)
+                              << 100.0 * (greedy_cost - fm.best_cost) / greedy_cost << "%)";
+                else
+                    std::cerr << " → FM=same";
+                std::cerr << " (" << fm.total_passes << "p "
+                          << fm.total_moves << "m " << fm.elapsed_ms << "ms)\n";
+            }
+        }
+
+        // --- Phase B: evo loop (no barrier — start immediately) ---
+        evo_phase:
+        if (!has_deadline) return;
+
+        // Update best_ever from pool after our init task
+        {
+            std::shared_lock lock(pool.mutex());
+            if (!pool.empty()) {
+                double pb = pool.best_cost();
+                double prev = best_ever.load();
+                while (pb < prev && !best_ever.compare_exchange_weak(prev, pb))
+                    ;
+            }
+        }
+
+        while (Clock::now() < deadline) {
+            if (cfg.early_stop &&
+                tasks_since_improve.load() >= early_stop_threshold)
+                break;
+
+            // Derive heat from stagnation
+            int stale = tasks_since_improve.load();
+            double heat = std::clamp(1.0 + stale * 0.05, 0.3, 4.0);
+
+            // --- Select parent(s) under shared lock ---
+            Partition child;
+            std::string origin;
+
             {
-                Partition greedy_copy(part);
-                greedy_copy.rebuild_index();
-                if (greedy_copy.is_acyclic()) {
-                    gen0_greedy_results[tid] = {std::move(greedy_copy), greedy_cost,
-                                                 "greedy+" + strategies[task.strategy_idx].name};
+                std::shared_lock lock(pool.mutex());
+                if (pool.empty()) {
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;  // wait for first init result
+                }
+
+                size_t pool_sz = pool.size();
+                int task_id = total_tasks.load();
+                bool do_crossover = (pool_sz >= 2) && (task_id % 3 == 0);
+                bool do_symm = !do_crossover &&
+                    symm_ready.load(std::memory_order_acquire) &&
+                    !symm_ctx.empty() && (rng() % 5 == 0);
+
+                if (do_crossover) {
+                    auto [p1, p2] = pool.select_for_crossover(rng);
+                    child = crossover(pool[p1].partition, pool[p2].partition, rng, mhp);
+                    child.cache = &shared_cache;
+                    origin = "xover";
+                } else if (do_symm) {
+                    size_t pi = pool.select_for_mutation(rng);
+                    Partition parent(pool[pi].partition);
+                    lock.unlock();
+
+                    auto result = (rng() % 2 == 0)
+                        ? symm_mutations::inject_representative_solution(
+                            std::move(parent), symm_ctx, prob, dag, rng)
+                        : symm_mutations::align_symmetric_reps(
+                            std::move(parent), symm_ctx, prob, dag, rng);
+                    if (result) {
+                        child = std::move(*result);
+                        child.cache = &shared_cache;
+                        origin = "symm";
+                    } else {
+                        int num_muts = std::max(2, (int)((4 + (int)(rng() % 5)) * heat));
+                        child = mutate_compound(std::move(parent), num_muts, rng);
+                        child.cache = &shared_cache;
+                        origin = "mutate(" + std::to_string(num_muts) + ")";
+                    }
+                } else {
+                    size_t pi = pool.select_for_mutation(rng);
+                    int num_muts = std::max(2, (int)((4 + (int)(rng() % 5)) * heat));
+                    child = mutate_compound(Partition(pool[pi].partition), num_muts, rng);
+                    child.cache = &shared_cache;
+                    origin = "mutate(" + std::to_string(num_muts) + ")";
                 }
             }
 
-            FMOuterConfig fc = gen0_fm;
-            fc.pass_config.seed = task.seed;
-            auto fm = fm_outer_loop(std::move(part), fc);
-            double fm_cost = fm.best_cost;
-
-            gen0_results[tid] = {std::move(fm.best_partition), fm_cost,
-                                  strategies[task.strategy_idx].name};
-
-            // Reject cyclic partitions — FM moves (especially TENSOR_EXTRACT)
-            // can introduce cycles that slip past per-move checks.
-            gen0_results[tid].partition.rebuild_index();
-            if (!gen0_results[tid].partition.is_acyclic()) {
-                gen0_results[tid].cost = 1e18;  // mark as invalid
+            // Skip if mutation/crossover created an ephemeral gap
+            if (partition_has_gap(child)) {
+                total_tasks.fetch_add(1);
+                tasks_since_improve.fetch_add(1);
+                continue;
             }
 
-            // Greedy-kick end state for pool diversity
-            if (fm.end_cost < 1e17 && fm.end_cost > fm_cost + 0.01) {
+            // One greedy pass on the mutated child: if it improves, use the
+            // greedy result as the FM starting point; otherwise start from the
+            // raw mutation result.
+            {
+                double pre_greedy = child.total_cost();
+                Partition greedy_child = greedy_descent(child);
+                if (!partition_has_gap(greedy_child) &&
+                    greedy_child.total_cost() < pre_greedy - 0.01)
+                    child = std::move(greedy_child);
+            }
+
+            // FM outer loop (no lock held — this takes seconds)
+            FMOuterConfig fc = cfg.fm;
+            fc.max_passes = std::min(fc.max_passes, 50);
+            fc.max_no_improve = std::min(fc.max_no_improve, 15);
+            fc.deadline = deadline;
+            fc.pass_config.max_drift_fraction = std::clamp(
+                fc.pass_config.max_drift_fraction * heat, 0.10, 2.0);
+            fc.pass_config.seed = (unsigned)(rng());
+            auto fm = fm_outer_loop(std::move(child), fc);
+
+            // Track evo FM stats
+            evo_tasks_done.fetch_add(1);
+            evo_fm_ms_total.fetch_add(fm.elapsed_ms);
+            evo_fm_passes_total.fetch_add(fm.total_passes);
+
+            // Validate and insert FM best under unique lock
+            PoolEntry fm_result(std::move(fm.best_partition), fm.best_cost, origin);
+            fm_result.partition.rebuild_index();
+            if (partition_has_gap(fm_result.partition))
+                fm_result.cost = 1e18;
+
+            // Greedy-kick end state for diversity
+            PoolEntry kick_result;
+            if (fm.end_cost < 1e17 && fm.end_cost > fm.best_cost + 0.01 &&
+                Clock::now() < deadline) {
                 auto kicked = greedy_descent(std::move(fm.end_partition));
                 double kick_cost = kicked.total_cost();
                 kicked.rebuild_index();
-                if (kicked.is_acyclic()) {
-                    gen0_end_partitions[tid] = {std::move(kicked), kick_cost,
-                        "kick+" + strategies[task.strategy_idx].name};
-                }
+                if (!partition_has_gap(kicked))
+                    kick_result = {std::move(kicked), kick_cost, "kick+" + origin};
             }
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now() - start).count();
-            std::lock_guard<std::mutex> lock(log_mutex);
-            std::cerr << "    gen0 [" << strategies[task.strategy_idx].name
-                      << " s=" << task.seed << "]: init=" << init_cost
-                      << " → greedy=" << greedy_cost;
-            if (fm_cost < greedy_cost - 0.01)
-                std::cerr << " → FM=" << fm_cost
-                          << " (-" << std::fixed << std::setprecision(1)
-                          << 100.0 * (greedy_cost - fm_cost) / greedy_cost << "%)";
-            else
-                std::cerr << " → FM=same";
-            std::cerr << " (" << ms << "ms)\n";
+
+            double current_best;
+            {
+                std::unique_lock lock(pool.mutex());
+                if (fm_result.cost < 1e17) pool.insert(std::move(fm_result));
+                if (kick_result.cost < 1e17) pool.insert(std::move(kick_result));
+                current_best = pool.best_cost();
+            }
+
+            // Track improvement
+            int task_num = total_tasks.fetch_add(1) + 1;
+            double prev_best = best_ever.load();
+            if (current_best < prev_best - 0.01) {
+                while (current_best < prev_best - 0.01 &&
+                       !best_ever.compare_exchange_weak(prev_best, current_best))
+                    ;
+                tasks_since_improve.store(0);
+                evo_improving.fetch_add(1);
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cerr << "  Task " << task_num << ": best=" << current_best
+                          << " [" << origin << "] ***\n";
+            } else {
+                tasks_since_improve.fetch_add(1);
+            }
         }
     };
 
-    std::cerr << "  Gen 0: " << gen0_tasks << " tasks on " 
-              << std::min(num_threads, gen0_tasks) << " threads\n";
     {
         std::vector<std::thread> threads;
-        int nt = std::min(num_threads, gen0_tasks);
-        for (int i = 0; i < nt; i++) threads.emplace_back(gen0_worker);
+        for (int i = 0; i < num_threads; i++) threads.emplace_back(worker);
         for (auto& t : threads) t.join();
     }
 
-    std::vector<PoolEntry> pool;
-    for (auto& r : gen0_results)
-        if (r.cost < 1e17)
-            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
-    for (auto& r : gen0_end_partitions)
-        if (r.cost < 1e17)
-            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
-    // Greedy results as fallback: always acyclic, ensures pool is never empty.
-    for (auto& r : gen0_greedy_results)
-        if (r.cost < 1e17)
-            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
-    // Symmetry-initialized partitions (already greedy-optimized, no FM needed)
-    for (auto& r : gen0_symm_results)
-        if (r.cost < 1e17)
-            pool_insert(pool, std::move(r), cfg.pool_size, mhp);
+    // Ensure pool has at least one entry (fallback for trivial problems)
+    if (pool.empty()) {
+        auto fallback = Partition::trivial(prob, dag);
+        fallback.cache = &shared_cache;
+        pool.insert(PoolEntry(std::move(fallback), fallback.total_cost(), "trivial"));
+    }
 
-    // Export discovered patterns to caller (for symmetry-aware mutations)
+    // Export discovered patterns to caller
     if (cfg.out_parallel_patterns)
         *cfg.out_parallel_patterns = std::move(discovered_parallel);
     if (cfg.out_series_patterns)
         *cfg.out_series_patterns = std::move(discovered_series);
 
-    if (pool.empty()) {
-        // Absolute last resort — should never happen since trivial init always works
-        auto fallback = Partition::trivial(prob, dag);
-        fallback.cache = &shared_cache;
-        pool_insert(pool, PoolEntry(std::move(fallback), fallback.total_cost(), "trivial"),
-                    cfg.pool_size, mhp);
+    pool.sort_by_cost();
+
+    int n_init = init_tasks_done.load();
+    int n_evo = evo_tasks_done.load();
+    int n_evo_imp = evo_improving.load();
+    int64_t evo_ms = evo_fm_ms_total.load();
+    int evo_passes = evo_fm_passes_total.load();
+
+    std::cerr << "  Final pool: " << pool.size() << " entries, best=" << pool.best_cost() << "\n";
+    std::cerr << "  Init: " << n_init << " tasks";
+    if (n_evo > 0) {
+        std::cerr << "  Evo: " << n_evo << " tasks (" << n_evo_imp << " improving)";
+        std::cerr << "  FM: " << evo_passes << " passes, "
+                  << (n_evo > 0 ? evo_ms / n_evo : 0) << "ms/task avg";
     }
-
-    pool_sort(pool);
-
-    std::cerr << "  Pool after gen0: " << pool.size() << " entries, best=" << pool[0].cost << "\n";
-    double gen0_best = pool[0].cost;
-
-    // ================================================================
-    // Generation 1+: mutation + crossover → greedy → FM
-    // ================================================================
-
-    int gen = 1;
-    int gens_no_improve = 0;
-    double best_ever = pool[0].cost;
-    double heat = 1.0;  // adaptive perturbation intensity
-
-    while (has_deadline && Clock::now() < deadline) {
-        auto remaining = deadline - Clock::now();
-        auto gen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
-        if (gen_ms < 200) break;
-
-        // Adaptive FM parameters: scale floor/drift with heat
-        FMOuterConfig gen_fm = cfg.fm;
-        gen_fm.deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(remaining * 8 / 10);
-        gen_fm.max_passes = std::min(gen_fm.max_passes, 50);
-        gen_fm.max_no_improve = std::min(gen_fm.max_no_improve, 15);
-        gen_fm.pass_config.floor_fraction = std::clamp(
-            gen_fm.pass_config.floor_fraction * heat, 0.05, 1.0);
-        gen_fm.pass_config.max_drift_fraction = std::clamp(
-            gen_fm.pass_config.max_drift_fraction * heat, 0.10, 2.0);
-
-        int mut_tasks = std::min(num_threads, std::max(2, (int)pool.size()));
-        std::vector<PoolEntry> mut_results(mut_tasks);
-        std::vector<PoolEntry> mut_end_partitions(mut_tasks);
-        next_task.store(0);
-
-        auto evo_worker = [&]() {
-            g_verbose = false;
-            std::mt19937 rng(std::random_device{}());
-            while (true) {
-                int tid = next_task.fetch_add(1);
-                if (tid >= mut_tasks) break;
-                if (Clock::now() >= deadline) break;
-
-                auto start = Clock::now();
-
-                Partition child;
-                child.prob = &prob;
-                child.dag = &dag;
-                child.cache = &shared_cache;
-                std::string origin;
-
-                // Mix of operators:
-                // - Half mutation, half crossover (when pool has ≥2)
-                bool do_crossover = (pool.size() >= 2) && (tid % 3 == 0);
-
-                if (do_crossover) {
-                    // Pick two different parents (uniform random)
-                    size_t p1 = rng() % pool.size();
-                    size_t p2 = rng() % pool.size();
-                    while (p2 == p1 && pool.size() > 1) p2 = rng() % pool.size();
-
-                    child = crossover(pool[p1].partition, pool[p2].partition, rng, mhp);
-                    child.cache = &shared_cache;
-                    origin = "xover";
-                } else {
-                    // Pick parent (uniform random — pool diversity maintained by insertion)
-                    size_t pi = rng() % pool.size();
-
-                    int num_muts = 4 + (int)(rng() % 5);  // base: 4..8
-                    // Scale with heat: stagnation → more mutations
-                    num_muts = std::max(2, (int)(num_muts * heat));
-                    child = mutate_compound(Partition(pool[pi].partition), num_muts, rng);
-                    child.cache = &shared_cache;
-                    origin = "mutate(" + std::to_string(num_muts) + ")";
-                }
-
-                // Skip if mutation/crossover created an ephemeral gap.
-                // With recomputation, a tensor can be ephemeral in all groups
-                // that produce it, leaving external consumers stranded.
-                if (partition_has_gap(child)) continue;
-                double after_mutate = child.total_cost();
-                child = greedy_descent(std::move(child));
-                double after_greedy = child.total_cost();
-
-                FMOuterConfig fc = gen_fm;
-                fc.pass_config.seed = (unsigned)(rng());
-                auto fm = fm_outer_loop(std::move(child), fc);
-                double after_fm = fm.best_cost;
-
-                mut_results[tid] = {std::move(fm.best_partition), after_fm, origin};
-
-                // Reject cyclic partitions — FM moves (especially TENSOR_EXTRACT)
-                // can introduce cycles that slip past per-move checks.
-                mut_results[tid].partition.rebuild_index();
-                if (!mut_results[tid].partition.is_acyclic()) {
-                    mut_results[tid].cost = 1e18;
-                }
-
-                // Greedy-kick the FM end state for pool diversity
-                // (matches solution_evo_search pattern)
-                if (fm.end_cost < 1e17 && fm.end_cost > after_fm + 0.01 &&
-                    Clock::now() < deadline) {
-                    auto kicked = greedy_descent(std::move(fm.end_partition));
-                    double kick_cost = kicked.total_cost();
-                    kicked.rebuild_index();
-                    if (kicked.is_acyclic()) {
-                        mut_end_partitions[tid] = {std::move(kicked),
-                            kick_cost, "kick+" + origin};
-                    }
-                }
-
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now() - start).count();
-                (void)ms; // available for debug logging if needed
-            }
-        };
-
-        {
-            std::vector<std::thread> threads;
-            int nt = std::min(num_threads, mut_tasks);
-            for (int i = 0; i < nt; i++) threads.emplace_back(evo_worker);
-            for (auto& t : threads) t.join();
-        }
-
-        int accepted = 0;
-        for (auto& r : mut_results)
-            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size, mhp))
-                accepted++;
-        for (auto& r : mut_end_partitions)
-            if (r.cost < 1e17 && pool_insert(pool, std::move(r), cfg.pool_size, mhp))
-                accepted++;
-        pool_sort(pool);
-
-        if (pool[0].cost < best_ever - 0.01) {
-            best_ever = pool[0].cost;
-            gens_no_improve = 0;
-            heat = std::clamp(heat * 0.7, 0.3, 4.0);  // cool down on success
-            std::cerr << "  Gen " << gen << ": best=" << best_ever
-                      << " (+" << accepted << " heat=" << heat << ") ***\n";
-        } else {
-            gens_no_improve++;
-            heat = std::clamp(heat * 1.2, 0.3, 4.0);  // heat up on stagnation
-        }
-
-        if (cfg.early_stop && gens_no_improve >= 25) {
-            std::cerr << "  Stopping after " << gen << " generations\n";
-            break;
-        }
-        gen++;
-    }
-
-    std::cerr << "  Final pool: " << pool.size() << " entries, best=" << pool[0].cost
-              << " (" << gen - 1 << " generations)";
-    if (pool[0].cost < gen0_best - 0.01)
-        std::cerr << "  evo improved by " << std::fixed << std::setprecision(1)
-                  << 100.0 * (gen0_best - pool[0].cost) / gen0_best << "%";
     std::cerr << "\n";
     std::cerr << "  Cache: " << shared_cache.size() << " entries, "
               << shared_cache.hits() << " hits, " << shared_cache.misses() << " misses\n";
 
     std::vector<Partition> result;
     result.reserve(pool.size());
-    for (auto& pe : pool)
-        result.push_back(std::move(pe.partition));
+    for (size_t i = 0; i < pool.size(); i++)
+        result.push_back(std::move(pool[i].partition));
     return result;
 }

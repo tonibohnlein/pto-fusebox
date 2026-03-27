@@ -1,0 +1,151 @@
+#pragma once
+
+#include "partition/partition.h"
+#include <set>
+
+// ============================================================================
+// partition_moves: canonical evaluation and application of partition moves.
+//
+// Convention: all functions use a uniform naming for groups:
+//   STEAL:  op moves FROM `from` INTO `to`
+//   MERGE:  `ga` survives, `gb` is killed (absorbed into ga)
+//
+// eval_* functions are pure — no mutation, return costs and saving.
+// apply_* functions validate + mutate. Return affected group indices,
+// or empty set on validation failure (no mutation occurred).
+//
+// Search files (fm_search, local_search, evolution) call these functions.
+// They NEVER implement move logic inline.
+// ============================================================================
+
+namespace partition_moves {
+
+struct EvalResult {
+    bool feasible = false;
+    double saving = 0.0;
+};
+
+// ============================================================================
+// STEAL: move a single op from one group to another
+//
+// Validates:
+//   - `to` group can absorb op (eval_set < 1e17)
+//   - `from` group remains feasible after losing op (eval_set < 1e17 or empty)
+//   - If `from` becomes empty, op must exist in another alive group
+//
+// Does NOT check acyclicity (caller uses cheap pre-filter at eval time,
+// apply_steal runs full Kahn's).
+// ============================================================================
+
+EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to);
+
+// Apply: Kahn's check → mutate → return affected groups.
+// Returns {} if Kahn's fails or cost re-evaluation fails.
+std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to);
+
+// ============================================================================
+// MERGE: fuse two groups (gb absorbed into ga, gb killed)
+//
+// Validates:
+//   - merged set is feasible (eval_set < 1e17)
+//
+// Does NOT check acyclicity (caller uses merge_creates_cycle at eval time,
+// apply_merge runs full Kahn's).
+// ============================================================================
+
+EvalResult eval_merge(const Partition& p, size_t ga, size_t gb);
+
+// Apply: Kahn's check → mutate → return affected groups.
+// Returns {} if Kahn's fails or cost re-evaluation fails.
+std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb);
+
+// ============================================================================
+// EJECT: remove a single op from a group, creating a singleton + remainder(s)
+//
+// eval_eject lives on Partition (returns EjectResult with remainder components).
+// We provide only apply_eject here as the canonical mutation path.
+//
+// Validates:
+//   - Ephemeral gap check (eject never creates a cycle — singleton always fits)
+//   - Re-evaluates eject to get current remainder components
+//
+// Does NOT check feasibility (caller already called part.eval_eject).
+// ============================================================================
+
+std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga);
+
+// ============================================================================
+// SPLIT: split a group at a bridge edge into two groups
+//
+// eval_split lives on Partition (returns SplitResult with side_a/side_b).
+// We provide only apply_split here as the canonical mutation path.
+//
+// Validates:
+//   - Acyclicity via split_creates_topo_cycle (eval-time, local)
+//   - Re-evaluates split to get current sides
+// ============================================================================
+
+std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga);
+
+// ============================================================================
+// DE_RECOMPUTE: remove a recomputed op from a group.
+// The op must exist in at least one other alive group. The source group
+// survives with the remaining ops (or dies if op was the only one).
+//
+// Validates:
+//   - Op exists in ga and in at least one other alive group
+//   - No ephemeral gap (output tensors still available as boundary outputs)
+//   - Acyclicity via acyclic_de_recompute_local (eval-time)
+// ============================================================================
+
+// Eval: check if op can be removed and compute saving.
+EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op);
+
+// Apply: validate + remove op from group. Returns affected groups.
+std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op);
+
+// ============================================================================
+// RECOMPUTE: copy op into a second group (op stays in its original group too)
+//
+// Validates:
+//   - Target group can absorb op (eval_set < 1e17)
+//   - Acyclicity via acyclic_recompute_local (eval-time)
+// ============================================================================
+
+EvalResult eval_recompute(const Partition& p, size_t op, size_t into);
+
+std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into);
+
+// ============================================================================
+// TENSOR_MERGE: merge all groups that touch a tensor into one
+//
+// Validates:
+//   - All groups alive
+//   - Merged set feasible (eval_set < 1e17)
+//   - Acyclicity via acyclic_merge_local (eval-time, in best_move_for)
+// ============================================================================
+
+EvalResult eval_tensor_merge(const Partition& p,
+                              const std::vector<size_t>& group_list);
+
+std::set<size_t> apply_tensor_merge(Partition& p,
+                                     const std::vector<size_t>& group_list);
+
+// ============================================================================
+// TENSOR_EXTRACT: pull ops out of multiple groups into a new group
+//
+// Validates:
+//   - All source groups alive
+//   - Extract set and all remainders feasible
+//   - Acyclicity via acyclic_extract_local (eval-time, in best_move_for)
+// ============================================================================
+
+EvalResult eval_tensor_extract(const Partition& p,
+                                const std::set<size_t>& extract_ops,
+                                const std::vector<size_t>& source_groups);
+
+std::set<size_t> apply_tensor_extract(Partition& p,
+                                       const std::set<size_t>& extract_ops,
+                                       const std::vector<size_t>& source_groups);
+
+} // namespace partition_moves

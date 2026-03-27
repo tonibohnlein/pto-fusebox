@@ -3,6 +3,7 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 // ============================================================================
 // DFS ordering
@@ -113,53 +114,67 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
     size_t ng      = part.groups.size();
     size_t n_alive = part.num_alive();
 
+    // Precompute inverted index: tensor → set of alive groups that need it as input.
+    // Replaces O(groups × boundary_inputs) future_needs() with O(1) lookup + set scan.
+    std::unordered_map<size_t, std::vector<size_t>> tensor_needed_by;
+    for (size_t i = 0; i < ng; i++) {
+        if (!part.groups[i].alive || !part.groups[i].sg) continue;
+        for (auto t : part.groups[i].sg->boundary_inputs())
+            tensor_needed_by[t].push_back(i);
+    }
+
     struct State {
         std::vector<size_t>           order;
         std::vector<int>              in_deg;
-        std::set<size_t>              resident;         // tensors in fast memory
+        std::vector<bool>             scheduled;        // carried incrementally
+        std::set<size_t>              resident;
         std::vector<std::set<size_t>> retain_per_step;
         double                        total_latency = 0;
     };
 
     State init;
     init.in_deg = part.group_in_deg;
+    init.scheduled.assign(ng, false);
     for (size_t i = 0; i < ng; i++)
-        if (!part.groups[i].alive) init.in_deg[i] = -1;
+        if (!part.groups[i].alive) { init.in_deg[i] = -1; init.scheduled[i] = true; }
 
     std::vector<State> beam = {init};
+
+    // Fast future_needs using inverted index
+    auto future_needs_fast = [&](size_t t, const std::vector<bool>& sched) -> bool {
+        auto it = tensor_needed_by.find(t);
+        if (it == tensor_needed_by.end()) return false;
+        for (auto gi : it->second)
+            if (!sched[gi]) return true;
+        return false;
+    };
 
     for (size_t step = 0; step < n_alive; step++) {
         std::vector<State> candidates;
 
         for (auto& state : beam) {
-            // Rebuild scheduled from order (compact, avoids storing a separate vector)
-            std::vector<bool> scheduled(ng, false);
-            for (size_t i = 0; i < ng; i++)
-                if (!part.groups[i].alive) scheduled[i] = true;
-            for (auto g : state.order) scheduled[g] = true;
-
             std::vector<size_t> ready;
             for (size_t i = 0; i < ng; i++)
-                if (!scheduled[i] && state.in_deg[i] == 0) ready.push_back(i);
+                if (!state.scheduled[i] && state.in_deg[i] == 0) ready.push_back(i);
 
             for (auto gi : ready) {
                 if (!part.groups[gi].sg) continue;
                 const Subgraph& sg = *part.groups[gi].sg;
 
-                scheduled[gi] = true;  // mark temporarily for future_needs
+                state.scheduled[gi] = true;  // mark temporarily
 
                 // Prune resident: drop tensors no future group will need
                 std::set<size_t> useful_resident;
                 for (auto t : state.resident)
-                    if (part.future_needs(t, scheduled)) useful_resident.insert(t);
+                    if (future_needs_fast(t, state.scheduled)) useful_resident.insert(t);
 
                 // Outputs worth retaining for a future step
                 std::set<size_t> retainable_out;
                 for (auto t : sg.boundary_outputs())
-                    if (prob.retainable_tensors.count(t) && part.future_needs(t, scheduled))
+                    if (prob.retainable_tensors.count(t) && future_needs_fast(t, state.scheduled))
                         retainable_out.insert(t);
 
-                // Baseline: no retention context (use the cached no-retain cost)
+                // Baseline: no retention context (cached cost)
                 CostResult best;
                 best.feasible = true;
                 best.latency  = part.groups[gi].cost;
@@ -173,13 +188,25 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 for (auto t : useful_resident)
                     if (sg.boundary_inputs().count(t)) only_used.insert(t);
 
+                // Fast path: try the cached config with retention context first.
+                // Only fall back to full best_cost() enumeration if it improves.
                 auto try_option = [&](const std::set<size_t>& res_in,
                                       const std::set<size_t>& ret_out) {
-                    auto c = sg.best_cost(res_in, ret_out);
+                    // Quick single-config check with cached tiling
+                    auto c = sg.compute_cost(best.config, res_in, ret_out);
                     if (c.feasible && c.latency < best.latency) {
                         best             = c;
                         best_resident_in = res_in;
                         best_retain_these = ret_out;
+                    }
+                    // Full enumeration only if retention changed the picture
+                    if (!res_in.empty() || !ret_out.empty()) {
+                        auto c2 = sg.best_cost(res_in, ret_out);
+                        if (c2.feasible && c2.latency < best.latency) {
+                            best             = c2;
+                            best_resident_in = res_in;
+                            best_retain_these = ret_out;
+                        }
                     }
                 };
 
@@ -197,10 +224,9 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 next.in_deg = state.in_deg;
                 for (auto v : part.group_succs[gi])
                     if (part.groups[v].alive) next.in_deg[v]--;
+                next.scheduled = state.scheduled;  // gi already marked
                 next.total_latency = state.total_latency + best.latency;
 
-                // Only boundary OUTPUTS can be retained (organizer ruling).
-                // Boundary inputs from resident are consumed and freed.
                 std::set<size_t> exportable;
                 for (auto t : best_retain_these)
                     if (sg.boundary_outputs().count(t))
@@ -211,7 +237,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 next.retain_per_step.push_back(exportable);
 
                 candidates.push_back(std::move(next));
-                scheduled[gi] = false;  // restore
+                state.scheduled[gi] = false;  // restore
             }
         }
 

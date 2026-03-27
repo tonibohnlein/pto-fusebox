@@ -9,7 +9,7 @@
 //   6.  eval_split (bridge, non-bridge, 2-op group after Bug 1 fix)
 //   7.  bridge_edges (chain, no-bridge fan-in, co-consumer bridge after Bug 2 fix)
 //   8.  creates_ephemeral_gap (no-gap, gap, recomputation, self-produce, overload)
-//   9.  would_create_cycle (chain, diamond)
+//   9.  acyclic_merge_local (chain, diamond)
 //  10.  add_group / rebuild_index
 //
 // Bug fixes exercised:
@@ -118,7 +118,7 @@ void test_trivial_construction() {
         CHECK("alive",       part.groups[i].alive);
         CHECK_EQ_S("1 op",   part.groups[i].ops.size(), 1);
         CHECK("correct op",  part.groups[i].ops.count(i));
-        CHECK("has sg",      part.groups[i].sg.has_value());
+        // trivial() intentionally skips sg/best_cfg; finalize() populates them later.
         CHECK("cost finite", part.groups[i].cost < 1e17 && part.groups[i].cost > 0);
     }
     double sum = 0; for (auto& g : part.groups) sum += g.cost;
@@ -405,7 +405,7 @@ void test_bridge_co_consumer_bridge() {
     bool co = false;
     for (auto v : d.op_neighbors[1]) if (v == 0) { co = true; break; }
     CHECK("co-consumer edge exists",           co);
-    CHECK("Op1 has no DAG succ to Op2",        !d.op_succs[1].count(2));
+    CHECK("Op1 has no DAG succ to Op2",        std::find(d.op_succs[1].begin(), d.op_succs[1].end(), (size_t)2) == d.op_succs[1].end());
     CostCache cache;
     Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
     size_t gi = part.add_group({0,1,2}, cache.evaluate({0,1,2},p,d)); part.rebuild_index();
@@ -433,12 +433,13 @@ void test_eph_chain_no_gap() {
 
 void test_eph_diamond_gap() {
     std::cout << "--- test_eph_diamond_gap ---\n";
-    // Merging {Op0,Op1}: T1 consumed by Op1 (internal) and Op2 (external).
-    // External consumer → T1 is boundary output, NOT ephemeral. No gap.
+    // Merging {Op0,Op1}: T1 produced by Op0 AND consumed by Op1 internally → ephemeral.
+    // External consumer Op2 has no other source for T1 → gap.
+    // (New rule: ephemeral iff produced+consumed inside, regardless of external consumers.)
     auto p = make_diamond(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
-    CHECK("{0,1} no gap (T1 boundary out)", !part.creates_ephemeral_gap({0,1}, 0, 1));
-    CHECK("{0,2} no gap (T1 boundary out)", !part.creates_ephemeral_gap({0,2}, 0, 2));
+    CHECK("{0,1} has gap (T1 ephemeral, Op2 stranded)", part.creates_ephemeral_gap({0,1}, 0, 1));
+    CHECK("{0,2} has gap (T1 ephemeral, Op1 stranded)", part.creates_ephemeral_gap({0,2}, 0, 2));
 }
 
 void test_eph_diamond_full_no_gap() {
@@ -488,25 +489,26 @@ void test_eph_vector_overload() {
     bool pair_result   = part.creates_ephemeral_gap({0,1}, 0, 1);
     bool vector_result = part.creates_ephemeral_gap({0,1}, std::vector<size_t>{0,1});
     CHECK("overloads agree", pair_result == vector_result);
-    // Both return false: T1 has external consumer Op2 → boundary output, no gap.
-    CHECK("both detect no gap", !pair_result && !vector_result);
+    // Both return true: T1 is ephemeral in {Op0,Op1} (produced+consumed internally),
+    // and external consumer Op2 has no other source → gap.
+    CHECK("both detect gap", pair_result && vector_result);
 }
 
 // ============================================================================
-// 9. would_create_cycle
+// 9. acyclic_merge_local
 // ============================================================================
 void test_cycle_chain() {
     std::cout << "--- test_cycle_chain ---\n";
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
     // Adjacent merges never create cycles.
-    CHECK("adj {0,1}: no cycle", !part.would_create_cycle(0, 1));
-    CHECK("adj {1,2}: no cycle", !part.would_create_cycle(1, 2));
-    CHECK("adj {2,3}: no cycle", !part.would_create_cycle(2, 3));
+    CHECK("adj {0,1}: safe", part.acyclic_merge_local(0, 1));
+    CHECK("adj {1,2}: safe", part.acyclic_merge_local(1, 2));
+    CHECK("adj {2,3}: safe", part.acyclic_merge_local(2, 3));
     // Skipping a group creates a cycle: Op0 can reach Op2 through Op1.
-    CHECK("skip {0,2}: cycle",    part.would_create_cycle(0, 2));
-    CHECK("skip {0,3}: cycle",    part.would_create_cycle(0, 3));
-    CHECK("skip {1,3}: cycle",    part.would_create_cycle(1, 3));
+    CHECK("skip {0,2}: cycle", !part.acyclic_merge_local(0, 2));
+    CHECK("skip {0,3}: cycle", !part.acyclic_merge_local(0, 3));
+    CHECK("skip {1,3}: cycle", !part.acyclic_merge_local(1, 3));
 }
 
 void test_cycle_diamond() {
@@ -514,14 +516,14 @@ void test_cycle_diamond() {
     auto p = make_diamond(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
     // All direct neighbors: fine.
-    CHECK("{0,1}: no cycle", !part.would_create_cycle(0, 1));
-    CHECK("{0,2}: no cycle", !part.would_create_cycle(0, 2));
-    CHECK("{1,3}: no cycle", !part.would_create_cycle(1, 3));
-    CHECK("{2,3}: no cycle", !part.would_create_cycle(2, 3));
+    CHECK("{0,1}: safe", part.acyclic_merge_local(0, 1));
+    CHECK("{0,2}: safe", part.acyclic_merge_local(0, 2));
+    CHECK("{1,3}: safe", part.acyclic_merge_local(1, 3));
+    CHECK("{2,3}: safe", part.acyclic_merge_local(2, 3));
     // Op1 and Op2 are siblings (co-consumers): no DAG path between them.
-    CHECK("{1,2}: no cycle", !part.would_create_cycle(1, 2));
+    CHECK("{1,2}: safe", part.acyclic_merge_local(1, 2));
     // Op0 can reach Op3 through the diamond: merging them creates a cycle.
-    CHECK("{0,3}: cycle",     part.would_create_cycle(0, 3));
+    CHECK("{0,3}: cycle", !part.acyclic_merge_local(0, 3));
 }
 
 // ============================================================================

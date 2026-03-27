@@ -17,7 +17,7 @@
 
 class ActiveSet {
 public:
-    ActiveSet(const Partition& part, double floor);
+    ActiveSet(const Partition& part, double floor = 0.0);
 
     // --- Activation ---
     void activate(size_t op);
@@ -40,9 +40,9 @@ public:
 
 private:
     const Partition* part_;
-    double floor_;
     PairingHeap<FMMove> heap_;
     std::set<size_t> locked_;
+    double floor_ = 0.0;  // reject moves with saving < -floor
 
     void recompute_and_update(size_t op);
 };

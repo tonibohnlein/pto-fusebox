@@ -220,32 +220,33 @@ void test_ex3_strategy_b() {
     DAG d = DAG::build(p);
 
     // Step 0: {Op0, Op1} → T2 (sink). Retain T2.
-    // T1 is boundary output (Op2 is external consumer), NOT ephemeral.
+    // Under new ephemeral rule: T1 is ephemeral (Op0 produces, Op1 consumes).
+    // Op2's external consumption is covered by recomputation in sg1.
     auto sg0 = make_sg(p, d, {0, 1});
     CHECK("3B sg0 valid", sg0.num_ops() == 2);
-    CHECK("3B T1 boundary out", sg0.boundary_outputs().count(1));
+    CHECK("3B T1 ephemeral", sg0.ephemeral().count(1));
     auto c0 = sg0.compute_cost(TC(128,128,1), {}, {2});
-    // mem_in = T0/B = 1638.4. T1 evicted (1638.4). T2 not evicted (retained).
-    // comp = 3000. lat = max(3000, 1638.4+1638.4) = 3276.8
-    CHECK_EQ("3B step0", c0.latency, 3276.8);
+    // T1 ephemeral → no IO. IO = T0 load (1638.4). T2 retained → no evict.
+    // comp = 3000. lat = max(3000, 1638.4) = 3000
+    CHECK_EQ("3B step0", c0.latency, 3000.0);
 
     // Step 1: {Op0, Op2} → T3 (sink). T2 retained from step 0.
-    // T1 is boundary output (Op1 is external consumer).
+    // T1 ephemeral (Op0 produces, Op2 consumes). Recomputation covers Op2.
     auto sg1 = make_sg(p, d, {0, 2});
     CHECK("3B sg1 valid", sg1.num_ops() == 2);
-    CHECK("3B T1 boundary out in sg1", sg1.boundary_outputs().count(1));
+    CHECK("3B T1 ephemeral in sg1", sg1.ephemeral().count(1));
     auto c1 = sg1.compute_cost(TC(128,128,1), {2}, {});
-    // mem_in = T0/B=1638.4 (T2 retained=free). T1 evict=1638.4. T3 evict=1638.4.
-    // comp = 3000. lat = max(3000, 1638.4+1638.4+1638.4) = max(3000,4915.2) = 4915.2
-    CHECK_EQ("3B step1", c1.latency, 4915.2);
-    CHECK_EQ("3B total", c0.latency + c1.latency, 8192.0);
+    // T0 load=1638.4. T2 retained=free. T1 ephemeral=free. T3 evict=1638.4.
+    // IO = 1638.4 + 1638.4 = 3276.8. comp = 3000. lat = 3276.8
+    CHECK_EQ("3B step1", c1.latency, 3276.8);
+    CHECK_EQ("3B total", c0.latency + c1.latency, 6276.8);
 
     Solution sol(p, d, {
         {std::move(sg0), TC(128,128,1), {2}},
         {std::move(sg1), TC(128,128,1), {}},
     });
     CHECK("3B solution valid", sol.validate().valid);
-    CHECK_EQ("3B solution total", sol.total_latency(), 8192.0);
+    CHECK_EQ("3B solution total", sol.total_latency(), 6276.8);
 }
 
 void test_ex3_strategy_c() {
@@ -390,22 +391,27 @@ void test_ex5_strategy_b() {
     CHECK_EQ_I("5B tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("5B k_passes", c.num_k_passes, 4);
 
-    // Compute per k-step: (2000*32/128) + (2000*32/128) = 500 + 500 = 1000
-    CHECK_EQ("5B comp/step", c.compute_per_step, 1000.0);
+    // Compute per step (new model: only sink Op1 divides by nk=4):
+    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
+    //   Op1 (sink):     2000/4 * scale=1 = 500
+    //   Total = 2500
+    CHECK_EQ("5B comp/step", c.compute_per_step, 2500.0);
 
-    // k=0: mem_in = T0(16384/10=1638.4) + T1(4096/10=409.6) + T2(4096/10=409.6) = 2457.6
-    //       no eviction. lat = max(1000, 2457.6) = 2457.6
-    // k=1: mem_in = T1(409.6) + T2(409.6) = 819.2 (T0 stays resident)
-    //       lat = max(1000, 819.2) = 1000
-    // k=2: same as k=1 → 1000
-    // k=3: mem_in = 819.2. mem_out = T4(16384/10=1638.4).
-    //       lat = max(1000, 819.2+1638.4) = max(1000, 2457.6) = 2457.6
-    // Total = 2457.6 + 1000 + 1000 + 2457.6 = 6915.2
-    CHECK_EQ("5B latency", c.latency, 6915.2);
+    // IO (ntw=1, nth=1):
+    //   T0: (FIXED_1, FROM_NTH) → once_load = 16384/10 = 1638.4
+    //   T1: (FROM_NK, FIXED_1)  → stream = 4096/10 = 409.6
+    //   T2: (FROM_NTW, FROM_NK) → stream = 4096/10 = 409.6; stream_total = 819.2
+    //   T4: out_evict = 1638.4
+    // k=0: max(2500, once(1638.4)+stream(819.2)) = max(2500, 2457.6) = 2500
+    // k=1: max(2500, stream(819.2)) = 2500
+    // k=2: same → 2500
+    // k=3: max(2500, stream(819.2)+evict(1638.4)) = max(2500, 2457.6) = 2500
+    // Total = 4 × 2500 = 10000
+    CHECK_EQ("5B latency", c.latency, 10000.0);
 
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("5B solution valid", sol.validate().valid);
-    CHECK_EQ("5B solution total", sol.total_latency(), 6915.2);
+    CHECK_EQ("5B solution total", sol.total_latency(), 10000.0);
 }
 
 // ==========================================================================

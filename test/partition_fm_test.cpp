@@ -203,17 +203,16 @@ void test_gap_Y_merge_creates_gap() {
     DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // Proposing {Op0+Op1}: T1 has external consumer Op2 → NOT ephemeral
-    // → boundary output → no gap.
-    CHECK("Y {Op0+Op1} no gap (T1 has external consumer)",
-          !part.creates_ephemeral_gap({0, 1}, 0, 1));
+    // Under new ephemeral rule: {Op0+Op1} makes T1 ephemeral (Op0 produces,
+    // Op1 consumes internally). Op2 is external, not covered → GAP.
+    CHECK("Y {Op0+Op1} has gap (T1 ephemeral, Op2 stranded)",
+          part.creates_ephemeral_gap({0, 1}, 0, 1));
 
-    // Same for {Op0+Op2}: T1 has external consumer Op1 → NOT ephemeral → no gap
-    CHECK("Y {Op0+Op2} no gap (T1 has external consumer)",
-          !part.creates_ephemeral_gap({0, 2}, 0, 2));
+    // Same for {Op0+Op2}: T1 ephemeral (Op2 consumes), Op1 stranded → GAP
+    CHECK("Y {Op0+Op2} has gap (T1 ephemeral, Op1 stranded)",
+          part.creates_ephemeral_gap({0, 2}, 0, 2));
 
-    // Fusing all three {Op0+Op1+Op2}: T1 ALL consumers internal → ephemeral.
-    // Must exclude all 3 groups (use vector overload for 3-way merge).
+    // Fusing all three {Op0+Op1+Op2}: T1 ALL consumers internal → ephemeral, no gap.
     CHECK("Y {Op0+Op1+Op2} no gap (all internal, all excluded)",
           !part.creates_ephemeral_gap({0, 1, 2}, {0, 1, 2}));
 }
@@ -259,13 +258,15 @@ void test_gap_recompute_exempts() {
     CHECK("Op2 in gb", part.groups_of(2).size() == 1 &&
                        part.groups_of(2)[0] == gb);
 
-    // Under new ephemeral rule: T1 has consumers Op1 and Op2.
-    // In any proposed subset that doesn't include BOTH, T1 has an external
-    // consumer → boundary output → no gap possible.
-    CHECK("recompute {Op0+Op2} no gap (Op1 external → T1 boundary)",
+    // {Op0+Op2} excluding gb: T1 ephemeral (Op2 consumes). Op1 external in ga.
+    // ga contains Op0 (producer) → recomputation covers Op1 → no gap!
+    CHECK("recompute {Op0+Op2} no gap (ga has Op0 → recomputation)",
           !part.creates_ephemeral_gap({0, 2}, SIZE_MAX, gb));
-    CHECK("recompute {Op0+Op1} no gap (Op2 external → T1 boundary)",
-          !part.creates_ephemeral_gap({0, 1}, ga, SIZE_MAX));
+
+    // {Op0+Op1} excluding ga: T1 ephemeral (Op1 consumes). Op2 external in gb.
+    // gb does NOT contain Op0 → gap!
+    CHECK("recompute {Op0+Op1} has gap (gb lacks Op0)",
+          part.creates_ephemeral_gap({0, 1}, ga, SIZE_MAX));
 }
 
 // --- 2d: gap with a shared boundary output ---
@@ -277,15 +278,16 @@ void test_gap_other_group_exports() {
     auto p = make_Y_instance6();
     DAG d = DAG::build(p);
 
-    // Under new ephemeral rule: T1 has consumers Op1 and Op2.
-    // Any proposed subset that doesn't include both always has an external
-    // consumer → T1 is a boundary output → no gap possible.
+    // Under new ephemeral rule: {Op0+Op1} makes T1 ephemeral.
+    // Op2 external → gap unless another group provides T1.
     Partition part = Partition::trivial(p, d);
 
-    CHECK("Y {Op0+Op1} no gap (Op2 external consumer → boundary)",
-          !part.creates_ephemeral_gap({0, 1}, 0, 1));
+    // Trivial partition: each op alone. {Op0+Op1} makes T1 ephemeral,
+    // Op2 in separate group without Op0 → gap.
+    CHECK("Y {Op0+Op1} has gap (Op2 stranded)",
+          part.creates_ephemeral_gap({0, 1}, 0, 1));
 
-    // Even with recompute groups, T1 external consumer prevents ephemeral
+    // With recompute groups: ga={Op0}, gb={Op1}, gc={Op2}
     Partition part2;
     part2.prob = &p;
     part2.dag  = &d;
@@ -293,10 +295,14 @@ void test_gap_other_group_exports() {
     size_t g_Op1 = part2.add_group({1}, part2.eval_set({1}));
     size_t g_Op2 = part2.add_group({2}, part2.eval_set({2}));
 
-    CHECK("recompute layout: no gap (Op2 external consumer)",
-          !part2.creates_ephemeral_gap({0, 1}, g_singleton_Op0, g_Op1));
+    // {Op0+Op1} excluding g_Op0 and g_Op1: T1 ephemeral, Op2 in g_Op2.
+    // g_Op2 doesn't have Op0 → gap.
+    CHECK("recompute layout: has gap (gc lacks Op0)",
+          part2.creates_ephemeral_gap({0, 1}, g_singleton_Op0, g_Op1));
 
-    CHECK("exporter stays alive → still no gap (external consumer)",
+    // Keep g_Op0 alive (don't exclude it) → g_Op0 exports T1 as boundary output
+    // (T1 produced by Op0, not consumed internally in singleton {Op0}) → no gap.
+    CHECK("exporter stays alive → no gap",
           !part2.creates_ephemeral_gap({0, 1}, SIZE_MAX, g_Op1));
 }
 
@@ -304,13 +310,13 @@ void test_gap_other_group_exports() {
 // Section 3: Partition::finalize() correctness
 // ============================================================================
 
-// --- 3a: trivial partition already has sg populated ---
+// --- 3a: trivial partition + finalize populates sg ---
 void test_finalize_trivial() {
     std::cout << "=== finalize: trivial partition ===\n";
     auto p = make_chain4();
     DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
-    part.finalize();  // idempotent
+    part.finalize();  // populates sg and best_cfg
 
     for (size_t i = 0; i < part.groups.size(); i++) {
         if (!part.groups[i].alive) continue;
@@ -405,15 +411,14 @@ void test_from_partition_recompute() {
     auto p = make_Y_instance6();
     DAG d = DAG::build(p);
 
-    // Under new ephemeral rule: eval_set costs are higher because T1 is
-    // classified as a boundary output (Op2/Op1 is an external consumer).
-    // At finalize time, compute_force_ephemeral correctly identifies T1 as
-    // ephemeral within each recompute group, bringing the solution cost down.
+    // Under new ephemeral rule: eval_set({0,1}) → T1 ephemeral (Op0 produces,
+    // Op1 consumes) → zero IO for T1. Cost = max(2000, T0_load + T2_evict)
+    // = max(2000, 1638.4 + 1638.4) = 3276.8
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
     double cost_01 = tmp.eval_set({0, 1});
     double cost_02 = tmp.eval_set({0, 2});
-    CHECK_EQ("cost {Op0+Op1}", cost_01, 9830.4);
-    CHECK_EQ("cost {Op0+Op2}", cost_02, 9830.4);
+    CHECK_EQ("cost {Op0+Op1}", cost_01, 3276.8);
+    CHECK_EQ("cost {Op0+Op2}", cost_02, 3276.8);
 
     // Build the recompute partition
     Partition part;
@@ -422,8 +427,7 @@ void test_from_partition_recompute() {
     part.add_group({0, 1}, cost_01);
     part.add_group({0, 2}, cost_02);
 
-    // finalize() populates Group::sg and applies force_ephemeral,
-    // bringing each group's actual cost down to 3276.8
+    // finalize() populates Group::sg (T1 already ephemeral under new rule)
     part.finalize();
     Solution sol = Solution::from_partition(p, d, part);
 
@@ -434,7 +438,7 @@ void test_from_partition_recompute() {
     CHECK("sol is valid", vr.valid);
     if (!vr.valid) std::cout << "    error: " << vr.error << "\n";
 
-    // Solution total: 2 × 3276.8 = 6553.6 (force_ephemeral applied at finalize)
+    // Solution total: 2 × 3276.8 = 6553.6 (T1 ephemeral in both groups)
     CHECK_EQ("sol total latency == recompute cost",
              sol.total_latency(), 6553.6);
 
@@ -456,9 +460,8 @@ void test_from_partition_gap_is_invalid() {
     DAG d = DAG::build(p);
 
     // Partition: {Op0+Op1} and {Op2}.
-    // Under the new ephemeral rule, T1 has an external consumer (Op2) so it is
-    // a boundary output of {Op0+Op1}, not ephemeral.  T1 gets written to slow
-    // memory and {Op2} can load it.  The solution IS valid.
+    // Under new ephemeral rule: T1 is ephemeral in {Op0+Op1} (Op0 produces,
+    // Op1 consumes internally). Op2 in second group can't access T1 → INVALID.
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
     double cost_01 = tmp.eval_set({0, 1});
     double cost_2  = tmp.eval_set({2});
@@ -473,8 +476,9 @@ void test_from_partition_gap_is_invalid() {
     Solution sol = Solution::from_partition(p, d, part);
     auto vr = sol.validate();
 
-    CHECK("fused partition is valid (T1 boundary output under new rule)", vr.valid);
-    if (!vr.valid) std::cout << "  error: " << vr.error << "\n";
+    // Solution is INVALID: T1 ephemeral in step 0, step 1 ({Op2}) can't access it
+    CHECK("fused partition is invalid (T1 ephemeral, Op2 stranded)", !vr.valid);
+    if (!vr.valid) std::cout << "  DIAG: " << vr.error << "\n";
 }
 
 // ============================================================================

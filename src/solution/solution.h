@@ -13,6 +13,13 @@
 struct Partition;
 
 // ============================================================================
+// One-time feasibility check: which tensors can physically be retained?
+// Depends only on Problem + DAG. Checks that singleton producer/consumer
+// subgraphs have feasible tilings with the tensor retained/entering.
+// ============================================================================
+std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag);
+
+// ============================================================================
 // ScheduleStep: a subgraph with its chosen tile configuration and retain set
 // ============================================================================
 
@@ -37,16 +44,19 @@ public:
     // finalize() already). Runs DFS and beam search ordering, returns the
     // lower-latency result. No deep copy, no redundant finalize.
     static Solution from_partition(const Problem& prob, const DAG& dag,
-                                   const Partition& part);
+                                   const Partition& part, int max_beam_width = 10,
+                                   class CostCache* cache = nullptr);
 
     // Lower-level: build ScheduleSteps from a pre-computed OrderingResult.
     // Performs per-step feasibility fallback (drop retains until feasible).
     // Exposed for callers (e.g. solver.cpp random variant) that compute their
-    // own ordering.
+    // own ordering.  When cache is non-null, retention-aware best_cost calls
+    // are routed through it, pre-warming Phase 3's retention cache.
     static std::vector<ScheduleStep> steps_from_ordering(
         const Problem& prob, const DAG& dag,
         const Partition& part,
-        const OrderingResult& res);
+        const OrderingResult& res,
+        class CostCache* cache = nullptr);
 
     // --- Validation ---
 

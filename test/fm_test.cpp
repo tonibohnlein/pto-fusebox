@@ -288,47 +288,29 @@ void test_best_move_locked() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    auto m = best_move_for(part, 1, 0.0, {1});  // Op1 is locked
+    auto m = best_move_for(part, 1, {1});  // Op1 is locked
     CHECK("locked op has no move", !m.valid());
 }
 
-void test_best_move_with_floor() {
-    std::cout << "--- test_best_move_with_floor ---\n";
+void test_best_move_border_op() {
+    std::cout << "--- test_best_move_border_op ---\n";
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // Merge all into one group
-    part.groups[0].ops = {0, 1, 2, 3};
-    part.groups[0].cost = part.eval_set({0, 1, 2, 3});
-    part.groups[1].alive = false;
-    part.groups[2].alive = false;
-    part.groups[3].alive = false;
-    part.rebuild_index();
-
-    // Op2 is border (succ Op3 outside? No, Op3 is inside too.)
-    // Actually all ops are inside one group — no border ops, no moves.
-    // Let me use a different setup: {Op0,Op1,Op2} + {Op3}
+    // Setup: {Op0,Op1,Op2} + {Op3}
     part.groups[0].ops = {0, 1, 2};
     part.groups[0].cost = part.eval_set({0, 1, 2});
-    part.rebuild_index();
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
     part.groups[3].alive = true;
     part.groups[3].ops = {3};
     part.groups[3].cost = part.eval_set({3});
     part.rebuild_index();
 
-    // Op2 is border (succ Op3 in G3). With floor=0, eject would be negative.
-    auto m_strict = best_move_for(part, 2, 0.0);
-    auto m_loose = best_move_for(part, 2, part.total_cost() * 0.1);
-
-    // Loose floor should find at least as many candidates
-    if (m_loose.valid())
-        std::cout << "    loose: type=" << m_loose.type << " saving=" << m_loose.saving << "\n";
-    if (m_strict.valid())
-        std::cout << "    strict: type=" << m_strict.type << " saving=" << m_strict.saving << "\n";
-
-    // If strict has a move, loose must have at least as good
-    if (m_strict.valid())
-        CHECK("loose >= strict", m_loose.saving >= m_strict.saving - 0.001);
+    // Op2 is border (succ Op3 in G3). best_move_for returns the best available.
+    auto m = best_move_for(part, 2);
+    if (m.valid())
+        std::cout << "    type=" << m.type << " saving=" << m.saving << "\n";
     g_pass++;  // documentation test
 }
 
@@ -473,7 +455,7 @@ void test_active_set_basic() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     CHECK_EQ_S("initially empty", as.num_active(), 0);
 
     // Activate Op0: it's a border op (succ Op1 in different group)
@@ -495,7 +477,7 @@ void test_active_set_activate_border() {
     part.groups[2].alive = false;
     part.rebuild_index();
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     as.activate_border(0);
 
     // Only Op2 is border (succ Op3 outside)
@@ -510,7 +492,7 @@ void test_active_set_pop_best() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     // Activate all ops
     for (size_t i = 0; i < 4; i++) as.activate(i);
     CHECK_EQ_S("4 active", as.num_active(), 4);
@@ -531,7 +513,7 @@ void test_active_set_pop_exhaustion() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     for (size_t i = 0; i < 4; i++) as.activate(i);
 
     // Pop all 4
@@ -553,7 +535,7 @@ void test_active_set_no_duplicate() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     as.activate(0);
     as.activate(0);  // duplicate
     CHECK_EQ_S("still 1 active", as.num_active(), 1);
@@ -564,7 +546,7 @@ void test_active_set_locked_not_activated() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     as.activate(0);
     as.pop_best();  // locks Op0 (or whichever pops)
 
@@ -579,7 +561,7 @@ void test_active_set_update_after_move() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     for (size_t i = 0; i < 4; i++) as.activate(i);
 
     // Pop and apply best move
@@ -606,7 +588,7 @@ void test_active_set_activate_neighbors() {
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    ActiveSet as(part, 0.0);
+    ActiveSet as(part);
     // Only activate Op0 initially
     as.activate(0);
     CHECK_EQ_S("1 active", as.num_active(), 1);
@@ -621,38 +603,29 @@ void test_active_set_activate_neighbors() {
               << as.num_active() << " active\n";
 }
 
-void test_active_set_with_negative_floor() {
-    std::cout << "--- test_active_set_with_negative_floor ---\n";
+void test_active_set_accepts_all_moves() {
+    std::cout << "--- test_active_set_accepts_all_moves ---\n";
     auto p = make_chain4(); DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
 
-    // Fuse {Op0,Op1,Op2}, {Op3}. Op2 is border. Eject Op2 is negative.
+    // Fuse {Op0,Op1,Op2}, {Op3}. Op2 is border.
     part.groups[0].ops = {0, 1, 2};
     part.groups[0].cost = part.eval_set({0, 1, 2});
     part.groups[1].alive = false;
     part.groups[2].alive = false;
     part.rebuild_index();
 
-    // With floor=0: Op2's eject is negative, might not pop
-    ActiveSet as_strict(part, 0.0);
-    as_strict.activate_border(0);
-    as_strict.activate_border(3);
-    auto m_strict = as_strict.pop_best();
+    // ActiveSet now accepts all moves (no floor filtering)
+    ActiveSet as(part);
+    as.activate_border(0);
+    as.activate_border(3);
+    auto m = as.pop_best();
 
-    // With large floor: should pop even negative moves
-    ActiveSet as_loose(part, part.total_cost() * 0.1);
-    as_loose.activate_border(0);
-    as_loose.activate_border(3);
-    auto m_loose = as_loose.pop_best();
+    if (m.has_value())
+        std::cout << "    pop: Op" << m->op << " type=" << m->type
+                  << " saving=" << m->saving << "\n";
 
-    if (m_loose.has_value())
-        std::cout << "    loose pop: Op" << m_loose->op << " type=" << m_loose->type
-                  << " saving=" << m_loose->saving << "\n";
-    if (m_strict.has_value())
-        std::cout << "    strict pop: Op" << m_strict->op << " type=" << m_strict->type
-                  << " saving=" << m_strict->saving << "\n";
-
-    g_pass++;  // documentation test — both modes work without crash
+    g_pass++;  // documentation test
 }
 
 // ==================== FM inner pass ====================
@@ -813,7 +786,6 @@ void test_fm_pass_negative_moves() {
 
     FMConfig cfg;
     cfg.init_count = 999;
-    cfg.floor_fraction = 0.1;  // allow 10% worsening
     auto result = fm_inner_pass(part, cfg);
 
     // Best seen should still be the optimal (snapshot at start)
@@ -993,7 +965,7 @@ int main() {
     test_eject_cant_eject_singleton();
     test_best_move_chain_unfused();
     test_best_move_locked();
-    test_best_move_with_floor();
+    test_best_move_border_op();
     test_best_move_recomputed_op();
     test_apply_steal();
     test_apply_merge();
@@ -1008,7 +980,7 @@ int main() {
     test_active_set_locked_not_activated();
     test_active_set_update_after_move();
     test_active_set_activate_neighbors();
-    test_active_set_with_negative_floor();
+    test_active_set_accepts_all_moves();
     test_fm_pass_improves_trivial();
     test_fm_pass_ops_covered();
     test_fm_pass_costs_consistent();

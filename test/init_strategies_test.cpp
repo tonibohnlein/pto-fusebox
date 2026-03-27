@@ -401,14 +401,19 @@ void test_random_diversity() {
 
 void test_try_merge_rejects_ephemeral_gap() {
     std::cout << "--- test_try_merge_rejects_ephemeral_gap ---\n";
-    // Diamond4 trivial. {Op0,Op1}: T1 is boundary output (Op2 still needs it
-    // and is external). No ephemeral gap — merge is allowed.
+    // Diamond4 trivial. Merging {Op0,Op1}: T1 is ephemeral (Op0 produces,
+    // Op1 consumes internally). Op2 needs T1 but is external and does NOT
+    // recompute Op0 → ephemeral gap detected.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     auto trivial = Partition::trivial(p, d);
-    // With corrected boundary classification, T1 stays as boundary output
-    // when merging {Op0,Op1}, so no ephemeral gap.
-    CHECK("no gap (T1 stays boundary output)", !trivial.creates_ephemeral_gap({0,1}, 0, 1));
-    // chain+edge is free to fuse {Op0,Op1} or even {Op0,Op1,Op2}
+    CHECK("gap detected (T1 ephemeral, Op2 stranded)",
+          trivial.creates_ephemeral_gap({0,1}, 0, 1));
+
+    // Merging {Op0,Op1,Op2}: T1 is ephemeral (all consumers internal) → no gap
+    CHECK("no gap when all T1 consumers internal",
+          !trivial.creates_ephemeral_gap({0,1,2}, 0, 1));
+
+    // chain+edge must not create an ephemeral gap in the final partition
     auto result = init_chain_then_edge(p, d);
     verify("chain+edge no gap", result, p);
 }

@@ -22,7 +22,7 @@
 #include "partition/partition.h"
 #include "init/init_strategies.h"
 #include "search/parallel_search.h"
-#include "search/solution_search.h"
+#include "search/coupling_search.h"
 #include "search/local_search.h"
 #include "solution/solution.h"
 #include "solution/ordering.h"
@@ -178,7 +178,8 @@ void test_solve_mm_pw_chain() {
     auto deadline = Clock::now() + std::chrono::milliseconds(500);
     auto sol = solve(p, d, deadline);
     check_solution("solve/mm_pw", sol, p, base);
-    // Verify PW-sink k=1 is respected in all steps with MM+PW
+    // Verify PW-sink k=max_K (nk=1) is respected in all steps with MM+PW.
+    // make_mm_pw_chain: MM T0(128×128)@T1(128×128), K=128. Expected k=128.
     for (size_t i = 0; i < sol.num_steps(); i++) {
         bool has_mm = false, has_pw = false;
         for (auto op : sol.step(i).subgraph.ops()) {
@@ -186,7 +187,7 @@ void test_solve_mm_pw_chain() {
             else has_pw = true;
         }
         if (has_mm && has_pw)
-            CHECK("MM+PW step: k=1", sol.step(i).config.k == 1);
+            CHECK("MM+PW step: k=128 (nk=1)", sol.step(i).config.k == 128);
     }
     std::cout << "    trivial=" << base << " solved=" << sol.total_latency()
               << " steps=" << sol.num_steps() << "\n";
@@ -252,6 +253,7 @@ void test_phase1_partition_pool() {
 
     // Build solutions from the pool
     for (auto& pt : pool) {
+        pt.finalize();
         auto sol = Solution::from_partition(p, d, pt);
         auto vr = sol.validate();
         CHECK("pool solution valid", vr.valid);
@@ -308,78 +310,66 @@ void test_phase2_random_ordering_valid() {
 }
 
 // ============================================================================
-// 4. Phase 3: solution search
+// 4. Phase 3: coupling search
 // ============================================================================
 
-void test_phase3_greedy_improves() {
-    std::cout << "--- test_phase3_greedy_improves ---\n";
+void test_phase3_coupling_valid() {
+    std::cout << "--- test_phase3_coupling_valid ---\n";
     auto p = make_chain6_tight(); DAG d = DAG::build(p);
     auto fr = compute_feasibly_retainable(p, d);
 
     CostCache cache;
-    auto part = Partition::trivial(p, d); part.cache = &cache;
-    auto initial = Solution::from_partition(p, d, std::move(part));
-    double init_cost = initial.total_latency();
-
-    auto result_steps = solution_greedy_descent(p, d, initial.steps(), {}, &fr);
-    Solution result(p, d, std::move(result_steps));
-    CHECK("greedy valid", result.validate().valid);
-    CHECK_LE("greedy ≤ initial", result.total_latency(), init_cost);
-    std::cout << "    initial=" << init_cost << " after=" << result.total_latency() << "\n";
-}
-
-void test_phase3_fm_search() {
-    std::cout << "--- test_phase3_fm_search ---\n";
-    auto p = make_chain6_tight(); DAG d = DAG::build(p);
-
-    CostCache cache;
     auto part = best_initial(p, d, &cache);
     part = greedy_descent(std::move(part));
-    auto initial = Solution::from_partition(p, d, std::move(part));
-    double init_cost = initial.total_latency();
+    part.finalize(&cache);
 
-    SolutionFMConfig cfg;
-    cfg.max_passes = 5;
-    cfg.max_no_improve = 2;
-    cfg.deadline = Clock::now() + std::chrono::milliseconds(300);
-
-    auto result = solution_fm_search(p, d, initial, cfg);
-    CHECK("fm_search valid", result.validate().valid);
-    CHECK_LE("fm_search ≤ initial", result.total_latency(), init_cost);
+    auto result = coupling_search(p, d, std::move(part), fr,
+                                  Clock::now() + std::chrono::milliseconds(300));
+    CHECK("coupling_search valid", result.validate().valid);
     for (size_t i = 0; i < p.num_ops(); i++) {
         std::set<size_t> cov;
         for (size_t j = 0; j < result.num_steps(); j++)
             for (auto op : result.step(j).subgraph.ops()) cov.insert(op);
         CHECK("all ops covered", cov.count(i) > 0);
     }
-    std::cout << "    initial=" << init_cost << " after=" << result.total_latency() << "\n";
+    std::cout << "    cost=" << result.total_latency() << "\n";
 }
 
-void test_phase3_evo_search() {
-    std::cout << "--- test_phase3_evo_search ---\n";
+void test_phase3_coupling_improves() {
+    std::cout << "--- test_phase3_coupling_improves ---\n";
+    auto p = make_chain6_tight(); DAG d = DAG::build(p);
+    auto fr = compute_feasibly_retainable(p, d);
+
+    CostCache cache;
+    auto part = best_initial(p, d, &cache);
+    part = greedy_descent(std::move(part));
+    part.finalize(&cache);
+
+    // Baseline: no retainment
+    auto baseline = Solution::from_partition(p, d, part, /*beam_width=*/1, &cache);
+    double base_cost = baseline.total_latency();
+
+    auto result = coupling_search(p, d, std::move(part), fr,
+                                  Clock::now() + std::chrono::milliseconds(300));
+    CHECK("coupling_search valid", result.validate().valid);
+    CHECK_LE("coupling ≤ baseline", result.total_latency(), base_cost + 0.01);
+    std::cout << "    baseline=" << base_cost << " after=" << result.total_latency() << "\n";
+}
+
+void test_phase3_coupling_no_retain() {
+    std::cout << "--- test_phase3_coupling_no_retain ---\n";
+    // When no tensors are feasibly retainable, coupling_search returns a valid
+    // solution with the same cost as the baseline (no retainment added).
     auto p = make_diamond(); DAG d = DAG::build(p);
+    std::set<size_t> fr;  // empty — no retainment
 
-    // Seed pool with two different solutions
-    std::vector<Solution> pool;
-    {
-        CostCache cache;
-        auto part = Partition::trivial(p, d); part.cache = &cache;
-        pool.push_back(Solution::from_partition(p, d, std::move(part)));
-    }
-    {
-        CostCache cache;
-        auto part = best_initial(p, d, &cache);
-        pool.push_back(Solution::from_partition(p, d, std::move(part)));
-    }
-    double pool_best = std::min(pool[0].total_latency(), pool[1].total_latency());
+    auto part = Partition::trivial(p, d);
+    part.finalize();
 
-    SolutionFMConfig cfg;
-    cfg.deadline = Clock::now() + std::chrono::milliseconds(400);
-
-    auto result = solution_evo_search(p, d, std::move(pool), cfg);
-    CHECK("evo_search valid", result.validate().valid);
-    CHECK_LE("evo_search ≤ pool best", result.total_latency(), pool_best);
-    std::cout << "    pool_best=" << pool_best << " after=" << result.total_latency() << "\n";
+    auto result = coupling_search(p, d, std::move(part), fr,
+                                  Clock::now() + std::chrono::milliseconds(200));
+    CHECK("coupling_search (no-retain) valid", result.validate().valid);
+    std::cout << "    cost=" << result.total_latency() << "\n";
 }
 
 // ============================================================================
@@ -389,13 +379,16 @@ void test_phase3_evo_search() {
 void test_invariant_pw_sink_k1() {
     std::cout << "--- test_invariant_pw_sink_k1 ---\n";
     // Every step in the final solution that has a MM feeding a PW sink
-    // must have k=1. Verify this on the MM+PW chain problem.
+    // must have k=max_K (nk=1). For make_mm_pw_chain(), MM has K=128.
     auto p = make_mm_pw_chain(); DAG d = DAG::build(p);
     auto deadline = Clock::now() + std::chrono::milliseconds(400);
     auto sol = solve(p, d, deadline);
 
+    // K for the MatMul in make_mm_pw_chain: LHS=T0(128×128), K=T0.width=128.
+    const int64_t expected_k = 128;
+
     bool found_mm_pw = false;
-    bool k1_ok = true;
+    bool k_ok = true;
     for (size_t i = 0; i < sol.num_steps(); i++) {
         bool has_mm = false, has_pw_sink = false;
         for (auto op : sol.step(i).subgraph.ops()) {
@@ -404,15 +397,15 @@ void test_invariant_pw_sink_k1() {
         }
         if (has_mm && has_pw_sink) {
             found_mm_pw = true;
-            if (sol.step(i).config.k != 1) k1_ok = false;
+            if (sol.step(i).config.k != expected_k) k_ok = false;
         }
     }
-    // If MM and PW were fused into the same step, k must be 1
+    // If MM and PW were fused into the same step, k must equal max_K (nk=1)
     if (found_mm_pw)
-        CHECK("PW-sink k=1 in fused MM+PW step", k1_ok);
+        CHECK("PW-sink k=max_K in fused MM+PW step", k_ok);
     else {
         g_pass++;  // not fused — constraint trivially satisfied
-        std::cout << "    MM and PW not fused (k=1 constraint trivially met)\n";
+        std::cout << "    MM and PW not fused (k=max_K constraint trivially met)\n";
     }
 }
 
@@ -522,9 +515,9 @@ int main() {
     test_phase2_random_ordering_valid();
 
     // 4. Phase 3: solution search
-    test_phase3_greedy_improves();
-    test_phase3_fm_search();
-    test_phase3_evo_search();
+    test_phase3_coupling_valid();
+    test_phase3_coupling_improves();
+    test_phase3_coupling_no_retain();
 
     // 5. Feasibility invariants
     test_invariant_pw_sink_k1();

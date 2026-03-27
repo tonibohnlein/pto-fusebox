@@ -1,58 +1,19 @@
 #include "search/evolution.h"
 #include "search/verbose.h"
-#include "search/local_search.h"  // partition_has_gap (cycle check)
+#include "search/local_search.h"  // partition_has_gap
+#include "search/feasibility.h"
+#include "search/partition_moves.h"
+#include "search/structural_ops.h"
 #include "symmetry/merkle_hash.h"
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 
-// Under the new ephemeral rule, gap checks are unnecessary.
-// Only acyclicity matters. partition_has_gap now checks cycles only.
+// Under the new ephemeral rule, a tensor produced AND consumed inside a group
+// is always ephemeral. partition_has_gap() checks BOTH acyclicity AND
+// mixed-consumer violations (external consumers not covered by recomputation).
 
 #include <functional>
-
-// ============================================================================
-// Merkle-aware ARI canonicalisation
-//
-// Within each Merkle equivalence class (structurally symmetric ops), sort ops
-// by their assignment in map_a, then match them rank-for-rank to ops sorted
-// by their assignment in map_b.  This makes symmetric variants have distance 0
-// instead of a spurious non-zero ARI distance.
-//
-// Time: O(sum_over_classes(k log k)) — negligible for typical ML graphs.
-// ============================================================================
-static void merkle_canonicalise(
-        const MerkleHashes& mh,
-        const std::vector<int>& map_a,
-        std::vector<int>& map_b)   // modified in-place
-{
-    for (auto& [hash, ops] : mh.equiv_classes) {
-        if (ops.size() <= 1) continue;
-
-        // Sort ops by their assignment in A (break ties by op index for stability)
-        std::vector<size_t> by_a(ops.begin(), ops.end());
-        std::sort(by_a.begin(), by_a.end(), [&](size_t x, size_t y){
-            int gx = (x < map_a.size()) ? map_a[x] : -1;
-            int gy = (y < map_a.size()) ? map_a[y] : -1;
-            return gx != gy ? gx < gy : x < y;
-        });
-
-        // Sort ops by their assignment in B
-        std::vector<size_t> by_b(ops.begin(), ops.end());
-        std::sort(by_b.begin(), by_b.end(), [&](size_t x, size_t y){
-            int gx = (x < map_b.size()) ? map_b[x] : -1;
-            int gy = (y < map_b.size()) ? map_b[y] : -1;
-            return gx != gy ? gx < gy : x < y;
-        });
-
-        // Match rank-for-rank: A's i-th op gets B's i-th op's assignment
-        std::vector<int> new_b(ops.size());
-        for (size_t i = 0; i < ops.size(); i++)
-            new_b[i] = (by_b[i] < map_b.size()) ? map_b[by_b[i]] : -1;
-        for (size_t i = 0; i < ops.size(); i++)
-            if (by_a[i] < map_b.size()) map_b[by_a[i]] = new_b[i];
-    }
-}
-
 #include <numeric>
 #include <map>
 #include <set>
@@ -90,23 +51,16 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     // Pick random pair
     auto [ga, gb] = adj_pairs[rng() % adj_pairs.size()];
 
-    if (part.dag->merge_creates_cycle(part.groups[ga].ops, part.groups[gb].ops)) return part;
+    if (!part.acyclic_merge_local(ga, gb)) return part;
     
-    // Merge: add all ops from gb into ga
-    std::set<size_t> merged = part.groups[ga].ops;
-    for (auto op : part.groups[gb].ops)
-        merged.insert(op);
-    
-    double cost = part.eval_set(merged);
-    if (cost >= 1e17) return part;
-    
-    Partition saved = part;
-    part.groups[ga].ops = merged;
-    part.groups[ga].cost = cost;
-    part.groups[ga].gen++;
-    part.groups[gb].alive = false;
+    // Eval feasibility
+    auto r = partition_moves::eval_merge(part, ga, gb);
+    if (!r.feasible) return part;
+
+    // Apply (includes Kahn's check)
+    auto affected = partition_moves::apply_merge(part, ga, gb);
+    if (affected.empty()) return part;
     part.rebuild_index();
-    if (partition_has_gap(part)) return saved;
     return part;
 }
 
@@ -129,19 +83,18 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
     auto bridges = part.bridge_edges(gi);
     if (bridges.empty()) return part;
     
-    // Pick random bridge edge and split
+    // Pick random bridge edge
     auto [op_a, op_b] = bridges[rng() % bridges.size()];
+
+    // Eval feasibility
     auto sr = part.eval_split(op_a, op_b, gi);
     if (!sr.feasible) return part;
-    
-    // Apply split
-    Partition saved = part;
-    part.groups[gi].ops = sr.side_a;
-    part.groups[gi].cost = sr.cost_a;
-    part.groups[gi].gen++;
-    part.add_group(sr.side_b, sr.cost_b);
+    if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, {gi})) return part;
+
+    // Apply (includes cheap pre-filter + Kahn's)
+    auto affected = partition_moves::apply_split(part, op_a, op_b, gi);
+    if (affected.empty()) return part;
     part.rebuild_index();
-    if (partition_has_gap(part)) return saved;
     return part;
 }
 
@@ -177,135 +130,19 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Pick random target
     size_t dst_gi = targets[rng() % targets.size()];
 
-    if (part.dag->merge_creates_cycle({op}, part.groups[dst_gi].ops)) return part;
-    
     // Check: removing op from src must leave it connected and non-empty
     if (part.groups[src_gi].ops.size() <= 1) return part;
-    
-    std::set<size_t> new_src = part.groups[src_gi].ops;
-    new_src.erase(op);
-    auto comps = part.connected_components(new_src);
-    if (comps.size() != 1) return part;  // would disconnect
-    
-    double src_cost = part.eval_set(new_src);
-    if (src_cost >= 1e17) return part;
-    
-    std::set<size_t> new_dst = part.groups[dst_gi].ops;
-    new_dst.insert(op);
-    double dst_cost = part.eval_set(new_dst);
-    if (dst_cost >= 1e17) return part;
-    
-    // Apply, then validate full partition. Revert if gap.
-    Partition saved = part;
-    part.groups[src_gi].ops = new_src;
-    part.groups[src_gi].cost = src_cost;
-    part.groups[src_gi].gen++;
-    part.groups[dst_gi].ops = new_dst;
-    part.groups[dst_gi].cost = dst_cost;
-    part.groups[dst_gi].gen++;
+    if (!structural_ops::is_connected_without(part.groups[src_gi].ops, op, *part.dag))
+        return part;  // would disconnect
+
+    // Eval feasibility (from=src_gi, to=dst_gi)
+    auto r = partition_moves::eval_steal(part, op, src_gi, dst_gi);
+    if (!r.feasible) return part;
+
+    // Apply (includes Kahn's check)
+    auto affected = partition_moves::apply_steal(part, op, src_gi, dst_gi);
+    if (affected.empty()) return part;
     part.rebuild_index();
-    
-    if (partition_has_gap(part)) return saved;
-    return part;
-}
-
-// ============================================================================
-// Mutate: block move (move a connected subpath between groups)
-// ============================================================================
-
-Partition mutate_block_move(Partition part, std::mt19937& rng) {
-    auto ag = alive_groups(part);
-    if (ag.empty()) return part;
-    
-    // Pick a random group with ≥2 ops
-    std::vector<size_t> candidates;
-    for (auto gi : ag)
-        if (part.groups[gi].ops.size() >= 2) candidates.push_back(gi);
-    if (candidates.empty()) return part;
-    
-    size_t src_gi = candidates[rng() % candidates.size()];
-    auto& src_ops = part.groups[src_gi].ops;
-    
-    // Pick a random border op as seed, grow a connected block of 2-3 ops
-    auto borders = part.border_ops(src_gi);
-    if (borders.empty()) return part;
-    
-    size_t seed_op = borders[rng() % borders.size()];
-    std::set<size_t> block = {seed_op};
-    int block_size = 2 + (rng() % 2);  // 2 or 3
-    
-    // Grow block by adding random neighbors within the group
-    for (int i = 1; i < block_size; i++) {
-        std::vector<size_t> growth_candidates;
-        for (auto op : block) {
-            for (auto p : part.dag->op_preds[op])
-                if (src_ops.count(p) && !block.count(p))
-                    growth_candidates.push_back(p);
-            for (auto s : part.dag->op_succs[op])
-                if (src_ops.count(s) && !block.count(s))
-                    growth_candidates.push_back(s);
-        }
-        if (growth_candidates.empty()) break;
-        block.insert(growth_candidates[rng() % growth_candidates.size()]);
-    }
-    
-    // Remainder must stay connected and non-empty
-    std::set<size_t> remainder = src_ops;
-    for (auto op : block) remainder.erase(op);
-    if (remainder.empty()) return part;
-    auto comps = part.connected_components(remainder);
-    if (comps.size() != 1) return part;
-    
-    // Find a target group adjacent to the block (via all neighbor edges)
-    std::set<size_t> target_groups;
-    for (auto op : block) {
-        for (auto nbr : part.dag->op_neighbors[op])
-            for (auto gi : part.groups_of(nbr))
-                if (gi != src_gi) target_groups.insert(gi);
-    }
-    if (target_groups.empty()) {
-        // No adjacent group — create new group for the block
-        double block_cost = part.eval_set(block);
-        if (block_cost >= 1e17) return part;
-        double rem_cost = part.eval_set(remainder);
-        if (rem_cost >= 1e17) return part;
-        
-        Partition saved = part;
-        part.groups[src_gi].ops = remainder;
-        part.groups[src_gi].cost = rem_cost;
-        part.groups[src_gi].gen++;
-        part.add_group(block, block_cost);
-        part.rebuild_index();
-        if (partition_has_gap(part)) return saved;
-        return part;
-    }
-    
-    // Pick random target
-    std::vector<size_t> tgt_vec(target_groups.begin(), target_groups.end());
-    size_t dst_gi = tgt_vec[rng() % tgt_vec.size()];
-    
-    if (part.dag->merge_creates_cycle(block, part.groups[dst_gi].ops)) return part;
-
-    // Evaluate
-    double rem_cost = part.eval_set(remainder);
-    if (rem_cost >= 1e17) return part;
-    
-    std::set<size_t> new_dst = part.groups[dst_gi].ops;
-    for (auto op : block) new_dst.insert(op);
-    double dst_cost = part.eval_set(new_dst);
-    if (dst_cost >= 1e17) return part;
-    
-    // Apply, then validate full partition
-    Partition saved = part;
-    part.groups[src_gi].ops = remainder;
-    part.groups[src_gi].cost = rem_cost;
-    part.groups[src_gi].gen++;
-    part.groups[dst_gi].ops = new_dst;
-    part.groups[dst_gi].cost = dst_cost;
-    part.groups[dst_gi].gen++;
-    part.rebuild_index();
-    
-    if (partition_has_gap(part)) return saved;
     return part;
 }
 
@@ -330,42 +167,23 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
                                 part.groups[gi].ops.end());
     size_t op = ops_vec[rng() % ops_vec.size()];
     
+    // Eval feasibility
     auto er = part.eval_eject(op, gi);
     if (!er.feasible) return part;
 
-    // Acyclicity check: ejecting an op with both preds and succs in the
-    // remainder creates a cycle. Also check inter-group cycles via Kahn's.
+    // Gap check: ejecting may make T ephemeral in remainder while op needs it
     {
-        bool has_pred = false, has_succ = false;
-        for (auto p : part.dag->op_preds[op])
-            if (p != op && part.groups[gi].ops.count(p)) { has_pred = true; break; }
-        for (auto s : part.dag->op_succs[op])
-            if (s != op && part.groups[gi].ops.count(s)) { has_succ = true; break; }
-        if (has_pred && has_succ) return part;  // straddling → cycle
-        if (has_pred || has_succ) {
-            // Has external deps — check full partition acyclicity
-            if (!part.is_acyclic_after_eject(op, gi)) return part;
-        }
+        std::vector<std::set<size_t>> components;
+        components.push_back({op});
+        for (auto& comp : er.remainder_components)
+            components.push_back(comp);
+        if (part.split_creates_ephemeral_gap(components, {gi})) return part;
     }
-    
-    // Apply: replace group with components + singleton
-    Partition saved = part;
-    if (er.remainder_components.size() == 1) {
-        part.groups[gi].ops = er.remainder_components[0];
-        part.groups[gi].cost = er.component_costs[0];
-    } else {
-        part.groups[gi].ops = er.remainder_components[0];
-        part.groups[gi].cost = er.component_costs[0];
-        for (size_t c = 1; c < er.remainder_components.size(); c++)
-            part.add_group(er.remainder_components[c], er.component_costs[c]);
-    }
-    part.groups[gi].gen++;
-    
-    if (er.singleton_cost > 0)
-        part.add_group({op}, er.singleton_cost);
-    
+
+    // Apply (includes cheap pre-filter + Kahn's)
+    auto affected = partition_moves::apply_eject(part, op, gi);
+    if (affected.empty()) return part;
     part.rebuild_index();
-    if (partition_has_gap(part)) return saved;
     return part;
 }
 
@@ -383,7 +201,6 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         auto& consumers = dag.tensor_consumers[t];
         if (consumers.size() < 2) continue;
         
-        // Check if consumers are in ≥2 different groups
         std::set<size_t> groups_seen;
         for (auto cop : consumers)
             for (auto gi : part.groups_of(cop))
@@ -408,83 +225,31 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
             target_groups.insert(gi);
     
     if (target_groups.size() < 2) return part;
-    
-    // Check for cycles (pairwise — conservative)
     std::vector<size_t> group_list(target_groups.begin(), target_groups.end());
-    for (size_t a = 0; a < group_list.size(); a++)
-        for (size_t b = a + 1; b < group_list.size(); b++)
-            if (dag.merge_creates_cycle(part.groups[group_list[a]].ops,
-                                        part.groups[group_list[b]].ops))
-                return part;
-    
+
     // Try full merge first
-    std::set<size_t> merged_ops;
-    for (auto gi : group_list)
-        merged_ops.insert(part.groups[gi].ops.begin(),
-                          part.groups[gi].ops.end());
-    
-    double merged_cost = part.eval_set(merged_ops);
-    if (merged_cost < 1e17) {
-        // Apply full merge: first group absorbs all, rest are killed
-        Partition saved = part;
-        part.groups[group_list[0]].ops = merged_ops;
-        part.groups[group_list[0]].cost = merged_cost;
-        part.groups[group_list[0]].gen++;
-        for (size_t i = 1; i < group_list.size(); i++) {
-            part.groups[group_list[i]].alive = false;
-            part.groups[group_list[i]].gen++;
+    auto mr = partition_moves::eval_tensor_merge(part, group_list);
+    if (mr.feasible) {
+        auto affected = partition_moves::apply_tensor_merge(part, group_list);
+        if (!affected.empty()) {
+            part.rebuild_index();
+            return part;
         }
-        part.rebuild_index();
-        if (!partition_has_gap(part)) return part;
-        part = std::move(saved);  // revert, fall through to extract
     }
     
-    // Fallback: extract just the consumer ops (+ producer) into a new group.
+    // Fallback: extract consumer ops (+ producer) into a new group
     std::set<size_t> extract_ops;
     for (auto cop : dag.tensor_consumers[t])
         extract_ops.insert(cop);
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
 
-    // Acyclicity check before mutation
-    if (!part.is_acyclic_after_extract(extract_ops, group_list)) return part;
+    auto er = partition_moves::eval_tensor_extract(part, extract_ops, group_list);
+    if (!er.feasible) return part;
 
-    double extract_cost = part.eval_set(extract_ops);
-    if (extract_cost >= 1e17) return part;
-    
-    // Compute remainder costs
-    bool feasible = true;
-    struct RemInfo { size_t gi; std::set<size_t> ops; double cost; };
-    std::vector<RemInfo> remainders;
-    
-    for (auto gi : group_list) {
-        std::set<size_t> rem;
-        for (auto op : part.groups[gi].ops)
-            if (!extract_ops.count(op))
-                rem.insert(op);
-        double rc = 0;
-        if (!rem.empty()) {
-            rc = part.eval_set(rem);
-            if (rc >= 1e17) { feasible = false; break; }
-        }
-        remainders.push_back({gi, rem, rc});
-    }
-    if (!feasible) return part;
-    
-    // Apply extract
-    Partition saved = part;
-    for (auto& ri : remainders) {
-        if (ri.ops.empty()) {
-            part.groups[ri.gi].alive = false;
-        } else {
-            part.groups[ri.gi].ops = ri.ops;
-            part.groups[ri.gi].cost = ri.cost;
-        }
-        part.groups[ri.gi].gen++;
-    }
-    part.add_group(extract_ops, extract_cost);
+    auto affected = partition_moves::apply_tensor_extract(part, extract_ops, group_list);
+    if (affected.empty()) return part;
     part.rebuild_index();
-    if (partition_has_gap(part)) return saved;
     return part;
 }
 
@@ -493,48 +258,56 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
 // ============================================================================
 
 // ============================================================================
-// Mutate: remove a recomputation group
+// Mutate: remove recomputed ops
 // ============================================================================
 
 Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
-    std::vector<size_t> candidates;
+    // Collect (group, op) pairs where op is recomputed in that group.
+    std::vector<std::pair<size_t, size_t>> candidates;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
-        bool all_covered = true;
         for (auto op : part.groups[gi].ops) {
-            bool in_other = false;
-            for (auto gj : part.groups_of(op))
-                if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
-            if (!in_other) { all_covered = false; break; }
+            auto r = partition_moves::eval_de_recompute(part, gi, op);
+            if (r.feasible) candidates.emplace_back(gi, op);
         }
-        if (all_covered) candidates.push_back(gi);
     }
     if (candidates.empty()) return part;
     std::shuffle(candidates.begin(), candidates.end(), rng);
 
-    // Greedy removal: try removing each candidate, re-checking coverage
-    // after each removal (since removing one group may invalidate another).
-    bool any_removed = false;
-    for (auto gi : candidates) {
+    // Greedy removal: try each candidate, re-checking after each removal.
+    for (auto [gi, op] : candidates) {
         if (!part.groups[gi].alive) continue;
-        // Re-check: all ops in gi still covered by other alive groups?
-        bool still_redundant = true;
-        for (auto op : part.groups[gi].ops) {
-            bool in_other = false;
-            for (auto gj : part.groups_of(op))
-                if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
-            if (!in_other) { still_redundant = false; break; }
-        }
-        if (still_redundant) {
-            // Check that removing this group doesn't create a cycle
-            if (!part.is_acyclic_without_group(gi)) continue;
-            part.groups[gi].alive = false;
-            part.groups[gi].gen++;
-            any_removed = true;
+        if (!part.groups[gi].ops.count(op)) continue;
+        auto r = partition_moves::eval_de_recompute(part, gi, op);
+        if (!r.feasible) continue;
+        auto affected = partition_moves::apply_de_recompute(part, gi, op);
+        if (!affected.empty()) {
+            part.rebuild_index();
         }
     }
-    if (any_removed) part.rebuild_index();
     return part;
+}
+
+CoupledPartition mutate_compound_coupled(CoupledPartition cp,
+                                          int num_mutations,
+                                          std::mt19937& rng) {
+    cp.part = mutate_compound(std::move(cp.part), num_mutations, rng);
+
+    // Extend coupling arrays for any new groups created by splits
+    while (cp.next_group.size() < cp.part.groups.size()) cp.next_group.push_back(SIZE_MAX);
+    while (cp.prev_group.size() < cp.part.groups.size()) cp.prev_group.push_back(SIZE_MAX);
+
+    // Remove coupling edges broken by the mutation (dead groups, tensors no
+    // longer boundary outputs, etc.). This is called within the mutation so
+    // coupling state remains valid before local search begins.
+    cp.invalidate_couplings();
+
+    // Mutations can introduce new group DAG edges that make existing coupling
+    // links cycle at the chain level (even though the group DAG is acyclic).
+    // Remove any such links before handing the result to FM / greedy descent.
+    cp.fix_chain_couplings();
+
+    return cp;
 }
 
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) {
@@ -547,20 +320,33 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
         size_t before_groups = part.num_alive();
         double before_cost   = part.total_cost();
 
-        int choice = rng() % 7;
+        int choice = rng() % 6;
         switch (choice) {
             case 0: part = mutate_merge(std::move(part), rng);        break;
             case 1: part = mutate_split(std::move(part), rng);        break;
             case 2: part = mutate_reassign(std::move(part), rng);     break;
-            case 3: part = mutate_block_move(std::move(part), rng);   break;
-            case 4: part = mutate_eject(std::move(part), rng);        break;
-            case 5: part = mutate_tensor_merge(std::move(part), rng); break;
-            case 6: part = mutate_de_recompute(std::move(part), rng); break;
+            case 3: part = mutate_eject(std::move(part), rng);        break;
+            case 4: part = mutate_tensor_merge(std::move(part), rng); break;
+            case 5: part = mutate_de_recompute(std::move(part), rng); break;
         }
 
         if (part.num_alive() != before_groups || part.total_cost() != before_cost)
             applied++;
 
+        // Verify coverage: every op in at least one alive group.
+        // If a mutation lost an op (rare edge case in split/de_recompute),
+        // the partition is invalid — stop mutating and let the caller's
+        // partition_has_gap check reject it.
+        {
+            bool coverage_ok = true;
+            for (size_t i = 0; i < part.prob->num_ops(); i++) {
+                bool found = false;
+                for (auto gi : part.groups_of(i))
+                    if (part.groups[gi].alive) { found = true; break; }
+                if (!found) { coverage_ok = false; break; }
+            }
+            if (!coverage_ok) break;  // bail out of mutation loop
+        }
 #ifndef NDEBUG
         // Verify cost consistency: each group's stored cost matches eval_set
         if (g_verbose) {
@@ -650,7 +436,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         size_t best_gi = SIZE_MAX;
         
         for (auto gi : adj_child_groups) {
-            if (child.dag->merge_creates_cycle(cluster, child.groups[gi].ops)) continue;
+            if (!child.acyclic_add_ops_into(cluster, gi)) continue;
             std::set<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
             double c = child.eval_set(merged);
@@ -686,9 +472,9 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     // Single rebuild at the end for cleanup (removes dead entries, etc.)
     child.rebuild_index();
     
-    // Safety: crossover can accidentally create cycles when splicing clusters
-    // from two parents. Reject cyclic children — fall back to better parent.
-    if (!child.is_acyclic()) {
+    // Safety: crossover can create cycles or mixed-consumer violations
+    // when splicing clusters from two parents.
+    if (partition_has_gap(child)) {
         return (parent_a.total_cost() <= parent_b.total_cost()) ? parent_a : parent_b;
     }
     

@@ -35,12 +35,10 @@ struct FMMove {
 // Evaluates steal, eject, recompute, merge for each (group, neighbor-group)
 // pair reachable via the op's DAG edges. Returns the single best move.
 //
-// floor: minimum saving to consider (negative = allow worsening moves)
 // locked: set of ops that cannot initiate moves (skip if op is locked)
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     double floor = 0.0,
                      const std::set<size_t>& locked = {});
 
 // ============================================================================

@@ -8,7 +8,8 @@
 #include <vector>
 #include <chrono>
 
-static double get_time_budget(const std::string& filename) {
+static double get_time_budget(const std::string& filename, size_t num_ops) {
+    // Try to parse benchmark number from competition filename
     auto pos = filename.rfind("mlsys-2026-");
     if (pos != std::string::npos) {
         std::string num_str = filename.substr(pos + 11);
@@ -23,7 +24,13 @@ static double get_time_budget(const std::string& filename) {
         if (num >= 17 && num <= 20) return 60.0;
         if (num >= 21 && num <= 25) return 120.0;
     }
-    return 60.0;
+    // Fallback: scale by problem size
+    if (num_ops <= 10)  return 2.0;
+    if (num_ops <= 25)  return 5.0;
+    if (num_ops <= 50)  return 15.0;
+    if (num_ops <= 100) return 30.0;
+    if (num_ops <= 200) return 60.0;
+    return 120.0;
 }
 
 int main(int argc, char* argv[]) {
@@ -66,7 +73,7 @@ int main(int argc, char* argv[]) {
               << total_tensor_size / 1e6 << "M\n";
 
     // Use 95% of budget (5% safety margin for I/O)
-    double budget = get_time_budget(args[0]);
+    double budget = get_time_budget(args[0], prob.num_ops());
     auto start = SteadyClock::now();
     auto deadline = start + std::chrono::milliseconds((int)(budget * 950));
     std::cerr << "Time budget: " << std::fixed << std::setprecision(0)

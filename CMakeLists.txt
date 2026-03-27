@@ -60,21 +60,22 @@ target_link_libraries(symmetry_app solver_lib Threads::Threads)
 enable_testing()
 
 set(TEST_SOURCES
+    test/test_feasibility.cpp
     test/cross_validate.cpp
     test/symm_init_test.cpp
     test/unit_tests.cpp
     test/problem_examples_test.cpp
     test/chained_matmul_test.cpp
     test/fanin_matmul_test.cpp
-    #test/local_search_test.cpp
+    test/local_search_test.cpp
     test/init_strategies_test.cpp
     test/fm_test.cpp
     test/move_gain_test.cpp
+    test/gain_update_test.cpp
     test/retain_snake_test.cpp
-    #test/constructed_optima_test.cpp
+    test/constructed_optima_test.cpp
     test/cost_cache_test.cpp
     test/evolution_test.cpp
-    test/solution_search_test.cpp
     test/sanity_test.cpp
     test/partition_fm_test.cpp
     test/more_unit_tests.cpp
@@ -87,8 +88,10 @@ set(TEST_SOURCES
     test/parallel_search_test.cpp
     test/ordering_test.cpp
     test/solver_test.cpp
-    test/solution_gain_test.cpp
     test/pairing_heap_test.cpp
+    test/coupling_test.cpp
+    test/coupling_moves_test.cpp
+    test/coupled_fm_correctness_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
@@ -132,3 +135,30 @@ add_custom_target(run_all
 add_custom_command(TARGET run_all POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "Solutions written to build directory"
 )
+
+# --- Regression target ---
+# Runs all benchmarks and compares against benchmarks/baseline.json.
+# Usage:
+#   make regression           -- run and compare
+#   make regression_update    -- run and promote improvements to baseline
+find_package(Python3 QUIET)
+if(Python3_FOUND OR EXISTS "/usr/bin/python3")
+    set(PYTHON_CMD ${Python3_EXECUTABLE})
+    if(NOT Python3_FOUND)
+        set(PYTHON_CMD python3)
+    endif()
+    add_custom_target(regression
+        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
+                --build ${CMAKE_BINARY_DIR}
+        DEPENDS mlsys
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running benchmark regression"
+    )
+    add_custom_target(regression_update
+        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
+                --build ${CMAKE_BINARY_DIR} --update
+        DEPENDS mlsys
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running benchmark regression and updating baseline"
+    )
+endif()

@@ -288,7 +288,7 @@ void test_fm_best_move_for() {
     std::set<size_t> locked;
 
     for (size_t op = 0; op < p.num_ops(); op++) {
-        auto m = best_move_for(part, op, part.total_cost() * 0.5, locked);
+        auto m = best_move_for(part, op, locked);
         if (m.valid()) {
             valid_moves++;
             CHECK("fm move has saving", m.saving > -1e17);
@@ -314,7 +314,6 @@ void test_fm_inner_pass() {
     double before = part.total_cost();
 
     FMConfig cfg;
-    cfg.floor_fraction = 0.3;
     cfg.max_drift_fraction = 0.5;
     cfg.init_count = 5;
     cfg.seed = 42;
@@ -346,7 +345,6 @@ void test_fm_outer_loop() {
     FMOuterConfig cfg;
     cfg.max_passes = 10;
     cfg.max_no_improve = 5;
-    cfg.pass_config.floor_fraction = 0.3;
     cfg.pass_config.max_drift_fraction = 0.5;
     cfg.pass_config.init_count = 5;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -402,9 +400,11 @@ void test_mm_diamond() {
     auto p = make_mm_diamond();
     DAG d = DAG::build(p);
 
-    // {Op0,Op1,Op2} should be rejected: T2 eph consumed by Op1 AND Op2
+    // {Op0,Op1,Op2}: T2 ephemeral (Op0 produces, Op1+Op2 consume internally).
+    // Multiple internal consumers are valid — same PW tiling applies to both.
+    // Op3 is external but only consumes T3,T4 (boundary outputs), not T2.
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
-    CHECK("eph fan-out rejected", tmp.eval_set({0,1,2}) >= 1e17);
+    CHECK("eph fan-out valid (all T2 consumers internal)", tmp.eval_set({0,1,2}) < 1e17);
 
     // {Op0,Op1} OK: T2 eph consumed only by Op1
     CHECK("{0,1} feasible", tmp.eval_set({0,1}) < 1e17);
@@ -472,18 +472,20 @@ void test_pw_sink_rule() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("MM+PW fused valid", sg.has_value());
 
-    // PW sink forces k=1
-    CHECK("k=128 rejected", !sg->is_valid_tiling({128,128,128,SnakeDir::None}));
-    CHECK("k=1 accepted", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+    // PW sink + matmul: output_K_=max_K_=256 (K=T0.width=256).
+    // nk must be 1 → only k=256 valid. k<256 → nk>1 → rejected.
+    CHECK("k=256 valid (nk=1)", sg->is_valid_tiling({128,128,256,SnakeDir::None}));
+    CHECK("k=128 invalid (nk=2 > 1)", !sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+    CHECK("k=1 invalid (nk=256 > 1)", !sg->is_valid_tiling({128,128,1,SnakeDir::None}));
 
     auto best = sg->best_cost();
-    CHECK("best k=1", best.config.k == 1);
+    CHECK("best k=256", best.config.k == 256);
 
     // Fused should still beat separate (saves T2 transfer)
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
     double fused = tmp.eval_set({0,1});
     double sep = tmp.eval_set({0}) + tmp.eval_set({1});
-    std::cout << "  Fused (k=1): " << fused << " Separate: " << sep << "\n";
+    std::cout << "  Fused (k=256): " << fused << " Separate: " << sep << "\n";
     CHECK("fused < separate", fused < sep);
 }
 
@@ -497,7 +499,7 @@ void test_apply_fm_move() {
     auto part = Partition::trivial(p, d);
 
     // Find a merge move via best_move_for
-    FMMove m = best_move_for(part, 0, part.total_cost(), {});
+    FMMove m = best_move_for(part, 0);
     if (m.valid()) {
         std::cout << "  Move: type=" << m.type << " op=" << m.op
                   << " ga=" << m.ga << " gb=" << m.gb << " saving=" << m.saving << "\n";

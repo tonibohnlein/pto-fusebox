@@ -331,67 +331,7 @@ void test_mutate_reassign_does_not_disconnect() {
 }
 
 // ============================================================================
-// 4. mutate_block_move
-// ============================================================================
-
-void test_mutate_block_move_chain6_specific() {
-    std::cout << "--- test_mutate_block_move_chain6_specific ---\n";
-    // Specific 2-group partition of chain6 (from original test).
-    auto p = make_chain6(); DAG d = DAG::build(p);
-    CostCache cache;
-    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
-    part.add_group({0,1,2}, part.eval_set({0,1,2}));
-    part.add_group({3,4,5}, part.eval_set({3,4,5}));
-
-    std::mt19937 rng(42);
-    for (int trial = 0; trial < 20; trial++) {
-        auto result = mutate_block_move(Partition(part), rng);
-        check_valid("block_move/chain6-specific", result, p);
-    }
-}
-
-void test_mutate_block_move_chain4_fuzz() {
-    std::cout << "--- test_mutate_block_move_chain4_fuzz ---\n";
-    auto p = make_chain4(); DAG d = DAG::build(p);
-    CostCache cache;
-    auto part = Partition::trivial(p, d); part.cache = &cache;
-    fuzz_mutation("block_move/chain4", part, p, [](const Partition& b, std::mt19937& r) {
-        return mutate_block_move(b, r);
-    });
-}
-
-void test_mutate_block_move_gap_blocked() {
-    std::cout << "--- test_mutate_block_move_gap_blocked ---\n";
-    // Diamond4: moving block {Op0} from G0 to G1 creates the same ephemeral
-    // gap as reassign. Bug 2 fix (exclude src_gi from gap check) must prevent it.
-    auto p = make_diamond4(); DAG d = DAG::build(p);
-    CostCache cache;
-    auto part = Partition::trivial(p, d); part.cache = &cache;
-    for (int seed = 0; seed < 100; seed++) {
-        std::mt19937 rng(seed);
-        check_valid("block_move gap blocked (Bug 2)", mutate_block_move(part, rng), p);
-    }
-}
-
-void test_mutate_block_move_eject_path() {
-    std::cout << "--- test_mutate_block_move_eject_path ---\n";
-    // Fully fused: no adjacent target group → block must be ejected as new group.
-    // This path (no adjacent target) cannot create gaps or cycles.
-    auto p = make_chain4(); DAG d = DAG::build(p);
-    CostCache cache;
-    auto part = Partition::trivial(p, d); part.cache = &cache;
-    part.groups[0].ops  = {0,1,2,3};
-    part.groups[0].cost = cache.evaluate({0,1,2,3},p,d);
-    for (int i = 1; i < 4; i++) part.groups[i].alive = false;
-    part.rebuild_index();
-    for (int seed = 0; seed < 30; seed++) {
-        std::mt19937 rng(seed);
-        check_valid("block_move eject path", mutate_block_move(part, rng), p);
-    }
-}
-
-// ============================================================================
-// 5. mutate_eject
+// 4. mutate_eject
 // ============================================================================
 
 void test_mutate_eject_chain4_fused() {
@@ -601,13 +541,23 @@ void test_crossover_diamond4_parents() {
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
 
+    // Under new ephemeral rule, {Op0,Op1} is invalid (T1 ephemeral, Op2 stranded).
+    // Use valid parents:
+    // Parent A: {Op0,Op1,Op2} + {Op3} — all T1 consumers internal
+    // Parent B: {Op0} + {Op1,Op2,Op3} — T1 is boundary input to second group
     auto pa = Partition::trivial(p, d); pa.cache = &cache;
-    pa.groups[0].ops  = {0,1}; pa.groups[0].cost = cache.evaluate({0,1},p,d);
-    pa.groups[1].alive = false; pa.rebuild_index();
+    pa.groups[0].ops = {0,1,2};
+    pa.groups[0].cost = cache.evaluate({0,1,2}, p, d);
+    pa.groups[1].alive = false;
+    pa.groups[2].alive = false;
+    pa.rebuild_index();
 
     auto pb = Partition::trivial(p, d); pb.cache = &cache;
-    pb.groups[0].ops  = {0,2}; pb.groups[0].cost = cache.evaluate({0,2},p,d);
-    pb.groups[2].alive = false; pb.rebuild_index();
+    pb.groups[1].ops = {1,2,3};
+    pb.groups[1].cost = cache.evaluate({1,2,3}, p, d);
+    pb.groups[2].alive = false;
+    pb.groups[3].alive = false;
+    pb.rebuild_index();
 
     for (int seed = 0; seed < 30; seed++) {
         std::mt19937 rng(seed);
@@ -667,7 +617,7 @@ void test_mutation_preserves_coverage_Y_merge() {
             case 0: part = mutate_merge(std::move(part), rng);    break;
             case 1: part = mutate_split(std::move(part), rng);    break;
             case 2: part = mutate_reassign(std::move(part), rng); break;
-            case 3: part = mutate_block_move(std::move(part), rng); break;
+            case 3: part = mutate_eject(std::move(part), rng);    break;
         }
         check_valid("coverage walk step", part, p);
     }
@@ -716,13 +666,7 @@ int main() {
     test_mutate_reassign_gap_blocked();
     test_mutate_reassign_does_not_disconnect();
 
-    // 4. mutate_block_move (Bug 2 regression)
-    test_mutate_block_move_chain6_specific();
-    test_mutate_block_move_chain4_fuzz();
-    test_mutate_block_move_gap_blocked();
-    test_mutate_block_move_eject_path();
-
-    // 5. mutate_eject
+    // 4. mutate_eject
     test_mutate_eject_chain4_fused();
     test_mutate_eject_splits_components();
 

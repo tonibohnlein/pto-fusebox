@@ -1,7 +1,7 @@
 #include "search/active_set.h"
 
 ActiveSet::ActiveSet(const Partition& part, double floor)
-    : part_(&part), floor_(floor), heap_(part.prob->num_ops()) {}
+    : part_(&part), heap_(part.prob->num_ops()), floor_(floor) {}
 
 // ============================================================================
 // Activation
@@ -9,8 +9,8 @@ ActiveSet::ActiveSet(const Partition& part, double floor)
 
 void ActiveSet::recompute_and_update(size_t op) {
     if (locked_.count(op)) return;
-    auto move = best_move_for(*part_, op, floor_, locked_);
-    if (move.valid())
+    auto move = best_move_for(*part_, op, locked_);
+    if (move.valid() && move.saving > -floor_)
         heap_.push_or_update(op, move);
     else
         heap_.remove(op);
@@ -102,6 +102,23 @@ void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
             for (auto nbr : part_->dag->op_neighbors[op])
                 ops_to_refresh.insert(nbr);
         }
+    }
+
+    // Expand to cover full groups: a DAG neighbor of an op in a relevant group
+    // may share a group with other ops that have no direct DAG connection to the
+    // affected area.  Those group-mates can still have stale cached moves because
+    // acyclicity checks (acyclic_steal_local, acyclic_merge_local) use global
+    // forward_reachable — a topology change far away can invalidate their evals.
+    // Solution: if any op in group G is being refreshed, refresh all of G.
+    {
+        std::set<size_t> groups_to_cover;
+        for (auto op : ops_to_refresh)
+            for (auto gi : part_->groups_of(op))
+                if (gi < part_->groups.size() && part_->groups[gi].alive)
+                    groups_to_cover.insert(gi);
+        for (auto gi : groups_to_cover)
+            for (auto op : part_->groups[gi].ops)
+                ops_to_refresh.insert(op);
     }
 
     // Recompute each affected op's best move

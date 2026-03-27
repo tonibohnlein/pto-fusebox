@@ -63,10 +63,14 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     FMPassResult result;
     result.start_cost = part.total_cost();
     result.best_cost = result.start_cost;
-    result.best_partition = part;  // initial snapshot
 
-    double floor = result.start_cost * cfg.floor_fraction;
+    // Lightweight checkpoint: store only groups (ops + cost + alive).
+    // Avoids copying op_to_groups_, group DAG, etc. on every improvement.
+    // Restored into a full Partition at the end.
+    auto best_groups = part.groups;
+
     double max_drift = result.start_cost * cfg.max_drift_fraction;
+    double floor = result.start_cost * cfg.floor_fraction;
 
     // Step 1: activate random subset of border ops
     auto candidates = all_activatable_ops(part);
@@ -80,16 +84,29 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     double cumulative_gain = 0;
     double best_cumulative_gain = 0;
     int fm_iters = 0;
+    int consecutive_non_improving = 0;
     using SteadyClock = std::chrono::steady_clock;
+
+    // Per-type counters: [type] → {applied, failed}
+    constexpr int NUM_TYPES = 9;
+    int type_applied[NUM_TYPES] = {};
+    int type_failed[NUM_TYPES] = {};
+    const char* stop_reason = "max_iters";
 
     while (true) {
         fm_iters++;
 
         // Check deadline every 32 iterations (clock syscall amortization)
-        if ((fm_iters & 31) == 0 && SteadyClock::now() >= cfg.deadline) break;
+        if ((fm_iters & 31) == 0 && SteadyClock::now() >= cfg.deadline) {
+            stop_reason = "deadline";
+            break;
+        }
 
         auto move_opt = active.pop_best();
-        if (!move_opt.has_value()) break;
+        if (!move_opt.has_value()) {
+            stop_reason = "exhausted";
+            break;
+        }
 
         FMMove move = *move_opt;
 
@@ -111,8 +128,10 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
         double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
+            if (move.type >= 0 && move.type < NUM_TYPES) type_failed[move.type]++;
             continue;
         }
+        if (move.type >= 0 && move.type < NUM_TYPES) type_applied[move.type]++;
 
 #ifndef NDEBUG
         {
@@ -139,25 +158,56 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
 
         if (new_cost < result.best_cost - 0.001) {
             result.best_cost = new_cost;
-            result.best_partition = part;
+            best_groups = part.groups;
             best_cumulative_gain = cumulative_gain;
+            consecutive_non_improving = 0;
+        } else {
+            consecutive_non_improving++;
         }
 
-        if (best_cumulative_gain - cumulative_gain > max_drift) break;
+        if (best_cumulative_gain - cumulative_gain > max_drift) {
+            stop_reason = "drift";
+            break;
+        }
+        if (consecutive_non_improving >= cfg.max_consecutive_non_improving) {
+            stop_reason = "no_improve";
+            break;
+        }
 
         active.lock_all(extra_locks);
         active.refresh_after_move(affected);
     }
 
-    result.end_partition = part;
     result.end_cost = part.total_cost();
+    result.end_partition = std::move(part);
+
+    // Restore best partition from lightweight checkpoint.
+    // Only the groups snapshot was saved — reconstruct the full Partition
+    // from pointers + groups + rebuild_index (avoids copying op_to_groups_).
+    result.best_partition.prob = result.end_partition.prob;
+    result.best_partition.dag = result.end_partition.dag;
+    result.best_partition.cache = result.end_partition.cache;
+    result.best_partition.groups = std::move(best_groups);
+    result.best_partition.rebuild_index();
 
     if (g_verbose) {
+        static const char* type_names[] = {
+            "STEAL", "EJECT", "RECOMP", "MERGE", "INT_EJECT",
+            "SPLIT", "T_MERGE", "T_EXTRACT", "DE_RECOMP"
+        };
         std::cerr << "      FM pass: " << fm_iters << " iters, "
                   << result.moves_applied << " applied ("
                   << result.moves_positive << "+, " << result.moves_negative << "-), "
                   << "best=" << result.best_cost
-                  << " end=" << result.end_cost << "\n";
+                  << " end=" << result.end_cost
+                  << " [" << stop_reason << "]\n";
+        std::cerr << "        moves:";
+        for (int t = 0; t < NUM_TYPES; t++) {
+            if (type_applied[t] || type_failed[t])
+                std::cerr << " " << type_names[t] << "=" << type_applied[t]
+                          << "(" << type_failed[t] << "f)";
+        }
+        std::cerr << "\n";
     }
 
     return result;

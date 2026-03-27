@@ -1,8 +1,41 @@
 #include "solution/solution.h"
 #include "partition/partition.h"
+#include "core/cost_cache.h"
 #include <algorithm>
 #include <sstream>
 #include <iostream>
+
+// ============================================================================
+// One-time feasibility check: which tensors can physically be retained?
+// ============================================================================
+std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag) {
+    std::set<size_t> result;
+    for (auto t : prob.retainable_tensors) {
+        if (prob.tensors[t].size() > prob.fast_memory_capacity)
+            continue;
+        bool ok = true;
+        // Producer singleton must be feasible while retaining t
+        int prod = dag.tensor_producer[t];
+        if (prod >= 0) {
+            auto sg = Subgraph::create(prob, dag, {(size_t)prod});
+            if (!sg) { ok = false; }
+            else if (!sg->best_cost({}, {t}).feasible) { ok = false; }
+        }
+        if (!ok) continue;
+        // Each consumer singleton must be feasible with t entering
+        for (size_t op = 0; op < prob.num_ops() && ok; op++) {
+            bool consumes = false;
+            for (auto inp : prob.ops[op].inputs)
+                if (inp == t) { consumes = true; break; }
+            if (!consumes) continue;
+            auto sg = Subgraph::create(prob, dag, {op});
+            if (!sg) { ok = false; break; }
+            if (!sg->best_cost({t}, {}).feasible) { ok = false; break; }
+        }
+        if (ok) result.insert(t);
+    }
+    return result;
+}
 
 // ============================================================================
 // Construction: evaluate costs with inter-step retain propagation
@@ -55,7 +88,16 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
 std::vector<ScheduleStep> Solution::steps_from_ordering(
         const Problem& /*prob*/, const DAG& /*dag*/,
         const Partition& part,
-        const OrderingResult& res) {
+        const OrderingResult& res,
+        CostCache* cache) {
+
+    // Helper: route best_cost through cache when available
+    auto best_cost_cached = [&](const Subgraph& sg,
+                                const std::set<size_t>& entering,
+                                const std::set<size_t>& retain) -> CostResult {
+        if (cache) return cache->evaluate_with_context(sg, entering, retain);
+        return sg.best_cost(entering, retain);
+    };
 
     std::vector<ScheduleStep> steps;
     steps.reserve(res.order.size());
@@ -89,13 +131,13 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         baseline.config   = g.best_cfg;
 
         // Attempt 1: full retention context (entering + retain)
-        auto cost = sg.best_cost(entering, retain_these);
+        auto cost = best_cost_cached(sg, entering, retain_these);
 
         // Attempt 2: keep entering, drop retain — ONLY if infeasible.
         // A local latency increase from retention is often worth it when it
         // saves the next step a massive slow-memory load.
         if (!cost.feasible) {
-            auto cost2 = sg.best_cost(entering, {});
+            auto cost2 = best_cost_cached(sg, entering, {});
             if (cost2.feasible) {
                 cost = cost2;
                 retain_these.clear();
@@ -123,16 +165,26 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
 // ============================================================================
 
 Solution Solution::from_partition(const Problem& prob, const DAG& dag,
-                                   const Partition& part) {
+                                   const Partition& part, int max_beam_width,
+                                   CostCache* cache) {
     // Caller must have called part.finalize() already.
     // No deep copy, no redundant finalize.
 
     auto dfs_res  = dfs_ordering(part);
-    int  bw       = std::min(20, std::max(5, (int)part.num_alive()));
+
+    // Scale beam width inversely with partition size.
+    // 35+ groups with beam=10 → ~15K best_cost calls → 10+ seconds.
+    // Cap to keep Phase 2 fast.
+    int n_alive = (int)part.num_alive();
+    int bw = max_beam_width;
+    if (n_alive > 25) bw = std::min(bw, 3);
+    else if (n_alive > 15) bw = std::min(bw, 5);
+    bw = std::max(2, bw);
+
     auto beam_res = beam_search_ordering(part, bw);
 
-    auto dfs_steps  = steps_from_ordering(prob, dag, part, dfs_res);
-    auto beam_steps = steps_from_ordering(prob, dag, part, beam_res);
+    auto dfs_steps  = steps_from_ordering(prob, dag, part, dfs_res, cache);
+    auto beam_steps = steps_from_ordering(prob, dag, part, beam_res, cache);
 
     // No-retention baseline: DFS order, each step uses standalone best_cost.
     // Guarantees solution cost ≤ partition cost.
@@ -149,18 +201,20 @@ Solution Solution::from_partition(const Problem& prob, const DAG& dag,
     Solution bare_sol(prob, dag, std::move(bare_steps));
 
     // Pick the best valid solution
-    Solution* best = &bare_sol;
-    if (dfs_sol.validate().valid && dfs_sol.total_latency() < best->total_latency() - 0.01)
-        best = &dfs_sol;
-    if (beam_sol.validate().valid && beam_sol.total_latency() < best->total_latency() - 0.01)
-        best = &beam_sol;
+    Solution* best = nullptr;
+    for (auto* s : {&bare_sol, &dfs_sol, &beam_sol}) {
+        if (s->validate().valid &&
+            (!best || s->total_latency() < best->total_latency() - 0.01))
+            best = s;
+    }
+    if (!best) best = &bare_sol;  // fallback (all invalid)
 
+#ifndef NDEBUG
     // Diagnostic: if best is invalid, dump group DAG info
-    auto vr = best->validate();
-    if (!vr.valid) {
+    if (!best->validate().valid) {
+        auto vr = best->validate();
         std::cerr << "  DIAG: " << vr.error << "\n";
         std::cerr << "  DIAG: " << part.num_alive() << " alive groups\n";
-        // Find groups with in_deg==0
         for (size_t gi = 0; gi < part.groups.size(); gi++) {
             if (!part.groups[gi].alive) continue;
             if (part.group_in_deg[gi] != 0) continue;
@@ -169,31 +223,14 @@ Solution Solution::from_partition(const Problem& prob, const DAG& dag,
                 int prod = dag.tensor_producer[t];
                 if (prod < 0) continue;
                 std::cerr << "  DIAG: G" << gi << " (in_deg=0) needs T" << t
-                          << " from op" << prod << ". ";
-                // Which groups export T?
-                bool any_export = false;
-                for (size_t gj = 0; gj < part.groups.size(); gj++) {
-                    if (!part.groups[gj].alive || gj == gi) continue;
-                    if (part.groups[gj].sg && part.groups[gj].sg->boundary_outputs().count(t)) {
-                        std::cerr << "G" << gj << "(pos=" << part.group_in_deg[gj] << ") exports. ";
-                        any_export = true;
-                    }
-                    if (part.groups[gj].ops.count(prod)) {
-                        auto fe = part.compute_force_ephemeral(gj);
-                        if (fe.count(t))
-                            std::cerr << "G" << gj << " FORCE-EPHEMERAL! ";
-                    }
-                }
-                if (!any_export)
-                    std::cerr << "NO GROUP EXPORTS T" << t << "!";
-                std::cerr << "\n";
+                          << " from op" << prod << "\n";
             }
         }
-        // Dump DFS order
         std::cerr << "  DIAG dfs_order: ";
         for (auto gi : dfs_res.order) std::cerr << gi << " ";
         std::cerr << "\n";
     }
+#endif
 
     return std::move(*best);
 }
@@ -270,6 +307,58 @@ Solution::ValidationResult Solution::validate() const {
         }
     }
 
+    // Mixed-consumer check (matches reference evaluator's checkEphemeralization):
+    // If tensor T is produced AND consumed inside step si (ephemeral), every
+    // external consumer must have T's producer recomputed in its own step.
+    // Without recomputation, the external consumer can't access T (it's ephemeral).
+    for (size_t si = 0; si < steps_.size(); si++) {
+        const auto& ops = steps_[si].subgraph.ops();
+        std::set<size_t> op_set(ops.begin(), ops.end());
+        for (auto op : ops) {
+            for (auto t : prob_->ops[op].outputs) {
+                // Is T consumed by any op inside this step?
+                bool consumed_internal = false;
+                for (auto cop : dag_->tensor_consumers[t])
+                    if (cop != op && op_set.count(cop)) { consumed_internal = true; break; }
+                if (!consumed_internal) continue;
+
+                // T is ephemeral in step si. If T is a boundary output of
+                // some OTHER step, external consumers can read it from slow
+                // memory — no recomputation needed.
+                bool avail_elsewhere = false;
+                for (size_t sj = 0; sj < steps_.size(); sj++) {
+                    if (sj == si) continue;
+                    if (steps_[sj].subgraph.boundary_outputs().count(t))
+                        { avail_elsewhere = true; break; }
+                }
+                if (avail_elsewhere) continue;
+
+                // T not available elsewhere — each external consumer must
+                // have the producer recomputed in its own step.
+                for (auto cop : dag_->tensor_consumers[t]) {
+                    if (op_set.count(cop)) continue;  // internal → OK
+
+                    bool covered = false;
+                    for (size_t sj = 0; sj < steps_.size(); sj++) {
+                        if (sj == si) continue;
+                        bool has_cop = false, has_prod = false;
+                        for (auto o : steps_[sj].subgraph.ops()) {
+                            if (o == cop) has_cop = true;
+                            if (o == op)  has_prod = true;
+                        }
+                        if (has_cop && has_prod) { covered = true; break; }
+                    }
+                    if (!covered) {
+                        fail("Step " + std::to_string(si) + ": T" + std::to_string(t)
+                             + " is ephemeral but external consumer op" + std::to_string(cop)
+                             + " has no recomputation of producer op" + std::to_string(op));
+                        return vr;
+                    }
+                }
+            }
+        }
+    }
+
     return vr;
 }
 
@@ -284,34 +373,32 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                       size_t exclude_step2) {
     for (auto op : proposed_ops) {
         for (auto t : prob.ops[op].outputs) {
-            // New ephemeral rule: T is ephemeral only if ALL DAG consumers
-            // are inside proposed_ops. If any consumer is external to the
-            // proposed group, T becomes a boundary output (materialized).
-            bool all_consumers_internal = true;
+            // New ephemeral rule: T is ephemeral in proposed_ops if ANY
+            // consumer is internal (produced + consumed = ephemeral).
             bool any_consumer_internal = false;
+            for (auto cop : dag.tensor_consumers[t])
+                if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
+            if (!any_consumer_internal) continue;  // pure boundary output → safe
+
+            // T is ephemeral → external consumers need it from elsewhere
             for (auto cop : dag.tensor_consumers[t]) {
-                if (proposed_ops.count(cop))
-                    any_consumer_internal = true;
-                else
-                    all_consumers_internal = false;
-            }
-            if (!any_consumer_internal) continue;  // pure boundary output
-            if (!all_consumers_internal) continue;  // external consumer → boundary output
+                if (proposed_ops.count(cop)) continue;  // internal → served
 
-            // T would be purely ephemeral. Is it available from some other step?
-            int prod_op = dag.tensor_producer[t];
-            if (prod_op < 0) continue;
+                int prod_op = dag.tensor_producer[t];
+                if (prod_op < 0) continue;
 
-            bool available = false;
-            for (size_t si = 0; si < steps.size(); si++) {
-                if (si == exclude_step || si == exclude_step2) continue;
-                if (steps[si].subgraph.boundary_outputs().count(t)) { available = true; break; }
-            }
-            if (available) continue;
+                // Is T available as boundary output from some non-excluded step?
+                // Under new rule: boundary_outputs() excludes internally-consumed tensors
+                bool available = false;
+                for (size_t si = 0; si < steps.size(); si++) {
+                    if (si == exclude_step || si == exclude_step2) continue;
+                    if (steps[si].subgraph.boundary_outputs().count(t))
+                        { available = true; break; }
+                }
+                if (available) continue;
 
-            // T is ephemeral everywhere. Any consumer in a non-excluded step
-            // that doesn't recompute the producer is stranded.
-            for (auto cop : dag.tensor_consumers[t]) {
+                // Check if cop's step recomputes the producer
+                bool cop_served = false;
                 for (size_t si = 0; si < steps.size(); si++) {
                     if (si == exclude_step || si == exclude_step2) continue;
                     bool in_step = false, has_prod = false;
@@ -319,8 +406,9 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                         if (o == cop)              in_step  = true;
                         if (o == (size_t)prod_op)  has_prod = true;
                     }
-                    if (in_step && !has_prod) return true;
+                    if (in_step && has_prod) { cop_served = true; break; }
                 }
+                if (!cop_served) return true;
             }
         }
     }

@@ -448,13 +448,14 @@ void test_pw_sink_mm_then_pw() {
 
     CHECK("T2 ephemeral",   sg.ephemeral().count(2));
     CHECK("T3 boundary out",sg.boundary_outputs().count(3));
-    // Reference accepts any k for PW sinks
-    CHECK("k=1 valid",  sg.is_valid_tiling(TC(128,128,1)));
-    CHECK("k=32 valid", sg.is_valid_tiling(TC(128,128,32)));
-    CHECK("k=64 valid", sg.is_valid_tiling(TC(128,128,64)));
-    // nk=1 (PW sink → output_K=1)
-    auto c = sg.compute_cost(TC(128,128,1));
-    CHECK("feasible k=1", c.feasible);
+    // PW sink + matmul (K=128): only k=128 valid (nk=1).
+    CHECK("k=1 invalid",  !sg.is_valid_tiling(TC(128,128,1)));
+    CHECK("k=32 invalid", !sg.is_valid_tiling(TC(128,128,32)));
+    CHECK("k=64 invalid", !sg.is_valid_tiling(TC(128,128,64)));
+    CHECK("k=128 valid",   sg.is_valid_tiling(TC(128,128,128)));
+    // nk=1 (k=128 → nk=128/128=1)
+    auto c = sg.compute_cost(TC(128,128,128));
+    CHECK("feasible k=128", c.feasible);
     CHECK_EQ_I("nk=1", c.num_k_passes, 1);
     // comp_per_step includes both MM and PW
     CHECK_EQ("comp/step=2500", c.compute_per_step, 2500.0);
@@ -495,13 +496,14 @@ void test_pw_sink_pw_then_mm_with_pw_output() {
     if (!sg) return;
 
     CHECK("T4 boundary out", sg->boundary_outputs().count(4));
-    CHECK("k=1 valid",   sg->is_valid_tiling(TC(128,128,1)));
-    CHECK("k=2 valid",   sg->is_valid_tiling(TC(128,128,2)));
-    CHECK("k=128 valid", sg->is_valid_tiling(TC(128,128,128)));
-    // Cost should be same regardless of k
-    auto c1 = sg->compute_cost(TC(128,128,1));
+    // PW sink + matmul (K=128): only k=128 valid (nk=1).
+    CHECK("k=1 invalid",  !sg->is_valid_tiling(TC(128,128,1)));
+    CHECK("k=2 invalid",  !sg->is_valid_tiling(TC(128,128,2)));
+    CHECK("k=128 valid",   sg->is_valid_tiling(TC(128,128,128)));
+    // Cost at k=128 is feasible
     auto c128 = sg->compute_cost(TC(128,128,128));
-    CHECK_EQ("k-invariant cost", c1.latency, c128.latency);
+    CHECK("k=128 feasible", c128.feasible);
+    CHECK_EQ_I("nk=1", c128.num_k_passes, 1);
 }
 
 void test_pw_sink_mixed_outputs_one_pw() {
@@ -523,9 +525,10 @@ void test_pw_sink_mixed_outputs_one_pw() {
 
     CHECK("T2 boundary out (MM)", sg->boundary_outputs().count(2));
     CHECK("T3 boundary out (PW)", sg->boundary_outputs().count(3));
-    // T3 is PW → has_pw_sink=true → k is ignored for entire subgraph
-    CHECK("k=1 valid",  sg->is_valid_tiling(TC(128,128,1)));
-    CHECK("k=32 valid", sg->is_valid_tiling(TC(128,128,32)));
+    // T3 is PW → has_pw_sink=true, output_K_=max_K_=128. Only k=128 valid.
+    CHECK("k=1 invalid",  !sg->is_valid_tiling(TC(128,128,1)));
+    CHECK("k=32 invalid", !sg->is_valid_tiling(TC(128,128,32)));
+    CHECK("k=128 valid",   sg->is_valid_tiling(TC(128,128,128)));
 }
 
 // ============================================================================

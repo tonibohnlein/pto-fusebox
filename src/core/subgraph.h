@@ -34,12 +34,8 @@
 class Subgraph {
 public:
   // Factory: returns nullopt if ops don't form a valid subgraph.
-  // force_ephemeral: tensors to treat as ephemeral even if they have external
-  // DAG consumers. Used when partition context shows all external consumers
-  // are in groups that recompute the producer (no eviction needed).
   static std::optional<Subgraph> create(const Problem &prob, const DAG &dag,
-                                        std::vector<size_t> op_indices,
-                                        const std::set<size_t> &force_ephemeral = {});
+                                        std::vector<size_t> op_indices);
 
   // --- Accessors ---
 
@@ -66,9 +62,12 @@ public:
   // Maximum K across all MatMul ops in this subgraph.
   int64_t max_K() const { return max_K_; }
 
-  // Reduction dimension of the output-producing MatMul(s).
-  // This is the K that drives the temporal loop (nk = output_K / k).
-  // For PW-sink subgraphs, output_K_ == 1 (k is forced to 1).
+  // Reduction dimension used in the temporal loop (nk = output_K / k).
+  // For MatMul-sink subgraphs: K of the boundary-output-producing MatMul.
+  // For PW-sink + MatMul subgraphs: max_K_ of the internal MatMul(s).
+  //   nk is still enforced to 1 (PW constraint), but k = output_K in the
+  //   solution file tells the runtime to do the full K in one pass.
+  // For pure-PW subgraphs: 1 (no K dimension).
   int64_t output_K() const { return output_K_; }
 
   // --- Tiling validity ---
@@ -111,6 +110,7 @@ private:
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
   bool has_pw_sink_ = false;
+  bool has_tiling_conflict_ = false;  // tensor gets conflicting roles → need numerical check
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
 
@@ -199,6 +199,15 @@ private:
     BoundaryTensorInfo::TileSource v = BoundaryTensorInfo::FROM_NTH;
   };
   std::vector<TilePair> tensor_tiling_;
+
+  // Minimum tensor dimension for each tile-count source.
+  // Used by is_valid_tiling to reject configs where derived tile counts
+  // (ntw, nth, nk) exceed tensor dimensions — which causes zero-size slices.
+  // Precomputed in create() from tensor_tiling_ sources.
+  int64_t min_ntw_dim_ = INT64_MAX;   // min width  among FROM_NTW tensors
+  int64_t min_nth_dim_ = INT64_MAX;   // min height among FROM_NTH tensors
+  int64_t min_nk_h_dim_ = INT64_MAX;  // min width  among h_source=FROM_NK tensors
+  int64_t min_nk_v_dim_ = INT64_MAX;  // min height among v_source=FROM_NK tensors
 
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;

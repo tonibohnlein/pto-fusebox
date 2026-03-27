@@ -2,42 +2,25 @@
 
 #include "core/subgraph.h"
 #include <vector>
-#include <unordered_map>
 #include <set>
-#include <shared_mutex>
-#include <mutex>
 #include <atomic>
+#include <memory>
 
 // ============================================================================
-// Thread-safe memoization cache for eval_set.
+// Unified cost cache for partition search AND solution search.
 //
-// The key insight: best_cost() for a given set of ops is deterministic
-// (depends only on the ops and the problem). During local search, the same
-// op-sets are evaluated millions of times across greedy, tabu, and FM passes.
-// Caching avoids redundant Subgraph::create + tiling enumeration.
+// Two tiers sharing one object, kept alive across all three solver phases:
 //
-// NOTE: only the scalar cost is stored here — not the Subgraph or TileConfig.
-// finalize() rebuilds those on demand for the small partition pool (O(pool *
-// groups) calls, all cache misses converted to Subgraph::create directly).
-// Storing Subgraph in this cache would copy a heavy object on every one of
-// the millions of cache hits during Phase 1, destroying search performance.
+//   BASE MAP: Lock-free open-addressed hash table.
+//     (op_set) → CostResult.  Populated during Phase 1 (partition search)
+//     via evaluate().  Reads are fully lock-free (atomic state load +
+//     key compare).  Writes use CAS on per-slot atomic state.
+//     ~30-70K entries across all phases.
 //
-// --- Key representation ---
-// The cache key is std::vector<size_t> built from std::set<size_t>, which
-// always iterates in sorted order. The key is therefore always sorted.
-// This is a required invariant: the same op-set must always produce the same
-// key regardless of how it was assembled by the caller. Callers MUST pass
-// ops as std::set<size_t> to guarantee this.
-//
-// --- Thread safety ---
-// Reads (hits) use a shared lock so multiple threads can read concurrently.
-// Writes (misses) use an exclusive lock.
-//
-// TOCTOU note: two threads can both miss the read check, both compute, and
-// one silently overwrites the other. This is safe because best_cost() is
-// deterministic — both produce the same value. The only side effect is that
-// misses_ may be incremented more than once for a single logical miss under
-// high concurrency, so misses() is an upper bound, not an exact count.
+//   RETENTION MAP: (op_set | SIZE_MAX | entering | SIZE_MAX | retain) → CostResult
+//     Populated during Phase 2/3 (coupling search) via evaluate_with_context().
+//     Also fully lock-free — same LockFreeMap design as the base map.
+//     When entering={} and retain={}, falls back to the base map instead.
 // ============================================================================
 
 struct VectorHash {
@@ -49,87 +32,293 @@ struct VectorHash {
     }
 };
 
+// ============================================================================
+// Lock-free open-addressed hash table with linear probing.
+//
+// Slot states: EMPTY → WRITING → READY  (one-way transitions, never recycle)
+//
+// Read path:  hash → probe → load state(acquire) → if READY, compare key
+//             No locks, no atomics beyond the state load.
+//
+// Write path: hash → probe → CAS(EMPTY, WRITING) → write key+value
+//             → store(READY, release).  Single-writer-per-slot via CAS.
+//
+// Duplicates from races are harmless (cache semantics — any hit is valid).
+// Table never rehashes; pre-allocate sufficient capacity.
+// ============================================================================
+
+template<typename Value>
+class LockFreeMap {
+    enum State : uint8_t { EMPTY = 0, WRITING = 1, READY = 2 };
+
+    struct Slot {
+        std::atomic<uint8_t> state{EMPTY};
+        size_t hash = 0;
+        std::vector<size_t> key;
+        Value value{};
+    };
+
+    std::unique_ptr<Slot[]> slots_;
+    size_t capacity_;
+    size_t mask_;
+    std::atomic<size_t> size_{0};
+
+public:
+    explicit LockFreeMap(size_t min_capacity = 131072) {
+        // Round up to power of 2
+        capacity_ = 1;
+        while (capacity_ < min_capacity) capacity_ <<= 1;
+        mask_ = capacity_ - 1;
+        slots_ = std::make_unique<Slot[]>(capacity_);
+    }
+
+    // Lock-free lookup. Returns pointer to value if found, nullptr otherwise.
+    // Safe to call concurrently from any number of threads.
+    const Value* find(const std::vector<size_t>& key, size_t h) const {
+        size_t idx = h & mask_;
+        for (size_t i = 0; i < capacity_; i++) {
+            const auto& slot = slots_[idx];
+            auto s = slot.state.load(std::memory_order_acquire);
+            if (s == EMPTY) return nullptr;  // end of probe chain
+            if (s == READY && slot.hash == h && slot.key == key)
+                return &slot.value;
+            idx = (idx + 1) & mask_;
+        }
+        return nullptr;
+    }
+
+    // Insert key→value. Returns true if inserted, false if duplicate or full.
+    // Safe to call concurrently; at most one thread wins each slot via CAS.
+    bool insert(const std::vector<size_t>& key, size_t h, const Value& value) {
+        size_t idx = h & mask_;
+        for (size_t i = 0; i < capacity_; i++) {
+            auto& slot = slots_[idx];
+            uint8_t expected = EMPTY;
+            if (slot.state.compare_exchange_strong(expected, WRITING,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Won this slot — write key+value, then publish
+                slot.hash = h;
+                slot.key = key;
+                slot.value = value;
+                slot.state.store(READY, std::memory_order_release);
+                size_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (expected == WRITING) {
+                // Another thread is filling this slot — skip (may create duplicate, harmless)
+                idx = (idx + 1) & mask_;
+                continue;
+            }
+            // expected == READY: check for duplicate key
+            if (slot.hash == h && slot.key == key)
+                return false;  // already cached
+            idx = (idx + 1) & mask_;
+        }
+        return false;  // table full
+    }
+
+    size_t size() const { return size_.load(std::memory_order_relaxed); }
+
+    // Reset all slots. Only call when no other thread is accessing the table.
+    void clear() {
+        for (size_t i = 0; i < capacity_; i++) {
+            slots_[i].state.store(EMPTY, std::memory_order_relaxed);
+            slots_[i].hash = 0;
+            slots_[i].key = std::vector<size_t>();  // free heap capacity
+            slots_[i].value = Value{};
+        }
+        size_.store(0, std::memory_order_relaxed);
+    }
+};
+
+// ============================================================================
+// CostCache
+// ============================================================================
+
 class CostCache {
 public:
-    // max_entries: maximum number of entries to store.
-    // 0 = unlimited (default — suitable when problem size is known to be small).
-    // When the cap is reached, new op-sets are still evaluated and returned but
-    // not inserted into the map. Use overcapacity() to detect this.
-    //
-    // Sizing guidance:
-    //   Each entry ≈ avg_group_size*8 + 8 + 64 bytes (key + value + node overhead).
-    //   For avg_group_size=4: ~100 bytes/entry.
-    //   250K entries ≈ 25 MB  (fine for competition benchmarks, N ≤ ~200 ops).
-    //   1M  entries ≈ 100 MB  (safe upper bound for N ≤ ~500 ops).
-    explicit CostCache(size_t max_entries = 0) : max_entries_(max_entries) {}
+    explicit CostCache(size_t max_entries = 0)
+        : max_entries_(max_entries)
+        // Base map: 2x headroom, minimum 1M slots.  Load factor < 0.5.
+        , base_map_(std::max<size_t>(1048576, max_entries > 0 ? max_entries * 2 : 1048576))
+        // Retention map: fixed 1M slots → up to ~500K entries at 0.5 load factor.
+        , ret_map_(1048576)
+    {}
 
-    // Evaluate the cost of a set of ops. Returns cached result if available.
-    // ops must be a std::set<size_t> to guarantee sorted key ordering.
+    // ====================================================================
+    // Tier 1: Base map — lock-free (op_set) → CostResult.
+    // ====================================================================
+
     double evaluate(const std::set<size_t>& ops, const Problem& prob, const DAG& dag) {
-        std::vector<size_t> key(ops.begin(), ops.end());
+        thread_local std::vector<size_t> key;
+        key.assign(ops.begin(), ops.end());
+        size_t h = VectorHash{}(key);
 
-        // Fast path: shared (read) lock — multiple threads can hit concurrently.
-        {
-            std::shared_lock<std::shared_mutex> lock(mutex_);
-            auto it = map_.find(key);
-            if (it != map_.end()) {
-                hits_.fetch_add(1, std::memory_order_relaxed);
-                return it->second;
-            }
+        // Lock-free read
+        auto* hit = base_map_.find(key, h);
+        if (hit) {
+            base_hits_.fetch_add(1, std::memory_order_relaxed);
+            return hit->feasible ? hit->latency : 1e18;
         }
 
-        // Cache miss: compute outside the lock.
-        // Two threads may both reach here for the same key — see TOCTOU note above.
-        misses_.fetch_add(1, std::memory_order_relaxed);
-        double cost = 1e18;
-        auto sg = Subgraph::create(prob, dag, key);
-        if (sg) {
-            auto c = sg->best_cost();
-            if (c.feasible) cost = c.latency;
-        }
+        // Miss — compute
+        base_misses_.fetch_add(1, std::memory_order_relaxed);
+        CostResult cr;
+        auto sg = Subgraph::create(prob, dag,
+            std::vector<size_t>(ops.begin(), ops.end()));
+        if (sg) cr = sg->best_cost();
 
-        // Write: exclusive lock.
-        // Skip insertion if the cap is set and already reached (stop-on-full policy).
-        // Early entries (small singleton/pair groups, most frequently re-evaluated)
-        // were cached first, so later overflow entries are typically less valuable.
-        {
-            std::unique_lock<std::shared_mutex> lock(mutex_);
-            if (max_entries_ == 0 || map_.size() < max_entries_) {
-                // Another thread may have already inserted this key (TOCTOU);
-                // harmlessly overwrite with the same deterministic value.
-                map_[key] = cost;
-            } else {
-                overcapacity_.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+        // Insert (may fail if full or duplicate from race — both harmless)
+        if (max_entries_ > 0 && base_map_.size() >= max_entries_)
+            base_overcapacity_.fetch_add(1, std::memory_order_relaxed);
+        else
+            base_map_.insert(key, h, cr);
 
-        return cost;
+        return cr.feasible ? cr.latency : 1e18;
     }
 
-    // Reset all state. Use between independent problem instances.
+    // ====================================================================
+    // Tier 2: Retention map — lock-free (op_set|entering|retain) → CostResult.
+    //
+    // When entering={} and retain={}, falls back to the lock-free base map.
+    // ====================================================================
+
+    // Overload: look up or compute (ops, entering, retain) without requiring a
+    // pre-built Subgraph.  On cache hit, returns immediately (no Subgraph
+    // created).  On miss, builds a Subgraph from ops and evaluates.
+    CostResult evaluate_with_context(const std::set<size_t>& ops,
+                                      const std::set<size_t>& entering,
+                                      const std::set<size_t>& retain,
+                                      const Problem& prob,
+                                      const DAG& dag) {
+        if (entering.empty() && retain.empty()) {
+            thread_local std::vector<size_t> okey;
+            okey.assign(ops.begin(), ops.end());
+            size_t h = VectorHash{}(okey);
+            auto* hit = base_map_.find(okey, h);
+            if (hit) {
+                base_hits_.fetch_add(1, std::memory_order_relaxed);
+                return *hit;
+            }
+            base_misses_.fetch_add(1, std::memory_order_relaxed);
+            auto sg_opt = Subgraph::create(prob, dag,
+                std::vector<size_t>(ops.begin(), ops.end()));
+            CostResult cr;
+            if (sg_opt) cr = sg_opt->best_cost({}, {});
+            if (max_entries_ == 0 || base_map_.size() < max_entries_)
+                base_map_.insert(okey, h, cr);
+            return cr;
+        }
+
+        thread_local std::vector<size_t> oext_key;
+        oext_key.clear();
+        oext_key.insert(oext_key.end(), ops.begin(), ops.end());
+        oext_key.push_back(SIZE_MAX);
+        oext_key.insert(oext_key.end(), entering.begin(), entering.end());
+        oext_key.push_back(SIZE_MAX);
+        oext_key.insert(oext_key.end(), retain.begin(), retain.end());
+        size_t h = VectorHash{}(oext_key);
+
+        // Lock-free read
+        auto* hit = ret_map_.find(oext_key, h);
+        if (hit) {
+            ret_hits_.fetch_add(1, std::memory_order_relaxed);
+            return *hit;
+        }
+
+        // Miss — compute
+        ret_misses_.fetch_add(1, std::memory_order_relaxed);
+        auto sg_opt = Subgraph::create(prob, dag,
+            std::vector<size_t>(ops.begin(), ops.end()));
+        CostResult cr;
+        if (sg_opt) cr = sg_opt->best_cost(entering, retain);
+
+        if (ret_map_.size() < 750000)  // stay under ~75% load factor
+            ret_map_.insert(oext_key, h, cr);
+        return cr;
+    }
+
+    CostResult evaluate_with_context(const Subgraph& sg,
+                                      const std::set<size_t>& entering,
+                                      const std::set<size_t>& retain) {
+        // No retention context → lock-free base map
+        if (entering.empty() && retain.empty()) {
+            thread_local std::vector<size_t> base_key;
+            base_key.assign(sg.ops().begin(), sg.ops().end());
+            size_t h = VectorHash{}(base_key);
+
+            auto* hit = base_map_.find(base_key, h);
+            if (hit) {
+                base_hits_.fetch_add(1, std::memory_order_relaxed);
+                return *hit;
+            }
+
+            base_misses_.fetch_add(1, std::memory_order_relaxed);
+            auto cr = sg.best_cost({}, {});
+            base_map_.insert(base_key, h, cr);
+            return cr;
+        }
+
+        // Retention context → lock-free retention map
+        thread_local std::vector<size_t> ext_key;
+        ext_key.clear();
+        ext_key.insert(ext_key.end(), sg.ops().begin(), sg.ops().end());
+        ext_key.push_back(SIZE_MAX);
+        ext_key.insert(ext_key.end(), entering.begin(), entering.end());
+        ext_key.push_back(SIZE_MAX);
+        ext_key.insert(ext_key.end(), retain.begin(), retain.end());
+        size_t h = VectorHash{}(ext_key);
+
+        auto* hit = ret_map_.find(ext_key, h);
+        if (hit) {
+            ret_hits_.fetch_add(1, std::memory_order_relaxed);
+            return *hit;
+        }
+
+        ret_misses_.fetch_add(1, std::memory_order_relaxed);
+        auto cr = sg.best_cost(entering, retain);
+        if (ret_map_.size() < 750000)  // stay under ~75% load factor
+            ret_map_.insert(ext_key, h, cr);
+        return cr;
+    }
+
+    // ====================================================================
+    // Diagnostics & management
+    // ====================================================================
+
+    // Only call when no threads are using the cache.
     void clear() {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        map_.clear();
-        hits_.store(0,          std::memory_order_relaxed);
-        misses_.store(0,        std::memory_order_relaxed);
-        overcapacity_.store(0,  std::memory_order_relaxed);
+        base_map_.clear();
+        ret_map_.clear();
+        base_hits_.store(0, std::memory_order_relaxed);
+        base_misses_.store(0, std::memory_order_relaxed);
+        base_overcapacity_.store(0, std::memory_order_relaxed);
+        ret_hits_.store(0, std::memory_order_relaxed);
+        ret_misses_.store(0, std::memory_order_relaxed);
     }
 
-    // misses() is an upper bound under concurrent access (see TOCTOU note).
-    size_t hits()         const { return hits_.load(std::memory_order_relaxed); }
-    size_t misses()       const { return misses_.load(std::memory_order_relaxed); }
-    // overcapacity(): number of evaluations that were computed but not stored
-    // because the cap was reached. Non-zero means the cap should be raised.
-    size_t overcapacity() const { return overcapacity_.load(std::memory_order_relaxed); }
-    size_t size()         const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return map_.size();
-    }
+    size_t base_hits()    const { return base_hits_.load(std::memory_order_relaxed); }
+    size_t base_misses()  const { return base_misses_.load(std::memory_order_relaxed); }
+    size_t ret_hits()     const { return ret_hits_.load(std::memory_order_relaxed); }
+    size_t ret_misses()   const { return ret_misses_.load(std::memory_order_relaxed); }
+
+    size_t hits()         const { return base_hits(); }
+    size_t misses()       const { return base_misses(); }
+    size_t overcapacity() const { return base_overcapacity_.load(std::memory_order_relaxed); }
+    size_t size()         const { return base_map_.size(); }
+    size_t ret_size()     const { return ret_map_.size(); }
     size_t max_entries()  const { return max_entries_; }
+
+    // freeze/unfreeze are no longer needed (both maps are always lock-free)
+    void freeze_base() {}
+    void unfreeze_base() {}
 
 private:
     const size_t max_entries_;
-    mutable std::shared_mutex mutex_;
-    std::unordered_map<std::vector<size_t>, double, VectorHash> map_;
-    std::atomic<size_t> hits_{0}, misses_{0}, overcapacity_{0};
+    LockFreeMap<CostResult> base_map_;
+    std::atomic<size_t> base_hits_{0}, base_misses_{0}, base_overcapacity_{0};
+
+    // Retention map: lock-free (op_set|entering|retain) → CostResult  [Phase 2/3]
+    LockFreeMap<CostResult> ret_map_;
+    std::atomic<size_t> ret_hits_{0}, ret_misses_{0};
 };

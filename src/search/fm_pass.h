@@ -10,10 +10,11 @@
 // ============================================================================
 
 struct FMConfig {
-    double floor_fraction = 0.30;     // allow moves worsening by up to this % of cost
-    double max_drift_fraction = 0.50; // abort if cumulative gain drops this % below best
-    int init_count = 3;               // number of border ops to activate initially
-    unsigned seed = 42;               // RNG seed for random initial subset
+    double max_drift_fraction = 0.50;          // abort if cumulative gain drops this % below best
+    double floor_fraction = 0.30;              // active set rejects moves with saving < -floor
+    int max_consecutive_non_improving = 10;    // abort after N consecutive non-improving moves
+    int init_count = 3;                        // number of border ops to activate initially
+    unsigned seed = 42;                        // RNG seed for random initial subset
     std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::time_point::max();  // wall-clock cutoff
 };

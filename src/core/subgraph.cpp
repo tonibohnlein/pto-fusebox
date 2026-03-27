@@ -26,8 +26,7 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // ============================================================================
 
 std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
-                                         std::vector<size_t> op_indices,
-                                         const std::set<size_t> &force_ephemeral) {
+                                         std::vector<size_t> op_indices) {
   if (op_indices.empty())
     return std::nullopt;
 
@@ -57,20 +56,20 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   }
 
   // Classify ephemerals
+  //
+  // Rule: a tensor produced AND consumed inside this subgraph is ephemeral.
+  // It passes directly between ops without consuming fast memory or slow
+  // memory bandwidth. Zero memory footprint, zero IO cost.
+  //
+  // Whether external consumers can access this tensor is NOT the subgraph's
+  // concern — that's validated at the partition/solution level by
+  // partition_has_gap() and Solution::validate().
   std::vector<bool> is_ephemeral(num_tensors, false);
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
       sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t]) {
-      bool all_internal = force_ephemeral.count(t) > 0;
-      if (!all_internal) {
-        all_internal = true;
-        for (auto cop : dag.tensor_consumers[t])
-          if (!is_in_sg[cop]) { all_internal = false; break; }
-      }
-      if (all_internal)
-        is_ephemeral[t] = true;
-    }
+    if (is_produced[t] && is_consumed[t])
+      is_ephemeral[t] = true;
   }
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_produced[t] && !is_ephemeral[t])
@@ -84,8 +83,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   enum class SliceW : uint8_t { W_param, K_param };
   enum class SliceH : uint8_t { H_param, K_param };
-  std::vector<SliceW> eph_sw(num_tensors, SliceW::W_param);
-  std::vector<SliceH> eph_sh(num_tensors, SliceH::H_param);
 
   {
     sg.is_sink_op_vec_.assign(num_ops, false);
@@ -134,6 +131,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
           break;
         }
       }
+    } else if (sg.has_matmul_) {
+      // PW-sink with a matmul inside: nk must still be 1 (enforced below),
+      // but the k written to the solution file should be the matmul's K so
+      // the runtime does the full contraction in one pass.  Use max_K_ so
+      // nk = max_K_ / max_K_ = 1.  Pure-PW subgraphs keep output_K_ = 1.
+      sg.output_K_ = sg.max_K_;
     }
 
     std::vector<std::vector<size_t>> eph_consumers(num_tensors);
@@ -246,11 +249,17 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       return existing;
     };
 
+    bool has_tiling_conflict = false;
+
     auto assign_or_check = [&](size_t t, TS new_h, TS new_v) {
       if (!tsrc[t].assigned) {
         tsrc[t] = {new_h, new_v, true};
       } else {
-        // Symbolic propagation ONLY for IO tracking. Numerical conflicts are caught dynamically later.
+        // Detect if this tensor gets conflicting roles from different consumers.
+        // A conflict means the numerical propagation in is_valid_tiling could
+        // fail for some (ntw, nth, nk) values — we can't skip it.
+        if (tsrc[t].h != new_h || tsrc[t].v != new_v)
+          has_tiling_conflict = true;
         tsrc[t].h = merge_source(tsrc[t].h, new_h);
         tsrc[t].v = merge_source(tsrc[t].v, new_v);
       }
@@ -279,11 +288,31 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
+    sg.has_tiling_conflict_ = has_tiling_conflict;
+
     sg.tensor_tiling_.resize(num_tensors);
     for (size_t t = 0; t < num_tensors; t++) {
       if (tsrc[t].assigned) {
         sg.tensor_tiling_[t] = {tsrc[t].h, tsrc[t].v};
       }
+    }
+
+    // Compute minimum tensor dimensions per tile-count source.
+    // This covers ALL tensors in the subgraph (boundary + ephemeral),
+    // so is_valid_tiling can reject configs where derived tile counts
+    // (ntw, nth, nk) would exceed any tensor's dimension.
+    for (auto op_idx : sg.ops_) {
+      auto check = [&](size_t t) {
+        if (!tsrc[t].assigned) return;
+        int64_t W = prob.tensors[t].width;
+        int64_t H = prob.tensors[t].height;
+        if (tsrc[t].h == TS::FROM_NTW) sg.min_ntw_dim_ = std::min(sg.min_ntw_dim_, W);
+        if (tsrc[t].h == TS::FROM_NK)  sg.min_nk_h_dim_ = std::min(sg.min_nk_h_dim_, W);
+        if (tsrc[t].v == TS::FROM_NTH) sg.min_nth_dim_ = std::min(sg.min_nth_dim_, H);
+        if (tsrc[t].v == TS::FROM_NK)  sg.min_nk_v_dim_ = std::min(sg.min_nk_v_dim_, H);
+      };
+      for (auto t : prob.ops[op_idx].inputs) check(t);
+      for (auto t : prob.ops[op_idx].outputs) check(t);
     }
 
     std::vector<int> tensor_in_info(num_tensors, -1);
@@ -360,7 +389,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   sg.ws_cand_ = valid_candidates(sg.w_divides_);
   sg.hs_cand_ = valid_candidates(sg.h_divides_);
-  sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{1}
+  // For PW-sink subgraphs output_K_ == 1, so k == output_K_ == 1 gives nk == 1
+  // (no temporal passes).  Using output_K_ here makes the intent explicit:
+  // k == output_K → nk == 1.
+  sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{sg.output_K_}
                                  : valid_candidates(sg.k_divides_);
 
   return sg;
@@ -382,59 +414,130 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     for (int64_t v : k_divides_)
       if (cfg.k < v && v % cfg.k != 0) return false;
   }
+  // For PW-sink subgraphs k is irrelevant (nk is always 1): skip k
+  // divisibility but enforce nk == 1 explicitly below.
 
+  // Derived tile-count bounds: reject if ntw/nth/nk would exceed any tensor's
+  // dimension in the corresponding direction. Without this, slice computation
+  // produces zero-size slices (integer division W/h_tiles = 0 when h_tiles > W).
   int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
   int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
 
-  std::vector<int64_t> h_tiles(prob_->num_tensors(), -1);
-  std::vector<int64_t> v_tiles(prob_->num_tensors(), -1);
+  // PW-sink: no temporal tiling allowed.
+  if (has_pw_sink_ && nk > 1) return false;
 
-  // Seed outputs of sink operators
+  if (ntw > min_ntw_dim_ || nth > min_nth_dim_) return false;
+  if (nk > min_nk_h_dim_ || nk > min_nk_v_dim_) return false;
+
+  // Fast path: if no tensor has conflicting roles from multiple consumers,
+  // divisibility checks are sufficient — numerical propagation always agrees.
+  if (!has_tiling_conflict_)
+    return true;
+
+  // Slow path: symbolic propagation to catch multi-role conflicts.
+  //
+  // The old numerical approach compared tile counts (e.g. h_tiles=ntw vs
+  // h_tiles=nk).  When ntw==nk the numbers coincide, but the tiling
+  // dimensions are semantically different: ntw varies across spatial columns,
+  // nk varies across temporal k-steps.  A tensor can't serve both roles.
+  //
+  // Fix: propagate TileSource labels.  Two different non-FIXED labels on the
+  // same axis → reject.  Both evaluating to 1 (no actual tiling) is the only
+  // exception — with one tile there's no positional ambiguity.
+
+  using TS = BoundaryTensorInfo::TileSource;
+
+  thread_local std::vector<TS> h_src, v_src;
+  thread_local std::vector<bool> assigned;
+  size_t nt = prob_->num_tensors();
+  h_src.resize(nt);
+  v_src.resize(nt);
+  assigned.assign(nt, false);
+
+  auto eval_ts = [&](TS s) -> int64_t {
+    switch (s) {
+      case TS::FIXED_1:  return 1;
+      case TS::FROM_NTW: return ntw;
+      case TS::FROM_NTH: return nth;
+      case TS::FROM_NK:  return nk;
+    }
+    return 1;
+  };
+
+  // Symbolic compatibility: same label → OK.  Both evaluate to 1 → OK
+  // (no tiling, no positional ambiguity).  Otherwise reject.
+  auto compat = [&](TS existing, TS incoming) -> bool {
+    if (existing == incoming) return true;
+    return eval_ts(existing) == 1 && eval_ts(incoming) == 1;
+  };
+
+  // Merge: prefer a non-FIXED label (more informative for future checks).
+  auto merge_ts = [](TS a, TS b) -> TS {
+    return (a != TS::FIXED_1) ? a : b;
+  };
+
   for (auto op_idx : ops_) {
     if (is_sink_op_vec_[op_idx]) {
       size_t out = prob_->ops[op_idx].outputs[0];
-      h_tiles[out] = ntw;
-      v_tiles[out] = nth;
+      h_src[out] = TS::FROM_NTW;
+      v_src[out] = TS::FROM_NTH;
+      assigned[out] = true;
     }
   }
 
-  // Reverse propagation using actual numerical values
   for (auto op_idx : reverse_topo_ops_) {
     const auto &op = prob_->ops[op_idx];
     size_t out = op.outputs[0];
-    int64_t out_h = h_tiles[out];
-    int64_t out_v = v_tiles[out];
 
-    if (out_h == -1) continue; // Unreachable tensor, skip
+    if (!assigned[out]) {
+      h_src[out] = TS::FROM_NTW;
+      v_src[out] = TS::FROM_NTH;
+      assigned[out] = true;
+    }
+
+    TS out_h = h_src[out];
+    TS out_v = v_src[out];
+
+    auto assign_or_reject = [&](size_t t, TS new_h, TS new_v) -> bool {
+      if (assigned[t]) {
+        if (!compat(h_src[t], new_h) || !compat(v_src[t], new_v))
+          return false;
+        h_src[t] = merge_ts(h_src[t], new_h);
+        v_src[t] = merge_ts(v_src[t], new_v);
+      } else {
+        h_src[t] = new_h;
+        v_src[t] = new_v;
+        assigned[t] = true;
+      }
+      return true;
+    };
 
     if (op.type == OpType::Pointwise) {
-      for (auto in : op.inputs) {
-        if (h_tiles[in] != -1 && (h_tiles[in] != out_h || v_tiles[in] != out_v)) 
-          return false;
-        h_tiles[in] = out_h;
-        v_tiles[in] = out_v;
-      }
-    } else { // MatMul
+      for (auto in : op.inputs)
+        if (!assign_or_reject(in, out_h, out_v)) return false;
+    } else {
       bool is_sink = is_sink_op_vec_[op_idx];
-      
-      int64_t lhs_h = (is_sink && nk > 1) ? nk : 1;
-      int64_t lhs_v = out_v;
-      int64_t rhs_h = out_h;
-      int64_t rhs_v = (is_sink && nk > 1) ? nk : 1;
 
-      size_t lhs = op.inputs[0], rhs = op.inputs[1];
+      TS lhs_h = is_sink ? TS::FROM_NK  : TS::FIXED_1;
+      TS lhs_v = out_v;
+      TS rhs_h = out_h;
+      TS rhs_v = is_sink ? TS::FROM_NK  : TS::FIXED_1;
 
-      if (h_tiles[lhs] != -1 && (h_tiles[lhs] != lhs_h || v_tiles[lhs] != lhs_v)) 
-        return false;
-      h_tiles[lhs] = lhs_h;
-      v_tiles[lhs] = lhs_v;
-
-      if (h_tiles[rhs] != -1 && (h_tiles[rhs] != rhs_h || v_tiles[rhs] != rhs_v)) 
-        return false;
-      h_tiles[rhs] = rhs_h;
-      v_tiles[rhs] = rhs_v;
+      if (!assign_or_reject(op.inputs[0], lhs_h, lhs_v)) return false;
+      if (!assign_or_reject(op.inputs[1], rhs_h, rhs_v)) return false;
     }
+  }
+
+  // Verify propagated tile counts don't exceed tensor dimensions.
+  for (size_t t = 0; t < nt; t++) {
+    if (!assigned[t]) continue;
+    int64_t ht = eval_ts(h_src[t]);
+    int64_t vt = eval_ts(v_src[t]);
+    int64_t W = prob_->tensors[t].width;
+    int64_t H = prob_->tensors[t].height;
+    if (ht > W || vt > H) return false;
+    if (W % ht != 0 || H % vt != 0) return false;
   }
 
   return true;
@@ -468,7 +571,11 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
     int64_t vt = info.eval_v_tiles(nth, nk);
     int64_t W = prob_->tensors[info.id].width;
     int64_t H = prob_->tensors[info.id].height;
-    int64_t slice = (ht > 0 && vt > 0) ? (W / ht) * (H / vt) : info.full_size;
+    // Clamp: tile count cannot exceed tensor dimension (safety net;
+    // is_valid_tiling should already reject such configs).
+    ht = std::max(std::min(ht, W), (int64_t)1);
+    vt = std::max(std::min(vt, H), (int64_t)1);
+    int64_t slice = (W / ht) * (H / vt);
     ws += slice;
   }
 
@@ -503,24 +610,26 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   CostResult result;
   result.config = cfg;
 
-  if (!is_valid_tiling(cfg))
-    return result;
-
+  // working_set() already calls is_valid_tiling() internally.
+  // No need to call it twice.
   result.working_set = working_set(cfg, retained_from_prev, retain_these);
 
   if (result.working_set > prob_->fast_memory_capacity)
     return result;
   result.feasible = true;
 
-  double B = (double)prob_->slow_memory_bandwidth;
+  const double inv_B = 1.0 / (double)prob_->slow_memory_bandwidth;
   int num_tw = std::max((int)(out_W_ / cfg.w), 1);
   int num_th = std::max((int)(out_H_ / cfg.h), 1);
   int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
   result.num_k_passes = has_matmul_ ? std::max((int)(output_K_ / cfg.k), 1) : 1;
-  int nk = result.num_k_passes;
+  const int nk = result.num_k_passes;
 
   double comp_per_step = 0.0;
+  double native_w = (double)prob_->native_w;
+  double native_h = (double)prob_->native_h;
+
   for (auto i : ops_) {
     double c = (double)prob_->ops[i].base_cost;
     size_t out_t = prob_->ops[i].outputs[0];
@@ -533,12 +642,17 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       tmpinfo.v_source = tp.v;
       int64_t ht = tmpinfo.eval_h_tiles(num_tw, nk);
       int64_t vt = tmpinfo.eval_v_tiles(num_th, nk);
-      double slice_w = (double)prob_->tensors[out_t].width / std::max(ht, (int64_t)1);
-      double slice_h = (double)prob_->tensors[out_t].height / std::max(vt, (int64_t)1);
-      op_scale = std::max(slice_w / (double)cfg.w, 1.0) *
-                 std::max(slice_h / (double)cfg.h, 1.0);
+      int64_t tW = prob_->tensors[out_t].width;
+      int64_t tH = prob_->tensors[out_t].height;
+      ht = std::max(std::min(ht, tW), (int64_t)1);
+      vt = std::max(std::min(vt, tH), (int64_t)1);
+      double slice_w = (double)tW / ht;
+      double slice_h = (double)tH / vt;
+      op_scale = std::max(slice_w / native_w, 1.0) *
+                 std::max(slice_h / native_h, 1.0);
     }
-    comp_per_step += c / (double)nk * op_scale;
+    const double nk_adjusted = is_sink_op_vec_[i] ? (double)nk : 1.0;
+    comp_per_step += c / nk_adjusted * op_scale;
   }
   result.compute_per_step = comp_per_step;
 
@@ -554,8 +668,9 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       int64_t vt = info.eval_v_tiles(num_th, nk);
       int64_t W = prob_->tensors[info.id].width;
       int64_t H = prob_->tensors[info.id].height;
-      double slice_io = (double)((W / std::max(ht, (int64_t)1)) *
-                                 (H / std::max(vt, (int64_t)1))) / B;
+      ht = std::max(std::min(ht, W), (int64_t)1);
+      vt = std::max(std::min(vt, H), (int64_t)1);
+      double slice_io = (double)((W / ht) * (H / vt)) * inv_B;
 
       auto eff_h = info.h_source;
       auto eff_v = info.v_source;
@@ -581,8 +696,9 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       int64_t vt = info.eval_v_tiles(num_th, nk);
       int64_t W = prob_->tensors[info.id].width;
       int64_t H = prob_->tensors[info.id].height;
-      out_evict += (double)((W / std::max(ht, (int64_t)1)) *
-                            (H / std::max(vt, (int64_t)1))) / B;
+      ht = std::max(std::min(ht, W), (int64_t)1);
+      vt = std::max(std::min(vt, H), (int64_t)1);
+      out_evict += (double)((W / ht) * (H / vt)) * inv_B;
     }
   }
 
@@ -605,19 +721,31 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
   if (cfg.snake == SnakeDir::None) {
     if (has_matmul_ && num_tw > 1) {
+      // Row-major scan, no snake. Rows go left-to-right, then reset.
+      // Within row: h changes → RHS (col_load) reloads; LHS stays.
+      // Row start: both h resets and v changes → both reload.
       double first_tile = tile_cost(true, true, true);
       double row_start = tile_cost(false, true, true);
       double within_row = tile_cost(false, false, true);
       result.latency = first_tile +
                        (double)(num_th - 1) * row_start +
                        (double)(num_tw - 1) * num_th * within_row;
+    } else if (has_matmul_ && num_th > 1) {
+      // Single column of tiles (num_tw=1): only v changes between tiles.
+      // LHS (row_load) reloads every tile; RHS (col_load/once_load) loads once.
+      double first_tile = tile_cost(true, true, true);
+      double rest = tile_cost(false, true, false);
+      result.latency = first_tile + (double)(num_th - 1) * rest;
     } else {
       result.latency = (double)num_tiles * tile_cost(true, true, true);
     }
   } else if (cfg.snake == SnakeDir::RowMajor) {
+    // hsnake: sweep rows, alternate direction each row.
+    // Within row: h changes → RHS (col_load) reloads.
+    // Row transition: v changes, h stays (snake) → LHS (row_load) reloads.
     double first = tile_cost(true, true, true);
-    double row_trans = tile_cost(false, false, true);
-    double within = tile_cost(false, true, false);
+    double row_trans = tile_cost(false, true, false);
+    double within = tile_cost(false, false, true);
     int n_row_trans = num_th - 1;
     int n_within = (num_tw - 1) * num_th;
     result.latency = first +
@@ -655,6 +783,10 @@ CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
   for (int64_t ww : ws_cand_) {
     for (int64_t hh : hs_cand_) {
       for (int64_t kk : ks_cand_) {
+        // is_valid_tiling depends on (w,h,k) only, not snake direction.
+        // Check once before iterating snakes to avoid redundant work inside
+        // compute_cost → working_set → is_valid_tiling.
+        if (!is_valid_tiling({ww, hh, kk, SnakeDir::None})) continue;
         for (auto sd : snakes) {
           TileConfig cfg{ww, hh, kk, sd};
           auto r = compute_cost(cfg, retained_from_prev, retain_these);

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <queue>
 
 // ============================================================================
@@ -66,8 +67,7 @@ static Partition greedy_merge_restricted(
                     if (!allowed_ops.count(op)) { gb_ok = false; break; }
                 if (!gb_ok) continue;
 
-                // Check acyclicity
-                if (!part.is_acyclic_after_merge(ga, gb)) continue;
+                if (!part.acyclic_merge_local(ga, gb)) continue;
 
                 // Evaluate merge
                 std::set<size_t> merged = part.groups[ga].ops;
@@ -108,16 +108,16 @@ static Partition greedy_merge_restricted(
 // then matches by sorted fingerprint.  Ties broken by local topo order.
 // ============================================================================
 
-static std::map<size_t, size_t> compute_bijection(
+static std::unordered_map<size_t, size_t> compute_bijection(
     const std::set<size_t>& src, const std::set<size_t>& dst,
     const Problem& prob, const DAG& dag, const MerkleHashes& merkle)
 {
     // Compute local topo depth within a component (BFS from sources)
     auto local_depths = [&](const std::set<size_t>& comp)
-        -> std::map<size_t, size_t>
+        -> std::unordered_map<size_t, size_t>
     {
-        // Find local sources (no predecessor within comp)
-        std::map<size_t, size_t> depth;
+        std::unordered_map<size_t, size_t> depth;
+        depth.reserve(comp.size());
         std::queue<size_t> q;
         for (auto op : comp) {
             bool is_source = true;
@@ -129,7 +129,6 @@ static std::map<size_t, size_t> compute_bijection(
             }
         }
 
-        // BFS
         while (!q.empty()) {
             size_t u = q.front(); q.pop();
             for (auto v : dag.op_succs[u]) {
@@ -141,14 +140,16 @@ static std::map<size_t, size_t> compute_bijection(
             }
         }
 
-        // Assign depth 0 to any unreached ops (disconnected via flow)
         for (auto op : comp)
             if (!depth.count(op)) depth[op] = 0;
 
         return depth;
     };
 
-    // Build (init_hash, depth, global_topo_pos) tuples for stable sorting
+    // Build (init_hash, depth, combined_hash) tuples for stable sorting.
+    // Uses merkle.combined (local structural context) instead of global
+    // topo position to avoid cross-wiring when global topo order interleaves
+    // parallel components.
     auto make_ranked = [&](const std::set<size_t>& comp)
         -> std::vector<std::pair<std::tuple<size_t, size_t, size_t>, size_t>>
     {
@@ -156,7 +157,7 @@ static std::map<size_t, size_t> compute_bijection(
         std::vector<std::pair<std::tuple<size_t, size_t, size_t>, size_t>> ranked;
         for (auto op : comp) {
             ranked.push_back({
-                {merkle.init[op], depths[op], dag.topo_position(op)},
+                {merkle.init[op], depths[op], merkle.combined[op]},
                 op
             });
         }
@@ -167,7 +168,8 @@ static std::map<size_t, size_t> compute_bijection(
     auto src_ranked = make_ranked(src);
     auto dst_ranked = make_ranked(dst);
 
-    std::map<size_t, size_t> bij;
+    std::unordered_map<size_t, size_t> bij;
+    bij.reserve(src_ranked.size());
     size_t n = std::min(src_ranked.size(), dst_ranked.size());
     for (size_t i = 0; i < n; i++)
         bij[src_ranked[i].second] = dst_ranked[i].second;
@@ -235,15 +237,7 @@ std::vector<Partition> init_from_patterns(
                                   rep_part.groups[gi].cost});
         }
 
-        if (rep_groups.empty()) {
-            std::cerr << "    no multi-op groups found, skipping\n";
-            continue;
-        }
-
-        std::cerr << "    representative: " << rep_groups.size()
-                  << " groups, cost="
-                  << ([&]{ double c=0; for (auto& g : rep_groups) c += g.cost; return c; })()
-                  << "\n";
+        if (rep_groups.empty()) continue;
 
         // Step 2: Build full partition with replicated groups
         Partition full = Partition::trivial(prob, dag);
@@ -271,11 +265,7 @@ std::vector<Partition> init_from_patterns(
                         mapped.insert(it->second);
                 }
 
-                if (mapped.size() != rg.ops.size()) {
-                    std::cerr << "    WARNING: bijection incomplete for copy "
-                              << ci << ", skipping group\n";
-                    continue;
-                }
+                if (mapped.size() != rg.ops.size()) continue;
 
                 double cost = full.eval_set(mapped);
                 if (cost < 1e17) {
@@ -343,10 +333,7 @@ std::vector<Partition> init_from_patterns(
                                   rep_part.groups[gi].cost});
         }
 
-        if (rep_groups.empty()) {
-            std::cerr << "    no multi-op groups found, skipping\n";
-            continue;
-        }
+        if (rep_groups.empty()) continue;
 
         // Step 2: Build bijections and replicate
         // Series bijection: block[0][j] ↔ block[i][j]

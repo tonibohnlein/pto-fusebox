@@ -1,44 +1,99 @@
 #include "search/fm_search.h"
+#include "search/partition_moves.h"
 #include <algorithm>
 #include <iostream>
 #include <cassert>
 
 // ============================================================================
-// Local cycle check for SPLIT: are the two new sides in a mutual dependency?
-// This is correct for splits because both sides come from the same parent
-// group — no third-party groups can create indirect cycles.
+// eject_creates_ephemeral_gap: local check for EJECT / INTERNAL_EJECT.
+//
+// When ejecting op from group gx, the remainder may have tensors that are
+// ephemeral (produced + consumed internally) but now have a NEW external
+// consumer (the ejected op). We only check tensors consumed by the ejected
+// op — fully local, O(|inputs of op| * small) via groups_of().
 // ============================================================================
 
-static bool split_creates_topo_cycle(const std::set<size_t>& side_a,
-                                      const std::set<size_t>& side_b,
-                                      const DAG& dag) {
-    bool a_to_b = false, b_to_a = false;
-    for (auto u : side_a) {
-        if (a_to_b) break;
-        for (auto v : dag.op_succs[u])
-            if (side_b.count(v)) { a_to_b = true; break; }
+static bool eject_creates_ephemeral_gap(const Partition& part, size_t op, size_t gx) {
+    const auto& dag = *part.dag;
+    const auto& prob = *part.prob;
+    const auto& gx_ops = part.groups[gx].ops;
+
+    for (auto t : prob.ops[op].inputs) {
+        int prod = dag.tensor_producer[t];
+        if (prod < 0) continue;
+        if (!gx_ops.count((size_t)prod)) continue;  // producer outside gx → unaffected
+
+        // Producer is in gx. Will T be ephemeral in the remainder?
+        // Only if another op in the remainder also consumes T.
+        bool consumed_in_remainder = false;
+        for (auto cop : dag.tensor_consumers[t])
+            if (cop != op && gx_ops.count(cop)) { consumed_in_remainder = true; break; }
+        if (!consumed_in_remainder) continue;  // T becomes boundary output → safe
+
+        // T will be ephemeral in remainder. The ejected op needs T externally.
+        // Check if T is available as boundary output from another group.
+        bool available = false;
+        for (auto gj : part.groups_of((size_t)prod)) {
+            if (gj == gx || !part.groups[gj].alive) continue;
+            bool consumed_in_gj = false;
+            for (auto c2 : dag.tensor_consumers[t])
+                if (part.groups[gj].ops.count(c2)) { consumed_in_gj = true; break; }
+            if (!consumed_in_gj) { available = true; break; }
+        }
+        if (!available) return true;
     }
-    if (!a_to_b) return false;
-    for (auto u : side_b) {
-        if (b_to_a) break;
-        for (auto v : dag.op_succs[u])
-            if (side_a.count(v)) { b_to_a = true; break; }
-    }
-    return b_to_a;
+    return false;
 }
 
-// Check if removing op from group_ops would create topological straddling:
-// op has both predecessors AND successors in the remainder. If so, the
-// remainder must execute both before AND after the removed op → group-DAG cycle.
-static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
-                                const DAG& dag) {
-    bool has_pred = false, has_succ = false;
-    for (auto p : dag.op_preds[op])
-        if (p != op && group_ops.count(p)) { has_pred = true; break; }
-    if (!has_pred) return false;
-    for (auto s : dag.op_succs[op])
-        if (s != op && group_ops.count(s)) { has_succ = true; break; }
-    return has_succ;
+// ============================================================================
+// split_creates_ephemeral_gap_local: local check for SPLIT.
+//
+// When splitting group gx into side_a and side_b, tensors that cross the
+// boundary may become ephemeral on one side with external consumers on the
+// other. Only checks tensors at the split boundary — O(|side| * small).
+// ============================================================================
+
+static bool split_creates_ephemeral_gap_local(
+    const Partition& part,
+    const std::set<size_t>& side_a, const std::set<size_t>& side_b,
+    size_t gx) {
+    const auto& dag = *part.dag;
+    const auto& prob = *part.prob;
+
+    // Check each side: does it have an ephemeral tensor needed by the other side?
+    auto check_side = [&](const std::set<size_t>& inside,
+                          const std::set<size_t>& outside) -> bool {
+        for (auto op : outside) {
+            for (auto t : prob.ops[op].inputs) {
+                int prod = dag.tensor_producer[t];
+                if (prod < 0 || !inside.count((size_t)prod)) continue;
+
+                // Producer in inside, consumer (op) in outside.
+                // Is T ephemeral in inside (another consumer also in inside)?
+                bool consumed_in_inside = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (cop != op && inside.count(cop))
+                        { consumed_in_inside = true; break; }
+                if (!consumed_in_inside) continue;
+
+                // T ephemeral in inside, op in outside needs it.
+                // Available from another group?
+                bool available = false;
+                for (auto gj : part.groups_of((size_t)prod)) {
+                    if (gj == gx || !part.groups[gj].alive) continue;
+                    bool consumed_in_gj = false;
+                    for (auto c2 : dag.tensor_consumers[t])
+                        if (part.groups[gj].ops.count(c2))
+                            { consumed_in_gj = true; break; }
+                    if (!consumed_in_gj) { available = true; break; }
+                }
+                if (!available) return true;
+            }
+        }
+        return false;
+    };
+
+    return check_side(side_a, side_b) || check_side(side_b, side_a);
 }
 
 // ============================================================================
@@ -46,120 +101,39 @@ static bool creates_topo_cycle(size_t op, const std::set<size_t>& group_ops,
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     double floor, const std::set<size_t>& locked) {
+                     const std::set<size_t>& locked) {
     if (locked.count(op)) return {};
 
-    constexpr double EPSILON = 1.0;
-
     FMMove best;
+    const auto& dag = *part.dag;
     auto groups_of_x = part.groups_of(op);
     if (groups_of_x.empty()) return {};
 
-    auto accept = [&](double saving) {
-        return (saving > EPSILON || saving < -EPSILON) &&
-               saving > -floor && saving > best.saving;
-    };
-
     bool op_in_multiple = groups_of_x.size() > 1;
 
-    // --- DE_RECOMPUTE: if op is in multiple groups, evaluate removing
-    // singleton groups or fully-redundant groups ---
+    // --- DE_RECOMPUTE: if op is recomputed (in multiple groups), evaluate
+    // removing it from each group ---
     if (op_in_multiple) {
         for (auto gx : groups_of_x) {
             if (!part.groups[gx].alive) continue;
-            if (part.groups[gx].ops.size() == 1) {
-                double saving = part.groups[gx].cost;
-                if (accept(saving))
-                    best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, saving};
-            } else {
-                bool all_covered = true;
-                for (auto o : part.groups[gx].ops) {
-                    bool in_other = false;
-                    for (auto gj : part.groups_of(o))
-                        if (gj != gx && part.groups[gj].alive) { in_other = true; break; }
-                    if (!in_other) { all_covered = false; break; }
-                }
-                if (all_covered) {
-                    double saving = part.groups[gx].cost;
-                    if (accept(saving))
-                        best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, saving};
-                }
-            }
+            auto dr = partition_moves::eval_de_recompute(part, gx, op);
+            if (dr.feasible && dr.saving > best.saving)
+                best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, dr.saving};
         }
     }
 
-    // --- Border moves: MERGE, STEAL, RECOMPUTE, EJECT ---
-    // Acyclicity is verified at apply time (is_acyclic_after_* in apply_fm_move).
-    // Here we only use cheap O(degree) or O(ops/64) pre-filters to avoid
-    // evaluating obviously infeasible moves.
+    // --- Border moves: EJECT ---
     for (auto gx : groups_of_x) {
         if (!part.is_border_op(op, gx)) continue;
+        if (eject_creates_ephemeral_gap(part, op, gx)) continue;
+        // Ejecting a recomputed op is equivalent to DE_RECOMPUTE: the op's
+        // outputs become external deps for the remainder.  Must check
+        // acyclicity to prevent cycles through the op's other group(s).
+        if (op_in_multiple && !part.acyclic_de_recompute_local(op, gx)) continue;
 
-        std::set<size_t> neighbor_groups;
-        for (auto nbr : part.dag->op_neighbors[op])
-            if (!part.groups[gx].ops.count(nbr))
-                for (auto gy : part.groups_of(nbr))
-                    if (gy != gx) neighbor_groups.insert(gy);
-
-        for (auto gy : neighbor_groups) {
-            bool x_in_gy = part.groups[gy].ops.count(op);
-
-            // MERGE: cheap bitwise reachability pre-filter
-            if (!part.dag->merge_creates_cycle(part.groups[gx].ops,
-                                                part.groups[gy].ops)) {
-                std::set<size_t> merged = part.groups[gx].ops;
-                merged.insert(part.groups[gy].ops.begin(), part.groups[gy].ops.end());
-                double merged_cost = part.eval_set(merged);
-                if (merged_cost < 1e17) {
-                    double saving = (part.groups[gx].cost + part.groups[gy].cost) - merged_cost;
-                    if (accept(saving))
-                        best = FMMove{FMMove::MERGE, op, gx, gy, SIZE_MAX, saving};
-                }
-            }
-
-            // STEAL + RECOMPUTE: no cheap pre-filter needed, defer to apply
-            if (!x_in_gy) {
-                std::set<size_t> new_gy = part.groups[gy].ops;
-                new_gy.insert(op);
-                double new_gy_cost = part.eval_set(new_gy);
-
-                if (new_gy_cost < 1e17) {
-                    // STEAL
-                    {
-                        std::set<size_t> new_gx = part.groups[gx].ops;
-                        new_gx.erase(op);
-                        double new_gx_cost = 0;
-                        bool gx_valid = true;
-                        if (new_gx.empty()) {
-                            if (groups_of_x.size() <= 1) gx_valid = false;
-                        } else {
-                            new_gx_cost = part.eval_set(new_gx);
-                            if (new_gx_cost >= 1e17) gx_valid = false;
-                        }
-                        if (gx_valid) {
-                            double saving = (part.groups[gx].cost + part.groups[gy].cost)
-                                            - (new_gx_cost + new_gy_cost);
-                            if (accept(saving))
-                                best = FMMove{FMMove::STEAL, op, gx, gy, SIZE_MAX, saving};
-                        }
-                    }
-
-                    // RECOMPUTE
-                    {
-                        double saving = part.groups[gy].cost - new_gy_cost;
-                        if (accept(saving))
-                            best = FMMove{FMMove::RECOMPUTE, op, gx, gy, SIZE_MAX, saving};
-                    }
-                }
-            }
-        }
-
-        // EJECT: cheap O(degree) pre-filters only
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
-            auto er = part.eval_eject(op, gx);
-            if (er.feasible && accept(er.saving))
-                best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
-        }
+        auto er = part.eval_eject(op, gx);
+        if (er.feasible && er.saving > best.saving)
+            best = FMMove{FMMove::EJECT, op, gx, SIZE_MAX, SIZE_MAX, er.saving};
     }
 
     // --- Internal moves: INTERNAL_EJECT and SPLIT ---
@@ -167,28 +141,104 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (part.is_border_op(op, gx)) continue;
         if (part.groups[gx].ops.size() < 3 || part.groups[gx].ops.size() > 15) continue;
 
-        // INTERNAL_EJECT: cheap pre-filter only
-        if (!creates_topo_cycle(op, part.groups[gx].ops, *part.dag)) {
+        // INTERNAL_EJECT
+        if (!eject_creates_ephemeral_gap(part, op, gx)) {
+            if (op_in_multiple && !part.acyclic_de_recompute_local(op, gx)) continue;
             auto er = part.eval_eject(op, gx);
-            if (er.feasible && accept(er.saving)) {
+            if (er.feasible && er.saving > best.saving) {
                 FMMove candidate;
                 candidate.type = FMMove::INTERNAL_EJECT;
                 candidate.op = op; candidate.ga = gx;
                 candidate.saving = er.saving;
-                if (candidate.saving > best.saving) best = candidate;
+                best = candidate;
             }
         }
 
         // SPLIT: cheap O(|side|) pre-filter only
-        for (auto v : part.dag->op_neighbors[op]) {
+        for (auto v : dag.op_neighbors[op]) {
             if (!part.groups[gx].ops.count(v)) continue;
-            auto edge = std::make_pair(std::min(op, v), std::max(op, v));
+            size_t u_lo = std::min(op, v), u_hi = std::max(op, v);
 
-            auto sr = part.eval_split(edge.first, edge.second, gx);
-            if (sr.feasible && accept(sr.saving) && sr.saving > best.saving) {
-                if (!split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
-                    best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, edge.second, sr.saving};
+            auto sr = part.eval_split(u_lo, u_hi, gx);
+            if (sr.feasible && sr.saving > best.saving) {
+                if (!split_creates_ephemeral_gap_local(part, sr.side_a, sr.side_b, gx))
+                    best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, v, sr.saving};
             }
+        }
+    }
+
+    // --- STEAL / RECOMPUTE / MERGE: op pulled into adjacent group ---
+    // Structured as (target → source) with pre-computed costs for efficiency.
+    std::set<size_t> adj_groups;
+    for (auto nbr : dag.op_neighbors[op])
+        for (auto gi : part.groups_of(nbr))
+            if (part.groups[gi].alive && !part.groups[gi].ops.count(op))
+                adj_groups.insert(gi);
+
+    // Pre-compute cost of each source group after losing op.
+    // Same regardless of target group — avoids redundant eval_set calls.
+    struct GxCost { double cost; bool valid; };
+    std::unordered_map<size_t, GxCost> gx_without_op;
+    for (auto gx : groups_of_x) {
+        if (!part.groups[gx].alive) continue;
+        std::set<size_t> rem = part.groups[gx].ops;
+        rem.erase(op);
+        if (rem.empty()) {
+            gx_without_op[gx] = {0.0, true};
+        } else {
+            double c = part.eval_set(rem);
+            gx_without_op[gx] = {c, c < 1e17};
+        }
+    }
+
+    std::set<std::pair<size_t,size_t>> merge_checked;
+    for (auto gi : adj_groups) {
+        std::set<size_t> new_gi = part.groups[gi].ops;
+        new_gi.insert(op);
+        double new_gi_cost = part.eval_set(new_gi);
+        if (new_gi_cost >= 1e17) continue;
+
+        for (auto gx : groups_of_x) {
+            if (gx == gi || !part.groups[gx].alive) continue;
+
+            // STEAL: move op from gx into gi
+            {
+                auto it = gx_without_op.find(gx);
+                if (it != gx_without_op.end() && it->second.valid) {
+                    double new_gx_cost = it->second.cost;
+                    double saving = (part.groups[gi].cost + part.groups[gx].cost)
+                                    - (new_gi_cost + new_gx_cost);
+                    if (saving > best.saving && part.acyclic_steal_local(op, gx, gi)) {
+                        // Gap check: reuse new_gi (already built) + reconstruct new_gx
+                        std::set<size_t> new_gx = part.groups[gx].ops;
+                        new_gx.erase(op);
+                        std::vector<std::set<size_t>> comps;
+                        comps.push_back(new_gi);
+                        if (!new_gx.empty()) comps.push_back(new_gx);
+                        if (!part.split_creates_ephemeral_gap(comps, {gx, gi}))
+                            best = FMMove{FMMove::STEAL, op, gx, gi, SIZE_MAX, saving};
+                    }
+                }
+            }
+
+            // MERGE: dedup via canonical pair key
+            auto pair_key = std::make_pair(std::min(gi, gx), std::max(gi, gx));
+            if (!merge_checked.count(pair_key)) {
+                merge_checked.insert(pair_key);
+                if (part.acyclic_merge_local(gi, gx)) {
+                    auto mr = partition_moves::eval_merge(part, gi, gx);
+                    if (mr.feasible && mr.saving > best.saving)
+                        best = FMMove{FMMove::MERGE, op, gi, gx, SIZE_MAX, mr.saving};
+                }
+            }
+        }
+
+        // RECOMPUTE: copy op into gi (stays in source groups too)
+        {
+            auto rr = partition_moves::eval_recompute(part, op, gi);
+            size_t gx = groups_of_x.empty() ? 0 : groups_of_x[0];
+            if (rr.feasible && rr.saving > best.saving)
+                best = FMMove{FMMove::RECOMPUTE, op, gx, gi, SIZE_MAX, rr.saving};
         }
     }
 
@@ -200,7 +250,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (tensors_checked.count(t)) continue;
                 tensors_checked.insert(t);
 
-                auto& consumers = part.dag->tensor_consumers[t];
+                auto& consumers = dag.tensor_consumers[t];
                 if (consumers.size() < 2) continue;
 
                 std::set<size_t> consumer_groups;
@@ -211,7 +261,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                     consumer_ops_vec.push_back(cop);
                 }
 
-                int prod = part.dag->tensor_producer[t];
+                int prod = dag.tensor_producer[t];
                 if (prod >= 0) {
                     auto& pg = part.groups_of((size_t)prod);
                     if (!pg.empty())
@@ -233,74 +283,39 @@ FMMove best_move_for(const Partition& part, size_t op,
                 std::vector<size_t> group_list(consumer_groups.begin(),
                                                consumer_groups.end());
 
-                // TENSOR_MERGE: use hypothetical multi-group merge check
-                {
-                    std::set<size_t> merged_ops;
-                    double old_cost = 0;
-
-                    for (auto cg : group_list) {
-                        old_cost += part.groups[cg].cost;
-                        merged_ops.insert(part.groups[cg].ops.begin(),
-                                          part.groups[cg].ops.end());
-                    }
-
-                    if (part.is_acyclic_after_merge(group_list)) {
-                        double new_cost = part.eval_set(merged_ops);
-                        if (new_cost < 1e17) {
-                            double saving = old_cost - new_cost;
-                            if (accept(saving)) {
-                                FMMove candidate;
-                                candidate.type = FMMove::TENSOR_MERGE;
-                                candidate.op = op;
-                                candidate.op2 = t;
-                                candidate.saving = saving;
-                                candidate.tensor_groups = group_list;
-                                if (candidate.saving > best.saving) best = candidate;
-                            }
-                        }
+                // TENSOR_MERGE: local group-level BFS at eval time
+                if (part.acyclic_merge_local(group_list)) {
+                    auto tmr = partition_moves::eval_tensor_merge(part, group_list);
+                    if (tmr.feasible && tmr.saving > best.saving) {
+                        FMMove candidate;
+                        candidate.type = FMMove::TENSOR_MERGE;
+                        candidate.op = op;
+                        candidate.op2 = t;
+                        candidate.saving = tmr.saving;
+                        candidate.tensor_groups = group_list;
+                        best = candidate;
                     }
                 }
 
-                // TENSOR_EXTRACT: use hypothetical acyclicity check.
+                // TENSOR_EXTRACT: Kahn's at eval time (rare move, high rejection)
                 {
                     std::set<size_t> extract_ops(consumer_ops_vec.begin(),
                                                  consumer_ops_vec.end());
                     if (prod >= 0) extract_ops.insert((size_t)prod);
 
-                    if (part.is_acyclic_after_extract(extract_ops, group_list)) {
-                        double old_cost = 0;
-                        double remainder_cost = 0;
-                        bool feasible = true;
-
-                        for (auto cg : group_list) {
-                            old_cost += part.groups[cg].cost;
-                            std::set<size_t> remainder;
-                            for (auto rop : part.groups[cg].ops)
-                                if (!extract_ops.count(rop))
-                                    remainder.insert(rop);
-                            if (!remainder.empty()) {
-                                double rc = part.eval_set(remainder);
-                                if (rc >= 1e17) { feasible = false; break; }
-                                remainder_cost += rc;
-                            }
-                        }
-
-                        if (feasible) {
-                            double extract_cost = part.eval_set(extract_ops);
-                            if (extract_cost < 1e17) {
-                                double saving = old_cost - (extract_cost + remainder_cost);
-                                if (accept(saving)) {
-                                    FMMove candidate;
-                                    candidate.type = FMMove::TENSOR_EXTRACT;
-                                    candidate.op = op;
-                                    candidate.op2 = t;
-                                    candidate.saving = saving;
-                                    candidate.tensor_groups = group_list;
-                                    candidate.tensor_consumer_ops.assign(
-                                        extract_ops.begin(), extract_ops.end());
-                                    if (candidate.saving > best.saving) best = candidate;
-                                }
-                            }
+                    if (part.acyclic_extract_local(extract_ops)) {
+                        auto ter = partition_moves::eval_tensor_extract(
+                            part, extract_ops, group_list);
+                        if (ter.feasible && ter.saving > best.saving) {
+                            FMMove candidate;
+                            candidate.type = FMMove::TENSOR_EXTRACT;
+                            candidate.op = op;
+                            candidate.op2 = t;
+                            candidate.saving = ter.saving;
+                            candidate.tensor_groups = group_list;
+                            candidate.tensor_consumer_ops.assign(
+                                extract_ops.begin(), extract_ops.end());
+                            best = candidate;
                         }
                     }
                 }
@@ -326,199 +341,48 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     switch (m.type) {
         case FMMove::STEAL: {
             // FMMove::STEAL: op moves FROM m.ga INTO m.gb
-            if (!part.is_acyclic_after_steal(m.op, m.ga, m.gb)) return {};
-
-            std::set<size_t> new_ga = part.groups[m.ga].ops;
-            new_ga.erase(m.op);
-            std::set<size_t> new_gb = part.groups[m.gb].ops;
-            new_gb.insert(m.op);
-
-            double new_gb_cost = part.eval_set(new_gb);
-            if (new_gb_cost >= 1e17) return {};
-
-            if (new_ga.empty()) {
-                part.groups[m.ga].alive = false;
-            } else {
-                double new_ga_cost = part.eval_set(new_ga);
-                if (new_ga_cost >= 1e17) return {};
-                part.groups[m.ga].ops = std::move(new_ga);
-                part.groups[m.ga].cost = new_ga_cost;
-            }
-            part.groups[m.ga].gen++;
-            affected.insert(m.ga);
-
-            part.groups[m.gb].ops = std::move(new_gb);
-            part.groups[m.gb].cost = new_gb_cost;
-            part.groups[m.gb].gen++;
-            affected.insert(m.gb);
+            affected = partition_moves::apply_steal(part, m.op, m.ga, m.gb);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::MERGE: {
-            if (!part.is_acyclic_after_merge(m.ga, m.gb)) return {};
-
-            std::set<size_t> merged = part.groups[m.ga].ops;
-            merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
-            double merged_cost = part.eval_set(merged);
-            if (merged_cost >= 1e17) return {};
-
-            part.groups[m.ga].ops = std::move(merged);
-            part.groups[m.ga].cost = merged_cost;
-            part.groups[m.ga].gen++;
-            affected.insert(m.ga);
-
-            part.groups[m.gb].alive = false;
-            part.groups[m.gb].gen++;
-            affected.insert(m.gb);
+            // ga survives, gb killed
+            affected = partition_moves::apply_merge(part, m.ga, m.gb);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::RECOMPUTE: {
-            if (!part.is_acyclic_after_recompute(m.op, m.gb)) return {};
-
-            std::set<size_t> new_gb = part.groups[m.gb].ops;
-            new_gb.insert(m.op);
-            double new_cost = part.eval_set(new_gb);
-            if (new_cost >= 1e17) return {};
-
-            part.groups[m.gb].ops = std::move(new_gb);
-            part.groups[m.gb].cost = new_cost;
-            part.groups[m.gb].gen++;
-            affected.insert(m.gb);
+            affected = partition_moves::apply_recompute(part, m.op, m.gb);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::EJECT:
         case FMMove::INTERNAL_EJECT: {
-            // Pre-mutation acyclicity check
-            if (!part.is_acyclic_after_eject(m.op, m.ga)) return {};
-
-            auto er = part.eval_eject(m.op, m.ga);
-            if (!er.feasible) return {};
-
-            if (er.remainder_components.empty()) {
-                part.groups[m.ga].alive = false;
-            } else {
-                part.groups[m.ga].ops = std::move(er.remainder_components[0]);
-                part.groups[m.ga].cost = er.component_costs[0];
-                for (size_t i = 1; i < er.remainder_components.size(); i++) {
-                    size_t new_gi = part.add_group(
-                        std::move(er.remainder_components[i]), er.component_costs[i]);
-                    affected.insert(new_gi);
-                }
-            }
-            part.groups[m.ga].gen++;
-            affected.insert(m.ga);
-
-            if (er.singleton_cost > 0) {
-                size_t new_gi = part.add_group({m.op}, er.singleton_cost);
-                affected.insert(new_gi);
-            }
+            affected = partition_moves::apply_eject(part, m.op, m.ga);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::SPLIT: {
-            auto sr = part.eval_split(m.op, m.op2, m.ga);
-            if (!sr.feasible) return {};
-            if (split_creates_topo_cycle(sr.side_a, sr.side_b, *part.dag))
-                return {};
-            // Full hypothetical acyclicity check (inter-group cycles)
-            if (!part.is_acyclic_after_split(sr.side_b, m.ga))
-                return {};
-
-            part.groups[m.ga].ops = std::move(sr.side_a);
-            part.groups[m.ga].cost = sr.cost_a;
-            part.groups[m.ga].gen++;
-            affected.insert(m.ga);
-
-            size_t gb = part.add_group(std::move(sr.side_b), sr.cost_b);
-            affected.insert(gb);
+            affected = partition_moves::apply_split(part, m.op, m.op2, m.ga);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::TENSOR_MERGE: {
-            for (auto cg : m.tensor_groups)
-                if (!part.groups[cg].alive) return {};
-            if (!part.is_acyclic_after_merge(m.tensor_groups)) return {};
-
-            std::set<size_t> merged_ops;
-            for (auto cg : m.tensor_groups)
-                merged_ops.insert(part.groups[cg].ops.begin(),
-                                  part.groups[cg].ops.end());
-
-            double merged_cost = part.eval_set(merged_ops);
-            if (merged_cost >= 1e17) return {};
-
-            size_t survivor = m.tensor_groups[0];
-            part.groups[survivor].ops = std::move(merged_ops);
-            part.groups[survivor].cost = merged_cost;
-            part.groups[survivor].gen++;
-            affected.insert(survivor);
-
-            for (size_t i = 1; i < m.tensor_groups.size(); i++) {
-                part.groups[m.tensor_groups[i]].alive = false;
-                part.groups[m.tensor_groups[i]].gen++;
-                affected.insert(m.tensor_groups[i]);
-            }
+            affected = partition_moves::apply_tensor_merge(part, m.tensor_groups);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::TENSOR_EXTRACT: {
-            for (auto cg : m.tensor_groups)
-                if (!part.groups[cg].alive) return {};
-
             std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
-
-            // Pre-mutation acyclicity check
-            if (!part.is_acyclic_after_extract(extract_ops, m.tensor_groups))
-                return {};
-
-            double extract_cost = part.eval_set(extract_ops);
-            if (extract_cost >= 1e17) return {};
-
-            // Pre-validate ALL remainder costs before mutating anything
-            struct RemInfo { size_t gi; std::set<size_t> rem; double cost; };
-            std::vector<RemInfo> remainders;
-            for (auto cg : m.tensor_groups) {
-                std::set<size_t> rem;
-                for (auto rop : part.groups[cg].ops)
-                    if (!extract_ops.count(rop)) rem.insert(rop);
-                double rc = 0;
-                if (!rem.empty()) {
-                    rc = part.eval_set(rem);
-                    if (rc >= 1e17) return {};  // reject before any mutation
-                }
-                remainders.push_back({cg, std::move(rem), rc});
-            }
-
-            // All costs validated — now mutate
-            for (auto& r : remainders) {
-                if (r.rem.empty()) {
-                    part.groups[r.gi].alive = false;
-                } else {
-                    part.groups[r.gi].ops = std::move(r.rem);
-                    part.groups[r.gi].cost = r.cost;
-                }
-                part.groups[r.gi].gen++;
-                affected.insert(r.gi);
-            }
-
-            size_t new_gi = part.add_group(std::move(extract_ops), extract_cost);
-            affected.insert(new_gi);
+            affected = partition_moves::apply_tensor_extract(part, extract_ops,
+                                                              m.tensor_groups);
+            if (affected.empty()) return {};
             break;
         }
         case FMMove::DE_RECOMPUTE: {
-            if (!part.groups[m.ga].alive) return {};
-            for (auto o : part.groups[m.ga].ops) {
-                bool in_other = false;
-                for (auto gj : part.groups_of(o))
-                    if (gj != m.ga && part.groups[gj].alive) { in_other = true; break; }
-                if (!in_other) return {};
-            }
-            // Acyclicity check: removing a recompute group can break a dependency
-            // chain. E.g., group {13} bridges {14}→{13,15} — killing {13} makes
-            // {14} depend on {13,15} which depends back on {14}.
-            if (!part.is_acyclic_without_group(m.ga)) return {};
-            auto adj = part.adjacent_groups(m.ga);
-            part.groups[m.ga].alive = false;
-            part.groups[m.ga].gen++;
-            affected.insert(adj.begin(), adj.end());
-            affected.insert(m.ga);
+            affected = partition_moves::apply_de_recompute(part, m.ga, m.op);
+            if (affected.empty()) return {};
             break;
         }
         default:
@@ -526,5 +390,21 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     }
 
     part.rebuild_index();
+
+#ifndef NDEBUG
+    // Debug: verify no op was lost by this move
+    for (size_t i = 0; i < part.prob->num_ops(); i++) {
+        bool found = false;
+        for (auto gi : part.groups_of(i))
+            if (part.groups[gi].alive) { found = true; break; }
+        if (!found) {
+            std::cerr << "  BUG: apply_fm_move lost op " << i
+                      << " (move type=" << (int)m.type
+                      << " op=" << m.op << " ga=" << m.ga << " gb=" << m.gb << ")\n";
+            assert(false && "apply_fm_move lost an op");
+        }
+    }
+#endif
+
     return affected;
 }

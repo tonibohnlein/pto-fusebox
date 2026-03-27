@@ -6,6 +6,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <algorithm>
 #include <queue>
 #include <iostream>
@@ -112,8 +113,8 @@ public:
         // 2. Build orbit-level DAG
         // ================================================================
 
-        std::vector<std::set<size_t>> orbit_succs(num_orbits);
-        std::vector<std::set<size_t>> orbit_preds(num_orbits);
+        std::vector<std::vector<size_t>> orbit_succs(num_orbits);
+        std::vector<std::vector<size_t>> orbit_preds(num_orbits);
 
         for (size_t t = 0; t < prob.num_tensors(); t++) {
             int prod = dag.tensor_producer[t];
@@ -122,10 +123,19 @@ public:
             for (auto cons : dag.tensor_consumers[t]) {
                 size_t cons_orbit = op_to_orbit[cons];
                 if (prod_orbit != cons_orbit) {
-                    orbit_succs[prod_orbit].insert(cons_orbit);
-                    orbit_preds[cons_orbit].insert(prod_orbit);
+                    orbit_succs[prod_orbit].push_back(cons_orbit);
+                    orbit_preds[cons_orbit].push_back(prod_orbit);
                 }
             }
+        }
+        // Deduplicate
+        for (auto& v : orbit_succs) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+        for (auto& v : orbit_preds) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
         }
 
         // ================================================================
@@ -217,9 +227,12 @@ public:
             -> std::vector<std::set<size_t>>
         {
             // Build undirected adjacency from tensor producer→consumer
-            // restricted to ops in the set.
-            std::vector<std::vector<size_t>> adj(num_ops);
+            // restricted to ops in the set. Use unordered_map to avoid
+            // allocating for all num_ops (the subset is usually small).
+            std::unordered_map<size_t, std::vector<size_t>> adj;
+            adj.reserve(ops.size());
             for (auto op : ops) {
+                adj[op];  // ensure entry exists
                 for (auto t : prob.ops[op].outputs) {
                     for (auto cons : dag.tensor_consumers[t]) {
                         if (ops.count(cons)) {

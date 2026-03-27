@@ -2,6 +2,7 @@
 #include "symmetry/merkle_hash.h"
 
 #include "partition/partition.h"
+#include "search/coupling_search.h"
 #include <random>
 #include <vector>
 
@@ -24,9 +25,6 @@ Partition mutate_split(Partition part, std::mt19937& rng);
 // Unlike FM's best_move_for, this ignores cost — pure structural perturbation.
 Partition mutate_reassign(Partition part, std::mt19937& rng);
 
-// Block move: move an entire DAG chain (connected subpath) between groups.
-Partition mutate_block_move(Partition part, std::mt19937& rng);
-
 // Random eject: pick a random op from a random group, eject it as a singleton.
 // If this disconnects the group, the components become separate groups.
 Partition mutate_eject(Partition part, std::mt19937& rng);
@@ -41,6 +39,12 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng);
 
 // Compound mutation: apply N random mutations (mix of all types).
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng);
+
+// Coupled compound mutation: same mutations applied to cp.part, then
+// invalidate_couplings() to remove any edges broken by the mutation.
+CoupledPartition mutate_compound_coupled(CoupledPartition cp,
+                                          int num_mutations,
+                                          std::mt19937& rng);
 
 // --- Crossover ---
 

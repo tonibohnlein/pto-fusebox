@@ -64,7 +64,7 @@ Problem read_problem(const std::string& filename) {
 
     for (size_t i = 0; i < num_ops; i++) {
         Op op;
-        const std::string type_str = op_types[i].get<std::string>();
+        const auto& type_str = op_types[i].get_ref<const std::string&>();
         if (type_str == "MatMul") {
             op.type = OpType::MatMul;
         } else if (type_str == "Pointwise") {
@@ -95,6 +95,35 @@ Problem read_problem(const std::string& filename) {
         }
         op.base_cost = base_costs[i].get<int64_t>();
         p.ops.push_back(std::move(op));
+    }
+
+    // --- Tensor integrity checks ---
+    // 1. Each tensor must have at most one producing op.
+    // 2. Warn about isolated tensors (no producer AND no consumer).
+    {
+        std::vector<int> producer_op(num_tensors, -1);
+        std::vector<bool> is_consumed(num_tensors, false);
+
+        for (size_t i = 0; i < num_ops; i++) {
+            for (auto t : p.ops[i].outputs) {
+                if (producer_op[t] >= 0) {
+                    std::cerr << "Error: tensor " << t << " produced by both op "
+                              << producer_op[t] << " and op " << i << "\n";
+                    std::exit(1);
+                }
+                producer_op[t] = (int)i;
+            }
+            for (auto t : p.ops[i].inputs)
+                is_consumed[t] = true;
+        }
+
+        for (size_t t = 0; t < num_tensors; t++) {
+            if (producer_op[t] < 0 && !is_consumed[t]) {
+                std::cerr << "Warning: tensor " << t << " ("
+                          << p.tensors[t].width << "x" << p.tensors[t].height
+                          << ") is isolated — not produced or consumed by any op\n";
+            }
+        }
     }
 
     // --- Hardware parameters ---

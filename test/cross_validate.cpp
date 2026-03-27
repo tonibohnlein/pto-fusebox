@@ -156,14 +156,16 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
                           (double)(prob.tensors[t].height / vt) / B;
                 }
 
-                // Compute: ALL ops, every d-step, base_cost/d_tiles × scale
+                // Compute: only SINK ops divide by d_tiles (temporal split-K).
+                // Non-sink ops execute once per tile regardless of nk.
                 size_t co = op.outputs[0];
                 int ht = std::max(h_tiles.count(co) ? h_tiles[co] : 1, 1);
                 int vt = std::max(v_tiles.count(co) ? v_tiles[co] : 1, 1);
                 double sw = (double)prob.tensors[co].width / ht;
                 double sh = (double)prob.tensors[co].height / vt;
                 double scale = std::max(sw / cfg.w, 1.0) * std::max(sh / cfg.h, 1.0);
-                compute += (double)op.base_cost / d_tiles * scale;
+                double nk_adj = is_sink ? (double)d_tiles : 1.0;
+                compute += (double)op.base_cost / nk_adj * scale;
 
                 for (auto t : op.inputs) { h_last[t] = h_pos[t]; v_last[t] = v_pos[t]; }
             }

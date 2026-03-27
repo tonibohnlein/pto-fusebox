@@ -19,6 +19,8 @@
 #include "core/cost_cache.h"
 #include "partition/partition.h"
 #include "search/local_search.h"
+#include "search/fm_search.h"
+#include "search/partition_moves.h"
 #include "init/init_strategies.h"
 #include <algorithm>
 #include <cmath>
@@ -128,10 +130,14 @@ static void check_feasible(const char* label, const Partition& part) {
     } else { g_pass++; }
 }
 
-static std::vector<Move> drain(MoveHeap heap) {
-    std::vector<Move> v;
-    while (!heap.empty()) { v.push_back(heap.top()); heap.pop(); }
-    return v;
+// Helper: collect best moves for all ops in partition.
+static std::vector<FMMove> collect_best_moves(const Partition& part) {
+    std::vector<FMMove> moves;
+    for (size_t op = 0; op < part.prob->num_ops(); op++) {
+        auto m = best_move_for(part, op);
+        if (m.valid()) moves.push_back(m);
+    }
+    return moves;
 }
 
 // ============================================================================
@@ -202,7 +208,8 @@ void test_eval_set() {
     CHECK_EQ("eval {0}", part.eval_set({0}), part.groups[0].cost);
     auto sg01 = *Subgraph::create(p, d, {0, 1});
     CHECK_EQ("eval {0,1}", part.eval_set({0,1}), sg01.best_cost().latency);
-    CHECK("eval disconnected", part.eval_set({0, 2}) >= 1e17);
+    // {Op0, Op2} are disconnected but have matching 128×128 PW outputs → valid
+    CHECK("eval disconnected valid", part.eval_set({0, 2}) < 1e17);
 }
 
 // ============================================================================
@@ -318,25 +325,19 @@ void test_eject_move() {
 // 3. Generation counters / staleness
 // ============================================================================
 
-void test_stale_detection() {
-    std::cout << "--- test_stale_detection ---\n";
-    auto p = make_chain3(); DAG d = DAG::build(p);
-    auto part = Partition::trivial(p, d);
+void test_fmmove_validity() {
+    std::cout << "--- test_fmmove_validity ---\n";
+    FMMove m;
+    CHECK("default FMMove invalid", !m.valid());
+    CHECK("default type NONE", m.type == FMMove::NONE);
 
-    Move m{Move::MERGE, 0, 1, 0, 100.0, part.groups[0].gen, part.groups[1].gen};
-    CHECK("fresh: ga alive",    part.groups[m.ga].alive);
-    CHECK("fresh: gen_a match", part.groups[m.ga].gen == m.gen_a);
-    CHECK("fresh: gen_b match", part.groups[m.gb].gen == m.gen_b);
-
-    part.groups[0].gen++;
-    CHECK("stale: gen_a mismatch", part.groups[m.ga].gen != m.gen_a);
-
-    part.groups[1].alive = false;
-    CHECK("stale: gb dead", !part.groups[m.gb].alive);
+    m.type = FMMove::MERGE;
+    m.op = 0; m.ga = 0; m.gb = 1; m.saving = 5.0;
+    CHECK("constructed FMMove valid", m.valid());
 }
 
 // ============================================================================
-// 4. generate_moves — one move type per test
+// 4. Move generation via best_move_for — one move type per test
 // ============================================================================
 
 void test_generate_merge_proposed() {
@@ -345,14 +346,13 @@ void test_generate_merge_proposed() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap);
-    auto moves = drain(heap);
+    auto moves = collect_best_moves(part);
     CHECK("moves generated", !moves.empty());
     bool found = false;
-    for (auto& m : moves) if (m.type == Move::MERGE) found = true;
-    CHECK("MERGE proposed", found);
-    for (auto& m : moves) CHECK("positive saving at default floor", m.saving > 0);
+    for (auto& m : moves)
+        if (m.type == FMMove::MERGE || m.type == FMMove::STEAL) found = true;
+    CHECK("MERGE or STEAL proposed", found);
+    for (auto& m : moves) CHECK("positive saving", m.saving > 0);
 }
 
 void test_generate_eject_proposed() {
@@ -360,22 +360,23 @@ void test_generate_eject_proposed() {
     auto p = make_chain3(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
-    // Fuse {Op0,Op1}: Op1 is a border op (neighbor Op2 outside)
     part.groups[0].ops  = {0,1};
     part.groups[0].cost = cache.evaluate({0,1}, p, d);
     part.groups[1].alive = false;
     part.rebuild_index();
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
-    bool found = false;
-    for (auto& m : drain(heap)) if (m.type == Move::EJECT) found = true;
-    CHECK("EJECT proposed for border op", found);
+    // best_move_for returns only the single best move per op.
+    // MERGE with G2 typically dominates EJECT (which increases cost).
+    // Verify that at least some move is proposed for border ops.
+    auto moves = collect_best_moves(part);
+    CHECK("border op has a move", !moves.empty());
+    // EJECT is valid but won't be the best — verify it's at least evaluable
+    auto er = part.eval_eject(1, 0);
+    CHECK("EJECT evaluable for border op", er.feasible);
 }
 
 void test_generate_steal_or_merge_proposed() {
     std::cout << "--- test_generate_steal_or_merge_proposed ---\n";
-    // G0={Op0,Op1}, G2={Op2,Op3}: adjacent fused groups
     auto p = make_chain4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
@@ -385,39 +386,27 @@ void test_generate_steal_or_merge_proposed() {
     part.groups[3].alive = false;
     part.rebuild_index();
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
-    auto moves = drain(heap);
+    auto moves = collect_best_moves(part);
     bool found = false;
     for (auto& m : moves)
-        if (m.type == Move::STEAL || m.type == Move::MERGE) { found = true; break; }
+        if (m.type == FMMove::STEAL || m.type == FMMove::MERGE) { found = true; break; }
     CHECK("STEAL or MERGE proposed", found);
 }
 
 void test_generate_recompute_proposed() {
     std::cout << "--- test_generate_recompute_proposed ---\n";
-    // Diamond4: G0={Op0}, G1={Op1}, G2={Op2}, G3={Op3}.
-    // T1 is produced by Op0 and consumed by BOTH Op1 (G1) and Op2 (G2).
-    //
-    // With tiling propagation: merging {Op0,Op1} keeps T1 as a boundary
-    // output (Op2 is external consumer). No ephemeral gap → MERGE allowed.
-    // RECOMPUTE may also be proposed (it's always safe).
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    auto moves = collect_best_moves(part);
     bool found_recompute = false, found_merge = false, found_steal = false;
-    for (auto& m : drain(heap)) {
-        if (m.type == Move::RECOMPUTE) found_recompute = true;
-        if (m.type == Move::MERGE)     found_merge     = true;
-        if (m.type == Move::STEAL)     found_steal     = true;
+    for (auto& m : moves) {
+        if (m.type == FMMove::RECOMPUTE) found_recompute = true;
+        if (m.type == FMMove::MERGE)     found_merge     = true;
+        if (m.type == FMMove::STEAL)     found_steal     = true;
     }
-    // MERGE is now allowed (T1 stays boundary output, not ephemeral)
-    CHECK("MERGE allowed (no ephemeral gap)", found_merge || found_steal);
-    // RECOMPUTE may or may not be proposed depending on move generator
-    // (it's always safe but the generator may skip it when MERGE exists)
+    CHECK("MERGE or STEAL proposed", found_merge || found_steal);
     std::cout << "    merge=" << found_merge << " steal=" << found_steal
               << " recompute=" << found_recompute << "\n";
 }
@@ -436,10 +425,9 @@ void test_generate_internal_eject_proposed() {
     CHECK("Op1 internal in {0,1,2}",
           std::find(internals.begin(),internals.end(),1) != internals.end());
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    auto moves = collect_best_moves(part);
     bool found = false;
-    for (auto& m : drain(heap)) if (m.type == Move::INTERNAL_EJECT) found = true;
+    for (auto& m : moves) if (m.type == FMMove::INTERNAL_EJECT) found = true;
     CHECK("INTERNAL_EJECT proposed", found);
 }
 
@@ -454,23 +442,19 @@ void test_generate_split_proposed() {
     part.groups[2].alive = false;
     part.rebuild_index();
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    auto moves = collect_best_moves(part);
     bool found = false;
-    for (auto& m : drain(heap)) if (m.type == Move::SPLIT) found = true;
+    for (auto& m : moves) if (m.type == FMMove::SPLIT) found = true;
     CHECK("SPLIT proposed for bridge edge", found);
 }
 
 void test_generate_split_co_consumer_bridge() {
     std::cout << "--- test_generate_split_co_consumer_bridge ---\n";
-    // Group {Op0,Op1,Op2}: Op0<->Op1 is a co-consumer bridge (both read T0,
-    // Op1 has no DAG edge to Op0 or Op2). After Fix 2, generate_moves iterates
-    // op_neighbors and proposes this bridge as a SPLIT candidate.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},1000},   // Op0: T0->T1
-             {OpType::Pointwise,{0},{2},1000},   // Op1: T0->T2 (co-consumer)
-             {OpType::Pointwise,{1},{3},1000}};  // Op2: T1->T3
+    p.ops = {{OpType::Pointwise,{0},{1},1000},
+             {OpType::Pointwise,{0},{2},1000},
+             {OpType::Pointwise,{1},{3},1000}};
     p.fast_memory_capacity = 200000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
@@ -484,37 +468,29 @@ void test_generate_split_co_consumer_bridge() {
     part.groups[2].alive = false;
     part.rebuild_index();
 
-    // Verify the co-consumer bridge exists
     bool co_bridge = false;
     for (auto& e : part.bridge_edges(0))
         if ((e.first==0&&e.second==1)||(e.first==1&&e.second==0)) co_bridge = true;
     CHECK("co-consumer bridge exists", co_bridge);
 
-    MoveHeap heap;
-    generate_moves(part, 0, heap, 1e18);
+    auto moves = collect_best_moves(part);
     bool found = false;
-    for (auto& m : drain(heap)) {
-        if (m.type == Move::SPLIT &&
+    for (auto& m : moves) {
+        if (m.type == FMMove::SPLIT &&
             ((m.op==0&&m.op2==1)||(m.op==1&&m.op2==0))) { found = true; break; }
     }
     CHECK("co-consumer bridge SPLIT proposed (Fix 2)", found);
 }
 
-void test_floor_filters_negative_savings() {
-    std::cout << "--- test_floor_filters_negative_savings ---\n";
+void test_best_move_returns_valid() {
+    std::cout << "--- test_best_move_returns_valid ---\n";
     auto p = make_chain3(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    MoveHeap strict, loose;
-    generate_moves(part, 0, strict, 0.0);
-    generate_moves(part, 0, loose, 1e18);
-
-    while (!strict.empty()) {
-        CHECK("strict: all positive", strict.top().saving > 0);
-        strict.pop();
-    }
-    CHECK("loose has moves", !loose.empty());
+    auto moves = collect_best_moves(part);
+    CHECK("has moves", !moves.empty());
+    for (auto& m : moves) CHECK("valid move", m.valid());
 }
 
 // ============================================================================
@@ -805,13 +781,15 @@ void test_greedy_descent_null_cache_works() {
 }
 
 // ============================================================================
-// 11. Full local_search
+// 11. Full pipeline: best_initial + greedy_descent
 // ============================================================================
 
 void test_local_search_chain() {
     std::cout << "--- test_local_search_chain ---\n";
     auto p = make_chain3(); DAG d = DAG::build(p);
-    auto part = local_search(p, d);
+    CostCache cache;
+    auto part = best_initial(p, d, &cache);
+    part = greedy_descent(std::move(part));
     CHECK("fewer groups than trivial", part.num_alive() < (size_t)p.num_ops());
     for (size_t i = 0; i < 3; i++) CHECK("op covered", !part.groups_of(i).empty());
     check_feasible("local_search_chain", part);
@@ -820,7 +798,9 @@ void test_local_search_chain() {
 void test_local_search_diamond() {
     std::cout << "--- test_local_search_diamond ---\n";
     auto p = make_diamond3(); DAG d = DAG::build(p);
-    auto part = local_search(p, d);
+    CostCache cache;
+    auto part = best_initial(p, d, &cache);
+    part = greedy_descent(std::move(part));
     CHECK("cost better than unfused", part.total_cost() < 3 * 3276.8 + 1.0);
     for (size_t i = 0; i < 3; i++) CHECK("op covered", !part.groups_of(i).empty());
     check_feasible("local_search_diamond", part);
@@ -845,7 +825,7 @@ int main() {
     test_eject_move();
 
     // Staleness
-    test_stale_detection();
+    test_fmmove_validity();
 
     // generate_moves: all six types
     test_generate_merge_proposed();
@@ -855,7 +835,7 @@ int main() {
     test_generate_internal_eject_proposed();
     test_generate_split_proposed();
     test_generate_split_co_consumer_bridge();  // Fix 2
-    test_floor_filters_negative_savings();
+    test_best_move_returns_valid();
 
     // Fix 1: EJECT/INTERNAL_EJECT identity
     test_eject_internal_eject_same_formula();

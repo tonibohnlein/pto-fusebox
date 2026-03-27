@@ -94,17 +94,23 @@ void test_chain2() {
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // Compute per step: Op0 = 2000×32/128 = 500, Op1 = 500. Total = 1000
-    CHECK_EQ("comp/step", c.compute_per_step, 1000.0);
+    // Compute per step (new model: only sink Op1 divides by nk=4):
+    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
+    //   Op1 (sink):     2000/4 * scale=1 = 500
+    //   Total = 2500
+    CHECK_EQ("comp/step", c.compute_per_step, 2500.0);
 
-    // k=0: mem_in = T0(1638.4) + T1_slice(409.6) + T2_slice(409.6) = 2457.6
-    //      mem_out = 0.  lat = max(1000, 2457.6) = 2457.6
-    // k=1: mem_in = T1(409.6) + T2(409.6) = 819.2 (T0 resident)
-    //      lat = max(1000, 819.2) = 1000
-    // k=2: same → 1000
-    // k=3: mem_in = 819.2, mem_out = T4(1638.4). lat = max(1000, 2457.6) = 2457.6
-    // Total = 2457.6 + 1000 + 1000 + 2457.6 = 6915.2
-    CHECK_EQ("latency", c.latency, 6915.2);
+    // IO (ntw=1, nth=1):
+    //   T0: (FIXED_1, FROM_NTH) → once_load = 128×128/10 = 1638.4
+    //   T1: (FROM_NK, FIXED_1)  → stream_slice = 32×128/10 = 409.6
+    //   T2: (FROM_NTW, FROM_NK) → stream_slice = 128×32/10 = 409.6; stream_total = 819.2
+    //   T4: out_evict = 1638.4
+    // k=0: max(2500, once(1638.4)+stream(819.2)) = max(2500, 2457.6) = 2500
+    // k=1: max(2500, stream(819.2)) = 2500
+    // k=2: same → 2500
+    // k=3: max(2500, stream(819.2)+evict(1638.4)) = max(2500, 2457.6) = 2500
+    // Total = 4 × 2500 = 10000
+    CHECK_EQ("latency", c.latency, 10000.0);
 
     // --- Also test at [128,128,64]: 2 k-passes ---
     auto c64 = sg.compute_cost(TC(128,128,64));
@@ -179,19 +185,24 @@ void test_chain3() {
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // Compute per step: 3 × (2000/4) = 1500
-    CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
+    // Compute per step (new model: only sink Op2 divides by nk=4):
+    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
+    //   Op1 (non-sink): 2000/1 * scale=1 = 2000
+    //   Op2 (sink):     2000/4 * scale=1 = 500
+    //   Total = 4500
+    CHECK_EQ("comp/step", c.compute_per_step, 4500.0);
 
     // IO (ntw=1, nth=1, 1 spatial tile):
-    //   once_load = T1(1638.4)
-    //   col_load  = T0(1638.4)  (FIXED_1 in h → col_load)
-    //   stream    = T3(409.6) + T5(409.6) = 819.2
-    //   evict     = T6(1638.4)
-    // d=0: max(1500, once+col+stream) = max(1500, 4096.0) = 4096.0
-    // d=1,2: max(1500, stream) = 1500
-    // d=3: max(1500, stream+evict) = max(1500, 2457.6) = 2457.6
-    // Total = 4096 + 2×1500 + 2457.6 = 9553.6
-    CHECK_EQ("latency", c.latency, 9553.6);
+    //   T1: (FIXED_1, FIXED_1) → once_load = 128×128/10 = 1638.4
+    //   T0: (FIXED_1, FROM_NTH) → once_load = 1638.4  (nth=1)
+    //   T3: (FROM_NK, FIXED_1)  → stream = 32×128/10 = 409.6
+    //   T5: (FROM_NTW, FROM_NK) → stream = 128×32/10 = 409.6; stream_total = 819.2
+    //   T6: out_evict = 1638.4
+    // d=0: max(4500, once(3276.8)+stream(819.2)) = max(4500, 4096) = 4500
+    // d=1,2: max(4500, stream(819.2)) = 4500
+    // d=3: max(4500, stream(819.2)+evict(1638.4)) = max(4500, 2457.6) = 4500
+    // Total = 4 × 4500 = 18000
+    CHECK_EQ("latency", c.latency, 18000.0);
 
     // --- Verify via breakdown ---
     double B = 10.0;
@@ -199,17 +210,17 @@ void test_chain3() {
     double col = 128.0 * 128.0 / B;          // T0: 1638.4
     double stream = 2.0 * 32.0 * 128.0 / B;  // T3+T5: 819.2
     double evict = 128.0 * 128.0 / B;        // T6: 1638.4
-    double comp = 1500.0;
+    double comp = 4500.0;
 
-    double k0 = std::max(comp, once + col + stream);      // 4096
-    double k_mid = std::max(comp, stream);                  // 1500
-    double k_last = std::max(comp, stream + evict);        // 2457.6
-    CHECK_EQ("k=0 lat", k0, 4096.0);
-    CHECK_EQ("k=mid lat", k_mid, 1500.0);
-    CHECK_EQ("k=3 lat", k_last, 2457.6);
+    double k0 = std::max(comp, once + col + stream);   // max(4500,4096)=4500
+    double k_mid = std::max(comp, stream);              // max(4500,819.2)=4500
+    double k_last = std::max(comp, stream + evict);     // max(4500,2457.6)=4500
+    CHECK_EQ("k=0 lat", k0, 4500.0);
+    CHECK_EQ("k=mid lat", k_mid, 4500.0);
+    CHECK_EQ("k=3 lat", k_last, 4500.0);
 
     double total_hand = k0 + 2 * k_mid + k_last;
-    CHECK_EQ("hand total", total_hand, 9553.6);
+    CHECK_EQ("hand total", total_hand, 18000.0);
     CHECK_EQ("matches compute_cost", c.latency, total_hand);
 }
 
@@ -257,9 +268,9 @@ void test_chain3_unfused() {
     CHECK("unfused valid", sol.validate().valid);
     CHECK_EQ("unfused sol total", sol.total_latency(), 14745.6);
 
-    // Fused chain = 9553.6 (from test_chain3), saving ≈ 35%
-    std::cout << "  Fusion saves: " << 14745.6 << " → 9553.6 ("
-              << (int)(100.0 * (14745.6 - 9553.6) / 14745.6) << "%)\n";
+    // Fused chain = 18000 (from test_chain3)
+    std::cout << "  Fusion saves: " << 14745.6 << " → 18000 ("
+              << (int)(100.0 * (14745.6 - 18000.0) / 14745.6) << "%)\n";
 }
 
 // ============================================================================
@@ -282,7 +293,7 @@ void test_chain2_solution() {
     auto sg = make_sg(p, d, {0, 1});
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("valid", sol.validate().valid);
-    CHECK_EQ("total=6915.2", sol.total_latency(), 6915.2);
+    CHECK_EQ("total=10000", sol.total_latency(), 10000.0);
 }
 
 // ============================================================================

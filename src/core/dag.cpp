@@ -1,5 +1,7 @@
 #include "core/dag.h"
 #include <algorithm>
+#include <bit>
+#include <cassert>
 #include <queue>
 
 // ============================================================================
@@ -19,24 +21,47 @@ DAG DAG::build(const Problem& prob) {
 
     // Map tensors to producers / consumers
     for (size_t i = 0; i < d.num_ops; i++) {
-        for (auto t : prob.ops[i].outputs)
+        for (auto t : prob.ops[i].outputs) {
+            // Assert unique producer (validated by read_problem, but defensive).
+            assert(d.tensor_producer[t] < 0 &&
+                   "tensor produced by multiple ops");
             d.tensor_producer[t] = (int)i;
+        }
     }
     for (size_t i = 0; i < d.num_ops; i++) {
         for (auto t : prob.ops[i].inputs) {
             d.tensor_consumers[t].push_back(i);
             int prod = d.tensor_producer[t];
             if (prod >= 0) {
-                d.op_preds[i].insert((size_t)prod);
-                d.op_succs[(size_t)prod].insert(i);
+                d.op_preds[i].push_back((size_t)prod);
+                d.op_succs[(size_t)prod].push_back(i);
             }
         }
     }
 
-    // Graph inputs / outputs
+    // Sort and deduplicate op_preds/op_succs
+    for (size_t i = 0; i < d.num_ops; i++) {
+        auto& p = d.op_preds[i];
+        std::sort(p.begin(), p.end());
+        p.erase(std::unique(p.begin(), p.end()), p.end());
+        auto& s = d.op_succs[i];
+        std::sort(s.begin(), s.end());
+        s.erase(std::unique(s.begin(), s.end()), s.end());
+    }
+
+    // Graph inputs / outputs.
+    //
+    // A graph input is a tensor that has no producing op AND is consumed by
+    // at least one op. A graph output is a tensor that has a producing op
+    // AND is not consumed by any op.
+    //
+    // Tensors with neither a producer nor a consumer are isolated and are
+    // excluded from both lists. They play no role in the computation.
     for (size_t t = 0; t < nt; t++) {
-        if (d.tensor_producer[t] < 0) d.graph_inputs.push_back(t);
-        if (d.tensor_consumers[t].empty()) d.graph_outputs.push_back(t);
+        bool has_producer = (d.tensor_producer[t] >= 0);
+        bool has_consumer = !d.tensor_consumers[t].empty();
+        if (!has_producer &&  has_consumer)  d.graph_inputs.push_back(t);
+        if ( has_producer && !has_consumer)  d.graph_outputs.push_back(t);
     }
 
     // op_neighbors: DAG edges + co-consumer edges (undirected)
@@ -52,16 +77,13 @@ DAG DAG::build(const Problem& prob) {
         d.op_neighbors[i] = {nbrs.begin(), nbrs.end()};
     }
 
-    d.precompute_reachability();
-
-    // Cache topological order and position map for O(1) lookups by callers.
-    // precompute_reachability already ran topo_sort() internally; we call it
-    // once more here so the result is available externally without redundant
-    // Kahn traversals later. The cost is one extra O(n+e) pass at build time.
+    // Cache topological order and position map, then use it for reachability.
     d.topo_order_ = d.topo_sort();
     d.topo_pos_.resize(d.num_ops);
     for (size_t i = 0; i < d.topo_order_.size(); i++)
         d.topo_pos_[d.topo_order_[i]] = i;
+
+    d.precompute_reachability();
 
     // Longest directed path (number of edges) via forward DP on topo order.
     // dist[u] = length of longest path ending at u.
@@ -86,7 +108,7 @@ DAG DAG::build(const Problem& prob) {
 std::vector<size_t> DAG::topo_sort() const {
     std::vector<int> in_deg(num_ops, 0);
     for (size_t i = 0; i < num_ops; i++)
-        for (auto j : op_succs[i]) in_deg[j]++;
+        in_deg[i] = (int)op_preds[i].size();
 
     std::queue<size_t> q;
     for (size_t i = 0; i < num_ops; i++)
@@ -119,7 +141,8 @@ void DAG::precompute_reachability() {
 
     reachable_.assign(num_ops * words_per_row_, 0ULL);
 
-    auto order = topo_sort();
+    // Use the already-computed topo_order_ (avoids a redundant Kahn's pass).
+    const auto& order = topo_order_;
 
     // Process in reverse topological order: successors already done
     for (int i = (int)order.size() - 1; i >= 0; i--) {
@@ -164,13 +187,17 @@ bool DAG::merge_creates_cycle(const std::set<size_t>& a,
                                const std::set<size_t>& b) const {
     if (words_per_row_ == 0) return false;
 
+    // Thread-local workspace to avoid heap allocations on every call.
+    // mask_S and combined_out are reused across calls on the same thread.
+    thread_local std::vector<uint64_t> mask_S, combined_out;
+    mask_S.assign(words_per_row_, 0ULL);
+    combined_out.assign(words_per_row_, 0ULL);
+
     // Step 1: mask for S = A∪B
-    std::vector<uint64_t> mask_S(words_per_row_, 0ULL);
     for (auto op : a) if (op < num_ops) mask_S[op / 64] |= (1ULL << (op % 64));
     for (auto op : b) if (op < num_ops) mask_S[op / 64] |= (1ULL << (op % 64));
 
     // Step 2: combined forward reach of every op in S
-    std::vector<uint64_t> combined_out(words_per_row_, 0ULL);
     for (auto op : a) if (op < num_ops) {
         const uint64_t* row = reachable_.data() + op * words_per_row_;
         for (size_t w = 0; w < words_per_row_; w++) combined_out[w] |= row[w];
@@ -180,54 +207,21 @@ bool DAG::merge_creates_cycle(const std::set<size_t>& a,
         for (size_t w = 0; w < words_per_row_; w++) combined_out[w] |= row[w];
     }
 
-    // Step 3: external ops reachable from S  (combined_out minus S itself)
-    // Step 4: back_reach = OR of reachable_ rows for those external ops
-    std::vector<uint64_t> back_reach(words_per_row_, 0ULL);
+    // Steps 3-5 fused: for each external op x reachable from S, check if x
+    // can reach back into S.  Early exit on the first cycle found — no need
+    // to compute the full back_reach bitmask.
     for (size_t w = 0; w < words_per_row_; w++) {
         uint64_t ext_bits = combined_out[w] & ~mask_S[w];
         while (ext_bits) {
-            int bit = __builtin_ctzll(ext_bits);
+            int bit = std::countr_zero(ext_bits);
             size_t x = w * 64 + bit;
             if (x < num_ops) {
                 const uint64_t* rx = reachable_.data() + x * words_per_row_;
                 for (size_t w2 = 0; w2 < words_per_row_; w2++)
-                    back_reach[w2] |= rx[w2];
+                    if (rx[w2] & mask_S[w2]) return true;
             }
             ext_bits &= ext_bits - 1;
         }
     }
-
-    // Step 5: cycle iff any back-reachable op is in S
-    for (size_t w = 0; w < words_per_row_; w++)
-        if (back_reach[w] & mask_S[w]) return true;
     return false;
-}
-// ============================================================================
-// reachable_from_mask
-//
-// Returns the bitset union of all reachable_[u] rows where u is set in `mask`.
-// This is step 2 of merge_creates_cycle (computing combined_out), exposed as a
-// public API so the partition layer can query "what ops lie between two groups?"
-// without re-doing the conversion from std::set<size_t> to bitmask.
-// ============================================================================
-
-std::vector<uint64_t> DAG::reachable_from_mask(
-        const std::vector<uint64_t>& mask) const {
-    std::vector<uint64_t> result(words_per_row_, 0ULL);
-    if (words_per_row_ == 0) return result;
-
-    for (size_t w = 0; w < words_per_row_; w++) {
-        uint64_t bits = mask[w];
-        while (bits) {
-            int bit = __builtin_ctzll(bits);
-            size_t u = w * 64 + bit;
-            if (u < num_ops) {
-                const uint64_t* row = reachable_.data() + u * words_per_row_;
-                for (size_t w2 = 0; w2 < words_per_row_; w2++)
-                    result[w2] |= row[w2];
-            }
-            bits &= bits - 1;
-        }
-    }
-    return result;
 }

@@ -165,8 +165,8 @@ void test_create_disconnected_rejected() {
   p.native_w = 128;
   p.native_h = 128;
   DAG d = DAG::build(p);
-  // {0,1} are disconnected (no edge between them)
-  CHECK("disconnected rejected", !Subgraph::create(p, d, {0, 1}).has_value());
+  // {0,1} are disconnected but have matching 128×128 PW outputs → valid
+  CHECK("disconnected valid (matching sinks)", Subgraph::create(p, d, {0, 1}).has_value());
   // {0,2} are connected via T1
   CHECK("{0,2} connected", Subgraph::create(p, d, {0, 2}).has_value());
   // {0,1,2} is connected (0-2 via T1, 1-2 via T3)
@@ -180,9 +180,10 @@ void test_create_diamond_fusions() {
 
   auto sg01 = Subgraph::create(p, d, {0, 1});
   CHECK("{0,1} valid", sg01.has_value());
-  // T1 produced by Op0, consumed by Op1 (both internal). BUT Op2 (external)
-  // also consumes T1 → T1 is boundary output, not ephemeral.
-  CHECK("T1 boundary out in {0,1}", sg01->boundary_outputs().count(1));
+  // T1 produced by Op0, consumed by Op1 (internal) → T1 is EPHEMERAL.
+  // External consumer Op2 is irrelevant to subgraph classification —
+  // validated at partition/solution level by gap checks.
+  CHECK("T1 ephemeral in {0,1}", sg01->ephemeral().count(1));
   CHECK("T2 boundary out in {0,1}", sg01->boundary_outputs().count(2));
 
   auto sg12 = Subgraph::create(p, d, {1, 2});
@@ -192,9 +193,8 @@ void test_create_diamond_fusions() {
 
   auto sg02 = Subgraph::create(p, d, {0, 2});
   CHECK("{0,2} valid", sg02.has_value());
-  // T1 produced by Op0, consumed by Op2 (both internal). BUT Op1 (external)
-  // also consumes T1 → T1 is boundary output, not ephemeral.
-  CHECK("T1 boundary out in {0,2}", sg02->boundary_outputs().count(1));
+  // T1 produced by Op0, consumed by Op2 (internal) → T1 is EPHEMERAL.
+  CHECK("T1 ephemeral in {0,2}", sg02->ephemeral().count(1));
   CHECK("T3 boundary out in {0,2}", sg02->boundary_outputs().count(3));
 
   auto sg012 = Subgraph::create(p, d, {0, 1, 2});
@@ -374,8 +374,8 @@ void test_dag_chain() {
   auto p = make_chain_pw();
   DAG d = DAG::build(p);
   CHECK("Op0 no preds", d.op_preds[0].empty());
-  CHECK("Op0→Op1", d.op_succs[0].count(1));
-  CHECK("Op1←Op0", d.op_preds[1].count(0));
+  CHECK("Op0→Op1", std::find(d.op_succs[0].begin(), d.op_succs[0].end(), 1) != d.op_succs[0].end());
+  CHECK("Op1←Op0", std::find(d.op_preds[1].begin(), d.op_preds[1].end(), 0) != d.op_preds[1].end());
   CHECK_EQ_S("graph inputs", d.graph_inputs.size(), 1);
   CHECK_EQ_S("graph outputs", d.graph_outputs.size(), 1);
   auto topo = d.topo_sort();
@@ -650,20 +650,22 @@ void test_matmul_pw_fusion_K() {
   CHECK_EQ_I("fused max_K", sg->max_K(), 256);
   CHECK("T2 ephemeral", sg->ephemeral().count(2));
 
-  // Reference accepts any k for PW sinks (d_tiles=1 regardless).
-  CHECK("k=64 accepted (PW sink ignores k)", sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
-  CHECK("k=1 accepted", sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
+  // PW-sink + matmul: output_K_ = max_K_ = 256.
+  // Only k=256 gives nk=1; other k values give nk>1 and are rejected.
+  CHECK("k=256 accepted (nk=1)", sg->is_valid_tiling({128, 128, 256, SnakeDir::None}));
+  CHECK("k=64 rejected (nk=4)", !sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
+  CHECK("k=1 rejected (nk=256)", !sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
 
-  // With any k, nk = 1 (PW sink → output_K=1)
-  auto c = sg->compute_cost(N(128, 128, 1));
-  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 1);
+  // With k=256, nk = 256/256 = 1
+  auto c = sg->compute_cost(N(128, 128, 256));
+  CHECK_EQ_I("fused k_passes (k=256)", c.num_k_passes, 1);
   // comp_per_step = (MM:2000 + PW:500) / 1 × scale(1) = 2500
   CHECK_EQ("fused comp/step", c.compute_per_step, 2500.0);
 
-  // best_cost picks k=1 (our search generates k=1 for PW sinks)
+  // best_cost picks k=256 (the only valid k for this PW-sink+matmul subgraph)
   auto best = sg->best_cost();
   CHECK("best feasible", best.feasible);
-  CHECK_EQ_I("best k=1", best.config.k, 1);
+  CHECK_EQ_I("best k=256", best.config.k, 256);
 }
 
 // ==================== Non-power-of-2 tiling ====================

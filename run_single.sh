@@ -35,7 +35,7 @@ echo "Solver finished in ${ms}ms."
 
 if [ -f "$out" ]; then
     echo "Generating visualization at $dot_out..."
-    python3 "$(dirname "$0")/visualize.py" solution "$INSTANCE" "$out" "$dot_out"
+    python3 "$(dirname "$0")/scripts/visualize.py" solution "$INSTANCE" "$out" "$dot_out"
     echo "Done. You can render the dot file using:"
     echo "  dot -Tpng $dot_out -o ${BUILD_DIR}/${name}_sol.png"
 else

@@ -30,6 +30,7 @@ struct FMOuterResult {
     int total_passes = 0;
     int improving_passes = 0;
     int total_moves = 0;
+    int elapsed_ms = 0;             // wall-clock time for the outer loop
 };
 
 // ============================================================================

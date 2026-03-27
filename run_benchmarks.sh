@@ -62,7 +62,7 @@ for f in "$BENCH_DIR"/*.json; do
     echo "$name,$partition_cost,$build_cost,$sol_evo_cost,$final_cost" >> "$CSV_FILE"
     
     if [ -f "$out" ]; then
-        python3 "$(dirname "$0")/visualize.py" solution "$f" "$out" "${BUILD_DIR}/${name}_sol.dot" > /dev/null 2>&1
+        python3 "$(dirname "$0")/scripts/visualize.py" solution "$f" "$out" "${BUILD_DIR}/${name}_sol.dot" > /dev/null 2>&1
     fi
     
     count=$((count + 1))

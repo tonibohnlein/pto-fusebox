@@ -24,6 +24,7 @@
 #include "partition/partition.h"
 #include "init/init_strategies.h"
 #include "search/fm_search.h"
+#include "search/partition_moves.h"
 #include "search/active_set.h"
 #include "search/fm_pass.h"
 #include "search/fm_outer.h"
@@ -125,11 +126,12 @@ void test_best_move_proposes_merge() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    auto m = best_move_for(part, 0, 0.0);
+    auto m = best_move_for(part, 0);
     CHECK("Op0 proposes valid move", m.valid());
-    CHECK("MERGE proposed", m.type == FMMove::MERGE);
+    CHECK("MERGE or STEAL proposed",
+          m.type == FMMove::MERGE || m.type == FMMove::STEAL);
     CHECK("positive saving", m.saving > 0);
-    std::cout << "    saving=" << m.saving << "\n";
+    std::cout << "    type=" << (int)m.type << " saving=" << m.saving << "\n";
 }
 
 void test_best_move_proposes_eject() {
@@ -145,7 +147,7 @@ void test_best_move_proposes_eject() {
     part.rebuild_index();
 
     // Op1 is in G0, border (Op2 is outside)
-    auto m = best_move_for(part, 1, 1e18);  // low floor to see all
+    auto m = best_move_for(part, 1);  // low floor to see all
     CHECK("Op1 proposes a move", m.valid());
     // Could be EJECT, STEAL, or MERGE — any is acceptable
     std::cout << "    type=" << m.type << " saving=" << m.saving << "\n";
@@ -155,42 +157,33 @@ void test_best_move_recompute_not_blocked_by_gap() {
     std::cout << "--- test_best_move_recompute_not_blocked_by_gap ---\n";
     // Diamond4 trivial. T1 is produced by Op0, consumed by BOTH Op1 and Op2.
     //
-    // Under the new ephemeral rule, gap checks are the cost model's job.
-    // Only acyclicity matters for feasibility. MERGE of {Op0,Op1} is acyclic
-    // (no cycle between merged group and G2/G3), so it IS allowed.
-    //
-    // Verify: whatever best_move_for proposes is feasible after apply.
+    // MERGE/STEAL of {Op0,Op1} creates an ephemeral gap (T1 ephemeral, Op2
+    // stranded). The gap check is now at eval time, so best_move_for must NOT
+    // propose such a move. Any move proposed for Op0 must be gap-free.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    auto m = best_move_for(part, 0, 1e18);
-    CHECK("Op0 proposes a move", m.valid());
-
-    // Whatever move is proposed, applying it must produce a feasible partition.
+    auto m = best_move_for(part, 0);
     if (m.valid()) {
         auto part2 = part;
         auto affected = apply_fm_move(part2, m);
-        CHECK("move applied successfully", !affected.empty());
-        if (!affected.empty()) {
+        if (!affected.empty())
             check_feasible("post-move diamond4", part2);
-            CHECK("partition acyclic after move", part2.is_acyclic());
-        }
         std::cout << "    move type=" << m.type << " saving=" << m.saving << "\n";
     }
 }
 void test_best_move_steal_gap_check_excludes_source() {
     std::cout << "--- test_best_move_steal_gap_check_excludes_source ---\n";
     // Diamond4 trivial. Op0 produces T1. Both Op1 and Op2 consume T1.
-    // Under the new ephemeral rule, gap checks are removed — only acyclicity
-    // matters. STEAL of Op0 from G0 to G1 is acyclic, so it may be proposed.
-    // Verify that whatever is proposed produces a feasible, acyclic partition.
+    // STEAL of Op0 from G0 to G1 creates an ephemeral gap — gap check is now
+    // at eval time, so best_move_for must not propose it. Any move proposed
+    // must produce a feasible, acyclic partition.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    auto m = best_move_for(part, 0, 1e18);
-    CHECK("Op0 proposes a move", m.valid());
+    auto m = best_move_for(part, 0);
     if (m.valid()) {
         auto part2 = part;
         auto affected = apply_fm_move(part2, m);
@@ -231,7 +224,7 @@ void test_best_move_split_co_consumer_bridge() {
     CHECK("co-consumer bridge exists", co_bridge);
 
     // best_move_for with low floor from Op1 (internal)
-    auto m = best_move_for(part, 1, 1e18);
+    auto m = best_move_for(part, 1);
     CHECK("SPLIT or INTERNAL_EJECT proposed for internal op", m.valid());
     std::cout << "    type=" << m.type << " saving=" << m.saving << "\n";
 }
@@ -311,10 +304,9 @@ void test_apply_recompute_feasible() {
 void test_apply_recompute_no_gap_check() {
     std::cout << "--- test_apply_recompute_no_gap_check ---\n";
     // Diamond4: RECOMPUTE Op0 into G1 (adding Op0 to G1={Op1}).
-    // T1 would become ephemeral in new_G1={Op0,Op1}.
-    // Op2 in G2 still needs T1, but new_G1 still has Op0 and exports T1.
-    // The old code blocked this with creates_ephemeral_gap (over-conservative).
-    // After Bug 5 fix, this RECOMPUTE must be allowed.
+    // T1 becomes ephemeral in new_G1={Op0,Op1}. Op2 in G2 still needs T1.
+    // But G0={Op0} stays alive and exports T1 as boundary output (Op0 produces
+    // T1, no internal consumer in G0) → no gap.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
@@ -325,8 +317,8 @@ void test_apply_recompute_no_gap_check() {
     m.saving = part.groups[1].cost - new_g1;
 
     auto affected = apply_fm_move(part, m);
-    // Should be accepted (no gap: new_G1 exports T1)
-    CHECK("RECOMPUTE accepted despite T1 ephemeral in new_G1 (Bug 5 fix)",
+    // RECOMPUTE accepted: G0 still alive, exports T1 → no gap
+    CHECK("RECOMPUTE accepted (G0 exports T1 as boundary output)",
           !affected.empty());
     if (!affected.empty())
         check_feasible("post-RECOMPUTE diamond4", part);
@@ -378,48 +370,284 @@ void test_apply_split_feasible() {
     }
 }
 
-void test_apply_merge_cycle_rejected_at_apply() {
-    std::cout << "--- test_apply_merge_cycle_rejected_at_apply ---\n";
+void test_eval_merge_cycle_rejected() {
+    std::cout << "--- test_eval_merge_cycle_rejected ---\n";
     // 4-op chain: Op0->Op1->Op2->Op3. Partition: G0={0,3}, G1={1}, G2={2}.
-    // merge_creates_cycle({0,3},{1}): S={0,1,3}, external={2}.
-    // Op1->Op2 (S->ext) and Op2->Op3 (ext->S) => cycle in condensed DAG => true.
+    // Group DAG has G0→G1→G2→G0 (cycle) because G0 contains both op0 and op3.
+    // acyclic_merge_local(G0,G1): G2 is external successor of G1, and G2→G0
+    // closes the loop back into the merge set → cycle detected.
     auto p = make_chain4(); DAG d = DAG::build(p);
     CostCache cache;
     Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
-    part.add_group({0,3}, cache.evaluate({0,3},p,d));  // disconnected: cost=1e18
+    part.add_group({0,3}, cache.evaluate({0,3},p,d));
     part.add_group({1},   cache.evaluate({1},p,d));
     part.add_group({2},   cache.evaluate({2},p,d));
     part.rebuild_index();
 
-    CHECK("merge_creates_cycle({0,3},{1}) = true", d.merge_creates_cycle({0,3}, {1}));
+    CHECK("acyclic_merge_local(G0,G1) detects cycle", !part.acyclic_merge_local(0, 1));
 
-    FMMove m;
-    m.type = FMMove::MERGE; m.op = 0; m.ga = 0; m.gb = 1; m.saving = 999.0;
-    auto affected = apply_fm_move(part, m);
-    CHECK("cycle-creating merge rejected at apply", affected.empty());
+    // Safe merge: trivial partition G0={0},G1={1},G2={2},G3={3}.
+    // Merging G1 and G2: external successors of {G1,G2} land in G3 only;
+    // BFS from G3 finds no path back into {G1,G2} → safe.
+    Partition trivial = Partition::trivial(p, d); trivial.cache = &cache;
+    CHECK("acyclic_merge_local(G1,G2) is safe in trivial chain",
+          trivial.acyclic_merge_local(1, 2));
 }
+// ============================================================================
+// Local acyclicity checks — recomputation corner cases
+// ============================================================================
+
+// Helper: 5-op chain with a recomputed op.
+// Op0→Op1→Op2→Op3→Op4 (linear), with Op2 recomputed into two groups.
+// Partition: G0={0,1,2}, G1={2,3}, G2={4}
+// (Op2 appears in both G0 and G1.)
+//
+// We use a simple chain5:
+//   T0->Op0->T1->Op1->T2->Op2->T3->Op3->T4->Op4->T5
+static Problem make_chain5() {
+    Problem p;
+    for (int i = 0; i <= 5; i++) p.tensors.push_back({128,128});
+    for (int i = 0; i < 5; i++)
+        p.ops.push_back({OpType::Pointwise,{(size_t)i},{(size_t)(i+1)},1000});
+    p.fast_memory_capacity = 500000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    return p;
+}
+
+// acyclic_recompute_local: copy op into gb where ALL producer copies are
+// forward-reachable from gb → cycle detected.
+//
+// Setup: chain4, Partition G0={0},G1={1},G2={2},G3={3}.
+// Propose RECOMPUTE Op1 into G2. Op1 needs T1 (produced by Op0 in G0).
+// G0 is NOT forward-reachable from G2 (G2→G3 only), so this is safe.
+void test_acyclic_recompute_local_safe() {
+    std::cout << "--- test_acyclic_recompute_local_safe ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    auto part = Partition::trivial(p, d); part.cache = &cache;
+    // Trivial: G0={0},G1={1},G2={2},G3={3}
+    // Recompute Op1 into G2: Op1 needs T1 from G0. G0 is not reachable from G2.
+    CHECK("recompute Op1 into G2 is safe", part.acyclic_recompute_local(1, 2));
+}
+
+// acyclic_recompute_local: copy op into gb where the only producer group IS
+// forward-reachable from gb → cycle.
+//
+// Setup: chain4, G0={0,1},G1={2,3}.
+// Propose RECOMPUTE Op2 into G0. Op2 needs T2 (produced by Op1 in G0).
+// But Op1 IS in G0 (gb) → internal, not a new constraint. So this is safe?
+// Actually let's think of a clearer cycle case.
+// Propose RECOMPUTE Op3 into G0. Op3 needs T3, produced by Op2 in G1.
+// G1 is a successor of G0 (G0→G1). Forward-reachable from G0 = {G1}.
+// So G1 ∈ fwd(G0), and G1 is the only producer → cycle detected.
+void test_acyclic_recompute_local_cycle() {
+    std::cout << "--- test_acyclic_recompute_local_cycle ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1}, cache.evaluate({0,1},p,d));  // G0
+    part.add_group({2,3}, cache.evaluate({2,3},p,d));  // G1
+    part.rebuild_index();
+    // Recompute Op3 into G0: Op3 needs T3 produced by Op2 in G1.
+    // G1 is forward-reachable from G0 → cycle.
+    CHECK("recompute Op3 into G0 creates cycle", !part.acyclic_recompute_local(3, 0));
+}
+
+// acyclic_recompute_local with two producer copies (OR-node): one copy blocked,
+// one free → safe despite the blocked copy.
+//
+// Setup: chain5, Op2 recomputed in G0={0,1,2} and G1={2,3}.
+// Propose RECOMPUTE Op3 into a new group G2={4}. Op3 needs T3 produced by Op2.
+// Op2 is in G0 (predecessor of G1) and G1. G2 is only reachable from G1.
+// fwd(G2)={} (G2 is the last group). Neither G0 nor G1 is in fwd(G2) → safe.
+void test_acyclic_recompute_local_or_node_free() {
+    std::cout << "--- test_acyclic_recompute_local_or_node_free ---\n";
+    auto p = make_chain5(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1,2}, cache.evaluate({0,1,2},p,d));  // G0
+    part.add_group({2,3},   cache.evaluate({2,3},p,d));    // G1 (Op2 recomputed)
+    part.add_group({4},     cache.evaluate({4},p,d));      // G2
+    part.rebuild_index();
+    // Recompute Op3 into G2: Op3 needs T3 from Op2 (G0 or G1).
+    // Neither is forward-reachable from G2 (G2 has no successors) → safe.
+    CHECK("recompute Op3 into G2 safe (OR: G0 and G1 both free)", part.acyclic_recompute_local(3, 2));
+}
+
+// acyclic_recompute_local with two producer copies (OR-node): BOTH copies
+// forward-reachable from gb → cycle despite OR-node.
+//
+// We need a partition where gb can reach both G0 and G1.
+// Layout: G_target={4}, G0={0,1,2}, G1={2,3}. But G_target is the last group.
+// Let's build a diamond where both branches merge back before the target.
+// Actually simpler: put target at the front.
+// chain5: G_target={0}, G_mid_a={1,2}, G_mid_b={2,3}, G_end={4}.
+// Then G_target → G_mid_a and G_mid_b → G_end.
+// Propose RECOMPUTE Op2 into G_end. Op2 needs T2 (from Op1 in G_mid_a) OR T2
+// could come from recomputed G_mid_b. But T2 is produced by Op1 which is only in
+// G_mid_a.
+// Hmm, let me use a simpler structure.
+// chain4, G0={0},G1={1,2},G2={3}. Propose recompute Op1 into G2.
+// Op1 needs T1 from G0. fwd(G2)={}. G0 not in fwd(G2) → safe.
+// That's not a cycle case for OR-node.
+// Real OR-node cycle: G0={1,2}, G1={2,3}, G_target={0}.
+// Recompute Op3 (needs T3) into G_target. T3 produced by Op2 in G0 and G1.
+// fwd(G_target) includes G0 and G1 (G_target→...→G0,G1)? We need G_target to
+// precede G0 and G1. But G_target={0}, G0={1,2}, G1={2,3}: chain is 0→1→2→3,
+// so G_target={0} precedes G0={1,2}. fwd(G_target)={G0,G1,...}. So recomputing
+// Op3 (needs T3 from Op2) into G_target: both G0 and G1 are in fwd(G_target) → cycle.
+void test_acyclic_recompute_local_or_node_all_blocked() {
+    std::cout << "--- test_acyclic_recompute_local_or_node_all_blocked ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0},   cache.evaluate({0},p,d));    // G0 = first
+    part.add_group({1,2}, cache.evaluate({1,2},p,d)); // G1 (Op2 in it)
+    part.add_group({2,3}, cache.evaluate({2,3},p,d)); // G2 (Op2 recomputed)
+    part.rebuild_index();
+    // Propose RECOMPUTE Op2 into G0. Op2 needs T2 from Op1, which is in G1.
+    // G1 is forward-reachable from G0. Op2 is also in G2 which is forward-reachable.
+    // ALL copies of the producer of T2 (Op1, only in G1) are in fwd(G0) → cycle.
+    CHECK("recompute Op2 into G0 cycle (all producers fwd-reachable)", !part.acyclic_recompute_local(2, 0));
+}
+
+// acyclic_de_recompute_local: removing op from ga where the only remaining copy
+// is forward-reachable from ga → cycle.
+//
+// Setup: chain5, G0={0,1,2,3}, G1={2,4}.
+// G0 produces T4 (Op3→T4 consumed by Op4 in G1) → G0→G1 in group DAG.
+// fwd(G0) includes G1.
+// De-recompute Op2 from G0: Op2's output T3 is consumed by Op3 in G0 (ephemeral).
+// The only remaining copy of Op2 is G1. G1 ∈ fwd(G0) → no free copy → cycle.
+void test_acyclic_de_recompute_local_cycle() {
+    std::cout << "--- test_acyclic_de_recompute_local_cycle ---\n";
+    auto p = make_chain5(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1,2,3}, cache.evaluate({0,1,2,3},p,d));  // G0
+    part.add_group({2,4},     cache.evaluate({2,4},p,d));      // G1 (Op2 recomputed + Op4)
+    part.rebuild_index();
+    // G0→G1 via T4 (Op3 in G0 produces T4, Op4 in G1 consumes it).
+    // De-recompute Op2 from G0: T3 consumed by Op3 in G0 → constraint on G0.
+    // Only copy left is G1 which is in fwd(G0) → cycle detected.
+    CHECK("de-recompute Op2 from G0 creates cycle (only copy G1 is successor)",
+          !part.acyclic_de_recompute_local(2, 0));
+}
+
+// acyclic_de_recompute_local: OR-node safe — one remaining copy is free.
+//
+// chain5, G0={0,1,2} (Op2 recomputed), G1={2}, G2={3,4}.
+// De-recompute Op2 from G0. G0 still has Op1 which produces T2.
+// But the output of Op2 is T3. Does G0 have any consumer of T3?
+// Op3 is in G2, not in G0. So T3 is not consumed in G0 → no constraint added.
+// De-recompute is safe (no consumers of T3 inside G0).
+// Let me pick a case where G0 does consume Op2's output:
+// G0={0,1,2,3} (uses T3 internally via Op3), G1={2} (copy of Op2).
+// De-recompute Op2 from G0: G0 still needs T3 (from Op3 consumer).
+// Remaining copy is G1. Is G1 forward-reachable from G0? G0 depends on T2 from
+// Op1 in G0, so G0→G1? Only if G0 has ops producing things G1 needs.
+// G1={Op2} needs T2 from Op1 (in G0). So G0→G1 edge exists. G1 is in fwd(G0).
+// → cycle again. We need a case where the remaining copy is NOT in fwd(G0).
+// chain5: G0={2,3} (uses T3 internally), G1={0,1,2} (Op2 recomputed).
+// G1 is a PREDECESSOR of G0 (G1 produces T1,T2,T3 that G0 uses). G1 not in fwd(G0).
+// De-recompute Op2 from G0: G0 needs T3. Remaining copy in G1. G1 not forward-reachable → safe.
+void test_acyclic_de_recompute_local_safe() {
+    std::cout << "--- test_acyclic_de_recompute_local_safe ---\n";
+    auto p = make_chain5(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1,2}, cache.evaluate({0,1,2},p,d));  // G0 (predecessor, has Op2)
+    part.add_group({2,3,4}, cache.evaluate({2,3,4},p,d));  // G1 (successor, Op2 recomputed)
+    part.rebuild_index();
+    // De-recompute Op2 from G1: G1 has Op3 and Op4 which need T3 (from Op2).
+    // Remaining copy is G0. G0 is NOT forward-reachable from G1 (G0 is predecessor) → safe.
+    CHECK("de-recompute Op2 from G1 safe (remaining copy G0 is predecessor)",
+          part.acyclic_de_recompute_local(2, 1));
+}
+
+// acyclic_extract_local: extracting ops that create a forward cycle.
+//
+// chain4, trivial partition G0={0},G1={1},G2={2},G3={3}.
+// Extract {Op1,Op2}: gnew gets outputs T2 (consumed by Op3 in G3).
+// G3 is gnew's successor. Does G3 have a path back to gnew?
+// G3={Op3}, Op3 outputs T4 (nothing consumes T4 in any group after it).
+// No cycle. → safe.
+//
+// For a cycle, we need gnew→external→gnew. But in a linear chain there's no
+// backwards path. Let's use a chain4 with recomputation:
+// G0={0,1,2,3} (all ops), G1={1} (Op1 recomputed).
+// Extract {Op1}: gnew gets T2 (consumed by Op2 in G0).
+// gnew's successor is G0 (has Op2 consuming T2). From G0, can we reach gnew?
+// gnew={Op1} needs T1 (produced by Op0 in G0). So G0→gnew edge after extract.
+// G0 is a successor of gnew AND gnew depends on G0 → cycle.
+void test_acyclic_extract_local_cycle() {
+    std::cout << "--- test_acyclic_extract_local_cycle ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1,2,3}, cache.evaluate({0,1,2,3},p,d));  // G0
+    part.add_group({1},       cache.evaluate({1},p,d));        // G1 (Op1 recomputed)
+    part.rebuild_index();
+    // Extract {Op1}: gnew needs T1 from Op0 (in G0), and produces T2 consumed by Op2 (in G0).
+    // gnew→G0 (via T2), G0→gnew (via T1) → cycle.
+    CHECK("extract {Op1} creates cycle (gnew↔G0)", !part.acyclic_extract_local({1}));
+}
+
+// acyclic_extract_local: safe extraction.
+//
+// chain4, trivial G0={0},G1={1},G2={2},G3={3}.
+// Extract {Op1,Op2}: gnew produces T3 consumed by Op3 in G3.
+// gnew needs T1 from G0. G0's forward reachability: G0→G1→G2→G3 (in trivial).
+// After extract {Op1,Op2}, gnew is between G0 and G3. No cycle.
+void test_acyclic_extract_local_safe() {
+    std::cout << "--- test_acyclic_extract_local_safe ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    auto part = Partition::trivial(p, d); part.cache = &cache;
+    // Extract {Op1,Op2} from trivial partition.
+    // gnew external successors: consumer groups of T2 and T3 not in {Op1,Op2}.
+    // T3 consumed by Op3 in G3. BFS from G3: G3's outputs go nowhere. No cycle.
+    CHECK("extract {Op1,Op2} safe in trivial chain4", part.acyclic_extract_local({1,2}));
+}
+
+// acyclic_extract_local: extract from a recomputed group where the
+// source group has both remainder and extracted ops.
+//
+// chain4: G0={0,1,2,3} (all ops), G1={1} (recomputed).
+// Extract {Op2}: gnew={Op2}. gnew needs T2 (from Op1 in G0, not in extract_ops).
+// gnew produces T3 consumed by Op3 in G0 (not in extract_ops).
+// gnew→G0 (via T3), and from G0 we need T2 → G0 needs Op1 which is in G0 → G0→gnew (via T2).
+// Wait: T2 is produced by Op1 in G0 (Op1 is not in extract_ops). So G0 is a producer
+// of T2 needed by gnew. gnew's successor includes G0 (via T3 consumer Op3). From G0,
+// can we reach gnew? G0 contains Op1 which produces T2 consumed by gnew={Op2}. Yes.
+// So gnew→G0→gnew → cycle.
+void test_acyclic_extract_local_recomp_cycle() {
+    std::cout << "--- test_acyclic_extract_local_recomp_cycle ---\n";
+    auto p = make_chain4(); DAG d = DAG::build(p);
+    CostCache cache;
+    Partition part; part.prob = &p; part.dag = &d; part.cache = &cache;
+    part.add_group({0,1,2,3}, cache.evaluate({0,1,2,3},p,d));  // G0
+    part.rebuild_index();
+    // Extract {Op2} from G0 (single group, Op2 internal).
+    // gnew={Op2}: needs T2 from Op1 in G0, produces T3 consumed by Op3 in G0.
+    // gnew→G0 and G0→gnew → cycle.
+    CHECK("extract {Op2} from singleton group creates cycle", !part.acyclic_extract_local({2}));
+}
+
 void test_apply_steal_gap_from_source_excluded() {
     std::cout << "--- test_apply_steal_gap_from_source_excluded ---\n";
-    // Diamond4 trivial. STEAL Op0 from G0 to G1:
-    // new_G1 = {Op0, Op1}. T1 becomes ephemeral.
-    // Under the new ephemeral rule, this is allowed (no cycle created).
-    // The cost model handles ephemeral classification at finalization.
+    // Diamond4: STEAL Op0 from G0 to G1.
+    // G0={Op0} dies (singleton). G1 becomes {Op0,Op1}.
+    // T1 ephemeral in G1, Op2 external. G0 is dead → no one exports T1.
+    // This is a real structural gap → STEAL correctly rejected at eval time.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    FMMove m;
-    m.type = FMMove::STEAL; m.op = 0; m.ga = 0; m.gb = 1;
-    m.saving = 999.0;
-
-    auto affected = apply_fm_move(part, m);
-    // Under new ephemeral rule, STEAL is acyclic → accepted
-    CHECK("STEAL accepted (no cycle, ephemeral handled by cost model)",
-          !affected.empty());
-    if (!affected.empty()) {
-        check_feasible("post-STEAL diamond4", part);
-        CHECK("partition acyclic after STEAL", part.is_acyclic());
-    }
+    // Gap check is now at eval time, not apply time.
+    auto r = partition_moves::eval_steal(part, 0, 0, 1);
+    CHECK("STEAL rejected (G0 dies, T1 ephemeral gap)", !r.feasible);
 }
 
 // ============================================================================
@@ -432,8 +660,7 @@ void test_active_set_activate_pop() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    double floor = 0.0;
-    ActiveSet active(part, floor);
+    ActiveSet active(part);
 
     // Activate Op1 (middle op, has both neighbors)
     active.activate(1);
@@ -456,7 +683,7 @@ void test_active_set_lock_prevents_pop() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    ActiveSet active(part, 0.0);
+    ActiveSet active(part);
     active.activate(0);
     active.activate(1);
     active.activate(2);
@@ -475,7 +702,7 @@ void test_active_set_activate_group_ops() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    ActiveSet active(part, 0.0);
+    ActiveSet active(part);
     active.activate_group_ops(1);  // G1={Op1}: border ops activated
 
     CHECK("Op1 activated", active.is_active(1));
@@ -487,7 +714,7 @@ void test_active_set_refresh_activates_new_ops() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    ActiveSet active(part, 0.0);
+    ActiveSet active(part);
     active.activate(0);  // only activate Op0 initially
 
     // Simulate applying a move: merge G0+G1 → {Op0,Op1}
@@ -514,7 +741,6 @@ void test_fm_inner_pass_valid_partition() {
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
     FMConfig cfg;
-    cfg.floor_fraction = 0.30;
     cfg.max_drift_fraction = 0.50;
     cfg.init_count = 3;
     cfg.seed = 42;
@@ -546,7 +772,6 @@ void test_fm_inner_pass_accepts_negative_moves() {
     part.rebuild_index();
 
     FMConfig cfg;
-    cfg.floor_fraction = 0.80;      // accept large worsening
     cfg.max_drift_fraction = 2.0;   // wide drift budget
     cfg.init_count = 3;
     cfg.seed = 99;
@@ -570,7 +795,6 @@ void test_fm_inner_pass_locking_prevents_revisit() {
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
     FMConfig cfg;
-    cfg.floor_fraction = 0.5;
     cfg.max_drift_fraction = 1.0;
     cfg.init_count = 10;  // large to activate many ops
     cfg.seed = 7;
@@ -590,13 +814,11 @@ void test_fm_inner_pass_drift_abort() {
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
     FMConfig cfg_tight;
-    cfg_tight.floor_fraction = 0.5;
     cfg_tight.max_drift_fraction = 0.001;  // abort after tiny degradation
     cfg_tight.init_count = 10;
     cfg_tight.seed = 11;
 
     FMConfig cfg_wide;
-    cfg_wide.floor_fraction = 0.5;
     cfg_wide.max_drift_fraction = 100.0;  // never abort
     cfg_wide.init_count = 10;
     cfg_wide.seed = 11;
@@ -674,7 +896,6 @@ void test_fm_outer_greedy_kick() {
     FMOuterConfig cfg;
     cfg.max_passes = 10;
     cfg.max_no_improve = 3;
-    cfg.pass_config.floor_fraction = 0.5;
     cfg.pass_config.max_drift_fraction = 1.0;
 
     auto result = fm_outer_loop(std::move(part), cfg);
@@ -746,8 +967,17 @@ int main() {
     test_apply_recompute_no_gap_check();
     test_apply_eject_feasible();
     test_apply_split_feasible();
-    test_apply_merge_cycle_rejected_at_apply();
+    test_eval_merge_cycle_rejected();
     test_apply_steal_gap_from_source_excluded();
+    test_acyclic_recompute_local_safe();
+    test_acyclic_recompute_local_cycle();
+    test_acyclic_recompute_local_or_node_free();
+    test_acyclic_recompute_local_or_node_all_blocked();
+    test_acyclic_de_recompute_local_cycle();
+    test_acyclic_de_recompute_local_safe();
+    test_acyclic_extract_local_cycle();
+    test_acyclic_extract_local_safe();
+    test_acyclic_extract_local_recomp_cycle();
 
     // 3. ActiveSet
     test_active_set_activate_pop();

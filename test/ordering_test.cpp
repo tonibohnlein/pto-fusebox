@@ -338,8 +338,9 @@ void test_from_partition_valid_solution() {
     auto p = make_chain3(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
+    part.finalize();
 
-    auto sol = Solution::from_partition(p, d, std::move(part));
+    auto sol = Solution::from_partition(p, d, part);
     auto vr = sol.validate();
     CHECK("solution valid", vr.valid);
     if (!vr.valid) std::cout << "    error: " << vr.error << "\n";
@@ -353,8 +354,9 @@ void test_from_partition_diamond_valid() {
     auto p = make_diamond4(); DAG d = DAG::build(p);
     CostCache cache;
     auto part = best_initial(p, d, &cache);
+    part.finalize();
 
-    auto sol = Solution::from_partition(p, d, std::move(part));
+    auto sol = Solution::from_partition(p, d, part);
     auto vr = sol.validate();
     CHECK("diamond solution valid", vr.valid);
     CHECK("diamond latency finite", sol.total_latency() < 1e17);

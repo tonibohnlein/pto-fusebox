@@ -34,15 +34,6 @@ static Problem make_chain(int n) {
     return p;
 }
 
-static std::vector<uint64_t> make_mask(const std::set<size_t>& ops, size_t words) {
-    std::vector<uint64_t> m(words, 0ULL);
-    for (auto op : ops) m[op/64] |= (1ULL << (op%64));
-    return m;
-}
-static bool mask_has(const std::vector<uint64_t>& m, size_t op) {
-    return (m[op/64] >> (op%64)) & 1u;
-}
-
 // ============================================================================
 // 1. can_reach
 // ============================================================================
@@ -262,72 +253,6 @@ void test_topo_position_diamond() {
 }
 
 // ============================================================================
-// 6. reachable_from_mask
-// ============================================================================
-
-void test_rfm_single_op() {
-    std::cout << "--- test_rfm_single_op ---\n";
-    auto p = make_chain(4);
-    DAG d = DAG::build(p);
-    auto m = make_mask({0}, d.words_per_row_);
-    auto r = d.reachable_from_mask(m);
-    CHECK("reach{Op0} has 0", mask_has(r,0));
-    CHECK("reach{Op0} has 1", mask_has(r,1));
-    CHECK("reach{Op0} has 2", mask_has(r,2));
-    CHECK("reach{Op0} has 3", mask_has(r,3));
-}
-
-void test_rfm_suffix() {
-    std::cout << "--- test_rfm_suffix ---\n";
-    auto p = make_chain(4);
-    DAG d = DAG::build(p);
-    auto m = make_mask({2}, d.words_per_row_);
-    auto r = d.reachable_from_mask(m);
-    CHECK("reach{Op2} no 0", !mask_has(r,0));
-    CHECK("reach{Op2} no 1", !mask_has(r,1));
-    CHECK("reach{Op2} has 2", mask_has(r,2));
-    CHECK("reach{Op2} has 3", mask_has(r,3));
-}
-
-void test_rfm_set() {
-    std::cout << "--- test_rfm_set ---\n";
-    Problem p;
-    p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{1},{2},100},
-             {OpType::Pointwise,{1},{3},100},
-             {OpType::Pointwise,{2,3},{4},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
-    DAG d = DAG::build(p);
-    auto m = make_mask({1,2}, d.words_per_row_);
-    auto r = d.reachable_from_mask(m);
-    CHECK("reach{1,2} no Op0", !mask_has(r,0));
-    CHECK("reach{1,2} has Op1", mask_has(r,1));
-    CHECK("reach{1,2} has Op2", mask_has(r,2));
-    CHECK("reach{1,2} has Op3", mask_has(r,3));
-}
-
-void test_rfm_consistent_with_can_reach() {
-    std::cout << "--- test_rfm_consistent_with_can_reach ---\n";
-    auto p = make_chain(5);
-    DAG d = DAG::build(p);
-    bool all_ok = true;
-    for (size_t u = 0; u < d.num_ops; u++) {
-        auto m = make_mask({u}, d.words_per_row_);
-        auto r = d.reachable_from_mask(m);
-        for (size_t v = 0; v < d.num_ops; v++) {
-            if (mask_has(r,v) != d.can_reach(u,v)) {
-                char buf[80];
-                snprintf(buf, sizeof(buf), "rfm{%zu} vs can_reach(%zu,%zu): %d vs %d",
-                         u, u, v, (int)mask_has(r,v), (int)d.can_reach(u,v));
-                g_fail++; std::cout << "  FAIL: " << buf << "\n";
-                all_ok = false;
-            }
-        }
-    }
-    if (all_ok) { g_pass++; std::cout << "  OK: rfm consistent with can_reach\n"; }
-}
 
 // ============================================================================
 // 7. merge_creates_cycle cross-check with topo_position
@@ -381,10 +306,6 @@ int main() {
     test_topo_position_chain();
     test_topo_position_diamond();
 
-    test_rfm_single_op();
-    test_rfm_suffix();
-    test_rfm_set();
-    test_rfm_consistent_with_can_reach();
 
     test_merge_cycle_vs_topo_pos();
 

@@ -11,6 +11,30 @@
 class CostCache;
 
 // ============================================================================
+// Boundary helpers — DAG-based, no Subgraph required.
+// t is a boundary output of ops if produced inside AND not consumed inside.
+// t is a boundary input  of ops if consumed inside AND not produced inside.
+// ============================================================================
+
+inline bool is_boundary_output_of(const std::set<size_t>& ops, size_t t, const DAG& dag) {
+    if (t >= dag.tensor_producer.size()) return false;
+    int prod = dag.tensor_producer[t];
+    if (prod < 0 || !ops.count((size_t)prod)) return false;
+    for (auto cop : dag.tensor_consumers[t])
+        if (ops.count(cop)) return false;
+    return true;
+}
+
+inline bool is_boundary_input_of(const std::set<size_t>& ops, size_t t, const DAG& dag) {
+    if (t >= dag.tensor_producer.size()) return false;
+    int prod = dag.tensor_producer[t];
+    if (prod >= 0 && ops.count((size_t)prod)) return false;
+    for (auto cop : dag.tensor_consumers[t])
+        if (ops.count(cop)) return true;
+    return false;
+}
+
+// ============================================================================
 // Partition: mutable representation of op-to-subgraph assignments.
 //
 // Each Group is a set of op indices. Groups may overlap (recomputation).
@@ -82,7 +106,7 @@ struct Partition {
     //      (almost always a cache hit — the same op-sets were evaluated during search).
     //   2. Populates Group::sg and Group::best_cfg from the cache entry.
     //   3. Calls rebuild_index() + rebuild_group_dag().
-    void finalize();
+    void finalize(class CostCache* cache = nullptr);
 
     // --- Queries ---
 
@@ -117,56 +141,54 @@ struct Partition {
     // that's the cost model's job (ephemeral classification at finalization).
     bool is_acyclic() const;
 
-    // Check acyclicity of a hypothetical partition state after a move.
-    // These are called by best_move_for_op / best_move_for to guarantee
-    // that ONLY feasible moves go on the heap.
-    //
-    // Each builds a temporary op→groups mapping reflecting the move, then
-    // runs the reference Kahn's algorithm. O(ops * inputs * groups_per_op).
+    // -------------------------------------------------------------------------
+    // Local acyclicity checks — O(reachable groups × ops × outputs).
+    // Use these at EVAL time so infeasible moves never reach the heap.
+    // Each method assumes the current group DAG is acyclic and only checks
+    // the new edges introduced by the proposed move (adding an edge A→B
+    // creates a cycle iff B can already reach A in the current DAG).
+    // Conservative under heavy recomputation (may reject valid moves when an
+    // alternative recomputed copy satisfies the dependency), but never wrong.
+    // -------------------------------------------------------------------------
 
-    // After MERGE: ga absorbs gb's ops, gb dies.
-    bool is_acyclic_after_merge(size_t ga, size_t gb) const;
+    // Is it acyclic to merge groups ga and gb?
+    // A merge creates a cycle iff there is a directed path between the two
+    // groups through at least one external group (a direct ga↔gb edge just
+    // becomes internal — no cycle). BFS from external successors of {ga,gb},
+    // flag cycle if we reach back into the merge set.
+    bool acyclic_merge_local(size_t ga, size_t gb) const;
 
-    // After multi-group MERGE: first group absorbs all, rest die.
-    bool is_acyclic_after_merge(const std::vector<size_t>& group_list) const;
+    // Multi-group version used for TENSOR_MERGE.
+    bool acyclic_merge_local(const std::vector<size_t>& G) const;
 
-    // After STEAL: op removed from ga, added to gb.
-    bool is_acyclic_after_steal(size_t op, size_t ga, size_t gb) const;
+    // Is it acyclic to add a set of currently-unassigned ops into existing group gi?
+    // Used during partition construction (e.g. crossover) before ops have groups.
+    // Same BFS as acyclic_merge_local but new_ops have no group index yet.
+    bool acyclic_add_ops_into(const std::set<size_t>& new_ops, size_t gi) const;
 
-    // After RECOMPUTE: op added to gb (stays in all existing groups too).
-    bool is_acyclic_after_recompute(size_t op, size_t gb) const;
+    // Is it acyclic to extract extract_ops into a virtual new group (TENSOR_EXTRACT)?
+    // A cycle exists iff any external group is forward-reachable from the new group
+    // and can also reach back into it.  BFS from gnew's external successors, flag
+    // cycle if we reach a group that produces something consumed by extract_ops.
+    bool acyclic_extract_local(const std::set<size_t>& extract_ops) const;
 
-    // After EJECT: op removed from ga into a virtual new singleton group.
-    // Uses STEAL delta with a virtual group index beyond groups.size().
-    bool is_acyclic_after_eject(size_t op, size_t ga) const;
+    // Is it acyclic to move op from ga into gb?
+    // New edges: gp→gb for each input-producer group gp, gb→gc for each
+    // output-consumer group gc. Checks via two BFS passes on the group DAG.
+    bool acyclic_steal_local(size_t op, size_t ga, size_t gb) const;
 
-    // After SPLIT: side_b ops moved from ga into a virtual new group.
-    // Uses SPLIT_MOVE delta with a virtual group index beyond groups.size().
-    bool is_acyclic_after_split(const std::set<size_t>& side_b, size_t ga) const;
+    // Is it acyclic to copy op into gb (RECOMPUTE — op stays in source groups)?
+    // Same edge analysis as steal but ga is not modified.
+    bool acyclic_recompute_local(size_t op, size_t gb) const;
 
-    // After TENSOR_EXTRACT: extract_ops removed from source_groups into a
-    // virtual new group. Source groups that become empty virtually die.
-    bool is_acyclic_after_extract(const std::set<size_t>& extract_ops,
-                                   const std::vector<size_t>& source_groups) const;
-
-    // After DE_RECOMPUTE: group ga is killed (all its ops are covered elsewhere).
-    // Check that removing ga doesn't break a dependency chain.
-    bool is_acyclic_without_group(size_t ga) const;
+    // Is it acyclic to remove op from ga (DE_RECOMPUTE — op stays elsewhere)?
+    // Only produces new edges when outputs of op were ephemeral inside ga but
+    // now need to come from another group containing op.
+    bool acyclic_de_recompute_local(size_t op, size_t ga) const;
 
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;
-
-    // Partition-aware evaluation: computes which tensors can be treated as
-    // ephemeral because all external consumers are served by recomputing groups.
-    // Returns the set of tensors that should be force-ephemeral for group gi.
-    std::set<size_t> compute_force_ephemeral(size_t gi) const;
-
-    // Evaluate group gi with partition-aware ephemeral classification.
-    // Uses force_ephemeral to avoid unnecessary eviction costs.
-    // More accurate than eval_set but cannot use CostCache (result depends
-    // on what other groups contain, not just the op-set).
-    double eval_group_in_context(size_t gi) const;
 
     struct EjectResult {
         bool   feasible = false;
@@ -199,14 +221,6 @@ struct Partition {
 
     SplitResult                          eval_split(size_t op_a, size_t op_b, size_t gi) const;
     std::vector<std::pair<size_t,size_t>> bridge_edges(size_t gi) const;
-
-    // Would merging groups gi and gj create a cycle in the condensed DAG?
-    // Must be checked before any MERGE move in addition to creates_ephemeral_gap.
-    // Thin wrapper around DAG::merge_creates_cycle operating on group op-sets.
-    bool would_create_cycle(size_t gi, size_t gj) const {
-        if (gi >= groups.size() || gj >= groups.size()) return true;
-        return dag->merge_creates_cycle(groups[gi].ops, groups[gj].ops);
-    }
 
     // --- Ephemeral gap check ---
 
