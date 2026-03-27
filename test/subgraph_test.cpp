@@ -45,7 +45,7 @@ static Subgraph make_sg(const Problem& p, const DAG& d, std::vector<size_t> ops)
 // 1. working_set() with invalid tiling
 //
 // An invalid tiling is one that violates divisibility constraints (w doesn't
-// divide the output width, k doesn't divide K, etc.) or the PW-sink k=1 rule.
+// divide the output width, k doesn't divide K, etc.).
 // working_set() now guards at the top: returns INT64_MAX for invalid tilings
 // so callers that bypass is_valid_tiling() get an obviously wrong value
 // rather than silent garbage.
@@ -100,8 +100,8 @@ void test_ws_invalid_tiling_nondivisible_k() {
 
 void test_ws_invalid_tiling_pw_sink_k_gt_1() {
     std::cout << "--- test_ws_invalid_tiling_pw_sink_k_gt_1 ---\n";
-    // Fused MM+PW: PW sink → nk must equal 1. output_K_ = max_K_ = 128.
-    // Only k=128 is valid (nk=128/128=1). k<128 gives nk>1 → rejected.
+    // Fused MM+PW: PW sink → output_K_ = 1. nk = max(1/k, 1) = 1 for any k.
+    // All k values are valid (nk is always 1).
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},
@@ -112,15 +112,15 @@ void test_ws_invalid_tiling_pw_sink_k_gt_1() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    // k=32 → nk=128/32=4 > 1 → rejected
-    CHECK("k=32 invalid (nk=4 > 1)", !sg.is_valid_tiling(TC(128, 128, 32)));
-    CHECK("ws k=32 is INT64_MAX",
-          sg.working_set(TC(128, 128, 32)) == INT64_MAX);
+    // k=32 → nk=max(1/32,1)=1 → accepted
+    CHECK("k=32 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 32)));
+    CHECK("ws k=32 not INT64_MAX",
+          sg.working_set(TC(128, 128, 32)) != INT64_MAX);
 
-    // k=1 → nk=128 > 1 → rejected
-    CHECK("k=1 invalid (nk=128 > 1)", !sg.is_valid_tiling(TC(128, 128, 1)));
-    CHECK("ws k=1 is INT64_MAX",
-          sg.working_set(TC(128, 128, 1)) == INT64_MAX);
+    // k=1 → nk=max(1/1,1)=1 → accepted
+    CHECK("k=1 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 1)));
+    CHECK("ws k=1 not INT64_MAX",
+          sg.working_set(TC(128, 128, 1)) != INT64_MAX);
 
     // k=128 → nk=1 → accepted
     CHECK("k=128 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 128)));
@@ -1442,23 +1442,23 @@ void test_fan_in_two_mm_to_pw() {
     CHECK("fan-in: T2 eph", sg.ephemeral().count(2));
     CHECK("fan-in: T5 eph", sg.ephemeral().count(5));
     CHECK("fan-in: T6 boundary out", sg.boundary_outputs().count(6));
-    // PW sink + matmul: output_K_ = max_K_ = 256 (K of Op0 and Op1).
-    CHECK("fan-in: output_K = max_K", sg.output_K() == sg.max_K());
+    // PW sink → output_K_ = 1.
+    CHECK_EQ_I("fan-in: output_K = 1", sg.output_K(), 1);
 
-    // PW sink: nk must be 1. output_K_=256, so only k=256 is valid.
-    CHECK("k=1 invalid (nk=256 > 1)", !sg.is_valid_tiling(TC(128, 256, 1)));
-    CHECK("k=2 invalid (nk=128 > 1)", !sg.is_valid_tiling(TC(128, 256, 2)));
+    // PW sink: output_K_=1, so nk=max(1/k,1)=1 for any k. All k values valid.
+    CHECK("k=1 valid (nk=1)", sg.is_valid_tiling(TC(128, 256, 1)));
+    CHECK("k=2 valid (nk=1)", sg.is_valid_tiling(TC(128, 256, 2)));
     CHECK("k=256 valid (nk=1)", sg.is_valid_tiling(TC(128, 256, 256)));
 
-    // ws at [128,256,256]: ntw=1, nth=1, nk=1.
+    // ws at [128,256,1]: ntw=1, nth=1, nk=1.
     // T0(256×256): (FIXED_1, FROM_NTH). h_tiles=1, v_tiles=1. slice=65536.
     // T1(128×256): (FROM_NTW, FIXED_1). h_tiles=1, v_tiles=1. slice=32768.
     // T3(256×256): same as T0. slice=65536.
     // T4(128×256): same as T1. slice=32768.
     // T6(128×256): (FROM_NTW, FROM_NTH). h_tiles=1, v_tiles=1. slice=32768.
     // Total = 65536 + 32768 + 65536 + 32768 + 32768 = 229376.
-    auto ws = sg.working_set(TC(128, 256, 256));
-    CHECK_EQ_I("ws(128,256,256) = 229376", ws, 229376);
+    auto ws = sg.working_set(TC(128, 256, 1));
+    CHECK_EQ_I("ws(128,256,1) = 229376", ws, 229376);
 
     auto best = sg.best_cost();
     CHECK("fan-in feasible", best.feasible);
@@ -1548,7 +1548,7 @@ void test_tensor_reused_different_roles() {
     //   From Op1 PW sink: inherits T3's source → (FROM_NTW, FROM_NTH)
     //   Merged: (FROM_NTW, FROM_NTH) [FROM_NTH wins over FIXED_1]
     //
-    // has_pw_sink_ = true → k forced to 1.
+    // has_pw_sink_ = true → output_K_ = 1.
 
     Problem p;
     p.tensors = {{256,128},{128,128},{128,128},{128,128}};
@@ -1563,9 +1563,9 @@ void test_tensor_reused_different_roles() {
 
     CHECK("dual-role: T1 is boundary input", sg.boundary_inputs().count(1));
     CHECK("dual-role: T2 eph", sg.ephemeral().count(2));
-    // PW sink + matmul: output_K_=max_K_=256 (K=T0.width=256). Only k=256 valid (nk=1).
-    CHECK("dual-role: k=1 invalid (nk=256 > 1)", !sg.is_valid_tiling(TC(128, 128, 1)));
-    CHECK("dual-role: k=2 invalid (nk=128 > 1)", !sg.is_valid_tiling(TC(128, 128, 2)));
+    // PW sink → output_K_=1. nk=max(1/k,1)=1 for any k. All k values valid.
+    CHECK("dual-role: k=1 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 1)));
+    CHECK("dual-role: k=2 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 2)));
     CHECK("dual-role: k=256 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 256)));
 
     // T1(128×128): merged source (FROM_NTW, FROM_NTH). ntw=1,nth=1 → full tensor.
@@ -1573,8 +1573,8 @@ void test_tensor_reused_different_roles() {
     // T3(128×128): (FROM_NTW, FROM_NTH). slice=128*128=16384.
     // T1: slice = 128*128 = 16384.
     // Total = 32768 + 16384 + 16384 = 65536.
-    auto ws = sg.working_set(TC(128, 128, 256));
-    CHECK_EQ_I("ws(128,128,256) = 65536", ws, 65536);
+    auto ws = sg.working_set(TC(128, 128, 1));
+    CHECK_EQ_I("ws(128,128,1) = 65536", ws, 65536);
 
     auto best = sg.best_cost();
     CHECK("dual-role feasible", best.feasible);
@@ -1648,7 +1648,7 @@ void test_residual_skip_connection() {
     // Op2: PW [T3, T_in] → T4(256×256)  [sink]
     //
     // T_in used at depth 0 (Op0) and depth 2 (Op2).
-    // T1, T3 ephemeral. T4 boundary output. PW sink → k=1.
+    // T1, T3 ephemeral. T4 boundary output. PW sink → output_K_ = 1.
     //
     // T_in sources:
     //   From Op0 PW: inherits T1's source
@@ -1683,20 +1683,20 @@ void test_residual_skip_connection() {
     CHECK("skip: T3 eph", sg.ephemeral().count(3));
     CHECK("skip: T4 boundary out", sg.boundary_outputs().count(4));
 
-    // PW sink + matmul: output_K_=max_K_=128 (K=T2.width=128). Only k=128 valid (nk=1).
-    CHECK("skip: k=1 invalid (nk=128 > 1)", !sg.is_valid_tiling(TC(256, 256, 1)));
-    CHECK("skip: k=2 invalid (nk=64 > 1)", !sg.is_valid_tiling(TC(256, 256, 2)));
+    // PW sink → output_K_=1. nk=max(1/k,1)=1 for any k. All k values valid.
+    CHECK("skip: k=1 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 1)));
+    CHECK("skip: k=2 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 2)));
     CHECK("skip: k=128 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 128)));
 
     // T_in (256×256): (FROM_NTW, FROM_NTH). ntw=256/w, nth=256/h.
     // T2 (128×256): (FIXED_1, FROM_NTH). slice = 128 * (256/nth).
     // T4 (256×256): (FROM_NTW, FROM_NTH). Output slice.
     //
-    // At [256,256,128]: ntw=1, nth=1, nk=1. Everything full size.
+    // At [256,256,1]: ntw=1, nth=1, nk=1. Everything full size.
     // T_in: 256*256=65536. T2: 128*256=32768. T4: 256*256=65536.
     // Total = 65536 + 32768 + 65536 = 163840.
-    auto ws = sg.working_set(TC(256, 256, 128));
-    CHECK_EQ_I("ws(256,256,128) = 163840", ws, 163840);
+    auto ws = sg.working_set(TC(256, 256, 1));
+    CHECK_EQ_I("ws(256,256,1) = 163840", ws, 163840);
 
     auto best = sg.best_cost();
     CHECK("skip feasible", best.feasible);
@@ -1930,38 +1930,39 @@ void test_ephemeral_fanout_to_mm_and_pw() {
     CHECK("eph-fanout-mixed: T3 ephemeral", sg.ephemeral().count(3));
 
     // h=128 → nth=2 → T1 conflict (nth=2 from PW, 1 from MM RHS). Reject.
-    // Also: has_pw_sink_+matmul → output_K_=256. k must equal 256 for nk=1.
-    // k=1 → nk=256 > 1 → rejected regardless.
+    // (output_K_=1 so k itself is not the reason; conflict is purely spatial.)
     CHECK("h=128 rejected (T1 conflict)",
           !sg.is_valid_tiling(TC(128, 128, 1)));
 
-    // h=256 → nth=1. Both roles agree on v_tiles=1. k=256 → nk=1. Accept.
-    CHECK("h=256 accepted (nth=1, no conflict)",
+    // h=256 → nth=1. Both roles agree on v_tiles=1. k=1 or k=256 both valid.
+    CHECK("h=256,k=1 accepted (nth=1, no conflict)",
+          sg.is_valid_tiling(TC(128, 256, 1)));
+    CHECK("h=256,k=256 accepted (nth=1, no conflict)",
           sg.is_valid_tiling(TC(128, 256, 256)));
 
     // w=64 → ntw=2. T1 gets h_tiles=ntw=2 from both roles. No h-conflict.
     CHECK("w=64,h=256 accepted",
-          sg.is_valid_tiling(TC(64, 256, 256)));
+          sg.is_valid_tiling(TC(64, 256, 1)));
 
     // Boundary tensors: T0(128×256), T2(256×256), T4(128×256, out).
     // Tile sources: T0 (FROM_NTW, FROM_NTH), T2 (FIXED_1, FROM_NTH), T4 (FROM_NTW, FROM_NTH).
     // No FROM_NK sources, so ws is the same at any valid nk=1 config.
     //
-    // ws at [128,256,256]: ntw=1, nth=1, nk=1.
+    // ws at [128,256,1]: ntw=1, nth=1, nk=1.
     //   T0: ht=1, vt=1 → 128*256 = 32768.
     //   T2: ht=1, vt=1 → 256*256 = 65536.
     //   T4: ht=1, vt=1 → 128*256 = 32768.
     //   Total = 131072.
-    CHECK_EQ_I("ws(128,256,256) = 131072", sg.working_set(TC(128, 256, 256)), 131072);
+    CHECK_EQ_I("ws(128,256,1) = 131072", sg.working_set(TC(128, 256, 1)), 131072);
 
-    // ws at [64,256,256]: ntw=2, nth=1.
+    // ws at [64,256,1]: ntw=2, nth=1.
     //   T0: ht=2, vt=1 → 64*256 = 16384.
     //   T2: ht=1, vt=1 → 65536 (FIXED_1 in h).
     //   T4: ht=2, vt=1 → 16384.
     //   Total = 98304.
-    CHECK_EQ_I("ws(64,256,256) = 98304", sg.working_set(TC(64, 256, 256)), 98304);
+    CHECK_EQ_I("ws(64,256,1) = 98304", sg.working_set(TC(64, 256, 1)), 98304);
 
-    // Cost at [128,256,256]: num_tw=1, num_th=1, nk=1. has_matmul=true.
+    // Cost at [128,256,1]: num_tw=1, num_th=1, nk=1. has_matmul=true.
     //   comp: Op0(PW, out=T1 128×256, op_scale=1*2=2): 100*2=200.
     //         Op1(MM, out=T3 128×256, op_scale=2): 1000*2=2000.
     //         Op2(PW, out=T4 128×256, op_scale=2): 100*2=200.
@@ -1971,7 +1972,7 @@ void test_ephemeral_fanout_to_mm_and_pw() {
     //       T4 out_evict=32768/10=3276.8.
     //   1 tile: per_tile_io=3276.8+6553.6=9830.4.
     //   max(2400, 9830.4+3276.8) = 13107.2.
-    auto r = sg.compute_cost(TC(128, 256, 256, SnakeDir::RowMajor));
+    auto r = sg.compute_cost(TC(128, 256, 1, SnakeDir::RowMajor));
     CHECK("cost feasible", r.feasible);
     CHECK_EQ("comp_per_step = 2400", r.compute_per_step, 2400.0);
     CHECK_EQ("latency = 13107.2", r.latency, 13107.2);
@@ -2672,14 +2673,13 @@ void test_single_mm_nk2_stream_only() {
 
 void test_mm_pw_chain_nk2_mixed_io() {
     std::cout << "--- test_mm_pw_chain_nk2_mixed_io ---\n";
-    // MM → PW chain where the PW is sink. PW sink forces nk=1.
-    // output_K_ = max_K_ = 128 (K of the matmul). Only k=128 valid (nk=1).
+    // MM → PW chain where the PW is sink. PW sink → output_K_ = 1.
+    // nk = max(1/k, 1) = 1 for any k. No temporal dimension regardless of k.
     //
     // Op0: MM T_a(128×128) @ T_b(128×128) → T_c(128×128)  [K=128]
     // Op1: PW T_c → T_out(128×128)
     //
-    // has_pw_sink_ = true → ks_cand_ = {output_K_} = {128}.
-    // With k=128, nk = max(128/128, 1) = 1. No temporal dimension.
+    // has_pw_sink_ = true → ks_cand_ = {output_K_} = {1}.
 
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
@@ -2691,10 +2691,10 @@ void test_mm_pw_chain_nk2_mixed_io() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    CHECK_EQ_I("pw_sink: output_K = 128", sg.output_K(), 128);
+    CHECK_EQ_I("pw_sink: output_K = 1", sg.output_K(), 1);
 
-    // Only k=128 valid (nk=128/128=1). k<128 → nk>1 → rejected.
-    CHECK("pw_sink: k=1 invalid", !sg.is_valid_tiling(TC(128, 128, 1)));
+    // output_K_=1: nk=max(1/k,1)=1 for any k. All k values valid.
+    CHECK("pw_sink: k=1 valid", sg.is_valid_tiling(TC(128, 128, 1)));
     CHECK("pw_sink: k=128 valid", sg.is_valid_tiling(TC(128, 128, 128)));
 
     // With nk=1 and ntw=1, nth=1: all tile counts are 1.
@@ -2702,13 +2702,13 @@ void test_mm_pw_chain_nk2_mixed_io() {
     // T_b: (FROM_NTW, FIXED_1) → ht=1, vt=1 → 16384
     // T_out: (FROM_NTW, FROM_NTH) → ht=1, vt=1 → 16384
     // ws = 49152
-    CHECK_EQ_I("ws(128,128,128) = 49152", sg.working_set(TC(128, 128, 128)), 49152);
+    CHECK_EQ_I("ws(128,128,1) = 49152", sg.working_set(TC(128, 128, 1)), 49152);
 
     // Cost: comp = 2000/1 * 1 + 500/1 * 1 = 2500 (nk=1).
     // IO: T_a once_load=1638.4, T_b once_load=1638.4, T_out evict=1638.4.
     // nk=1: tile_cost = max(2500, 3276.8 + 0 + 1638.4) = max(2500, 4915.2) = 4915.2
     // 1 tile → latency = 4915.2
-    auto r = sg.compute_cost(TC(128, 128, 128, SnakeDir::RowMajor));
+    auto r = sg.compute_cost(TC(128, 128, 1, SnakeDir::RowMajor));
     CHECK("pw_sink cost feasible", r.feasible);
     CHECK_EQ("pw_sink comp = 2500", r.compute_per_step, 2500.0);
     CHECK_EQ("pw_sink latency = 4915.2", r.latency, 4915.2);
@@ -2718,13 +2718,13 @@ void test_mm_pw_chain_nk2_mixed_io() {
 // Section 12: PW-sink temporal tiling rejection
 //
 // When any sink op is Pointwise, has_pw_sink_ = true which forces:
-//   - output_K_ = max_K_ (K of the internal MatMul, or 1 for pure-PW)
-//   - ks_cand_ = {output_K_}  (only k=max_K gives nk=1)
-//   - is_valid_tiling rejects any k where nk = output_K_/k > 1
+//   - output_K_ = 1 (not max_K_)
+//   - ks_cand_ = {1}  (only k=1 is the sole candidate)
+//   - nk = max(1/k, 1) = 1 for any k, so is_valid_tiling accepts all k
 //
 // This ensures that temporal K-dimension splitting is never applied when the
 // output is a Pointwise op, even if a MatMul is present in the same subgraph.
-// The k written to the solution file equals max_K_ (the matmul's K dimension).
+// The k written to the solution file equals 1 (output_K_).
 // ============================================================================
 
 void test_pw_sink_best_cost_no_temporal_mm_pw_chain() {
@@ -2742,18 +2742,18 @@ void test_pw_sink_best_cost_no_temporal_mm_pw_chain() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    // output_K_ = max_K_ = 128 (K of Op0).
-    CHECK_EQ_I("mm_pw chain: output_K = 128", sg.output_K(), 128);
+    // output_K_ = 1 (PW sink).
+    CHECK_EQ_I("mm_pw chain: output_K = 1", sg.output_K(), 1);
 
-    // best_cost() only tries k=128 (ks_cand_ = {128}), giving nk=1.
+    // best_cost() only tries k=1 (ks_cand_ = {1}), giving nk=1.
     auto best = sg.best_cost();
     CHECK("mm_pw chain: best_cost feasible", best.feasible);
     CHECK_EQ_I("mm_pw chain: num_k_passes = 1", best.num_k_passes, 1);
-    CHECK_EQ_I("mm_pw chain: best k = 128", (int64_t)best.config.k, 128);
+    CHECK_EQ_I("mm_pw chain: best k = 1", (int64_t)best.config.k, 1);
 
-    // k < 128 → nk > 1 → rejected by PW-sink constraint.
-    CHECK("mm_pw k=2 invalid", !sg.is_valid_tiling(TC(128, 128, 2)));
-    CHECK("mm_pw k=64 invalid", !sg.is_valid_tiling(TC(128, 128, 64)));
+    // output_K_=1: nk=max(1/k,1)=1 for any k. All k values valid.
+    CHECK("mm_pw k=2 valid", sg.is_valid_tiling(TC(128, 128, 2)));
+    CHECK("mm_pw k=64 valid", sg.is_valid_tiling(TC(128, 128, 64)));
 }
 
 void test_pw_cosink_no_temporal_tiling() {
@@ -2762,7 +2762,8 @@ void test_pw_cosink_no_temporal_tiling() {
     // Op0: MM T0(128×128) @ T1(128×128) → T2(128×128)  [sink]
     // Op1: PW T0 → T3(128×128)                          [sink]
     //
-    // Two sinks, one is PW → has_pw_sink_ = true, output_K_ = max_K_ = 128.
+    // Mixed MM+PW sinks → has_pw_sink_ = true, output_K_ = op_K(MM) = 128.
+    // Only k=128 gives nk=1; k<128 gives nk>1 and is rejected.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},   // Op0: MM sink
@@ -2779,9 +2780,8 @@ void test_pw_cosink_no_temporal_tiling() {
     CHECK("cosink: best_cost feasible", best.feasible);
     CHECK_EQ_I("cosink: num_k_passes = 1", best.num_k_passes, 1);
 
-    // k=32 → nk=128/32=4 > 1 → rejected by PW-sink constraint.
+    // output_K_=128 (from MM sink): only k=128 valid (nk=1). k=32 → nk=4 → invalid.
     CHECK("cosink k=32 invalid", !sg.is_valid_tiling(TC(128, 128, 32)));
-    // k=128 → nk=1 → valid.
     CHECK("cosink k=128 valid", sg.is_valid_tiling(TC(128, 128, 128)));
 }
 
@@ -2795,9 +2795,8 @@ void test_pw_sink_no_temporal_tight_memory() {
     // Op0: MM T0(128×128) @ T1(128×128) → T2(128×128)  [K=128]
     // Op1: PW T2 → T3(128×128)  [sink]
     //
-    // output_K_ = max_K_ = 128. Only k=128 valid (nk=1).
-    // At {128,128,128}: ws = T0+T1+T3 = 3×16384 = 49152. Capacity = 5000.
-    // Must tile spatially: e.g. {8,8,128} → T0 slice small, feasible.
+    // output_K_ = 1. ks_cand_ = {1}. At {128,128,1}: ws = T0+T1+T3 = 3×16384 = 49152.
+    // Capacity = 5000. Must tile spatially: e.g. {8,8,1} → T0 slice small, feasible.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},
@@ -2808,7 +2807,7 @@ void test_pw_sink_no_temporal_tight_memory() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    CHECK_EQ_I("tight mm_pw: output_K = 128", sg.output_K(), 128);
+    CHECK_EQ_I("tight mm_pw: output_K = 1", sg.output_K(), 1);
 
     auto best = sg.best_cost();
     // Regardless of whether a feasible tiling is found, it must not use nk > 1

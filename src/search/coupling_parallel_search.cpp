@@ -12,6 +12,7 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -42,6 +43,8 @@ static double coupling_partition_distance(const CouplingPoolEntry& a,
     const Partition& pb = b.cp.part;
     size_t n = pa.prob->num_ops();
 
+    // --- Component 1: Adjusted Rand Index on op-to-group assignment ---
+
     std::vector<int> ga_map(n, -1), gb_map(n, -1);
     int num_ga = 0, num_gb = 0;
     for (size_t gi = 0; gi < pa.groups.size(); gi++)
@@ -54,39 +57,63 @@ static double coupling_partition_distance(const CouplingPoolEntry& a,
             for (auto op : pb.groups[gi].ops) gb_map[op] = num_gb;
             num_gb++;
         }
-    if (num_ga == 0 || num_gb == 0) return 0.0;
 
-    std::vector<int> table(num_ga * num_gb, 0);
-    std::vector<int> row_sum(num_ga, 0), col_sum(num_gb, 0);
-    int total = 0;
-    for (size_t op = 0; op < n; op++) {
-        if (ga_map[op] < 0 || gb_map[op] < 0) continue;
-        table[ga_map[op] * num_gb + gb_map[op]]++;
-        row_sum[ga_map[op]]++;
-        col_sum[gb_map[op]]++;
-        total++;
+    double ari_dist = 0.0;
+    if (num_ga > 0 && num_gb > 0) {
+        std::vector<int> table(num_ga * num_gb, 0);
+        std::vector<int> row_sum(num_ga, 0), col_sum(num_gb, 0);
+        int total = 0;
+        for (size_t op = 0; op < n; op++) {
+            if (ga_map[op] < 0 || gb_map[op] < 0) continue;
+            table[ga_map[op] * num_gb + gb_map[op]]++;
+            row_sum[ga_map[op]]++;
+            col_sum[gb_map[op]]++;
+            total++;
+        }
+
+        if (total > 1) {
+            auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
+            int64_t same_a = 0, same_b = 0, agree = 0;
+            for (int i = 0; i < num_ga; i++) same_a += choose2(row_sum[i]);
+            for (int j = 0; j < num_gb; j++) same_b += choose2(col_sum[j]);
+            for (int i = 0; i < num_ga; i++)
+                for (int j = 0; j < num_gb; j++)
+                    agree += choose2(table[i * num_gb + j]);
+
+            int64_t total_pairs = choose2(total);
+            if (total_pairs > 0) {
+                double expected  = (double)same_a * same_b / total_pairs;
+                double max_agree = (double)(same_a + same_b) / 2.0;
+                double denom     = max_agree - expected;
+                if (std::abs(denom) > 1e-12) {
+                    double ari = ((double)agree - expected) / denom;
+                    ari_dist = 1.0 - std::clamp(ari, 0.0, 1.0);
+                }
+            }
+        }
     }
-    if (total <= 1) return 0.0;
 
-    auto choose2 = [](int64_t x) -> int64_t { return x * (x - 1) / 2; };
-    int64_t same_a = 0, same_b = 0, agree = 0;
-    for (int i = 0; i < num_ga; i++) same_a += choose2(row_sum[i]);
-    for (int j = 0; j < num_gb; j++) same_b += choose2(col_sum[j]);
-    for (int i = 0; i < num_ga; i++)
-        for (int j = 0; j < num_gb; j++)
-            agree += choose2(table[i * num_gb + j]);
+    // --- Component 2: Jaccard distance on retained tensor sets ---
 
-    int64_t total_pairs = choose2(total);
-    if (total_pairs == 0) return 0.0;
+    // Collect the set of all retained tensor IDs from each coupled partition.
+    std::set<size_t> ra, rb;
+    for (auto& [edge, tensors] : a.cp.retained)
+        ra.insert(tensors.begin(), tensors.end());
+    for (auto& [edge, tensors] : b.cp.retained)
+        rb.insert(tensors.begin(), tensors.end());
 
-    double expected  = (double)same_a * same_b / total_pairs;
-    double max_agree = (double)(same_a + same_b) / 2.0;
-    double denom     = max_agree - expected;
-    if (std::abs(denom) < 1e-12) return 0.0;
+    double jaccard_dist = 0.0;
+    if (!ra.empty() || !rb.empty()) {
+        size_t intersection = 0;
+        for (auto t : ra)
+            if (rb.count(t)) intersection++;
+        size_t union_size = ra.size() + rb.size() - intersection;
+        jaccard_dist = 1.0 - (double)intersection / (double)union_size;
+    }
 
-    double ari = ((double)agree - expected) / denom;
-    ari = std::clamp(ari, 0.0, 1.0);
-    return 1.0 - ari;
+    // --- Blend: partition structure (dominant) + coupling topology ---
+    constexpr double alpha = 0.6;
+    return alpha * ari_dist + (1.0 - alpha) * jaccard_dist;
 }
 
 // ============================================================================

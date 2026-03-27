@@ -472,20 +472,20 @@ void test_pw_sink_rule() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("MM+PW fused valid", sg.has_value());
 
-    // PW sink + matmul: output_K_=max_K_=256 (K=T0.width=256).
-    // nk must be 1 → only k=256 valid. k<256 → nk>1 → rejected.
+    // PW sink + matmul: output_K_=1 (PW-sink subgraph).
+    // nk = max(output_K_/k, 1) = max(1/k, 1) = 1 for all k → all k valid.
     CHECK("k=256 valid (nk=1)", sg->is_valid_tiling({128,128,256,SnakeDir::None}));
-    CHECK("k=128 invalid (nk=2 > 1)", !sg->is_valid_tiling({128,128,128,SnakeDir::None}));
-    CHECK("k=1 invalid (nk=256 > 1)", !sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+    CHECK("k=128 valid (nk=1)", sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+    CHECK("k=1 valid (nk=1)", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
 
     auto best = sg->best_cost();
-    CHECK("best k=256", best.config.k == 256);
+    CHECK("best k=1", best.config.k == 1);
 
     // Fused should still beat separate (saves T2 transfer)
     Partition tmp; tmp.prob = &p; tmp.dag = &d;
     double fused = tmp.eval_set({0,1});
     double sep = tmp.eval_set({0}) + tmp.eval_set({1});
-    std::cout << "  Fused (k=256): " << fused << " Separate: " << sep << "\n";
+    std::cout << "  Fused: " << fused << " Separate: " << sep << "\n";
     CHECK("fused < separate", fused < sep);
 }
 

@@ -124,19 +124,16 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
-    if (!sg.has_pw_sink_) {
-      for (auto s : sink_ops) {
-        if (prob.ops[s].type == OpType::MatMul) {
-          sg.output_K_ = sg.op_K(s);
-          break;
-        }
+    // Set output_K_ from the sink matmul (if any).
+    //   MM-only sinks:  output_K_ = op_K(sink_mm) — standard temporal tiling.
+    //   Mixed MM+PW sinks: output_K_ = op_K(sink_mm) — the MM sink determines
+    //     K; has_pw_sink_ enforcement below ensures nk == 1.
+    //   PW-only sinks:  output_K_ stays 1 — no temporal dimension.
+    for (auto s : sink_ops) {
+      if (prob.ops[s].type == OpType::MatMul) {
+        sg.output_K_ = sg.op_K(s);
+        break;
       }
-    } else if (sg.has_matmul_) {
-      // PW-sink with a matmul inside: nk must still be 1 (enforced below),
-      // but the k written to the solution file should be the matmul's K so
-      // the runtime does the full contraction in one pass.  Use max_K_ so
-      // nk = max_K_ / max_K_ = 1.  Pure-PW subgraphs keep output_K_ = 1.
-      sg.output_K_ = sg.max_K_;
     }
 
     std::vector<std::vector<size_t>> eph_consumers(num_tensors);
@@ -389,9 +386,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   sg.ws_cand_ = valid_candidates(sg.w_divides_);
   sg.hs_cand_ = valid_candidates(sg.h_divides_);
-  // For PW-sink subgraphs output_K_ == 1, so k == output_K_ == 1 gives nk == 1
-  // (no temporal passes).  Using output_K_ here makes the intent explicit:
-  // k == output_K → nk == 1.
+  // PW-sink subgraphs: force k = output_K_ so nk == 1 (no temporal tiling).
+  //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
+  //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
+  //     (full reduction in one pass).
   sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{sg.output_K_}
                                  : valid_candidates(sg.k_divides_);
 

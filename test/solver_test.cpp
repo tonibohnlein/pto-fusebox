@@ -178,8 +178,8 @@ void test_solve_mm_pw_chain() {
     auto deadline = Clock::now() + std::chrono::milliseconds(500);
     auto sol = solve(p, d, deadline);
     check_solution("solve/mm_pw", sol, p, base);
-    // Verify PW-sink k=max_K (nk=1) is respected in all steps with MM+PW.
-    // make_mm_pw_chain: MM T0(128×128)@T1(128×128), K=128. Expected k=128.
+    // Verify PW-only sink rule: when MM+PW are fused (MM output is ephemeral),
+    // output_K_=1 so best k=1 (nk=1 for any k). Solver should pick k=1.
     for (size_t i = 0; i < sol.num_steps(); i++) {
         bool has_mm = false, has_pw = false;
         for (auto op : sol.step(i).subgraph.ops()) {
@@ -187,7 +187,7 @@ void test_solve_mm_pw_chain() {
             else has_pw = true;
         }
         if (has_mm && has_pw)
-            CHECK("MM+PW step: k=128 (nk=1)", sol.step(i).config.k == 128);
+            CHECK("MM+PW step: k=1 (PW-only sink)", sol.step(i).config.k == 1);
     }
     std::cout << "    trivial=" << base << " solved=" << sol.total_latency()
               << " steps=" << sol.num_steps() << "\n";
@@ -379,13 +379,14 @@ void test_phase3_coupling_no_retain() {
 void test_invariant_pw_sink_k1() {
     std::cout << "--- test_invariant_pw_sink_k1 ---\n";
     // Every step in the final solution that has a MM feeding a PW sink
-    // must have k=max_K (nk=1). For make_mm_pw_chain(), MM has K=128.
+    // (PW-only sink: MM output is ephemeral) must have k=1 (output_K_=1).
+    // For make_mm_pw_chain(), MM output T2 is ephemeral → PW-only sink.
     auto p = make_mm_pw_chain(); DAG d = DAG::build(p);
     auto deadline = Clock::now() + std::chrono::milliseconds(400);
     auto sol = solve(p, d, deadline);
 
-    // K for the MatMul in make_mm_pw_chain: LHS=T0(128×128), K=T0.width=128.
-    const int64_t expected_k = 128;
+    // PW-only sink: output_K_=1, best k=1.
+    const int64_t expected_k = 1;
 
     bool found_mm_pw = false;
     bool k_ok = true;
@@ -400,12 +401,12 @@ void test_invariant_pw_sink_k1() {
             if (sol.step(i).config.k != expected_k) k_ok = false;
         }
     }
-    // If MM and PW were fused into the same step, k must equal max_K (nk=1)
+    // If MM and PW were fused into the same step, k must equal 1 (PW-only sink)
     if (found_mm_pw)
-        CHECK("PW-sink k=max_K in fused MM+PW step", k_ok);
+        CHECK("PW-sink k=1 in fused MM+PW step", k_ok);
     else {
         g_pass++;  // not fused — constraint trivially satisfied
-        std::cout << "    MM and PW not fused (k=max_K constraint trivially met)\n";
+        std::cout << "    MM and PW not fused (k=1 constraint trivially met)\n";
     }
 }
 

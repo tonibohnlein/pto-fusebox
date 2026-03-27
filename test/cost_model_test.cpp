@@ -448,12 +448,13 @@ void test_pw_sink_mm_then_pw() {
 
     CHECK("T2 ephemeral",   sg.ephemeral().count(2));
     CHECK("T3 boundary out",sg.boundary_outputs().count(3));
-    // PW sink + matmul (K=128): only k=128 valid (nk=1).
-    CHECK("k=1 invalid",  !sg.is_valid_tiling(TC(128,128,1)));
-    CHECK("k=32 invalid", !sg.is_valid_tiling(TC(128,128,32)));
-    CHECK("k=64 invalid", !sg.is_valid_tiling(TC(128,128,64)));
-    CHECK("k=128 valid",   sg.is_valid_tiling(TC(128,128,128)));
-    // nk=1 (k=128 → nk=128/128=1)
+    // PW-only sink (T3 produced by PW, T2 ephemeral so MM is not a sink):
+    // output_K_=1, nk=1 for any k. All k values valid.
+    CHECK("k=1 valid",   sg.is_valid_tiling(TC(128,128,1)));
+    CHECK("k=32 valid",  sg.is_valid_tiling(TC(128,128,32)));
+    CHECK("k=64 valid",  sg.is_valid_tiling(TC(128,128,64)));
+    CHECK("k=128 valid",  sg.is_valid_tiling(TC(128,128,128)));
+    // nk=1 for any k (PW-only sink)
     auto c = sg.compute_cost(TC(128,128,128));
     CHECK("feasible k=128", c.feasible);
     CHECK_EQ_I("nk=1", c.num_k_passes, 1);
@@ -496,10 +497,11 @@ void test_pw_sink_pw_then_mm_with_pw_output() {
     if (!sg) return;
 
     CHECK("T4 boundary out", sg->boundary_outputs().count(4));
-    // PW sink + matmul (K=128): only k=128 valid (nk=1).
-    CHECK("k=1 invalid",  !sg->is_valid_tiling(TC(128,128,1)));
-    CHECK("k=2 invalid",  !sg->is_valid_tiling(TC(128,128,2)));
-    CHECK("k=128 valid",   sg->is_valid_tiling(TC(128,128,128)));
+    // PW-only sink (T4 produced by PW, T3 ephemeral so MM is not a sink):
+    // output_K_=1, nk=1 for any k. All k values valid.
+    CHECK("k=1 valid",   sg->is_valid_tiling(TC(128,128,1)));
+    CHECK("k=2 valid",   sg->is_valid_tiling(TC(128,128,2)));
+    CHECK("k=128 valid",  sg->is_valid_tiling(TC(128,128,128)));
     // Cost at k=128 is feasible
     auto c128 = sg->compute_cost(TC(128,128,128));
     CHECK("k=128 feasible", c128.feasible);

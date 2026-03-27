@@ -196,22 +196,30 @@ Solution CoupledPartition::to_solution() const {
         if (part.groups[g].alive && (g >= prev_group.size() || prev_group[g] == SIZE_MAX))
             heads.push_back(g);
 
-    // Build chain-level DAG: edge h1→h2 if any group in chain(h1) has a
-    // group-DAG edge to any group in chain(h2).  Edges within the same chain
-    // (i.e. the coupling edges themselves) are internal and skipped.
+    // Build chain-level DAG from the op/tensor DAG directly (not
+    // part.group_succs, which may be stale after coupling mutations).
+    // Edge h1→h2 if any group in chain(h1) produces a tensor consumed by
+    // a group in chain(h2).  Edges within the same chain are skipped.
     std::map<size_t, std::set<size_t>> chain_succs;
     std::map<size_t, int> in_deg;
     for (auto h : heads) { chain_succs[h]; in_deg[h] = 0; }
 
     for (size_t g = 0; g < n; g++) {
-        if (!part.groups[g].alive || g >= part.group_succs.size()) continue;
+        if (!part.groups[g].alive) continue;
         size_t hg = head_of[g];
-        for (auto s : part.group_succs[g]) {
-            if (!part.groups[s].alive || s >= n) continue;
-            size_t hs = head_of[s];
-            if (hs == hg) continue;  // same chain — internal edge
-            if (chain_succs[hg].insert(hs).second)
-                in_deg[hs]++;
+        for (auto op : part.groups[g].ops) {
+            for (auto t : prob.ops[op].outputs) {
+                if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
+                for (auto cop : dag.tensor_consumers[t]) {
+                    for (auto gs : part.groups_of(cop)) {
+                        if (!part.groups[gs].alive || gs == g) continue;
+                        size_t hs = head_of[gs];
+                        if (hs == hg) continue;  // same chain
+                        if (chain_succs[hg].insert(hs).second)
+                            in_deg[hs]++;
+                    }
+                }
+            }
         }
     }
 
@@ -235,17 +243,27 @@ Solution CoupledPartition::to_solution() const {
         std::cerr << "WARNING: to_solution: chain DAG cycle detected — "
                      "falling back to group-level sort (no retention)\n";
 
-        // Group-level Kahn's using part.group_succs.
+        // Group-level Kahn's from op/tensor DAG (not stale group_succs).
         std::vector<size_t> all_g;
         for (size_t g = 0; g < n; g++)
             if (part.groups[g].alive) all_g.push_back(g);
 
+        std::map<size_t, std::set<size_t>> g_succs;
         std::map<size_t, int> g_indeg;
-        for (auto g : all_g) g_indeg[g] = 0;
+        for (auto g : all_g) { g_succs[g]; g_indeg[g] = 0; }
         for (auto g : all_g) {
-            if (g >= part.group_succs.size()) continue;
-            for (auto s : part.group_succs[g])
-                if (part.groups[s].alive) g_indeg[s]++;
+            for (auto op : part.groups[g].ops) {
+                for (auto t : prob.ops[op].outputs) {
+                    if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
+                    for (auto cop : dag.tensor_consumers[t]) {
+                        for (auto gs : part.groups_of(cop)) {
+                            if (!part.groups[gs].alive || gs == g) continue;
+                            if (g_succs[g].insert(gs).second)
+                                g_indeg[gs]++;
+                        }
+                    }
+                }
+            }
         }
         std::queue<size_t> gq;
         std::vector<size_t> g_topo;
@@ -254,9 +272,8 @@ Solution CoupledPartition::to_solution() const {
         while (!gq.empty()) {
             size_t g = gq.front(); gq.pop();
             g_topo.push_back(g);
-            if (g < part.group_succs.size())
-                for (auto s : part.group_succs[g])
-                    if (part.groups[s].alive && --g_indeg[s] == 0) gq.push(s);
+            for (auto s : g_succs[g])
+                if (part.groups[s].alive && --g_indeg[s] == 0) gq.push(s);
         }
         for (auto g : all_g)
             if (g_indeg[g] > 0) g_topo.push_back(g);

@@ -650,22 +650,22 @@ void test_matmul_pw_fusion_K() {
   CHECK_EQ_I("fused max_K", sg->max_K(), 256);
   CHECK("T2 ephemeral", sg->ephemeral().count(2));
 
-  // PW-sink + matmul: output_K_ = max_K_ = 256.
-  // Only k=256 gives nk=1; other k values give nk>1 and are rejected.
+  // PW-only sink (T3 produced by PW, T2 ephemeral so MM is not a sink):
+  // output_K_=1, nk=1 for any k. All k values valid.
   CHECK("k=256 accepted (nk=1)", sg->is_valid_tiling({128, 128, 256, SnakeDir::None}));
-  CHECK("k=64 rejected (nk=4)", !sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
-  CHECK("k=1 rejected (nk=256)", !sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
+  CHECK("k=64 accepted (nk=1)", sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
+  CHECK("k=1 accepted (nk=1)", sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
 
-  // With k=256, nk = 256/256 = 1
-  auto c = sg->compute_cost(N(128, 128, 256));
-  CHECK_EQ_I("fused k_passes (k=256)", c.num_k_passes, 1);
+  // With k=1 (best for PW-only sink), nk = 1
+  auto c = sg->compute_cost(N(128, 128, 1));
+  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 1);
   // comp_per_step = (MM:2000 + PW:500) / 1 × scale(1) = 2500
   CHECK_EQ("fused comp/step", c.compute_per_step, 2500.0);
 
-  // best_cost picks k=256 (the only valid k for this PW-sink+matmul subgraph)
+  // best_cost picks k=1 (best for PW-only sink: output_K_=1)
   auto best = sg->best_cost();
   CHECK("best feasible", best.feasible);
-  CHECK_EQ_I("best k=256", best.config.k, 256);
+  CHECK_EQ_I("best k=1", best.config.k, 1);
 }
 
 // ==================== Non-power-of-2 tiling ====================

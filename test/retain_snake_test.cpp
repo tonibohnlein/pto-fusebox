@@ -201,7 +201,7 @@ void test_retain_two_step_chain() {
 void test_retain_fused_mm_pw_k1() {
     std::cout << "--- test_retain_fused_mm_pw_k1 ---\n";
     // Op0: MM T0@T1→T2. Op1: PW T2→T3. Fused, T2 eph. K=128.
-    // PW-sink + matmul: output_K_=128, so k=128 is the only valid tiling (nk=1).
+    // PW-only sink (T3 produced by PW, T2 ephemeral): output_K_=1, all k valid.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},{OpType::Pointwise,{2},{3},500}};
@@ -212,16 +212,16 @@ void test_retain_fused_mm_pw_k1() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("has_pw_sink", sg.has_value());
 
-    // PW-sink + matmul: output_K_ = max_K_ = 128.
-    // Only k=128 gives nk=1; smaller k values give nk>1 and are rejected.
+    // PW-only sink (T3 produced by PW, T2 ephemeral so MM is not a sink):
+    // output_K_=1, nk=1 for any k. All k values valid.
     CHECK("k=128 accepted (nk=1)", sg->is_valid_tiling({128,128,128,SnakeDir::None}));
-    CHECK("k=32 rejected (nk=4)", !sg->is_valid_tiling({128,128,32,SnakeDir::None}));
-    CHECK("k=1 rejected (nk=128)", !sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+    CHECK("k=32 accepted (nk=1)", sg->is_valid_tiling({128,128,32,SnakeDir::None}));
+    CHECK("k=1 accepted (nk=1)", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
 
-    // best_cost picks k=128 (the only valid k for this PW-sink+matmul subgraph)
+    // best_cost picks k=1 (best for PW-only sink: output_K_=1)
     auto best = sg->best_cost();
     CHECK("best feasible", best.feasible);
-    CHECK("best k=128", best.config.k == 128);
+    CHECK("best k=1", best.config.k == 1);
 }
 
 // ==================== Snake × retain cross-product tests ====================
