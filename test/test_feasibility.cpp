@@ -261,22 +261,6 @@ void test_bottleneck_recompute_bridge() {
 // Split tests
 // ============================================================================
 
-void test_split_cycle() {
-    std::cerr << "test_split_cycle... ";
-    auto g = make_chain3();
-
-    // Split {0,1,2} into {0,2} and {1} → mutual dependency
-    assert(split_creates_topo_cycle({0, 2}, {1}, g.dag));
-
-    // Split {0,1,2} into {0,1} and {2} → no cycle (a→b only)
-    assert(!split_creates_topo_cycle({0, 1}, {2}, g.dag));
-
-    // Split {0,1,2} into {0} and {1,2} → no cycle (a→b only)
-    assert(!split_creates_topo_cycle({0}, {1, 2}, g.dag));
-
-    std::cerr << "OK\n";
-}
-
 // ============================================================================
 // Recompute: adding an op to a second group
 // ============================================================================
@@ -484,13 +468,12 @@ int main() {
     test_diamond_merge_branches();
     test_diamond_merge_source_sink();
     test_bottleneck_recompute_bridge();
-    test_split_cycle();
     test_recompute();
     test_multi_merge();
     test_split_move_delta();
     test_parallel_branches();
     test_extract_move();
 
-    std::cerr << "\n=== All " << 13 << " tests passed ===\n";
+    std::cerr << "\n=== All " << 12 << " tests passed ===\n";
     return 0;
 }

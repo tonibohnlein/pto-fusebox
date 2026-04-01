@@ -309,10 +309,6 @@ public:
     size_t ret_size()     const { return ret_map_.size(); }
     size_t max_entries()  const { return max_entries_; }
 
-    // freeze/unfreeze are no longer needed (both maps are always lock-free)
-    void freeze_base() {}
-    void unfreeze_base() {}
-
 private:
     const size_t max_entries_;
     LockFreeMap<CostResult> base_map_;

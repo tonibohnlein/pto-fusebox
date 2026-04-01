@@ -333,8 +333,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     if (kick_result.cost < 1e17) pool.insert(std::move(kick_result));
                 }
 
-                if (init_tasks_done.fetch_add(1) + 1 >= gen0_tasks)
-                    shared_cache.freeze_base();
+                init_tasks_done.fetch_add(1);
 
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - start).count();

@@ -180,14 +180,16 @@ FMMove best_move_for(const Partition& part, size_t op,
 
     // Pre-compute cost of each source group after losing op.
     // Account for disconnected components in the remainder.
-    struct GxCost { double cost; bool valid; };
-    std::unordered_map<size_t, GxCost> gx_without_op;
+    struct GxCost { size_t gx; double cost; bool valid; };
+    // groups_of_x is typically 1-2 entries; flat vector beats unordered_map
+    std::vector<GxCost> gx_without_op;
+    gx_without_op.reserve(groups_of_x.size());
     for (auto gx : groups_of_x) {
         if (!part.groups[gx].alive) continue;
         FlatSet<size_t> rem = part.groups[gx].ops;
         rem.erase(op);
         if (rem.empty()) {
-            gx_without_op[gx] = {0.0, true};
+            gx_without_op.push_back({gx, 0.0, true});
         } else {
             auto comps = structural_ops::connected_components(rem, *part.dag);
             double total = 0;
@@ -197,11 +199,12 @@ FMMove best_move_for(const Partition& part, size_t op,
                 if (c >= 1e17) { ok = false; break; }
                 total += c;
             }
-            gx_without_op[gx] = {total, ok};
+            gx_without_op.push_back({gx, total, ok});
         }
     }
 
-    std::set<std::pair<size_t,size_t>> merge_checked;
+    // Typically <10 pairs; flat vector with linear scan beats std::set
+    std::vector<std::pair<size_t,size_t>> merge_checked;
     for (auto gi : adj_groups) {
         FlatSet<size_t> new_gi = part.groups[gi].ops;
         new_gi.insert(op);
@@ -213,9 +216,11 @@ FMMove best_move_for(const Partition& part, size_t op,
 
             // STEAL: move op from gx into gi
             {
-                auto it = gx_without_op.find(gx);
-                if (it != gx_without_op.end() && it->second.valid) {
-                    double new_gx_cost = it->second.cost;
+                const GxCost* gxc = nullptr;
+                for (auto& e : gx_without_op)
+                    if (e.gx == gx) { gxc = &e; break; }
+                if (gxc && gxc->valid) {
+                    double new_gx_cost = gxc->cost;
                     double saving = (part.groups[gi].cost + part.groups[gx].cost)
                                     - (new_gi_cost + new_gx_cost);
                     if (saving > best.saving && part.acyclic_steal_local(op, gx, gi)) {
@@ -233,8 +238,9 @@ FMMove best_move_for(const Partition& part, size_t op,
 
             // MERGE: dedup via canonical pair key
             auto pair_key = std::make_pair(std::min(gi, gx), std::max(gi, gx));
-            if (!merge_checked.count(pair_key)) {
-                merge_checked.insert(pair_key);
+            if (std::find(merge_checked.begin(), merge_checked.end(), pair_key)
+                == merge_checked.end()) {
+                merge_checked.push_back(pair_key);
                 if (part.acyclic_merge_local(gi, gx)) {
                     FlatSet<size_t> merged_ops = part.groups[gi].ops;
                     merged_ops.insert(part.groups[gx].ops.begin(),

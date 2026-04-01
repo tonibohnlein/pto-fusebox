@@ -4,8 +4,6 @@
 #include "search/structural_ops.h"
 #include <iostream>
 #include <queue>
-#include <functional>
-#include <deque>
 #include <algorithm>
 
 // ============================================================================

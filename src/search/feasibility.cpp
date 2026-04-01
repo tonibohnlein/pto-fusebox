@@ -4,31 +4,7 @@
 namespace feasibility {
 
 // ============================================================================
-// Layer 1: O(degree) pre-filter for SPLIT
-// ============================================================================
-
-bool split_creates_topo_cycle(const FlatSet<size_t>& side_a,
-                               const FlatSet<size_t>& side_b,
-                               const DAG& dag) {
-    bool a_to_b = false, b_to_a = false;
-    for (auto op : side_a) {
-        for (auto succ : dag.op_succs[op]) {
-            if (side_b.count(succ)) { a_to_b = true; break; }
-        }
-        if (a_to_b) break;
-    }
-    if (!a_to_b) return false;
-    for (auto op : side_b) {
-        for (auto succ : dag.op_succs[op]) {
-            if (side_a.count(succ)) { b_to_a = true; break; }
-        }
-        if (b_to_a) break;
-    }
-    return b_to_a;
-}
-
-// ============================================================================
-// Layer 2: Partition-level Kahn's algorithm
+// Partition-level Kahn's algorithm
 //
 // Zero-allocation Kahn's with virtual group mapping via lambda.
 // Instead of copying op_to_groups and mutating it, we use for_virtual_groups
@@ -152,10 +128,14 @@ bool kahn_with_delta(
         }
     };
 
-    // 1. Build dependencies using flat vectors
-    std::vector<int> unsatisfied_deps(ng, 0);
-    std::vector<bool> dep_met;
-    std::vector<std::vector<std::pair<size_t, size_t>>> frees(ng);
+    // 1. Build dependencies using thread-local flat vectors (reuse across calls)
+    thread_local std::vector<int> unsatisfied_deps;
+    thread_local std::vector<bool> dep_met;
+    thread_local std::vector<std::vector<std::pair<size_t, size_t>>> frees;
+    unsatisfied_deps.assign(ng, 0);
+    dep_met.clear();
+    frees.resize(ng);
+    for (size_t i = 0; i < ng; i++) frees[i].clear();
 
     for (size_t op_idx = 0; op_idx < prob.ops.size(); op_idx++) {
         for (auto t : prob.ops[op_idx].inputs) {
@@ -191,9 +171,11 @@ bool kahn_with_delta(
     }
 
     // 2. Kahn's traversal with flat vector queue
-    std::vector<size_t> q;
+    thread_local std::vector<size_t> q;
+    thread_local std::vector<bool> enqueued;
+    q.clear();
     q.reserve(ng);
-    std::vector<bool> enqueued(ng, false);
+    enqueued.assign(ng, false);
     size_t visited = 0;
 
     for (size_t i = 0; i < ng; i++) {

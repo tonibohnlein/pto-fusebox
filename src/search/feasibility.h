@@ -20,17 +20,7 @@
 namespace feasibility {
 
 // ============================================================================
-// Layer 1: O(degree) pre-filter for SPLIT
-// ============================================================================
-
-// Would splitting a group into side_a and side_b create a cycle between them?
-// (edges in both directions → mutual dependency)
-bool split_creates_topo_cycle(const FlatSet<size_t>& side_a,
-                               const FlatSet<size_t>& side_b,
-                               const DAG& dag);
-
-// ============================================================================
-// Layer 2: Partition-level Kahn's algorithm
+// Partition-level Kahn's algorithm
 //
 // MoveDelta describes a hypothetical move so we can check acyclicity
 // WITHOUT copying op_to_groups.  kahn_with_delta does a full topological

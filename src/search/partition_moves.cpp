@@ -25,12 +25,13 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to) {
     FlatSet<size_t> new_from = p.groups[from].ops;
     new_from.erase(op);
     double new_from_cost = 0;
+    std::vector<FlatSet<size_t>> from_comps;
 
     if (new_from.empty()) {
         // `from` dies — its cost becomes 0.
     } else {
-        auto comps = structural_ops::connected_components(new_from, *p.dag);
-        for (auto& comp : comps) {
+        from_comps = structural_ops::connected_components(new_from, *p.dag);
+        for (auto& comp : from_comps) {
             double c = p.eval_set(comp);
             if (c >= 1e17) return r;
             new_from_cost += c;
@@ -41,10 +42,7 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to) {
     {
         std::vector<FlatSet<size_t>> gap_components;
         gap_components.push_back(new_to);
-        if (!new_from.empty()) {
-            auto from_comps = structural_ops::connected_components(new_from, *p.dag);
-            for (auto& c : from_comps) gap_components.push_back(c);
-        }
+        for (auto& c : from_comps) gap_components.push_back(c);
         if (p.split_creates_ephemeral_gap(gap_components, {from, to})) return r;
     }
 

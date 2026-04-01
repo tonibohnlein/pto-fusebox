@@ -86,7 +86,7 @@ FlatSet<size_t> apply_eject(Partition& p, size_t op, size_t ga,
 // We provide only apply_split here as the canonical mutation path.
 //
 // Validates:
-//   - Acyclicity via split_creates_topo_cycle (eval-time, local)
+//   - Acyclicity via acyclic_split_local (eval-time, local)
 //   - Re-evaluates split to get current sides
 // ============================================================================
 
