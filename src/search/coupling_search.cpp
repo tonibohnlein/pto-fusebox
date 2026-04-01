@@ -2,6 +2,7 @@
 #include "search/partition_moves.h"
 #include "core/cost_cache.h"
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <iostream>
 #include <queue>
@@ -567,6 +568,10 @@ CouplingEvalResult eval_retain_force_split(const CoupledPartition& cp,
     auto sr = cp.part.eval_split(op_a, op_b, g);
     if (!sr.feasible) return {};
 
+    // Acyclicity + gap checks for the split.
+    if (cp.part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, {g})) return {};
+    if (!cp.part.acyclic_split_local(sr.side_a, sr.side_b, g)) return {};
+
     // Verify t becomes a boundary output of side_a and boundary input of side_b.
     if (!is_boundary_output_of(sr.side_a, t, *cp.part.dag)) return {};
     if (!is_boundary_input_of(sr.side_b, t, *cp.part.dag))  return {};
@@ -628,6 +633,10 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     // Split g_dst at bridge (op_a_dst, op_b_dst): side_a gets op_a_dst.
     auto sr = cp.part.eval_split(op_a_dst, op_b_dst, g_dst);
     if (!sr.feasible) return {};
+
+    // Feasibility checks for the split (removed from eval_split per audit pattern).
+    if (cp.part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, {g_dst})) return {};
+    if (!cp.part.acyclic_split_local(sr.side_a, sr.side_b, g_dst)) return {};
 
     // op_a_dst (consumer of t) must end up in side_a so it can receive t from ga.
     if (!sr.side_a.count(op_a_dst)) return {};
@@ -810,17 +819,31 @@ std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
         std::cerr << "  BUG: apply_retain_force_split: split created cyclic partition"
                   << " g=" << g << " op_a=" << op_a << " op_b=" << op_b
                   << " t=" << t << "\n";
-        for (size_t gi2 = 0; gi2 < cp.part.groups.size(); gi2++) {
-            if (!cp.part.groups[gi2].alive) continue;
-            std::cerr << "    G" << gi2 << " ops={";
-            for (auto o : cp.part.groups[gi2].ops) {
-                std::cerr << o;
-                auto gs = cp.part.groups_of(o);
-                int ac = 0; for (auto g2 : gs) if (cp.part.groups[g2].alive) ac++;
-                if (ac > 1) std::cerr << "*";
-                std::cerr << ",";
+        std::cerr << "  side_a (G" << ga << "): {";
+        for (auto o : cp.part.groups[ga].ops) std::cerr << o << " ";
+        std::cerr << "}\n  side_b (G" << gb << "): {";
+        for (auto o : cp.part.groups[gb].ops) std::cerr << o << " ";
+        std::cerr << "}\n";
+        // Show recomputed ops and their other groups
+        for (auto o : cp.part.groups[ga].ops) {
+            auto gs = cp.part.groups_of(o);
+            std::vector<size_t> others;
+            for (auto g2 : gs) if (g2 != ga && cp.part.groups[g2].alive) others.push_back(g2);
+            if (!others.empty()) {
+                std::cerr << "  recomp op" << o << " in G" << ga << " also in:";
+                for (auto g2 : others) std::cerr << " G" << g2;
+                std::cerr << "\n";
             }
-            std::cerr << "}\n";
+        }
+        for (auto o : cp.part.groups[gb].ops) {
+            auto gs = cp.part.groups_of(o);
+            std::vector<size_t> others;
+            for (auto g2 : gs) if (g2 != gb && cp.part.groups[g2].alive) others.push_back(g2);
+            if (!others.empty()) {
+                std::cerr << "  recomp op" << o << " in G" << gb << " also in:";
+                for (auto g2 : others) std::cerr << " G" << g2;
+                std::cerr << "\n";
+            }
         }
     }
 #endif
@@ -853,6 +876,7 @@ std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
 
 std::set<size_t> apply_couple(CoupledPartition& cp,
                                size_t ga, size_t gb, size_t t) {
+    assert(cp.part.groups[ga].alive && cp.part.groups[gb].alive);
     const bool existing_edge = (ga < cp.next_group.size() && cp.next_group[ga] == gb) &&
                                 (gb < cp.prev_group.size() && cp.prev_group[gb] == ga);
     const bool new_edge      = (ga < cp.next_group.size() && cp.next_group[ga] == SIZE_MAX) &&

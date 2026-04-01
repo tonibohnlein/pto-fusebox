@@ -21,12 +21,13 @@ struct CoupledFMMove {
         STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3,
         INTERNAL_EJECT = 4, SPLIT = 5,
         TENSOR_MERGE = 6, TENSOR_EXTRACT = 7, DE_RECOMPUTE = 8,
+        FORCE_RECOMPUTE = 9,
         // Coupling moves
-        COUPLE = 9, UNCOUPLE = 10, RETAIN_FORCE_SPLIT = 11,
+        COUPLE = 10, UNCOUPLE = 11, RETAIN_FORCE_SPLIT = 12,
         // FORCE_RETAIN: t is already a boundary output of ga; split the
         // destination group at a bridge adjacent to t's consumer so the
         // smaller side_a can be coupled to ga via t.
-        FORCE_RETAIN = 12
+        FORCE_RETAIN = 13
     } type = NONE;
 
     size_t op     = SIZE_MAX;   // initiating op (heap key; for coupling moves: any op in ga)
@@ -43,8 +44,8 @@ struct CoupledFMMove {
     std::vector<size_t> tensor_consumer_ops;
 
     bool valid()             const { return type != NONE; }
-    bool is_partition_move() const { return type >= 0 && type <= 8; }
-    bool is_coupling_move()  const { return type >= 9 && type <= 12; }
+    bool is_partition_move() const { return type >= 0 && type <= 9; }
+    bool is_coupling_move()  const { return type >= 10 && type <= 13; }
 
     // Build an FMMove from this (only valid for partition move types)
     FMMove as_fm_move() const {

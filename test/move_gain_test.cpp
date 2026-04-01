@@ -77,6 +77,7 @@ static std::pair<int,int> verify_all_fm(const char* label, Partition& part) {
         auto m = best_move_for(part, op);
         if (!m.valid()) continue;
         Partition p2 = part;
+        p2.rebuild_index();
         double before = p2.total_cost();
         auto affected = apply_fm_move(p2, m);
         if (affected.empty()) continue;

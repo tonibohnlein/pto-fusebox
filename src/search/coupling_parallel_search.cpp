@@ -2,9 +2,12 @@
 #include <cassert>
 #include "search/pool.h"
 #include "search/evolution.h"
+#include "search/symm_mutations.h"
 #include "search/local_search.h"   // partition_has_gap
 #include "search/coupled_fm_outer.h"
+#include "search/coupling_search.h"
 #include "core/cost_cache.h"
+#include "symmetry/merkle_hash.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -129,6 +132,10 @@ Solution coupling_parallel_search(
     // Caller (solver.cpp Phase 2) guarantees at least one entry.
     assert(!coupled_pool.empty() && "coupling_parallel_search: empty pool");
 
+    // Save prob/dag pointers before the pool moves entries.
+    const Problem& prob = *coupled_pool[0].part.prob;
+    const DAG& dag = *coupled_pool[0].part.dag;
+
     int hw_threads = (int)std::thread::hardware_concurrency();
     if (hw_threads <= 0) hw_threads = 4;
     int num_threads = cfg.num_threads > 0 ? cfg.num_threads : hw_threads;
@@ -177,9 +184,10 @@ Solution coupling_parallel_search(
     std::atomic<int>    evo_tasks_done{0};
 
     // ================================================================
-    // Evo worker: select full CoupledPartition → mutate_compound_coupled →
-    //             coupled_fm_outer_loop (partition + coupling moves) → insert
+    // Evo worker: three operators — crossover, symmetry mutation, compound mutation
     // ================================================================
+    const bool has_symm = cfg.symm_ctx && !cfg.symm_ctx->empty();
+
     auto worker = [&]() {
         std::mt19937 rng(std::random_device{}());
 
@@ -188,38 +196,121 @@ Solution coupling_parallel_search(
                 tasks_since_improve.load() >= early_stop_threshold)
                 break;
 
-            // Select parent and copy the full CoupledPartition (under shared lock)
-            CoupledPartition cp_copy;
-            int num_muts;
+            int stale = tasks_since_improve.load();
+            double heat = std::clamp(1.0 + stale * 0.05, 0.3, 4.0);
+            int num_muts = std::max(2, (int)((4 + (int)(rng() % 5)) * heat));
+            int task_id = total_tasks.load();
+
+            // --- Operator selection ---
+            size_t pool_sz;
             {
                 std::shared_lock lock(pool.mutex());
-                int stale = tasks_since_improve.load();
-                double heat = std::clamp(1.0 + stale * 0.05, 0.3, 4.0);
-                num_muts = std::max(2, (int)((4 + (int)(rng() % 5)) * heat));
-                size_t pi = pool.select_for_mutation(rng);
-                cp_copy = pool[pi].cp;  // copy full CoupledPartition
+                pool_sz = pool.size();
             }
 
-            // Mutate at CoupledPartition level — invalidates stale coupling edges
-            cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
-            if (partition_has_gap(cp_copy.part) || !cp_copy.part.is_acyclic()) {
-                total_tasks.fetch_add(1);
-                tasks_since_improve.fetch_add(1);
-                continue;
-            }
-            cp_copy.part.cache = &cache;
+            bool do_crossover = (pool_sz >= 2) && (task_id % 3 == 0);
+            bool do_symm = !do_crossover && has_symm && (rng() % 5 == 0);
 
-            // Combined FM: partition moves + coupling moves on the full
-            // CoupledPartition. coupled_fm_outer_loop finalizes .sg internally.
+            CoupledPartition cp_child;
+            std::string origin;
+
+            if (do_crossover) {
+                // --- Crossover: combine partition structure from two parents ---
+                Partition child_part;
+                {
+                    std::shared_lock lock(pool.mutex());
+                    auto [p1, p2] = pool.select_for_crossover(rng);
+                    child_part = crossover(pool[p1].cp.part, pool[p2].cp.part,
+                                           rng, cfg.merkle);
+                }
+                child_part.cache = &cache;
+                if (partition_has_gap(child_part) || !child_part.is_acyclic()) {
+                    total_tasks.fetch_add(1);
+                    tasks_since_improve.fetch_add(1);
+                    continue;
+                }
+                // Build coupled partition from crossover child
+                cp_child.part = std::move(child_part);
+                cp_child.part.cache = &cache;
+                size_t ng = cp_child.part.groups.size();
+                cp_child.next_group.assign(ng, SIZE_MAX);
+                cp_child.prev_group.assign(ng, SIZE_MAX);
+                cp_child.retained.clear();
+                origin = "xover";
+
+            } else if (do_symm) {
+                // --- Symmetry mutation: inject or align representatives ---
+                Partition parent_part;
+                {
+                    std::shared_lock lock(pool.mutex());
+                    size_t pi = pool.select_for_mutation(rng);
+                    parent_part = pool[pi].cp.part;
+                }
+                auto result = (rng() % 2 == 0)
+                    ? symm_mutations::inject_representative_solution(
+                          std::move(parent_part), *cfg.symm_ctx, prob, dag, rng)
+                    : symm_mutations::align_symmetric_reps(
+                          std::move(parent_part), *cfg.symm_ctx, prob, dag, rng);
+                if (!result) {
+                    // Fallback to compound mutation
+                    CoupledPartition cp_copy;
+                    {
+                        std::shared_lock lock(pool.mutex());
+                        size_t pi = pool.select_for_mutation(rng);
+                        cp_copy = pool[pi].cp;
+                    }
+                    cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
+                    if (partition_has_gap(cp_copy.part) || !cp_copy.part.is_acyclic()) {
+                        total_tasks.fetch_add(1);
+                        tasks_since_improve.fetch_add(1);
+                        continue;
+                    }
+                    cp_child = std::move(cp_copy);
+                    origin = "mutate(" + std::to_string(num_muts) + ")";
+                } else {
+                    if (partition_has_gap(*result) || !result->is_acyclic()) {
+                        total_tasks.fetch_add(1);
+                        tasks_since_improve.fetch_add(1);
+                        continue;
+                    }
+                    cp_child.part = std::move(*result);
+                    cp_child.part.cache = &cache;
+                    size_t ng = cp_child.part.groups.size();
+                cp_child.next_group.assign(ng, SIZE_MAX);
+                cp_child.prev_group.assign(ng, SIZE_MAX);
+                cp_child.retained.clear();
+                    origin = "symm";
+                }
+
+            } else {
+                // --- Compound mutation: partition + coupling moves ---
+                CoupledPartition cp_copy;
+                {
+                    std::shared_lock lock(pool.mutex());
+                    size_t pi = pool.select_for_mutation(rng);
+                    cp_copy = pool[pi].cp;
+                }
+                cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
+                if (partition_has_gap(cp_copy.part) || !cp_copy.part.is_acyclic()) {
+                    total_tasks.fetch_add(1);
+                    tasks_since_improve.fetch_add(1);
+                    continue;
+                }
+                cp_child = std::move(cp_copy);
+                origin = "mutate(" + std::to_string(num_muts) + ")";
+            }
+
+            cp_child.part.cache = &cache;
+
+            // Combined FM: partition moves + coupling moves
             FMOuterConfig fc = cfg.fm;
             fc.max_passes       = std::min(fc.max_passes,     50);
             fc.max_no_improve   = std::min(fc.max_no_improve, 15);
             fc.deadline         = deadline;
             fc.pass_config.seed = (unsigned)rng();
-            auto fm = coupled_fm_outer_loop(std::move(cp_copy), feasibly_ret, fc, &cache);
+            auto fm = coupled_fm_outer_loop(std::move(cp_child), feasibly_ret, fc, &cache);
 
             CoupledPartition child_cp = std::move(fm.best_cp);
-            std::string origin = "mutate(" + std::to_string(num_muts) + ")";
             double cost = child_cp.total_cost();
 
             double current_best;

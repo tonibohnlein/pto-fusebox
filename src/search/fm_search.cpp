@@ -1,5 +1,6 @@
 #include "search/fm_search.h"
 #include "search/partition_moves.h"
+#include "search/structural_ops.h"
 #include <algorithm>
 #include <iostream>
 #include <cassert>
@@ -116,6 +117,7 @@ FMMove best_move_for(const Partition& part, size_t op,
     if (op_in_multiple) {
         for (auto gx : groups_of_x) {
             if (!part.groups[gx].alive) continue;
+            if (!part.acyclic_de_recompute_local(op, gx)) continue;
             auto dr = partition_moves::eval_de_recompute(part, gx, op);
             if (dr.feasible && dr.saving > best.saving)
                 best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, dr.saving};
@@ -161,7 +163,8 @@ FMMove best_move_for(const Partition& part, size_t op,
 
             auto sr = part.eval_split(u_lo, u_hi, gx);
             if (sr.feasible && sr.saving > best.saving) {
-                if (!split_creates_ephemeral_gap_local(part, sr.side_a, sr.side_b, gx))
+                if (!split_creates_ephemeral_gap_local(part, sr.side_a, sr.side_b, gx)
+                    && part.acyclic_split_local(sr.side_a, sr.side_b, gx))
                     best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, v, sr.saving};
             }
         }
@@ -176,7 +179,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 adj_groups.insert(gi);
 
     // Pre-compute cost of each source group after losing op.
-    // Same regardless of target group — avoids redundant eval_set calls.
+    // Account for disconnected components in the remainder.
     struct GxCost { double cost; bool valid; };
     std::unordered_map<size_t, GxCost> gx_without_op;
     for (auto gx : groups_of_x) {
@@ -186,8 +189,15 @@ FMMove best_move_for(const Partition& part, size_t op,
         if (rem.empty()) {
             gx_without_op[gx] = {0.0, true};
         } else {
-            double c = part.eval_set(rem);
-            gx_without_op[gx] = {c, c < 1e17};
+            auto comps = structural_ops::connected_components(rem, *part.dag);
+            double total = 0;
+            bool ok = true;
+            for (auto& comp : comps) {
+                double c = part.eval_set(comp);
+                if (c >= 1e17) { ok = false; break; }
+                total += c;
+            }
+            gx_without_op[gx] = {total, ok};
         }
     }
 
@@ -226,15 +236,23 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
                 if (part.acyclic_merge_local(gi, gx)) {
-                    auto mr = partition_moves::eval_merge(part, gi, gx);
-                    if (mr.feasible && mr.saving > best.saving)
-                        best = FMMove{FMMove::MERGE, op, gi, gx, SIZE_MAX, mr.saving};
+                    std::set<size_t> merged_ops = part.groups[gi].ops;
+                    merged_ops.insert(part.groups[gx].ops.begin(),
+                                      part.groups[gx].ops.end());
+                    if (!part.creates_ephemeral_gap(merged_ops, gi, gx)) {
+                        double merged_cost = part.eval_set(merged_ops);
+                        if (merged_cost < 1e17) {
+                            double saving = part.groups[gi].cost + part.groups[gx].cost - merged_cost;
+                            if (saving > best.saving)
+                                best = FMMove{FMMove::MERGE, op, gi, gx, SIZE_MAX, saving};
+                        }
+                    }
                 }
             }
         }
 
         // RECOMPUTE: copy op into gi (stays in source groups too)
-        {
+        if (part.acyclic_recompute_local(op, gi)) {
             auto rr = partition_moves::eval_recompute(part, op, gi);
             size_t gx = groups_of_x.empty() ? 0 : groups_of_x[0];
             if (rr.feasible && rr.saving > best.saving)
@@ -323,6 +341,41 @@ FMMove best_move_for(const Partition& part, size_t op,
         }
     }
 
+    // --- FORCE_RECOMPUTE: for each input tensor of op with ≥2 consumers,
+    // evaluate extracting producer + consumers into {P, C_i} pairs ---
+    {
+        std::set<size_t> fr_tensors_checked;
+        for (auto gx : groups_of_x) {
+            for (auto t : part.prob->ops[op].inputs) {
+                if (fr_tensors_checked.count(t)) continue;
+                fr_tensors_checked.insert(t);
+
+                int prod = dag.tensor_producer[t];
+                if (prod < 0) continue;
+                if (dag.tensor_consumers[t].size() < 2) continue;
+
+                auto frr = partition_moves::eval_force_recompute(part, t);
+                if (!frr.feasible) continue;
+                if (frr.saving > best.saving) {
+                    bool has_locked = false;
+                    if (locked.count(frr.prod_op)) has_locked = true;
+                    for (auto cop : frr.consumer_ops)
+                        if (locked.count(cop)) { has_locked = true; break; }
+                    if (has_locked) continue;
+
+                    FMMove candidate;
+                    candidate.type = FMMove::FORCE_RECOMPUTE;
+                    candidate.op = op;
+                    candidate.op2 = t;
+                    candidate.saving = frr.saving;
+                    candidate.tensor_consumer_ops.assign(
+                        frr.consumer_ops.begin(), frr.consumer_ops.end());
+                    best = candidate;
+                }
+            }
+        }
+    }
+
     return best;
 }
 
@@ -382,6 +435,12 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         }
         case FMMove::DE_RECOMPUTE: {
             affected = partition_moves::apply_de_recompute(part, m.ga, m.op);
+            if (affected.empty()) return {};
+            break;
+        }
+        case FMMove::FORCE_RECOMPUTE: {
+            auto frr = partition_moves::eval_force_recompute(part, m.op2);
+            affected = partition_moves::apply_force_recompute(part, m.op2, frr);
             if (affected.empty()) return {};
             break;
         }

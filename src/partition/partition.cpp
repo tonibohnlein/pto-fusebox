@@ -53,6 +53,40 @@ void Partition::rebuild_index() {
         if (groups[i].alive)
             for (auto op : groups[i].ops)
                 op_to_groups_[op].push_back(i);
+    invalidate_fwd_cache();
+}
+
+const std::vector<bool>& Partition::cached_forward_reachable(size_t g) const {
+    size_t ng = groups.size();
+    if (fwd_cache_.size() < ng) {
+        fwd_cache_.resize(ng);
+        fwd_cache_gen_.resize(ng, 0);
+    }
+    if (fwd_cache_gen_[g] == fwd_gen_ && !fwd_cache_[g].empty())
+        return fwd_cache_[g];
+
+    // Compute via BFS
+    fwd_cache_[g].assign(ng, false);
+    std::queue<size_t> q;
+    fwd_cache_[g][g] = true;
+    q.push(g);
+    while (!q.empty()) {
+        size_t cur = q.front(); q.pop();
+        for (auto op : groups[cur].ops) {
+            for (auto t : prob->ops[op].outputs) {
+                for (auto cop : dag->tensor_consumers[t]) {
+                    if (groups[cur].ops.count(cop)) continue;
+                    for (auto gj : groups_of(cop)) {
+                        if (!groups[gj].alive || fwd_cache_[g][gj]) continue;
+                        fwd_cache_[g][gj] = true;
+                        q.push(gj);
+                    }
+                }
+            }
+        }
+    }
+    fwd_cache_gen_[g] = fwd_gen_;
+    return fwd_cache_[g];
 }
 
 void Partition::rebuild_group_dag() {
@@ -317,33 +351,6 @@ bool Partition::is_acyclic() const {
 // not reachable from gB, we can place it before gB without creating a cycle.
 // ============================================================================
 
-// Forward BFS from `start` following output→consumer group edges.
-// Returns vis[] where vis[g] == true iff g is forward-reachable from start.
-static std::vector<bool> forward_reachable(const Partition& p, size_t start)
-{
-    size_t ng = p.groups.size();
-    std::vector<bool> vis(ng, false);
-    std::queue<size_t> q;
-    vis[start] = true;
-    q.push(start);
-    while (!q.empty()) {
-        size_t cur = q.front(); q.pop();
-        for (auto op : p.groups[cur].ops) {
-            for (auto t : p.prob->ops[op].outputs) {
-                for (auto cop : p.dag->tensor_consumers[t]) {
-                    if (p.groups[cur].ops.count(cop)) continue;
-                    for (auto gj : p.groups_of(cop)) {
-                        if (!p.groups[gj].alive || vis[gj]) continue;
-                        vis[gj] = true;
-                        q.push(gj);
-                    }
-                }
-            }
-        }
-    }
-    return vis;
-}
-
 bool Partition::acyclic_merge_local(const std::vector<size_t>& G) const {
     if (!prob || !dag || G.size() < 2) return true;
 
@@ -500,7 +507,7 @@ bool Partition::acyclic_recompute_local(size_t op, size_t gb) const {
     // Cycle iff ALL producer groups are forward-reachable from gb.
     // Outputs are only new options for consumers (never forced) → no new cycle.
 
-    auto fwd_gb = forward_reachable(*this, gb);
+    const auto& fwd_gb = cached_forward_reachable(gb);
 
     for (auto t : prob->ops[op].inputs) {
         // Skip if T already consumed by another op in gb (constraint exists).
@@ -534,7 +541,7 @@ bool Partition::acyclic_de_recompute_local(size_t op, size_t ga) const {
     for (auto gother : groups_of(op))
         if (gother != ga && groups[gother].alive) S.push_back(gother);
 
-    auto fwd_ga = forward_reachable(*this, ga);
+    const auto& fwd_ga = cached_forward_reachable(ga);
 
     for (auto t : prob->ops[op].outputs) {
         // Part 1: internal consumers in ga lose their ephemeral source.
@@ -558,7 +565,7 @@ bool Partition::acyclic_de_recompute_local(size_t op, size_t ga) const {
             if (groups[ga].ops.count(cop)) continue;  // internal, handled above
             for (auto gc : groups_of(cop)) {
                 if (!groups[gc].alive || gc == ga) continue;
-                auto fwd_gc = forward_reachable(*this, gc);
+                const auto& fwd_gc = cached_forward_reachable(gc);
                 bool any_free = false;
                 for (auto gP : S)
                     if (!fwd_gc[gP]) { any_free = true; break; }
@@ -579,7 +586,7 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
     // ga now needs T from {gb} ∪ (groups_of(op) − {ga}).
     // Cycle iff ALL sources in that set are forward-reachable from ga.
     {
-        auto fwd_ga = forward_reachable(*this, ga);
+        const auto& fwd_ga = cached_forward_reachable(ga);
         for (auto t : prob->ops[op].outputs) {
             bool consumed_in_ga = false;
             for (auto cop : dag->tensor_consumers[t])
@@ -616,7 +623,7 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
                 for (auto gc : groups_of(cop)) {
                     if (!groups[gc].alive || gc == ga || gc == gb) continue;
                     // Is there at least one gP ∈ S that gc cannot reach?
-                    auto fwd_gc = forward_reachable(*this, gc);
+                    const auto& fwd_gc = cached_forward_reachable(gc);
                     bool any_free = false;
                     for (auto gP : S)
                         if (!fwd_gc[gP]) { any_free = true; break; }
@@ -627,6 +634,33 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
     }
 
     return true;
+}
+
+bool Partition::acyclic_split_local(const std::set<size_t>& side_a,
+                                     const std::set<size_t>& side_b,
+                                     size_t ga) const {
+    if (!prob || !dag) return true;
+
+    // Temporarily apply the split, check acyclicity, then undo.
+    // The split only touches groups[ga] and adds a new group — O(V+E) check.
+    Partition& mut = const_cast<Partition&>(*this);
+    auto saved_ops = mut.groups[ga].ops;
+    double saved_cost = mut.groups[ga].cost;
+
+    mut.groups[ga].ops = side_a;
+    size_t gb = mut.groups.size();
+    mut.groups.push_back({side_b, 0.0, true, 0, std::nullopt, {}});
+    mut.rebuild_index();
+
+    bool ok = mut.is_acyclic();
+
+    // Undo: remove the temporary group and restore ga.
+    mut.groups.pop_back();
+    mut.groups[ga].ops = std::move(saved_ops);
+    mut.groups[ga].cost = saved_cost;
+    mut.rebuild_index();
+
+    return ok;
 }
 
 double Partition::eval_set(const std::set<size_t>& ops) const {
@@ -747,48 +781,6 @@ Partition::SplitResult Partition::eval_split(size_t op_a, size_t op_b, size_t gi
     if (result.cost_a >= 1e17) return result;
     result.cost_b = eval_set(result.side_b);
     if (result.cost_b >= 1e17) return result;
-
-    // Ephemeral gap: check that the split doesn't make a tensor unavailable.
-    if (split_creates_ephemeral_gap({result.side_a, result.side_b}, gi))
-        return result;
-
-    // Acyclicity: splitting can create a cycle when a recomputed op (with a
-    // copy in another group) ends up on one side while its outputs are consumed
-    // by the other side.  The other side then depends on the external copy,
-    // which may be downstream → cycle.  Check both directions.
-    for (auto opR : groups[gi].ops) {
-        bool in_other_group = false;
-        for (auto gj : groups_of(opR))
-            if (gj != gi && groups[gj].alive) { in_other_group = true; break; }
-        if (!in_other_group) continue;
-
-        bool opR_in_a = result.side_a.count(opR);
-        const auto& my_side = opR_in_a ? result.side_a : result.side_b;
-        const auto& other_side = opR_in_a ? result.side_b : result.side_a;
-
-        for (auto t : prob->ops[opR].outputs) {
-            bool consumed_by_other = false;
-            for (auto cop : dag->tensor_consumers[t])
-                if (other_side.count(cop)) { consumed_by_other = true; break; }
-            if (!consumed_by_other) continue;
-
-            // other_side needs T from opR's external group(s).
-            // Cycle iff ALL external copies are forward-reachable from other_side.
-            // Use a conservative check: treat other_side as gi (same group slot).
-            auto fwd = forward_reachable(*this, gi);
-            bool any_free = false;
-            for (auto gother : groups_of(opR))
-                if (gother != gi && groups[gother].alive && !fwd[gother])
-                    { any_free = true; break; }
-            if (!any_free) {
-#ifndef NDEBUG
-                std::cerr << "  DBG eval_split: rejecting split of G" << gi
-                          << " (recomp op" << opR << " would create cycle)\n";
-#endif
-                return result;  // would create cycle
-            }
-        }
-    }
 
     result.feasible = true;
     result.saving   = groups[gi].cost - (result.cost_a + result.cost_b);

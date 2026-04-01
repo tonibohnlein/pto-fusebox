@@ -1,6 +1,7 @@
 #include "search/verbose.h"
 #include "search/fm_pass.h"
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 
 // ============================================================================
@@ -44,14 +45,11 @@ static std::vector<size_t> random_subset_n(const std::vector<size_t>& ops,
 // ============================================================================
 
 static std::vector<size_t> merge_lock_ops(const Partition& part, const FMMove& m) {
-    std::vector<size_t> to_lock = {m.op};
-
-    if (m.gb < part.groups.size() && part.groups[m.gb].alive) {
-        for (auto nbr : part.dag->op_neighbors[m.op]) {
-            if (part.groups[m.gb].ops.count(nbr))
-                to_lock.push_back(nbr);
-        }
-    }
+    std::vector<size_t> to_lock;
+    if (m.ga < part.groups.size() && part.groups[m.ga].alive)
+        for (auto op : part.groups[m.ga].ops) to_lock.push_back(op);
+    if (m.gb < part.groups.size() && part.groups[m.gb].alive)
+        for (auto op : part.groups[m.gb].ops) to_lock.push_back(op);
     return to_lock;
 }
 
@@ -88,7 +86,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     using SteadyClock = std::chrono::steady_clock;
 
     // Per-type counters: [type] → {applied, failed}
-    constexpr int NUM_TYPES = 9;
+    constexpr int NUM_TYPES = 10;
     int type_applied[NUM_TYPES] = {};
     int type_failed[NUM_TYPES] = {};
     const char* stop_reason = "max_iters";
@@ -120,11 +118,32 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
                 if (part.groups[cg].alive)
                     for (auto cop : part.groups[cg].ops)
                         extra_locks.push_back(cop);
+        } else if (move.type == FMMove::SPLIT) {
+            if (move.ga < part.groups.size() && part.groups[move.ga].alive)
+                for (auto op : part.groups[move.ga].ops) extra_locks.push_back(op);
+        } else if (move.type == FMMove::STEAL) {
+            extra_locks.push_back(move.op);
+            // Lock DAG neighbors of the moved op in both groups
+            for (auto nbr : part.dag->op_neighbors[move.op]) {
+                if (part.groups[move.ga].ops.count(nbr) || part.groups[move.gb].ops.count(nbr))
+                    extra_locks.push_back(nbr);
+            }
+        } else if (move.type == FMMove::EJECT || move.type == FMMove::INTERNAL_EJECT) {
+            extra_locks.push_back(move.op);
+            // Lock DAG neighbors of the ejected op in ga (prevent immediate re-merge)
+            for (auto nbr : part.dag->op_neighbors[move.op]) {
+                if (part.groups[move.ga].ops.count(nbr))
+                    extra_locks.push_back(nbr);
+            }
+        } else if (move.type == FMMove::RECOMPUTE) {
+            extra_locks.push_back(move.op);
+        } else if (move.type == FMMove::DE_RECOMPUTE) {
+            extra_locks.push_back(move.op);
+        } else if (move.type == FMMove::FORCE_RECOMPUTE) {
+            for (auto cop : move.tensor_consumer_ops)
+                extra_locks.push_back(cop);
         }
 
-        // Apply the move. All validation (acyclicity, cost feasibility)
-        // happens inside apply_fm_move BEFORE any mutation. If validation
-        // fails, it returns {} without side effects — no snapshot needed.
         double total_before = part.total_cost();
         auto affected = apply_fm_move(part, move);
         if (affected.empty()) {
@@ -193,7 +212,7 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     if (g_verbose) {
         static const char* type_names[] = {
             "STEAL", "EJECT", "RECOMP", "MERGE", "INT_EJECT",
-            "SPLIT", "T_MERGE", "T_EXTRACT", "DE_RECOMP"
+            "SPLIT", "T_MERGE", "T_EXTRACT", "DE_RECOMP", "FORCE_RECOMP"
         };
         std::cerr << "      FM pass: " << fm_iters << " iters, "
                   << result.moves_applied << " applied ("

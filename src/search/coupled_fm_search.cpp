@@ -1,5 +1,6 @@
 #include "search/coupled_fm_search.h"
 #include "search/feasibility.h"
+#include "search/structural_ops.h"
 #include "core/cost_cache.h"
 #include <algorithm>
 #include <cassert>
@@ -9,6 +10,7 @@
 // Coupled cost evaluation helpers (forward-declared; defined after in_forward_chain)
 // ============================================================================
 static bool in_forward_chain(const CoupledPartition& cp, size_t start, size_t target);
+static double coupled_recompute_saving(const CoupledPartition& cp, size_t op, size_t gb);
 static double coupled_steal_saving(const CoupledPartition& cp, size_t op, size_t ga, size_t gb);
 static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t gb);
 static double coupled_tensor_merge_saving(const CoupledPartition& cp,
@@ -55,16 +57,59 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
                 // constrain tile configs — ignoring them causes large gain mismatches.
                 if (pm.type == FMMove::STEAL) {
                     double cs = coupled_steal_saving(cp, pm.op, pm.ga, pm.gb);
+#ifndef NDEBUG
+                    if (cs > -1e17) {
+                        CoupledPartition cp_copy = cp;
+                        double before = cp_copy.total_cost();
+                        CoupledFMMove cm;
+                        cm.type = CoupledFMMove::STEAL;
+                        cm.op = pm.op; cm.ga = pm.ga; cm.gb = pm.gb;
+                        cm.saving = cs;
+                        auto aff = apply_coupled_fm_move(cp_copy, cm);
+                        double actual = aff.empty() ? -1e18 : before - cp_copy.total_cost();
+                        double disc = cs - actual;
+                        if (std::abs(disc) > 0.1 * std::max(1.0, std::abs(cs)) + 1.0) {
+                            std::cerr << "  EVAL-TIME STEAL MISMATCH: predicted=" << cs
+                                      << " simulated=" << actual
+                                      << " op=" << pm.op << " ga=" << pm.ga
+                                      << " gb=" << pm.gb << "\n";
+                        }
+                    }
+#endif
                     best.saving = (cs > -1e17) ? cs : pm.saving;
                 } else if (pm.type == FMMove::EJECT || pm.type == FMMove::INTERNAL_EJECT) {
                     double cs = coupled_steal_saving(cp, pm.op, pm.ga, SIZE_MAX);
                     best.saving = (cs > -1e17) ? cs : pm.saving;
                 } else if (pm.type == FMMove::MERGE) {
                     double cs = coupled_merge_saving(cp, pm.ga, pm.gb);
+#ifndef NDEBUG
+                    // Verify prediction at eval time by simulating on a copy.
+                    if (cs > -1e17) {
+                        CoupledPartition cp_copy = cp;
+                        double before = cp_copy.total_cost();
+                        CoupledFMMove cm;
+                        cm.type = CoupledFMMove::MERGE;
+                        cm.op = pm.op; cm.ga = pm.ga; cm.gb = pm.gb;
+                        cm.saving = cs;
+                        auto aff = apply_coupled_fm_move(cp_copy, cm);
+                        double actual = aff.empty() ? -1e18 : before - cp_copy.total_cost();
+                        double disc = cs - actual;
+                        if (std::abs(disc) > 0.1 * std::max(1.0, std::abs(cs)) + 1.0) {
+                            std::cerr << "  EVAL-TIME MERGE MISMATCH: predicted=" << cs
+                                      << " simulated=" << actual
+                                      << " op=" << pm.op << " ga=" << pm.ga
+                                      << " gb=" << pm.gb << "\n";
+                        }
+                    }
+#endif
                     best.saving = (cs > -1e17) ? cs : pm.saving;
                 } else if (pm.type == FMMove::TENSOR_MERGE) {
                     double cs = coupled_tensor_merge_saving(cp, pm.tensor_groups);
                     best.saving = (cs > -1e17) ? cs : pm.saving;
+                } else if (pm.type == FMMove::RECOMPUTE) {
+                    double cs = coupled_recompute_saving(cp, pm.op, pm.gb);
+                    if (cs <= -1e17) { best = CoupledFMMove{}; }  // infeasible with coupling — reject
+                    else best.saving = cs;
                 } else {
                     best.saving = pm.saving;
                 }
@@ -296,6 +341,38 @@ static double eval_coupled_group_cost(const CoupledPartition& cp,
     return cr.feasible ? cr.latency : 1e18;
 }
 
+// Coupled saving for RECOMPUTE(op into gb).
+// Only gb changes — evaluate it with its coupling context.
+// Source groups are unchanged (op stays in them).
+static double coupled_recompute_saving(const CoupledPartition& cp,
+                                        size_t op, size_t gb) {
+    const Partition& part = cp.part;
+    if (!part.groups[gb].alive) return -1e18;
+
+    std::set<size_t> new_gb = part.groups[gb].ops;
+    new_gb.insert(op);
+
+    auto en_gb = cp.entering_for(gb);
+    auto re_gb = cp.retain_for(gb);
+
+    // After adding op, some entering tensors may become internal
+    // (op produces them → now produced inside gb). Filter.
+    if (!en_gb.empty()) {
+        std::set<size_t> valid;
+        for (auto t : en_gb)
+            if (is_boundary_input_of(new_gb, t, *part.dag)) valid.insert(t);
+        en_gb = std::move(valid);
+    }
+    // Retain tensors: op might consume a retained tensor internally,
+    // but that doesn't change its boundary-output status — still produced
+    // by gb for the next group. No filtering needed for retain.
+
+    double old_cost = cp.group_cost(gb);
+    double new_cost = eval_coupled_group_cost(cp, new_gb, en_gb, re_gb);
+    if (new_cost >= 1e17) return -1e18;
+    return old_cost - new_cost;
+}
+
 // Coupled saving for STEAL(op, from=ga, to=gb) or EJECT [gb==SIZE_MAX].
 // Evaluates new group costs with coupling contexts and simulates the
 // coupling-edge transfer that fixup_coupling_steal would perform.
@@ -394,32 +471,91 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     if (ga_dies && !is_eject && cp.next_group[gb] == ga)
         re_gb = {};
 
-    // Chain-neighbor cost deltas: when coupling edges are dissolved, the
-    // predecessor (loses retain) and successor (loses entering) change cost.
+    // Chain-neighbor cost deltas: when coupling context changes (entering/retain
+    // shrank or dissolved), neighbors' costs change.  Compute precise deltas.
     double neighbor_delta = 0;
 
-    // ga_prev: if ga's incoming coupling dissolves (en_ga became empty)
     size_t ga_prev = (ga < cp.prev_group.size()) ? cp.prev_group[ga] : SIZE_MAX;
-    if (ga_prev != SIZE_MAX && ga_prev != gb &&
-        !orig_en_ga.empty() && en_ga.empty()) {
+    size_t ga_next = (ga < cp.next_group.size()) ? cp.next_group[ga] : SIZE_MAX;
+    size_t gb_prev_orig = (!is_eject && gb < cp.prev_group.size()) ? cp.prev_group[gb] : SIZE_MAX;
+    size_t gb_next_orig = (!is_eject && gb < cp.next_group.size()) ? cp.next_group[gb] : SIZE_MAX;
+
+    // ga_prev: if ga's entering changed, ga_prev's retain context changed
+    if (ga_prev != SIZE_MAX && ga_prev != gb && en_ga != orig_en_ga) {
         double old_prev = cp.group_cost(ga_prev);
+        // ga_prev retains tensors for ga. If en_ga is now empty, prev loses all retain.
+        // If en_ga shrank, prev retains only the remaining tensors.
+        auto prev_retain = en_ga.empty() ? std::set<size_t>{} : en_ga;
         double new_prev = eval_coupled_group_cost(
-            cp, part.groups[ga_prev].ops, cp.entering_for(ga_prev), {});
+            cp, part.groups[ga_prev].ops, cp.entering_for(ga_prev), prev_retain);
         neighbor_delta += old_prev - new_prev;
     }
 
-    // ga_next: if ga's outgoing coupling dissolves (re_ga became empty)
-    size_t ga_next = (ga < cp.next_group.size()) ? cp.next_group[ga] : SIZE_MAX;
-    if (ga_next != SIZE_MAX && ga_next != gb &&
-        !orig_re_ga.empty() && re_ga.empty()) {
-        double old_next = cp.group_cost(ga_next);
-        double new_next = eval_coupled_group_cost(
-            cp, part.groups[ga_next].ops, {}, cp.retain_for(ga_next));
-        neighbor_delta += old_next - new_next;
+    // ga_next chain cascade: if ga's retain changed, walk the chain forward
+    // until the change stops propagating (a group's cost doesn't change,
+    // or the chain ends).
+    if (ga_next != SIZE_MAX && ga_next != gb && re_ga != orig_re_ga) {
+        // Walk forward from ga_next along the chain.
+        std::set<size_t> cur_enter = re_ga.empty() ? std::set<size_t>{} : re_ga;
+        size_t cur = ga_next;
+        size_t max_steps = part.groups.size();
+        for (size_t step = 0; step < max_steps && cur != SIZE_MAX; step++) {
+            if (cur == ga || cur == gb || !part.groups[cur].alive) break;
+            double old_cur = cp.group_cost(cur);
+            auto cur_retain = cp.retain_for(cur);
+            double new_cur = eval_coupled_group_cost(
+                cp, part.groups[cur].ops, cur_enter, cur_retain);
+            if (std::abs(old_cur - new_cur) < 0.001) break;  // no change, stop
+            neighbor_delta += old_cur - new_cur;
+            // If cur retains for next, the next group's entering is cur's retain
+            // (which didn't change — only cur's entering changed).
+            // Cost change only propagates if cur's retain depends on its entering.
+            // Actually, cur's retain set doesn't change — only its cost changes.
+            // The next group's entering (= cur's retained tensors) is unchanged.
+            // So the cascade STOPS here — next group's entering is the same.
+            break;
+        }
+    }
+
+    // gb's edges: if gb gains op, its retained tensors may change boundary status
+    if (!is_eject) {
+        auto orig_re_gb = cp.retain_for(gb);
+        auto orig_en_gb = cp.entering_for(gb);
+
+        // gb_next: if gb's retain changed (re_gb != orig_re_gb), next's entering changed
+        if (gb_next_orig != SIZE_MAX && gb_next_orig != ga && re_gb != orig_re_gb) {
+            double old_next = cp.group_cost(gb_next_orig);
+            auto next_enter = re_gb.empty() ? std::set<size_t>{} : re_gb;
+            double new_next = eval_coupled_group_cost(
+                cp, part.groups[gb_next_orig].ops, next_enter, cp.retain_for(gb_next_orig));
+            neighbor_delta += old_next - new_next;
+        }
+
+        // gb_prev: if gb's entering changed (en_gb != orig_en_gb), prev's retain changed
+        if (gb_prev_orig != SIZE_MAX && gb_prev_orig != ga && en_gb != orig_en_gb) {
+            double old_prev = cp.group_cost(gb_prev_orig);
+            auto prev_retain = en_gb.empty() ? std::set<size_t>{} : en_gb;
+            double new_prev = eval_coupled_group_cost(
+                cp, part.groups[gb_prev_orig].ops, cp.entering_for(gb_prev_orig), prev_retain);
+            neighbor_delta += old_prev - new_prev;
+        }
     }
 
     double old_cost = cp.group_cost(ga) + (is_eject ? 0.0 : cp.group_cost(gb));
-    double new_ga_cost = eval_coupled_group_cost(cp, new_ga, en_ga, re_ga);
+
+    // Account for disconnected components in the remainder.
+    // First component keeps ga's coupling context, additional components are uncoupled.
+    double new_ga_cost = 0;
+    if (!new_ga.empty()) {
+        auto comps = structural_ops::connected_components(new_ga, *part.dag);
+        new_ga_cost = eval_coupled_group_cost(cp, comps[0], en_ga, re_ga);
+        for (size_t i = 1; i < comps.size(); i++) {
+            double c = part.eval_set(comps[i]);
+            if (c >= 1e17) return -1e18;
+            new_ga_cost += c;
+        }
+    }
+
     double new_gb_cost = eval_coupled_group_cost(cp, new_gb, en_gb, re_gb);
     if (new_ga_cost >= 1e17 || new_gb_cost >= 1e17) return -1e18;
     return old_cost - (new_ga_cost + new_gb_cost) + neighbor_delta;
@@ -464,10 +600,90 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
         if (it != cp.retained.end()) retain = it->second;
     }
 
+    // Filter entering/retain to only include tensors still valid for the
+    // merged group.  A tensor that was boundary between ga and gb becomes
+    // internal after merge → no longer valid as entering or retained.
+    const DAG& dag = *part.dag;
+    {
+        std::set<size_t> valid_entering;
+        for (auto t : entering)
+            if (is_boundary_input_of(merged, t, dag))
+                valid_entering.insert(t);
+        entering = std::move(valid_entering);
+    }
+    {
+        std::set<size_t> valid_retain;
+        for (auto t : retain)
+            if (is_boundary_output_of(merged, t, dag))
+                valid_retain.insert(t);
+        retain = std::move(valid_retain);
+    }
+
     double old_cost = cp.group_cost(ga) + cp.group_cost(gb);
     double merged_cost = eval_coupled_group_cost(cp, merged, entering, retain);
     if (merged_cost >= 1e17) return -1e18;
-    return old_cost - merged_cost;
+
+    // Chain-neighbor cost deltas: dissolved/stale coupling edges change neighbor costs.
+    double neighbor_delta = 0;
+
+    // Determine which prev/next the merged group ends up with
+    size_t merged_prev = (ga_prev != SIZE_MAX) ? ga_prev :
+                          ((gb_prev != SIZE_MAX && gb_prev != ga && gb_prev != gb &&
+                            !in_forward_chain(cp, ga, gb_prev)) ? gb_prev : SIZE_MAX);
+    size_t merged_next = (ga_next != SIZE_MAX) ? ga_next :
+                          ((gb_next != SIZE_MAX && gb_next != ga && gb_next != gb &&
+                            !in_forward_chain(cp, gb_next, ga)) ? gb_next : SIZE_MAX);
+
+    // gb's prev loses its retain if NOT transferred (ga already had a prev)
+    if (gb_prev != SIZE_MAX && gb_prev != ga && gb_prev != gb &&
+        merged_prev != gb_prev) {
+        double old_p = cp.group_cost(gb_prev);
+        double new_p = eval_coupled_group_cost(
+            cp, part.groups[gb_prev].ops, cp.entering_for(gb_prev), {});
+        if (new_p >= 1e17) return -1e18;
+        neighbor_delta += old_p - new_p;
+    }
+
+    // gb's next loses its entering if NOT transferred (ga already had a next)
+    if (gb_next != SIZE_MAX && gb_next != ga && gb_next != gb &&
+        merged_next != gb_next) {
+        double old_n = cp.group_cost(gb_next);
+        double new_n = eval_coupled_group_cost(
+            cp, part.groups[gb_next].ops, {}, cp.retain_for(gb_next));
+        if (new_n >= 1e17) return -1e18;
+        neighbor_delta += old_n - new_n;
+    }
+
+    // Merged prev loses retain if entering became empty after filtering
+    if (merged_prev != SIZE_MAX && entering.empty()) {
+        // Check if prev originally HAD retain to the merged group
+        bool had_retain = false;
+        if (merged_prev == ga_prev && !cp.entering_for(ga).empty()) had_retain = true;
+        if (merged_prev == gb_prev && !cp.entering_for(gb).empty()) had_retain = true;
+        if (had_retain) {
+            double old_p = cp.group_cost(merged_prev);
+            double new_p = eval_coupled_group_cost(
+                cp, part.groups[merged_prev].ops, cp.entering_for(merged_prev), {});
+            if (new_p >= 1e17) return -1e18;
+            neighbor_delta += old_p - new_p;
+        }
+    }
+
+    // Merged next loses entering if retain became empty after filtering
+    if (merged_next != SIZE_MAX && retain.empty()) {
+        bool had_entering = false;
+        if (merged_next == ga_next && !cp.retain_for(ga).empty()) had_entering = true;
+        if (merged_next == gb_next && !cp.retain_for(gb).empty()) had_entering = true;
+        if (had_entering) {
+            double old_n = cp.group_cost(merged_next);
+            double new_n = eval_coupled_group_cost(
+                cp, part.groups[merged_next].ops, {}, cp.retain_for(merged_next));
+            if (new_n >= 1e17) return -1e18;
+            neighbor_delta += old_n - new_n;
+        }
+    }
+
+    return old_cost - merged_cost + neighbor_delta;
 }
 
 // Coupled saving for TENSOR_MERGE(groups[0] survives, rest die).
@@ -517,6 +733,22 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
         }
     }
 
+    // Filter entering/retain to only include tensors still valid for the
+    // merged group (tensors between merged groups become internal).
+    const DAG& dag = *cp.part.dag;
+    {
+        std::set<size_t> valid;
+        for (auto t : entering)
+            if (is_boundary_input_of(merged, t, dag)) valid.insert(t);
+        entering = std::move(valid);
+    }
+    {
+        std::set<size_t> valid;
+        for (auto t : retain)
+            if (is_boundary_output_of(merged, t, dag)) valid.insert(t);
+        retain = std::move(valid);
+    }
+
     double merged_cost = eval_coupled_group_cost(cp, merged, entering, retain);
     if (merged_cost >= 1e17) return -1e18;
     return old_cost - merged_cost;
@@ -545,9 +777,38 @@ static void fixup_coupling_merge(CoupledPartition& cp,
         gb_next = SIZE_MAX;
     }
 
+    const DAG& dag = *cp.part.dag;
+
+    // Helper: filter retained tensors for boundary validity on the merged group.
+    auto filter_retained = [&](const std::pair<size_t,size_t>& edge) {
+        auto it = cp.retained.find(edge);
+        if (it == cp.retained.end()) return;
+        std::set<size_t> valid;
+        for (auto t : it->second) {
+            // Producer side: must still be boundary output of the producer group
+            if (edge.first == ga) {
+                if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+            } else if (cp.part.groups[edge.first].alive) {
+                if (!is_boundary_output_of(cp.part.groups[edge.first].ops, t, dag)) continue;
+            }
+            // Consumer side: must still be boundary input of the consumer group
+            if (edge.second == ga) {
+                if (!is_boundary_input_of(cp.part.groups[ga].ops, t, dag)) continue;
+            } else if (cp.part.groups[edge.second].alive) {
+                if (!is_boundary_input_of(cp.part.groups[edge.second].ops, t, dag)) continue;
+            }
+            valid.insert(t);
+        }
+        if (valid.empty()) {
+            cp.retained.erase(it);
+            cp.next_group[edge.first] = SIZE_MAX;
+            cp.prev_group[edge.second] = SIZE_MAX;
+        } else {
+            it->second = std::move(valid);
+        }
+    };
+
     // Transfer gb's external next link to ga (if ga has none and won't create a cycle).
-    // A cycle would occur if ga is already in gb_next's forward chain
-    // (e.g. chain was: gb → gb_next → ... → ga).
     if (gb_next != SIZE_MAX && gb_next != ga && gb_next != gb) {
         if (cp.next_group[ga] == SIZE_MAX && !in_forward_chain(cp, gb_next, ga)) {
             cp.next_group[ga] = gb_next;
@@ -558,15 +819,12 @@ static void fixup_coupling_merge(CoupledPartition& cp,
                 cp.retained.erase(it);
             }
         } else {
-            // ga already has a next, or transfer would create a cycle — dissolve gb's outgoing edge
             cp.prev_group[gb_next] = SIZE_MAX;
             cp.retained.erase({gb, gb_next});
         }
     }
 
     // Transfer gb's external prev link to ga (if ga has none and won't create a cycle).
-    // A cycle would occur if gb_prev is already in ga's forward chain
-    // (e.g. chain was: ga → ... → gb_prev → gb).
     if (gb_prev != SIZE_MAX && gb_prev != ga && gb_prev != gb) {
         if (cp.prev_group[ga] == SIZE_MAX && !in_forward_chain(cp, ga, gb_prev)) {
             cp.prev_group[ga] = gb_prev;
@@ -577,11 +835,17 @@ static void fixup_coupling_merge(CoupledPartition& cp,
                 cp.retained.erase(it);
             }
         } else {
-            // ga already has a prev, or transfer would create a cycle — dissolve gb's incoming edge
             cp.next_group[gb_prev] = SIZE_MAX;
             cp.retained.erase({gb_prev, gb});
         }
     }
+
+    // Validate all edges involving ga (the merged group) — retained tensors
+    // that became internal after merge must be removed.
+    if (cp.next_group[ga] != SIZE_MAX)
+        filter_retained({ga, cp.next_group[ga]});
+    if (cp.prev_group[ga] != SIZE_MAX)
+        filter_retained({cp.prev_group[ga], ga});
 
     // Clear gb's now-dead coupling slots
     cp.next_group[gb] = SIZE_MAX;
@@ -673,7 +937,7 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
                         keep.insert(t);
                     else if (is_boundary_input_of(cp.part.groups[gb_new].ops, t, dag))
                         move.insert(t);
-                    // else: consumer vanished — let invalidate_couplings clean up
+                    // else: consumer vanished — dissolve below
                 }
                 if (!keep.empty()) {
                     it->second = std::move(keep);
@@ -707,7 +971,7 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
                         keep.insert(t);
                     else if (is_boundary_output_of(cp.part.groups[gb_new].ops, t, dag))
                         move.insert(t);
-                    // else: producer vanished — let invalidate_couplings clean up
+                    // else: producer vanished — dissolve below
                 }
                 if (!keep.empty()) {
                     it->second = std::move(keep);
@@ -757,32 +1021,87 @@ std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
         while (cp.prev_group.size() < cp.part.groups.size())
             cp.prev_group.push_back(SIZE_MAX);
 
+        // ── Coupling fixup: move-specific logic + targeted edge validation ──
+        //
+        // Each move type handles coupling precisely:
+        // 1. Transfer/redirect chain links as needed (MERGE/STEAL/SPLIT)
+        // 2. Validate retained tensors on edges involving changed groups
+        // No global invalidate_couplings — each fixup is surgical.
+
+        // Save chain neighbors BEFORE fixup (they need refreshing).
+        auto save_chain_neighbors = [&](size_t g) {
+            if (g < cp.prev_group.size() && cp.prev_group[g] != SIZE_MAX)
+                affected.insert(cp.prev_group[g]);
+            if (g < cp.next_group.size() && cp.next_group[g] != SIZE_MAX)
+                affected.insert(cp.next_group[g]);
+        };
+
+        // Validate a single coupling edge: remove retained tensors no longer
+        // boundary-valid. Dissolve edge if retained set becomes empty.
+        const DAG& dag = *cp.part.dag;
+        auto validate_edge = [&](size_t from, size_t to) {
+            auto it = cp.retained.find({from, to});
+            if (it == cp.retained.end()) return;
+            if (!cp.part.groups[from].alive || !cp.part.groups[to].alive) {
+                cp.retained.erase(it);
+                cp.next_group[from] = SIZE_MAX;
+                cp.prev_group[to] = SIZE_MAX;
+                affected.insert(from);
+                affected.insert(to);
+                return;
+            }
+            std::set<size_t> valid;
+            for (auto t : it->second)
+                if (is_boundary_output_of(cp.part.groups[from].ops, t, dag) &&
+                    is_boundary_input_of(cp.part.groups[to].ops, t, dag))
+                    valid.insert(t);
+            if (valid.empty()) {
+                cp.retained.erase(it);
+                cp.next_group[from] = SIZE_MAX;
+                cp.prev_group[to] = SIZE_MAX;
+                affected.insert(from);
+                affected.insert(to);
+            } else if (valid.size() < it->second.size()) {
+                it->second = std::move(valid);
+            }
+        };
+
+        // Validate all edges involving a specific group.
+        auto validate_group_edges = [&](size_t g) {
+            if (g < cp.next_group.size() && cp.next_group[g] != SIZE_MAX)
+                validate_edge(g, cp.next_group[g]);
+            if (g < cp.prev_group.size() && cp.prev_group[g] != SIZE_MAX)
+                validate_edge(cp.prev_group[g], g);
+        };
+
         if (m.type == CoupledFMMove::MERGE) {
-            // Two-group merge: transfer gb's chain links to ga.
+            save_chain_neighbors(m.ga);
+            save_chain_neighbors(m.gb);
             fixup_coupling_merge(cp, m.ga, m.gb);
+            // fixup_coupling_merge already validates ga's edges inline
         } else if (m.type == CoupledFMMove::TENSOR_MERGE) {
-            // N-group merge: tensor_groups[0] survives, rest die.
-            // Call fixup_coupling_merge once per dead group so their chain
-            // links are transferred to the survivor.
+            for (auto g : m.tensor_groups) save_chain_neighbors(g);
             for (size_t i = 1; i < m.tensor_groups.size(); i++)
                 fixup_coupling_merge(cp, m.tensor_groups[0], m.tensor_groups[i]);
         } else if (m.type == CoupledFMMove::STEAL) {
+            save_chain_neighbors(steal_ga);
             fixup_coupling_steal(cp, m.op, steal_ga, steal_gb);
-            // Then clean up anything else broken (e.g. ga's outgoing edge if
-            // op produced a retained tensor)
-            cp.invalidate_couplings();
+            // Validate edges on from (steal_ga) — op's tensors may have changed
+            // boundary status. Also validate to (steal_gb) if it gained coupling.
+            validate_group_edges(steal_ga);
+            if (steal_gb != SIZE_MAX) validate_group_edges(steal_gb);
         } else if (m.type == CoupledFMMove::SPLIT) {
-            // Find the new group created by the split (the group in affected
-            // that is not ga).
             size_t gb_new = SIZE_MAX;
             for (auto g : affected)
                 if (g != m.ga) { gb_new = g; break; }
             if (gb_new != SIZE_MAX)
                 fixup_coupling_split(cp, m.ga, gb_new);
-            cp.invalidate_couplings();
+            // fixup_coupling_split already handles edge redirection
         } else {
             // EJECT, INTERNAL_EJECT, RECOMPUTE, TENSOR_EXTRACT, DE_RECOMPUTE
-            cp.invalidate_couplings();
+            // No link transfer needed — just validate edges on changed groups.
+            for (auto g : affected)
+                validate_group_edges(g);
         }
 
         return affected;

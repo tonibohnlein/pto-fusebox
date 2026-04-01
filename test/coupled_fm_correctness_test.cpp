@@ -19,6 +19,7 @@
 #include "search/coupled_fm_pass.h"
 #include "search/coupling_search.h"
 #include "search/partition_moves.h"
+#include "search/structural_ops.h"
 #include "partition/partition.h"
 #include "core/cost_cache.h"
 #include "solution/solution.h"
@@ -534,8 +535,16 @@ void test_steal_isolated() {
                         if (new_gj_cost >= 1e17) continue;
                         std::set<size_t> new_gi = ti.cp.part.groups[gi].ops;
                         new_gi.erase(op);
-                        double new_gi_cost = new_gi.empty() ? 0 : ti.cp.part.eval_set(new_gi);
-                        if (!new_gi.empty() && new_gi_cost >= 1e17) continue;
+                        double new_gi_cost = 0;
+                        if (!new_gi.empty()) {
+                            auto comps = structural_ops::connected_components(new_gi, ti.dag);
+                            for (auto& comp : comps) {
+                                double c = ti.cp.part.eval_set(comp);
+                                if (c >= 1e17) { new_gi_cost = 1e18; break; }
+                                new_gi_cost += c;
+                            }
+                        }
+                        if (new_gi_cost >= 1e17) continue;
                         double saving = (ti.cp.part.groups[gi].cost +
                                          ti.cp.part.groups[gj].cost) -
                                         (new_gi_cost + new_gj_cost);
@@ -603,7 +612,9 @@ void test_recompute_de_recompute_isolated() {
                     rc_count++;
 
                     // Now try DE_RECOMPUTE from gb
-                    auto dr = partition_moves::eval_de_recompute(ti.cp.part, gb, op);
+                    auto dr = ti.cp.part.acyclic_de_recompute_local(op, gb)
+                                  ? partition_moves::eval_de_recompute(ti.cp.part, gb, op)
+                                  : partition_moves::EvalResult{};
                     if (dr.feasible) {
                         CoupledFMMove dm;
                         dm.type = CoupledFMMove::DE_RECOMPUTE;

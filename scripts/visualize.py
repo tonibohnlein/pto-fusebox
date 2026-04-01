@@ -16,21 +16,21 @@ def generate_instance_dot(input_data, out_filepath):
         ""
     ]
 
-    cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
+    cap_kb = input_data.get('fast_memory_capacity', 0) / 1000.0
     bw = input_data.get('slow_memory_bandwidth', 'Unknown')
     gran = input_data.get('native_granularity', 'Unknown')
     if isinstance(gran, list):
         gran = "x".join(map(str, gran))
     
-    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} KB\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} K\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
     lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 
     # 1. Define Tensors (Data)
     lines.append("    // --- Tensors ---")
     for i, (w, h) in enumerate(zip(input_data['widths'], input_data['heights'])):
-        size_kb = (w * h) / 1024.0
-        label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)"
+        size_kb = (w * h) / 1000.0
+        label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} K)"
         lines.append(f"    T{i} [label=\"{label}\", shape=box, style=filled, fillcolor=lightblue];")
 
     # 2. Define Ops (Compute)
@@ -71,13 +71,13 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         ""
     ]
 
-    cap_kb = input_data.get('fast_memory_capacity', 0) / 1024.0
+    cap_kb = input_data.get('fast_memory_capacity', 0) / 1000.0
     bw = input_data.get('slow_memory_bandwidth', 'Unknown')
     gran = input_data.get('native_granularity', 'Unknown')
     if isinstance(gran, list):
         gran = "x".join(map(str, gran))
     
-    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} KB\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} K\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
     lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 
@@ -122,10 +122,10 @@ def generate_solution_dot(input_data, output_data, out_filepath):
     # 1. Define Tensors
     lines.append("    // --- Tensors ---")
     
-    cap_kb_raw = input_data.get('fast_memory_capacity', 0) / 1024.0
+    cap_kb_raw = input_data.get('fast_memory_capacity', 0) / 1000.0
     
     for i, (w, h) in enumerate(zip(input_data['widths'], input_data['heights'])):
-        size_kb = (w * h) / 1024.0
+        size_kb = (w * h) / 1000.0
         
         # Base style parameters
         style_list = ["filled"]
@@ -207,7 +207,7 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         style_str = ",".join(style_list)
         role_label = "|".join(roles)
             
-        label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} KB)\\n[{role_label}]"
+        label = f"Tensor {i}\\n{w}x{h}\\n({size_kb:.1f} K)\\n[{role_label}]"
         
         # Add to graph
         lines.append(f"    T{i} [label=\"{label}\", shape=box, style=\"{style_str}\", fillcolor=\"{fillcolor_str}\", color=\"{border_color}\", penwidth={penwidth}];")

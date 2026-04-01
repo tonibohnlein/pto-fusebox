@@ -186,6 +186,14 @@ struct Partition {
     // now need to come from another group containing op.
     bool acyclic_de_recompute_local(size_t op, size_t ga) const;
 
+    // Is it acyclic to split group ga into side_a and side_b?
+    // The split exposes internal tensors as boundary edges between the two
+    // sides.  A cycle exists iff any new cross-edge closes a loop through
+    // external groups (side_a → external → side_b or vice versa).
+    bool acyclic_split_local(const std::set<size_t>& side_a,
+                              const std::set<size_t>& side_b,
+                              size_t ga) const;
+
     // --- Evaluation ---
 
     double eval_set(const std::set<size_t>& ops) const;
@@ -258,6 +266,15 @@ struct Partition {
         }
     }
 
+    // Forward-reachable cache: fwd_cache_[g] = groups reachable from g via
+    // boundary edges.  Lazily populated, invalidated by rebuild_index() which
+    // bumps fwd_gen_.  Mutable so const acyclicity methods can populate it.
+    const std::vector<bool>& cached_forward_reachable(size_t g) const;
+    void invalidate_fwd_cache() { fwd_gen_++; fwd_cache_.clear(); }
+
 private:
     std::vector<std::vector<size_t>> op_to_groups_;
+    mutable std::vector<std::vector<bool>> fwd_cache_;
+    mutable std::vector<uint32_t> fwd_cache_gen_;
+    uint32_t fwd_gen_ = 0;
 };

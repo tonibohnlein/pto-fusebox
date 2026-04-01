@@ -35,9 +35,12 @@ static double get_time_budget(const std::string& filename, size_t num_ops) {
 
 int main(int argc, char* argv[]) {
     bool verbose = false;
+    bool use_v2 = false;   // v2 pipeline is the default
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-v") verbose = true;
+        else if (std::string(argv[i]) == "--v2") use_v2 = true;
+        else if (std::string(argv[i]) == "--v1") use_v2 = false;
         else args.push_back(argv[i]);
     }
     g_verbose = verbose;
@@ -80,7 +83,8 @@ int main(int argc, char* argv[]) {
               << budget << "s (deadline=" << (budget * 0.95) << "s)\n\n";
 
     DAG dag = DAG::build(prob);
-    auto sol = solve(prob, dag, deadline);
+    auto sol = use_v2 ? solve_v2(prob, dag, deadline)
+                      : solve(prob, dag, deadline);
 
     auto elapsed = std::chrono::duration<double>(SteadyClock::now() - start).count();
 

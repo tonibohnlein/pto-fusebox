@@ -2,10 +2,13 @@
 #include "partition/partition.h"
 #include "core/cost_cache.h"
 #include "search/parallel_search.h"
-#include "search/local_search.h"   // partition_has_gap
+#include "search/local_search.h"   // partition_has_gap, greedy_descent
 #include "search/coupling_parallel_search.h"
+#include "search/symm_mutations.h"
 #include "solution/solution.h"     // compute_feasibly_retainable
 #include "solution/ordering.h"
+#include "init/init_strategies.h"
+#include "init/symm_init.h"
 #include "symmetry/symmetry.h"
 #include "symmetry/series.h"
 #include "symmetry/merkle_hash.h"
@@ -196,6 +199,10 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
                 cp_base.part.finalize(&shared_cache);
                 int n_alive = (int)cp_base.part.num_alive();
 
+                // Bare variant (no coupling) — ensures the uncoupled partition
+                // is always in the pool as a fallback.
+                { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp_base); }
+
                 // DFS-seeded variant
                 if (SteadyClock::now() < phase2_dl)
                     add_variant(cp_base, dfs_ordering(cp_base.part));
@@ -252,11 +259,23 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
             });
 
         std::cerr << "Phase 3: Coupling evo search...\n";
+
+        // Build symmetry context for Phase 3 crossover + symmetry mutations
+        std::optional<MerkleHashes> merkle;
+        std::optional<symm_mutations::PatternContext> symm_ctx;
+        if (!parallel_patterns.empty() || !series_patterns.empty()) {
+            merkle = MerkleHashes::compute(prob, dag);
+            symm_ctx = symm_mutations::build_context(
+                prob, dag, parallel_patterns, series_patterns, *merkle);
+        }
+
         CouplingParallelConfig ccfg;
         ccfg.pool_size   = std::min((int)coupled_pool.size(), 16);
         ccfg.fm.deadline = effective_dl;
         ccfg.cache       = &shared_cache;
         ccfg.early_stop  = false;  // deadline governs termination; don't bail early
+        ccfg.merkle      = merkle  ? &*merkle  : nullptr;
+        ccfg.symm_ctx    = symm_ctx ? &*symm_ctx : nullptr;
         auto coupling_sol = coupling_parallel_search(std::move(coupled_pool),
                                                      feasibly_ret,
                                                      effective_dl,
@@ -264,7 +283,30 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
         auto vr2 = coupling_sol.validate();
         if (!vr2.valid)
             std::cerr << "  WARNING: coupling solution invalid: " << vr2.error << "\n";
-        final_sol = std::move(coupling_sol);
+        // Build uncoupled fallback from best partition (no retention).
+        Solution uncoupled_fb(prob, dag, {});
+        {
+            Partition fb = partition_pool[0];
+            fb.rebuild_index();
+            fb.finalize(&shared_cache);
+            uncoupled_fb = Solution::from_partition(prob, dag, fb);
+        }
+
+        // Pick the best valid solution among: coupled, uncoupled fallback.
+        bool coupled_ok   = vr2.valid;
+        bool uncoupled_ok = uncoupled_fb.validate().valid;
+
+        if (coupled_ok && uncoupled_ok) {
+            final_sol = (coupling_sol.total_latency() < uncoupled_fb.total_latency() - 0.01)
+                      ? std::move(coupling_sol) : std::move(uncoupled_fb);
+        } else if (coupled_ok) {
+            final_sol = std::move(coupling_sol);
+        } else if (uncoupled_ok) {
+            final_sol = std::move(uncoupled_fb);
+        } else {
+            // Both invalid — use coupled (may have warnings but at least has retention).
+            final_sol = std::move(coupling_sol);
+        }
     }
     after_sol_evo = final_sol.total_latency();
 
@@ -289,6 +331,316 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
     if (final_cost < partition_cost - 0.01)
         std::cerr << " (-" << std::fixed << std::setprecision(1)
                   << 100.0 * (partition_cost - final_cost) / partition_cost << "% total)";
+    std::cerr << "\n  Cache: base=" << shared_cache.size()
+              << " (" << shared_cache.base_hits() << "h/" << shared_cache.base_misses() << "m)"
+              << " ret=" << shared_cache.ret_size()
+              << " (" << shared_cache.ret_hits() << "h/" << shared_cache.ret_misses() << "m)";
+    std::cerr << "\n";
+
+    return final_sol;
+}
+
+// ============================================================================
+// V2 pipeline: init-only seeding → evo loop (partition or coupled)
+//
+// Differences from solve():
+//   - Phase 1 runs ONLY init heuristics (no greedy descent, no FM)
+//   - No Phase 2 (no ordering+greedy coupling seeding)
+//   - The evo loop handles everything: mutation → greedy → FM
+//   - Fork on has_retain: partition evo loop vs coupled evo loop
+// ============================================================================
+
+Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
+    auto now = SteadyClock::now();
+    auto effective_dl = deadline;
+    if (deadline == TimePoint::max())
+        effective_dl = now + std::chrono::seconds(5);
+
+    auto feasibly_ret = compute_feasibly_retainable(prob, dag);
+    bool has_retain = !feasibly_ret.empty();
+
+    std::cerr << "  Retainable tensors: " << feasibly_ret.size()
+              << " / " << prob.retainable_tensors.size() << "\n";
+
+    CostCache shared_cache;
+
+    // ================================================================
+    // Seed pool: run init heuristics only (no greedy, no FM)
+    // ================================================================
+    std::cerr << "Seeding pool (init heuristics only)...\n";
+
+    // Run all init strategies to produce raw partitions.
+    // Each strategy: init → greedy descent (cheap) → insert into pool.
+    // NO FM refinement.
+    auto init_start = SteadyClock::now();
+
+    // Use all_init_strategies() to get the registered strategies.
+    auto strategies = all_init_strategies();
+
+    std::vector<Partition> seed_pool;
+    std::mutex pool_mutex;
+
+    // Also run symm_init
+    auto symm_parts = init_from_patterns(prob, dag, &shared_cache);
+    for (auto& sp : symm_parts) {
+        sp.rebuild_index();
+        if (!partition_has_gap(sp))
+            seed_pool.push_back(std::move(sp));
+    }
+
+    int hw_threads = (int)std::thread::hardware_concurrency();
+    if (hw_threads <= 0) hw_threads = 4;
+
+    // Run each init strategy + greedy descent (no FM).
+    // Add 3 extra random inits for diversity.
+    int n_strats = (int)strategies.size();
+    int n_random_extra = 3;
+    int n_total = n_strats + n_random_extra;
+
+    {
+        std::atomic<int> next{0};
+
+        auto worker = [&]() {
+            while (true) {
+                int idx = next.fetch_add(1);
+                if (idx >= n_total) break;
+
+                Partition part = (idx < n_strats)
+                    ? strategies[idx].init(prob, dag, &shared_cache)
+                    : init_random(prob, dag, &shared_cache);
+
+                std::string name = (idx < n_strats) ? strategies[idx].name : "random";
+
+                // Quick greedy descent (no FM)
+                part.rebuild_index();
+                part = greedy_descent(std::move(part));
+                part.rebuild_index();
+
+                if (partition_has_gap(part)) return;
+
+                double cost = part.total_cost();
+                std::lock_guard<std::mutex> lk(pool_mutex);
+                seed_pool.push_back(std::move(part));
+
+                std::cerr << "    init [" << name << "]: cost=" << cost << "\n";
+            }
+        };
+
+        int nt = std::min(hw_threads, n_total);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < nt; i++) threads.emplace_back(worker);
+        for (auto& t : threads) t.join();
+    }
+
+    if (seed_pool.empty()) {
+        // Fallback: trivial partition
+        auto part = Partition::trivial(prob, dag);
+        part.cache = &shared_cache;
+        part.rebuild_index();
+        seed_pool.push_back(std::move(part));
+    }
+
+    // Sort by cost
+    std::sort(seed_pool.begin(), seed_pool.end(),
+        [](const Partition& a, const Partition& b) {
+            return a.total_cost() < b.total_cost();
+        });
+
+    auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        SteadyClock::now() - init_start).count();
+    std::cerr << "  Seed pool: " << seed_pool.size()
+              << " entries, best=" << seed_pool[0].total_cost()
+              << " (" << init_ms << "ms)\n";
+
+    double seed_best = seed_pool[0].total_cost();
+
+    // ================================================================
+    // Evo loop: fork on has_retain
+    // ================================================================
+
+    Solution final_sol(prob, dag, {});
+
+    if (!has_retain) {
+        // No retention: run partition evo loop directly.
+        // Use parallel_search with the seed pool already built.
+        std::cerr << "Partition evo loop (no retention)...\n";
+
+        ParallelConfig pcfg;
+        pcfg.fm.deadline = effective_dl;
+        pcfg.cache = &shared_cache;
+        pcfg.early_stop = false;
+
+        auto result_pool = parallel_search(prob, dag, pcfg);
+
+        // Build solution from best partition
+        result_pool[0].rebuild_index();
+        result_pool[0].finalize(&shared_cache);
+        final_sol = Solution::from_partition(prob, dag, result_pool[0], 8, &shared_cache);
+
+    } else {
+        // Has retention: build coupled pool from seeds via Phase 2 logic,
+        // then run coupled evo.
+        std::cerr << "Building coupled pool from seeds...\n";
+        auto phase2_start = SteadyClock::now();
+        // Use ~5% of remaining budget for Phase 2 seeding
+        auto phase2_dl = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+            (effective_dl - SteadyClock::now()) * 5 / 100);
+
+        auto seed_coupling_from_ordering = [&](CoupledPartition& cp,
+                                                const OrderingResult& res) {
+            const auto& part = cp.part;
+            while (cp.next_group.size() < part.groups.size())
+                cp.next_group.push_back(SIZE_MAX);
+            while (cp.prev_group.size() < part.groups.size())
+                cp.prev_group.push_back(SIZE_MAX);
+
+            for (size_t i = 0; i + 1 < res.order.size(); i++) {
+                if (i >= res.retain_per_step.size()) break;
+                const auto& ret = res.retain_per_step[i];
+                if (ret.empty()) continue;
+                size_t ga = res.order[i], gb = res.order[i + 1];
+                if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
+                const auto& bouts = part.groups[ga].sg->boundary_outputs();
+                const auto& bins  = part.groups[gb].sg->boundary_inputs();
+                for (auto t : ret) {
+                    if (!feasibly_ret.count(t)) continue;
+                    if (!bouts.count(t) || !bins.count(t)) continue;
+                    if (cp.next_group[ga] != SIZE_MAX && cp.next_group[ga] != gb) continue;
+                    if (cp.prev_group[gb] != SIZE_MAX && cp.prev_group[gb] != ga) continue;
+                    cp.next_group[ga] = gb;
+                    cp.prev_group[gb] = ga;
+                    cp.retained[{ga, gb}].insert(t);
+                }
+            }
+        };
+
+        std::vector<CoupledPartition> coupled_pool;
+        std::mutex cp_mutex;
+
+        auto add_variant = [&](CoupledPartition cp, const OrderingResult& res) {
+            seed_coupling_from_ordering(cp, res);
+            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp); }
+            coupling_greedy_descent(cp, feasibly_ret, phase2_dl);
+            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp)); }
+        };
+
+        {
+            std::atomic<int> next_task{0};
+            int n_tasks = (int)seed_pool.size();
+
+            auto gen0_worker = [&]() {
+                std::mt19937 rng(std::random_device{}());
+                while (true) {
+                    int tid = next_task.fetch_add(1);
+                    if (tid >= n_tasks) break;
+                    if (SteadyClock::now() >= phase2_dl) break;
+
+                    Partition part = seed_pool[tid];
+                    part.rebuild_index();
+                    if (partition_has_gap(part)) continue;
+
+                    CoupledPartition cp_base;
+                    cp_base.init_from(std::move(part), &shared_cache);
+                    cp_base.part.finalize(&shared_cache);
+
+                    // Bare variant (no coupling fallback)
+                    { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp_base); }
+
+                    // DFS-seeded variant
+                    if (SteadyClock::now() < phase2_dl)
+                        add_variant(cp_base, dfs_ordering(cp_base.part));
+
+                    // Random-ordering variant
+                    if (SteadyClock::now() < phase2_dl)
+                        add_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng));
+                }
+            };
+
+            int nt = std::min(hw_threads, n_tasks);
+            std::vector<std::thread> threads;
+            for (int i = 0; i < nt; i++) threads.emplace_back(gen0_worker);
+            for (auto& t : threads) t.join();
+        }
+
+        if (coupled_pool.empty()) {
+            Partition part = seed_pool[0];
+            part.rebuild_index();
+            CoupledPartition cp;
+            cp.init_from(std::move(part), &shared_cache);
+            cp.part.finalize(&shared_cache);
+            coupled_pool.push_back(std::move(cp));
+        }
+
+        auto phase2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            SteadyClock::now() - phase2_start).count();
+        double best_coupled = std::min_element(coupled_pool.begin(), coupled_pool.end(),
+            [](const CoupledPartition& a, const CoupledPartition& b) {
+                return a.total_cost() < b.total_cost();
+            })->total_cost();
+        std::cerr << "  Coupled pool: " << coupled_pool.size()
+                  << " entries, best=" << best_coupled
+                  << " (" << phase2_ms << "ms)\n";
+
+        // Sort best-first
+        std::sort(coupled_pool.begin(), coupled_pool.end(),
+            [](const CoupledPartition& a, const CoupledPartition& b) {
+                return a.total_cost() < b.total_cost();
+            });
+
+        // Build symmetry context for crossover + symmetry mutations
+        auto v2_merkle = MerkleHashes::compute(prob, dag);
+        auto v2_parallel = SymmetryDetector::discover(prob, dag, v2_merkle);
+        auto v2_series = SeriesDetector::discover(prob, dag, v2_merkle);
+        std::optional<symm_mutations::PatternContext> v2_symm;
+        if (!v2_parallel.empty() || !v2_series.empty())
+            v2_symm = symm_mutations::build_context(
+                prob, dag, v2_parallel, v2_series, v2_merkle);
+
+        CouplingParallelConfig ccfg;
+        ccfg.pool_size = std::min((int)coupled_pool.size(), 16);
+        ccfg.fm.deadline = effective_dl;
+        ccfg.cache = &shared_cache;
+        ccfg.early_stop = false;
+        ccfg.merkle   = &v2_merkle;
+        ccfg.symm_ctx = v2_symm ? &*v2_symm : nullptr;
+
+        auto coupling_sol = coupling_parallel_search(
+            std::move(coupled_pool), feasibly_ret, effective_dl, ccfg);
+
+        // Build uncoupled fallback
+        Solution uncoupled_fb(prob, dag, {});
+        {
+            Partition fb = seed_pool[0];
+            fb.rebuild_index();
+            fb.finalize(&shared_cache);
+            uncoupled_fb = Solution::from_partition(prob, dag, fb, 8, &shared_cache);
+        }
+
+        auto vr_c = coupling_sol.validate();
+        auto vr_u = uncoupled_fb.validate();
+
+        if (vr_c.valid && vr_u.valid)
+            final_sol = (coupling_sol.total_latency() < uncoupled_fb.total_latency() - 0.01)
+                      ? std::move(coupling_sol) : std::move(uncoupled_fb);
+        else if (vr_c.valid)
+            final_sol = std::move(coupling_sol);
+        else if (vr_u.valid)
+            final_sol = std::move(uncoupled_fb);
+        else
+            final_sol = std::move(coupling_sol);
+    }
+
+    double final_cost = final_sol.total_latency();
+    auto vr = final_sol.validate();
+    if (!vr.valid)
+        std::cerr << "  WARNING: " << vr.error << "\n";
+
+    std::cerr << "  === Summary ===\n"
+              << "  Seed:   " << seed_best << "\n"
+              << "  Final:  " << final_cost;
+    if (final_cost < seed_best - 0.01)
+        std::cerr << " (-" << std::fixed << std::setprecision(1)
+                  << 100.0 * (seed_best - final_cost) / seed_best << "%)";
     std::cerr << "\n  Cache: base=" << shared_cache.size()
               << " (" << shared_cache.base_hits() << "h/" << shared_cache.base_misses() << "m)"
               << " ret=" << shared_cache.ret_size()

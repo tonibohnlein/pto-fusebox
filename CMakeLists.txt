@@ -56,6 +56,10 @@ target_link_libraries(evaluate solver_lib Threads::Threads)
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 
+# Reference evaluator (standalone, no solver_lib dependency)
+add_executable(reference_evaluator src/pipeline/reference_evaluator.cpp)
+target_compile_features(reference_evaluator PRIVATE cxx_std_17)
+
 # --- Tests ---
 enable_testing()
 
@@ -92,6 +96,15 @@ set(TEST_SOURCES
     test/coupling_test.cpp
     test/coupling_moves_test.cpp
     test/coupled_fm_correctness_test.cpp
+    test/merge_correctness_test.cpp
+    test/split_correctness_test.cpp
+    test/steal_correctness_test.cpp
+    test/eject_correctness_test.cpp
+    test/recompute_correctness_test.cpp
+    test/de_recompute_correctness_test.cpp
+    test/tensor_merge_correctness_test.cpp
+    test/tensor_extract_correctness_test.cpp
+    test/regression_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
@@ -139,7 +152,8 @@ add_custom_command(TARGET run_all POST_BUILD
 # --- Regression target ---
 # Runs all benchmarks and compares against benchmarks/baseline.json.
 # Usage:
-#   make regression           -- run and compare
+#   make regression           -- run and compare (default = v2 pipeline)
+#   make regression_v1        -- run with v1 pipeline
 #   make regression_update    -- run and promote improvements to baseline
 find_package(Python3 QUIET)
 if(Python3_FOUND OR EXISTS "/usr/bin/python3")
@@ -152,7 +166,14 @@ if(Python3_FOUND OR EXISTS "/usr/bin/python3")
                 --build ${CMAKE_BINARY_DIR}
         DEPENDS mlsys
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Running benchmark regression"
+        COMMENT "Running benchmark regression (v2 pipeline, default)"
+    )
+    add_custom_target(regression_v1
+        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
+                --build ${CMAKE_BINARY_DIR} --solver-args "--v1"
+        DEPENDS mlsys
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running benchmark regression with v1 pipeline"
     )
     add_custom_target(regression_update
         COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py

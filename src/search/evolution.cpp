@@ -4,6 +4,7 @@
 #include "search/feasibility.h"
 #include "search/partition_moves.h"
 #include "search/structural_ops.h"
+#include "search/coupling_search.h"  // eval_couple, apply_couple, apply_uncouple
 #include "symmetry/merkle_hash.h"
 #include <algorithm>
 #include <cassert>
@@ -52,13 +53,15 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     auto [ga, gb] = adj_pairs[rng() % adj_pairs.size()];
 
     if (!part.acyclic_merge_local(ga, gb)) return part;
-    
-    // Eval feasibility
-    auto r = partition_moves::eval_merge(part, ga, gb);
-    if (!r.feasible) return part;
+    std::set<size_t> merged_ops = part.groups[ga].ops;
+    merged_ops.insert(part.groups[gb].ops.begin(), part.groups[gb].ops.end());
+    if (part.creates_ephemeral_gap(merged_ops, ga, gb)) return part;
+    double merged_cost = part.eval_set(merged_ops);
+    if (merged_cost >= 1e17) return part;
+    double saving = part.groups[ga].cost + part.groups[gb].cost - merged_cost;
+    if (saving < -1e15) return part;  // infeasible
 
-    // Apply (includes Kahn's check)
-    auto affected = partition_moves::apply_merge(part, ga, gb);
+    auto affected = partition_moves::apply_merge(part, ga, gb, merged_cost);
     if (affected.empty()) return part;
     part.rebuild_index();
     return part;
@@ -90,9 +93,9 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
     auto sr = part.eval_split(op_a, op_b, gi);
     if (!sr.feasible) return part;
     if (part.split_creates_ephemeral_gap({sr.side_a, sr.side_b}, {gi})) return part;
+    if (!part.acyclic_split_local(sr.side_a, sr.side_b, gi)) return part;
 
-    // Apply (includes cheap pre-filter + Kahn's)
-    auto affected = partition_moves::apply_split(part, op_a, op_b, gi);
+    auto affected = partition_moves::apply_split(part, op_a, op_b, gi, &sr);
     if (affected.empty()) return part;
     part.rebuild_index();
     return part;
@@ -138,8 +141,8 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
     // Eval feasibility (from=src_gi, to=dst_gi)
     auto r = partition_moves::eval_steal(part, op, src_gi, dst_gi);
     if (!r.feasible) return part;
+    if (!part.acyclic_steal_local(op, src_gi, dst_gi)) return part;
 
-    // Apply (includes Kahn's check)
     auto affected = partition_moves::apply_steal(part, op, src_gi, dst_gi);
     if (affected.empty()) return part;
     part.rebuild_index();
@@ -180,8 +183,15 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
         if (part.split_creates_ephemeral_gap(components, {gi})) return part;
     }
 
-    // Apply (includes cheap pre-filter + Kahn's)
-    auto affected = partition_moves::apply_eject(part, op, gi);
+    // Acyclicity: ejecting a recomputed op is a de_recompute.
+    {
+        bool in_other = false;
+        for (auto gj : part.groups_of(op))
+            if (gj != gi && part.groups[gj].alive) { in_other = true; break; }
+        if (in_other && !part.acyclic_de_recompute_local(op, gi)) return part;
+    }
+
+    auto affected = partition_moves::apply_eject(part, op, gi, &er);
     if (affected.empty()) return part;
     part.rebuild_index();
     return part;
@@ -227,16 +237,21 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (target_groups.size() < 2) return part;
     std::vector<size_t> group_list(target_groups.begin(), target_groups.end());
 
-    // Try full merge first
-    auto mr = partition_moves::eval_tensor_merge(part, group_list);
-    if (mr.feasible) {
-        auto affected = partition_moves::apply_tensor_merge(part, group_list);
-        if (!affected.empty()) {
-            part.rebuild_index();
-            return part;
+    // Try full merge first (check acyclicity before eval — cheaper, filters early)
+    if (part.acyclic_merge_local(group_list)) {
+        auto mr = partition_moves::eval_tensor_merge(part, group_list);
+        if (mr.feasible) {
+            double old_cost = 0;
+            for (auto gi : group_list) old_cost += part.groups[gi].cost;
+            double merged_cost = old_cost - mr.saving;
+            auto affected = partition_moves::apply_tensor_merge(part, group_list, merged_cost);
+            if (!affected.empty()) {
+                part.rebuild_index();
+                return part;
+            }
         }
     }
-    
+
     // Fallback: extract consumer ops (+ producer) into a new group
     std::set<size_t> extract_ops;
     for (auto cop : dag.tensor_consumers[t])
@@ -244,6 +259,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
 
+    if (!part.acyclic_extract_local(extract_ops)) return part;
     auto er = partition_moves::eval_tensor_extract(part, extract_ops, group_list);
     if (!er.feasible) return part;
 
@@ -267,6 +283,7 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops) {
+            if (!part.acyclic_de_recompute_local(op, gi)) continue;
             auto r = partition_moves::eval_de_recompute(part, gi, op);
             if (r.feasible) candidates.emplace_back(gi, op);
         }
@@ -278,13 +295,107 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
     for (auto [gi, op] : candidates) {
         if (!part.groups[gi].alive) continue;
         if (!part.groups[gi].ops.count(op)) continue;
+        if (!part.acyclic_de_recompute_local(op, gi)) continue;
         auto r = partition_moves::eval_de_recompute(part, gi, op);
         if (!r.feasible) continue;
-        auto affected = partition_moves::apply_de_recompute(part, gi, op);
+        double new_ga_cost = part.groups[gi].cost - r.saving;
+        auto affected = partition_moves::apply_de_recompute(part, gi, op, new_ga_cost);
         if (!affected.empty()) {
             part.rebuild_index();
         }
     }
+    return part;
+}
+
+// ============================================================================
+// Mutate: force recomputation around a multi-consumer tensor
+//
+// Pick a tensor T with ≥2 consumers, produced by op P (not a model input).
+// Extract P and each consumer C_i from their current groups and form new
+// groups {P, C_i}.  T becomes ephemeral in each new group.
+// ============================================================================
+
+Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
+    const auto& dag = *part.dag;
+    const auto& prob = *part.prob;
+
+    // Collect candidate tensors: produced by an op, ≥2 consumers
+    std::vector<size_t> candidates;
+    for (size_t t = 0; t < dag.tensor_producer.size(); t++) {
+        int prod = dag.tensor_producer[t];
+        if (prod < 0) continue;  // model input, no producer op
+        if (dag.tensor_consumers[t].size() < 2) continue;
+        candidates.push_back(t);
+    }
+    if (candidates.empty()) return part;
+
+    // Pick a random candidate tensor
+    size_t t = candidates[rng() % candidates.size()];
+    size_t prod_op = (size_t)dag.tensor_producer[t];
+    const auto& consumers = dag.tensor_consumers[t];
+
+    // For each consumer C_i, form a new group {P, C_i}.
+    // First check that each {P, C_i} is feasible (fits in fast memory).
+    std::vector<std::pair<size_t, double>> new_groups;  // (consumer_op, cost)
+    for (auto cop : consumers) {
+        std::set<size_t> ops = {prod_op, cop};
+        double cost = part.eval_set(ops);
+        if (cost >= 1e17) continue;  // doesn't fit → skip this consumer
+        new_groups.push_back({cop, cost});
+    }
+    if (new_groups.empty()) return part;  // no feasible {P, C_i} pair
+
+    // Extract consumer ops from their current groups.
+    // Track which groups lose ops so we can handle empty/disconnected groups.
+    std::set<size_t> affected_groups;
+    for (auto& [cop, cost] : new_groups) {
+        for (auto gi : part.groups_of(cop)) {
+            if (!part.groups[gi].alive) continue;
+            part.groups[gi].ops.erase(cop);
+            affected_groups.insert(gi);
+        }
+    }
+
+    // Also extract producer from its current groups (it will be recomputed in each new group)
+    for (auto gi : part.groups_of(prod_op)) {
+        if (!part.groups[gi].alive) continue;
+        part.groups[gi].ops.erase(prod_op);
+        affected_groups.insert(gi);
+    }
+
+    // Handle affected groups: re-evaluate costs, split disconnected components,
+    // kill empty groups.
+    part.rebuild_index();
+    for (auto gi : affected_groups) {
+        if (!part.groups[gi].alive) continue;
+        if (part.groups[gi].ops.empty()) {
+            part.groups[gi].alive = false;
+            continue;
+        }
+        // Split disconnected components
+        auto comps = structural_ops::connected_components(part.groups[gi].ops, dag);
+        if (comps.size() <= 1) {
+            // Still connected — just re-evaluate cost
+            double nc = part.eval_set(part.groups[gi].ops);
+            part.groups[gi].cost = (nc < 1e17) ? nc : 1e18;
+        } else {
+            // Keep first component in the original group, create new groups for the rest
+            part.groups[gi].ops = comps[0];
+            double nc = part.eval_set(comps[0]);
+            part.groups[gi].cost = (nc < 1e17) ? nc : 1e18;
+            for (size_t c = 1; c < comps.size(); c++) {
+                double cc = part.eval_set(comps[c]);
+                part.add_group(std::move(comps[c]), (cc < 1e17) ? cc : 1e18);
+            }
+        }
+    }
+
+    // Create the new {P, C_i} groups
+    for (auto& [cop, cost] : new_groups) {
+        part.add_group({prod_op, cop}, cost);
+    }
+
+    part.rebuild_index();
     return part;
 }
 
@@ -298,14 +409,166 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
     while (cp.prev_group.size() < cp.part.groups.size()) cp.prev_group.push_back(SIZE_MAX);
 
     // Remove coupling edges broken by the mutation (dead groups, tensors no
-    // longer boundary outputs, etc.). This is called within the mutation so
-    // coupling state remains valid before local search begins.
+    // longer boundary outputs, etc.).
     cp.invalidate_couplings();
 
-    // Mutations can introduce new group DAG edges that make existing coupling
-    // links cycle at the chain level (even though the group DAG is acyclic).
-    // Remove any such links before handing the result to FM / greedy descent.
+    // Remove coupling links that would cycle at the chain level.
     cp.fix_chain_couplings();
+
+    // --- Coupling mutations: randomly perturb coupling structure ---
+    // 4 move types: COUPLE, UNCOUPLE, RETAIN_FORCE_SPLIT, FORCE_RETAIN.
+    const DAG& dag = *cp.part.dag;
+    const Problem& prob = *cp.part.prob;
+    int coupling_muts = 1 + (int)(rng() % 2);
+    for (int cm = 0; cm < coupling_muts; cm++) {
+        int choice = rng() % 10;  // 0-2: uncouple, 3-6: couple, 7-8: rfs, 9: fr
+
+        if (choice <= 2) {
+            // --- UNCOUPLE: remove a random retained tensor from a coupling edge ---
+            std::vector<std::pair<size_t,size_t>> edges;
+            for (size_t g = 0; g < cp.next_group.size(); g++)
+                if (cp.next_group[g] != SIZE_MAX)
+                    edges.push_back({g, cp.next_group[g]});
+            if (edges.empty()) continue;
+            auto [ga, gb] = edges[rng() % edges.size()];
+            auto it = cp.retained.find({ga, gb});
+            if (it == cp.retained.end() || it->second.empty()) continue;
+            std::vector<size_t> tensors(it->second.begin(), it->second.end());
+            size_t t = tensors[rng() % tensors.size()];
+            apply_uncouple(cp, ga, gb, t);
+
+        } else if (choice <= 6) {
+            // --- COUPLE: add a coupling edge for a random boundary tensor ---
+            std::vector<size_t> boundary_tensors;
+            for (size_t t = 0; t < dag.tensor_producer.size(); t++) {
+                int prod = dag.tensor_producer[t];
+                if (prod < 0) continue;
+                if (!dag.tensor_consumers[t].empty())
+                    boundary_tensors.push_back(t);
+            }
+            if (boundary_tensors.empty()) continue;
+            size_t t = boundary_tensors[rng() % boundary_tensors.size()];
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            auto& prod_groups = cp.part.groups_of((size_t)prod_op);
+            if (prod_groups.empty()) continue;
+            size_t ga = prod_groups[rng() % prod_groups.size()];
+            if (!cp.part.groups[ga].alive) continue;
+            if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+
+            auto& consumers = dag.tensor_consumers[t];
+            if (consumers.empty()) continue;
+            size_t cons_op = consumers[rng() % consumers.size()];
+            auto& cons_groups = cp.part.groups_of(cons_op);
+            if (cons_groups.empty()) continue;
+            size_t gb = cons_groups[rng() % cons_groups.size()];
+            if (!cp.part.groups[gb].alive || ga == gb) continue;
+            if (!is_boundary_input_of(cp.part.groups[gb].ops, t, dag)) continue;
+
+            auto ev = eval_couple(cp, ga, gb, t);
+            if (ev.feasible && ev.saving > -1e17)
+                apply_couple(cp, ga, gb, t);
+
+        } else if (choice <= 8) {
+            // --- RETAIN_FORCE_SPLIT: split a group so the two halves can couple ---
+            // Pick a random group with ≥3 ops and a bridge edge
+            std::vector<size_t> alive;
+            for (size_t gi = 0; gi < cp.part.groups.size(); gi++)
+                if (cp.part.groups[gi].alive && cp.part.groups[gi].ops.size() >= 3)
+                    alive.push_back(gi);
+            if (alive.empty()) continue;
+            size_t g = alive[rng() % alive.size()];
+            auto bridges = structural_ops::bridge_edges(cp.part.groups[g].ops, dag);
+            if (bridges.empty()) continue;
+            auto [op_a, op_b] = bridges[rng() % bridges.size()];
+
+            // Find a tensor produced by one side and consumed by the other
+            auto sa = structural_ops::analyze_split(op_a, op_b,
+                cp.part.groups[g].ops, dag);
+            if (!sa.is_bridge) continue;
+            // Look for internal tensors that become boundary after split
+            size_t split_tensor = SIZE_MAX;
+            for (auto op : sa.side_a) {
+                for (auto out : prob.ops[op].outputs) {
+                    // Check if any consumer is in side_b
+                    for (auto cop : dag.tensor_consumers[out])
+                        if (sa.side_b.count(cop)) { split_tensor = out; break; }
+                    if (split_tensor != SIZE_MAX) break;
+                }
+                if (split_tensor != SIZE_MAX) break;
+            }
+            if (split_tensor == SIZE_MAX) continue;
+
+            auto ev = eval_retain_force_split(cp, g, op_a, op_b, split_tensor);
+            if (ev.feasible && ev.saving > -1e17) {
+                auto aff = apply_retain_force_split(cp, g, op_a, op_b, split_tensor);
+                if (!aff.empty()) {
+                    cp.part.rebuild_index();
+                    cp.part.rebuild_group_dag();
+                }
+            }
+
+        } else {
+            // --- FORCE_RETAIN: split a consumer group to enable coupling ---
+            // Pick a random boundary tensor, find producer (ga) and consumer (g_dst)
+            // where COUPLE fails, then split g_dst
+            std::vector<size_t> boundary_tensors;
+            for (size_t t = 0; t < dag.tensor_producer.size(); t++) {
+                int prod = dag.tensor_producer[t];
+                if (prod < 0) continue;
+                if (!dag.tensor_consumers[t].empty())
+                    boundary_tensors.push_back(t);
+            }
+            if (boundary_tensors.empty()) continue;
+            size_t t = boundary_tensors[rng() % boundary_tensors.size()];
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+
+            auto& prod_groups = cp.part.groups_of((size_t)prod_op);
+            if (prod_groups.empty()) continue;
+            size_t ga = prod_groups[rng() % prod_groups.size()];
+            if (!cp.part.groups[ga].alive) continue;
+            if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+
+            // Find a consumer group that's too large for direct COUPLE
+            auto& consumers = dag.tensor_consumers[t];
+            if (consumers.empty()) continue;
+            size_t cons_op = consumers[rng() % consumers.size()];
+            auto& cons_groups = cp.part.groups_of(cons_op);
+            if (cons_groups.empty()) continue;
+            size_t g_dst = cons_groups[rng() % cons_groups.size()];
+            if (!cp.part.groups[g_dst].alive || ga == g_dst) continue;
+            if (cp.part.groups[g_dst].ops.size() < 3) continue;
+
+            // Find a bridge edge in g_dst that separates the consumer from the rest
+            auto bridges = structural_ops::bridge_edges(cp.part.groups[g_dst].ops, dag);
+            if (bridges.empty()) continue;
+            // Pick a bridge where cons_op is on one side
+            for (auto& [ba, bb] : bridges) {
+                auto sa = structural_ops::analyze_split(ba, bb,
+                    cp.part.groups[g_dst].ops, dag);
+                if (!sa.is_bridge) continue;
+                // Determine which side has the consumer
+                size_t op_a_dst, op_b_dst;
+                if (sa.side_a.count(cons_op)) {
+                    op_a_dst = ba; op_b_dst = bb;
+                } else if (sa.side_b.count(cons_op)) {
+                    op_a_dst = bb; op_b_dst = ba;
+                } else continue;
+
+                auto ev = eval_force_retain(cp, ga, g_dst, op_a_dst, op_b_dst, t);
+                if (ev.feasible && ev.saving > -1e17) {
+                    auto aff = apply_force_retain(cp, ga, g_dst, op_a_dst, op_b_dst, t);
+                    if (!aff.empty()) {
+                        cp.part.rebuild_index();
+                        cp.part.rebuild_group_dag();
+                    }
+                }
+                break;  // tried one bridge, move on
+            }
+        }
+    }
 
     return cp;
 }
@@ -320,14 +583,15 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
         size_t before_groups = part.num_alive();
         double before_cost   = part.total_cost();
 
-        int choice = rng() % 6;
+        int choice = rng() % 7;
         switch (choice) {
-            case 0: part = mutate_merge(std::move(part), rng);        break;
-            case 1: part = mutate_split(std::move(part), rng);        break;
-            case 2: part = mutate_reassign(std::move(part), rng);     break;
-            case 3: part = mutate_eject(std::move(part), rng);        break;
-            case 4: part = mutate_tensor_merge(std::move(part), rng); break;
-            case 5: part = mutate_de_recompute(std::move(part), rng); break;
+            case 0: part = mutate_merge(std::move(part), rng);            break;
+            case 1: part = mutate_split(std::move(part), rng);            break;
+            case 2: part = mutate_reassign(std::move(part), rng);         break;
+            case 3: part = mutate_eject(std::move(part), rng);            break;
+            case 4: part = mutate_tensor_merge(std::move(part), rng);     break;
+            case 5: part = mutate_de_recompute(std::move(part), rng);     break;
+            case 6: part = mutate_force_recompute(std::move(part), rng);  break;
         }
 
         if (part.num_alive() != before_groups || part.total_cost() != before_cost)
@@ -363,6 +627,8 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
         }
 #endif
     }
+
+
     return part;
 }
 

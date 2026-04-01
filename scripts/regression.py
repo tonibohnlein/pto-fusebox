@@ -66,7 +66,8 @@ def count_ops(bench_path: Path) -> int:
 
 # ── Run one benchmark ──────────────────────────────────────────────────────────
 
-def run_benchmark(bench_path: Path, budget: float | None, solver: Path) -> dict:
+def run_benchmark(bench_path: Path, budget: float | None, solver: Path,
+                   extra_args: list[str] = []) -> dict:
     """
     Run the solver on bench_path with a time limit of `budget` seconds.
     Returns a dict with keys: latency (float), valid (bool), wall (float), output (str).
@@ -82,7 +83,7 @@ def run_benchmark(bench_path: Path, budget: float | None, solver: Path) -> dict:
     try:
         t0 = time.monotonic()
         result = subprocess.run(
-            [str(solver), str(bench_path), out_path],
+            [str(solver)] + extra_args + [str(bench_path), out_path],
             capture_output=True, text=True,
             timeout=budget * 3 + 10  # generous wall timeout
         )
@@ -185,6 +186,8 @@ def main():
         help="Exit with code 1 on any invalid solution (default: only warn).")
     ap.add_argument("--build", default=str(BUILD_DIR),
         help="Path to build directory containing the mlsys binary.")
+    ap.add_argument("--solver-args", default="",
+        help="Extra arguments to pass to the solver (e.g. '--v2').")
     args = ap.parse_args()
 
     solver = Path(args.build) / "mlsys"
@@ -240,7 +243,8 @@ def main():
         base_entry = baseline.get(name)
         base_lat   = base_entry["latency"] if base_entry else None
 
-        run = run_benchmark(bench_path, budget, solver)
+        extra = args.solver_args.split() if args.solver_args else []
+        run = run_benchmark(bench_path, budget, solver, extra)
         lat   = run["latency"]
         valid = run["valid"]
 

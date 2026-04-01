@@ -255,10 +255,12 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     discovered_parallel = std::move(par_pats);
                     discovered_series = std::move(ser_pats);
 
-                    // Insert symm partitions into pool
+                    // Insert symm partitions into pool (skip those with ephemeral gaps)
                     {
                         std::unique_lock lock(pool.mutex());
                         for (size_t i = 0; i < symm_parts.size(); i++) {
+                            symm_parts[i].rebuild_index();
+                            if (partition_has_gap(symm_parts[i])) continue;
                             double cost = symm_parts[i].total_cost();
                             pool.insert(PoolEntry(std::move(symm_parts[i]), cost,
                                 "symm_" + std::to_string(i)));

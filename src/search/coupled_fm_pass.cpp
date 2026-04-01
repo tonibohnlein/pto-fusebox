@@ -79,7 +79,7 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
     int    consecutive_non_improving = 0;
     using SteadyClock = std::chrono::steady_clock;
 
-    constexpr int NUM_TYPES = 12;
+    constexpr int NUM_TYPES = 14;
     int type_applied[NUM_TYPES] = {};
     int type_failed[NUM_TYPES]  = {};
     const char* stop_reason = "max_iters";
@@ -114,6 +114,25 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
             // Lock the op that is being split around
             extra_locks.push_back(move.op);
             extra_locks.push_back(move.op2);
+        } else if (move.type == CoupledFMMove::FORCE_RETAIN) {
+            // Lock split boundary ops + tensor endpoints
+            extra_locks.push_back(move.op2);  // op_a_dst (consumer of t)
+            extra_locks.push_back(move.op3);  // op_b_dst (split partner)
+            if (move.tensor < cp.part.dag->tensor_consumers.size()) {
+                int prod = cp.part.dag->tensor_producer[move.tensor];
+                if (prod >= 0) extra_locks.push_back((size_t)prod);
+            }
+        } else if (move.type == CoupledFMMove::COUPLE ||
+                   move.type == CoupledFMMove::UNCOUPLE) {
+            // Lock ops at the coupling boundary to prevent immediate reversal.
+            // The tensor that's being coupled/uncoupled flows from ga to gb —
+            // lock its producer in ga and consumers in gb.
+            if (move.tensor < cp.part.dag->tensor_consumers.size()) {
+                int prod = cp.part.dag->tensor_producer[move.tensor];
+                if (prod >= 0) extra_locks.push_back((size_t)prod);
+                for (auto cop : cp.part.dag->tensor_consumers[move.tensor])
+                    extra_locks.push_back(cop);
+            }
         }
 
         double total_before = cp.total_cost();
@@ -217,8 +236,8 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
     if (g_verbose) {
         static const char* type_names[] = {
             "STEAL","EJECT","RECOMP","MERGE","INT_EJECT",
-            "SPLIT","T_MERGE","T_EXTRACT","DE_RECOMP",
-            "COUPLE","UNCOUPLE","RFS"
+            "SPLIT","T_MERGE","T_EXTRACT","DE_RECOMP","FORCE_RECOMP",
+            "COUPLE","UNCOUPLE","RFS","FORCE_RET"
         };
         std::cerr << "      Coupled FM pass: " << fm_iters << " iters, "
                   << result.moves_applied << " applied ("

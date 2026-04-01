@@ -41,7 +41,10 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to);
 
 // Apply: Kahn's check → mutate → return affected groups.
 // Returns {} if Kahn's fails or cost re-evaluation fails.
-std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to);
+// When both precomputed costs are >= 0, skip re-evaluation and use them directly.
+std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
+                              double precomputed_from_cost = -1.0,
+                              double precomputed_to_cost = -1.0);
 
 // ============================================================================
 // MERGE: fuse two groups (gb absorbed into ga, gb killed)
@@ -57,7 +60,8 @@ EvalResult eval_merge(const Partition& p, size_t ga, size_t gb);
 
 // Apply: Kahn's check → mutate → return affected groups.
 // Returns {} if Kahn's fails or cost re-evaluation fails.
-std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb);
+// When precomputed_cost >= 0, skip re-evaluation and use that value directly.
+std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precomputed_cost = -1.0);
 
 // ============================================================================
 // EJECT: remove a single op from a group, creating a singleton + remainder(s)
@@ -72,7 +76,8 @@ std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb);
 // Does NOT check feasibility (caller already called part.eval_eject).
 // ============================================================================
 
-std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga);
+std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
+                              const Partition::EjectResult* precomputed = nullptr);
 
 // ============================================================================
 // SPLIT: split a group at a bridge edge into two groups
@@ -85,7 +90,8 @@ std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga);
 //   - Re-evaluates split to get current sides
 // ============================================================================
 
-std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga);
+std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
+                              const Partition::SplitResult* precomputed = nullptr);
 
 // ============================================================================
 // DE_RECOMPUTE: remove a recomputed op from a group.
@@ -95,14 +101,18 @@ std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga);
 // Validates:
 //   - Op exists in ga and in at least one other alive group
 //   - No ephemeral gap (output tensors still available as boundary outputs)
-//   - Acyclicity via acyclic_de_recompute_local (eval-time)
+//
+// Does NOT check acyclicity (caller's responsibility — call
+// acyclic_de_recompute_local before eval_de_recompute).
 // ============================================================================
 
 // Eval: check if op can be removed and compute saving.
 EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op);
 
 // Apply: validate + remove op from group. Returns affected groups.
-std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op);
+// When precomputed_cost >= 0, skip re-evaluation and use that value directly.
+std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op,
+                                     double precomputed_cost = -1.0);
 
 // ============================================================================
 // RECOMPUTE: copy op into a second group (op stays in its original group too)
@@ -114,7 +124,8 @@ std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op);
 
 EvalResult eval_recompute(const Partition& p, size_t op, size_t into);
 
-std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into);
+std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into,
+                                  double precomputed_cost = -1.0);
 
 // ============================================================================
 // TENSOR_MERGE: merge all groups that touch a tensor into one
@@ -129,7 +140,8 @@ EvalResult eval_tensor_merge(const Partition& p,
                               const std::vector<size_t>& group_list);
 
 std::set<size_t> apply_tensor_merge(Partition& p,
-                                     const std::vector<size_t>& group_list);
+                                     const std::vector<size_t>& group_list,
+                                     double precomputed_cost = -1.0);
 
 // ============================================================================
 // TENSOR_EXTRACT: pull ops out of multiple groups into a new group
@@ -146,6 +158,23 @@ EvalResult eval_tensor_extract(const Partition& p,
 
 std::set<size_t> apply_tensor_extract(Partition& p,
                                        const std::set<size_t>& extract_ops,
-                                       const std::vector<size_t>& source_groups);
+                                       const std::vector<size_t>& source_groups,
+                                       double precomputed_extract_cost = -1.0);
+
+// FORCE_RECOMPUTE: for tensor t with producer P and consumers [C_i],
+// extract P and each C_i from their current groups, create {P, C_i} pairs.
+// T becomes ephemeral in each new group.
+struct ForceRecomputeResult {
+    bool   feasible = false;
+    double saving   = -1e18;
+    size_t prod_op  = SIZE_MAX;
+    std::vector<size_t> consumer_ops;   // feasible consumers
+    std::vector<double> pair_costs;     // cost of each {P, C_i}
+};
+
+ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id);
+
+std::set<size_t> apply_force_recompute(Partition& p, size_t tensor_id,
+                                        const ForceRecomputeResult& eval);
 
 } // namespace partition_moves

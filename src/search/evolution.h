@@ -37,6 +37,12 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng);
 // Remove a recomputation group where every op is covered by another group.
 Partition mutate_de_recompute(Partition part, std::mt19937& rng);
 
+// Force recomputation: pick a tensor T with ≥2 consumers produced by an op P.
+// Extract P and each consumer C_i from their current groups, create new groups
+// {P, C_i} so T becomes ephemeral (never touches slow memory).  Remaining ops
+// in the original groups stay as-is (split into connected components if needed).
+Partition mutate_force_recompute(Partition part, std::mt19937& rng);
+
 // Compound mutation: apply N random mutations (mix of all types).
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng);
 
