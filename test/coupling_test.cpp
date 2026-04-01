@@ -49,7 +49,7 @@ static Problem make_chain6_tight() {
 
 // Trivial partition (one group per op), finalized.
 // Returns (part, feasibly_ret).
-static std::pair<Partition, std::set<size_t>>
+static std::pair<Partition, FlatSet<size_t>>
 make_trivial_finalized(const Problem& p, const DAG& d) {
     Partition part = Partition::trivial(p, d);
     part.finalize();
@@ -306,7 +306,7 @@ void test_to_solution_no_coupling() {
     for (size_t i = 0; i < sol.num_steps(); i++)
         CHECK("retain_these empty", sol.step(i).retain_these.empty());
     // All ops covered.
-    std::set<size_t> cov;
+    FlatSet<size_t> cov;
     for (size_t i = 0; i < sol.num_steps(); i++)
         for (auto op : sol.step(i).subgraph.ops()) cov.insert(op);
     CHECK_EQ("all 6 ops", cov.size(), 6);
@@ -381,7 +381,7 @@ void test_search_no_retain() {
     auto p = make_chain6_tight();
     auto d = DAG::build(p);
     auto [part, fr] = make_trivial_finalized(p, d);
-    std::set<size_t> empty_fr;
+    FlatSet<size_t> empty_fr;
 
     auto sol = coupling_search(p, d, std::move(part), empty_fr,
                                Clock::now() + std::chrono::milliseconds(100));
@@ -403,7 +403,7 @@ void test_search_valid_with_retain() {
     CHECK("valid", vr.valid);
     if (!vr.valid) std::cout << "    error: " << vr.error << "\n";
 
-    std::set<size_t> cov;
+    FlatSet<size_t> cov;
     for (size_t i = 0; i < sol.num_steps(); i++)
         for (auto op : sol.step(i).subgraph.ops()) cov.insert(op);
     CHECK_EQ("all 6 ops", cov.size(), 6);

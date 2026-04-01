@@ -44,9 +44,9 @@ public:
   const std::vector<size_t> &ops() const { return ops_; }
   size_t num_ops() const { return ops_.size(); }
 
-  const std::set<size_t> &boundary_inputs() const { return boundary_inputs_; }
-  const std::set<size_t> &boundary_outputs() const { return boundary_outputs_; }
-  const std::set<size_t> &ephemeral() const { return ephemeral_; }
+  const FlatSet<size_t> &boundary_inputs() const { return boundary_inputs_; }
+  const FlatSet<size_t> &boundary_outputs() const { return boundary_outputs_; }
+  const FlatSet<size_t> &ephemeral() const { return ephemeral_; }
 
   // Dimensions of boundary outputs (all must match).
   int64_t output_width() const { return out_W_; }
@@ -77,23 +77,23 @@ public:
   // --- Feasibility ---
 
   int64_t working_set(const TileConfig &cfg,
-                      const std::set<size_t> &retained_from_prev = {},
-                      const std::set<size_t> &retain_these = {}) const;
+                      const FlatSet<size_t> &retained_from_prev = {},
+                      const FlatSet<size_t> &retain_these = {}) const;
 
   bool is_feasible(const TileConfig &cfg,
-                   const std::set<size_t> &retained_from_prev = {},
-                   const std::set<size_t> &retain_these = {}) const;
+                   const FlatSet<size_t> &retained_from_prev = {},
+                   const FlatSet<size_t> &retain_these = {}) const;
 
   // --- Cost evaluation ---
 
   CostResult compute_cost(const TileConfig &cfg,
-                          const std::set<size_t> &retained_from_prev = {},
-                          const std::set<size_t> &retain_these = {}) const;
+                          const FlatSet<size_t> &retained_from_prev = {},
+                          const FlatSet<size_t> &retain_these = {}) const;
 
   // --- Parameter enumeration ---
 
-  CostResult best_cost(const std::set<size_t> &retained_from_prev = {},
-                       const std::set<size_t> &retain_these = {}) const;
+  CostResult best_cost(const FlatSet<size_t> &retained_from_prev = {},
+                       const FlatSet<size_t> &retain_these = {}) const;
 
 
   Subgraph() = default;
@@ -103,9 +103,9 @@ private:
   const DAG *dag_ = nullptr;
   std::vector<size_t> ops_;
 
-  std::set<size_t> boundary_inputs_;
-  std::set<size_t> boundary_outputs_;
-  std::set<size_t> ephemeral_;
+  FlatSet<size_t> boundary_inputs_;
+  FlatSet<size_t> boundary_outputs_;
+  FlatSet<size_t> ephemeral_;
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;

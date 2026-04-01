@@ -23,7 +23,7 @@
 // ============================================================================
 
 static Partition greedy_merge_restricted(
-    Partition part, const std::set<size_t>& allowed_ops)
+    Partition part, const FlatSet<size_t>& allowed_ops)
 {
     bool improved = true;
     int passes = 0;
@@ -44,7 +44,7 @@ static Partition greedy_merge_restricted(
         // Try all pairs of eligible adjacent groups
         double best_saving = 0.001;  // minimum threshold
         size_t best_ga = SIZE_MAX, best_gb = SIZE_MAX;
-        std::set<size_t> best_merged;
+        FlatSet<size_t> best_merged;
         double best_cost = 0;
 
         for (size_t i = 0; i < eligible.size(); i++) {
@@ -52,7 +52,7 @@ static Partition greedy_merge_restricted(
             if (!part.groups[ga].alive) continue;
 
             // Find adjacent eligible groups via boundary ops
-            std::set<size_t> adj;
+            FlatSet<size_t> adj;
             for (auto op : part.groups[ga].ops)
                 for (auto nbr : part.dag->op_neighbors[op])
                     if (allowed_ops.count(nbr))
@@ -70,7 +70,7 @@ static Partition greedy_merge_restricted(
                 if (!part.acyclic_merge_local(ga, gb)) continue;
 
                 // Evaluate merge
-                std::set<size_t> merged = part.groups[ga].ops;
+                FlatSet<size_t> merged = part.groups[ga].ops;
                 merged.insert(part.groups[gb].ops.begin(),
                               part.groups[gb].ops.end());
                 double mc = part.eval_set(merged);
@@ -109,11 +109,11 @@ static Partition greedy_merge_restricted(
 // ============================================================================
 
 static std::unordered_map<size_t, size_t> compute_bijection(
-    const std::set<size_t>& src, const std::set<size_t>& dst,
+    const FlatSet<size_t>& src, const FlatSet<size_t>& dst,
     const Problem& prob, const DAG& dag, const MerkleHashes& merkle)
 {
     // Compute local topo depth within a component (BFS from sources)
-    auto local_depths = [&](const std::set<size_t>& comp)
+    auto local_depths = [&](const FlatSet<size_t>& comp)
         -> std::unordered_map<size_t, size_t>
     {
         std::unordered_map<size_t, size_t> depth;
@@ -150,7 +150,7 @@ static std::unordered_map<size_t, size_t> compute_bijection(
     // Uses merkle.combined (local structural context) instead of global
     // topo position to avoid cross-wiring when global topo order interleaves
     // parallel components.
-    auto make_ranked = [&](const std::set<size_t>& comp)
+    auto make_ranked = [&](const FlatSet<size_t>& comp)
         -> std::vector<std::pair<std::tuple<size_t, size_t, size_t>, size_t>>
     {
         auto depths = local_depths(comp);
@@ -217,7 +217,7 @@ std::vector<Partition> init_from_patterns(
 
         // Extract the groups found for the representative
         struct GroupInfo {
-            std::set<size_t> ops;
+            FlatSet<size_t> ops;
             double cost;
         };
         std::vector<GroupInfo> rep_groups;
@@ -244,7 +244,7 @@ std::vector<Partition> init_from_patterns(
         full.cache = cache;
 
         // Kill singleton groups for ops covered by pattern groups
-        std::set<size_t> covered_ops;
+        FlatSet<size_t> covered_ops;
 
         // Add representative groups (already evaluated)
         for (auto& rg : rep_groups) {
@@ -258,7 +258,7 @@ std::vector<Partition> init_from_patterns(
                                          prob, dag, merkle);
 
             for (auto& rg : rep_groups) {
-                std::set<size_t> mapped;
+                FlatSet<size_t> mapped;
                 for (auto op : rg.ops) {
                     auto it = bij.find(op);
                     if (it != bij.end())
@@ -310,7 +310,7 @@ std::vector<Partition> init_from_patterns(
                   << pat.block_size << " ops\n";
 
         // Step 1: Solve the first block
-        std::set<size_t> rep_set(pat.representative.begin(),
+        FlatSet<size_t> rep_set(pat.representative.begin(),
                                   pat.representative.end());
 
         Partition rep_part = Partition::trivial(prob, dag);
@@ -319,7 +319,7 @@ std::vector<Partition> init_from_patterns(
 
         // Extract groups
         struct GroupInfo {
-            std::set<size_t> ops;
+            FlatSet<size_t> ops;
             double cost;
         };
         std::vector<GroupInfo> rep_groups;
@@ -339,7 +339,7 @@ std::vector<Partition> init_from_patterns(
         // Series bijection: block[0][j] ↔ block[i][j]
         Partition full = Partition::trivial(prob, dag);
         full.cache = cache;
-        std::set<size_t> covered_ops;
+        FlatSet<size_t> covered_ops;
 
         for (size_t bi = 0; bi < pat.num_blocks; bi++) {
             std::map<size_t, size_t> bij;
@@ -347,7 +347,7 @@ std::vector<Partition> init_from_patterns(
                 bij[pat.blocks[0][j]] = pat.blocks[bi][j];
 
             for (auto& rg : rep_groups) {
-                std::set<size_t> mapped;
+                FlatSet<size_t> mapped;
                 for (auto op : rg.ops) {
                     auto it = bij.find(op);
                     if (it != bij.end())

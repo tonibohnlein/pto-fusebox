@@ -51,7 +51,7 @@ struct TestGraph {
     }
 
     // Set up op_to_groups for a given partition (list of groups)
-    void set_groups(const std::vector<std::set<size_t>>& groups) {
+    void set_groups(const std::vector<FlatSet<size_t>>& groups) {
         op_to_groups.assign(prob.num_ops(), {});
         for (size_t gi = 0; gi < groups.size(); gi++)
             for (auto op : groups[gi])
@@ -351,7 +351,7 @@ void test_split_move_delta() {
     g.set_groups({{0, 1, 2}});
     std::vector<bool> alive = {true, true};  // G0 alive, G1 (virtual) alive
 
-    std::set<size_t> split_ops = {2};
+    FlatSet<size_t> split_ops = {2};
     MoveDelta delta;
     delta.type = MoveDelta::SPLIT_MOVE;
     delta.ga = 0;  // source
@@ -361,7 +361,7 @@ void test_split_move_delta() {
 
     // Split {0} into new group → G0={1,2}, G1={0}
     // Acyclic: G1={0} → G0={1,2}
-    std::set<size_t> split_ops2 = {0};
+    FlatSet<size_t> split_ops2 = {0};
     MoveDelta delta2;
     delta2.type = MoveDelta::SPLIT_MOVE;
     delta2.ga = 0;
@@ -371,7 +371,7 @@ void test_split_move_delta() {
 
     // Split {0,2} from {0,1,2} → G0={1}, G1={0,2}
     // {0,2} needs T1 from {1}, {1} needs T0 from {0,2} → CYCLE
-    std::set<size_t> split_ops3 = {0, 2};
+    FlatSet<size_t> split_ops3 = {0, 2};
     MoveDelta delta3;
     delta3.type = MoveDelta::SPLIT_MOVE;
     delta3.ga = 0;
@@ -438,7 +438,7 @@ void test_extract_move() {
     g.set_groups({{0, 1}, {2, 3}});
     std::vector<bool> alive = {true, true, true};  // G0, G1, G2(virtual)
 
-    std::set<size_t> extract = {1, 2};
+    FlatSet<size_t> extract = {1, 2};
     std::vector<size_t> sources = {0, 1};
     MoveDelta delta;
     delta.type = MoveDelta::EXTRACT_MOVE;
@@ -450,7 +450,7 @@ void test_extract_move() {
     // Extract {0,3} from G0 and G1 → G2={0,3}
     // G0={1}, G1={2}, G2={0,3}
     // G2 depends on G0 (T1) and G1 (T2), G0 depends on G2 (T0) → CYCLE
-    std::set<size_t> extract2 = {0, 3};
+    FlatSet<size_t> extract2 = {0, 3};
     MoveDelta delta2;
     delta2.type = MoveDelta::EXTRACT_MOVE;
     delta2.gb = 2;

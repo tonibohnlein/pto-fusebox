@@ -19,7 +19,7 @@
 // ============================================================================
 
 struct SymmetricPattern {
-    std::vector<std::set<size_t>> components;   // isomorphic components
+    std::vector<FlatSet<size_t>> components;   // isomorphic components
     size_t symmetry;                             // == components.size()
 
     size_t component_size() const {
@@ -186,9 +186,9 @@ public:
 
         struct SuperNode {
             size_t id;
-            std::set<size_t> orbit_ids;
-            std::set<size_t> all_ops;
-            std::vector<std::set<size_t>> components;
+            FlatSet<size_t> orbit_ids;
+            FlatSet<size_t> all_ops;
+            std::vector<FlatSet<size_t>> components;
             size_t symmetry;
             int top_min, top_max;
             int bot_min, bot_max;
@@ -223,8 +223,8 @@ public:
         // critical: co-consumer edges (ops sharing a common input) would
         // collapse parallel heads that read the same shared tensor into
         // one component, destroying the symmetry we're trying to detect.
-        auto compute_cc = [&](const std::set<size_t>& ops)
-            -> std::vector<std::set<size_t>>
+        auto compute_cc = [&](const FlatSet<size_t>& ops)
+            -> std::vector<FlatSet<size_t>>
         {
             // Build undirected adjacency from tensor producer→consumer
             // restricted to ops in the set. Use unordered_map to avoid
@@ -243,11 +243,11 @@ public:
                 }
             }
 
-            std::vector<std::set<size_t>> result;
-            std::set<size_t> visited;
+            std::vector<FlatSet<size_t>> result;
+            FlatSet<size_t> visited;
             for (auto seed : ops) {
                 if (visited.count(seed)) continue;
-                std::set<size_t> comp;
+                FlatSet<size_t> comp;
                 std::vector<size_t> stack = {seed};
                 visited.insert(seed);
                 while (!stack.empty()) {
@@ -280,7 +280,7 @@ public:
         // are identical — the difference (Op4→Op15 vs Op14→Op16) is
         // external and irrelevant for partition isomorphism.
         // ============================================================
-        auto component_hash = [&](const std::set<size_t>& comp) -> size_t {
+        auto component_hash = [&](const FlatSet<size_t>& comp) -> size_t {
             if (comp.empty()) return 0;
 
             // Build local init hash per op (type + cost + shapes)
@@ -446,7 +446,7 @@ public:
         };
 
         // Compute symmetry = size of the largest isomorphism class
-        auto compute_symmetry = [&](const std::vector<std::set<size_t>>& comps)
+        auto compute_symmetry = [&](const std::vector<FlatSet<size_t>>& comps)
             -> size_t
         {
             if (comps.empty()) return 0;
@@ -497,7 +497,7 @@ public:
 
         // Merge two super-nodes, creating a new one
         auto do_merge = [&](size_t id_a, size_t id_b,
-                            std::vector<std::set<size_t>> comps,
+                            std::vector<FlatSet<size_t>> comps,
                             size_t sym) -> size_t
         {
             auto& a = snodes[id_a];
@@ -588,7 +588,7 @@ public:
                 auto pairs = get_adjacent_pairs();
 
                 size_t best_a = SIZE_MAX, best_b = SIZE_MAX;
-                std::vector<std::set<size_t>> best_comps;
+                std::vector<FlatSet<size_t>> best_comps;
                 size_t best_sym = 0;
                 size_t best_comp_size = 0;
                 size_t best_ops = 0;
@@ -602,7 +602,7 @@ public:
                         if (a.symmetry <= 1) continue;
                     }
 
-                    std::set<size_t> union_ops = a.all_ops;
+                    FlatSet<size_t> union_ops = a.all_ops;
                     union_ops.insert(b.all_ops.begin(), b.all_ops.end());
                     auto comps = compute_cc(union_ops);
                     size_t sym = compute_symmetry(comps);
@@ -682,7 +682,7 @@ public:
         // Compute the union of all ops per pattern
         struct PatternInfo {
             size_t idx;
-            std::set<size_t> all_ops;
+            FlatSet<size_t> all_ops;
         };
         std::vector<PatternInfo> pinfos;
         for (size_t i = 0; i < all_tracked.size(); i++) {
@@ -731,7 +731,7 @@ public:
                     if (dup[j]) continue;
                     if (patterns[i].symmetry != patterns[j].symmetry) continue;
                     // Same ops?
-                    std::set<size_t> ops_i, ops_j;
+                    FlatSet<size_t> ops_i, ops_j;
                     for (auto& c : patterns[i].components)
                         ops_i.insert(c.begin(), c.end());
                     for (auto& c : patterns[j].components)

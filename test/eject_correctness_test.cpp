@@ -54,7 +54,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -80,7 +80,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -103,7 +103,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -675,7 +675,7 @@ void test_eject_from_pair() {
     // Remainder should be {op0} (single component)
     CHECK("pair: 1 remainder component", er.remainder_components.size() == 1);
     if (!er.remainder_components.empty()) {
-        CHECK("pair: remainder is {op0}", er.remainder_components[0] == std::set<size_t>{0});
+        CHECK("pair: remainder is {op0}", er.remainder_components[0] == FlatSet<size_t>{0});
     }
 
     // Verify costs
@@ -698,14 +698,14 @@ void test_eject_from_pair() {
 
     // G0 should now be {op0}
     CHECK("pair: G0 alive", ctx.part.groups[0].alive);
-    CHECK("pair: G0 is {op0}", ctx.part.groups[0].ops == std::set<size_t>{0});
+    CHECK("pair: G0 is {op0}", ctx.part.groups[0].ops == FlatSet<size_t>{0});
     CHECK_CLOSE("pair: G0 cost", ctx.part.groups[0].cost, cost_op0);
 
     // New singleton for op1
     bool found_op1_singleton = false;
     for (size_t i = 1; i < ctx.part.groups.size(); i++) {
         if (ctx.part.groups[i].alive &&
-            ctx.part.groups[i].ops == std::set<size_t>{1}) {
+            ctx.part.groups[i].ops == FlatSet<size_t>{1}) {
             found_op1_singleton = true;
             CHECK_CLOSE("pair: singleton cost", ctx.part.groups[i].cost, cost_op1);
             break;
@@ -726,7 +726,7 @@ void test_eject_from_pair() {
     CHECK("pair_reverse: 1 remainder component", er2.remainder_components.size() == 1);
     if (!er2.remainder_components.empty()) {
         CHECK("pair_reverse: remainder is {op1}",
-              er2.remainder_components[0] == std::set<size_t>{1});
+              er2.remainder_components[0] == FlatSet<size_t>{1});
     }
 }
 
@@ -858,14 +858,14 @@ void test_eject_precomputed() {
     CHECK("precomputed: B acyclic", ctxB.part.is_acyclic());
 
     // Same group structure: collect alive op sets from both
-    std::vector<std::set<size_t>> groups_A, groups_B;
+    std::vector<FlatSet<size_t>> groups_A, groups_B;
     for (auto& g : ctxA.part.groups)
         if (g.alive) groups_A.push_back(g.ops);
     for (auto& g : ctxB.part.groups)
         if (g.alive) groups_B.push_back(g.ops);
 
     // Sort for comparison
-    auto cmp = [](const std::set<size_t>& a, const std::set<size_t>& b) {
+    auto cmp = [](const FlatSet<size_t>& a, const FlatSet<size_t>& b) {
         return a < b;
     };
     std::sort(groups_A.begin(), groups_A.end(), cmp);

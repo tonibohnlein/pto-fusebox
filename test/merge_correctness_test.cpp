@@ -51,7 +51,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -77,7 +77,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -100,7 +100,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -406,7 +406,7 @@ void test_merge_creates_ephemeral_gap_rejected() {
 
     ctx.build_partition({{0}, {1}, {2}});
 
-    std::set<size_t> merged = {0, 1};
+    FlatSet<size_t> merged = {0, 1};
     bool gap = ctx.part.creates_ephemeral_gap(merged, 0, 1);
     CHECK("gap: creates_ephemeral_gap detected", gap);
 

@@ -16,7 +16,7 @@ class CostCache;
 // t is a boundary input  of ops if consumed inside AND not produced inside.
 // ============================================================================
 
-inline bool is_boundary_output_of(const std::set<size_t>& ops, size_t t, const DAG& dag) {
+inline bool is_boundary_output_of(const FlatSet<size_t>& ops, size_t t, const DAG& dag) {
     if (t >= dag.tensor_producer.size()) return false;
     int prod = dag.tensor_producer[t];
     if (prod < 0 || !ops.count((size_t)prod)) return false;
@@ -25,7 +25,7 @@ inline bool is_boundary_output_of(const std::set<size_t>& ops, size_t t, const D
     return true;
 }
 
-inline bool is_boundary_input_of(const std::set<size_t>& ops, size_t t, const DAG& dag) {
+inline bool is_boundary_input_of(const FlatSet<size_t>& ops, size_t t, const DAG& dag) {
     if (t >= dag.tensor_producer.size()) return false;
     int prod = dag.tensor_producer[t];
     if (prod >= 0 && ops.count((size_t)prod)) return false;
@@ -55,7 +55,7 @@ struct Partition {
 
     // -------------------------------------------------------------------------
     struct Group {
-        std::set<size_t> ops;
+        FlatSet<size_t> ops;
         double           cost     = 1e18;   // latency from best_cost(), no retention
         bool             alive    = true;
         int              gen      = 0;
@@ -74,8 +74,8 @@ struct Partition {
     // Indices into groups[] (sparse — dead groups have empty pred/succ sets).
     // Rebuilt by rebuild_group_dag() after any structural mutation.
     // -------------------------------------------------------------------------
-    std::vector<std::set<size_t>> group_preds;   // group → predecessor groups
-    std::vector<std::set<size_t>> group_succs;   // group → successor groups
+    std::vector<FlatSet<size_t>> group_preds;   // group → predecessor groups
+    std::vector<FlatSet<size_t>> group_succs;   // group → successor groups
     std::vector<int>              group_in_deg;   // in-degree per group
     // Boundary output tensor → alive group index.  Used by ordering algorithms
     // for retain scoring without scanning all groups.
@@ -122,11 +122,11 @@ struct Partition {
 
     bool                     is_border_op(size_t op, size_t gi) const;
     std::vector<size_t>      border_ops(size_t gi) const;
-    std::set<size_t>         boundary_neighbors(size_t gi) const;
-    std::set<size_t>         adjacent_groups(size_t gi) const;
+    FlatSet<size_t>         boundary_neighbors(size_t gi) const;
+    FlatSet<size_t>         adjacent_groups(size_t gi) const;
 
     // Connected components of an op set using DAG op_neighbors.
-    std::vector<std::set<size_t>> connected_components(const std::set<size_t>& ops) const;
+    std::vector<FlatSet<size_t>> connected_components(const FlatSet<size_t>& ops) const;
 
     // Does any alive, not-yet-scheduled group need tensor t as a boundary input?
     // scheduled[i] == true means group i has already been placed in the order.
@@ -164,13 +164,13 @@ struct Partition {
     // Is it acyclic to add a set of currently-unassigned ops into existing group gi?
     // Used during partition construction (e.g. crossover) before ops have groups.
     // Same BFS as acyclic_merge_local but new_ops have no group index yet.
-    bool acyclic_add_ops_into(const std::set<size_t>& new_ops, size_t gi) const;
+    bool acyclic_add_ops_into(const FlatSet<size_t>& new_ops, size_t gi) const;
 
     // Is it acyclic to extract extract_ops into a virtual new group (TENSOR_EXTRACT)?
     // A cycle exists iff any external group is forward-reachable from the new group
     // and can also reach back into it.  BFS from gnew's external successors, flag
     // cycle if we reach a group that produces something consumed by extract_ops.
-    bool acyclic_extract_local(const std::set<size_t>& extract_ops) const;
+    bool acyclic_extract_local(const FlatSet<size_t>& extract_ops) const;
 
     // Is it acyclic to move op from ga into gb?
     // New edges: gp→gb for each input-producer group gp, gb→gc for each
@@ -190,19 +190,19 @@ struct Partition {
     // The split exposes internal tensors as boundary edges between the two
     // sides.  A cycle exists iff any new cross-edge closes a loop through
     // external groups (side_a → external → side_b or vice versa).
-    bool acyclic_split_local(const std::set<size_t>& side_a,
-                              const std::set<size_t>& side_b,
+    bool acyclic_split_local(const FlatSet<size_t>& side_a,
+                              const FlatSet<size_t>& side_b,
                               size_t ga) const;
 
     // --- Evaluation ---
 
-    double eval_set(const std::set<size_t>& ops) const;
+    double eval_set(const FlatSet<size_t>& ops) const;
 
     struct EjectResult {
         bool   feasible = false;
         double saving   = -1e18;
         double singleton_cost = 1e18;
-        std::vector<std::set<size_t>> remainder_components;
+        std::vector<FlatSet<size_t>> remainder_components;
         std::vector<double>           component_costs;
     };
 
@@ -213,7 +213,7 @@ struct Partition {
     // Add a new group.  sg and cfg are optional — when provided (e.g. retrieved
     // from CostCache::evaluate_entry) the values are stored directly, avoiding a
     // redundant Subgraph::create on the caller side.
-    size_t add_group(std::set<size_t> ops, double cost,
+    size_t add_group(FlatSet<size_t> ops, double cost,
                      std::optional<Subgraph> sg = std::nullopt,
                      TileConfig cfg = {});
 
@@ -223,7 +223,7 @@ struct Partition {
     struct SplitResult {
         bool             feasible = false;
         double           saving   = -1e18;
-        std::set<size_t> side_a, side_b;
+        FlatSet<size_t> side_a, side_b;
         double           cost_a = 1e18, cost_b = 1e18;
     };
 
@@ -232,11 +232,11 @@ struct Partition {
 
     // --- Ephemeral gap check ---
 
-    bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+    bool creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
                                size_t exclude_ga = SIZE_MAX,
                                size_t exclude_gb = SIZE_MAX) const;
 
-    bool creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+    bool creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
                                const std::vector<size_t>& exclude_groups) const;
 
     // Check whether splitting group `exclude_gi` into `components` creates a gap.
@@ -245,19 +245,19 @@ struct Partition {
     // required because a tensor might be available from one sibling component
     // but not from any existing group.
     bool split_creates_ephemeral_gap(
-        const std::vector<std::set<size_t>>& components,
+        const std::vector<FlatSet<size_t>>& components,
         size_t exclude_gi) const {
-        return split_creates_ephemeral_gap(components, std::set<size_t>{exclude_gi});
+        return split_creates_ephemeral_gap(components, FlatSet<size_t>{exclude_gi});
     }
 
     // General form: exclude multiple groups (e.g., for STEAL replacing ga+gb).
     bool split_creates_ephemeral_gap(
-        const std::vector<std::set<size_t>>& components,
-        const std::set<size_t>& excluded_groups) const;
+        const std::vector<FlatSet<size_t>>& components,
+        const FlatSet<size_t>& excluded_groups) const;
 
     // Merge ops into an existing group, updating op_to_groups_ incrementally.
     // Does NOT recompute cost — caller must set groups[gi].cost.
-    void merge_ops_into(size_t gi, const std::set<size_t>& ops) {
+    void merge_ops_into(size_t gi, const FlatSet<size_t>& ops) {
         if (op_to_groups_.size() < prob->num_ops())
             op_to_groups_.resize(prob->num_ops());
         for (auto op : ops) {

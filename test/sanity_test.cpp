@@ -64,7 +64,7 @@ static bool validate_partition(const Partition& part, const Problem& prob, const
 static Solution partition_to_solution(const Problem& prob, const DAG& dag,
                                        const Partition& part) {
     // Collect alive groups
-    struct GInfo { size_t idx; std::set<size_t> ops; Subgraph sg; CostResult cost; };
+    struct GInfo { size_t idx; FlatSet<size_t> ops; Subgraph sg; CostResult cost; };
     std::vector<GInfo> groups;
     for (size_t i = 0; i < part.groups.size(); i++) {
         if (!part.groups[i].alive) continue;
@@ -249,7 +249,7 @@ void test_move_generation() {
 
             // Verify gain accuracy for merge moves (cheap to check)
             if (m.type == FMMove::MERGE) {
-                std::set<size_t> merged = part.groups[m.ga].ops;
+                FlatSet<size_t> merged = part.groups[m.ga].ops;
                 merged.insert(part.groups[m.gb].ops.begin(), part.groups[m.gb].ops.end());
                 double actual = part.groups[m.ga].cost + part.groups[m.gb].cost - part.eval_set(merged);
                 if (std::abs(m.saving - actual) > 0.5) bad_gains++;
@@ -285,7 +285,7 @@ void test_fm_best_move_for() {
     part.rebuild_index();
 
     int valid_moves = 0, invalid_moves = 0;
-    std::set<size_t> locked;
+    FlatSet<size_t> locked;
 
     for (size_t op = 0; op < p.num_ops(); op++) {
         auto m = best_move_for(part, op, locked);

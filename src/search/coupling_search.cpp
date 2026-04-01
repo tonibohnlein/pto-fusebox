@@ -53,7 +53,7 @@ void CoupledPartition::invalidate_couplings() {
         //  retained edge stale and causing incorrect working-set inflation.)
         auto it = retained.find({g, h});
         if (it == retained.end()) continue;
-        std::set<size_t> valid;
+        FlatSet<size_t> valid;
         for (auto t : it->second)
             if (is_boundary_output_of(part.groups[g].ops, t, dag) &&
                 is_boundary_input_of(part.groups[h].ops, t, dag))
@@ -135,16 +135,16 @@ std::vector<size_t> CoupledPartition::chain_of(size_t g) const {
     return result;
 }
 
-std::set<size_t> CoupledPartition::entering_for(size_t g) const {
+FlatSet<size_t> CoupledPartition::entering_for(size_t g) const {
     if (g >= prev_group.size() || prev_group[g] == SIZE_MAX) return {};
     auto it = retained.find({prev_group[g], g});
-    return (it != retained.end()) ? it->second : std::set<size_t>{};
+    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
 }
 
-std::set<size_t> CoupledPartition::retain_for(size_t g) const {
+FlatSet<size_t> CoupledPartition::retain_for(size_t g) const {
     if (g >= next_group.size() || next_group[g] == SIZE_MAX) return {};
     auto it = retained.find({g, next_group[g]});
-    return (it != retained.end()) ? it->second : std::set<size_t>{};
+    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
 }
 
 // ============================================================================
@@ -201,7 +201,7 @@ Solution CoupledPartition::to_solution() const {
     // part.group_succs, which may be stale after coupling mutations).
     // Edge h1→h2 if any group in chain(h1) produces a tensor consumed by
     // a group in chain(h2).  Edges within the same chain are skipped.
-    std::map<size_t, std::set<size_t>> chain_succs;
+    std::map<size_t, FlatSet<size_t>> chain_succs;
     std::map<size_t, int> in_deg;
     for (auto h : heads) { chain_succs[h]; in_deg[h] = 0; }
 
@@ -249,7 +249,7 @@ Solution CoupledPartition::to_solution() const {
         for (size_t g = 0; g < n; g++)
             if (part.groups[g].alive) all_g.push_back(g);
 
-        std::map<size_t, std::set<size_t>> g_succs;
+        std::map<size_t, FlatSet<size_t>> g_succs;
         std::map<size_t, int> g_indeg;
         for (auto g : all_g) { g_succs[g]; g_indeg[g] = 0; }
         for (auto g : all_g) {
@@ -363,7 +363,7 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                                  const std::vector<size_t>& chain_b) {
     if (!cp.part.prob || !cp.part.dag) return true;
 
-    std::set<size_t> in_G(chain_a.begin(), chain_a.end());
+    FlatSet<size_t> in_G(chain_a.begin(), chain_a.end());
     for (auto g : chain_b) in_G.insert(g);
 
     size_t n = cp.part.groups.size();
@@ -375,7 +375,7 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
             head_of[g] = cp.chain_head(g);
 
     // BFS over external chain heads reachable from G.
-    std::set<size_t> vis_heads;
+    FlatSet<size_t> vis_heads;
     std::queue<size_t> q;
 
     // Seed: external direct successors of each group in G.
@@ -657,7 +657,7 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
 
     auto new_ga_retain = ga_retain;
     new_ga_retain.insert(t);
-    const std::set<size_t> side_a_enter = {t};
+    const FlatSet<size_t> side_a_enter = {t};
 
     CostResult r_ga, r_side_a, r_side_b;
     if (cp.part.cache) {
@@ -687,7 +687,7 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     return {true, cost_before - (r_ga.latency + r_side_a.latency + r_side_b.latency)};
 }
 
-std::set<size_t> apply_force_retain(CoupledPartition& cp,
+FlatSet<size_t> apply_force_retain(CoupledPartition& cp,
                                      size_t ga, size_t g_dst,
                                      size_t op_a_dst, size_t op_b_dst,
                                      size_t t) {
@@ -696,7 +696,7 @@ std::set<size_t> apply_force_retain(CoupledPartition& cp,
 
     // Save g_dst's outgoing chain link (g_dst is chain head, so no prev to save).
     size_t old_next = (g_dst < cp.next_group.size()) ? cp.next_group[g_dst] : SIZE_MAX;
-    std::set<size_t> old_retain_to_next;
+    FlatSet<size_t> old_retain_to_next;
     if (old_next != SIZE_MAX) {
         auto it = cp.retained.find({g_dst, old_next});
         if (it != cp.retained.end())
@@ -773,7 +773,7 @@ std::set<size_t> apply_force_retain(CoupledPartition& cp,
     return affected;
 }
 
-std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
+FlatSet<size_t> apply_retain_force_split(CoupledPartition& cp,
                                            size_t g,
                                            size_t op_a, size_t op_b,
                                            size_t t) {
@@ -781,7 +781,7 @@ std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
 
     // Save G's outgoing chain link; incoming link stays with ga (reuses G's slot).
     size_t old_next = (g < cp.next_group.size()) ? cp.next_group[g] : SIZE_MAX;
-    std::set<size_t> old_retain_to_next;
+    FlatSet<size_t> old_retain_to_next;
     if (old_next != SIZE_MAX) {
         auto it = cp.retained.find({g, old_next});
         if (it != cp.retained.end())
@@ -874,7 +874,7 @@ std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
 // Application
 // ============================================================================
 
-std::set<size_t> apply_couple(CoupledPartition& cp,
+FlatSet<size_t> apply_couple(CoupledPartition& cp,
                                size_t ga, size_t gb, size_t t) {
     assert(cp.part.groups[ga].alive && cp.part.groups[gb].alive);
     const bool existing_edge = (ga < cp.next_group.size() && cp.next_group[ga] == gb) &&
@@ -894,7 +894,7 @@ std::set<size_t> apply_couple(CoupledPartition& cp,
     return {ga, gb};
 }
 
-std::set<size_t> apply_uncouple(CoupledPartition& cp,
+FlatSet<size_t> apply_uncouple(CoupledPartition& cp,
                                  size_t ga, size_t gb, size_t t) {
     if (ga >= cp.next_group.size() || cp.next_group[ga] != gb) return {};
     auto it = cp.retained.find({ga, gb});
@@ -915,7 +915,7 @@ std::set<size_t> apply_uncouple(CoupledPartition& cp,
 // Run one best-improving sweep over all coupling moves.
 // Returns the number of moves applied (0 = local optimum reached).
 static int coupling_greedy_pass(CoupledPartition& cp,
-                                 const std::set<size_t>& feasibly_ret,
+                                 const FlatSet<size_t>& feasibly_ret,
                                  size_t& n,
                                  CouplingTimePoint deadline) {
     const DAG& dag = *cp.part.dag;
@@ -1018,7 +1018,7 @@ static int coupling_greedy_pass(CoupledPartition& cp,
 
 // Run sweeps until no improvement. Returns final total_cost().
 double coupling_greedy_descent(CoupledPartition& cp,
-                                const std::set<size_t>& feasibly_ret,
+                                const FlatSet<size_t>& feasibly_ret,
                                 CouplingTimePoint deadline) {
     size_t n = cp.part.groups.size();
     while (SteadyClock::now() < deadline)
@@ -1028,7 +1028,7 @@ double coupling_greedy_descent(CoupledPartition& cp,
 
 Solution coupling_search(const Problem& prob, const DAG& dag,
                           Partition part,
-                          const std::set<size_t>& feasibly_ret,
+                          const FlatSet<size_t>& feasibly_ret,
                           CouplingTimePoint deadline) {
     (void)prob; (void)dag;  // embedded in part
 

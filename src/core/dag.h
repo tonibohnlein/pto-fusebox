@@ -63,8 +63,8 @@ struct DAG {
 
     // Would merging two op-sets create a cycle in the condensed DAG?
     // O(|a|*|b| / 64) word operations — no BFS.
-    bool merge_creates_cycle(const std::set<size_t>& a,
-                             const std::set<size_t>& b) const;
+    bool merge_creates_cycle(const FlatSet<size_t>& a,
+                             const FlatSet<size_t>& b) const;
 
     // Single-pair reachability test.  O(1).
     // Returns true iff there is a directed path u ->* v in the op DAG.

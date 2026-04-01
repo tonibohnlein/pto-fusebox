@@ -53,7 +53,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -79,7 +79,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -102,7 +102,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -359,7 +359,7 @@ void test_split_creates_ephemeral_gap_rejected() {
 
     if (sr.feasible) {
         // Identify the side that contains op1 and op2 (where T2 is ephemeral)
-        std::vector<std::set<size_t>> components = {sr.side_a, sr.side_b};
+        std::vector<FlatSet<size_t>> components = {sr.side_a, sr.side_b};
         bool gap = ctx.part.split_creates_ephemeral_gap(components, 0);
         CHECK("ephemeral_gap: split_creates_ephemeral_gap detected", gap);
     }
@@ -1012,7 +1012,7 @@ void test_split_preserves_external_boundaries() {
 
     // G1 is unmodified
     double cost_g1_before = ctx.part.groups[1].cost;
-    std::set<size_t> g1_ops_before = ctx.part.groups[1].ops;
+    FlatSet<size_t> g1_ops_before = ctx.part.groups[1].ops;
 
     // Split G0 at bridge (op0, op1)
     auto sr = ctx.part.eval_split(0, 1, 0);
@@ -1048,7 +1048,7 @@ void test_split_preserves_external_boundaries() {
 
         // No ephemeral gap after split (T3 is boundary output of the op2 side,
         // so G1 can still access T3)
-        std::vector<std::set<size_t>> components = {sr.side_a, sr.side_b};
+        std::vector<FlatSet<size_t>> components = {sr.side_a, sr.side_b};
         bool gap = ctx.part.split_creates_ephemeral_gap(components, 0);
         CHECK("boundaries: no ephemeral gap", !gap);
 

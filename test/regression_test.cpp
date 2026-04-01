@@ -57,7 +57,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -83,7 +83,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -105,7 +105,7 @@ struct CoupledTestContext {
         cp.init_from(std::move(part), cache.get());
     }
 
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -193,7 +193,7 @@ void test_steal_splits_disconnected_remainder() {
     CHECK("steal_split: new group created", num_groups_after > num_groups_before);
 
     // Find all alive groups containing remainder ops
-    std::set<size_t> remainder_groups;
+    FlatSet<size_t> remainder_groups;
     for (size_t gi = 0; gi < ctx.part.groups.size(); gi++) {
         if (!ctx.part.groups[gi].alive) continue;
         if (gi == 1) continue;
@@ -265,7 +265,7 @@ void test_de_recompute_splits_disconnected_remainder() {
     size_t num_groups_after = ctx.part.groups.size();
     CHECK("de_recomp_split: new group created", num_groups_after > num_groups_before);
 
-    std::set<size_t> remainder_groups;
+    FlatSet<size_t> remainder_groups;
     for (size_t gi = 0; gi < ctx.part.groups.size(); gi++) {
         if (!ctx.part.groups[gi].alive) continue;
         if (gi == 1) continue;
@@ -320,7 +320,7 @@ void test_tensor_extract_splits_disconnected_remainder() {
     size_t num_groups_before = ctx.part.groups.size();
 
     // Extract op1 from G0
-    std::set<size_t> extract_ops = {1};
+    FlatSet<size_t> extract_ops = {1};
     std::vector<size_t> source_groups = {0};
 
     auto affected = partition_moves::apply_tensor_extract(
@@ -336,7 +336,7 @@ void test_tensor_extract_splits_disconnected_remainder() {
     CHECK("tex_split: groups grew", num_groups_after > num_groups_before);
 
     // Find remainder groups (alive, not the extracted singleton)
-    std::set<size_t> remainder_groups;
+    FlatSet<size_t> remainder_groups;
     for (size_t gi = 0; gi < ctx.part.groups.size(); gi++) {
         if (!ctx.part.groups[gi].alive) continue;
         bool has_remainder_op = false;
@@ -467,7 +467,7 @@ void test_coupled_recompute_infeasible_rejected() {
     CHECK("coupled_recomp: uncoupled feasible", uncoupled < 1e17);
 
     // best_coupled_move_for_op should NOT return RECOMPUTE into G1
-    std::set<size_t> feasibly_ret = {1};
+    FlatSet<size_t> feasibly_ret = {1};
     CoupledFMMove move = best_coupled_move_for_op(ctx.cp, 2, feasibly_ret);
 
     bool recomp_into_g1 = (move.valid() &&

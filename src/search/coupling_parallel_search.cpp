@@ -99,7 +99,7 @@ static double coupling_partition_distance(const CouplingPoolEntry& a,
     // --- Component 2: Jaccard distance on retained tensor sets ---
 
     // Collect the set of all retained tensor IDs from each coupled partition.
-    std::set<size_t> ra, rb;
+    FlatSet<size_t> ra, rb;
     for (auto& [edge, tensors] : a.cp.retained)
         ra.insert(tensors.begin(), tensors.end());
     for (auto& [edge, tensors] : b.cp.retained)
@@ -125,7 +125,7 @@ static double coupling_partition_distance(const CouplingPoolEntry& a,
 
 Solution coupling_parallel_search(
     std::vector<CoupledPartition> coupled_pool,
-    const std::set<size_t>&       feasibly_ret,
+    const FlatSet<size_t>&       feasibly_ret,
     CouplingTimePoint             deadline,
     const CouplingParallelConfig& cfg)
 {

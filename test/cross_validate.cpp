@@ -15,7 +15,7 @@
 
 // Tile-by-tile simulation matching the reference evaluator's logic.
 static CostResult simulate(const Subgraph& sg, TileConfig cfg,
-    const std::set<size_t>& rfp, const std::set<size_t>& rt)
+    const FlatSet<size_t>& rfp, const FlatSet<size_t>& rt)
 {
     CostResult result;
     result.config = cfg;
@@ -29,8 +29,8 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     const auto& bo = sg.boundary_outputs();
 
     // Build internal topology
-    std::set<size_t> ops_set(sg.ops().begin(), sg.ops().end());
-    std::map<size_t, std::set<size_t>> op_succs;
+    FlatSet<size_t> ops_set(sg.ops().begin(), sg.ops().end());
+    std::map<size_t, FlatSet<size_t>> op_succs;
     for (auto i : sg.ops()) {
         op_succs[i] = {};
         for (auto t : prob.ops[i].outputs)
@@ -182,7 +182,7 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     return result;
 }
 
-struct TC { std::string nm; Problem p; std::vector<size_t> ops; TileConfig cfg; std::set<size_t> rfp, rt; };
+struct TC { std::string nm; Problem p; std::vector<size_t> ops; TileConfig cfg; FlatSet<size_t> rfp, rt; };
 
 int main() {
     int pass = 0, fail = 0;

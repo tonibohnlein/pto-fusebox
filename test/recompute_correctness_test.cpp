@@ -53,7 +53,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -79,7 +79,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -102,7 +102,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -144,7 +144,7 @@ void test_basic_recompute() {
 
     double cost_g0_before = ctx.part.groups[0].cost;
     double cost_g1_before = ctx.part.groups[1].cost;
-    std::set<size_t> g0_ops_before = ctx.part.groups[0].ops;
+    FlatSet<size_t> g0_ops_before = ctx.part.groups[0].ops;
 
     // Evaluate recompute: copy op0 into G1
     auto eval = partition_moves::eval_recompute(ctx.part, 0, 1);
@@ -454,8 +454,8 @@ void test_recompute_source_unchanged() {
     ctx.build_partition({{0}, {1, 2}, {3}});
 
     // Snapshot before
-    std::set<size_t> g0_ops_before = ctx.part.groups[0].ops;
-    std::set<size_t> g1_ops_before = ctx.part.groups[1].ops;
+    FlatSet<size_t> g0_ops_before = ctx.part.groups[0].ops;
+    FlatSet<size_t> g1_ops_before = ctx.part.groups[1].ops;
     double g0_cost_before = ctx.part.groups[0].cost;
     double g1_cost_before = ctx.part.groups[1].cost;
     bool g0_alive_before = ctx.part.groups[0].alive;

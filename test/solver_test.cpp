@@ -149,7 +149,7 @@ static void check_solution(const char* label, const Solution& sol,
              sol.total_latency(), baseline);
 
     // Coverage
-    std::set<size_t> covered;
+    FlatSet<size_t> covered;
     for (size_t i = 0; i < sol.num_steps(); i++)
         for (auto op : sol.step(i).subgraph.ops()) covered.insert(op);
     for (size_t i = 0; i < p.num_ops(); i++)
@@ -327,7 +327,7 @@ void test_phase3_coupling_valid() {
                                   Clock::now() + std::chrono::milliseconds(300));
     CHECK("coupling_search valid", result.validate().valid);
     for (size_t i = 0; i < p.num_ops(); i++) {
-        std::set<size_t> cov;
+        FlatSet<size_t> cov;
         for (size_t j = 0; j < result.num_steps(); j++)
             for (auto op : result.step(j).subgraph.ops()) cov.insert(op);
         CHECK("all ops covered", cov.count(i) > 0);
@@ -361,7 +361,7 @@ void test_phase3_coupling_no_retain() {
     // When no tensors are feasibly retainable, coupling_search returns a valid
     // solution with the same cost as the baseline (no retainment added).
     auto p = make_diamond(); DAG d = DAG::build(p);
-    std::set<size_t> fr;  // empty — no retainment
+    FlatSet<size_t> fr;  // empty — no retainment
 
     auto part = Partition::trivial(p, d);
     part.finalize();
@@ -438,7 +438,7 @@ void test_invariant_no_ephemeral_gap() {
     if (!vr.valid) std::cout << "    error: " << vr.error << "\n";
 
     // Direct check: every step's boundary inputs must be produced by a prior step
-    std::set<size_t> available(d.graph_inputs.begin(), d.graph_inputs.end());
+    FlatSet<size_t> available(d.graph_inputs.begin(), d.graph_inputs.end());
     bool topo_ok = true;
     for (size_t i = 0; i < sol.num_steps(); i++) {
         for (auto t : sol.step(i).subgraph.boundary_inputs()) {
@@ -487,7 +487,7 @@ void test_two_independent_ops() {
     auto sol = solve(p, d, deadline);
     CHECK("two independent: valid", sol.validate().valid);
 
-    std::set<size_t> covered;
+    FlatSet<size_t> covered;
     for (size_t i = 0; i < sol.num_steps(); i++)
         for (auto op : sol.step(i).subgraph.ops()) covered.insert(op);
     CHECK("Op0 covered", covered.count(0) > 0);

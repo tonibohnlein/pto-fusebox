@@ -27,7 +27,7 @@
 
 struct OrderingResult {
     std::vector<size_t>             order;            // group indices in execution order
-    std::vector<std::set<size_t>>   retain_per_step;  // what each step should retain
+    std::vector<FlatSet<size_t>>   retain_per_step;  // what each step should retain
     double                          total_latency = 0;
 };
 
@@ -41,5 +41,5 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width);
 // feasibly_ret: tensors that can physically be retained (subset of
 //   prob.retainable_tensors filtered by working-set feasibility).
 OrderingResult random_ordering(const Partition& part,
-                               const std::set<size_t>& feasibly_ret,
+                               const FlatSet<size_t>& feasibly_ret,
                                std::mt19937& rng);

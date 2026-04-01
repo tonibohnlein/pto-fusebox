@@ -293,8 +293,8 @@ std::vector<size_t> Partition::border_ops(size_t gi) const {
     return result;
 }
 
-std::set<size_t> Partition::boundary_neighbors(size_t gi) const {
-    std::set<size_t> result;
+FlatSet<size_t> Partition::boundary_neighbors(size_t gi) const {
+    FlatSet<size_t> result;
     for (auto op : groups[gi].ops)
         for (auto v : dag->op_neighbors[op])
             if (!groups[gi].ops.count(v))
@@ -302,8 +302,8 @@ std::set<size_t> Partition::boundary_neighbors(size_t gi) const {
     return result;
 }
 
-std::set<size_t> Partition::adjacent_groups(size_t gi) const {
-    std::set<size_t> result;
+FlatSet<size_t> Partition::adjacent_groups(size_t gi) const {
+    FlatSet<size_t> result;
     for (auto op : boundary_neighbors(gi))
         for (auto gj : op_to_groups_[op])
             if (gj != gi) result.insert(gj);
@@ -409,7 +409,7 @@ bool Partition::acyclic_merge_local(size_t ga, size_t gb) const {
     return acyclic_merge_local(std::vector<size_t>{ga, gb});
 }
 
-bool Partition::acyclic_add_ops_into(const std::set<size_t>& new_ops, size_t gi) const {
+bool Partition::acyclic_add_ops_into(const FlatSet<size_t>& new_ops, size_t gi) const {
     if (!prob || !dag || new_ops.empty() || gi >= groups.size()) return true;
     // Treat new_ops as a virtual group gnew (no group index yet).
     // Merged set = new_ops ∪ groups[gi].ops.
@@ -457,7 +457,7 @@ bool Partition::acyclic_add_ops_into(const std::set<size_t>& new_ops, size_t gi)
     return true;
 }
 
-bool Partition::acyclic_extract_local(const std::set<size_t>& extract_ops) const {
+bool Partition::acyclic_extract_local(const FlatSet<size_t>& extract_ops) const {
     if (!prob || !dag || extract_ops.empty()) return true;
     // gnew = virtual group containing extract_ops.
     // Seed BFS with external successors of gnew: consumer groups of extract_ops outputs
@@ -636,8 +636,8 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
     return true;
 }
 
-bool Partition::acyclic_split_local(const std::set<size_t>& side_a,
-                                     const std::set<size_t>& side_b,
+bool Partition::acyclic_split_local(const FlatSet<size_t>& side_a,
+                                     const FlatSet<size_t>& side_b,
                                      size_t ga) const {
     if (!prob || !dag) return true;
 
@@ -663,7 +663,7 @@ bool Partition::acyclic_split_local(const std::set<size_t>& side_a,
     return ok;
 }
 
-double Partition::eval_set(const std::set<size_t>& ops) const {
+double Partition::eval_set(const FlatSet<size_t>& ops) const {
     if (ops.empty()) return 1e18;
     if (cache) return cache->evaluate(ops, *prob, *dag);
     auto sg = Subgraph::create(*prob, *dag, {ops.begin(), ops.end()});
@@ -676,7 +676,7 @@ double Partition::eval_set(const std::set<size_t>& ops) const {
 // Mutation
 // ============================================================================
 
-size_t Partition::add_group(std::set<size_t> ops, double cost,
+size_t Partition::add_group(FlatSet<size_t> ops, double cost,
                              std::optional<Subgraph> sg, TileConfig cfg) {
     size_t idx = groups.size();
     Group g;
@@ -723,8 +723,8 @@ std::vector<size_t> Partition::internal_ops(size_t gi) const {
 // Connected components
 // ============================================================================
 
-std::vector<std::set<size_t>> Partition::connected_components(
-        const std::set<size_t>& ops) const {
+std::vector<FlatSet<size_t>> Partition::connected_components(
+        const FlatSet<size_t>& ops) const {
     return structural_ops::connected_components(ops, *dag);
 }
 
@@ -800,7 +800,7 @@ std::vector<std::pair<size_t,size_t>> Partition::bridge_edges(size_t gi) const {
 // Ephemeral gap check
 // ============================================================================
 
-bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
                                       size_t exclude_ga,
                                       size_t exclude_gb) const {
     if (!prob || !dag) return false;
@@ -856,10 +856,10 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
     return false;
 }
 
-bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
+bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
                                       const std::vector<size_t>& exclude_groups) const {
     if (!prob || !dag) return false;
-    std::set<size_t> excluded(exclude_groups.begin(), exclude_groups.end());
+    FlatSet<size_t> excluded(exclude_groups.begin(), exclude_groups.end());
 
     for (auto op : proposed_ops) {
         for (auto t : prob->ops[op].outputs) {
@@ -911,8 +911,8 @@ bool Partition::creates_ephemeral_gap(const std::set<size_t>& proposed_ops,
 // ============================================================================
 
 bool Partition::split_creates_ephemeral_gap(
-        const std::vector<std::set<size_t>>& components,
-        const std::set<size_t>& excluded) const {
+        const std::vector<FlatSet<size_t>>& components,
+        const FlatSet<size_t>& excluded) const {
     if (!prob || !dag) return false;
 
     for (size_t ci = 0; ci < components.size(); ci++) {

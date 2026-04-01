@@ -14,10 +14,10 @@ namespace symm_mutations {
 // ============================================================================
 
 static std::map<size_t, size_t> compute_bijection(
-    const std::set<size_t>& src, const std::set<size_t>& dst,
+    const FlatSet<size_t>& src, const FlatSet<size_t>& dst,
     const DAG& dag, const MerkleHashes& merkle)
 {
-    auto local_depths = [&](const std::set<size_t>& comp)
+    auto local_depths = [&](const FlatSet<size_t>& comp)
         -> std::map<size_t, size_t>
     {
         std::map<size_t, size_t> depth;
@@ -43,7 +43,7 @@ static std::map<size_t, size_t> compute_bijection(
         return depth;
     };
 
-    auto make_ranked = [&](const std::set<size_t>& comp)
+    auto make_ranked = [&](const FlatSet<size_t>& comp)
         -> std::vector<std::pair<std::tuple<size_t, size_t, size_t>, size_t>>
     {
         auto depths = local_depths(comp);
@@ -77,11 +77,11 @@ static std::map<size_t, size_t> compute_bijection(
 
 static void extract_and_inject(
     Partition& part,
-    const std::set<size_t>& target_ops,
-    const std::vector<std::set<size_t>>& new_groups)
+    const FlatSet<size_t>& target_ops,
+    const std::vector<FlatSet<size_t>>& new_groups)
 {
     // Phase 1: Extract target_ops from existing groups
-    std::set<size_t> affected_groups;
+    FlatSet<size_t> affected_groups;
     for (auto op : target_ops)
         for (auto gi : part.groups_of(op))
             affected_groups.insert(gi);
@@ -90,7 +90,7 @@ static void extract_and_inject(
         if (!part.groups[gi].alive) continue;
 
         // Remove target ops from this group
-        std::set<size_t> remaining;
+        FlatSet<size_t> remaining;
         for (auto op : part.groups[gi].ops)
             if (!target_ops.count(op))
                 remaining.insert(op);
@@ -156,7 +156,7 @@ static void extract_and_inject(
     if (added_in_phase3) part.rebuild_index();
 
     // Phase 4: Kill redundant singletons for ops now in multi-op injected groups
-    std::set<size_t> injected_ops;
+    FlatSet<size_t> injected_ops;
     for (auto& ng : new_groups)
         for (auto op : ng)
             injected_ops.insert(op);
@@ -193,13 +193,13 @@ static void extract_and_inject(
 // Extract current grouping config for a set of ops from a partition
 // ============================================================================
 
-std::vector<std::set<size_t>> extract_config_from_partition(
+std::vector<FlatSet<size_t>> extract_config_from_partition(
     const Partition& part,
-    const std::set<size_t>& ops)
+    const FlatSet<size_t>& ops)
 {
-    std::vector<std::set<size_t>> config;
-    std::set<size_t> seen_groups;
-    std::set<size_t> covered;
+    std::vector<FlatSet<size_t>> config;
+    FlatSet<size_t> seen_groups;
+    FlatSet<size_t> covered;
 
     for (auto op : ops) {
         for (auto gi : part.groups_of(op)) {
@@ -208,7 +208,7 @@ std::vector<std::set<size_t>> extract_config_from_partition(
             if (!part.groups[gi].alive) continue;
 
             // Collect ops from this group that are in our target set
-            std::set<size_t> group_ops;
+            FlatSet<size_t> group_ops;
             for (auto gop : part.groups[gi].ops)
                 if (ops.count(gop))
                     group_ops.insert(gop);
@@ -229,13 +229,13 @@ std::vector<std::set<size_t>> extract_config_from_partition(
 // Map a config from one component to another via bijection
 // ============================================================================
 
-static std::vector<std::set<size_t>> map_config(
-    const std::vector<std::set<size_t>>& config,
+static std::vector<FlatSet<size_t>> map_config(
+    const std::vector<FlatSet<size_t>>& config,
     const std::map<size_t, size_t>& bij)
 {
-    std::vector<std::set<size_t>> mapped;
+    std::vector<FlatSet<size_t>> mapped;
     for (auto& group : config) {
-        std::set<size_t> mg;
+        FlatSet<size_t> mg;
         bool complete = true;
         for (auto op : group) {
             auto it = bij.find(op);
@@ -312,13 +312,13 @@ std::optional<Partition> inject_representative_solution(
         auto& sol = solutions[rng() % solutions.size()];
 
         // Collect all ops in the pattern
-        std::set<size_t> all_pattern_ops;
+        FlatSet<size_t> all_pattern_ops;
         for (auto& comp : pat.components)
             for (auto op : comp)
                 all_pattern_ops.insert(op);
 
         // Build new groups: representative solution replicated to all components
-        std::vector<std::set<size_t>> new_groups;
+        std::vector<FlatSet<size_t>> new_groups;
 
         // Representative (component 0) — use solution directly
         for (auto& g : sol.groups)
@@ -345,12 +345,12 @@ std::optional<Partition> inject_representative_solution(
         auto& sol = solutions[rng() % solutions.size()];
 
         // Series: blocks[i] ops correspond positionally
-        std::set<size_t> all_pattern_ops;
+        FlatSet<size_t> all_pattern_ops;
         for (auto& block : pat.blocks)
             for (auto op : block)
                 all_pattern_ops.insert(op);
 
-        std::vector<std::set<size_t>> new_groups;
+        std::vector<FlatSet<size_t>> new_groups;
 
         // Representative (block 0) — direct
         for (auto& g : sol.groups)
@@ -416,13 +416,13 @@ std::optional<Partition> align_symmetric_reps(
         if (donor_config.empty()) return std::nullopt;
 
         // Collect all ops in the pattern
-        std::set<size_t> all_pattern_ops;
+        FlatSet<size_t> all_pattern_ops;
         for (auto& comp : pat.components)
             for (auto op : comp)
                 all_pattern_ops.insert(op);
 
         // Build new groups: donor config replicated to all components
-        std::vector<std::set<size_t>> new_groups;
+        std::vector<FlatSet<size_t>> new_groups;
 
         // Donor keeps its own config
         for (auto& g : donor_config)
@@ -452,17 +452,17 @@ std::optional<Partition> align_symmetric_reps(
         size_t donor = rng() % k;
 
         // Extract donor's config
-        std::set<size_t> donor_ops(pat.blocks[donor].begin(),
+        FlatSet<size_t> donor_ops(pat.blocks[donor].begin(),
                                     pat.blocks[donor].end());
         auto donor_config = extract_config_from_partition(part, donor_ops);
         if (donor_config.empty()) return std::nullopt;
 
-        std::set<size_t> all_pattern_ops;
+        FlatSet<size_t> all_pattern_ops;
         for (auto& block : pat.blocks)
             for (auto op : block)
                 all_pattern_ops.insert(op);
 
-        std::vector<std::set<size_t>> new_groups;
+        std::vector<FlatSet<size_t>> new_groups;
 
         // Donor keeps config
         for (auto& g : donor_config)
@@ -498,15 +498,15 @@ namespace symm_mutations {
 // Returns reconstructed step sequence in topological order.
 static std::optional<std::vector<ScheduleStep>> extract_and_inject_steps(
     std::vector<ScheduleStep> steps,
-    const std::set<size_t>& target_ops,
-    const std::vector<std::set<size_t>>& new_groups,
+    const FlatSet<size_t>& target_ops,
+    const std::vector<FlatSet<size_t>>& new_groups,
     const Problem& prob, const DAG& dag)
 {
     // Phase 1: Remove target_ops from existing steps
-    std::vector<std::set<size_t>> rebuilt_groups;
+    std::vector<FlatSet<size_t>> rebuilt_groups;
 
     for (auto& step : steps) {
-        std::set<size_t> remaining;
+        FlatSet<size_t> remaining;
         for (auto op : step.subgraph.ops())
             if (!target_ops.count(op))
                 remaining.insert(op);
@@ -535,7 +535,7 @@ static std::optional<std::vector<ScheduleStep>> extract_and_inject_steps(
     // new_groups may not include all target_ops (singletons are implicit in
     // RepSolution; map_config drops incomplete bijections).
     {
-        std::set<size_t> covered_by_rebuilt;
+        FlatSet<size_t> covered_by_rebuilt;
         for (auto& g : rebuilt_groups)
             for (auto op : g)
                 covered_by_rebuilt.insert(op);
@@ -556,7 +556,7 @@ static std::optional<std::vector<ScheduleStep>> extract_and_inject_steps(
         for (auto op : rebuilt_groups[gi])
             op_to_gi[op] = gi;
 
-    std::vector<std::set<size_t>> group_succs(k);
+    std::vector<FlatSet<size_t>> group_succs(k);
     std::vector<int> in_deg(k, 0);
     for (size_t gi = 0; gi < k; gi++) {
         for (auto op : rebuilt_groups[gi]) {
@@ -601,12 +601,12 @@ static std::optional<std::vector<ScheduleStep>> extract_and_inject_steps(
 }
 
 // Extract config from steps (like extract_config_from_partition but for steps)
-std::vector<std::set<size_t>> extract_config_from_steps(
+std::vector<FlatSet<size_t>> extract_config_from_steps(
     const std::vector<ScheduleStep>& steps,
-    const std::set<size_t>& ops)
+    const FlatSet<size_t>& ops)
 {
-    std::vector<std::set<size_t>> config;
-    std::set<size_t> seen_steps;
+    std::vector<FlatSet<size_t>> config;
+    FlatSet<size_t> seen_steps;
 
     for (auto op : ops) {
         for (size_t si = 0; si < steps.size(); si++) {
@@ -617,7 +617,7 @@ std::vector<std::set<size_t>> extract_config_from_steps(
             if (!has_op) continue;
             seen_steps.insert(si);
 
-            std::set<size_t> group_ops;
+            FlatSet<size_t> group_ops;
             for (auto sop : steps[si].subgraph.ops())
                 if (ops.count(sop))
                     group_ops.insert(sop);
@@ -656,8 +656,8 @@ std::optional<std::vector<ScheduleStep>> inject_representative_solution_steps(
 
     size_t pick = rng() % total;
 
-    std::set<size_t> all_pattern_ops;
-    std::vector<std::set<size_t>> new_groups;
+    FlatSet<size_t> all_pattern_ops;
+    std::vector<FlatSet<size_t>> new_groups;
 
     if (pick < usable.size()) {
         size_t pi = usable[pick];
@@ -722,8 +722,8 @@ std::optional<std::vector<ScheduleStep>> align_symmetric_reps_steps(
 
     size_t pick = rng() % total;
 
-    std::set<size_t> all_pattern_ops;
-    std::vector<std::set<size_t>> new_groups;
+    FlatSet<size_t> all_pattern_ops;
+    std::vector<FlatSet<size_t>> new_groups;
 
     if (pick < usable_par.size()) {
         size_t pi = usable_par[pick];
@@ -749,7 +749,7 @@ std::optional<std::vector<ScheduleStep>> align_symmetric_reps_steps(
         auto& pat = ctx.series[si];
         size_t donor = rng() % pat.blocks.size();
 
-        std::set<size_t> donor_ops(pat.blocks[donor].begin(), pat.blocks[donor].end());
+        FlatSet<size_t> donor_ops(pat.blocks[donor].begin(), pat.blocks[donor].end());
         auto donor_config = extract_config_from_steps(steps, donor_ops);
         if (donor_config.empty()) return std::nullopt;
 

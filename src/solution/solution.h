@@ -17,7 +17,7 @@ struct Partition;
 // Depends only on Problem + DAG. Checks that singleton producer/consumer
 // subgraphs have feasible tilings with the tensor retained/entering.
 // ============================================================================
-std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag);
+FlatSet<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag);
 
 // ============================================================================
 // ScheduleStep: a subgraph with its chosen tile configuration and retain set
@@ -26,7 +26,7 @@ std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag
 struct ScheduleStep {
     Subgraph         subgraph;
     TileConfig       config;
-    std::set<size_t> retain_these;
+    FlatSet<size_t> retain_these;
 };
 
 // ============================================================================
@@ -80,12 +80,12 @@ public:
     size_t                           num_steps()         const { return steps_.size(); }
     const ScheduleStep&              step(size_t i)      const { return steps_[i]; }
     const std::vector<ScheduleStep>& steps()             const { return steps_; }
-    const std::set<size_t>&          retained_entering(size_t i) const { return retained_entering_[i]; }
+    const FlatSet<size_t>&          retained_entering(size_t i) const { return retained_entering_[i]; }
 
     // --- Ephemeral gap check (solution-level) ---
 
     static bool creates_ephemeral_gap(const Problem& prob, const DAG& dag,
-                                       const std::set<size_t>& proposed_ops,
+                                       const FlatSet<size_t>& proposed_ops,
                                        const std::vector<ScheduleStep>& steps,
                                        size_t exclude_step,
                                        size_t exclude_step2 = SIZE_MAX);
@@ -95,6 +95,6 @@ private:
     const DAG*               dag_;
     std::vector<ScheduleStep> steps_;
     std::vector<CostResult>  step_costs_;
-    std::vector<std::set<size_t>> retained_entering_;
+    std::vector<FlatSet<size_t>> retained_entering_;
     double                   total_latency_ = 0;
 };

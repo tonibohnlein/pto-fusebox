@@ -110,14 +110,14 @@ static bool topo_valid(const OrderingResult& r, const Partition& part) {
     if (r.order.size() != n_alive) return false;
 
     // All groups appear exactly once
-    std::set<size_t> seen;
+    FlatSet<size_t> seen;
     for (auto g : r.order) {
         if (!part.groups[g].alive) return false;
         if (!seen.insert(g).second) return false;  // duplicate
     }
 
     // Each group's predecessors appear before it
-    std::set<size_t> scheduled;
+    FlatSet<size_t> scheduled;
     for (auto g : r.order) {
         // Check all in-edges of g in the group DAG
         for (size_t pred = 0; pred < part.groups.size(); pred++) {
@@ -245,7 +245,7 @@ void test_random_topo_chain3() {
     auto p = make_chain3(); DAG d = DAG::build(p);
     auto part = make_finalized(p, d);
     // Collect retainable tensors
-    std::set<size_t> feasibly_ret = p.retainable_tensors;
+    FlatSet<size_t> feasibly_ret = p.retainable_tensors;
 
     for (int seed = 0; seed < 20; seed++) {
         std::mt19937 rng(seed);
@@ -259,7 +259,7 @@ void test_random_topo_diamond4() {
     std::cout << "--- test_random_topo_diamond4 ---\n";
     auto p = make_diamond4(); DAG d = DAG::build(p);
     auto part = make_finalized(p, d);
-    std::set<size_t> feasibly_ret = p.retainable_tensors;
+    FlatSet<size_t> feasibly_ret = p.retainable_tensors;
 
     for (int seed = 0; seed < 20; seed++) {
         std::mt19937 rng(seed);
@@ -273,7 +273,7 @@ void test_random_diversity() {
     // Different seeds should occasionally produce different orderings.
     auto p = make_diamond4(); DAG d = DAG::build(p);
     auto part = make_finalized(p, d);
-    std::set<size_t> feasibly_ret = p.retainable_tensors;
+    FlatSet<size_t> feasibly_ret = p.retainable_tensors;
 
     std::set<std::vector<size_t>> seen_orders;
     for (int seed = 0; seed < 30; seed++) {

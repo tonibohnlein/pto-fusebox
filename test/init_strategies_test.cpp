@@ -385,7 +385,7 @@ void test_random_diversity() {
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
 
-    std::set<size_t> seen;
+    FlatSet<size_t> seen;
     for (int i = 0; i < 10; i++) {
         auto part = init_random(p, d);
         verify("random diversity", part, p);

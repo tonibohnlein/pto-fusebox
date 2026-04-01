@@ -38,7 +38,7 @@ namespace symm_mutations {
 // Cached representative solution: the grouping found by symm_init
 // for a pattern's representative component.
 struct RepSolution {
-    std::vector<std::set<size_t>> groups;  // groups of ops in rep component
+    std::vector<FlatSet<size_t>> groups;  // groups of ops in rep component
 };
 
 // Precomputed pattern context: pattern + bijections + cached solutions.
@@ -103,12 +103,12 @@ std::optional<Partition> align_symmetric_reps(
 // Used to build RepSolution from gen0 results.
 // ============================================================================
 
-std::vector<std::set<size_t>> extract_config_from_partition(
-    const Partition& part, const std::set<size_t>& ops);
+std::vector<FlatSet<size_t>> extract_config_from_partition(
+    const Partition& part, const FlatSet<size_t>& ops);
 
 // Extract grouping config from solution steps (for solution-level mutations)
-std::vector<std::set<size_t>> extract_config_from_steps(
-    const std::vector<ScheduleStep>& steps, const std::set<size_t>& ops);
+std::vector<FlatSet<size_t>> extract_config_from_steps(
+    const std::vector<ScheduleStep>& steps, const FlatSet<size_t>& ops);
 
 // ============================================================================
 // Solution-level variants

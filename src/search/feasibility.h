@@ -25,8 +25,8 @@ namespace feasibility {
 
 // Would splitting a group into side_a and side_b create a cycle between them?
 // (edges in both directions → mutual dependency)
-bool split_creates_topo_cycle(const std::set<size_t>& side_a,
-                               const std::set<size_t>& side_b,
+bool split_creates_topo_cycle(const FlatSet<size_t>& side_a,
+                               const FlatSet<size_t>& side_b,
                                const DAG& dag);
 
 // ============================================================================
@@ -54,7 +54,7 @@ struct MoveDelta {
     size_t ga = SIZE_MAX;
     size_t gb = SIZE_MAX;
     const std::vector<size_t>* merge_list = nullptr;
-    const std::set<size_t>* split_ops = nullptr;
+    const FlatSet<size_t>* split_ops = nullptr;
 };
 
 // Core algorithm: Kahn's topological sort with virtual group mapping.

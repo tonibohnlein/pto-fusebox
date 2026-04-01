@@ -40,6 +40,6 @@ struct CouplingParallelConfig {
 
 Solution coupling_parallel_search(
     std::vector<CoupledPartition> coupled_pool,  // initialized by Phase 2
-    const std::set<size_t>&       feasibly_ret,
+    const FlatSet<size_t>&       feasibly_ret,
     CouplingTimePoint             deadline = CouplingTimePoint::max(),
     const CouplingParallelConfig& cfg      = {});

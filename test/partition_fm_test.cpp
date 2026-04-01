@@ -383,12 +383,12 @@ void test_finalize_recompute_partition() {
     CHECK("gb sg present", part.groups[gb].sg.has_value());
 
     // ga: T0→Op0→T1(ephemeral)→Op1→T2. boundary_inputs={T0}, boundary_outputs={T2}
-    CHECK("ga bi={T0}", part.groups[ga].sg->boundary_inputs()  == std::set<size_t>{0});
-    CHECK("ga bo={T2}", part.groups[ga].sg->boundary_outputs() == std::set<size_t>{2});
+    CHECK("ga bi={T0}", part.groups[ga].sg->boundary_inputs()  == FlatSet<size_t>{0});
+    CHECK("ga bo={T2}", part.groups[ga].sg->boundary_outputs() == FlatSet<size_t>{2});
 
     // gb: T0→Op0→T1(ephemeral)→Op2→T3. boundary_inputs={T0}, boundary_outputs={T3}
-    CHECK("gb bi={T0}", part.groups[gb].sg->boundary_inputs()  == std::set<size_t>{0});
-    CHECK("gb bo={T3}", part.groups[gb].sg->boundary_outputs() == std::set<size_t>{3});
+    CHECK("gb bi={T0}", part.groups[gb].sg->boundary_inputs()  == FlatSet<size_t>{0});
+    CHECK("gb bo={T3}", part.groups[gb].sg->boundary_outputs() == FlatSet<size_t>{3});
 
     // Both groups depend only on T0 (graph input) → both in_deg = 0
     CHECK("recompute DAG in_deg[ga]==0", part.group_in_deg[ga] == 0);
@@ -443,7 +443,7 @@ void test_from_partition_recompute() {
              sol.total_latency(), 6553.6);
 
     // All three ops must be covered (Op0 recomputed in both steps)
-    std::set<size_t> covered;
+    FlatSet<size_t> covered;
     for (auto& step : sol.steps())
         for (auto op : step.subgraph.ops())
             covered.insert(op);
@@ -505,10 +505,10 @@ void test_ordering_recompute() {
     CHECK("beam order covers 2 groups", beam.order.size() == 2);
 
     // In both orderings, neither group appears twice
-    std::set<size_t> dfs_seen(dfs.order.begin(), dfs.order.end());
+    FlatSet<size_t> dfs_seen(dfs.order.begin(), dfs.order.end());
     CHECK("dfs no duplicates", dfs_seen.size() == 2);
 
-    std::set<size_t> beam_seen(beam.order.begin(), beam.order.end());
+    FlatSet<size_t> beam_seen(beam.order.begin(), beam.order.end());
     CHECK("beam no duplicates", beam_seen.size() == 2);
 }
 

@@ -149,7 +149,7 @@ public:
     // Tier 1: Base map — lock-free (op_set) → CostResult.
     // ====================================================================
 
-    double evaluate(const std::set<size_t>& ops, const Problem& prob, const DAG& dag) {
+    double evaluate(const FlatSet<size_t>& ops, const Problem& prob, const DAG& dag) {
         thread_local std::vector<size_t> key;
         key.assign(ops.begin(), ops.end());
         size_t h = VectorHash{}(key);
@@ -186,9 +186,9 @@ public:
     // Overload: look up or compute (ops, entering, retain) without requiring a
     // pre-built Subgraph.  On cache hit, returns immediately (no Subgraph
     // created).  On miss, builds a Subgraph from ops and evaluates.
-    CostResult evaluate_with_context(const std::set<size_t>& ops,
-                                      const std::set<size_t>& entering,
-                                      const std::set<size_t>& retain,
+    CostResult evaluate_with_context(const FlatSet<size_t>& ops,
+                                      const FlatSet<size_t>& entering,
+                                      const FlatSet<size_t>& retain,
                                       const Problem& prob,
                                       const DAG& dag) {
         if (entering.empty() && retain.empty()) {
@@ -239,8 +239,8 @@ public:
     }
 
     CostResult evaluate_with_context(const Subgraph& sg,
-                                      const std::set<size_t>& entering,
-                                      const std::set<size_t>& retain) {
+                                      const FlatSet<size_t>& entering,
+                                      const FlatSet<size_t>& retain) {
         // No retention context → lock-free base map
         if (entering.empty() && retain.empty()) {
             thread_local std::vector<size_t> base_key;

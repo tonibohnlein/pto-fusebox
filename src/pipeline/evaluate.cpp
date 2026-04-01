@@ -80,8 +80,8 @@ int main(int argc, char* argv[]) {
                          sol["subgraph_latencies"].size() == num_steps;
 
     // ---- Evaluate each step ----
-    std::set<size_t> covered_ops;
-    std::set<size_t> entering;  // retained from previous step
+    FlatSet<size_t> covered_ops;
+    FlatSet<size_t> entering;  // retained from previous step
     double total_our = 0;
     double total_ref = 0;
     bool all_feasible = true;
@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
         int64_t k = g[2].get<int64_t>();
 
         // Parse retain
-        std::set<size_t> retain;
+        FlatSet<size_t> retain;
         for (auto& t : ret_json[i]) retain.insert(t.get<size_t>());
 
         // Parse traversal → detect snake

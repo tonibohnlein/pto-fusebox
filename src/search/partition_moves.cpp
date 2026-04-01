@@ -16,13 +16,13 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to) {
     if (!p.groups[from].ops.count(op)) return r;
 
     // Compute new `to` cost
-    std::set<size_t> new_to = p.groups[to].ops;
+    FlatSet<size_t> new_to = p.groups[to].ops;
     new_to.insert(op);
     double new_to_cost = p.eval_set(new_to);
     if (new_to_cost >= 1e17) return r;
 
     // Compute new `from` cost — account for possible disconnected components
-    std::set<size_t> new_from = p.groups[from].ops;
+    FlatSet<size_t> new_from = p.groups[from].ops;
     new_from.erase(op);
     double new_from_cost = 0;
 
@@ -39,7 +39,7 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to) {
 
     // Ephemeral gap check using actual components (after connectivity split).
     {
-        std::vector<std::set<size_t>> gap_components;
+        std::vector<FlatSet<size_t>> gap_components;
         gap_components.push_back(new_to);
         if (!new_from.empty()) {
             auto from_comps = structural_ops::connected_components(new_from, *p.dag);
@@ -54,7 +54,7 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to) {
     return r;
 }
 
-std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
+FlatSet<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
                               double precomputed_from_cost,
                               double precomputed_to_cost) {
     if (!p.groups[from].alive || !p.groups[to].alive) return {};
@@ -68,10 +68,10 @@ std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
     }
 
     // Build new op sets
-    std::set<size_t> new_to = p.groups[to].ops;
+    FlatSet<size_t> new_to = p.groups[to].ops;
     new_to.insert(op);
 
-    std::set<size_t> new_from = p.groups[from].ops;
+    FlatSet<size_t> new_from = p.groups[from].ops;
     new_from.erase(op);
 
     // Validate costs — use precomputed values if both are provided
@@ -97,7 +97,7 @@ std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
     }
 
     // Mutate
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     if (from_dies) {
         p.groups[from].alive = false;
@@ -133,7 +133,7 @@ EvalResult eval_merge(const Partition& p, size_t ga, size_t gb) {
     if (!p.groups[ga].alive || !p.groups[gb].alive) return r;
     if (ga == gb) return r;
 
-    std::set<size_t> merged = p.groups[ga].ops;
+    FlatSet<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
     double merged_cost = p.eval_set(merged);
     if (merged_cost >= 1e17) return r;
@@ -143,13 +143,13 @@ EvalResult eval_merge(const Partition& p, size_t ga, size_t gb) {
     return r;
 }
 
-std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precomputed_cost) {
+FlatSet<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precomputed_cost) {
     if (!p.groups[ga].alive || !p.groups[gb].alive) return {};
     if (ga == gb) return {};
     assert(p.acyclic_merge_local(ga, gb) && "apply_merge: cyclic — eval-time check missed it");
 
     // Build merged ops set (always needed to assign to ga.ops)
-    std::set<size_t> merged = p.groups[ga].ops;
+    FlatSet<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
 
     // Use precomputed cost if provided, otherwise evaluate
@@ -162,7 +162,7 @@ std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precompu
     }
 
     // Mutate
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     p.groups[ga].ops = std::move(merged);
     p.groups[ga].cost = merged_cost;
@@ -180,7 +180,7 @@ std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precompu
 // EJECT: remove op from group ga → singleton {op} + remainder(s)
 // ============================================================================
 
-std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
+FlatSet<size_t> apply_eject(Partition& p, size_t op, size_t ga,
                               const Partition::EjectResult* precomputed) {
     if (!p.groups[ga].alive) return {};
     if (!p.groups[ga].ops.count(op)) return {};
@@ -204,7 +204,7 @@ std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
                && "apply_eject: cyclic move — eval-time check missed it");
     }
 
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     // Replace ga with first remainder component (or kill if empty)
     if (er.remainder_components.empty()) {
@@ -235,7 +235,7 @@ std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
 // SPLIT: split group ga at edge (op_a, op_b) into two groups
 // ============================================================================
 
-std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
+FlatSet<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
                               const Partition::SplitResult* precomputed) {
     if (!p.groups[ga].alive) return {};
 
@@ -250,7 +250,7 @@ std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
     assert(p.acyclic_split_local(sr.side_a, sr.side_b, ga)
            && "apply_split: acyclic_split_local rejected");
 
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     p.groups[ga].ops = std::move(sr.side_a);
     p.groups[ga].cost = sr.cost_a;
@@ -283,7 +283,7 @@ EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op) {
     bool ga_dies = (p.groups[ga].ops.size() == 1);
     double new_ga_cost = 0;
     if (!ga_dies) {
-        std::set<size_t> remaining = p.groups[ga].ops;
+        FlatSet<size_t> remaining = p.groups[ga].ops;
         remaining.erase(op);
         // Account for possible disconnected components.
         auto comps = structural_ops::connected_components(remaining, *p.dag);
@@ -325,7 +325,7 @@ EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op) {
     return r;
 }
 
-std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op, double precomputed_cost) {
+FlatSet<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op, double precomputed_cost) {
     if (!p.groups[ga].alive) return {};
     if (!p.groups[ga].ops.count(op)) return {};
 
@@ -340,19 +340,19 @@ std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op, double p
         } else {
             auto check = eval_de_recompute(p, ga, op);
             if (!check.feasible) return {};
-            std::set<size_t> remaining = p.groups[ga].ops;
+            FlatSet<size_t> remaining = p.groups[ga].ops;
             remaining.erase(op);
             new_ga_cost = p.eval_set(remaining);
             if (new_ga_cost >= 1e17) return {};
         }
     }
 
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     if (ga_dies) {
         p.groups[ga].alive = false;
     } else {
-        std::set<size_t> remaining = p.groups[ga].ops;
+        FlatSet<size_t> remaining = p.groups[ga].ops;
         remaining.erase(op);
         // Split remainder into connected components if needed.
         auto comps = structural_ops::connected_components(remaining, *p.dag);
@@ -378,7 +378,7 @@ EvalResult eval_recompute(const Partition& p, size_t op, size_t into) {
     EvalResult r;
     if (!p.groups[into].alive) return r;
 
-    std::set<size_t> new_into = p.groups[into].ops;
+    FlatSet<size_t> new_into = p.groups[into].ops;
     new_into.insert(op);
     double new_cost = p.eval_set(new_into);
     if (new_cost >= 1e17) return r;
@@ -409,11 +409,11 @@ EvalResult eval_recompute(const Partition& p, size_t op, size_t into) {
     return r;
 }
 
-std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into, double precomputed_cost) {
+FlatSet<size_t> apply_recompute(Partition& p, size_t op, size_t into, double precomputed_cost) {
     if (!p.groups[into].alive) return {};
     assert(p.acyclic_recompute_local(op, into) && "apply_recompute: cyclic — eval-time check missed it");
 
-    std::set<size_t> new_into = p.groups[into].ops;
+    FlatSet<size_t> new_into = p.groups[into].ops;
     new_into.insert(op);
 
     double new_cost;
@@ -424,7 +424,7 @@ std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into, double pr
         if (new_cost >= 1e17) return {};
     }
 
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
     p.groups[into].ops = std::move(new_into);
     p.groups[into].cost = new_cost;
     p.groups[into].gen++;
@@ -442,7 +442,7 @@ EvalResult eval_tensor_merge(const Partition& p,
     EvalResult r;
     if (group_list.size() < 2) return r;
 
-    std::set<size_t> merged_ops;
+    FlatSet<size_t> merged_ops;
     double old_cost = 0;
     for (auto gi : group_list) {
         if (!p.groups[gi].alive) return r;
@@ -460,7 +460,7 @@ EvalResult eval_tensor_merge(const Partition& p,
     return r;
 }
 
-std::set<size_t> apply_tensor_merge(Partition& p,
+FlatSet<size_t> apply_tensor_merge(Partition& p,
                                      const std::vector<size_t>& group_list,
                                      double precomputed_cost) {
     if (group_list.size() < 2) return {};
@@ -469,14 +469,14 @@ std::set<size_t> apply_tensor_merge(Partition& p,
 
     assert(p.acyclic_merge_local(group_list) && "apply_tensor_merge: cyclic move");
 
-    std::set<size_t> merged_ops;
+    FlatSet<size_t> merged_ops;
     for (auto gi : group_list)
         merged_ops.insert(p.groups[gi].ops.begin(), p.groups[gi].ops.end());
 
     double merged_cost = (precomputed_cost >= 0.0) ? precomputed_cost : p.eval_set(merged_ops);
     if (merged_cost >= 1e17) return {};
 
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
     size_t survivor = group_list[0];
     p.groups[survivor].ops = std::move(merged_ops);
     p.groups[survivor].cost = merged_cost;
@@ -497,7 +497,7 @@ std::set<size_t> apply_tensor_merge(Partition& p,
 // ============================================================================
 
 EvalResult eval_tensor_extract(const Partition& p,
-                                const std::set<size_t>& extract_ops,
+                                const FlatSet<size_t>& extract_ops,
                                 const std::vector<size_t>& source_groups) {
     EvalResult r;
     if (extract_ops.empty() || source_groups.empty()) return r;
@@ -507,11 +507,11 @@ EvalResult eval_tensor_extract(const Partition& p,
 
     double old_cost = 0;
     double remainder_cost = 0;
-    std::vector<std::set<size_t>> remainder_sets;
+    std::vector<FlatSet<size_t>> remainder_sets;
 
     for (auto gi : source_groups) {
         old_cost += p.groups[gi].cost;
-        std::set<size_t> rem;
+        FlatSet<size_t> rem;
         for (auto op : p.groups[gi].ops)
             if (!extract_ops.count(op)) rem.insert(op);
         if (!rem.empty()) {
@@ -531,10 +531,10 @@ EvalResult eval_tensor_extract(const Partition& p,
 
     // Ephemeral gap check at eval time (uses actual components)
     {
-        std::vector<std::set<size_t>> gap_components;
+        std::vector<FlatSet<size_t>> gap_components;
         gap_components.push_back(extract_ops);
         for (auto& rem : remainder_sets) gap_components.push_back(rem);
-        std::set<size_t> excluded(source_groups.begin(), source_groups.end());
+        FlatSet<size_t> excluded(source_groups.begin(), source_groups.end());
         if (p.split_creates_ephemeral_gap(gap_components, excluded)) return r;
     }
 
@@ -543,8 +543,8 @@ EvalResult eval_tensor_extract(const Partition& p,
     return r;
 }
 
-std::set<size_t> apply_tensor_extract(Partition& p,
-                                       const std::set<size_t>& extract_ops,
+FlatSet<size_t> apply_tensor_extract(Partition& p,
+                                       const FlatSet<size_t>& extract_ops,
                                        const std::vector<size_t>& source_groups,
                                        double precomputed_extract_cost) {
     assert(p.acyclic_extract_local(extract_ops) && "apply_tensor_extract: cyclic");
@@ -562,10 +562,10 @@ std::set<size_t> apply_tensor_extract(Partition& p,
     if (extract_cost >= 1e17) return {};
 
     // Pre-validate ALL remainder costs before mutating
-    struct RemInfo { size_t gi; std::set<size_t> rem; double cost; };
+    struct RemInfo { size_t gi; FlatSet<size_t> rem; double cost; };
     std::vector<RemInfo> remainders;
     for (auto gi : source_groups) {
-        std::set<size_t> rem;
+        FlatSet<size_t> rem;
         for (auto op : p.groups[gi].ops)
             if (!extract_ops.count(op)) rem.insert(op);
         double rc = 0;
@@ -577,7 +577,7 @@ std::set<size_t> apply_tensor_extract(Partition& p,
     }
 
     // All validated — mutate. Split disconnected remainders into components.
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
     for (auto& ri : remainders) {
         if (ri.rem.empty()) {
             p.groups[ri.gi].alive = false;
@@ -625,7 +625,7 @@ ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id) 
 
     // Cost of groups that will lose ops (producer's groups + each consumer's groups)
     // Use a set to avoid double-counting groups that contain both P and a consumer
-    std::set<size_t> affected_groups;
+    FlatSet<size_t> affected_groups;
     for (auto gi : p.groups_of(prod_op))
         if (p.groups[gi].alive) affected_groups.insert(gi);
     for (auto cop : consumers)
@@ -637,7 +637,7 @@ ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id) 
 
     // For each consumer, check if {P, C_i} is feasible
     for (auto cop : consumers) {
-        std::set<size_t> pair_ops = {prod_op, cop};
+        FlatSet<size_t> pair_ops = {prod_op, cop};
         double pair_cost = p.eval_set(pair_ops);
         if (pair_cost >= 1e17) continue;  // infeasible
         r.consumer_ops.push_back(cop);
@@ -649,12 +649,12 @@ ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id) 
 
     // Estimate cost of damaged groups (after removing ops).
     // For each affected group, compute remainder cost.
-    std::set<size_t> extracted_ops;
+    FlatSet<size_t> extracted_ops;
     extracted_ops.insert(prod_op);
     for (auto cop : r.consumer_ops) extracted_ops.insert(cop);
 
     for (auto gi : affected_groups) {
-        std::set<size_t> remainder;
+        FlatSet<size_t> remainder;
         for (auto op : p.groups[gi].ops)
             if (!extracted_ops.count(op)) remainder.insert(op);
         if (remainder.empty()) continue;  // group dies → 0 cost (already subtracted)
@@ -671,21 +671,21 @@ ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id) 
     return r;
 }
 
-std::set<size_t> apply_force_recompute(Partition& p, size_t tensor_id,
+FlatSet<size_t> apply_force_recompute(Partition& p, size_t tensor_id,
                                         const ForceRecomputeResult& eval) {
     if (!eval.feasible) return {};
 
     const auto& dag = *p.dag;
     size_t prod_op = eval.prod_op;
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     // Collect all ops being extracted
-    std::set<size_t> extracted_ops;
+    FlatSet<size_t> extracted_ops;
     extracted_ops.insert(prod_op);
     for (auto cop : eval.consumer_ops) extracted_ops.insert(cop);
 
     // Collect affected groups
-    std::set<size_t> affected_groups;
+    FlatSet<size_t> affected_groups;
     for (auto op : extracted_ops)
         for (auto gi : p.groups_of(op))
             if (p.groups[gi].alive) affected_groups.insert(gi);

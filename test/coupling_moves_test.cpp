@@ -359,7 +359,7 @@ void test_merge_chain_cycle_rejected() {
           !acyclic_chain_merge_groups(cp, {g2, g3}));
 
     // best_coupled_move_for_op for Op3 must NOT propose MERGE(G2,G3).
-    std::set<size_t> fr;
+    FlatSet<size_t> fr;
     auto best = best_coupled_move_for_op(cp, 3, fr);
     bool is_bad_merge = (best.type == CoupledFMMove::MERGE &&
                          ((best.ga == g2 && best.gb == g3) ||

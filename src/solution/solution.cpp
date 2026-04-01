@@ -8,8 +8,8 @@
 // ============================================================================
 // One-time feasibility check: which tensors can physically be retained?
 // ============================================================================
-std::set<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag) {
-    std::set<size_t> result;
+FlatSet<size_t> compute_feasibly_retainable(const Problem& prob, const DAG& dag) {
+    FlatSet<size_t> result;
     for (auto t : prob.retainable_tensors) {
         if (prob.tensors[t].size() > prob.fast_memory_capacity)
             continue;
@@ -48,7 +48,7 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
     step_costs_.resize(n);
     retained_entering_.resize(n);
 
-    std::set<size_t> currently_retained;
+    FlatSet<size_t> currently_retained;
 
     for (size_t i = 0; i < n; i++) {
         retained_entering_[i] = currently_retained;
@@ -56,7 +56,7 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
         // Only boundary OUTPUTS can be retained (organizer ruling).
         // Overlap with currently_retained is possible (recomputation case)
         // and handled correctly by working_set.
-        std::set<size_t> valid_retain;
+        FlatSet<size_t> valid_retain;
         for (auto t : steps_[i].retain_these)
             if (steps_[i].subgraph.boundary_outputs().count(t))
                 valid_retain.insert(t);
@@ -93,15 +93,15 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
 
     // Helper: route best_cost through cache when available
     auto best_cost_cached = [&](const Subgraph& sg,
-                                const std::set<size_t>& entering,
-                                const std::set<size_t>& retain) -> CostResult {
+                                const FlatSet<size_t>& entering,
+                                const FlatSet<size_t>& retain) -> CostResult {
         if (cache) return cache->evaluate_with_context(sg, entering, retain);
         return sg.best_cost(entering, retain);
     };
 
     std::vector<ScheduleStep> steps;
     steps.reserve(res.order.size());
-    std::set<size_t> entering;
+    FlatSet<size_t> entering;
 
     for (size_t i = 0; i < res.order.size(); i++) {
         size_t gi = res.order[i];
@@ -111,7 +111,7 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
 
         // Build retain_these: only boundary OUTPUTS of this step that the next
         // step needs as input.
-        std::set<size_t> retain_these;
+        FlatSet<size_t> retain_these;
         if (i + 1 < res.order.size()) {
             size_t next_gi = res.order[i + 1];
             if (part.groups[next_gi].sg) {
@@ -246,7 +246,7 @@ Solution::ValidationResult Solution::validate() const {
     if (steps_.empty()) { fail("Solution has no steps"); return vr; }
 
     // Coverage
-    std::set<size_t> covered;
+    FlatSet<size_t> covered;
     for (auto& step : steps_)
         for (auto op : step.subgraph.ops()) covered.insert(op);
     for (size_t i = 0; i < prob_->num_ops(); i++)
@@ -262,7 +262,7 @@ Solution::ValidationResult Solution::validate() const {
         }
 
     // Topological order
-    std::set<size_t> available(dag_->graph_inputs.begin(), dag_->graph_inputs.end());
+    FlatSet<size_t> available(dag_->graph_inputs.begin(), dag_->graph_inputs.end());
     for (size_t i = 0; i < steps_.size(); i++) {
         for (auto t : steps_[i].subgraph.boundary_inputs())
             if (!available.count(t)) {
@@ -313,7 +313,7 @@ Solution::ValidationResult Solution::validate() const {
     // Without recomputation, the external consumer can't access T (it's ephemeral).
     for (size_t si = 0; si < steps_.size(); si++) {
         const auto& ops = steps_[si].subgraph.ops();
-        std::set<size_t> op_set(ops.begin(), ops.end());
+        FlatSet<size_t> op_set(ops.begin(), ops.end());
         for (auto op : ops) {
             for (auto t : prob_->ops[op].outputs) {
                 // Is T consumed by any op inside this step?
@@ -367,7 +367,7 @@ Solution::ValidationResult Solution::validate() const {
 // ============================================================================
 
 bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
-                                      const std::set<size_t>& proposed_ops,
+                                      const FlatSet<size_t>& proposed_ops,
                                       const std::vector<ScheduleStep>& steps,
                                       size_t exclude_step,
                                       size_t exclude_step2) {

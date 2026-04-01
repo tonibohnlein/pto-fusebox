@@ -272,7 +272,7 @@ void test_recompute_move() {
     CostCache cache;
     auto part = Partition::trivial(p, d); part.cache = &cache;
 
-    std::set<size_t> new_g2 = {1,2};
+    FlatSet<size_t> new_g2 = {1,2};
     double new_cost = part.eval_set(new_g2);
     CHECK("recompute feasible", new_cost < 1e17);
 

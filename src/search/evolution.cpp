@@ -53,7 +53,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
     auto [ga, gb] = adj_pairs[rng() % adj_pairs.size()];
 
     if (!part.acyclic_merge_local(ga, gb)) return part;
-    std::set<size_t> merged_ops = part.groups[ga].ops;
+    FlatSet<size_t> merged_ops = part.groups[ga].ops;
     merged_ops.insert(part.groups[gb].ops.begin(), part.groups[gb].ops.end());
     if (part.creates_ephemeral_gap(merged_ops, ga, gb)) return part;
     double merged_cost = part.eval_set(merged_ops);
@@ -176,7 +176,7 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
 
     // Gap check: ejecting may make T ephemeral in remainder while op needs it
     {
-        std::vector<std::set<size_t>> components;
+        std::vector<FlatSet<size_t>> components;
         components.push_back({op});
         for (auto& comp : er.remainder_components)
             components.push_back(comp);
@@ -211,7 +211,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         auto& consumers = dag.tensor_consumers[t];
         if (consumers.size() < 2) continue;
         
-        std::set<size_t> groups_seen;
+        FlatSet<size_t> groups_seen;
         for (auto cop : consumers)
             for (auto gi : part.groups_of(cop))
                 groups_seen.insert(gi);
@@ -224,7 +224,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     size_t t = candidate_tensors[rng() % candidate_tensors.size()];
     
     // Collect all consumer groups + optionally the producer group
-    std::set<size_t> target_groups;
+    FlatSet<size_t> target_groups;
     for (auto cop : dag.tensor_consumers[t])
         for (auto gi : part.groups_of(cop))
             target_groups.insert(gi);
@@ -253,7 +253,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
     }
 
     // Fallback: extract consumer ops (+ producer) into a new group
-    std::set<size_t> extract_ops;
+    FlatSet<size_t> extract_ops;
     for (auto cop : dag.tensor_consumers[t])
         extract_ops.insert(cop);
     if (prod >= 0)
@@ -338,7 +338,7 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
     // First check that each {P, C_i} is feasible (fits in fast memory).
     std::vector<std::pair<size_t, double>> new_groups;  // (consumer_op, cost)
     for (auto cop : consumers) {
-        std::set<size_t> ops = {prod_op, cop};
+        FlatSet<size_t> ops = {prod_op, cop};
         double cost = part.eval_set(ops);
         if (cost >= 1e17) continue;  // doesn't fit → skip this consumer
         new_groups.push_back({cop, cost});
@@ -347,7 +347,7 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
 
     // Extract consumer ops from their current groups.
     // Track which groups lose ops so we can handle empty/disconnected groups.
-    std::set<size_t> affected_groups;
+    FlatSet<size_t> affected_groups;
     for (auto& [cop, cost] : new_groups) {
         for (auto gi : part.groups_of(cop)) {
             if (!part.groups[gi].alive) continue;
@@ -668,7 +668,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
 
     // Two ops are in the same cluster iff they share the same group in BOTH parents.
     // O(n) via hashing (grp_a, grp_b) pairs — no pairwise comparison needed.
-    std::map<std::pair<int,int>, std::set<size_t>> clusters;
+    std::map<std::pair<int,int>, FlatSet<size_t>> clusters;
     for (size_t i = 0; i < n_ops; i++) {
         if (grp_a[i] < 0 || grp_b[i] < 0) continue;
         clusters[{grp_a[i], grp_b[i]}].insert(i);
@@ -690,7 +690,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         
         // Find existing child groups adjacent to this cluster
         // Uses op_to_groups_ which is maintained incrementally below
-        std::set<size_t> adj_child_groups;
+        FlatSet<size_t> adj_child_groups;
         for (auto op : cluster) {
             for (auto nbr : dag.op_neighbors[op])
                 for (auto gi : child.groups_of(nbr))
@@ -703,7 +703,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
         
         for (auto gi : adj_child_groups) {
             if (!child.acyclic_add_ops_into(cluster, gi)) continue;
-            std::set<size_t> merged = child.groups[gi].ops;
+            FlatSet<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
             double c = child.eval_set(merged);
             if (c < 1e17 && c < best_cost) {

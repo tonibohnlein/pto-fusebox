@@ -74,7 +74,7 @@ void test_basic_hit_miss() {
     DAG d = DAG::build(p);
     CostCache cache;
 
-    std::set<size_t> ops = {0};
+    FlatSet<size_t> ops = {0};
     double c1 = cache.evaluate(ops, p, d);
     CHECK_EQ_S("1 miss",   cache.misses(), 1);
     CHECK_EQ_S("0 hits",   cache.hits(),   0);
@@ -214,7 +214,7 @@ void test_empty_set() {
 // ============================================================================
 // 3. Sorted-key contract
 //
-// The key is built from std::set<size_t>, which always iterates sorted.
+// The key is built from FlatSet<size_t>, which always iterates sorted.
 // The same logical op-set — regardless of source order — must produce
 // exactly one cache entry.
 // ============================================================================
@@ -225,8 +225,8 @@ void test_sorted_key_two_ops() {
     DAG d = DAG::build(p);
     CostCache cache;
 
-    std::set<size_t> s01 = {0, 1};
-    std::set<size_t> s10 = {1, 0};  // same set, different source order
+    FlatSet<size_t> s01 = {0, 1};
+    FlatSet<size_t> s10 = {1, 0};  // same set, different source order
 
     double c1 = cache.evaluate(s01, p, d);
     double c2 = cache.evaluate(s10, p, d);
@@ -478,7 +478,7 @@ void test_cache_growth_all_connected_subsets() {
 
     int evaluated = 0;
     for (int i = 0; i < N; i++) {
-        std::set<size_t> s;
+        FlatSet<size_t> s;
         for (int j = i; j < N; j++) {
             s.insert(j);
             cache.evaluate(s, p, d);

@@ -26,8 +26,8 @@ namespace structural_ops {
 // Returns vector of disjoint op sets whose union equals `ops`.
 // ============================================================================
 
-std::vector<std::set<size_t>> connected_components(
-    const std::set<size_t>& ops, const DAG& dag);
+std::vector<FlatSet<size_t>> connected_components(
+    const FlatSet<size_t>& ops, const DAG& dag);
 
 // ============================================================================
 // Is the op set still connected after removing `rm`?
@@ -36,7 +36,7 @@ std::vector<std::set<size_t>> connected_components(
 // Returns false if ops.size() <= 1 (nothing left after removal).
 // ============================================================================
 
-bool is_connected_without(const std::set<size_t>& ops, size_t rm,
+bool is_connected_without(const FlatSet<size_t>& ops, size_t rm,
                            const DAG& dag);
 
 // ============================================================================
@@ -47,11 +47,11 @@ bool is_connected_without(const std::set<size_t>& ops, size_t rm,
 // ============================================================================
 
 struct EjectAnalysis {
-    std::vector<std::set<size_t>> remainder_components;
+    std::vector<FlatSet<size_t>> remainder_components;
     bool connected;  // true if remainder is a single connected component
 };
 
-EjectAnalysis analyze_eject(size_t op, const std::set<size_t>& ops,
+EjectAnalysis analyze_eject(size_t op, const FlatSet<size_t>& ops,
                              const DAG& dag);
 
 // ============================================================================
@@ -63,13 +63,13 @@ EjectAnalysis analyze_eject(size_t op, const std::set<size_t>& ops,
 // ============================================================================
 
 struct SplitAnalysis {
-    std::set<size_t> side_a;
-    std::set<size_t> side_b;
+    FlatSet<size_t> side_a;
+    FlatSet<size_t> side_b;
     bool is_bridge;  // true if cutting the edge disconnects the graph
 };
 
 SplitAnalysis analyze_split(size_t op_a, size_t op_b,
-                             const std::set<size_t>& ops,
+                             const FlatSet<size_t>& ops,
                              const DAG& dag);
 
 // ============================================================================
@@ -80,6 +80,6 @@ SplitAnalysis analyze_split(size_t op_a, size_t op_b,
 // ============================================================================
 
 std::vector<std::pair<size_t, size_t>> bridge_edges(
-    const std::set<size_t>& ops, const DAG& dag);
+    const FlatSet<size_t>& ops, const DAG& dag);
 
 } // namespace structural_ops

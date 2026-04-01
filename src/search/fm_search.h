@@ -41,11 +41,11 @@ struct FMMove {
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     const std::set<size_t>& locked = {});
+                     const FlatSet<size_t>& locked = {});
 
 // ============================================================================
 // Apply an FM move to the partition. Returns the set of affected group indices
 // (groups whose ops or costs changed). Empty if move could not be applied.
 // ============================================================================
 
-std::set<size_t> apply_fm_move(Partition& part, const FMMove& m);
+FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m);

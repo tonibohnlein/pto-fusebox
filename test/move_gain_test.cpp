@@ -65,7 +65,7 @@ static std::pair<int,int> verify_all_fm(const char* label, Partition& part) {
     int type_counts[6] = {};
 
     // Check both border ops AND internal ops from large groups
-    std::set<size_t> ops_to_check;
+    FlatSet<size_t> ops_to_check;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.border_ops(gi)) ops_to_check.insert(op);

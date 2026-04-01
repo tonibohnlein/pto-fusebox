@@ -35,6 +35,6 @@ struct CoupledFMOuterResult {
 
 CoupledFMOuterResult coupled_fm_outer_loop(
     CoupledPartition        cp,
-    const std::set<size_t>& feasibly_ret,
+    const FlatSet<size_t>& feasibly_ret,
     const FMOuterConfig&    cfg   = {},
     CostCache*              cache = nullptr);

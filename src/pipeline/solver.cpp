@@ -24,6 +24,78 @@
 #include <vector>
 
 // ============================================================================
+// Shared helpers (used by both solve() and solve_v2())
+// ============================================================================
+
+namespace {
+
+// Seed coupling edges from an ordering result: for each consecutive pair
+// (ga, gb) in the ordering, if ga produces retained tensors consumed by gb,
+// create a coupling edge ga→gb with those tensors.
+void seed_coupling_from_ordering(CoupledPartition& cp,
+                                 const OrderingResult& res,
+                                 const FlatSet<size_t>& feasibly_ret) {
+    const auto& part = cp.part;
+    while (cp.next_group.size() < part.groups.size())
+        cp.next_group.push_back(SIZE_MAX);
+    while (cp.prev_group.size() < part.groups.size())
+        cp.prev_group.push_back(SIZE_MAX);
+
+    for (size_t i = 0; i + 1 < res.order.size(); i++) {
+        if (i >= res.retain_per_step.size()) break;
+        const auto& ret = res.retain_per_step[i];
+        if (ret.empty()) continue;
+        size_t ga = res.order[i], gb = res.order[i + 1];
+        if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
+        const auto& bouts = part.groups[ga].sg->boundary_outputs();
+        const auto& bins  = part.groups[gb].sg->boundary_inputs();
+        for (auto t : ret) {
+            if (!feasibly_ret.count(t)) continue;
+            if (!bouts.count(t) || !bins.count(t)) continue;
+            // Only couple if ga is still a free tail and gb a free head
+            if (cp.next_group[ga] != SIZE_MAX && cp.next_group[ga] != gb) continue;
+            if (cp.prev_group[gb] != SIZE_MAX && cp.prev_group[gb] != ga) continue;
+            cp.next_group[ga] = gb;
+            cp.prev_group[gb] = ga;
+            cp.retained[{ga, gb}].insert(t);
+        }
+    }
+}
+
+// Seed coupling from an ordering, push pre-greedy copy into pool, run
+// greedy descent, push post-greedy result.  Both go into the pool for diversity.
+void add_coupled_variant(CoupledPartition cp,
+                         const OrderingResult& res,
+                         const FlatSet<size_t>& feasibly_ret,
+                         std::mutex& cp_mutex,
+                         std::vector<CoupledPartition>& coupled_pool,
+                         TimePoint deadline) {
+    seed_coupling_from_ordering(cp, res, feasibly_ret);
+    { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp); }
+    coupling_greedy_descent(cp, feasibly_ret, deadline);
+    { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp)); }
+}
+
+// Pick the best valid solution between a coupled and uncoupled candidate.
+// Prefers coupled if both valid and coupled is cheaper (with 0.01 tolerance).
+// Falls back to coupled if both invalid (it at least has retention).
+Solution pick_best_valid(Solution coupled, Solution uncoupled) {
+    auto vr_c = coupled.validate();
+    auto vr_u = uncoupled.validate();
+
+    if (vr_c.valid && vr_u.valid)
+        return (coupled.total_latency() < uncoupled.total_latency() - 0.01)
+              ? std::move(coupled) : std::move(uncoupled);
+    if (vr_c.valid)
+        return std::move(coupled);
+    if (vr_u.valid)
+        return std::move(uncoupled);
+    return std::move(coupled);
+}
+
+} // anonymous namespace
+
+// ============================================================================
 // Full pipeline
 // ============================================================================
 
@@ -130,54 +202,12 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
         std::cerr << "Phase 2: Building coupled partitions from "
                   << partition_pool.size() << " partitions...\n";
 
-        // Helper: read retain_per_step from an ordering and set the coupling
-        // edges directly on cp (no acyclicity check needed — DFS/beam
-        // orderings respect topological order by construction).
-        auto seed_coupling_from_ordering = [&](CoupledPartition& cp,
-                                                const OrderingResult& res) {
-            const auto& part = cp.part;
-            while (cp.next_group.size() < part.groups.size())
-                cp.next_group.push_back(SIZE_MAX);
-            while (cp.prev_group.size() < part.groups.size())
-                cp.prev_group.push_back(SIZE_MAX);
-
-            for (size_t i = 0; i + 1 < res.order.size(); i++) {
-                if (i >= res.retain_per_step.size()) break;
-                const auto& ret = res.retain_per_step[i];
-                if (ret.empty()) continue;
-                size_t ga = res.order[i], gb = res.order[i + 1];
-                if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
-                const auto& bouts = part.groups[ga].sg->boundary_outputs();
-                const auto& bins  = part.groups[gb].sg->boundary_inputs();
-                for (auto t : ret) {
-                    if (!feasibly_ret.count(t)) continue;
-                    if (!bouts.count(t) || !bins.count(t)) continue;
-                    // Only couple if ga is still a free tail and gb a free head
-                    if (cp.next_group[ga] != SIZE_MAX && cp.next_group[ga] != gb) continue;
-                    if (cp.prev_group[gb] != SIZE_MAX && cp.prev_group[gb] != ga) continue;
-                    cp.next_group[ga] = gb;
-                    cp.prev_group[gb] = ga;
-                    cp.retained[{ga, gb}].insert(t);
-                }
-            }
-        };
-
         int hw_threads = (int)std::thread::hardware_concurrency();
         if (hw_threads <= 0) hw_threads = 4;
         int n_tasks = (int)partition_pool.size();
         std::atomic<int> next_task{0};
         std::mutex cp_mutex;
         std::vector<CoupledPartition> coupled_pool;
-
-        // Helper: seed coupling from ordering, push pre-greedy copy, run
-        // greedy descent, push post-greedy result. Both go into the pool for
-        // diversity.
-        auto add_variant = [&](CoupledPartition cp, const OrderingResult& res) {
-            seed_coupling_from_ordering(cp, res);
-            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp); }
-            coupling_greedy_descent(cp, feasibly_ret, phase2_dl);
-            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp)); }
-        };
 
         auto gen0_worker = [&]() {
             std::mt19937 rng(std::random_device{}());
@@ -205,17 +235,20 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
                 // DFS-seeded variant
                 if (SteadyClock::now() < phase2_dl)
-                    add_variant(cp_base, dfs_ordering(cp_base.part));
+                    add_coupled_variant(cp_base, dfs_ordering(cp_base.part),
+                                        feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
 
                 // Top 2 partitions: beam-search-seeded variant
                 if (tid < 2 && SteadyClock::now() < phase2_dl) {
                     int bw = (n_alive > 25) ? 3 : (n_alive > 15) ? 5 : 8;
-                    add_variant(cp_base, beam_search_ordering(cp_base.part, bw));
+                    add_coupled_variant(cp_base, beam_search_ordering(cp_base.part, bw),
+                                        feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
                 }
 
                 // Random-ordering variant for diversity
                 if (SteadyClock::now() < phase2_dl)
-                    add_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng));
+                    add_coupled_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng),
+                                        feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
             }
         };
 
@@ -232,7 +265,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
             cp.init_from(std::move(part), &shared_cache);
             cp.part.finalize(&shared_cache);
             auto res = dfs_ordering(cp.part);
-            seed_coupling_from_ordering(cp, res);
+            seed_coupling_from_ordering(cp, res, feasibly_ret);
             coupling_greedy_descent(cp, feasibly_ret);
             coupled_pool.push_back(std::move(cp));
         }
@@ -292,21 +325,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
             uncoupled_fb = Solution::from_partition(prob, dag, fb);
         }
 
-        // Pick the best valid solution among: coupled, uncoupled fallback.
-        bool coupled_ok   = vr2.valid;
-        bool uncoupled_ok = uncoupled_fb.validate().valid;
-
-        if (coupled_ok && uncoupled_ok) {
-            final_sol = (coupling_sol.total_latency() < uncoupled_fb.total_latency() - 0.01)
-                      ? std::move(coupling_sol) : std::move(uncoupled_fb);
-        } else if (coupled_ok) {
-            final_sol = std::move(coupling_sol);
-        } else if (uncoupled_ok) {
-            final_sol = std::move(uncoupled_fb);
-        } else {
-            // Both invalid — use coupled (may have warnings but at least has retention).
-            final_sol = std::move(coupling_sol);
-        }
+        final_sol = pick_best_valid(std::move(coupling_sol), std::move(uncoupled_fb));
     }
     after_sol_evo = final_sol.total_latency();
 
@@ -486,43 +505,8 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
         auto phase2_dl = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
             (effective_dl - SteadyClock::now()) * 5 / 100);
 
-        auto seed_coupling_from_ordering = [&](CoupledPartition& cp,
-                                                const OrderingResult& res) {
-            const auto& part = cp.part;
-            while (cp.next_group.size() < part.groups.size())
-                cp.next_group.push_back(SIZE_MAX);
-            while (cp.prev_group.size() < part.groups.size())
-                cp.prev_group.push_back(SIZE_MAX);
-
-            for (size_t i = 0; i + 1 < res.order.size(); i++) {
-                if (i >= res.retain_per_step.size()) break;
-                const auto& ret = res.retain_per_step[i];
-                if (ret.empty()) continue;
-                size_t ga = res.order[i], gb = res.order[i + 1];
-                if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
-                const auto& bouts = part.groups[ga].sg->boundary_outputs();
-                const auto& bins  = part.groups[gb].sg->boundary_inputs();
-                for (auto t : ret) {
-                    if (!feasibly_ret.count(t)) continue;
-                    if (!bouts.count(t) || !bins.count(t)) continue;
-                    if (cp.next_group[ga] != SIZE_MAX && cp.next_group[ga] != gb) continue;
-                    if (cp.prev_group[gb] != SIZE_MAX && cp.prev_group[gb] != ga) continue;
-                    cp.next_group[ga] = gb;
-                    cp.prev_group[gb] = ga;
-                    cp.retained[{ga, gb}].insert(t);
-                }
-            }
-        };
-
         std::vector<CoupledPartition> coupled_pool;
         std::mutex cp_mutex;
-
-        auto add_variant = [&](CoupledPartition cp, const OrderingResult& res) {
-            seed_coupling_from_ordering(cp, res);
-            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp); }
-            coupling_greedy_descent(cp, feasibly_ret, phase2_dl);
-            { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp)); }
-        };
 
         {
             std::atomic<int> next_task{0};
@@ -548,11 +532,13 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
                     // DFS-seeded variant
                     if (SteadyClock::now() < phase2_dl)
-                        add_variant(cp_base, dfs_ordering(cp_base.part));
+                        add_coupled_variant(cp_base, dfs_ordering(cp_base.part),
+                                            feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
 
                     // Random-ordering variant
                     if (SteadyClock::now() < phase2_dl)
-                        add_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng));
+                        add_coupled_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng),
+                                            feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
                 }
             };
 
@@ -616,18 +602,7 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
             uncoupled_fb = Solution::from_partition(prob, dag, fb, 8, &shared_cache);
         }
 
-        auto vr_c = coupling_sol.validate();
-        auto vr_u = uncoupled_fb.validate();
-
-        if (vr_c.valid && vr_u.valid)
-            final_sol = (coupling_sol.total_latency() < uncoupled_fb.total_latency() - 0.01)
-                      ? std::move(coupling_sol) : std::move(uncoupled_fb);
-        else if (vr_c.valid)
-            final_sol = std::move(coupling_sol);
-        else if (vr_u.valid)
-            final_sol = std::move(uncoupled_fb);
-        else
-            final_sol = std::move(coupling_sol);
+        final_sol = pick_best_valid(std::move(coupling_sol), std::move(uncoupled_fb));
     }
 
     double final_cost = final_sol.total_latency();

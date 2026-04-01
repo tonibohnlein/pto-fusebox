@@ -334,7 +334,7 @@ void test_series_chain_replication() {
 
     // After greedy, blocks 1-7 should have matching group structure.
     // Check: groups that span block ops should appear in multiples.
-    std::set<size_t> block_ops;
+    FlatSet<size_t> block_ops;
     for (int b = 1; b <= 7; b++)
         for (int j = 0; j < 4; j++)
             block_ops.insert(b * 4 + j);

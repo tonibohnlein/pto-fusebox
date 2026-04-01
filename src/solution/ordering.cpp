@@ -19,7 +19,7 @@ OrderingResult dfs_ordering(const Partition& part) {
         if (!part.groups[i].alive) scheduled[i] = true;
 
     std::vector<int> in_deg = part.group_in_deg;
-    std::set<size_t> ready;
+    FlatSet<size_t> ready;
     for (size_t i = 0; i < ng; i++)
         if (part.groups[i].alive && in_deg[i] == 0) ready.insert(i);
 
@@ -127,8 +127,8 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
         std::vector<size_t>           order;
         std::vector<int>              in_deg;
         std::vector<bool>             scheduled;        // carried incrementally
-        std::set<size_t>              resident;
-        std::vector<std::set<size_t>> retain_per_step;
+        FlatSet<size_t>              resident;
+        std::vector<FlatSet<size_t>> retain_per_step;
         double                        total_latency = 0;
     };
 
@@ -164,12 +164,12 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 state.scheduled[gi] = true;  // mark temporarily
 
                 // Prune resident: drop tensors no future group will need
-                std::set<size_t> useful_resident;
+                FlatSet<size_t> useful_resident;
                 for (auto t : state.resident)
                     if (future_needs_fast(t, state.scheduled)) useful_resident.insert(t);
 
                 // Outputs worth retaining for a future step
-                std::set<size_t> retainable_out;
+                FlatSet<size_t> retainable_out;
                 for (auto t : sg.boundary_outputs())
                     if (prob.retainable_tensors.count(t) && future_needs_fast(t, state.scheduled))
                         retainable_out.insert(t);
@@ -180,18 +180,18 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 best.latency  = part.groups[gi].cost;
                 best.config   = part.groups[gi].best_cfg;
 
-                std::set<size_t> best_resident_in;
-                std::set<size_t> best_retain_these;
+                FlatSet<size_t> best_resident_in;
+                FlatSet<size_t> best_retain_these;
 
                 // Subset of resident tensors actually used by this group
-                std::set<size_t> only_used;
+                FlatSet<size_t> only_used;
                 for (auto t : useful_resident)
                     if (sg.boundary_inputs().count(t)) only_used.insert(t);
 
                 // Fast path: try the cached config with retention context first.
                 // Only fall back to full best_cost() enumeration if it improves.
-                auto try_option = [&](const std::set<size_t>& res_in,
-                                      const std::set<size_t>& ret_out) {
+                auto try_option = [&](const FlatSet<size_t>& res_in,
+                                      const FlatSet<size_t>& ret_out) {
                     // Quick single-config check with cached tiling
                     auto c = sg.compute_cost(best.config, res_in, ret_out);
                     if (c.feasible && c.latency < best.latency) {
@@ -227,7 +227,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 next.scheduled = state.scheduled;  // gi already marked
                 next.total_latency = state.total_latency + best.latency;
 
-                std::set<size_t> exportable;
+                FlatSet<size_t> exportable;
                 for (auto t : best_retain_these)
                     if (sg.boundary_outputs().count(t))
                         exportable.insert(t);
@@ -266,7 +266,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
 // ============================================================================
 
 OrderingResult random_ordering(const Partition& part,
-                               const std::set<size_t>& feasibly_ret,
+                               const FlatSet<size_t>& feasibly_ret,
                                std::mt19937& rng) {
     const Problem& prob = *part.prob;
     size_t ng      = part.groups.size();
@@ -346,7 +346,7 @@ OrderingResult random_ordering(const Partition& part,
     std::vector<size_t> group_to_step(ng, SIZE_MAX);
     for (size_t i = 0; i < order.size(); i++) group_to_step[order[i]] = i;
 
-    std::vector<std::set<size_t>> retain_per_step(order.size());
+    std::vector<FlatSet<size_t>> retain_per_step(order.size());
     for (auto& rc : cands) {
         size_t sp = group_to_step[rc.prod_group];
         size_t sc = group_to_step[rc.cons_group];

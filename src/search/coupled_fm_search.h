@@ -74,8 +74,8 @@ struct CoupledFMMove {
 
 CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
                                         size_t op,
-                                        const std::set<size_t>& feasibly_ret,
-                                        const std::set<size_t>& locked = {});
+                                        const FlatSet<size_t>& feasibly_ret,
+                                        const FlatSet<size_t>& locked = {});
 
 // ============================================================================
 // apply_coupled_fm_move
@@ -93,7 +93,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
 // Empty return = move was not applied.
 // ============================================================================
 
-std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
+FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                                         const CoupledFMMove& m);
 
 // ============================================================================
@@ -107,7 +107,7 @@ std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
 class CoupledActiveSet {
 public:
     CoupledActiveSet(const CoupledPartition& cp,
-                     const std::set<size_t>& feasibly_ret,
+                     const FlatSet<size_t>& feasibly_ret,
                      double floor = 0.0);
 
     // --- Activation ---
@@ -121,7 +121,7 @@ public:
     void lock_all(const std::vector<size_t>& ops);
 
     // --- Update ---
-    void refresh_after_move(const std::set<size_t>& affected_groups);
+    void refresh_after_move(const FlatSet<size_t>& affected_groups);
 
     // --- Queries ---
     bool is_active(size_t op) const { return heap_.contains(op); }
@@ -129,9 +129,9 @@ public:
 
 private:
     const CoupledPartition*   cp_;
-    const std::set<size_t>*   feasibly_ret_;
+    const FlatSet<size_t>*   feasibly_ret_;
     PairingHeap<CoupledFMMove> heap_;
-    std::set<size_t>           locked_;
+    FlatSet<size_t>           locked_;
     double                     floor_ = 0.0;
 
     void recompute_and_update(size_t op);

@@ -56,14 +56,14 @@ static bool eject_creates_ephemeral_gap(const Partition& part, size_t op, size_t
 
 static bool split_creates_ephemeral_gap_local(
     const Partition& part,
-    const std::set<size_t>& side_a, const std::set<size_t>& side_b,
+    const FlatSet<size_t>& side_a, const FlatSet<size_t>& side_b,
     size_t gx) {
     const auto& dag = *part.dag;
     const auto& prob = *part.prob;
 
     // Check each side: does it have an ephemeral tensor needed by the other side?
-    auto check_side = [&](const std::set<size_t>& inside,
-                          const std::set<size_t>& outside) -> bool {
+    auto check_side = [&](const FlatSet<size_t>& inside,
+                          const FlatSet<size_t>& outside) -> bool {
         for (auto op : outside) {
             for (auto t : prob.ops[op].inputs) {
                 int prod = dag.tensor_producer[t];
@@ -102,7 +102,7 @@ static bool split_creates_ephemeral_gap_local(
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     const std::set<size_t>& locked) {
+                     const FlatSet<size_t>& locked) {
     if (locked.count(op)) return {};
 
     FMMove best;
@@ -172,7 +172,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
     // --- STEAL / RECOMPUTE / MERGE: op pulled into adjacent group ---
     // Structured as (target → source) with pre-computed costs for efficiency.
-    std::set<size_t> adj_groups;
+    FlatSet<size_t> adj_groups;
     for (auto nbr : dag.op_neighbors[op])
         for (auto gi : part.groups_of(nbr))
             if (part.groups[gi].alive && !part.groups[gi].ops.count(op))
@@ -184,7 +184,7 @@ FMMove best_move_for(const Partition& part, size_t op,
     std::unordered_map<size_t, GxCost> gx_without_op;
     for (auto gx : groups_of_x) {
         if (!part.groups[gx].alive) continue;
-        std::set<size_t> rem = part.groups[gx].ops;
+        FlatSet<size_t> rem = part.groups[gx].ops;
         rem.erase(op);
         if (rem.empty()) {
             gx_without_op[gx] = {0.0, true};
@@ -203,7 +203,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
     std::set<std::pair<size_t,size_t>> merge_checked;
     for (auto gi : adj_groups) {
-        std::set<size_t> new_gi = part.groups[gi].ops;
+        FlatSet<size_t> new_gi = part.groups[gi].ops;
         new_gi.insert(op);
         double new_gi_cost = part.eval_set(new_gi);
         if (new_gi_cost >= 1e17) continue;
@@ -220,9 +220,9 @@ FMMove best_move_for(const Partition& part, size_t op,
                                     - (new_gi_cost + new_gx_cost);
                     if (saving > best.saving && part.acyclic_steal_local(op, gx, gi)) {
                         // Gap check: reuse new_gi (already built) + reconstruct new_gx
-                        std::set<size_t> new_gx = part.groups[gx].ops;
+                        FlatSet<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
-                        std::vector<std::set<size_t>> comps;
+                        std::vector<FlatSet<size_t>> comps;
                         comps.push_back(new_gi);
                         if (!new_gx.empty()) comps.push_back(new_gx);
                         if (!part.split_creates_ephemeral_gap(comps, {gx, gi}))
@@ -236,7 +236,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (!merge_checked.count(pair_key)) {
                 merge_checked.insert(pair_key);
                 if (part.acyclic_merge_local(gi, gx)) {
-                    std::set<size_t> merged_ops = part.groups[gi].ops;
+                    FlatSet<size_t> merged_ops = part.groups[gi].ops;
                     merged_ops.insert(part.groups[gx].ops.begin(),
                                       part.groups[gx].ops.end());
                     if (!part.creates_ephemeral_gap(merged_ops, gi, gx)) {
@@ -262,7 +262,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
     // --- Tensor-centric moves: TENSOR_MERGE and TENSOR_EXTRACT ---
     {
-        std::set<size_t> tensors_checked;
+        FlatSet<size_t> tensors_checked;
         for (auto gx : groups_of_x) {
             for (auto t : part.prob->ops[op].inputs) {
                 if (tensors_checked.count(t)) continue;
@@ -271,7 +271,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                 auto& consumers = dag.tensor_consumers[t];
                 if (consumers.size() < 2) continue;
 
-                std::set<size_t> consumer_groups;
+                FlatSet<size_t> consumer_groups;
                 std::vector<size_t> consumer_ops_vec;
                 for (auto cop : consumers) {
                     for (auto cg : part.groups_of(cop))
@@ -317,7 +317,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
                 // TENSOR_EXTRACT: Kahn's at eval time (rare move, high rejection)
                 {
-                    std::set<size_t> extract_ops(consumer_ops_vec.begin(),
+                    FlatSet<size_t> extract_ops(consumer_ops_vec.begin(),
                                                  consumer_ops_vec.end());
                     if (prod >= 0) extract_ops.insert((size_t)prod);
 
@@ -344,7 +344,7 @@ FMMove best_move_for(const Partition& part, size_t op,
     // --- FORCE_RECOMPUTE: for each input tensor of op with ≥2 consumers,
     // evaluate extracting producer + consumers into {P, C_i} pairs ---
     {
-        std::set<size_t> fr_tensors_checked;
+        FlatSet<size_t> fr_tensors_checked;
         for (auto gx : groups_of_x) {
             for (auto t : part.prob->ops[op].inputs) {
                 if (fr_tensors_checked.count(t)) continue;
@@ -387,9 +387,9 @@ FMMove best_move_for(const Partition& part, size_t op,
 // No post-hoc is_acyclic() needed — no partial mutation on failure.
 // ============================================================================
 
-std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
+FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     if (!m.valid()) return {};
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     switch (m.type) {
         case FMMove::STEAL: {
@@ -426,7 +426,7 @@ std::set<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::TENSOR_EXTRACT: {
-            std::set<size_t> extract_ops(m.tensor_consumer_ops.begin(),
+            FlatSet<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
             affected = partition_moves::apply_tensor_extract(part, extract_ops,
                                                               m.tensor_groups);

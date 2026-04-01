@@ -32,5 +32,5 @@ struct CoupledFMPassResult {
 
 CoupledFMPassResult coupled_fm_inner_pass(
     CoupledPartition               cp,
-    const std::set<size_t>&        feasibly_ret,
+    const FlatSet<size_t>&        feasibly_ret,
     const FMConfig&                cfg = {});

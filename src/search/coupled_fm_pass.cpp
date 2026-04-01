@@ -8,7 +8,7 @@
 // ============================================================================
 
 static std::vector<size_t> all_activatable_ops_coupled(const CoupledPartition& cp) {
-    std::set<size_t> ops;
+    FlatSet<size_t> ops;
     const auto& part = cp.part;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
@@ -51,7 +51,7 @@ static std::vector<size_t> merge_lock_ops_coupled(const CoupledPartition& cp,
 // ============================================================================
 
 CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
-                                           const std::set<size_t>& feasibly_ret,
+                                           const FlatSet<size_t>& feasibly_ret,
                                            const FMConfig& cfg) {
     CoupledFMPassResult result;
     result.start_cost = cp.total_cost();

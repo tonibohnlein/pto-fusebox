@@ -84,9 +84,9 @@ size_t ActiveSet::num_active() const {
 // Update
 // ============================================================================
 
-void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
+void ActiveSet::refresh_after_move(const FlatSet<size_t>& affected_groups) {
     // Collect relevant groups: affected + their adjacents
-    std::set<size_t> relevant;
+    FlatSet<size_t> relevant;
     for (auto gi : affected_groups) {
         relevant.insert(gi);
         if (part_->groups[gi].alive) {
@@ -96,7 +96,7 @@ void ActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
     }
 
     // Collect all ops in relevant groups + their DAG neighbors
-    std::set<size_t> ops_to_refresh;
+    FlatSet<size_t> ops_to_refresh;
     for (auto gi : relevant) {
         if (!part_->groups[gi].alive) continue;
         for (auto op : part_->groups[gi].ops) {

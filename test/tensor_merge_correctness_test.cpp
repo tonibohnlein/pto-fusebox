@@ -50,7 +50,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -76,7 +76,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -99,7 +99,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -218,7 +218,7 @@ void test_tensor_merge_gain_correctness() {
                    + ctx.part.groups[2].cost;
 
     // Independently compute merged cost
-    std::set<size_t> merged_ops = {0, 1, 2};
+    FlatSet<size_t> merged_ops = {0, 1, 2};
     double independent_merged_cost = ctx.part.eval_set(merged_ops);
     double independent_saving = old_sum - independent_merged_cost;
 
@@ -549,7 +549,7 @@ void test_tensor_merge_precomputed() {
     std::vector<size_t> group_list = {0, 1, 2};
 
     // Precompute the merged cost
-    std::set<size_t> merged_ops = {0, 1, 2};
+    FlatSet<size_t> merged_ops = {0, 1, 2};
     double precomputed_cost = ctx1.part.eval_set(merged_ops);
     CHECK("precomputed: cost is finite", precomputed_cost < 1e17);
 

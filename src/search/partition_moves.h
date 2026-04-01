@@ -42,7 +42,7 @@ EvalResult eval_steal(const Partition& p, size_t op, size_t from, size_t to);
 // Apply: Kahn's check → mutate → return affected groups.
 // Returns {} if Kahn's fails or cost re-evaluation fails.
 // When both precomputed costs are >= 0, skip re-evaluation and use them directly.
-std::set<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
+FlatSet<size_t> apply_steal(Partition& p, size_t op, size_t from, size_t to,
                               double precomputed_from_cost = -1.0,
                               double precomputed_to_cost = -1.0);
 
@@ -61,7 +61,7 @@ EvalResult eval_merge(const Partition& p, size_t ga, size_t gb);
 // Apply: Kahn's check → mutate → return affected groups.
 // Returns {} if Kahn's fails or cost re-evaluation fails.
 // When precomputed_cost >= 0, skip re-evaluation and use that value directly.
-std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precomputed_cost = -1.0);
+FlatSet<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precomputed_cost = -1.0);
 
 // ============================================================================
 // EJECT: remove a single op from a group, creating a singleton + remainder(s)
@@ -76,7 +76,7 @@ std::set<size_t> apply_merge(Partition& p, size_t ga, size_t gb, double precompu
 // Does NOT check feasibility (caller already called part.eval_eject).
 // ============================================================================
 
-std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
+FlatSet<size_t> apply_eject(Partition& p, size_t op, size_t ga,
                               const Partition::EjectResult* precomputed = nullptr);
 
 // ============================================================================
@@ -90,7 +90,7 @@ std::set<size_t> apply_eject(Partition& p, size_t op, size_t ga,
 //   - Re-evaluates split to get current sides
 // ============================================================================
 
-std::set<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
+FlatSet<size_t> apply_split(Partition& p, size_t op_a, size_t op_b, size_t ga,
                               const Partition::SplitResult* precomputed = nullptr);
 
 // ============================================================================
@@ -111,7 +111,7 @@ EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op);
 
 // Apply: validate + remove op from group. Returns affected groups.
 // When precomputed_cost >= 0, skip re-evaluation and use that value directly.
-std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op,
+FlatSet<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op,
                                      double precomputed_cost = -1.0);
 
 // ============================================================================
@@ -124,7 +124,7 @@ std::set<size_t> apply_de_recompute(Partition& p, size_t ga, size_t op,
 
 EvalResult eval_recompute(const Partition& p, size_t op, size_t into);
 
-std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into,
+FlatSet<size_t> apply_recompute(Partition& p, size_t op, size_t into,
                                   double precomputed_cost = -1.0);
 
 // ============================================================================
@@ -139,7 +139,7 @@ std::set<size_t> apply_recompute(Partition& p, size_t op, size_t into,
 EvalResult eval_tensor_merge(const Partition& p,
                               const std::vector<size_t>& group_list);
 
-std::set<size_t> apply_tensor_merge(Partition& p,
+FlatSet<size_t> apply_tensor_merge(Partition& p,
                                      const std::vector<size_t>& group_list,
                                      double precomputed_cost = -1.0);
 
@@ -153,11 +153,11 @@ std::set<size_t> apply_tensor_merge(Partition& p,
 // ============================================================================
 
 EvalResult eval_tensor_extract(const Partition& p,
-                                const std::set<size_t>& extract_ops,
+                                const FlatSet<size_t>& extract_ops,
                                 const std::vector<size_t>& source_groups);
 
-std::set<size_t> apply_tensor_extract(Partition& p,
-                                       const std::set<size_t>& extract_ops,
+FlatSet<size_t> apply_tensor_extract(Partition& p,
+                                       const FlatSet<size_t>& extract_ops,
                                        const std::vector<size_t>& source_groups,
                                        double precomputed_extract_cost = -1.0);
 
@@ -174,7 +174,7 @@ struct ForceRecomputeResult {
 
 ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id);
 
-std::set<size_t> apply_force_recompute(Partition& p, size_t tensor_id,
+FlatSet<size_t> apply_force_recompute(Partition& p, size_t tensor_id,
                                         const ForceRecomputeResult& eval);
 
 } // namespace partition_moves

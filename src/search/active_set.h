@@ -30,18 +30,18 @@ public:
     void lock_all(const std::vector<size_t>& ops);
 
     // --- Update ---
-    void refresh_after_move(const std::set<size_t>& affected_groups);
+    void refresh_after_move(const FlatSet<size_t>& affected_groups);
 
     // --- Queries ---
     bool is_active(size_t op) const { return heap_.contains(op); }
     bool is_locked(size_t op) const { return locked_.count(op) > 0; }
     size_t num_active() const;
-    const std::set<size_t>& locked_ops() const { return locked_; }
+    const FlatSet<size_t>& locked_ops() const { return locked_; }
 
 private:
     const Partition* part_;
     PairingHeap<FMMove> heap_;
-    std::set<size_t> locked_;
+    FlatSet<size_t> locked_;
     double floor_ = 0.0;  // reject moves with saving < -floor
 
     void recompute_and_update(size_t op);

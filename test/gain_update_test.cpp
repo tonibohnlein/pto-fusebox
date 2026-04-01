@@ -116,10 +116,10 @@ static std::map<size_t, MoveSnapshot> snapshot_all_moves(const Partition& part) 
 // Helper: compute the affected_ops set the same way greedy_descent does
 // ============================================================================
 
-static std::set<size_t> greedy_affected_ops(const Partition& part,
+static FlatSet<size_t> greedy_affected_ops(const Partition& part,
                                              const FMMove& m,
-                                             const std::set<size_t>& affected_groups) {
-    std::set<size_t> affected_ops;
+                                             const FlatSet<size_t>& affected_groups) {
+    FlatSet<size_t> affected_ops;
     affected_ops.insert(m.op);
     for (auto nbr : part.dag->op_neighbors[m.op])
         affected_ops.insert(nbr);
@@ -168,7 +168,7 @@ static bool verify_gain(const char* label, const Partition& part, const FMMove& 
 
 static void verify_update_scope(const char* label,
                                  const Partition& part_after,
-                                 const std::set<size_t>& affected_ops,
+                                 const FlatSet<size_t>& affected_ops,
                                  const std::map<size_t, MoveSnapshot>& pre_snap) {
     int mismatches = 0;
     int missed_updates = 0;

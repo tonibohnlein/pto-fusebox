@@ -22,7 +22,7 @@ inline std::vector<FMMove> all_moves_for_group(const Partition& part, size_t gi,
 
             // MERGE
             if (!part.dag->merge_creates_cycle(part.groups[gi].ops, part.groups[gj].ops)) {
-                std::set<size_t> merged = part.groups[gi].ops;
+                FlatSet<size_t> merged = part.groups[gi].ops;
                 merged.insert(part.groups[gj].ops.begin(), part.groups[gj].ops.end());
                 double nc = part.eval_set(merged);
                 double saving = (part.groups[gi].cost + part.groups[gj].cost) - nc;
@@ -33,11 +33,11 @@ inline std::vector<FMMove> all_moves_for_group(const Partition& part, size_t gi,
             // STEAL (from gj to gi)
             if (!part.groups[gi].ops.count(adj_op) &&
                 !part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
-                std::set<size_t> new_gi = part.groups[gi].ops;
+                FlatSet<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
                 double new_gi_cost = part.eval_set(new_gi);
                 if (new_gi_cost < 1e17) {
-                    std::set<size_t> new_gj = part.groups[gj].ops;
+                    FlatSet<size_t> new_gj = part.groups[gj].ops;
                     new_gj.erase(adj_op);
                     double new_gj_cost = new_gj.empty() ? 0 : part.eval_set(new_gj);
                     if (new_gj.empty() || new_gj_cost < 1e17) {
@@ -53,7 +53,7 @@ inline std::vector<FMMove> all_moves_for_group(const Partition& part, size_t gi,
             // RECOMPUTE (add adj_op to gi, keep in gj)
             if (!part.groups[gi].ops.count(adj_op) &&
                 !part.dag->merge_creates_cycle({adj_op}, part.groups[gi].ops)) {
-                std::set<size_t> new_gi = part.groups[gi].ops;
+                FlatSet<size_t> new_gi = part.groups[gi].ops;
                 new_gi.insert(adj_op);
                 double nc = part.eval_set(new_gi);
                 double saving = part.groups[gi].cost - nc;

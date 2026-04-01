@@ -22,8 +22,8 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
 
 CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
                                         size_t op,
-                                        const std::set<size_t>& feasibly_ret,
-                                        const std::set<size_t>& locked) {
+                                        const FlatSet<size_t>& feasibly_ret,
+                                        const FlatSet<size_t>& locked) {
     CoupledFMMove best;
 
     // --- Partition moves (delegate to existing best_move_for) ---
@@ -330,9 +330,9 @@ static bool in_forward_chain(const CoupledPartition& cp, size_t start, size_t ta
 // ============================================================================
 
 static double eval_coupled_group_cost(const CoupledPartition& cp,
-                                       const std::set<size_t>& ops,
-                                       const std::set<size_t>& entering,
-                                       const std::set<size_t>& retain) {
+                                       const FlatSet<size_t>& ops,
+                                       const FlatSet<size_t>& entering,
+                                       const FlatSet<size_t>& retain) {
     if (ops.empty()) return 0.0;
     const Partition& part = cp.part;
     if (entering.empty() && retain.empty()) return part.eval_set(ops);
@@ -349,7 +349,7 @@ static double coupled_recompute_saving(const CoupledPartition& cp,
     const Partition& part = cp.part;
     if (!part.groups[gb].alive) return -1e18;
 
-    std::set<size_t> new_gb = part.groups[gb].ops;
+    FlatSet<size_t> new_gb = part.groups[gb].ops;
     new_gb.insert(op);
 
     auto en_gb = cp.entering_for(gb);
@@ -358,7 +358,7 @@ static double coupled_recompute_saving(const CoupledPartition& cp,
     // After adding op, some entering tensors may become internal
     // (op produces them → now produced inside gb). Filter.
     if (!en_gb.empty()) {
-        std::set<size_t> valid;
+        FlatSet<size_t> valid;
         for (auto t : en_gb)
             if (is_boundary_input_of(new_gb, t, *part.dag)) valid.insert(t);
         en_gb = std::move(valid);
@@ -383,16 +383,16 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     const Partition& part = cp.part;
     bool is_eject = (gb == SIZE_MAX);
 
-    std::set<size_t> new_ga = part.groups[ga].ops;  new_ga.erase(op);
-    std::set<size_t> new_gb = is_eject ? std::set<size_t>{op} : part.groups[gb].ops;
+    FlatSet<size_t> new_ga = part.groups[ga].ops;  new_ga.erase(op);
+    FlatSet<size_t> new_gb = is_eject ? FlatSet<size_t>{op} : part.groups[gb].ops;
     if (!is_eject) new_gb.insert(op);
 
     auto orig_en_ga = cp.entering_for(ga);
     auto orig_re_ga = cp.retain_for(ga);
     auto en_ga = orig_en_ga;
     auto re_ga = orig_re_ga;
-    auto en_gb = is_eject ? std::set<size_t>{} : cp.entering_for(gb);
-    auto re_gb = is_eject ? std::set<size_t>{} : cp.retain_for(gb);
+    auto en_gb = is_eject ? FlatSet<size_t>{} : cp.entering_for(gb);
+    auto re_gb = is_eject ? FlatSet<size_t>{} : cp.retain_for(gb);
 
     // Simulate fixup_coupling_steal: if op is the last consumer of ALL retained
     // entering tensors in ga, and gb has no incoming coupling, transfer the edge.
@@ -419,7 +419,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     // Simulate: if op is the only producer of a retained output in ga,
     // that retention becomes invalid (invalidate_couplings will remove it).
     if (!re_ga.empty()) {
-        std::set<size_t> valid_re;
+        FlatSet<size_t> valid_re;
         for (auto t : re_ga) {
             bool op_produces = false;
             for (auto out : part.prob->ops[op].outputs)
@@ -441,25 +441,25 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     // retain). Also filter en_gb for tensors that are no longer boundary inputs
     // of new_gb (e.g. tensor became internal after absorbing its producer).
     if (!en_ga.empty()) {
-        std::set<size_t> v;
+        FlatSet<size_t> v;
         for (auto t : en_ga)
             if (is_boundary_input_of(new_ga, t, *part.dag)) v.insert(t);
         en_ga = std::move(v);
     }
     if (!re_ga.empty()) {
-        std::set<size_t> v;
+        FlatSet<size_t> v;
         for (auto t : re_ga)
             if (is_boundary_output_of(new_ga, t, *part.dag)) v.insert(t);
         re_ga = std::move(v);
     }
     if (!en_gb.empty()) {
-        std::set<size_t> v;
+        FlatSet<size_t> v;
         for (auto t : en_gb)
             if (is_boundary_input_of(new_gb, t, *part.dag)) v.insert(t);
         en_gb = std::move(v);
     }
     if (!re_gb.empty() && !is_eject) {
-        std::set<size_t> v;
+        FlatSet<size_t> v;
         for (auto t : re_gb)
             if (is_boundary_output_of(new_gb, t, *part.dag)) v.insert(t);
         re_gb = std::move(v);
@@ -485,7 +485,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         double old_prev = cp.group_cost(ga_prev);
         // ga_prev retains tensors for ga. If en_ga is now empty, prev loses all retain.
         // If en_ga shrank, prev retains only the remaining tensors.
-        auto prev_retain = en_ga.empty() ? std::set<size_t>{} : en_ga;
+        auto prev_retain = en_ga.empty() ? FlatSet<size_t>{} : en_ga;
         double new_prev = eval_coupled_group_cost(
             cp, part.groups[ga_prev].ops, cp.entering_for(ga_prev), prev_retain);
         neighbor_delta += old_prev - new_prev;
@@ -496,7 +496,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     // or the chain ends).
     if (ga_next != SIZE_MAX && ga_next != gb && re_ga != orig_re_ga) {
         // Walk forward from ga_next along the chain.
-        std::set<size_t> cur_enter = re_ga.empty() ? std::set<size_t>{} : re_ga;
+        FlatSet<size_t> cur_enter = re_ga.empty() ? FlatSet<size_t>{} : re_ga;
         size_t cur = ga_next;
         size_t max_steps = part.groups.size();
         for (size_t step = 0; step < max_steps && cur != SIZE_MAX; step++) {
@@ -525,7 +525,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         // gb_next: if gb's retain changed (re_gb != orig_re_gb), next's entering changed
         if (gb_next_orig != SIZE_MAX && gb_next_orig != ga && re_gb != orig_re_gb) {
             double old_next = cp.group_cost(gb_next_orig);
-            auto next_enter = re_gb.empty() ? std::set<size_t>{} : re_gb;
+            auto next_enter = re_gb.empty() ? FlatSet<size_t>{} : re_gb;
             double new_next = eval_coupled_group_cost(
                 cp, part.groups[gb_next_orig].ops, next_enter, cp.retain_for(gb_next_orig));
             neighbor_delta += old_next - new_next;
@@ -534,7 +534,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         // gb_prev: if gb's entering changed (en_gb != orig_en_gb), prev's retain changed
         if (gb_prev_orig != SIZE_MAX && gb_prev_orig != ga && en_gb != orig_en_gb) {
             double old_prev = cp.group_cost(gb_prev_orig);
-            auto prev_retain = en_gb.empty() ? std::set<size_t>{} : en_gb;
+            auto prev_retain = en_gb.empty() ? FlatSet<size_t>{} : en_gb;
             double new_prev = eval_coupled_group_cost(
                 cp, part.groups[gb_prev_orig].ops, cp.entering_for(gb_prev_orig), prev_retain);
             neighbor_delta += old_prev - new_prev;
@@ -566,7 +566,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
 static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t gb) {
     const Partition& part = cp.part;
 
-    std::set<size_t> merged = part.groups[ga].ops;
+    FlatSet<size_t> merged = part.groups[ga].ops;
     for (auto op : part.groups[gb].ops) merged.insert(op);
 
     size_t ga_prev = (ga < cp.prev_group.size()) ? cp.prev_group[ga] : SIZE_MAX;
@@ -579,7 +579,7 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     if (ga_prev == gb) { ga_prev = SIZE_MAX; gb_next = SIZE_MAX; }
 
     // Merged entering: ga's prev (if any), else gb's prev (if no cycle)
-    std::set<size_t> entering;
+    FlatSet<size_t> entering;
     if (ga_prev != SIZE_MAX) {
         auto it = cp.retained.find({ga_prev, ga});
         if (it != cp.retained.end()) entering = it->second;
@@ -590,7 +590,7 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     }
 
     // Merged retain: ga's next (if any), else gb's next (if no cycle)
-    std::set<size_t> retain;
+    FlatSet<size_t> retain;
     if (ga_next != SIZE_MAX) {
         auto it = cp.retained.find({ga, ga_next});
         if (it != cp.retained.end()) retain = it->second;
@@ -605,14 +605,14 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     // internal after merge → no longer valid as entering or retained.
     const DAG& dag = *part.dag;
     {
-        std::set<size_t> valid_entering;
+        FlatSet<size_t> valid_entering;
         for (auto t : entering)
             if (is_boundary_input_of(merged, t, dag))
                 valid_entering.insert(t);
         entering = std::move(valid_entering);
     }
     {
-        std::set<size_t> valid_retain;
+        FlatSet<size_t> valid_retain;
         for (auto t : retain)
             if (is_boundary_output_of(merged, t, dag))
                 valid_retain.insert(t);
@@ -692,17 +692,17 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
     if (groups.empty()) return -1e18;
     size_t survivor = groups[0];
 
-    std::set<size_t> merged = cp.part.groups[survivor].ops;
+    FlatSet<size_t> merged = cp.part.groups[survivor].ops;
     for (size_t i = 1; i < groups.size(); i++)
         for (auto op : cp.part.groups[groups[i]].ops) merged.insert(op);
 
     double old_cost = 0;
     for (auto g : groups) old_cost += cp.group_cost(g);
 
-    std::set<size_t> merge_set(groups.begin(), groups.end());
+    FlatSet<size_t> merge_set(groups.begin(), groups.end());
 
     // Start with survivor's current coupling context
-    std::set<size_t> entering, retain;
+    FlatSet<size_t> entering, retain;
     {
         size_t sv_prev = (survivor < cp.prev_group.size()) ? cp.prev_group[survivor] : SIZE_MAX;
         size_t sv_next = (survivor < cp.next_group.size()) ? cp.next_group[survivor] : SIZE_MAX;
@@ -737,13 +737,13 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
     // merged group (tensors between merged groups become internal).
     const DAG& dag = *cp.part.dag;
     {
-        std::set<size_t> valid;
+        FlatSet<size_t> valid;
         for (auto t : entering)
             if (is_boundary_input_of(merged, t, dag)) valid.insert(t);
         entering = std::move(valid);
     }
     {
-        std::set<size_t> valid;
+        FlatSet<size_t> valid;
         for (auto t : retain)
             if (is_boundary_output_of(merged, t, dag)) valid.insert(t);
         retain = std::move(valid);
@@ -783,7 +783,7 @@ static void fixup_coupling_merge(CoupledPartition& cp,
     auto filter_retained = [&](const std::pair<size_t,size_t>& edge) {
         auto it = cp.retained.find(edge);
         if (it == cp.retained.end()) return;
-        std::set<size_t> valid;
+        FlatSet<size_t> valid;
         for (auto t : it->second) {
             // Producer side: must still be boundary output of the producer group
             if (edge.first == ga) {
@@ -867,7 +867,7 @@ static void fixup_coupling_steal(CoupledPartition& cp,
     auto it = cp.retained.find({ga_prev, ga});
     if (it == cp.retained.end()) return;
 
-    std::set<size_t> keep, transfer;
+    FlatSet<size_t> keep, transfer;
     for (auto t : it->second) {
         // Check if op is the only consumer of t in ga (after steal, op is in gb)
         bool op_consumes_t = false;
@@ -931,7 +931,7 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
         if (ga_prev != SIZE_MAX) {
             auto it = cp.retained.find({ga_prev, ga});
             if (it != cp.retained.end()) {
-                std::set<size_t> keep, move;
+                FlatSet<size_t> keep, move;
                 for (auto t : it->second) {
                     if (is_boundary_input_of(cp.part.groups[ga].ops, t, dag))
                         keep.insert(t);
@@ -965,7 +965,7 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
         if (ga_next != SIZE_MAX) {
             auto it = cp.retained.find({ga, ga_next});
             if (it != cp.retained.end()) {
-                std::set<size_t> keep, move;
+                FlatSet<size_t> keep, move;
                 for (auto t : it->second) {
                     if (is_boundary_output_of(cp.part.groups[ga].ops, t, dag))
                         keep.insert(t);
@@ -998,7 +998,7 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
 // apply_coupled_fm_move
 // ============================================================================
 
-std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
+FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                                         const CoupledFMMove& m) {
     if (!m.valid()) return {};
 
@@ -1050,7 +1050,7 @@ std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                 affected.insert(to);
                 return;
             }
-            std::set<size_t> valid;
+            FlatSet<size_t> valid;
             for (auto t : it->second)
                 if (is_boundary_output_of(cp.part.groups[from].ops, t, dag) &&
                     is_boundary_input_of(cp.part.groups[to].ops, t, dag))
@@ -1108,7 +1108,7 @@ std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
     }
 
     // --- Coupling moves ---
-    std::set<size_t> affected;
+    FlatSet<size_t> affected;
 
     switch (m.type) {
         case CoupledFMMove::COUPLE:
@@ -1147,7 +1147,7 @@ std::set<size_t> apply_coupled_fm_move(CoupledPartition& cp,
 // ============================================================================
 
 CoupledActiveSet::CoupledActiveSet(const CoupledPartition& cp,
-                                    const std::set<size_t>& feasibly_ret,
+                                    const FlatSet<size_t>& feasibly_ret,
                                     double floor)
     : cp_(&cp),
       feasibly_ret_(&feasibly_ret),
@@ -1210,11 +1210,11 @@ void CoupledActiveSet::lock_all(const std::vector<size_t>& ops) {
     }
 }
 
-void CoupledActiveSet::refresh_after_move(const std::set<size_t>& affected_groups) {
+void CoupledActiveSet::refresh_after_move(const FlatSet<size_t>& affected_groups) {
     const auto& part = cp_->part;
 
     // Collect relevant groups: affected + their adjacents
-    std::set<size_t> relevant;
+    FlatSet<size_t> relevant;
     for (auto gi : affected_groups) {
         relevant.insert(gi);
         if (gi < part.groups.size() && part.groups[gi].alive) {
@@ -1232,7 +1232,7 @@ void CoupledActiveSet::refresh_after_move(const std::set<size_t>& affected_group
     }
 
     // Collect ops to refresh
-    std::set<size_t> ops_to_refresh;
+    FlatSet<size_t> ops_to_refresh;
     for (auto gi : relevant) {
         if (gi >= part.groups.size() || !part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops) {
@@ -1246,7 +1246,7 @@ void CoupledActiveSet::refresh_after_move(const std::set<size_t>& affected_group
     // that have no direct DAG connection to the affected area, yet can have stale
     // cached moves because acyclicity uses global forward_reachable.
     {
-        std::set<size_t> groups_to_cover;
+        FlatSet<size_t> groups_to_cover;
         for (auto op : ops_to_refresh)
             for (auto gi : part.groups_of(op))
                 if (gi < part.groups.size() && part.groups[gi].alive)

@@ -7,8 +7,8 @@ namespace feasibility {
 // Layer 1: O(degree) pre-filter for SPLIT
 // ============================================================================
 
-bool split_creates_topo_cycle(const std::set<size_t>& side_a,
-                               const std::set<size_t>& side_b,
+bool split_creates_topo_cycle(const FlatSet<size_t>& side_a,
+                               const FlatSet<size_t>& side_b,
                                const DAG& dag) {
     bool a_to_b = false, b_to_a = false;
     for (auto op : side_a) {

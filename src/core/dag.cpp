@@ -67,7 +67,7 @@ DAG DAG::build(const Problem& prob) {
     // op_neighbors: DAG edges + co-consumer edges (undirected)
     d.op_neighbors.resize(d.num_ops);
     for (size_t i = 0; i < d.num_ops; i++) {
-        std::set<size_t> nbrs;
+        FlatSet<size_t> nbrs;
         for (auto j : d.op_preds[i])  nbrs.insert(j);
         for (auto j : d.op_succs[i])  nbrs.insert(j);
         // Co-consumer edges: share a common input tensor
@@ -183,8 +183,8 @@ void DAG::precompute_reachability() {
 //   merge({1},{2}): external_out = ∅ → false ✓
 // ============================================================================
 
-bool DAG::merge_creates_cycle(const std::set<size_t>& a,
-                               const std::set<size_t>& b) const {
+bool DAG::merge_creates_cycle(const FlatSet<size_t>& a,
+                               const FlatSet<size_t>& b) const {
     if (words_per_row_ == 0) return false;
 
     // Thread-local workspace to avoid heap allocations on every call.

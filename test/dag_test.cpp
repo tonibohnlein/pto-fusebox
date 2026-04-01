@@ -187,7 +187,7 @@ void test_topo_sort_disconnected() {
     DAG d = DAG::build(p);
     auto order = d.topo_sort();
     CHECK_EQ_S("covers all 4 ops", order.size(), 4);
-    std::set<size_t> seen(order.begin(), order.end());
+    FlatSet<size_t> seen(order.begin(), order.end());
     CHECK_EQ_S("no duplicates", seen.size(), 4);
     // Within each chain, relative order preserved
     auto pos = [&](size_t op){ return std::find(order.begin(),order.end(),op)-order.begin(); };

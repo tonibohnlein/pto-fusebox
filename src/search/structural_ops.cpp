@@ -6,10 +6,10 @@ namespace structural_ops {
 // Connected components via BFS on DAG neighbor edges
 // ============================================================================
 
-std::vector<std::set<size_t>> connected_components(
-    const std::set<size_t>& ops, const DAG& dag)
+std::vector<FlatSet<size_t>> connected_components(
+    const FlatSet<size_t>& ops, const DAG& dag)
 {
-    std::vector<std::set<size_t>> components;
+    std::vector<FlatSet<size_t>> components;
     size_t n = dag.num_ops;
 
     // Thread-local scratch — reused across calls, no heap allocation after first.
@@ -23,7 +23,7 @@ std::vector<std::set<size_t>> connected_components(
 
     for (auto seed : ops) {
         if (visited[seed]) continue;
-        std::set<size_t> comp;
+        FlatSet<size_t> comp;
         std::vector<size_t> queue = {seed};
         visited[seed] = true;
         while (!queue.empty()) {
@@ -47,7 +47,7 @@ std::vector<std::set<size_t>> connected_components(
 // Connectivity check after removing one op
 // ============================================================================
 
-bool is_connected_without(const std::set<size_t>& ops, size_t rm,
+bool is_connected_without(const FlatSet<size_t>& ops, size_t rm,
                            const DAG& dag)
 {
     if (ops.size() <= 1) return false;
@@ -89,13 +89,13 @@ bool is_connected_without(const std::set<size_t>& ops, size_t rm,
 // Eject analysis
 // ============================================================================
 
-EjectAnalysis analyze_eject(size_t op, const std::set<size_t>& ops,
+EjectAnalysis analyze_eject(size_t op, const FlatSet<size_t>& ops,
                              const DAG& dag)
 {
     EjectAnalysis result;
     if (!ops.count(op) || ops.size() <= 1) return result;
 
-    std::set<size_t> remainder = ops;
+    FlatSet<size_t> remainder = ops;
     remainder.erase(op);
     result.remainder_components = connected_components(remainder, dag);
     result.connected = (result.remainder_components.size() == 1);
@@ -107,7 +107,7 @@ EjectAnalysis analyze_eject(size_t op, const std::set<size_t>& ops,
 // ============================================================================
 
 SplitAnalysis analyze_split(size_t op_a, size_t op_b,
-                             const std::set<size_t>& ops,
+                             const FlatSet<size_t>& ops,
                              const DAG& dag)
 {
     SplitAnalysis result;
@@ -148,7 +148,7 @@ SplitAnalysis analyze_split(size_t op_a, size_t op_b,
 // ============================================================================
 
 std::vector<std::pair<size_t, size_t>> bridge_edges(
-    const std::set<size_t>& ops, const DAG& dag)
+    const FlatSet<size_t>& ops, const DAG& dag)
 {
     std::vector<std::pair<size_t, size_t>> bridges;
     if (ops.size() < 2) return bridges;

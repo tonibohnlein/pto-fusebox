@@ -48,7 +48,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -113,7 +113,7 @@ void test_basic_tensor_extract() {
 
     // Extract ops: {op0, op2} from G0 into a new group
     // (G0 has only these ops, so G0 dies; G1 is untouched)
-    std::set<size_t> extract_ops = {0, 2};
+    FlatSet<size_t> extract_ops = {0, 2};
     std::vector<size_t> source_groups = {0};
 
     auto eval = partition_moves::eval_tensor_extract(ctx.part, extract_ops, source_groups);
@@ -197,7 +197,7 @@ void test_tensor_extract_gain_correctness() {
     double cost_g2 = ctx.part.groups[2].cost;
     double old_sum = cost_g0 + cost_g1 + cost_g2;
 
-    std::set<size_t> extract_ops = {0, 1, 2};
+    FlatSet<size_t> extract_ops = {0, 1, 2};
     std::vector<size_t> source_groups = {0, 1, 2};
 
     // Independently compute each term
@@ -270,7 +270,7 @@ void test_tensor_extract_cyclic_rejected() {
     // Extract {op0, op2}: gnew produces T1 (consumed by G1) and T3.
     // gnew also needs T2 as input (produced by G1's op1).
     // So: gnew -> G1 (via T1) and G1 -> gnew (via T2) -- cycle.
-    std::set<size_t> extract_cyclic = {0, 2};
+    FlatSet<size_t> extract_cyclic = {0, 2};
     CHECK("cyclic: extract {op0,op2} rejected", !ctx.part.acyclic_extract_local(extract_cyclic));
 
     // eval_tensor_extract should also fail or at least the acyclicity check rejects
@@ -278,11 +278,11 @@ void test_tensor_extract_cyclic_rejected() {
     // But we can verify that the caller pattern works.
 
     // Extracting adjacent ops is fine: {op0, op1}
-    std::set<size_t> extract_adjacent = {0, 1};
+    FlatSet<size_t> extract_adjacent = {0, 1};
     CHECK("cyclic: extract {op0,op1} ok", ctx.part.acyclic_extract_local(extract_adjacent));
 
     // Extracting all ops is fine (no external group to route through)
-    std::set<size_t> extract_all = {0, 1, 2};
+    FlatSet<size_t> extract_all = {0, 1, 2};
     CHECK("cyclic: extract all ok", ctx.part.acyclic_extract_local(extract_all));
 }
 
@@ -323,14 +323,14 @@ void test_tensor_extract_ephemeral_gap_rejected() {
     // Extract {op0, op1} from G0. T1 produced by op0, consumed by op1 --
     // both in extract set, so T1 becomes ephemeral. But op2 (G1) and op3 (G2)
     // still need T1 from outside. Ephemeral gap.
-    std::set<size_t> extract_ops = {0, 1};
+    FlatSet<size_t> extract_ops = {0, 1};
     std::vector<size_t> source_groups = {0};
 
     auto eval = partition_moves::eval_tensor_extract(ctx.part, extract_ops, source_groups);
     CHECK("eph_gap: eval_tensor_extract rejected", !eval.feasible);
 
     // But extracting just the producer is fine -- T1 stays boundary output
-    std::set<size_t> extract_producer_only = {0};
+    FlatSet<size_t> extract_producer_only = {0};
     auto eval2 = partition_moves::eval_tensor_extract(ctx.part, extract_producer_only, source_groups);
     CHECK("eph_gap: extract producer only feasible", eval2.feasible);
 }
@@ -371,7 +371,7 @@ void test_tensor_extract_source_dies() {
     double cost_g0 = ctx.part.groups[0].cost;
     double cost_g1 = ctx.part.groups[1].cost;
 
-    std::set<size_t> extract_ops = {0, 1};
+    FlatSet<size_t> extract_ops = {0, 1};
     std::vector<size_t> source_groups = {0, 1};
 
     auto eval = partition_moves::eval_tensor_extract(ctx.part, extract_ops, source_groups);
@@ -461,7 +461,7 @@ void test_tensor_extract_multiple_sources() {
     double cost_g3 = ctx.part.groups[3].cost;
     double old_sum = cost_g0 + cost_g1 + cost_g2 + cost_g3;
 
-    std::set<size_t> extract_ops = {0, 1, 2, 3};
+    FlatSet<size_t> extract_ops = {0, 1, 2, 3};
     std::vector<size_t> source_groups = {0, 1, 2, 3};
 
     // Compute expected costs independently
@@ -541,7 +541,7 @@ void test_tensor_extract_dead_group() {
     ctx.part.groups[2].alive = false;
 
     // Extract with dead group in source list
-    std::set<size_t> extract_ops = {0, 1, 2};
+    FlatSet<size_t> extract_ops = {0, 1, 2};
     std::vector<size_t> source_groups = {0, 1, 2};
 
     auto eval = partition_moves::eval_tensor_extract(ctx.part, extract_ops, source_groups);
@@ -557,13 +557,13 @@ void test_tensor_extract_dead_group() {
     CHECK("dead: G2 still dead", !ctx.part.groups[2].alive);
 
     // Test edge cases: empty extract_ops
-    std::set<size_t> empty_ops;
+    FlatSet<size_t> empty_ops;
     std::vector<size_t> sg = {0};
     auto eval_empty_ops = partition_moves::eval_tensor_extract(ctx.part, empty_ops, sg);
     CHECK("dead: empty ops infeasible", !eval_empty_ops.feasible);
 
     // Empty source_groups
-    std::set<size_t> some_ops = {0};
+    FlatSet<size_t> some_ops = {0};
     std::vector<size_t> empty_sg;
     auto eval_empty_sg = partition_moves::eval_tensor_extract(ctx.part, some_ops, empty_sg);
     CHECK("dead: empty sources infeasible", !eval_empty_sg.feasible);
@@ -599,7 +599,7 @@ void test_tensor_extract_precomputed() {
     auto ctx1 = make_ctx();
     auto ctx2 = make_ctx();
 
-    std::set<size_t> extract_ops = {0, 1, 2};
+    FlatSet<size_t> extract_ops = {0, 1, 2};
     std::vector<size_t> source_groups = {0, 1, 2};
 
     // Precompute the extract cost

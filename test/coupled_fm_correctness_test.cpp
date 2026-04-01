@@ -278,7 +278,7 @@ struct TestInstance {
     DAG dag;
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
-    std::set<size_t> feasibly_ret;
+    FlatSet<size_t> feasibly_ret;
 
     TestInstance() = default;
     TestInstance(TestInstance&&) = default;
@@ -529,11 +529,11 @@ void test_steal_isolated() {
                         if (gj == gi || !ti.cp.part.groups[gj].alive) continue;
                         if (!ti.cp.part.acyclic_steal_local(op, gi, gj)) continue;
                         // Evaluate
-                        std::set<size_t> new_gj = ti.cp.part.groups[gj].ops;
+                        FlatSet<size_t> new_gj = ti.cp.part.groups[gj].ops;
                         new_gj.insert(op);
                         double new_gj_cost = ti.cp.part.eval_set(new_gj);
                         if (new_gj_cost >= 1e17) continue;
-                        std::set<size_t> new_gi = ti.cp.part.groups[gi].ops;
+                        FlatSet<size_t> new_gi = ti.cp.part.groups[gi].ops;
                         new_gi.erase(op);
                         double new_gi_cost = 0;
                         if (!new_gi.empty()) {
@@ -656,12 +656,12 @@ void test_tensor_merge_isolated() {
     int count = 0;
 
     auto run = [&](const char* tag, TestInstance ti) {
-        std::set<size_t> tensors_done;
+        FlatSet<size_t> tensors_done;
         for (size_t t = 0; t < ti.dag.tensor_consumers.size(); t++) {
             if (tensors_done.count(t)) continue;
             auto& consumers = ti.dag.tensor_consumers[t];
             if (consumers.size() < 2) continue;
-            std::set<size_t> cgroups;
+            FlatSet<size_t> cgroups;
             for (auto cop : consumers)
                 for (auto cg : ti.cp.part.groups_of(cop))
                     cgroups.insert(cg);
@@ -715,8 +715,8 @@ void test_tensor_extract_isolated() {
         for (size_t t = 0; t < ti.dag.tensor_consumers.size(); t++) {
             auto& consumers = ti.dag.tensor_consumers[t];
             if (consumers.size() < 2) continue;
-            std::set<size_t> cgroups;
-            std::set<size_t> extract_ops;
+            FlatSet<size_t> cgroups;
+            FlatSet<size_t> extract_ops;
             for (auto cop : consumers) {
                 extract_ops.insert(cop);
                 for (auto cg : ti.cp.part.groups_of(cop))
@@ -927,7 +927,7 @@ struct StepStats {
 };
 
 static StepStats run_validated_steps(CoupledPartition& cp,
-                                      const std::set<size_t>& fr,
+                                      const FlatSet<size_t>& fr,
                                       int max_steps) {
     StepStats s;
     double floor = cp.total_cost() * 0.30;

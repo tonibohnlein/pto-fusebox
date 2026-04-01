@@ -545,8 +545,8 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 // Working set
 // ============================================================================
 int64_t Subgraph::working_set(const TileConfig &cfg,
-                              const std::set<size_t> &retained_from_prev,
-                              const std::set<size_t> &retain_these) const {
+                              const FlatSet<size_t> &retained_from_prev,
+                              const FlatSet<size_t> &retain_these) const {
   if (!is_valid_tiling(cfg))
     return INT64_MAX;
 
@@ -591,8 +591,8 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
 }
 
 bool Subgraph::is_feasible(const TileConfig &cfg,
-                           const std::set<size_t> &retained_from_prev,
-                           const std::set<size_t> &retain_these) const {
+                           const FlatSet<size_t> &retained_from_prev,
+                           const FlatSet<size_t> &retain_these) const {
   return is_valid_tiling(cfg) &&
          working_set(cfg, retained_from_prev, retain_these) <=
              prob_->fast_memory_capacity;
@@ -603,8 +603,8 @@ bool Subgraph::is_feasible(const TileConfig &cfg,
 // ============================================================================
 
 CostResult Subgraph::compute_cost(const TileConfig &cfg,
-                                  const std::set<size_t> &retained_from_prev,
-                                  const std::set<size_t> &retain_these) const {
+                                  const FlatSet<size_t> &retained_from_prev,
+                                  const FlatSet<size_t> &retain_these) const {
   CostResult result;
   result.config = cfg;
 
@@ -767,8 +767,8 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 // Granularity enumeration
 // ============================================================================
 
-CostResult Subgraph::best_cost(const std::set<size_t> &retained_from_prev,
-                               const std::set<size_t> &retain_these) const {
+CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
+                               const FlatSet<size_t> &retain_these) const {
   std::vector<SnakeDir> snakes;
   if (has_matmul_) {
     snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};

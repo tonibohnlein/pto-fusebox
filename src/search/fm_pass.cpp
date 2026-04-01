@@ -9,7 +9,7 @@
 // ============================================================================
 
 static std::vector<size_t> all_activatable_ops(const Partition& part) {
-    std::set<size_t> ops;
+    FlatSet<size_t> ops;
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.border_ops(gi))

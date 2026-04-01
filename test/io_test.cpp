@@ -48,14 +48,14 @@ static void CHECK_EQ_S(const char* label, size_t got, size_t exp) {
 // directly on hand-crafted Problem objects.
 // ============================================================================
 
-static std::set<size_t> compute_retainable(const Problem& p) {
+static FlatSet<size_t> compute_retainable(const Problem& p) {
     const size_t nt = p.num_tensors();
     std::vector<size_t> consumer_count(nt, 0);
     for (auto& op : p.ops)
         for (auto t : op.inputs)
             consumer_count[t]++;
 
-    std::set<size_t> result;
+    FlatSet<size_t> result;
     for (size_t i = 0; i < nt; i++) {
         if (p.tensors[i].size() > p.fast_memory_capacity) continue;
         if (consumer_count[i] == 0)                        continue;

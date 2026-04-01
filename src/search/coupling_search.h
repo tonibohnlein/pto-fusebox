@@ -34,7 +34,7 @@ struct CoupledPartition {
     std::vector<size_t> prev_group;
 
     // Tensors retained across each coupling edge (ga → gb).
-    std::map<std::pair<size_t,size_t>, std::set<size_t>> retained;
+    std::map<std::pair<size_t,size_t>, FlatSet<size_t>> retained;
 
     // --- Construction ---
 
@@ -60,9 +60,9 @@ struct CoupledPartition {
     std::vector<size_t> chain_of(size_t g) const; // head-to-tail group list
 
     // Tensors entering group g from its chain predecessor's retained set.
-    std::set<size_t> entering_for(size_t g) const;
+    FlatSet<size_t> entering_for(size_t g) const;
     // Tensors group g must retain for its chain successor.
-    std::set<size_t> retain_for(size_t g) const;
+    FlatSet<size_t> retain_for(size_t g) const;
 
     // --- Cost ---
 
@@ -118,7 +118,7 @@ CouplingEvalResult eval_retain_force_split(const CoupledPartition& cp,
 // Apply: split g and couple the two halves via t.
 // Returns affected group indices, or {} on failure.
 // After a successful apply: call cp.part.rebuild_index() + rebuild_group_dag().
-std::set<size_t> apply_retain_force_split(CoupledPartition& cp,
+FlatSet<size_t> apply_retain_force_split(CoupledPartition& cp,
                                            size_t g,
                                            size_t op_a, size_t op_b,
                                            size_t t);
@@ -149,7 +149,7 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
 // Apply: split g_dst, couple ga → side_a via t, side_b inherits g_dst's
 // old outgoing chain link (if any).
 // Returns affected group indices (including ga), or {} on failure.
-std::set<size_t> apply_force_retain(CoupledPartition& cp,
+FlatSet<size_t> apply_force_retain(CoupledPartition& cp,
                                      size_t ga, size_t g_dst,
                                      size_t op_a_dst, size_t op_b_dst,
                                      size_t t);
@@ -171,10 +171,10 @@ bool acyclic_chain_merge_groups(const CoupledPartition& cp,
 // Callers must have verified feasibility via eval_* first.
 // ============================================================================
 
-std::set<size_t> apply_couple(CoupledPartition& cp,
+FlatSet<size_t> apply_couple(CoupledPartition& cp,
                                size_t ga, size_t gb, size_t t);
 
-std::set<size_t> apply_uncouple(CoupledPartition& cp,
+FlatSet<size_t> apply_uncouple(CoupledPartition& cp,
                                  size_t ga, size_t gb, size_t t);
 
 // ============================================================================
@@ -193,10 +193,10 @@ using CouplingTimePoint = std::chrono::steady_clock::time_point;
 // Run greedy descent on an already-initialized CoupledPartition in-place.
 // Returns final total_cost(). Used by the parallel search workers.
 double coupling_greedy_descent(CoupledPartition& cp,
-                                const std::set<size_t>& feasibly_ret,
+                                const FlatSet<size_t>& feasibly_ret,
                                 CouplingTimePoint deadline = CouplingTimePoint::max());
 
 Solution coupling_search(const Problem& prob, const DAG& dag,
                           Partition part,
-                          const std::set<size_t>& feasibly_ret,
+                          const FlatSet<size_t>& feasibly_ret,
                           CouplingTimePoint deadline = CouplingTimePoint::max());

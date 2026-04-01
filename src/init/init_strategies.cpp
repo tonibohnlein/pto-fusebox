@@ -27,7 +27,7 @@ static bool try_merge(Partition& p, size_t ga, size_t gb,
 
     if (p.dag->merge_creates_cycle(p.groups[ga].ops, p.groups[gb].ops)) return false;
 
-    std::set<size_t> merged = p.groups[ga].ops;
+    FlatSet<size_t> merged = p.groups[ga].ops;
     merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
 
     if (p.creates_ephemeral_gap(merged, ga, gb)) return false;
@@ -178,7 +178,7 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
     for (auto seed : order) {
         if (assigned[seed]) continue;
 
-        std::set<size_t> group = {seed};
+        FlatSet<size_t> group = {seed};
         double group_cost = p.eval_set(group);
         assigned[seed] = true;
 
@@ -188,7 +188,7 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
             size_t best_op = SIZE_MAX;
             double best_cost = group_cost;
 
-            std::set<size_t> neighbors;
+            FlatSet<size_t> neighbors;
             for (auto op : group) {
                 for (auto v : dag.op_neighbors[op])
                     if (!group.count(v) && !assigned[v])
@@ -304,7 +304,7 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
 
             if (p.dag->merge_creates_cycle(p.groups[gi].ops, p.groups[gj].ops)) continue;
 
-            std::set<size_t> merged = p.groups[gi].ops;
+            FlatSet<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[gj].ops.begin(), p.groups[gj].ops.end());
 
             if (p.creates_ephemeral_gap(merged, (size_t)gi, (size_t)gj)) continue;
@@ -321,7 +321,7 @@ Partition init_reverse_topo(const Problem& prob, const DAG& dag, CostCache* cach
         if (best_gj != SIZE_MAX) {
             // Inline the merge directly — we already verified cycle/gap/cost above.
             // try_merge would re-evaluate (cache hit but redundant).
-            std::set<size_t> merged = p.groups[gi].ops;
+            FlatSet<size_t> merged = p.groups[gi].ops;
             merged.insert(p.groups[best_gj].ops.begin(), p.groups[best_gj].ops.end());
             double new_cost = p.eval_set(merged);  // cache hit from above
             if (new_cost < p.groups[gi].cost + p.groups[best_gj].cost - 0.01) {
@@ -386,7 +386,7 @@ Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
             continue;
 
         // Try merge — accept if subgraph is valid (feasible tiling exists)
-        std::set<size_t> merged = p.groups[ga].ops;
+        FlatSet<size_t> merged = p.groups[ga].ops;
         merged.insert(p.groups[gb].ops.begin(), p.groups[gb].ops.end());
         if (p.creates_ephemeral_gap(merged, ga, gb)) continue;
         double new_cost = p.eval_set(merged);

@@ -2,9 +2,10 @@
 
 #include <cstdint>
 #include <limits>
-#include <set>
 #include <string>
 #include <vector>
+
+#include "core/flat_set.h"
 
 // ============================================================================
 // Tensor & Op
@@ -47,7 +48,7 @@ struct Problem {
     // retaining it after the first eliminates the second load.
     // This set is the permissive upper bound; the ordering layer decides
     // whether retention is beneficial for any given schedule.
-    std::set<size_t> retainable_tensors;
+    FlatSet<size_t> retainable_tensors;
 };
 
 // ============================================================================

@@ -7,7 +7,7 @@
 #include <algorithm>
 
 CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
-                                            const std::set<size_t>& feasibly_ret,
+                                            const FlatSet<size_t>& feasibly_ret,
                                             const FMOuterConfig&    cfg,
                                             CostCache*              cache) {
     // Ensure the cache pointer is set — coupling eval uses it directly.

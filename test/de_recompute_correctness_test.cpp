@@ -53,7 +53,7 @@ struct TestContext {
     std::unique_ptr<CostCache> cache;
     Partition part;
 
-    void build_partition(const std::vector<std::set<size_t>>& group_assignments) {
+    void build_partition(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
         part.prob  = &prob;
@@ -79,7 +79,7 @@ struct CoupledTestContext {
     std::unique_ptr<CostCache> cache;
     CoupledPartition cp;
 
-    void build(const std::vector<std::set<size_t>>& group_assignments) {
+    void build(const std::vector<FlatSet<size_t>>& group_assignments) {
         dag = DAG::build(prob);
         cache = std::make_unique<CostCache>(100000);
 
@@ -102,7 +102,7 @@ struct CoupledTestContext {
     }
 
     // Wire a coupling edge: ga -> gb retaining tensors
-    void couple(size_t ga, size_t gb, std::set<size_t> tensors) {
+    void couple(size_t ga, size_t gb, FlatSet<size_t> tensors) {
         cp.next_group[ga] = gb;
         cp.prev_group[gb] = ga;
         cp.retained[{ga, gb}] = std::move(tensors);
@@ -148,7 +148,7 @@ void test_basic_de_recompute() {
     ctx.build_partition({{0, 1}, {0}});
 
     double cost_g0_before = ctx.part.groups[0].cost;
-    std::set<size_t> g1_ops_before = ctx.part.groups[1].ops;
+    FlatSet<size_t> g1_ops_before = ctx.part.groups[1].ops;
     double cost_g1_before = ctx.part.groups[1].cost;
 
     // op0 should be in two groups
@@ -608,7 +608,7 @@ void test_de_recompute_source_unchanged() {
     ctx.build_partition({{0, 1}, {0}});
 
     // Snapshot G1 before
-    std::set<size_t> g1_ops_before = ctx.part.groups[1].ops;
+    FlatSet<size_t> g1_ops_before = ctx.part.groups[1].ops;
     double g1_cost_before = ctx.part.groups[1].cost;
     bool g1_alive_before = ctx.part.groups[1].alive;
     int g1_gen_before = ctx.part.groups[1].gen;
@@ -711,7 +711,7 @@ void test_de_recompute_precomputed() {
     auto affected1 = partition_moves::apply_de_recompute(ctx1.part, 0, 0);
     CHECK("precomputed: applied without precomputed", !affected1.empty());
     double cost_without = ctx1.part.groups[0].cost;
-    std::set<size_t> ops_without = ctx1.part.groups[0].ops;
+    FlatSet<size_t> ops_without = ctx1.part.groups[0].ops;
 
     // Second: with precomputed cost
     auto ctx2 = make_ctx();
@@ -720,7 +720,7 @@ void test_de_recompute_precomputed() {
     auto affected2 = partition_moves::apply_de_recompute(ctx2.part, 0, 0, precomputed);
     CHECK("precomputed: applied with precomputed", !affected2.empty());
     double cost_with = ctx2.part.groups[0].cost;
-    std::set<size_t> ops_with = ctx2.part.groups[0].ops;
+    FlatSet<size_t> ops_with = ctx2.part.groups[0].ops;
 
     // Both should give the same cost
     CHECK_CLOSE("precomputed: same cost", cost_with, cost_without);

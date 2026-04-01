@@ -38,7 +38,6 @@ file(GLOB_RECURSE LIB_SOURCES
     src/partition/*.cpp
     src/init/*.cpp
     src/search/*.cpp
-    src/postopt/*.cpp
     src/io/*.cpp
     src/pipeline/solver.cpp
 )

@@ -58,7 +58,7 @@ Partition greedy_descent(Partition part) {
         applied++;
 
         // Collect affected ops: ops in affected groups + their DAG neighbors
-        std::set<size_t> affected_ops;
+        FlatSet<size_t> affected_ops;
         affected_ops.insert(m.op);
         for (auto nbr : part.dag->op_neighbors[m.op])
             affected_ops.insert(nbr);
