@@ -292,18 +292,20 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
     std::shuffle(candidates.begin(), candidates.end(), rng);
 
     // Greedy removal: try each candidate, re-checking after each removal.
+    bool any_applied = false;
     for (auto [gi, op] : candidates) {
         if (!part.groups[gi].alive) continue;
         if (!part.groups[gi].ops.count(op)) continue;
+        // rebuild_index deferred — must refresh before acyclicity check
+        if (any_applied) { part.rebuild_index(); any_applied = false; }
         if (!part.acyclic_de_recompute_local(op, gi)) continue;
         auto r = partition_moves::eval_de_recompute(part, gi, op);
         if (!r.feasible) continue;
         double new_ga_cost = part.groups[gi].cost - r.saving;
         auto affected = partition_moves::apply_de_recompute(part, gi, op, new_ga_cost);
-        if (!affected.empty()) {
-            part.rebuild_index();
-        }
+        if (!affected.empty()) any_applied = true;
     }
+    if (any_applied) part.rebuild_index();
     return part;
 }
 
@@ -345,27 +347,24 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
     }
     if (new_groups.empty()) return part;  // no feasible {P, C_i} pair
 
-    // Extract consumer ops from their current groups.
-    // Track which groups lose ops so we can handle empty/disconnected groups.
-    FlatSet<size_t> affected_groups;
-    for (auto& [cop, cost] : new_groups) {
-        for (auto gi : part.groups_of(cop)) {
-            if (!part.groups[gi].alive) continue;
-            part.groups[gi].ops.erase(cop);
-            affected_groups.insert(gi);
-        }
-    }
+    // Collect group memberships BEFORE mutating ops (groups_of reads op_to_groups_).
+    std::vector<std::pair<size_t, size_t>> erase_list;  // (group, op)
+    for (auto& [cop, cost] : new_groups)
+        for (auto gi : part.groups_of(cop))
+            if (part.groups[gi].alive) erase_list.push_back({gi, cop});
+    for (auto gi : part.groups_of(prod_op))
+        if (part.groups[gi].alive) erase_list.push_back({gi, prod_op});
 
-    // Also extract producer from its current groups (it will be recomputed in each new group)
-    for (auto gi : part.groups_of(prod_op)) {
-        if (!part.groups[gi].alive) continue;
-        part.groups[gi].ops.erase(prod_op);
+    // Now erase ops from groups and collect affected set.
+    FlatSet<size_t> affected_groups;
+    for (auto [gi, op] : erase_list) {
+        part.groups[gi].ops.erase(op);
         affected_groups.insert(gi);
     }
 
     // Handle affected groups: re-evaluate costs, split disconnected components,
-    // kill empty groups.
-    part.rebuild_index();
+    // kill empty groups.  No rebuild_index needed — this loop only uses
+    // groups[gi].ops directly, not groups_of().
     for (auto gi : affected_groups) {
         if (!part.groups[gi].alive) continue;
         if (part.groups[gi].ops.empty()) {

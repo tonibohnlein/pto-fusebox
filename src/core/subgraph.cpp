@@ -544,12 +544,11 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 // ============================================================================
 // Working set
 // ============================================================================
-int64_t Subgraph::working_set(const TileConfig &cfg,
+
+// Internal: compute working set assuming cfg is already validated.
+int64_t Subgraph::working_set_unchecked(const TileConfig &cfg,
                               const FlatSet<size_t> &retained_from_prev,
                               const FlatSet<size_t> &retain_these) const {
-  if (!is_valid_tiling(cfg))
-    return INT64_MAX;
-
   int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
   int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
@@ -590,11 +589,19 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   return ws;
 }
 
+int64_t Subgraph::working_set(const TileConfig &cfg,
+                              const FlatSet<size_t> &retained_from_prev,
+                              const FlatSet<size_t> &retain_these) const {
+  if (!is_valid_tiling(cfg))
+    return INT64_MAX;
+  return working_set_unchecked(cfg, retained_from_prev, retain_these);
+}
+
 bool Subgraph::is_feasible(const TileConfig &cfg,
                            const FlatSet<size_t> &retained_from_prev,
                            const FlatSet<size_t> &retain_these) const {
   return is_valid_tiling(cfg) &&
-         working_set(cfg, retained_from_prev, retain_these) <=
+         working_set_unchecked(cfg, retained_from_prev, retain_these) <=
              prob_->fast_memory_capacity;
 }
 
@@ -608,8 +615,6 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   CostResult result;
   result.config = cfg;
 
-  // working_set() already calls is_valid_tiling() internally.
-  // No need to call it twice.
   result.working_set = working_set(cfg, retained_from_prev, retain_these);
 
   if (result.working_set > prob_->fast_memory_capacity)
@@ -784,7 +789,12 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
         // is_valid_tiling depends on (w,h,k) only, not snake direction.
         // Check once before iterating snakes to avoid redundant work inside
         // compute_cost → working_set → is_valid_tiling.
-        if (!is_valid_tiling({ww, hh, kk, SnakeDir::None})) continue;
+        TileConfig base_cfg{ww, hh, kk, SnakeDir::None};
+        if (!is_valid_tiling(base_cfg)) continue;
+        // Working set depends on (w,h,k) only, not snake direction.
+        // Check once here to skip all snake variants for infeasible tiles.
+        int64_t ws = working_set_unchecked(base_cfg, retained_from_prev, retain_these);
+        if (ws > prob_->fast_memory_capacity) continue;
         for (auto sd : snakes) {
           TileConfig cfg{ww, hh, kk, sd};
           auto r = compute_cost(cfg, retained_from_prev, retain_these);

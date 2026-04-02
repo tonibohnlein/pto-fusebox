@@ -99,6 +99,13 @@ public:
   Subgraph() = default;
 
 private:
+  // working_set without the is_valid_tiling() guard — caller must ensure
+  // validity before calling.  Used by compute_cost() and is_feasible() to
+  // avoid redundant validation when best_cost() already checked.
+  int64_t working_set_unchecked(const TileConfig &cfg,
+                                const FlatSet<size_t> &retained_from_prev,
+                                const FlatSet<size_t> &retain_these) const;
+
   const Problem *prob_ = nullptr;
   const DAG *dag_ = nullptr;
   std::vector<size_t> ops_;
