@@ -1,6 +1,7 @@
 #pragma once
 
 #include "partition/partition.h"
+#include "search/partition_moves.h"
 #include <set>
 #include <vector>
 
@@ -15,7 +16,7 @@ struct FMMove {
     enum Type { NONE = -1, STEAL = 0, EJECT = 1, RECOMPUTE = 2, MERGE = 3,
                 INTERNAL_EJECT = 4, SPLIT = 5,
                 TENSOR_MERGE = 6, TENSOR_EXTRACT = 7, DE_RECOMPUTE = 8,
-                FORCE_RECOMPUTE = 9 } type = NONE;
+                FORCE_RECOMPUTE = 9, TENSOR_EXTRACT_SPLIT = 10 } type = NONE;
     size_t op = SIZE_MAX;     // initiating op
     size_t ga = SIZE_MAX;     // source group
     size_t gb = SIZE_MAX;     // target group
@@ -27,6 +28,8 @@ struct FMMove {
     // For TENSOR_EXTRACT: the consumer ops to extract
     // For FORCE_RECOMPUTE: the consumer ops to pair with the producer
     std::vector<size_t> tensor_consumer_ops;
+    // For TENSOR_EXTRACT_SPLIT: precomputed split result
+    partition_moves::SplitExtractResult split_extract_result;
 
     bool valid() const { return type != NONE; }
 };

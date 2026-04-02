@@ -600,6 +600,137 @@ FlatSet<size_t> apply_tensor_extract(Partition& p,
 }
 
 // ============================================================================
+// TENSOR_EXTRACT_SPLIT: split consumers into k balanced sub-groups,
+// each containing the producer (recomputed).
+// ============================================================================
+
+SplitExtractResult eval_tensor_extract_split(
+    const Partition& p,
+    size_t tensor_id,
+    const std::vector<size_t>& consumer_ops,
+    const std::vector<size_t>& source_groups)
+{
+    SplitExtractResult best;
+    const auto& dag = *p.dag;
+
+    int prod = dag.tensor_producer[tensor_id];
+    if (prod < 0) return best;
+    size_t prod_op = (size_t)prod;
+
+    size_t n = consumer_ops.size();
+    if (n < 2) return best;
+
+    // Compute old cost of all source groups (once).
+    double old_cost = 0;
+    for (auto gi : source_groups) {
+        if (!p.groups[gi].alive) return best;
+        old_cost += p.groups[gi].cost;
+    }
+
+    // Compute remainder cost (source groups minus all extract ops).
+    FlatSet<size_t> all_extract_ops(consumer_ops.begin(), consumer_ops.end());
+    all_extract_ops.insert(prod_op);
+    double remainder_cost = 0;
+    for (auto gi : source_groups) {
+        FlatSet<size_t> rem;
+        for (auto op : p.groups[gi].ops)
+            if (!all_extract_ops.count(op)) rem.insert(op);
+        if (!rem.empty()) {
+            auto comps = structural_ops::connected_components(rem, *p.dag);
+            for (auto& comp : comps) {
+                double c = p.eval_set(comp);
+                if (c >= 1e17) return best;
+                remainder_cost += c;
+            }
+        }
+    }
+
+    // Try k = 2, 4, 8, ... up to n.
+    for (size_t k = 2; k <= n; k *= 2) {
+        size_t per_group = (n + k - 1) / k;  // ceil(n / k)
+        std::vector<FlatSet<size_t>> sub_groups;
+        std::vector<double> sub_costs;
+        double total_sub_cost = 0;
+        bool feasible = true;
+
+        for (size_t g = 0; g < k && feasible; g++) {
+            FlatSet<size_t> sg;
+            sg.insert(prod_op);
+            for (size_t i = g * per_group; i < std::min((g + 1) * per_group, n); i++)
+                sg.insert(consumer_ops[i]);
+
+            double c = p.eval_set(sg);
+            if (c >= 1e17) { feasible = false; break; }
+            total_sub_cost += c;
+            sub_groups.push_back(std::move(sg));
+            sub_costs.push_back(c);
+        }
+
+        if (!feasible) continue;
+
+        double saving = old_cost - (total_sub_cost + remainder_cost);
+        if (saving > best.saving) {
+            best.feasible = true;
+            best.saving = saving;
+            best.prod_op = prod;
+            best.sub_groups = std::move(sub_groups);
+            best.sub_costs = std::move(sub_costs);
+        }
+        // Found a feasible split — smaller k is always better if feasible,
+        // so we could break here, but trying larger k as well in case
+        // the cost model favors more splits.
+    }
+
+    return best;
+}
+
+FlatSet<size_t> apply_tensor_extract_split(
+    Partition& p,
+    const SplitExtractResult& result,
+    const std::vector<size_t>& source_groups)
+{
+    if (!result.feasible || result.sub_groups.empty()) return {};
+
+    // Collect all ops being extracted.
+    FlatSet<size_t> all_extract_ops;
+    for (auto& sg : result.sub_groups)
+        for (auto op : sg)
+            all_extract_ops.insert(op);
+
+    // Remove extract ops from source groups, handle remainders.
+    FlatSet<size_t> affected;
+    for (auto gi : source_groups) {
+        if (!p.groups[gi].alive) continue;
+        FlatSet<size_t> rem;
+        for (auto op : p.groups[gi].ops)
+            if (!all_extract_ops.count(op)) rem.insert(op);
+
+        if (rem.empty()) {
+            p.groups[gi].alive = false;
+        } else {
+            auto comps = structural_ops::connected_components(rem, *p.dag);
+            p.groups[gi].ops = std::move(comps[0]);
+            p.groups[gi].cost = p.eval_set(p.groups[gi].ops);
+            for (size_t i = 1; i < comps.size(); i++) {
+                double c = p.eval_set(comps[i]);
+                size_t ngi = p.add_group(std::move(comps[i]), c);
+                affected.insert(ngi);
+            }
+        }
+        p.groups[gi].gen++;
+        affected.insert(gi);
+    }
+
+    // Create the sub-groups.
+    for (size_t i = 0; i < result.sub_groups.size(); i++) {
+        size_t ngi = p.add_group(result.sub_groups[i], result.sub_costs[i]);
+        affected.insert(ngi);
+    }
+
+    return affected;
+}
+
+// ============================================================================
 // FORCE_RECOMPUTE
 // ============================================================================
 

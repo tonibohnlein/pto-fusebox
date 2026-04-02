@@ -7,8 +7,45 @@
 #include "search/coupling_search.h"  // eval_couple, apply_couple, apply_uncouple
 #include "symmetry/merkle_hash.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <iostream>
+
+// --- Mutation statistics (thread-safe) ---
+static std::atomic<uint64_t> g_mut_total_requested{0};
+static std::atomic<uint64_t> g_mut_total_applied{0};
+static std::atomic<uint64_t> g_mut_total_attempts{0};
+static std::atomic<uint64_t> g_mut_per_type_attempts[7]{};
+static std::atomic<uint64_t> g_mut_per_type_applied[7]{};
+
+void print_mutation_stats() {
+    uint64_t req = g_mut_total_requested.load();
+    uint64_t app = g_mut_total_applied.load();
+    uint64_t att = g_mut_total_attempts.load();
+    if (att == 0) return;
+    std::cerr << "  Mutation stats: " << app << "/" << req << " applied/requested"
+              << "  (" << att << " attempts, "
+              << (att > 0 ? (int)(100.0 * app / att) : 0) << "% success rate)\n";
+    const char* names[] = {"merge", "split", "reassign", "eject",
+                           "tensor_merge", "force_recompute"};
+    for (int i = 0; i < 6; i++) {
+        uint64_t a = g_mut_per_type_attempts[i].load();
+        uint64_t s = g_mut_per_type_applied[i].load();
+        if (a > 0)
+            std::cerr << "    " << names[i] << ": " << s << "/" << a
+                      << " (" << (int)(100.0 * s / a) << "%)\n";
+    }
+}
+
+void reset_mutation_stats() {
+    g_mut_total_requested = 0;
+    g_mut_total_applied = 0;
+    g_mut_total_attempts = 0;
+    for (int i = 0; i < 6; i++) {
+        g_mut_per_type_attempts[i] = 0;
+        g_mut_per_type_applied[i] = 0;
+    }
+}
 
 // Under the new ephemeral rule, a tensor produced AND consumed inside a group
 // is always ephemeral. partition_has_gap() checks BOTH acyclicity AND
@@ -252,20 +289,41 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         }
     }
 
-    // Fallback: extract consumer ops (+ producer) into a new group
+    // Fallback 1: extract consumer ops (+ producer) into a new group
     FlatSet<size_t> extract_ops;
-    for (auto cop : dag.tensor_consumers[t])
+    std::vector<size_t> consumer_ops_vec;
+    for (auto cop : dag.tensor_consumers[t]) {
         extract_ops.insert(cop);
+        consumer_ops_vec.push_back(cop);
+    }
     if (prod >= 0)
         extract_ops.insert((size_t)prod);
 
-    if (!part.acyclic_extract_local(extract_ops)) return part;
-    auto er = partition_moves::eval_tensor_extract(part, extract_ops, group_list);
-    if (!er.feasible) return part;
+    if (part.acyclic_extract_local(extract_ops)) {
+        auto er = partition_moves::eval_tensor_extract(part, extract_ops, group_list);
+        if (er.feasible) {
+            auto affected = partition_moves::apply_tensor_extract(part, extract_ops, group_list);
+            if (!affected.empty()) {
+                part.rebuild_index();
+                return part;
+            }
+        }
+    }
 
-    auto affected = partition_moves::apply_tensor_extract(part, extract_ops, group_list);
-    if (affected.empty()) return part;
-    part.rebuild_index();
+    // Fallback 2: split consumers into balanced sub-groups with producer recomputed
+    if (consumer_ops_vec.size() >= 2) {
+        auto sr = partition_moves::eval_tensor_extract_split(
+            part, t, consumer_ops_vec, group_list);
+        if (sr.feasible) {
+            auto affected = partition_moves::apply_tensor_extract_split(
+                part, sr, group_list);
+            if (!affected.empty()) {
+                part.rebuild_index();
+                return part;
+            }
+        }
+    }
+
     return part;
 }
 
@@ -577,24 +635,29 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
     int applied  = 0;
     int attempts = 0;
 
+    g_mut_total_requested.fetch_add(num_mutations, std::memory_order_relaxed);
+
     while (applied < num_mutations && attempts < max_attempts) {
         attempts++;
         size_t before_groups = part.num_alive();
         double before_cost   = part.total_cost();
 
-        int choice = rng() % 7;
+        int choice = rng() % 6;
         switch (choice) {
             case 0: part = mutate_merge(std::move(part), rng);            break;
             case 1: part = mutate_split(std::move(part), rng);            break;
             case 2: part = mutate_reassign(std::move(part), rng);         break;
             case 3: part = mutate_eject(std::move(part), rng);            break;
             case 4: part = mutate_tensor_merge(std::move(part), rng);     break;
-            case 5: part = mutate_de_recompute(std::move(part), rng);     break;
-            case 6: part = mutate_force_recompute(std::move(part), rng);  break;
+            case 5: part = mutate_force_recompute(std::move(part), rng);  break;
         }
 
-        if (part.num_alive() != before_groups || part.total_cost() != before_cost)
+        g_mut_per_type_attempts[choice].fetch_add(1, std::memory_order_relaxed);
+        bool did_apply = (part.num_alive() != before_groups || part.total_cost() != before_cost);
+        if (did_apply) {
             applied++;
+            g_mut_per_type_applied[choice].fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Verify coverage: every op in at least one alive group.
         // If a mutation lost an op (rare edge case in split/de_recompute),
@@ -627,6 +690,8 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
 #endif
     }
 
+    g_mut_total_attempts.fetch_add(attempts, std::memory_order_relaxed);
+    g_mut_total_applied.fetch_add(applied, std::memory_order_relaxed);
 
     return part;
 }

@@ -161,6 +161,34 @@ FlatSet<size_t> apply_tensor_extract(Partition& p,
                                        const std::vector<size_t>& source_groups,
                                        double precomputed_extract_cost = -1.0);
 
+// ============================================================================
+// TENSOR_EXTRACT_SPLIT: when full extract fails (too many ops for one group),
+// split consumer ops into k balanced sub-groups, each containing the producer
+// (recomputed).  The tensor becomes ephemeral in every sub-group.
+//
+// Tries k = 2, 4, ... up to n (one consumer per group = force_recompute).
+// Picks the k that minimises total cost.
+// ============================================================================
+
+struct SplitExtractResult {
+    bool   feasible = false;
+    double saving   = -1e18;
+    int    prod_op  = -1;
+    std::vector<FlatSet<size_t>> sub_groups;  // each contains producer + consumer subset
+    std::vector<double>          sub_costs;
+};
+
+SplitExtractResult eval_tensor_extract_split(
+    const Partition& p,
+    size_t tensor_id,
+    const std::vector<size_t>& consumer_ops,
+    const std::vector<size_t>& source_groups);
+
+FlatSet<size_t> apply_tensor_extract_split(
+    Partition& p,
+    const SplitExtractResult& result,
+    const std::vector<size_t>& source_groups);
+
 // FORCE_RECOMPUTE: for tensor t with producer P and consumers [C_i],
 // extract P and each C_i from their current groups, create {P, C_i} pairs.
 // T becomes ephemeral in each new group.

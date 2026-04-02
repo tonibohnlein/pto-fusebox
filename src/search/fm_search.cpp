@@ -343,6 +343,22 @@ FMMove best_move_for(const Partition& part, size_t op,
                         }
                     }
                 }
+
+                // TENSOR_EXTRACT_SPLIT: split consumers into balanced sub-groups
+                if (consumer_ops_vec.size() >= 2) {
+                    auto sr = partition_moves::eval_tensor_extract_split(
+                        part, t, consumer_ops_vec, group_list);
+                    if (sr.feasible && sr.saving > best.saving) {
+                        FMMove candidate;
+                        candidate.type = FMMove::TENSOR_EXTRACT_SPLIT;
+                        candidate.op = op;
+                        candidate.op2 = t;
+                        candidate.saving = sr.saving;
+                        candidate.tensor_groups = group_list;
+                        candidate.split_extract_result = std::move(sr);
+                        best = candidate;
+                    }
+                }
             }
         }
     }
@@ -447,6 +463,12 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::FORCE_RECOMPUTE: {
             auto frr = partition_moves::eval_force_recompute(part, m.op2);
             affected = partition_moves::apply_force_recompute(part, m.op2, frr);
+            if (affected.empty()) return {};
+            break;
+        }
+        case FMMove::TENSOR_EXTRACT_SPLIT: {
+            affected = partition_moves::apply_tensor_extract_split(
+                part, m.split_extract_result, m.tensor_groups);
             if (affected.empty()) return {};
             break;
         }

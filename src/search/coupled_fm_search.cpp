@@ -1098,7 +1098,7 @@ FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                 fixup_coupling_split(cp, m.ga, gb_new);
             // fixup_coupling_split already handles edge redirection
         } else {
-            // EJECT, INTERNAL_EJECT, RECOMPUTE, TENSOR_EXTRACT, DE_RECOMPUTE
+            // EJECT, INTERNAL_EJECT, RECOMPUTE, TENSOR_EXTRACT, DE_RECOMPUTE, TENSOR_EXTRACT_SPLIT
             // No link transfer needed — just validate edges on changed groups.
             for (auto g : affected)
                 validate_group_edges(g);
