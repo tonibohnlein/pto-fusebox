@@ -35,7 +35,7 @@ static double get_time_budget(const std::string& filename, size_t num_ops) {
 
 int main(int argc, char* argv[]) {
     bool verbose = false;
-    bool use_v2 = false;   // v2 pipeline is the default
+    bool use_v2 = false;  
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-v") verbose = true;

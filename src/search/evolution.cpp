@@ -15,25 +15,41 @@
 static std::atomic<uint64_t> g_mut_total_requested{0};
 static std::atomic<uint64_t> g_mut_total_applied{0};
 static std::atomic<uint64_t> g_mut_total_attempts{0};
-static std::atomic<uint64_t> g_mut_per_type_attempts[7]{};
-static std::atomic<uint64_t> g_mut_per_type_applied[7]{};
+static std::atomic<uint64_t> g_mut_per_type_attempts[6]{};
+static std::atomic<uint64_t> g_mut_per_type_applied[6]{};
+
+// Crossover statistics
+static std::atomic<uint64_t> g_xover_calls{0};
+static std::atomic<uint64_t> g_xover_clusters{0};
+static std::atomic<uint64_t> g_xover_eval_set_calls{0};
+static std::atomic<uint64_t> g_xover_gap_rejects{0};
 
 void print_mutation_stats() {
     uint64_t req = g_mut_total_requested.load();
     uint64_t app = g_mut_total_applied.load();
     uint64_t att = g_mut_total_attempts.load();
-    if (att == 0) return;
-    std::cerr << "  Mutation stats: " << app << "/" << req << " applied/requested"
-              << "  (" << att << " attempts, "
-              << (att > 0 ? (int)(100.0 * app / att) : 0) << "% success rate)\n";
-    const char* names[] = {"merge", "split", "reassign", "eject",
-                           "tensor_merge", "force_recompute"};
-    for (int i = 0; i < 6; i++) {
-        uint64_t a = g_mut_per_type_attempts[i].load();
-        uint64_t s = g_mut_per_type_applied[i].load();
-        if (a > 0)
-            std::cerr << "    " << names[i] << ": " << s << "/" << a
-                      << " (" << (int)(100.0 * s / a) << "%)\n";
+    if (att == 0 && g_xover_calls.load() == 0) return;
+    if (att > 0) {
+        std::cerr << "  Mutation stats: " << app << "/" << req << " applied/requested"
+                  << "  (" << att << " attempts, "
+                  << (att > 0 ? (int)(100.0 * app / att) : 0) << "% success rate)\n";
+        const char* names[] = {"merge", "split", "reassign", "eject",
+                               "tensor_merge", "force_recompute"};
+        for (int i = 0; i < 6; i++) {
+            uint64_t a = g_mut_per_type_attempts[i].load();
+            uint64_t s = g_mut_per_type_applied[i].load();
+            if (a > 0)
+                std::cerr << "    " << names[i] << ": " << s << "/" << a
+                          << " (" << (int)(100.0 * s / a) << "%)\n";
+        }
+    }
+    uint64_t xc = g_xover_calls.load();
+    if (xc > 0) {
+        std::cerr << "  Crossover stats: " << xc << " calls"
+                  << ", avg clusters=" << g_xover_clusters.load() / xc
+                  << ", avg evals=" << g_xover_eval_set_calls.load() / xc
+                  << ", gap_rejects=" << g_xover_gap_rejects.load()
+                  << " (" << (int)(100.0 * g_xover_gap_rejects.load() / xc) << "%)\n";
     }
 }
 
@@ -45,6 +61,10 @@ void reset_mutation_stats() {
         g_mut_per_type_attempts[i] = 0;
         g_mut_per_type_applied[i] = 0;
     }
+    g_xover_calls = 0;
+    g_xover_clusters = 0;
+    g_xover_eval_set_calls = 0;
+    g_xover_gap_rejects = 0;
 }
 
 // Under the new ephemeral rule, a tensor produced AND consumed inside a group
@@ -631,18 +651,82 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
 }
 
 Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) {
-    const int max_attempts = num_mutations * 10;
     int applied  = 0;
     int attempts = 0;
+    int consecutive_fails = 0;
 
     g_mut_total_requested.fetch_add(num_mutations, std::memory_order_relaxed);
 
-    while (applied < num_mutations && attempts < max_attempts) {
+    // --- Pre-filter: determine which mutation types can fire on this partition ---
+    // 0=merge, 1=split, 2=reassign, 3=eject, 4=tensor_merge, 5=force_recompute
+    const auto& dag = *part.dag;
+    const auto& prob = *part.prob;
+
+    auto compute_eligible = [&](const Partition& p) {
+        std::vector<int> eligible;
+
+        bool has_multi_op_group = false;
+        bool has_large_group = false;  // ≥3 ops
+        bool has_adjacent_pair = false;
+        for (size_t gi = 0; gi < p.groups.size(); gi++) {
+            if (!p.groups[gi].alive) continue;
+            size_t sz = p.groups[gi].ops.size();
+            if (sz >= 2) has_multi_op_group = true;
+            if (sz >= 3) has_large_group = true;
+            if (has_multi_op_group && has_adjacent_pair && has_large_group) break;
+            if (!has_adjacent_pair) {
+                auto nbrs = p.adjacent_groups(gi);
+                for (auto gj : nbrs)
+                    if (p.groups[gj].alive) { has_adjacent_pair = true; break; }
+            }
+        }
+
+        if (has_adjacent_pair) eligible.push_back(0);  // merge
+        if (has_large_group) eligible.push_back(1);    // split
+        if (has_adjacent_pair) eligible.push_back(2);  // reassign
+        if (has_multi_op_group) eligible.push_back(3); // eject
+
+        // tensor_merge: any tensor with ≥2 consumers in different groups?
+        bool has_tensor_merge_candidate = false;
+        for (size_t t = 0; t < prob.num_tensors() && !has_tensor_merge_candidate; t++) {
+            auto& consumers = dag.tensor_consumers[t];
+            if (consumers.size() < 2) continue;
+            size_t first_group = SIZE_MAX;
+            for (auto cop : consumers) {
+                auto& gs = p.groups_of(cop);
+                for (auto gi : gs) {
+                    if (first_group == SIZE_MAX) first_group = gi;
+                    else if (gi != first_group) { has_tensor_merge_candidate = true; break; }
+                }
+                if (has_tensor_merge_candidate) break;
+            }
+        }
+        if (has_tensor_merge_candidate) eligible.push_back(4);
+
+        // force_recompute: any tensor with ≥2 consumers and a producer op?
+        bool has_force_recompute_candidate = false;
+        for (size_t t = 0; t < dag.tensor_producer.size() && !has_force_recompute_candidate; t++) {
+            if (dag.tensor_producer[t] < 0) continue;
+            if (dag.tensor_consumers[t].size() >= 2) has_force_recompute_candidate = true;
+        }
+        if (has_force_recompute_candidate) eligible.push_back(5);
+
+        return eligible;
+    };
+
+    auto eligible = compute_eligible(part);
+    if (eligible.empty()) return part;
+
+    const int max_attempts = num_mutations * 5;
+    const int max_consecutive_fails = std::max(num_mutations * 2, 10);
+
+    while (applied < num_mutations && attempts < max_attempts
+           && consecutive_fails < max_consecutive_fails) {
         attempts++;
         size_t before_groups = part.num_alive();
         double before_cost   = part.total_cost();
 
-        int choice = rng() % 6;
+        int choice = eligible[rng() % eligible.size()];
         switch (choice) {
             case 0: part = mutate_merge(std::move(part), rng);            break;
             case 1: part = mutate_split(std::move(part), rng);            break;
@@ -656,22 +740,27 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
         bool did_apply = (part.num_alive() != before_groups || part.total_cost() != before_cost);
         if (did_apply) {
             applied++;
+            consecutive_fails = 0;
             g_mut_per_type_applied[choice].fetch_add(1, std::memory_order_relaxed);
+
+            // Recompute eligible types — partition structure changed
+            eligible = compute_eligible(part);
+            if (eligible.empty()) break;
+        } else {
+            consecutive_fails++;
         }
 
-        // Verify coverage: every op in at least one alive group.
-        // If a mutation lost an op (rare edge case in split/de_recompute),
-        // the partition is invalid — stop mutating and let the caller's
-        // partition_has_gap check reject it.
-        {
+        // Verify coverage only after successful mutations (the only case
+        // where ops can be lost).
+        if (did_apply) {
             bool coverage_ok = true;
-            for (size_t i = 0; i < part.prob->num_ops(); i++) {
+            for (size_t i = 0; i < prob.num_ops(); i++) {
                 bool found = false;
                 for (auto gi : part.groups_of(i))
                     if (part.groups[gi].alive) { found = true; break; }
                 if (!found) { coverage_ok = false; break; }
             }
-            if (!coverage_ok) break;  // bail out of mutation loop
+            if (!coverage_ok) break;
         }
 #ifndef NDEBUG
         // Verify cost consistency: each group's stored cost matches eval_set
@@ -742,6 +831,10 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     std::vector<std::pair<int,int>> cluster_keys;
     for (auto& [k, _] : clusters) cluster_keys.push_back(k);
     std::shuffle(cluster_keys.begin(), cluster_keys.end(), rng);
+
+    g_xover_calls.fetch_add(1, std::memory_order_relaxed);
+    g_xover_clusters.fetch_add(cluster_keys.size(), std::memory_order_relaxed);
+    uint64_t local_evals = 0;
     
     Partition child;
     child.prob = &prob;
@@ -770,14 +863,16 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
             FlatSet<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
             double c = child.eval_set(merged);
+            local_evals++;
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;
                 best_gi = gi;
             }
         }
-        
+
         // Also evaluate the cluster as standalone
         double standalone = child.eval_set(cluster);
+        local_evals++;
         
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
             // Merge into existing group — incremental index update
@@ -794,17 +889,21 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
             // Last resort: singletons
             for (auto op : cluster) {
                 double c = child.eval_set({op});
+                local_evals++;
                 child.add_group({op}, c);
             }
         }
     }
-    
+
+    g_xover_eval_set_calls.fetch_add(local_evals, std::memory_order_relaxed);
+
     // Single rebuild at the end for cleanup (removes dead entries, etc.)
     child.rebuild_index();
-    
+
     // Safety: crossover can create cycles or mixed-consumer violations
     // when splicing clusters from two parents.
     if (partition_has_gap(child)) {
+        g_xover_gap_rejects.fetch_add(1, std::memory_order_relaxed);
         return (parent_a.total_cost() <= parent_b.total_cost()) ? parent_a : parent_b;
     }
     

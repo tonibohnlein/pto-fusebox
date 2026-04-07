@@ -77,7 +77,20 @@
       "Bash(./mlsys ../benchmarks/custom-enc-dec-2x3.json /tmp/out.json)",
       "Bash(./mlsys ../benchmarks/hydra-net.json /tmp/out.json)",
       "Bash(./mlsys ../benchmarks/mega-gnn.json /tmp/mega_out.json)",
-      "Bash(./mlsys ../benchmarks/mega-gnn.json /tmp/out.json)"
+      "Bash(./mlsys ../benchmarks/mega-gnn.json /tmp/out.json)",
+      "Bash(wc -l /home/toni/work/mlsys26/src/**/*.cpp /home/toni/work/mlsys26/src/**/*.h)",
+      "Bash(ls -la /home/toni/work/mlsys26/benchmarks/*.json)",
+      "Bash(ls -1 /home/toni/work/mlsys26/test/*.cpp)",
+      "Bash(grep -n \"void solve\\\\|struct Problem\\\\|struct DAG\" /home/toni/work/mlsys26/src/**/*.h)",
+      "Bash(find /home/toni/work/mlsys26 -not -path */build/* -not -path */.git/* -not -path */.claude/* -type d)",
+      "Bash(grep -l \"boundary_inputs\\\\|boundary_outputs\\\\|ephemeral\" /home/toni/work/mlsys26/src/**/*.cpp /home/toni/work/mlsys26/src/**/*.h)",
+      "Bash(grep -n \"\\\\.ops\\\\b\" /home/toni/work/mlsys26/src/pipeline/*.cpp)",
+      "Bash(wc -l /home/toni/work/mlsys26/test/*.cpp /home/toni/work/mlsys26/test/*.h)",
+      "Bash(xargs sed:*)",
+      "Bash(./build/mlsys benchmarks/mlsys-2026-1.json /tmp/test_sol.json)",
+      "Bash(git stash:*)",
+      "Bash(ctest --output-on-failure -j2)",
+      "Bash(git add:*)"
     ],
     "additionalDirectories": [
       "/tmp"
