@@ -1067,7 +1067,7 @@ FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
             }
             FlatSet<size_t> valid;
             for (auto t : it->second)
-                if (is_boundary_output_of(cp.part.groups[from].ops, t, dag) &&
+                if (is_produced_in(cp.part.groups[from].ops, t, dag) &&
                     is_boundary_input_of(cp.part.groups[to].ops, t, dag))
                     valid.insert(t);
             if (valid.empty()) {

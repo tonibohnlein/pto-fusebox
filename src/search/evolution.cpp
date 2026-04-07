@@ -532,7 +532,8 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
             if (prod_groups.empty()) continue;
             size_t ga = prod_groups[rng() % prod_groups.size()];
             if (!cp.part.groups[ga].alive) continue;
-            if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+            // Allow boundary outputs and ephemeral tensors (retained coupling).
+            if (prod_op < 0 || !cp.part.groups[ga].ops.count((size_t)prod_op)) continue;
 
             auto& consumers = dag.tensor_consumers[t];
             if (consumers.empty()) continue;
@@ -606,7 +607,8 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
             if (prod_groups.empty()) continue;
             size_t ga = prod_groups[rng() % prod_groups.size()];
             if (!cp.part.groups[ga].alive) continue;
-            if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+            // T must be produced in ga (boundary output or ephemeral).
+            if (prod_op < 0 || !cp.part.groups[ga].ops.count((size_t)prod_op)) continue;
 
             // Find a consumer group that's too large for direct COUPLE
             auto& consumers = dag.tensor_consumers[t];
