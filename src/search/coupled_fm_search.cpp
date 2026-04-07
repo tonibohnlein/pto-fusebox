@@ -320,6 +320,51 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         }
     }
 
+    // --- EPHEMERAL_FUSE: for each output tensor T of this op that has ≥2 consumers,
+    //     try extracting op (producer) + one consumer into a new group where T is
+    //     ephemeral, and couple T to another consumer's group. ---
+    for (auto t : prob.ops[op].outputs) {
+        if (!feasibly_ret.count(t)) continue;
+        if (dag.tensor_producer[t] != (int)op) continue;
+        auto& consumers = dag.tensor_consumers[t];
+        if (consumers.size() < 2) continue;
+
+        // Find groups containing op (producer)
+        auto op_groups = part.groups_of(op);
+
+        for (size_t ci = 0; ci < consumers.size(); ci++) {
+            size_t c1 = consumers[ci];
+            // c1 must be in the same group as op
+            bool c1_with_op = false;
+            for (auto g : op_groups)
+                if (part.groups[g].alive && part.groups[g].ops.count(c1))
+                    { c1_with_op = true; break; }
+            if (!c1_with_op) continue;
+
+            for (size_t cj = 0; cj < consumers.size(); cj++) {
+                if (ci == cj) continue;
+                size_t c2 = consumers[cj];
+                for (auto g_c2 : part.groups_of(c2)) {
+                    if (!part.groups[g_c2].alive) continue;
+                    if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) continue;
+                    // g_c2 CAN be the same group as op — extracting {P,C1}
+                    // leaves C2 in the remainder which becomes the coupling target.
+                    // eval_ephemeral_fuse handles this correctly.
+
+                    auto r = eval_ephemeral_fuse(cp, op, c1, g_c2, t);
+                    if (r.feasible && r.saving > best.saving) {
+                        best.type   = CoupledFMMove::EPHEMERAL_FUSE;
+                        best.op     = op;
+                        best.op2    = c1;
+                        best.ga     = g_c2;
+                        best.tensor = t;
+                        best.saving = r.saving;
+                    }
+                }
+            }
+        }
+    }
+
     return best;
 }
 
@@ -1149,6 +1194,10 @@ FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                 while (cp.prev_group.size() < cp.part.groups.size())
                     cp.prev_group.push_back(SIZE_MAX);
             }
+            break;
+        case CoupledFMMove::EPHEMERAL_FUSE:
+            // m.op = producer, m.op2 = consumer c1, m.ga = g_c2, m.tensor = t
+            affected = apply_ephemeral_fuse(cp, m.op, m.op2, m.ga, m.tensor);
             break;
         default:
             break;

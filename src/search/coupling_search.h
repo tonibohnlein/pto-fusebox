@@ -162,6 +162,29 @@ FlatSet<size_t> apply_force_retain(CoupledPartition& cp,
                                      size_t t);
 
 // ============================================================================
+// EPHEMERAL_FUSE: extract producer P (= op_p) and consumer C1 (= op_c1) of
+// tensor t from their current groups into a new group {P, C1} where t is
+// ephemeral, then couple t to consumer C2's group (g_c2).
+//
+// t must have ≥2 consumers. P and C1 are extracted from their source groups
+// (which may be the same or different groups). The source groups' remainders
+// are re-evaluated; empty groups are killed.
+//
+// After the move:
+//   new_group = {P, C1}  (t ephemeral inside)
+//   new_group → g_c2 via retained {t}
+//   C2 in g_c2 gets t from fast memory (no slow memory round-trip)
+// ============================================================================
+
+CouplingEvalResult eval_ephemeral_fuse(const CoupledPartition& cp,
+                                        size_t op_p, size_t op_c1,
+                                        size_t g_c2, size_t t);
+
+FlatSet<size_t> apply_ephemeral_fuse(CoupledPartition& cp,
+                                       size_t op_p, size_t op_c1,
+                                       size_t g_c2, size_t t);
+
+// ============================================================================
 // Chain-level acyclicity check for partition moves on a CoupledPartition.
 //
 // Returns true if treating all chains containing the given groups as a single

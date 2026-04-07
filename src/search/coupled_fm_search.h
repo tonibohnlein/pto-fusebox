@@ -27,7 +27,12 @@ struct CoupledFMMove {
         // FORCE_RETAIN: t is already a boundary output of ga; split the
         // destination group at a bridge adjacent to t's consumer so the
         // smaller side_a can be coupled to ga via t.
-        FORCE_RETAIN = 13
+        FORCE_RETAIN = 13,
+        // EPHEMERAL_FUSE: extract producer P and consumer C1 of tensor t
+        // from their current groups into a new group {P, C1} where t is
+        // ephemeral, then couple t to a second consumer C2's group.
+        // op = P, op2 = C1, tensor = t, ga = C2's group.
+        EPHEMERAL_FUSE = 14
     } type = NONE;
 
     size_t op     = SIZE_MAX;   // initiating op (heap key; for coupling moves: any op in ga)
@@ -45,7 +50,7 @@ struct CoupledFMMove {
 
     bool valid()             const { return type != NONE; }
     bool is_partition_move() const { return type >= 0 && type <= 9; }
-    bool is_coupling_move()  const { return type >= 10 && type <= 13; }
+    bool is_coupling_move()  const { return type >= 10 && type <= 14; }
 
     // Build an FMMove from this (only valid for partition move types)
     FMMove as_fm_move() const {

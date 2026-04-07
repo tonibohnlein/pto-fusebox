@@ -1,5 +1,6 @@
 #include "search/coupling_search.h"
 #include "search/partition_moves.h"
+#include "search/structural_ops.h"
 #include "core/cost_cache.h"
 #include <algorithm>
 #include <cassert>
@@ -948,6 +949,182 @@ FlatSet<size_t> apply_uncouple(CoupledPartition& cp,
         cp.prev_group[gb] = SIZE_MAX;
     }
     return {ga, gb};
+}
+
+// ============================================================================
+// EPHEMERAL_FUSE: eval + apply
+// ============================================================================
+
+CouplingEvalResult eval_ephemeral_fuse(const CoupledPartition& cp,
+                                        size_t op_p, size_t op_c1,
+                                        size_t g_c2, size_t t) {
+    const Partition& part = cp.part;
+    const DAG& dag = *part.dag;
+    const Problem& prob = *part.prob;
+
+    // Basic validation
+    if (g_c2 >= part.groups.size() || !part.groups[g_c2].alive) return {};
+    if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) return {};
+
+    // Find source groups for P and C1
+    auto p_groups = part.groups_of(op_p);
+    auto c1_groups = part.groups_of(op_c1);
+    if (p_groups.empty() || c1_groups.empty()) return {};
+
+    // Pick first alive group for each
+    size_t g_p = SIZE_MAX, g_c1 = SIZE_MAX;
+    for (auto g : p_groups) if (part.groups[g].alive) { g_p = g; break; }
+    for (auto g : c1_groups) if (part.groups[g].alive) { g_c1 = g; break; }
+    if (g_p == SIZE_MAX || g_c1 == SIZE_MAX) return {};
+
+    // Verify T is produced by op_p and consumed by op_c1
+    if (dag.tensor_producer[t] != (int)op_p) return {};
+    bool c1_consumes = false;
+    for (auto inp : prob.ops[op_c1].inputs)
+        if (inp == t) { c1_consumes = true; break; }
+    if (!c1_consumes) return {};
+
+    // After extracting {P, C1}, g_c2's remainder must still contain a consumer
+    // of T. Build the remainder ops to verify.
+    FlatSet<size_t> c2_remainder = part.groups[g_c2].ops;
+    if (g_p == g_c2) c2_remainder.erase(op_p);
+    if (g_c1 == g_c2) c2_remainder.erase(op_c1);
+    if (c2_remainder.empty()) return {};
+    // T must be a boundary input of the remainder
+    if (!is_boundary_input_of(c2_remainder, t, dag)) return {};
+
+    // Collect all distinct affected groups (deduplicated)
+    FlatSet<size_t> affected_groups;
+    affected_groups.insert(g_p);
+    if (g_c1 != g_p) affected_groups.insert(g_c1);
+    affected_groups.insert(g_c2);
+
+    // Old cost: sum of all affected groups (no double-counting)
+    double total_old = 0;
+    for (auto g : affected_groups)
+        total_old += cp.group_cost(g);
+
+    // The new group {op_p, op_c1}: T is ephemeral (produced by P, consumed by C1).
+    FlatSet<size_t> new_ops = {op_p, op_c1};
+
+    // New group cost with retention context: retain T for remainder
+    FlatSet<size_t> retain_t = {t};
+    CostResult r_new;
+    if (part.cache) {
+        r_new = part.cache->evaluate_with_context(new_ops, {}, retain_t,
+                                                   prob, dag);
+    } else {
+        auto sg = Subgraph::create(prob, dag, {new_ops.begin(), new_ops.end()});
+        if (!sg) return {};
+        r_new = sg->best_cost({}, retain_t);
+    }
+    if (!r_new.feasible) return {};
+
+    // Remainder cost: for each affected group, compute cost of ops left behind
+    double remainder_cost = 0;
+    for (auto g : affected_groups) {
+        FlatSet<size_t> rem = part.groups[g].ops;
+        if (g == g_p)  rem.erase(op_p);
+        if (g == g_c1) rem.erase(op_c1);
+        if (rem.empty()) continue;
+
+        // The remainder that is g_c2 (or its subset) gets T entering from retention
+        bool is_c2_remainder = (g == g_c2);
+        auto comps = structural_ops::connected_components(rem, dag);
+        for (auto& comp : comps) {
+            if (is_c2_remainder && is_boundary_input_of(comp, t, dag)) {
+                // This component receives T from retention
+                FlatSet<size_t> entering = {t};
+                CostResult r_rem;
+                if (part.cache)
+                    r_rem = part.cache->evaluate_with_context(comp, entering, {},
+                                                               prob, dag);
+                else {
+                    auto sg = Subgraph::create(prob, dag, {comp.begin(), comp.end()});
+                    if (!sg) return {};
+                    r_rem = sg->best_cost(entering, {});
+                }
+                if (!r_rem.feasible) return {};
+                remainder_cost += r_rem.latency;
+            } else {
+                double c = part.eval_set(comp);
+                if (c >= 1e17) return {};
+                remainder_cost += c;
+            }
+        }
+    }
+
+    double total_new = r_new.latency + remainder_cost;
+
+    return {true, total_old - total_new};
+}
+
+FlatSet<size_t> apply_ephemeral_fuse(CoupledPartition& cp,
+                                       size_t op_p, size_t op_c1,
+                                       size_t g_c2, size_t t) {
+    Partition& part = cp.part;
+    const DAG& dag = *part.dag;
+
+    // Find source groups
+    size_t g_p = SIZE_MAX, g_c1 = SIZE_MAX;
+    for (auto g : part.groups_of(op_p))
+        if (part.groups[g].alive) { g_p = g; break; }
+    for (auto g : part.groups_of(op_c1))
+        if (part.groups[g].alive) { g_c1 = g; break; }
+    if (g_p == SIZE_MAX || g_c1 == SIZE_MAX) return {};
+
+    FlatSet<size_t> affected;
+    affected.insert(g_p);
+    if (g_c1 != g_p) affected.insert(g_c1);
+    affected.insert(g_c2);
+
+    // Extract P from g_p
+    part.groups[g_p].ops.erase(op_p);
+    // Extract C1 from g_c1
+    if (g_c1 != g_p) part.groups[g_c1].ops.erase(op_c1);
+    else part.groups[g_p].ops.erase(op_c1);
+
+    // Handle empty/disconnected source groups
+    FlatSet<size_t> src_groups = {g_p};
+    if (g_c1 != g_p) src_groups.insert(g_c1);
+    for (auto g : src_groups) {
+        if (part.groups[g].ops.empty()) {
+            part.groups[g].alive = false;
+            continue;
+        }
+        auto comps = structural_ops::connected_components(part.groups[g].ops, dag);
+        part.groups[g].ops = comps[0];
+        part.groups[g].cost = part.eval_set(comps[0]);
+        for (size_t c = 1; c < comps.size(); c++) {
+            double cc = part.eval_set(comps[c]);
+            size_t ng = part.add_group(std::move(comps[c]), cc < 1e17 ? cc : 1e18);
+            affected.insert(ng);
+        }
+    }
+
+    // Create new group {P, C1}
+    FlatSet<size_t> new_ops = {op_p, op_c1};
+    double nc = part.eval_set(new_ops);
+    size_t g_new = part.add_group(std::move(new_ops), nc < 1e17 ? nc : 1e18);
+    affected.insert(g_new);
+
+    // Rebuild partition index
+    part.rebuild_index();
+    part.rebuild_group_dag();
+
+    // Extend coupling arrays
+    while (cp.next_group.size() <= g_new) cp.next_group.push_back(SIZE_MAX);
+    while (cp.prev_group.size() <= g_new) cp.prev_group.push_back(SIZE_MAX);
+
+    // Couple: g_new → g_c2 via t
+    cp.next_group[g_new] = g_c2;
+    cp.prev_group[g_c2] = g_new;
+    cp.retained[{g_new, g_c2}].insert(t);
+
+    // Invalidate any stale coupling edges on source groups
+    cp.invalidate_couplings();
+
+    return affected;
 }
 
 // ============================================================================
