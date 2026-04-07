@@ -53,12 +53,13 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
     for (size_t i = 0; i < n; i++) {
         retained_entering_[i] = currently_retained;
 
-        // Only boundary OUTPUTS can be retained (organizer ruling).
-        // Overlap with currently_retained is possible (recomputation case)
-        // and handled correctly by working_set.
+        // Boundary outputs and ephemeral tensors can be retained.
+        // Ephemeral retention materialises the tensor into fast memory at
+        // full_size cost, with zero eviction IO (competition ruling).
         FlatSet<size_t> valid_retain;
         for (auto t : steps_[i].retain_these)
-            if (steps_[i].subgraph.boundary_outputs().count(t))
+            if (steps_[i].subgraph.boundary_outputs().count(t) ||
+                steps_[i].subgraph.ephemeral().count(t))
                 valid_retain.insert(t);
         steps_[i].retain_these = valid_retain;
 
@@ -274,13 +275,13 @@ Solution::ValidationResult Solution::validate() const {
             for (auto t : prob_->ops[op].outputs) available.insert(t);
     }
 
-    // Retain validity: only boundary OUTPUTS can be retained
+    // Retain validity: boundary outputs and ephemeral tensors can be retained
     for (size_t i = 0; i < steps_.size(); i++) {
         const auto& sg = steps_[i].subgraph;
         for (auto t : steps_[i].retain_these)
-            if (!sg.boundary_outputs().count(t)) {
+            if (!sg.boundary_outputs().count(t) && !sg.ephemeral().count(t)) {
                 fail("Step " + std::to_string(i) + ": retained T"
-                     + std::to_string(t) + " is not a boundary output");
+                     + std::to_string(t) + " is not produced by this subgraph");
                 return vr;
             }
     }
@@ -292,16 +293,21 @@ Solution::ValidationResult Solution::validate() const {
             return vr;
         }
 
-    // Ephemeral gap check
+    // Ephemeral gap check: each boundary input must be available from either
+    // slow memory (boundary output of some step) or fast memory (retained
+    // ephemeral from the immediately preceding step).
     for (size_t si = 0; si < steps_.size(); si++) {
         for (auto t : steps_[si].subgraph.boundary_inputs()) {
             if (dag_->tensor_producer[t] < 0) continue;
             bool found = false;
             for (size_t sj = 0; sj < steps_.size(); sj++)
                 if (steps_[sj].subgraph.boundary_outputs().count(t)) { found = true; break; }
+            // Also available if the previous step retained it (ephemeral retention)
+            if (!found && si > 0 && steps_[si-1].retain_these.count(t))
+                found = true;
             if (!found) {
                 fail("Step " + std::to_string(si) + ": T" + std::to_string(t)
-                     + " not available from slow memory (ephemeral gap)");
+                     + " not available (no boundary output or retention)");
                 return vr;
             }
         }
@@ -333,8 +339,12 @@ Solution::ValidationResult Solution::validate() const {
                 }
                 if (avail_elsewhere) continue;
 
-                // T not available elsewhere — each external consumer must
-                // have the producer recomputed in its own step.
+                // T is retained in this step → available in the next step's
+                // fast memory.  External consumers in that next step are covered.
+                if (steps_[si].retain_these.count(t)) continue;
+
+                // T not available elsewhere and not retained — each external
+                // consumer must have the producer recomputed in its own step.
                 for (auto cop : dag_->tensor_consumers[t]) {
                     if (op_set.count(cop)) continue;  // internal → OK
 
