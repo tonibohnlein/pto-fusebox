@@ -6,6 +6,21 @@
 #include <cassert>
 #include <iostream>
 
+// Helper: tensor t is produced inside ops (regardless of internal consumers).
+// Unlike is_boundary_output_of, this also matches ephemeral tensors that are
+// produced+consumed internally — they are eligible for retention coupling.
+//
+// In practice, ephemeral tensors with external consumers rarely exist in valid
+// uncoupled partitions (partition_has_gap rejects them).  The main path for
+// creating such couplings is RETAIN_FORCE_SPLIT, which splits a group to
+// expose an internal tensor.  Using is_produced_in here (instead of the
+// stricter is_boundary_output_of) keeps the COUPLE move consistent with the
+// relaxed gap check and handles edge cases from mutations.
+static bool is_produced_in(const FlatSet<size_t>& ops, size_t t, const DAG& dag) {
+    int prod = dag.tensor_producer[t];
+    return prod >= 0 && ops.count((size_t)prod);
+}
+
 // ============================================================================
 // Coupled cost evaluation helpers (forward-declared; defined after in_forward_chain)
 // ============================================================================
@@ -134,7 +149,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
             if (h == SIZE_MAX) {
                 // New edge: ga is a free chain tail — find candidate gb groups.
                 for (auto t : feasibly_ret) {
-                    if (!is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;
+                    if (!is_produced_in(part.groups[ga].ops, t, dag)) continue;
                     for (auto cop : dag.tensor_consumers[t]) {
                         auto cg_list = part.groups_of(cop);
                         for (auto gb : cg_list) {
@@ -162,7 +177,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
                     auto rit = cp.retained.find({ga, h});
                     for (auto t : feasibly_ret) {
                         if (rit != cp.retained.end() && rit->second.count(t)) continue;
-                        if (!is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;
+                        if (!is_produced_in(part.groups[ga].ops, t, dag)) continue;
                         if (!is_boundary_input_of(part.groups[h].ops, t, dag)) continue;
                         auto r = eval_couple(cp, ga, h, t);
                         if (r.feasible && r.saving > best.saving) {
@@ -185,7 +200,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
                 auto rit = cp.retained.find({p, ga});
                 for (auto t : feasibly_ret) {
                     if (rit != cp.retained.end() && rit->second.count(t)) continue;
-                    if (!is_boundary_output_of(part.groups[p].ops, t, dag)) continue;
+                    if (!is_produced_in(part.groups[p].ops, t, dag)) continue;
                     if (!is_boundary_input_of(part.groups[ga].ops, t, dag)) continue;
                     auto r = eval_couple(cp, p, ga, t);
                     if (r.feasible && r.saving > best.saving) {
@@ -246,7 +261,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         //     that is internal to ga (not yet a boundary output). ---
         for (auto t : prob.ops[op].outputs) {
             if (!feasibly_ret.count(t)) continue;
-            if (is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;  // use COUPLE
+            if (is_produced_in(part.groups[ga].ops, t, dag)) continue;  // use COUPLE
 
             // t is internal to ga. Look for consumers of t also in ga.
             for (auto cop : dag.tensor_consumers[t]) {
@@ -271,7 +286,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         if (cp.next_group[ga] == SIZE_MAX) {  // ga must be chain tail
             for (auto t : prob.ops[op].outputs) {
                 if (!feasibly_ret.count(t)) continue;
-                if (!is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;
+                if (!is_produced_in(part.groups[ga].ops, t, dag)) continue;
 
                 for (auto cop : dag.tensor_consumers[t]) {
                     for (auto g_dst : part.groups_of(cop)) {

@@ -8,6 +8,9 @@
 #include "core/dag.h"
 #include "core/subgraph.h"
 #include "core/types.h"
+#include "partition/partition.h"
+#include "search/coupling_search.h"
+#include "search/local_search.h"
 #include "solution/solution.h"
 #include <cmath>
 #include <iostream>
@@ -200,12 +203,159 @@ void test_retained_ephemeral_oom() {
     CHECK("retain infeasible (OOM)", !c_ret.feasible);
 }
 
+// ============================================================================
+// Test 6: partition_has_gap detects gap without retention
+// ============================================================================
+
+void test_partition_has_gap_without_retention() {
+    std::cout << "=== test_partition_has_gap_without_retention ===\n";
+    // Diamond: {Op0,Op1} fused, {Op2} separate.
+    // T1 is ephemeral in {Op0,Op1}, Op2 needs T1 → gap.
+    auto p = make_diamond();
+    auto d = DAG::build(p);
+
+    Partition part = Partition::trivial(p, d);
+    // Merge Op0 and Op1 into one group
+    FlatSet<size_t> merged = {0, 1};
+    double mc = part.eval_set(merged);
+    part.groups[0].ops = merged;
+    part.groups[0].cost = mc;
+    part.groups[1].alive = false;
+    part.rebuild_index();
+
+    // Without retention info → gap detected
+    CHECK("gap without retention", partition_has_gap(part));
+    // With no-op callback → still gap
+    CHECK("gap with false callback", partition_has_gap(part, [](size_t) { return false; }));
+}
+
+// ============================================================================
+// Test 7: partition_has_gap accepts retained ephemeral
+// ============================================================================
+
+void test_partition_has_gap_with_retention() {
+    std::cout << "=== test_partition_has_gap_with_retention ===\n";
+    auto p = make_diamond();
+    auto d = DAG::build(p);
+
+    Partition part = Partition::trivial(p, d);
+    FlatSet<size_t> merged = {0, 1};
+    double mc = part.eval_set(merged);
+    part.groups[0].ops = merged;
+    part.groups[0].cost = mc;
+    part.groups[1].alive = false;
+    part.rebuild_index();
+
+    // T1 retained → no gap
+    CHECK("no gap with T1 retained",
+          !partition_has_gap(part, [](size_t t) { return t == 1; }));
+}
+
+// ============================================================================
+// Test 8: CoupledPartition::is_retained
+// ============================================================================
+
+void test_coupled_partition_is_retained() {
+    std::cout << "=== test_coupled_partition_is_retained ===\n";
+    auto p = make_diamond();
+    auto d = DAG::build(p);
+
+    CoupledPartition cp;
+    cp.init_from(Partition::trivial(p, d));
+
+    // No couplings → nothing retained
+    CHECK("nothing retained initially", !cp.is_retained(0));
+    CHECK("nothing retained initially", !cp.is_retained(1));
+
+    // Add a coupling: group 0 retains T1 for group 2
+    size_t ga = 0, gb = 2;
+    cp.next_group[ga] = gb;
+    cp.prev_group[gb] = ga;
+    cp.retained[{ga, gb}].insert(1);
+
+    CHECK("T1 is retained after coupling", cp.is_retained(1));
+    CHECK("T0 is not retained", !cp.is_retained(0));
+    CHECK("T2 is not retained", !cp.is_retained(2));
+}
+
+// ============================================================================
+// Test 9: eval_couple accepts ephemeral tensor
+// ============================================================================
+
+void test_eval_couple_ephemeral() {
+    std::cout << "=== test_eval_couple_ephemeral ===\n";
+    // Build partition where {Op0,Op1} is one group and {Op2} is another.
+    // T1 is ephemeral in {Op0,Op1}. eval_couple should accept coupling T1
+    // from {Op0,Op1} to {Op2}.
+    auto p = make_diamond();
+    p.fast_memory_capacity = 100000;  // plenty of room for retention
+    auto d = DAG::build(p);
+
+    Partition part = Partition::trivial(p, d);
+    // Merge Op0+Op1 into group 0
+    FlatSet<size_t> merged = {0, 1};
+    double mc = part.eval_set(merged);
+    part.groups[0].ops = merged;
+    part.groups[0].cost = mc;
+    part.groups[1].alive = false;
+    part.rebuild_index();
+    part.finalize();
+
+    CoupledPartition cp;
+    cp.init_from(std::move(part));
+
+    // ga = group with {Op0,Op1}, gb = group with {Op2}
+    size_t ga = 0, gb = 2;
+    auto ev = eval_couple(cp, ga, gb, 1);  // T1
+    CHECK("eval_couple accepts ephemeral T1", ev.feasible);
+}
+
+// ============================================================================
+// Test 10: invalidate_couplings keeps ephemeral tensor
+// ============================================================================
+
+void test_invalidate_keeps_ephemeral() {
+    std::cout << "=== test_invalidate_keeps_ephemeral ===\n";
+    auto p = make_diamond();
+    p.fast_memory_capacity = 100000;
+    auto d = DAG::build(p);
+
+    Partition part = Partition::trivial(p, d);
+    FlatSet<size_t> merged = {0, 1};
+    double mc = part.eval_set(merged);
+    part.groups[0].ops = merged;
+    part.groups[0].cost = mc;
+    part.groups[1].alive = false;
+    part.rebuild_index();
+
+    CoupledPartition cp;
+    cp.init_from(std::move(part));
+
+    // Manually set up coupling with ephemeral T1
+    size_t ga = 0, gb = 2;
+    cp.next_group[ga] = gb;
+    cp.prev_group[gb] = ga;
+    cp.retained[{ga, gb}].insert(1);
+
+    // invalidate_couplings should keep T1 (produced in ga, consumed in gb)
+    cp.invalidate_couplings();
+    CHECK("coupling edge still exists", cp.next_group[ga] == gb);
+    auto it = cp.retained.find({ga, gb});
+    CHECK("T1 still retained after invalidate",
+          it != cp.retained.end() && it->second.count(1));
+}
+
 int main() {
     test_ephemeral_classification();
     test_working_set_with_retained_ephemeral();
     test_cost_with_retained_ephemeral();
     test_solution_validates_retained_ephemeral();
     test_retained_ephemeral_oom();
+    test_partition_has_gap_without_retention();
+    test_partition_has_gap_with_retention();
+    test_coupled_partition_is_retained();
+    test_eval_couple_ephemeral();
+    test_invalidate_keeps_ephemeral();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";

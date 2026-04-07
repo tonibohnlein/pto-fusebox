@@ -48,11 +48,14 @@ void seed_coupling_from_ordering(CoupledPartition& cp,
         if (ret.empty()) continue;
         size_t ga = res.order[i], gb = res.order[i + 1];
         if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
-        const auto& bouts = part.groups[ga].sg->boundary_outputs();
         const auto& bins  = part.groups[gb].sg->boundary_inputs();
         for (auto t : ret) {
             if (!feasibly_ret.count(t)) continue;
-            if (!bouts.count(t) || !bins.count(t)) continue;
+            // T must be produced in ga (boundary output or ephemeral) and
+            // consumed in gb (boundary input).
+            bool produced_in_ga = (part.groups[ga].sg->boundary_outputs().count(t) ||
+                                   part.groups[ga].sg->ephemeral().count(t));
+            if (!produced_in_ga || !bins.count(t)) continue;
             // Only couple if ga is still a free tail and gb a free head
             if (cp.next_group[ga] != SIZE_MAX && cp.next_group[ga] != gb) continue;
             if (cp.prev_group[gb] != SIZE_MAX && cp.prev_group[gb] != ga) continue;
