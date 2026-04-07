@@ -16,4 +16,9 @@ Partition greedy_descent(Partition part);
 
 // Quick full gap check: returns true if ANY ephemeral gap exists
 // OR the group DAG has a cycle. Used as post-move safety check.
-bool partition_has_gap(const Partition& part);
+//
+// retained_tensors: tensors retained across coupling edges.  An ephemeral
+// tensor in this set is not considered a gap (it is materialized in fast
+// memory for the next step).
+bool partition_has_gap(const Partition& part,
+                       const FlatSet<size_t>& retained_tensors = {});

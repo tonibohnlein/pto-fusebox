@@ -64,6 +64,14 @@ struct CoupledPartition {
     // Tensors group g must retain for its chain successor.
     FlatSet<size_t> retain_for(size_t g) const;
 
+    // All tensors retained across any coupling edge (union of all retained sets).
+    FlatSet<size_t> all_retained_tensors() const {
+        FlatSet<size_t> result;
+        for (auto& [edge, tensors] : retained)
+            for (auto t : tensors) result.insert(t);
+        return result;
+    }
+
     // --- Cost ---
 
     // Effective latency of group g, accounting for entering and retained tensors.

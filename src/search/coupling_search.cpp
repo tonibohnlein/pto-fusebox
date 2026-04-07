@@ -47,15 +47,20 @@ void CoupledPartition::invalidate_couplings() {
         }
 
         // Remove retained tensors no longer valid on either side:
-        //   producer side: t must still be a boundary output of g
-        //   consumer side: t must still be a boundary input  of h
+        //   producer side: t must still be produced in g (boundary output OR
+        //                  ephemeral with external consumer — both are retainable)
+        //   consumer side: t must still be a boundary input of h
         // (After EJECT/STEAL, the consuming op may have left h, making the
         //  retained edge stale and causing incorrect working-set inflation.)
         auto it = retained.find({g, h});
         if (it == retained.end()) continue;
         FlatSet<size_t> valid;
+        auto is_produced_in = [&](const FlatSet<size_t>& ops, size_t t) -> bool {
+            int prod = dag.tensor_producer[t];
+            return prod >= 0 && ops.count((size_t)prod);
+        };
         for (auto t : it->second)
-            if (is_boundary_output_of(part.groups[g].ops, t, dag) &&
+            if (is_produced_in(part.groups[g].ops, t) &&
                 is_boundary_input_of(part.groups[h].ops, t, dag))
                 valid.insert(t);
         if (valid.empty()) {
@@ -462,7 +467,11 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
                                 (gb < cp.prev_group.size() && cp.prev_group[gb] == SIZE_MAX);
     if (!existing_edge && !new_edge) return {};
     const DAG& dag = *cp.part.dag;
-    if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) return {};
+    // Producer side: t must be produced in ga (boundary output or ephemeral).
+    {
+        int prod = dag.tensor_producer[t];
+        if (prod < 0 || !cp.part.groups[ga].ops.count((size_t)prod)) return {};
+    }
     if (!is_boundary_input_of(cp.part.groups[gb].ops, t, dag))  return {};
 
     // Refuse to add a tensor already in the retained set for this edge.

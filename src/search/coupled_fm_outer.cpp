@@ -101,7 +101,7 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
         std::cerr << "BUG: coupled_fm_outer_loop: best checkpoint is cyclic\n";
         assert(false && "cyclic checkpoint — eval-time check missed a move");
     }
-    if (partition_has_gap(result.best_cp.part)) {
+    if (partition_has_gap(result.best_cp.part, result.best_cp.all_retained_tensors())) {
         std::cerr << "BUG: coupled_fm_outer_loop: best checkpoint has ephemeral gap\n";
         assert(false && "ephemeral gap in checkpoint — eval-time check missed a move");
     }
