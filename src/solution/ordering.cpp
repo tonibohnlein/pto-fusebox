@@ -96,8 +96,12 @@ OrderingResult dfs_ordering(const Partition& part) {
         size_t gb = result.order[i + 1];
         if (!part.groups[ga].sg || !part.groups[gb].sg) continue;
         const auto& out_a = part.groups[ga].sg->boundary_outputs();
+        const auto& eph_a = part.groups[ga].sg->ephemeral();
         const auto& in_b  = part.groups[gb].sg->boundary_inputs();
         for (auto t : out_a)
+            if (in_b.count(t) && prob.retainable_tensors.count(t))
+                result.retain_per_step[i].insert(t);
+        for (auto t : eph_a)
             if (in_b.count(t) && prob.retainable_tensors.count(t))
                 result.retain_per_step[i].insert(t);
     }
@@ -168,9 +172,13 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
                 for (auto t : state.resident)
                     if (future_needs_fast(t, state.scheduled)) useful_resident.insert(t);
 
-                // Outputs worth retaining for a future step
+                // Outputs worth retaining for a future step (boundary outputs
+                // and ephemeral tensors with external consumers).
                 FlatSet<size_t> retainable_out;
                 for (auto t : sg.boundary_outputs())
+                    if (prob.retainable_tensors.count(t) && future_needs_fast(t, state.scheduled))
+                        retainable_out.insert(t);
+                for (auto t : sg.ephemeral())
                     if (prob.retainable_tensors.count(t) && future_needs_fast(t, state.scheduled))
                         retainable_out.insert(t);
 
@@ -229,7 +237,7 @@ OrderingResult beam_search_ordering(const Partition& part, int beam_width) {
 
                 FlatSet<size_t> exportable;
                 for (auto t : best_retain_these)
-                    if (sg.boundary_outputs().count(t))
+                    if (sg.boundary_outputs().count(t) || sg.ephemeral().count(t))
                         exportable.insert(t);
 
                 next.resident = exportable;

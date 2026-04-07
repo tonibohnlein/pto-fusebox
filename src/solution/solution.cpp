@@ -110,8 +110,8 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
         if (!g.sg) continue;
         const Subgraph& sg = *g.sg;
 
-        // Build retain_these: only boundary OUTPUTS of this step that the next
-        // step needs as input.
+        // Build retain_these: tensors produced by this step (boundary outputs
+        // or ephemeral) that the next step needs as input.
         FlatSet<size_t> retain_these;
         if (i + 1 < res.order.size()) {
             size_t next_gi = res.order[i + 1];
@@ -119,7 +119,8 @@ std::vector<ScheduleStep> Solution::steps_from_ordering(
                 const auto& next_inputs = part.groups[next_gi].sg->boundary_inputs();
                 if (i < res.retain_per_step.size()) {
                     for (auto t : res.retain_per_step[i])
-                        if (next_inputs.count(t) && sg.boundary_outputs().count(t))
+                        if (next_inputs.count(t) &&
+                            (sg.boundary_outputs().count(t) || sg.ephemeral().count(t)))
                             retain_these.insert(t);
                 }
             }
