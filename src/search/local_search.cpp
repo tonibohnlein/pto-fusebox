@@ -89,7 +89,7 @@ Partition greedy_descent(Partition part) {
     return part;
 }
 
-bool partition_has_gap(const Partition& part, const FlatSet<size_t>& retained_tensors) {
+bool partition_has_gap(const Partition& part, std::function<bool(size_t)> is_retained) {
     if (!part.is_acyclic()) return true;
     if (!part.prob || !part.dag) return false;
     const auto& prob = *part.prob;
@@ -143,7 +143,7 @@ bool partition_has_gap(const Partition& part, const FlatSet<size_t>& retained_te
 
                 // If T is retained across a coupling edge, the next step
                 // gets it from fast memory — no gap.
-                if (retained_tensors.count(t)) continue;
+                if (is_retained && is_retained(t)) continue;
 
                 // (a) External consumers
                 for (auto cop : dag.tensor_consumers[t]) {

@@ -260,7 +260,8 @@ Solution coupling_parallel_search(
                         cp_copy = pool[pi].cp;
                     }
                     cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
-                    if (partition_has_gap(cp_copy.part, cp_copy.all_retained_tensors()) || !cp_copy.part.is_acyclic()) {
+                    auto is_ret = [&](size_t t) { return cp_copy.is_retained(t); };
+                    if (partition_has_gap(cp_copy.part, is_ret) || !cp_copy.part.is_acyclic()) {
                         total_tasks.fetch_add(1);
                         tasks_since_improve.fetch_add(1);
                         continue;
@@ -291,7 +292,8 @@ Solution coupling_parallel_search(
                     cp_copy = pool[pi].cp;
                 }
                 cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
-                if (partition_has_gap(cp_copy.part, cp_copy.all_retained_tensors()) || !cp_copy.part.is_acyclic()) {
+                auto is_ret2 = [&](size_t t) { return cp_copy.is_retained(t); };
+                if (partition_has_gap(cp_copy.part, is_ret2) || !cp_copy.part.is_acyclic()) {
                     total_tasks.fetch_add(1);
                     tasks_since_improve.fetch_add(1);
                     continue;

@@ -64,12 +64,11 @@ struct CoupledPartition {
     // Tensors group g must retain for its chain successor.
     FlatSet<size_t> retain_for(size_t g) const;
 
-    // All tensors retained across any coupling edge (union of all retained sets).
-    FlatSet<size_t> all_retained_tensors() const {
-        FlatSet<size_t> result;
+    // Check whether a specific tensor is retained across any coupling edge.
+    bool is_retained(size_t t) const {
         for (auto& [edge, tensors] : retained)
-            for (auto t : tensors) result.insert(t);
-        return result;
+            if (tensors.count(t)) return true;
+        return false;
     }
 
     // --- Cost ---
