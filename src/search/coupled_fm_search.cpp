@@ -261,7 +261,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         //     that is internal to ga (not yet a boundary output). ---
         for (auto t : prob.ops[op].outputs) {
             if (!feasibly_ret.count(t)) continue;
-            if (is_produced_in(part.groups[ga].ops, t, dag)) continue;  // use COUPLE
+            if (is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;  // use COUPLE
 
             // t is internal to ga. Look for consumers of t also in ga.
             for (auto cop : dag.tensor_consumers[t]) {
