@@ -523,6 +523,28 @@ CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
     auto it = cp.retained.find({ga, gb});
     if (it == cp.retained.end() || !it->second.count(t)) return {};
 
+    // Reject if uncoupling T would create an ephemeral gap: T is ephemeral in
+    // ga (produced+consumed internally) and gb has no other source for T.
+    const DAG& dag = *cp.part.dag;
+    if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) {
+        // T is not a boundary output of ga → it's ephemeral/internal.
+        // Without retention, gb can only get T if another group exports it
+        // as a boundary output or gb recomputes the producer.
+        int prod = dag.tensor_producer[t];
+        bool available = false;
+        if (prod >= 0) {
+            for (auto gj : cp.part.groups_of((size_t)prod)) {
+                if (gj == ga || !cp.part.groups[gj].alive) continue;
+                if (is_boundary_output_of(cp.part.groups[gj].ops, t, dag))
+                    { available = true; break; }
+            }
+            if (!available)
+                for (auto gj : cp.part.groups_of((size_t)prod))
+                    if (gj == gb) { available = true; break; }
+        }
+        if (!available) return {};  // would create ephemeral gap
+    }
+
     auto ga_enter  = cp.entering_for(ga);
     auto ga_retain = cp.retain_for(ga);
     auto gb_enter  = cp.entering_for(gb);
