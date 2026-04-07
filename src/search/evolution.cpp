@@ -498,7 +498,7 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
     const Problem& prob = *cp.part.prob;
     int coupling_muts = 1 + (int)(rng() % 2);
     for (int cm = 0; cm < coupling_muts; cm++) {
-        int choice = rng() % 10;  // 0-2: uncouple, 3-6: couple, 7-8: rfs, 9: fr
+        int choice = rng() % 12;  // 0-2: uncouple, 3-6: couple, 7-8: rfs, 9: fr, 10-11: eph_fuse
 
         if (choice <= 2) {
             // --- UNCOUPLE: remove a random retained tensor from a coupling edge ---
@@ -587,7 +587,7 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
                 }
             }
 
-        } else {
+        } else if (choice <= 9) {
             // --- FORCE_RETAIN: split a consumer group to enable coupling ---
             // Pick a random boundary tensor, find producer (ga) and consumer (g_dst)
             // where COUPLE fails, then split g_dst
@@ -645,6 +645,52 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
                     }
                 }
                 break;  // tried one bridge, move on
+            }
+
+        } else {
+            // --- EPHEMERAL_FUSE: extract {P, C1} into a new group, couple T to C2 ---
+            // Pick a random tensor with ≥2 consumers
+            std::vector<size_t> candidate_tensors;
+            for (size_t t = 0; t < dag.tensor_producer.size(); t++) {
+                int prod = dag.tensor_producer[t];
+                if (prod < 0) continue;
+                if (dag.tensor_consumers[t].size() >= 2)
+                    candidate_tensors.push_back(t);
+            }
+            if (candidate_tensors.empty()) continue;
+            size_t t = candidate_tensors[rng() % candidate_tensors.size()];
+            size_t op_p = (size_t)dag.tensor_producer[t];
+            auto& consumers = dag.tensor_consumers[t];
+
+            // Pick random c1 that's in the same group as producer
+            std::vector<size_t> c1_candidates;
+            for (auto c : consumers)
+                for (auto g : cp.part.groups_of(op_p))
+                    if (cp.part.groups[g].alive && cp.part.groups[g].ops.count(c))
+                        { c1_candidates.push_back(c); break; }
+            if (c1_candidates.empty()) continue;
+            size_t c1 = c1_candidates[rng() % c1_candidates.size()];
+
+            // Pick random c2 in a group that is a free chain head
+            std::vector<std::pair<size_t, size_t>> c2_targets;  // (c2, g_c2)
+            for (auto c2 : consumers) {
+                if (c2 == c1) continue;
+                for (auto g_c2 : cp.part.groups_of(c2)) {
+                    if (!cp.part.groups[g_c2].alive) continue;
+                    if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) continue;
+                    c2_targets.push_back({c2, g_c2});
+                }
+            }
+            if (c2_targets.empty()) continue;
+            auto [c2, g_c2] = c2_targets[rng() % c2_targets.size()];
+
+            auto ev = eval_ephemeral_fuse(cp, op_p, c1, g_c2, t);
+            if (ev.feasible && ev.saving > -1e17) {
+                auto aff = apply_ephemeral_fuse(cp, op_p, c1, g_c2, t);
+                if (!aff.empty()) {
+                    cp.part.rebuild_index();
+                    cp.part.rebuild_group_dag();
+                }
             }
         }
     }

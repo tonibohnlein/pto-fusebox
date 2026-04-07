@@ -1147,7 +1147,7 @@ static int coupling_greedy_pass(CoupledPartition& cp,
         CouplingEvalResult best;
         size_t best_ga = SIZE_MAX, best_gb = SIZE_MAX, best_t = SIZE_MAX;
         size_t best_g  = SIZE_MAX, best_op_a = SIZE_MAX, best_op_b = SIZE_MAX;
-        enum class MoveType { Couple, Uncouple, RetainForceSplit } best_type = MoveType::Couple;
+        enum class MoveType { Couple, Uncouple, RetainForceSplit, EphemeralFuse } best_type = MoveType::Couple;
 
         // --- Enumerate COUPLE candidates ---
         for (size_t ga = 0; ga < n; ga++) {
@@ -1155,7 +1155,11 @@ static int coupling_greedy_pass(CoupledPartition& cp,
             if (ga >= cp.next_group.size() || cp.next_group[ga] != SIZE_MAX) continue;
 
             for (auto t : feasibly_ret) {
-                if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+                // t must be produced in ga (boundary output or ephemeral)
+                {
+                    int prod = dag.tensor_producer[t];
+                    if (prod < 0 || !cp.part.groups[ga].ops.count((size_t)prod)) continue;
+                }
 
                 // Find alive groups that have t as a boundary input and are free chain heads.
                 for (auto cop : dag.tensor_consumers[t]) {
@@ -1216,16 +1220,53 @@ static int coupling_greedy_pass(CoupledPartition& cp,
             }
         }
 
+        // --- Enumerate EPHEMERAL_FUSE candidates ---
+        for (auto t : feasibly_ret) {
+            int prod_op = dag.tensor_producer[t];
+            if (prod_op < 0) continue;
+            auto& consumers = dag.tensor_consumers[t];
+            if (consumers.size() < 2) continue;
+
+            for (auto c1 : consumers) {
+                // c1 must be in the same group as producer
+                bool together = false;
+                for (auto g : cp.part.groups_of((size_t)prod_op))
+                    if (cp.part.groups[g].alive && cp.part.groups[g].ops.count(c1))
+                        { together = true; break; }
+                if (!together) continue;
+
+                for (auto c2 : consumers) {
+                    if (c1 == c2) continue;
+                    for (auto g_c2 : cp.part.groups_of(c2)) {
+                        if (!cp.part.groups[g_c2].alive) continue;
+                        if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) continue;
+                        auto ev = eval_ephemeral_fuse(cp, (size_t)prod_op, c1, g_c2, t);
+                        if (ev.feasible && ev.saving > best.saving) {
+                            best = ev;
+                            best_op_a = (size_t)prod_op;
+                            best_op_b = c1;
+                            best_ga = g_c2;
+                            best_t = t;
+                            best_type = MoveType::EphemeralFuse;
+                        }
+                    }
+                }
+            }
+        }
+
         // Apply if improving.
         if (best.feasible && best.saving > 0.01) {
             if (best_type == MoveType::Uncouple)
                 apply_uncouple(cp, best_ga, best_gb, best_t);
             else if (best_type == MoveType::Couple)
                 apply_couple(cp, best_ga, best_gb, best_t);
-            else {
+            else if (best_type == MoveType::EphemeralFuse) {
+                auto aff = apply_ephemeral_fuse(cp, best_op_a, best_op_b, best_ga, best_t);
+                if (aff.empty()) { improved = false; break; }
+                n = cp.part.groups.size();
+            } else {
                 auto aff = apply_retain_force_split(cp, best_g, best_op_a, best_op_b, best_t);
                 if (aff.empty()) { improved = false; break; }
-                // n was computed before; update it since a new group was added.
                 n = cp.part.groups.size();
             }
             n_moves++;

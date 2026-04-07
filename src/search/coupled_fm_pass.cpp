@@ -122,6 +122,16 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
                 int prod = cp.part.dag->tensor_producer[move.tensor];
                 if (prod >= 0) extra_locks.push_back((size_t)prod);
             }
+        } else if (move.type == CoupledFMMove::EPHEMERAL_FUSE) {
+            // Lock the extracted ops (P, C1) and consumers of T in g_c2
+            // to prevent the FM pass from immediately undoing the fuse.
+            extra_locks.push_back(move.op);   // P
+            extra_locks.push_back(move.op2);  // C1
+            if (move.tensor < cp.part.dag->tensor_consumers.size())
+                for (auto cop : cp.part.dag->tensor_consumers[move.tensor])
+                    if (move.ga < cp.part.groups.size() &&
+                        cp.part.groups[move.ga].ops.count(cop))
+                        extra_locks.push_back(cop);
         } else if (move.type == CoupledFMMove::COUPLE ||
                    move.type == CoupledFMMove::UNCOUPLE) {
             // Lock ops at the coupling boundary to prevent immediate reversal.
@@ -237,7 +247,7 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
         static const char* type_names[] = {
             "STEAL","EJECT","RECOMP","MERGE","INT_EJECT",
             "SPLIT","T_MERGE","T_EXTRACT","DE_RECOMP","FORCE_RECOMP",
-            "COUPLE","UNCOUPLE","RFS","FORCE_RET"
+            "COUPLE","UNCOUPLE","RFS","FORCE_RET","EPH_FUSE"
         };
         std::cerr << "      Coupled FM pass: " << fm_iters << " iters, "
                   << result.moves_applied << " applied ("
