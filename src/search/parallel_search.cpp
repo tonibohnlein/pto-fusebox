@@ -449,8 +449,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
 
             // FM outer loop (no lock held — this takes seconds)
             FMOuterConfig fc = cfg.fm;
-            fc.max_passes = std::min(fc.max_passes, 50);
-            fc.max_no_improve = std::min(fc.max_no_improve, 15);
+            fc.max_passes = std::min(fc.max_passes, 20);
+            fc.max_no_improve = std::min(fc.max_no_improve, 8);
             fc.deadline = deadline;
             fc.pass_config.max_drift_fraction = std::clamp(
                 fc.pass_config.max_drift_fraction * heat, 0.10, 2.0);
