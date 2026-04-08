@@ -33,6 +33,7 @@ void CoupledPartition::init_from(Partition p, CostCache* cache) {
 }
 
 void CoupledPartition::invalidate_couplings() {
+    invalidate_chain_cache();
     const DAG& dag = *part.dag;
     for (size_t g = 0; g < next_group.size(); g++) {
         size_t h = next_group[g];
@@ -75,6 +76,7 @@ void CoupledPartition::invalidate_couplings() {
 }
 
 void CoupledPartition::fix_chain_couplings() {
+    invalidate_chain_cache();
     // Mutations can create new group DAG edges that make existing coupling links
     // form a cycle in the chain-level DAG.  Detect and remove them.
     //
@@ -121,6 +123,16 @@ size_t CoupledPartition::chain_head(size_t g) const {
     for (size_t steps = 0; steps < n && g < prev_group.size() && prev_group[g] != SIZE_MAX; steps++)
         g = prev_group[g];
     return g;
+}
+
+size_t CoupledPartition::chain_head_cached(size_t g) const {
+    if (g < chain_head_cache_.size() && chain_head_cache_[g] != SIZE_MAX)
+        return chain_head_cache_[g];
+    size_t h = chain_head(g);
+    if (chain_head_cache_.size() <= g)
+        chain_head_cache_.resize(g + 1, SIZE_MAX);
+    chain_head_cache_[g] = h;
+    return h;
 }
 
 size_t CoupledPartition::chain_tail(size_t g) const {
@@ -371,16 +383,19 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                                  const std::vector<size_t>& chain_b) {
     if (!cp.part.prob || !cp.part.dag) return true;
 
+    // Two singleton (free) groups can never create a chain-level cycle.
+    if (chain_a.size() <= 1 && chain_b.size() <= 1) return true;
+
     FlatSet<size_t> in_G(chain_a.begin(), chain_a.end());
     for (auto g : chain_b) in_G.insert(g);
 
     size_t n = cp.part.groups.size();
 
-    // For external groups, compute their chain head once.
-    std::vector<size_t> head_of(n, SIZE_MAX);
-    for (size_t g = 0; g < n; g++)
-        if (cp.part.groups[g].alive && !in_G.count(g))
-            head_of[g] = cp.chain_head(g);
+    // For external groups, look up their chain head (cached).
+    auto head_of_g = [&](size_t g) -> size_t {
+        if (g >= n || !cp.part.groups[g].alive || in_G.count(g)) return SIZE_MAX;
+        return cp.chain_head_cached(g);
+    };
 
     // BFS over external chain heads reachable from G.
     FlatSet<size_t> vis_heads;
@@ -396,7 +411,7 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                     if (cp.part.groups[gi].ops.count(cop)) continue;
                     for (auto gj : cp.part.groups_of(cop)) {
                         if (!cp.part.groups[gj].alive || in_G.count(gj)) continue;
-                        size_t hj = head_of[gj];
+                        size_t hj = head_of_g(gj);
                         if (hj == SIZE_MAX || vis_heads.count(hj)) continue;
                         vis_heads.insert(hj);
                         q.push(hj);
@@ -404,6 +419,28 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                 }
             }
         }
+    }
+
+    // Quick filter: use group-level forward reachability to check if any
+    // seeded external group can reach back into G.  If not, no cycle possible.
+    if (!q.empty()) {
+        bool any_back_edge = false;
+        // Check: for each group in G, is it forward-reachable from any seed?
+        // Equivalently: for each seed head h, does fwd(h) intersect G?
+        for (auto h : vis_heads) {
+            // Walk the chain from head h to check all groups
+            size_t g_walk = h;
+            for (size_t s = 0; s <= n && g_walk != SIZE_MAX; s++) {
+                if (!cp.part.groups[g_walk].alive) break;
+                const auto& fwd = cp.part.cached_forward_reachable(g_walk);
+                for (auto gi : in_G)
+                    if (gi < fwd.size() && fwd[gi]) { any_back_edge = true; break; }
+                if (any_back_edge) break;
+                g_walk = (g_walk < cp.next_group.size()) ? cp.next_group[g_walk] : SIZE_MAX;
+            }
+            if (any_back_edge) break;
+        }
+        if (!any_back_edge) return true;
     }
 
     // BFS through external chains; cycle if any group in an external chain
@@ -422,7 +459,7 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                         for (auto gj : cp.part.groups_of(cop)) {
                             if (!cp.part.groups[gj].alive) continue;
                             if (in_G.count(gj)) return false;  // external path back into G
-                            size_t hj = head_of[gj];
+                            size_t hj = head_of_g(gj);
                             if (hj == SIZE_MAX || vis_heads.count(hj)) continue;
                             vis_heads.insert(hj);
                             q.push(hj);
@@ -923,6 +960,7 @@ FlatSet<size_t> apply_retain_force_split(CoupledPartition& cp,
 
 FlatSet<size_t> apply_couple(CoupledPartition& cp,
                                size_t ga, size_t gb, size_t t) {
+    cp.invalidate_chain_cache();
     assert(cp.part.groups[ga].alive && cp.part.groups[gb].alive);
     const bool existing_edge = (ga < cp.next_group.size() && cp.next_group[ga] == gb) &&
                                 (gb < cp.prev_group.size() && cp.prev_group[gb] == ga);
@@ -943,6 +981,7 @@ FlatSet<size_t> apply_couple(CoupledPartition& cp,
 
 FlatSet<size_t> apply_uncouple(CoupledPartition& cp,
                                  size_t ga, size_t gb, size_t t) {
+    cp.invalidate_chain_cache();
     if (ga >= cp.next_group.size() || cp.next_group[ga] != gb) return {};
     auto it = cp.retained.find({ga, gb});
     if (it == cp.retained.end() || !it->second.count(t)) return {};

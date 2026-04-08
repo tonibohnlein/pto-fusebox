@@ -56,8 +56,14 @@ struct CoupledPartition {
     // --- Chain helpers ---
 
     size_t chain_head(size_t g) const;           // follow prev_group to start
+    size_t chain_head_cached(size_t g) const;    // cached version (lazy, invalidated on coupling change)
     size_t chain_tail(size_t g) const;           // follow next_group to end
     std::vector<size_t> chain_of(size_t g) const; // head-to-tail group list
+    void invalidate_chain_cache() const { chain_head_cache_.clear(); }
+
+private:
+    mutable std::vector<size_t> chain_head_cache_;
+public:
 
     // Tensors entering group g from its chain predecessor's retained set.
     FlatSet<size_t> entering_for(size_t g) const;

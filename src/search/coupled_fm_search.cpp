@@ -51,13 +51,10 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
     {
         FMMove pm = best_move_for(cp.part, op, locked);
         if (pm.valid()) {
-            bool chain_ok = true;
-            if (pm.type == FMMove::MERGE) {
-                chain_ok = acyclic_chain_merge_groups(cp, {pm.ga, pm.gb});
-            } else if (pm.type == FMMove::TENSOR_MERGE) {
-                chain_ok = acyclic_chain_merge_groups(cp, pm.tensor_groups);
-            }
-            if (chain_ok) {
+            // Chain-level acyclicity for MERGE/TENSOR_MERGE is deferred to
+            // apply time (coupled_fm_pass.cpp) to avoid expensive checks on
+            // every candidate.  The apply step rejects invalid merges.
+            {
                 best.type                = static_cast<CoupledFMMove::Type>(static_cast<int>(pm.type));
                 best.op                  = pm.op;
                 best.ga                  = pm.ga;
