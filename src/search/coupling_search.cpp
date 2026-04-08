@@ -215,7 +215,8 @@ Solution CoupledPartition::to_solution() const {
         if (!part.groups[g].alive) continue;
         size_t hg = head_of[g];
         for (auto op : part.groups[g].ops) {
-            for (auto t : prob.ops[op].outputs) {
+            {
+                size_t t = prob.ops[op].output();
                 if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
                 for (auto cop : dag.tensor_consumers[t]) {
                     for (auto gs : part.groups_of(cop)) {
@@ -260,7 +261,8 @@ Solution CoupledPartition::to_solution() const {
         for (auto g : all_g) { g_succs[g]; g_indeg[g] = 0; }
         for (auto g : all_g) {
             for (auto op : part.groups[g].ops) {
-                for (auto t : prob.ops[op].outputs) {
+                {
+                    size_t t = prob.ops[op].output();
                     if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
                     for (auto cop : dag.tensor_consumers[t]) {
                         for (auto gs : part.groups_of(cop)) {
@@ -388,7 +390,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
     for (auto gi : in_G) {
         if (!cp.part.groups[gi].alive) continue;
         for (auto op : cp.part.groups[gi].ops) {
-            for (auto t : cp.part.prob->ops[op].outputs) {
+            {
+                size_t t = cp.part.prob->ops[op].output();
                 for (auto cop : cp.part.dag->tensor_consumers[t]) {
                     if (cp.part.groups[gi].ops.count(cop)) continue;
                     for (auto gj : cp.part.groups_of(cop)) {
@@ -412,7 +415,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
         for (size_t steps = 0; steps <= n && g_cur != SIZE_MAX; steps++) {
             if (!cp.part.groups[g_cur].alive) break;
             for (auto op : cp.part.groups[g_cur].ops) {
-                for (auto t : cp.part.prob->ops[op].outputs) {
+                {
+                    size_t t = cp.part.prob->ops[op].output();
                     for (auto cop : cp.part.dag->tensor_consumers[t]) {
                         if (cp.part.groups[g_cur].ops.count(cop)) continue;
                         for (auto gj : cp.part.groups_of(cop)) {

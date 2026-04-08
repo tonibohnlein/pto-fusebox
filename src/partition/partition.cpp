@@ -71,7 +71,8 @@ const std::vector<bool>& Partition::cached_forward_reachable(size_t g) const {
     while (!q.empty()) {
         size_t cur = q.front(); q.pop();
         for (auto op : groups[cur].ops) {
-            for (auto t : prob->ops[op].outputs) {
+            {
+                size_t t = prob->ops[op].output();
                 for (auto cop : dag->tensor_consumers[t]) {
                     if (groups[cur].ops.count(cop)) continue;
                     for (auto gj : groups_of(cop)) {
@@ -370,7 +371,8 @@ bool Partition::acyclic_merge_local(const std::vector<size_t>& G) const {
     for (auto gi : G) {
         if (!groups[gi].alive) continue;
         for (auto op : groups[gi].ops) {
-            for (auto t : prob->ops[op].outputs) {
+            {
+                size_t t = prob->ops[op].output();
                 for (auto cop : dag->tensor_consumers[t]) {
                     if (groups[gi].ops.count(cop)) continue;  // internal to gi
                     for (auto gj : groups_of(cop)) {
@@ -388,7 +390,8 @@ bool Partition::acyclic_merge_local(const std::vector<size_t>& G) const {
     while (!q.empty()) {
         size_t cur = q.front(); q.pop();
         for (auto op : groups[cur].ops) {
-            for (auto t : prob->ops[op].outputs) {
+            {
+                size_t t = prob->ops[op].output();
                 for (auto cop : dag->tensor_consumers[t]) {
                     if (groups[cur].ops.count(cop)) continue;
                     for (auto gj : groups_of(cop)) {
@@ -423,7 +426,8 @@ bool Partition::acyclic_add_ops_into(const FlatSet<size_t>& new_ops, size_t gi) 
     std::queue<size_t> q;
 
     auto seed = [&](size_t op) {
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             for (auto cop : dag->tensor_consumers[t]) {
                 if (in_merged(cop)) continue;
                 for (auto gc : groups_of(cop)) {
@@ -440,7 +444,8 @@ bool Partition::acyclic_add_ops_into(const FlatSet<size_t>& new_ops, size_t gi) 
     while (!q.empty()) {
         size_t cur = q.front(); q.pop();
         for (auto cur_op : groups[cur].ops) {
-            for (auto t : prob->ops[cur_op].outputs) {
+            {
+                size_t t = prob->ops[cur_op].output();
                 for (auto cop : dag->tensor_consumers[t]) {
                     if (in_merged(cop)) return false;  // path back into merged set
                     for (auto gc : groups_of(cop)) {
@@ -464,7 +469,8 @@ bool Partition::acyclic_extract_local(const FlatSet<size_t>& extract_ops) const 
     std::queue<size_t> q;
 
     for (auto op : extract_ops) {
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             for (auto cop : dag->tensor_consumers[t]) {
                 if (extract_ops.count(cop)) continue;  // internal to gnew
                 for (auto gc : groups_of(cop)) {
@@ -483,7 +489,8 @@ bool Partition::acyclic_extract_local(const FlatSet<size_t>& extract_ops) const 
         size_t cur = q.front(); q.pop();
         for (auto cur_op : groups[cur].ops) {
             if (extract_ops.count(cur_op)) continue;
-            for (auto t : prob->ops[cur_op].outputs) {
+            {
+                size_t t = prob->ops[cur_op].output();
                 for (auto cop : dag->tensor_consumers[t]) {
                     if (extract_ops.count(cop)) return false;  // path back into gnew
                     for (auto gc : groups_of(cop)) {
@@ -541,7 +548,7 @@ bool Partition::acyclic_de_recompute_local(size_t op, size_t ga) const {
 
     const auto& fwd_ga = cached_forward_reachable(ga);
 
-    for (auto t : prob->ops[op].outputs) {
+    { size_t t = prob->ops[op].output();
         // Part 1: internal consumers in ga lose their ephemeral source.
         bool consumed_in_ga = false;
         for (auto cop : dag->tensor_consumers[t])
@@ -558,16 +565,17 @@ bool Partition::acyclic_de_recompute_local(size_t op, size_t ga) const {
         // it from S.  For each such consumer group gc, at least one gP ∈ S
         // must not be forward-reachable from gc (can be placed before gc).
         // This mirrors Part 3 of acyclic_steal_local.
-        if (S.empty()) continue;
-        for (auto cop : dag->tensor_consumers[t]) {
-            if (groups[ga].ops.count(cop)) continue;  // internal, handled above
-            for (auto gc : groups_of(cop)) {
-                if (!groups[gc].alive || gc == ga) continue;
-                const auto& fwd_gc = cached_forward_reachable(gc);
-                bool any_free = false;
-                for (auto gP : S)
-                    if (!fwd_gc[gP]) { any_free = true; break; }
-                if (!any_free) return false;
+        if (!S.empty()) {
+            for (auto cop : dag->tensor_consumers[t]) {
+                if (groups[ga].ops.count(cop)) continue;  // internal, handled above
+                for (auto gc : groups_of(cop)) {
+                    if (!groups[gc].alive || gc == ga) continue;
+                    const auto& fwd_gc = cached_forward_reachable(gc);
+                    bool any_free = false;
+                    for (auto gP : S)
+                        if (!fwd_gc[gP]) { any_free = true; break; }
+                    if (!any_free) return false;
+                }
             }
         }
     }
@@ -585,20 +593,21 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
     // Cycle iff ALL sources in that set are forward-reachable from ga.
     {
         const auto& fwd_ga = cached_forward_reachable(ga);
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             bool consumed_in_ga = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (cop != op && groups[ga].ops.count(cop)) { consumed_in_ga = true; break; }
-            if (!consumed_in_ga) continue;
-
-            // Source options: gb (op's new home) ∪ any other existing copy.
-            bool any_free = (gb < groups.size() && groups[gb].alive && !fwd_ga[gb]);
-            if (!any_free) {
-                for (auto gother : groups_of(op))
-                    if (gother != ga && groups[gother].alive && !fwd_ga[gother])
-                        { any_free = true; break; }
+            if (consumed_in_ga) {
+                // Source options: gb (op's new home) ∪ any other existing copy.
+                bool any_free = (gb < groups.size() && groups[gb].alive && !fwd_ga[gb]);
+                if (!any_free) {
+                    for (auto gother : groups_of(op))
+                        if (gother != ga && groups[gother].alive && !fwd_ga[gother])
+                            { any_free = true; break; }
+                }
+                if (!any_free) return false;
             }
-            if (!any_free) return false;
         }
     }
 
@@ -615,7 +624,8 @@ bool Partition::acyclic_steal_local(size_t op, size_t ga, size_t gb) const {
             if (gother != ga && groups[gother].alive) S.push_back(gother);
         if (S.empty()) return false;  // op has no copy left → no source for T
 
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             // Check external consumers of T (not in ga, not in gb).
             for (auto cop : dag->tensor_consumers[t]) {
                 for (auto gc : groups_of(cop)) {
@@ -804,7 +814,8 @@ bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
     if (!prob || !dag) return false;
 
     for (auto op : proposed_ops) {
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             // New ephemeral rule: T is ephemeral in proposed_ops iff it is
             // produced AND consumed internally. External consumers are irrelevant
             // to the ephemeral classification — but they DO need T from somewhere.
@@ -860,7 +871,8 @@ bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
     FlatSet<size_t> excluded(exclude_groups.begin(), exclude_groups.end());
 
     for (auto op : proposed_ops) {
-        for (auto t : prob->ops[op].outputs) {
+        {
+            size_t t = prob->ops[op].output();
             bool any_consumer_internal = false;
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
@@ -917,7 +929,8 @@ bool Partition::split_creates_ephemeral_gap(
         const auto& comp = components[ci];
 
         for (auto op : comp) {
-            for (auto t : prob->ops[op].outputs) {
+            {
+                size_t t = prob->ops[op].output();
                 // T is ephemeral in this component if any consumer is internal
                 bool any_consumer_in_comp = false;
                 for (auto cop : dag->tensor_consumers[t])

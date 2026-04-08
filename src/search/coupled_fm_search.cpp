@@ -259,22 +259,24 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
 
         // --- RETAIN_FORCE_SPLIT: op produces a feasibly-retainable tensor
         //     that is internal to ga (not yet a boundary output). ---
-        for (auto t : prob.ops[op].outputs) {
-            if (!feasibly_ret.count(t)) continue;
-            if (is_boundary_output_of(part.groups[ga].ops, t, dag)) continue;  // use COUPLE
+        {
+            size_t t = prob.ops[op].output();
+            if (feasibly_ret.count(t) &&
+                !is_boundary_output_of(part.groups[ga].ops, t, dag)) {
 
-            // t is internal to ga. Look for consumers of t also in ga.
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (!part.groups[ga].ops.count(cop)) continue;
-                // Try split at bridge edge (op → cop)
-                auto r = eval_retain_force_split(cp, ga, op, cop, t);
-                if (r.feasible && r.saving > best.saving) {
-                    best.type   = CoupledFMMove::RETAIN_FORCE_SPLIT;
-                    best.op     = op;
-                    best.op2    = cop;
-                    best.ga     = ga;
-                    best.tensor = t;
-                    best.saving = r.saving;
+                // t is internal to ga. Look for consumers of t also in ga.
+                for (auto cop : dag.tensor_consumers[t]) {
+                    if (!part.groups[ga].ops.count(cop)) continue;
+                    // Try split at bridge edge (op → cop)
+                    auto r = eval_retain_force_split(cp, ga, op, cop, t);
+                    if (r.feasible && r.saving > best.saving) {
+                        best.type   = CoupledFMMove::RETAIN_FORCE_SPLIT;
+                        best.op     = op;
+                        best.op2    = cop;
+                        best.ga     = ga;
+                        best.tensor = t;
+                        best.saving = r.saving;
+                    }
                 }
             }
         }
@@ -284,9 +286,9 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         //     to hold all of t in fast memory. Split g_dst at a bridge adjacent
         //     to t's consumer so the smaller side_a can be coupled to ga via t. ---
         if (cp.next_group[ga] == SIZE_MAX) {  // ga must be chain tail
-            for (auto t : prob.ops[op].outputs) {
-                if (!feasibly_ret.count(t)) continue;
-                if (!is_produced_in(part.groups[ga].ops, t, dag)) continue;
+            size_t t = prob.ops[op].output();
+            if (feasibly_ret.count(t) &&
+                is_produced_in(part.groups[ga].ops, t, dag)) {
 
                 for (auto cop : dag.tensor_consumers[t]) {
                     for (auto g_dst : part.groups_of(cop)) {
@@ -323,42 +325,45 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
     // --- EPHEMERAL_FUSE: for each output tensor T of this op that has ≥2 consumers,
     //     try extracting op (producer) + one consumer into a new group where T is
     //     ephemeral, and couple T to another consumer's group. ---
-    for (auto t : prob.ops[op].outputs) {
-        if (!feasibly_ret.count(t)) continue;
-        if (dag.tensor_producer[t] != (int)op) continue;
-        auto& consumers = dag.tensor_consumers[t];
-        if (consumers.size() < 2) continue;
+    {
+        size_t t = prob.ops[op].output();
+        if (feasibly_ret.count(t) &&
+            dag.tensor_producer[t] == (int)op &&
+            dag.tensor_consumers[t].size() >= 2) {
 
-        // Find groups containing op (producer)
-        auto op_groups = part.groups_of(op);
+            auto& consumers = dag.tensor_consumers[t];
 
-        for (size_t ci = 0; ci < consumers.size(); ci++) {
-            size_t c1 = consumers[ci];
-            // c1 must be in the same group as op
-            bool c1_with_op = false;
-            for (auto g : op_groups)
-                if (part.groups[g].alive && part.groups[g].ops.count(c1))
-                    { c1_with_op = true; break; }
-            if (!c1_with_op) continue;
+            // Find groups containing op (producer)
+            auto op_groups = part.groups_of(op);
 
-            for (size_t cj = 0; cj < consumers.size(); cj++) {
-                if (ci == cj) continue;
-                size_t c2 = consumers[cj];
-                for (auto g_c2 : part.groups_of(c2)) {
-                    if (!part.groups[g_c2].alive) continue;
-                    if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) continue;
-                    // g_c2 CAN be the same group as op — extracting {P,C1}
-                    // leaves C2 in the remainder which becomes the coupling target.
-                    // eval_ephemeral_fuse handles this correctly.
+            for (size_t ci = 0; ci < consumers.size(); ci++) {
+                size_t c1 = consumers[ci];
+                // c1 must be in the same group as op
+                bool c1_with_op = false;
+                for (auto g : op_groups)
+                    if (part.groups[g].alive && part.groups[g].ops.count(c1))
+                        { c1_with_op = true; break; }
+                if (!c1_with_op) continue;
 
-                    auto r = eval_ephemeral_fuse(cp, op, c1, g_c2, t);
-                    if (r.feasible && r.saving > best.saving) {
-                        best.type   = CoupledFMMove::EPHEMERAL_FUSE;
-                        best.op     = op;
-                        best.op2    = c1;
-                        best.ga     = g_c2;
-                        best.tensor = t;
-                        best.saving = r.saving;
+                for (size_t cj = 0; cj < consumers.size(); cj++) {
+                    if (ci == cj) continue;
+                    size_t c2 = consumers[cj];
+                    for (auto g_c2 : part.groups_of(c2)) {
+                        if (!part.groups[g_c2].alive) continue;
+                        if (g_c2 >= cp.prev_group.size() || cp.prev_group[g_c2] != SIZE_MAX) continue;
+                        // g_c2 CAN be the same group as op — extracting {P,C1}
+                        // leaves C2 in the remainder which becomes the coupling target.
+                        // eval_ephemeral_fuse handles this correctly.
+
+                        auto r = eval_ephemeral_fuse(cp, op, c1, g_c2, t);
+                        if (r.feasible && r.saving > best.saving) {
+                            best.type   = CoupledFMMove::EPHEMERAL_FUSE;
+                            best.op     = op;
+                            best.op2    = c1;
+                            best.ga     = g_c2;
+                            best.tensor = t;
+                            best.saving = r.saving;
+                        }
                     }
                 }
             }
@@ -482,13 +487,13 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         FlatSet<size_t> valid_re;
         for (auto t : re_ga) {
             bool op_produces = false;
-            for (auto out : part.prob->ops[op].outputs)
-                if (out == t) { op_produces = true; break; }
+            { size_t out = part.prob->ops[op].output();
+                if (out == t) { op_produces = true; } }
             if (!op_produces) { valid_re.insert(t); continue; }
             bool other_producer = false;
             for (auto cop : new_ga) {
-                for (auto out2 : part.prob->ops[cop].outputs)
-                    if (out2 == t) { other_producer = true; break; }
+                { size_t out2 = part.prob->ops[cop].output();
+                    if (out2 == t) { other_producer = true; } }
                 if (other_producer) break;
             }
             if (other_producer) valid_re.insert(t);

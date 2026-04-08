@@ -294,7 +294,8 @@ EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op) {
 
     // Ephemeral gap check: for each output tensor of op, verify it's still
     // available as a boundary output from at least one other source.
-    for (auto t : p.prob->ops[op].outputs) {
+    {
+        size_t t = p.prob->ops[op].output();
         // Is T still produced as boundary output by some other group?
         bool still_available = false;
         for (auto gj : p.groups_of(op)) {
@@ -304,17 +305,17 @@ EvalResult eval_de_recompute(const Partition& p, size_t ga, size_t op) {
                 if (p.groups[gj].ops.count(cop)) { consumed_in_gj = true; break; }
             if (!consumed_in_gj) { still_available = true; break; }
         }
-        if (still_available) continue;
-
-        // T lost its only boundary-output source. Check every external consumer
-        // has op recomputed in its group.
-        for (auto cop : p.dag->tensor_consumers[t]) {
-            bool served = false;
-            for (auto gj : p.groups_of(cop)) {
-                if (gj == ga || !p.groups[gj].alive) continue;
-                if (p.groups[gj].ops.count(op)) { served = true; break; }
+        if (!still_available) {
+            // T lost its only boundary-output source. Check every external consumer
+            // has op recomputed in its group.
+            for (auto cop : p.dag->tensor_consumers[t]) {
+                bool served = false;
+                for (auto gj : p.groups_of(cop)) {
+                    if (gj == ga || !p.groups[gj].alive) continue;
+                    if (p.groups[gj].ops.count(op)) { served = true; break; }
+                }
+                if (!served) return r;
             }
-            if (!served) return r;
         }
     }
 

@@ -233,7 +233,8 @@ public:
             adj.reserve(ops.size());
             for (auto op : ops) {
                 adj[op];  // ensure entry exists
-                for (auto t : prob.ops[op].outputs) {
+                {
+                    size_t t = prob.ops[op].output();
                     for (auto cons : dag.tensor_consumers[t]) {
                         if (ops.count(cons)) {
                             adj[op].push_back(cons);
@@ -300,9 +301,9 @@ public:
                 }
                 h = hash_combine(h, 0xDEADBEEF);
                 std::vector<std::pair<int64_t,int64_t>> out_shapes;
-                for (auto t : prob.ops[op].outputs)
+                { size_t t = prob.ops[op].output();
                     out_shapes.push_back({prob.tensors[t].width,
-                                          prob.tensors[t].height});
+                                          prob.tensors[t].height}); }
                 std::sort(out_shapes.begin(), out_shapes.end());
                 for (auto [w, ht] : out_shapes) {
                     h = hash_combine(h, (size_t)w);
@@ -327,7 +328,8 @@ public:
                         ext_in_count[op]++;
                     }
                 }
-                for (auto t : prob.ops[op].outputs) {
+                {
+                    size_t t = prob.ops[op].output();
                     for (auto cons : dag.tensor_consumers[t]) {
                         if (comp.count(cons)) {
                             local_succs[op].push_back({cons, t});
@@ -414,7 +416,8 @@ public:
                         succ_hashes.push_back(th);
                     }
                     // Hash external outputs by shape
-                    for (auto t : prob.ops[op].outputs) {
+                    {
+                        size_t t = prob.ops[op].output();
                         bool has_ext = false;
                         for (auto cons : dag.tensor_consumers[t])
                             if (!comp.count(cons)) { has_ext = true; break; }

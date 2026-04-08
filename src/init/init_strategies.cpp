@@ -208,7 +208,8 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
                 // recomputation exists, so this is always invalid.
                 bool has_gap = false;
                 for (auto op_i : group) {
-                    for (auto t : prob.ops[op_i].outputs) {
+                    {
+                        size_t t = prob.ops[op_i].output();
                         bool any_in = false;
                         bool any_out = false;
                         for (auto cop : dag.tensor_consumers[t]) {
@@ -217,17 +218,18 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
                         }
                         if (any_in && any_out) {
                             int prod_op_t = dag.tensor_producer[t];
-                            if (prod_op_t < 0) continue;
-                            for (auto cop : dag.tensor_consumers[t]) {
-                                if (has_gap) break;
-                                if (group.count(cop)) continue;
-                                bool served = false;
-                                for (auto gj : p.groups_of(cop)) {
-                                    if (!p.groups[gj].alive) continue;
-                                    if (p.groups[gj].ops.count((size_t)prod_op_t))
-                                        { served = true; break; }
+                            if (prod_op_t >= 0) {
+                                for (auto cop : dag.tensor_consumers[t]) {
+                                    if (has_gap) break;
+                                    if (group.count(cop)) continue;
+                                    bool served = false;
+                                    for (auto gj : p.groups_of(cop)) {
+                                        if (!p.groups[gj].alive) continue;
+                                        if (p.groups[gj].ops.count((size_t)prod_op_t))
+                                            { served = true; break; }
+                                    }
+                                    if (!served) has_gap = true;
                                 }
-                                if (!served) has_gap = true;
                             }
                         }
                     }
@@ -489,7 +491,8 @@ std::string verify_partition_feasibility(const Partition& part) {
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops) {
-            for (auto t : prob.ops[op].outputs) {
+            {
+                size_t t = prob.ops[op].output();
                 bool consumed_internal = false;
                 for (auto cop : dag.tensor_consumers[t])
                     if (cop != op && part.groups[gi].ops.count(cop))

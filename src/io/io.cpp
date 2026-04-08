@@ -84,8 +84,8 @@ Problem read_problem(const std::string& filename) {
             }
             op.inputs.push_back(idx);
         }
-        for (auto& t : outputs[i]) {
-            size_t idx = t.get<size_t>();
+        {
+            size_t idx = outputs[i][0].get<size_t>();
             if (idx >= num_tensors) {
                 std::cerr << "Error: op " << i << " output tensor index " << idx
                           << " out of range (num_tensors=" << num_tensors << ")\n";
@@ -105,7 +105,7 @@ Problem read_problem(const std::string& filename) {
         std::vector<bool> is_consumed(num_tensors, false);
 
         for (size_t i = 0; i < num_ops; i++) {
-            for (auto t : p.ops[i].outputs) {
+            { size_t t = p.ops[i].output();
                 if (producer_op[t] >= 0) {
                     std::cerr << "Error: tensor " << t << " produced by both op "
                               << producer_op[t] << " and op " << i << "\n";

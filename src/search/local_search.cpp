@@ -119,7 +119,8 @@ bool partition_has_gap(const Partition& part, std::function<bool(size_t)> is_ret
     for (size_t gi = 0; gi < part.groups.size(); gi++) {
         if (!part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops) {
-            for (auto t : prob.ops[op].outputs) {
+            {
+                size_t t = prob.ops[op].output();
                 bool consumed_internal = false;
                 for (auto cop : dag.tensor_consumers[t])
                     if (cop != op && part.groups[gi].ops.count(cop))

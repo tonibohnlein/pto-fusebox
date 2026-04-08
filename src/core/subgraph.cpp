@@ -44,8 +44,8 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   for (auto i : sg.ops_) {
     is_in_sg[i] = true;
-    for (auto t : prob.ops[i].outputs)
-      is_produced[t] = true;
+    { size_t t = prob.ops[i].output();
+      is_produced[t] = true; }
     for (auto t : prob.ops[i].inputs)
       is_consumed[t] = true;
     if (prob.ops[i].type == OpType::MatMul) {
@@ -89,9 +89,9 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     std::vector<size_t> sink_ops;
     for (auto i : sg.ops_) {
       bool has_internal_succ = false;
-      for (auto t : prob.ops[i].outputs)
+      { size_t t = prob.ops[i].output();
         for (auto cop : dag.tensor_consumers[t])
-          if (is_in_sg[cop]) { has_internal_succ = true; break; }
+          if (is_in_sg[cop]) { has_internal_succ = true; break; } }
       
       if (!has_internal_succ) {
         sink_ops.push_back(i);
@@ -150,9 +150,9 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       std::vector<size_t> eph_order;
       for (auto op_idx : dag.topological_order())
         if (is_in_sg[op_idx])
-          for (auto t : prob.ops[op_idx].outputs)
+          { size_t t = prob.ops[op_idx].output();
             if (is_ephemeral[t])
-              eph_order.push_back(t);
+              eph_order.push_back(t); }
 
       for (int ei = (int)eph_order.size() - 1; ei >= 0; ei--) {
         size_t t = eph_order[ei];
@@ -237,8 +237,8 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
     for (auto i : sg.ops_) {
       if (!sg.is_sink_op_vec_[i]) continue;
-      for (auto t : prob.ops[i].outputs)
-        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
+      { size_t t = prob.ops[i].output();
+        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true}; }
     }
 
     auto merge_source = [](TS existing, TS incoming) -> TS {
@@ -309,7 +309,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         if (tsrc[t].v == TS::FROM_NK)  sg.min_nk_v_dim_ = std::min(sg.min_nk_v_dim_, H);
       };
       for (auto t : prob.ops[op_idx].inputs) check(t);
-      for (auto t : prob.ops[op_idx].outputs) check(t);
+      { size_t t = prob.ops[op_idx].output(); check(t); }
     }
 
     std::vector<int> tensor_in_info(num_tensors, -1);
@@ -351,7 +351,8 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
 
     for (auto op_idx : sg.ops_) {
-      for (auto t : prob.ops[op_idx].outputs) {
+      {
+        size_t t = prob.ops[op_idx].output();
         if (sg.boundary_outputs_.count(t) && is_produced[t]) {
           size_t idx = ensure(t);
           bool used_internally = false;

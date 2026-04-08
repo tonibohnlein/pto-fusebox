@@ -568,11 +568,10 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
             // Look for internal tensors that become boundary after split
             size_t split_tensor = SIZE_MAX;
             for (auto op : sa.side_a) {
-                for (auto out : prob.ops[op].outputs) {
+                { size_t out = prob.ops[op].output();
                     // Check if any consumer is in side_b
                     for (auto cop : dag.tensor_consumers[out])
                         if (sa.side_b.count(cop)) { split_tensor = out; break; }
-                    if (split_tensor != SIZE_MAX) break;
                 }
                 if (split_tensor != SIZE_MAX) break;
             }

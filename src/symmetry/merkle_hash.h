@@ -92,8 +92,8 @@ struct MerkleHashes {
 
             // Hash output tensor shapes
             std::vector<std::pair<int64_t,int64_t>> out_shapes;
-            for (auto t : prob.ops[i].outputs)
-                out_shapes.push_back({prob.tensors[t].width, prob.tensors[t].height});
+            { size_t t = prob.ops[i].output();
+                out_shapes.push_back({prob.tensors[t].width, prob.tensors[t].height}); }
             std::sort(out_shapes.begin(), out_shapes.end());
             h = hash_combine(h, 0xDEADBEEF);  // separator
             for (auto [w, ht] : out_shapes) {
@@ -167,7 +167,8 @@ struct MerkleHashes {
                     size_t h = mh.init[op];
 
                     succ_hashes.clear();
-                    for (auto t : prob.ops[op].outputs) {
+                    {
+                        size_t t = prob.ops[op].output();
                         auto& consumers = dag.tensor_consumers[t];
                         if (consumers.empty()) {
                             size_t th = hash_combine(0xCAFEBABEULL, (size_t)prob.tensors[t].width);

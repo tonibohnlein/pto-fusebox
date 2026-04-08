@@ -273,7 +273,7 @@ Solution::ValidationResult Solution::validate() const {
                 return vr;
             }
         for (auto op : steps_[i].subgraph.ops())
-            for (auto t : prob_->ops[op].outputs) available.insert(t);
+            { size_t t = prob_->ops[op].output(); available.insert(t); }
     }
 
     // Retain validity: boundary outputs and ephemeral tensors can be retained
@@ -322,7 +322,8 @@ Solution::ValidationResult Solution::validate() const {
         const auto& ops = steps_[si].subgraph.ops();
         FlatSet<size_t> op_set(ops.begin(), ops.end());
         for (auto op : ops) {
-            for (auto t : prob_->ops[op].outputs) {
+            {
+                size_t t = prob_->ops[op].output();
                 // Is T consumed by any op inside this step?
                 bool consumed_internal = false;
                 for (auto cop : dag_->tensor_consumers[t])
@@ -383,7 +384,8 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
                                       size_t exclude_step,
                                       size_t exclude_step2) {
     for (auto op : proposed_ops) {
-        for (auto t : prob.ops[op].outputs) {
+        {
+            size_t t = prob.ops[op].output();
             // New ephemeral rule: T is ephemeral in proposed_ops if ANY
             // consumer is internal (produced + consumed = ephemeral).
             bool any_consumer_internal = false;
