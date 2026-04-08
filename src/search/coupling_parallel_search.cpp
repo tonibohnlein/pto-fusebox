@@ -30,10 +30,22 @@ struct CouplingPoolEntry {
     CoupledPartition cp;
     double cost = 1e18;
     std::string origin;
+    std::vector<int> group_map;  // cached op→group index for distance computation
 
     CouplingPoolEntry() = default;
     CouplingPoolEntry(CoupledPartition c, double cost_, std::string o)
-        : cp(std::move(c)), cost(cost_), origin(std::move(o)) {}
+        : cp(std::move(c)), cost(cost_), origin(std::move(o))
+    {
+        // Precompute group map
+        size_t n = cp.part.prob->num_ops();
+        group_map.assign(n, -1);
+        int gidx = 0;
+        for (size_t gi = 0; gi < cp.part.groups.size(); gi++)
+            if (cp.part.groups[gi].alive) {
+                for (auto op : cp.part.groups[gi].ops) group_map[op] = gidx;
+                gidx++;
+            }
+    }
 };
 
 // ============================================================================
@@ -42,24 +54,16 @@ struct CouplingPoolEntry {
 
 static double coupling_partition_distance(const CouplingPoolEntry& a,
                                            const CouplingPoolEntry& b) {
-    const Partition& pa = a.cp.part;
-    const Partition& pb = b.cp.part;
-    size_t n = pa.prob->num_ops();
+    size_t n = a.group_map.size();
 
     // --- Component 1: Adjusted Rand Index on op-to-group assignment ---
+    // Uses cached group_map from pool entry (precomputed on insertion).
 
-    std::vector<int> ga_map(n, -1), gb_map(n, -1);
+    const auto& ga_map = a.group_map;
+    const auto& gb_map = b.group_map;
     int num_ga = 0, num_gb = 0;
-    for (size_t gi = 0; gi < pa.groups.size(); gi++)
-        if (pa.groups[gi].alive) {
-            for (auto op : pa.groups[gi].ops) ga_map[op] = num_ga;
-            num_ga++;
-        }
-    for (size_t gi = 0; gi < pb.groups.size(); gi++)
-        if (pb.groups[gi].alive) {
-            for (auto op : pb.groups[gi].ops) gb_map[op] = num_gb;
-            num_gb++;
-        }
+    for (auto v : ga_map) if (v >= num_ga) num_ga = v + 1;
+    for (auto v : gb_map) if (v >= num_gb) num_gb = v + 1;
 
     double ari_dist = 0.0;
     if (num_ga > 0 && num_gb > 0) {
@@ -357,8 +361,8 @@ Solution coupling_parallel_search(
 
             // Combined FM: partition moves + coupling moves
             FMOuterConfig fc = cfg.fm;
-            fc.max_passes       = std::min(fc.max_passes,     50);
-            fc.max_no_improve   = std::min(fc.max_no_improve, 15);
+            fc.max_passes       = std::min(fc.max_passes,     20);
+            fc.max_no_improve   = std::min(fc.max_no_improve, 8);
             fc.deadline         = deadline;
             fc.pass_config.seed = (unsigned)rng();
             auto fm = coupled_fm_outer_loop(std::move(cp_child), feasibly_ret, fc, &cache);

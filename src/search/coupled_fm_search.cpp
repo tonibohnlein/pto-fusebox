@@ -1281,53 +1281,53 @@ void CoupledActiveSet::lock_all(const std::vector<size_t>& ops) {
 
 void CoupledActiveSet::refresh_after_move(const FlatSet<size_t>& affected_groups) {
     const auto& part = cp_->part;
+    size_t ng = part.groups.size();
+    size_t n_ops = part.prob->num_ops();
 
-    // Collect relevant groups: affected + their adjacents
-    FlatSet<size_t> relevant;
+    // Use thread-local boolean vectors to avoid FlatSet allocations.
+    thread_local std::vector<bool> is_relevant_group;
+    thread_local std::vector<bool> is_refresh_op;
+    is_relevant_group.assign(ng, false);
+    is_refresh_op.assign(n_ops, false);
+
+    // Collect relevant groups: affected + their adjacents + chain neighbours
     for (auto gi : affected_groups) {
-        relevant.insert(gi);
-        if (gi < part.groups.size() && part.groups[gi].alive) {
+        if (gi < ng) is_relevant_group[gi] = true;
+        if (gi < ng && part.groups[gi].alive) {
             auto adj = part.adjacent_groups(gi);
-            relevant.insert(adj.begin(), adj.end());
+            for (auto gj : adj)
+                if (gj < ng) is_relevant_group[gj] = true;
         }
-    }
-
-    // Also include chain neighbours (groups coupled to affected groups)
-    for (auto gi : affected_groups) {
         if (gi < cp_->next_group.size() && cp_->next_group[gi] != SIZE_MAX)
-            relevant.insert(cp_->next_group[gi]);
+            is_relevant_group[cp_->next_group[gi]] = true;
         if (gi < cp_->prev_group.size() && cp_->prev_group[gi] != SIZE_MAX)
-            relevant.insert(cp_->prev_group[gi]);
+            is_relevant_group[cp_->prev_group[gi]] = true;
     }
 
-    // Collect ops to refresh
-    FlatSet<size_t> ops_to_refresh;
-    for (auto gi : relevant) {
-        if (gi >= part.groups.size() || !part.groups[gi].alive) continue;
+    // Collect ops to refresh from relevant groups + their DAG neighbors
+    for (size_t gi = 0; gi < ng; gi++) {
+        if (!is_relevant_group[gi] || !part.groups[gi].alive) continue;
         for (auto op : part.groups[gi].ops) {
-            ops_to_refresh.insert(op);
+            is_refresh_op[op] = true;
             for (auto nbr : part.dag->op_neighbors[op])
-                ops_to_refresh.insert(nbr);
+                if (nbr < n_ops) is_refresh_op[nbr] = true;
         }
     }
 
-    // Expand to cover full groups: a DAG neighbor may share a group with ops
-    // that have no direct DAG connection to the affected area, yet can have stale
-    // cached moves because acyclicity uses global forward_reachable.
-    {
-        FlatSet<size_t> groups_to_cover;
-        for (auto op : ops_to_refresh)
-            for (auto gi : part.groups_of(op))
-                if (gi < part.groups.size() && part.groups[gi].alive)
-                    groups_to_cover.insert(gi);
-        for (auto gi : groups_to_cover)
-            for (auto op : part.groups[gi].ops)
-                ops_to_refresh.insert(op);
+    // Expand to cover full groups of flagged ops
+    for (size_t op = 0; op < n_ops; op++) {
+        if (!is_refresh_op[op]) continue;
+        for (auto gi : part.groups_of(op))
+            if (gi < ng && part.groups[gi].alive)
+                for (auto gop : part.groups[gi].ops)
+                    is_refresh_op[gop] = true;
     }
 
-    for (auto op : ops_to_refresh)
-        recompute_and_update(op);
+    for (size_t op = 0; op < n_ops; op++)
+        if (is_refresh_op[op])
+            recompute_and_update(op);
 
-    for (auto gi : relevant)
-        activate_group_ops(gi);
+    for (size_t gi = 0; gi < ng; gi++)
+        if (is_relevant_group[gi])
+            activate_group_ops(gi);
 }
