@@ -34,12 +34,13 @@
 
 struct PoolConfig {
     size_t hard_cap            = 16;    // maximum pool size
-    double near_dup_threshold  = 0.05;  // distance below this = duplicate
+    double near_dup_threshold  = 0.10;  // distance below this = duplicate
     double evict_div_margin    = 0.05;  // new must beat victim's nn-dist by this
     double min_diversity       = 0.10;  // floor for "decent diversity"
     double cost_eps            = 0.01;  // cost difference threshold
     double selection_temp      = 0.5;   // softmax temperature for mutation
     size_t tournament_k        = 3;     // tournament size for crossover
+    double max_cost_ratio      = 2.0;   // reject entries > best_cost * this
 };
 
 template<typename Entry>
@@ -60,6 +61,12 @@ public:
 
     bool insert(Entry entry) {
         double ec = cost_(entry);
+
+        // 0. Reject entries far worse than the best (wastes pool slots)
+        if (!entries_.empty() && cfg_.max_cost_ratio > 0) {
+            double best = cost_(entries_[find_best_cost_idx()]);
+            if (best > 0 && ec > best * cfg_.max_cost_ratio) return false;
+        }
 
         // 1. Compute distances to all existing entries (fills new_dists)
         std::vector<double> new_dists(entries_.size());

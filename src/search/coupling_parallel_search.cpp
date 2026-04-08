@@ -209,19 +209,34 @@ Solution coupling_parallel_search(
             }
 
             bool do_crossover = (pool_sz >= 2) && (task_id % 3 == 0);
-            bool do_symm = !do_crossover && has_symm && (rng() % 5 == 0);
+            // Scale symmetry frequency with number of patterns:
+            // more patterns → more symmetric structure to exploit → higher frequency.
+            // 0 patterns: never. 1-2 patterns: ~25%. 3+: ~40%.
+            bool do_symm = false;
+            if (!do_crossover && has_symm) {
+                size_t n_patterns = cfg.symm_ctx->parallel.size()
+                                  + cfg.symm_ctx->series.size();
+                int symm_pct = (n_patterns >= 3) ? 40 : 25;
+                do_symm = ((int)(rng() % 100) < symm_pct);
+            }
 
             CoupledPartition cp_child;
             std::string origin;
 
             if (do_crossover) {
-                // --- Crossover: combine partition structure from two parents ---
+                // --- Crossover: combine partition structure from two parents,
+                //     then inherit coupling edges where possible ---
                 Partition child_part;
+                std::vector<std::pair<size_t, FlatSet<size_t>>> parent_retained_list;
                 {
                     std::shared_lock lock(pool.mutex());
                     auto [p1, p2] = pool.select_for_crossover(rng);
                     child_part = crossover(pool[p1].cp.part, pool[p2].cp.part,
                                            rng, cfg.merkle);
+                    // Collect retained tensors from both parents for seeding
+                    for (auto pidx : {p1, p2})
+                        for (auto& [edge, tensors] : pool[pidx].cp.retained)
+                            parent_retained_list.push_back({edge.first, tensors});
                 }
                 child_part.cache = &cache;
                 if (partition_has_gap(child_part) || !child_part.is_acyclic()) {
@@ -236,6 +251,42 @@ Solution coupling_parallel_search(
                 cp_child.next_group.assign(ng, SIZE_MAX);
                 cp_child.prev_group.assign(ng, SIZE_MAX);
                 cp_child.retained.clear();
+
+                // Seed coupling from parents' retained tensors: for each
+                // tensor a parent retained, try to couple the child's
+                // producer→consumer groups.
+                cp_child.part.rebuild_index();
+                cp_child.part.finalize(&cache);
+                for (auto& [parent_ga_unused, tensors] : parent_retained_list) {
+                    (void)parent_ga_unused;
+                    for (auto t : tensors) {
+                        if (!feasibly_ret.count(t)) continue;
+                        int prod = dag.tensor_producer[t];
+                        if (prod < 0) continue;
+                        size_t ga = SIZE_MAX;
+                        for (auto g : cp_child.part.groups_of((size_t)prod))
+                            if (cp_child.part.groups[g].alive) { ga = g; break; }
+                        if (ga == SIZE_MAX) continue;
+                        if (ga >= cp_child.next_group.size() ||
+                            cp_child.next_group[ga] != SIZE_MAX) continue;
+                        for (auto cop : dag.tensor_consumers[t]) {
+                            for (auto gb : cp_child.part.groups_of(cop)) {
+                                if (gb == ga || !cp_child.part.groups[gb].alive) continue;
+                                if (gb >= cp_child.prev_group.size() ||
+                                    cp_child.prev_group[gb] != SIZE_MAX) continue;
+                                if (!is_boundary_input_of(
+                                        cp_child.part.groups[gb].ops, t, dag)) continue;
+                                auto ev = eval_couple(cp_child, ga, gb, t);
+                                if (ev.feasible) {
+                                    apply_couple(cp_child, ga, gb, t);
+                                    break;
+                                }
+                            }
+                            if (ga < cp_child.next_group.size() &&
+                                cp_child.next_group[ga] != SIZE_MAX) break;
+                        }
+                    }
+                }
                 origin = "xover";
 
             } else if (do_symm) {

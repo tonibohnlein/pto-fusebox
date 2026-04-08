@@ -308,8 +308,19 @@ std::optional<Partition> inject_representative_solution(
         auto& pat = ctx.parallel[pi];
         auto& solutions = ctx.parallel_solutions[pi];
 
-        // Pick random cached solution variant
-        auto& sol = solutions[rng() % solutions.size()];
+        // Pick best cached solution variant by cost on representative
+        size_t best_si = 0;
+        double best_sol_cost = 1e18;
+        for (size_t si = 0; si < solutions.size(); si++) {
+            double cost = 0;
+            for (auto& g : solutions[si].groups)
+                cost += part.eval_set(g);
+            if (cost < best_sol_cost) {
+                best_sol_cost = cost;
+                best_si = si;
+            }
+        }
+        auto& sol = solutions[best_si];
 
         // Collect all ops in the pattern
         FlatSet<size_t> all_pattern_ops;
@@ -342,7 +353,19 @@ std::optional<Partition> inject_representative_solution(
         size_t si = usable_series[pick - usable_parallel.size()];
         auto& pat = ctx.series[si];
         auto& solutions = ctx.series_solutions[si];
-        auto& sol = solutions[rng() % solutions.size()];
+        // Pick best cached solution by cost on representative block
+        size_t best_si2 = 0;
+        double best_sol_cost2 = 1e18;
+        for (size_t si2 = 0; si2 < solutions.size(); si2++) {
+            double cost = 0;
+            for (auto& g : solutions[si2].groups)
+                cost += part.eval_set(g);
+            if (cost < best_sol_cost2) {
+                best_sol_cost2 = cost;
+                best_si2 = si2;
+            }
+        }
+        auto& sol = solutions[best_si2];
 
         // Series: blocks[i] ops correspond positionally
         FlatSet<size_t> all_pattern_ops;
@@ -408,11 +431,23 @@ std::optional<Partition> align_symmetric_reps(
         auto& pat = ctx.parallel[pi];
         size_t k = pat.components.size();
 
-        // Pick random donor component
-        size_t donor = rng() % k;
-
-        // Extract donor's current config from the partition
-        auto donor_config = extract_config_from_partition(part, pat.components[donor]);
+        // Pick donor component with cheapest current grouping cost
+        size_t donor = 0;
+        std::vector<FlatSet<size_t>> donor_config;
+        {
+            double best_donor_cost = 1e18;
+            for (size_t ci = 0; ci < k; ci++) {
+                auto config = extract_config_from_partition(part, pat.components[ci]);
+                if (config.empty()) continue;
+                double cost = 0;
+                for (auto& g : config) cost += part.eval_set(g);
+                if (cost < best_donor_cost) {
+                    best_donor_cost = cost;
+                    donor = ci;
+                    donor_config = std::move(config);
+                }
+            }
+        }
         if (donor_config.empty()) return std::nullopt;
 
         // Collect all ops in the pattern
@@ -448,13 +483,25 @@ std::optional<Partition> align_symmetric_reps(
         auto& pat = ctx.series[si];
         size_t k = pat.blocks.size();
 
-        // Pick random donor block
-        size_t donor = rng() % k;
-
-        // Extract donor's config
-        FlatSet<size_t> donor_ops(pat.blocks[donor].begin(),
-                                    pat.blocks[donor].end());
-        auto donor_config = extract_config_from_partition(part, donor_ops);
+        // Pick donor block with cheapest current grouping cost
+        size_t donor = 0;
+        std::vector<FlatSet<size_t>> donor_config;
+        {
+            double best_donor_cost = 1e18;
+            for (size_t bi = 0; bi < k; bi++) {
+                FlatSet<size_t> block_ops(pat.blocks[bi].begin(),
+                                           pat.blocks[bi].end());
+                auto config = extract_config_from_partition(part, block_ops);
+                if (config.empty()) continue;
+                double cost = 0;
+                for (auto& g : config) cost += part.eval_set(g);
+                if (cost < best_donor_cost) {
+                    best_donor_cost = cost;
+                    donor = bi;
+                    donor_config = std::move(config);
+                }
+            }
+        }
         if (donor_config.empty()) return std::nullopt;
 
         FlatSet<size_t> all_pattern_ops;

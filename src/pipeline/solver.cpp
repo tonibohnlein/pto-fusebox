@@ -66,17 +66,15 @@ void seed_coupling_from_ordering(CoupledPartition& cp,
     }
 }
 
-// Seed coupling from an ordering, push pre-greedy copy into pool, run
-// greedy descent, push post-greedy result.  Both go into the pool for diversity.
+// Seed coupling from an ordering and push into the pool.
+// No greedy descent here — Phase 3's coupled evolution handles refinement.
 void add_coupled_variant(CoupledPartition cp,
                          const OrderingResult& res,
                          const FlatSet<size_t>& feasibly_ret,
                          std::mutex& cp_mutex,
                          std::vector<CoupledPartition>& coupled_pool,
-                         TimePoint deadline) {
+                         TimePoint /*deadline*/) {
     seed_coupling_from_ordering(cp, res, feasibly_ret);
-    { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp); }
-    coupling_greedy_descent(cp, feasibly_ret, deadline);
     { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp)); }
 }
 
@@ -533,7 +531,7 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
                     cp_base.init_from(std::move(part), &shared_cache);
                     cp_base.part.finalize(&shared_cache);
 
-                    // Bare variant (no coupling fallback)
+                    // Bare variant (no coupling)
                     { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(cp_base); }
 
                     // DFS-seeded variant
@@ -541,10 +539,39 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
                         add_coupled_variant(cp_base, dfs_ordering(cp_base.part),
                                             feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
 
-                    // Random-ordering variant
-                    if (SteadyClock::now() < phase2_dl)
-                        add_coupled_variant(cp_base, random_ordering(cp_base.part, feasibly_ret, rng),
-                                            feasibly_ret, cp_mutex, coupled_pool, phase2_dl);
+                    // Random coupling variant: pick random retainable tensors
+                    // and couple their producer/consumer groups directly.
+                    if (SteadyClock::now() < phase2_dl) {
+                        CoupledPartition cp_rand = cp_base;
+                        std::vector<size_t> ret_vec(feasibly_ret.begin(), feasibly_ret.end());
+                        std::shuffle(ret_vec.begin(), ret_vec.end(), rng);
+                        const DAG& dag_ref = *cp_rand.part.dag;
+                        for (auto t : ret_vec) {
+                            int prod = dag_ref.tensor_producer[t];
+                            if (prod < 0) continue;
+                            size_t ga = SIZE_MAX;
+                            for (auto g : cp_rand.part.groups_of((size_t)prod))
+                                if (cp_rand.part.groups[g].alive) { ga = g; break; }
+                            if (ga == SIZE_MAX) continue;
+                            if (ga >= cp_rand.next_group.size() || cp_rand.next_group[ga] != SIZE_MAX) continue;
+                            bool produced = cp_rand.part.groups[ga].ops.count((size_t)prod);
+                            if (!produced) continue;
+                            for (auto cop : dag_ref.tensor_consumers[t]) {
+                                for (auto gb : cp_rand.part.groups_of(cop)) {
+                                    if (gb == ga || !cp_rand.part.groups[gb].alive) continue;
+                                    if (gb >= cp_rand.prev_group.size() || cp_rand.prev_group[gb] != SIZE_MAX) continue;
+                                    if (!is_boundary_input_of(cp_rand.part.groups[gb].ops, t, dag_ref)) continue;
+                                    auto ev = eval_couple(cp_rand, ga, gb, t);
+                                    if (ev.feasible) {
+                                        apply_couple(cp_rand, ga, gb, t);
+                                        break;
+                                    }
+                                }
+                                if (ga < cp_rand.next_group.size() && cp_rand.next_group[ga] != SIZE_MAX) break;
+                            }
+                        }
+                        { std::lock_guard<std::mutex> lk(cp_mutex); coupled_pool.push_back(std::move(cp_rand)); }
+                    }
                 }
             };
 
