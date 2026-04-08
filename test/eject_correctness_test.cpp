@@ -190,45 +190,57 @@ void test_eject_remainder_splits() {
     std::cout << "--- test_eject_remainder_splits ---\n";
 
     TestContext ctx;
-    ctx.prob.tensors = {{64,64},{64,64},{64,64},{64,64},{64,64},{64,64}};
+    // Hub pattern: op2 consumes T1 (from op0) and T3 (from op1), producing T4.
+    // op3 is downstream of op2. op4 consumes T1 (keeps op0 connected).
+    //   op0: T0 → T1
+    //   op1: T7 → T3  (separate input T7 — no co-consumer edge with op0)
+    //   op2: T1, T3 → T4  (hub)
+    //   op3: T4 → T5
+    //   op4: T1 → T6  (another consumer of T1)
+    // Ejecting op2: remainder = {op0, op1, op3, op4}
+    //   op0 connects to op4 via T1. op1 is isolated (T3 only goes to op2, T7 is input).
+    //   op3 is isolated (T4 only came from op2).
+    //   → 3 components: {op0, op4}, {op1}, {op3}
+    ctx.prob.tensors = {{64,64},{64,64},{64,64},{64,64},{64,64},{64,64},{64,64},{64,64}};
     ctx.prob.ops = {
-        {OpType::Pointwise, {0}, {1}, 300},     // op0: T0 -> T1
-        {OpType::Pointwise, {1}, {2, 3}, 300},  // op1: T1 -> T2, T3
-        {OpType::Pointwise, {2}, {4}, 300},      // op2: T2 -> T4
-        {OpType::Pointwise, {3}, {5}, 300},      // op3: T3 -> T5
+        {OpType::Pointwise, {0}, {1}, 300},       // op0: T0 -> T1
+        {OpType::Pointwise, {7}, {3}, 300},       // op1: T7 -> T3 (separate input)
+        {OpType::Pointwise, {1, 3}, {4}, 300},    // op2: T1, T3 -> T4 (hub)
+        {OpType::Pointwise, {4}, {5}, 300},       // op3: T4 -> T5
+        {OpType::Pointwise, {1}, {6}, 300},       // op4: T1 -> T6
     };
     ctx.prob.fast_memory_capacity = 50000;
     ctx.prob.slow_memory_bandwidth = 10;
     ctx.prob.native_w = 64;
     ctx.prob.native_h = 64;
 
-    ctx.build_partition({{0, 1, 2, 3}});
+    ctx.build_partition({{0, 1, 2, 3, 4}});
 
-    auto er = ctx.part.eval_eject(1, 0);
+    auto er = ctx.part.eval_eject(2, 0);
     CHECK("remainder_splits: feasible", er.feasible);
 
-    // Remainder is {op0, op2, op3}.
-    // op0's neighbors: op1 (ejected, removed from remainder) -- isolated
-    // op2's neighbors: op1 (ejected) -- isolated from op0 and op3
-    // op3's neighbors: op1 (ejected) -- isolated from op0 and op2
-    // op2 inputs T2, op3 inputs T3 -- different inputs, not co-consumers.
-    // So remainder splits into 3 singletons: {op0}, {op2}, {op3}.
+    // Remainder is {op0, op1, op3, op4}.
+    // op0 connects to op4 via T1. op1 is isolated (T3 only went to op2).
+    // op3 is isolated (T4 only came from op2).
+    // → 3 components: {op0, op4}, {op1}, {op3}
     size_t num_components = er.remainder_components.size();
     CHECK("remainder_splits: 3 remainder components", num_components == 3);
 
     // Verify all ops accounted for
-    bool has_op0 = false, has_op2 = false, has_op3 = false;
+    bool has_op0 = false, has_op1 = false, has_op3 = false, has_op4 = false;
     for (auto& comp : er.remainder_components) {
         if (comp.count(0)) has_op0 = true;
-        if (comp.count(2)) has_op2 = true;
+        if (comp.count(1)) has_op1 = true;
         if (comp.count(3)) has_op3 = true;
+        if (comp.count(4)) has_op4 = true;
     }
     CHECK("remainder_splits: has op0", has_op0);
-    CHECK("remainder_splits: has op2", has_op2);
+    CHECK("remainder_splits: has op1", has_op1);
     CHECK("remainder_splits: has op3", has_op3);
+    CHECK("remainder_splits: has op4", has_op4);
 
     // Apply eject
-    auto affected = partition_moves::apply_eject(ctx.part, 1, 0);
+    auto affected = partition_moves::apply_eject(ctx.part, 2, 0);
     CHECK("remainder_splits: applied", !affected.empty());
 
     ctx.part.rebuild_index();

@@ -658,43 +658,43 @@ void test_steal_preserves_connectivity() {
     std::cout << "--- test_steal_preserves_connectivity ---\n";
 
     TestContext ctx;
-    // op0 -> T1 -> op1, op0 -> T2 -> op2, both feed op3
-    ctx.prob.tensors = {{48,48},{48,48},{48,48},{48,48},{48,48},{48,48}};
+    // op0 → T1, op1 → T2 (parallel from T0), both feed op3 via op2
+    //   op0: T0 → T1
+    //   op1: T0 → T2
+    //   op2: T1 → T3
+    //   op3: T2 → T4
+    //   op4: T3, T4 → T5
+    //   op5: T5 → T6  (target group)
+    ctx.prob.tensors = {{48,48},{48,48},{48,48},{48,48},{48,48},{48,48},{48,48}};
     ctx.prob.ops = {
-        {OpType::Pointwise, {0}, {1, 2}, 300},     // op0: T0 -> T1, T2
-        {OpType::Pointwise, {1}, {3}, 300},          // op1: T1 -> T3
-        {OpType::Pointwise, {2}, {4}, 300},          // op2: T2 -> T4
-        {OpType::Pointwise, {3, 4}, {5}, 300},       // op3: T3, T4 -> T5
+        {OpType::Pointwise, {0}, {1}, 300},       // op0: T0 -> T1
+        {OpType::Pointwise, {0}, {2}, 300},       // op1: T0 -> T2
+        {OpType::Pointwise, {1}, {3}, 300},       // op2: T1 -> T3
+        {OpType::Pointwise, {2}, {4}, 300},       // op3: T2 -> T4
+        {OpType::Pointwise, {3, 4}, {5}, 300},    // op4: T3, T4 -> T5
+        {OpType::Pointwise, {5}, {6}, 300},       // op5: T5 -> T6
     };
     ctx.prob.fast_memory_capacity = 50000;
     ctx.prob.slow_memory_bandwidth = 10;
     ctx.prob.native_w = 48;
     ctx.prob.native_h = 48;
 
-    // G0={op0, op1, op2, op3}, G1=new target (need a separate group)
-    // We need another op for G1 to have something to steal into.
-    // Add a 5th op consuming T5.
-    ctx.prob.tensors.push_back({48, 48});  // T6
-    ctx.prob.ops.push_back({OpType::Pointwise, {5}, {6}, 300});  // op4: T5 -> T6
+    ctx.build_partition({{0, 1, 2, 3, 4}, {5}});
 
-    ctx.build_partition({{0, 1, 2, 3}, {4}});
-
-    // Steal op3 from G0 to G1 (op3 is the fan-in node).
-    // After: G0={op0, op1, op2}, G1={op3, op4}.
-    // G0 is still connected: op0->op1, op0->op2 (all reachable from op0).
-
-    // But T3 and T4 become boundary outputs of G0 — no gap because G1 consumes them.
-    auto eval = partition_moves::eval_steal(ctx.part, 3, 0, 1);
-    CHECK("connectivity: steal op3 feasible", eval.feasible);
+    // Steal op4 from G0 to G1 (op4 is the fan-in node).
+    // After: G0={op0, op1, op2, op3}, G1={op4, op5}.
+    // G0 still connected: op0→op2, op1→op3 (all reachable via T0 consumers).
+    auto eval = partition_moves::eval_steal(ctx.part, 4, 0, 1);
+    CHECK("connectivity: steal op4 feasible", eval.feasible);
 
     if (eval.feasible) {
-        auto affected = partition_moves::apply_steal(ctx.part, 3, 0, 1);
+        auto affected = partition_moves::apply_steal(ctx.part, 4, 0, 1);
         CHECK("connectivity: applied", !affected.empty());
 
         ctx.part.rebuild_index();
         ctx.part.rebuild_group_dag();
 
-        CHECK("connectivity: G0 has 3 ops", ctx.part.groups[0].ops.size() == 3);
+        CHECK("connectivity: G0 has 4 ops", ctx.part.groups[0].ops.size() == 4);
         CHECK("connectivity: G1 has 2 ops", ctx.part.groups[1].ops.size() == 2);
         CHECK("connectivity: acyclic after", ctx.part.is_acyclic());
     }

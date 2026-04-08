@@ -100,12 +100,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
 
     if (sink_ops.empty()) return std::nullopt;
-    size_t first_sink_out = prob.ops[sink_ops[0]].outputs[0];
+    size_t first_sink_out = prob.ops[sink_ops[0]].output();
     sg.out_W_ = prob.tensors[first_sink_out].width;
     sg.out_H_ = prob.tensors[first_sink_out].height;
     
     for (size_t si = 1; si < sink_ops.size(); si++) {
-      size_t out = prob.ops[sink_ops[si]].outputs[0];
+      size_t out = prob.ops[sink_ops[si]].output();
       if (prob.tensors[out].width != sg.out_W_ ||
           prob.tensors[out].height != sg.out_H_)
         return std::nullopt;
@@ -166,7 +166,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
             else
               eph_roles[t].push_back({SliceW::W_param, SliceH::K_param});
           } else {
-            size_t pw_out = op.outputs[0];
+            size_t pw_out = op.output();
             if (sg.boundary_outputs_.count(pw_out)) {
               eph_roles[t].push_back({SliceW::W_param, SliceH::H_param});
             } else if (is_ephemeral[pw_out] && eph_roles_computed[pw_out]) {
@@ -193,14 +193,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       if (op.type == OpType::MatMul) {
         add_constraint(op.inputs[0], SliceW::K_param, SliceH::H_param);
         add_constraint(op.inputs[1], SliceW::W_param, SliceH::K_param);
-        size_t out = op.outputs[0];
+        size_t out = op.output();
         if (sg.boundary_outputs_.count(out)) {
           add_constraint(out, SliceW::W_param, SliceH::H_param);
         } else if (is_ephemeral[out]) {
           for (auto &r : eph_roles[out]) add_constraint(out, r.sw, r.sh);
         }
       } else {
-        size_t out = op.outputs[0];
+        size_t out = op.output();
         if (sg.boundary_outputs_.count(out)) {
           add_constraint(out, SliceW::W_param, SliceH::H_param);
           for (auto t : op.inputs) add_constraint(t, SliceW::W_param, SliceH::H_param);
@@ -264,7 +264,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
     for (auto op_idx : sg.reverse_topo_ops_) {
       const auto &op = prob.ops[op_idx];
-      size_t out = op.outputs[0];
+      size_t out = op.output();
 
       if (!tsrc[out].assigned) tsrc[out] = {TS::FROM_NTW, TS::FROM_NTH, true};
 
@@ -342,7 +342,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     for (auto op_idx : sg.ops_) {
       const auto &op = prob.ops[op_idx];
       if (op.type == OpType::MatMul) {
-        size_t out = op.outputs[0];
+        size_t out = op.output();
         if (sg.boundary_outputs_.count(out)) {
           size_t idx = ensure(out);
           sg.boundary_tensor_info_[idx].is_mm_out = true;
@@ -477,7 +477,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 
   for (auto op_idx : ops_) {
     if (is_sink_op_vec_[op_idx]) {
-      size_t out = prob_->ops[op_idx].outputs[0];
+      size_t out = prob_->ops[op_idx].output();
       h_src[out] = TS::FROM_NTW;
       v_src[out] = TS::FROM_NTH;
       assigned[out] = true;
@@ -486,7 +486,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 
   for (auto op_idx : reverse_topo_ops_) {
     const auto &op = prob_->ops[op_idx];
-    size_t out = op.outputs[0];
+    size_t out = op.output();
 
     if (!assigned[out]) {
       h_src[out] = TS::FROM_NTW;
@@ -635,7 +635,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
   for (auto i : ops_) {
     double c = (double)prob_->ops[i].base_cost;
-    size_t out_t = prob_->ops[i].outputs[0];
+    size_t out_t = prob_->ops[i].output();
 
     double op_scale = 1.0;
     if (out_t < tensor_tiling_.size()) {

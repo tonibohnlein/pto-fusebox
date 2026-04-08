@@ -272,14 +272,15 @@ void test_de_recompute_cyclic_rejected() {
     std::cout << "--- test_de_recompute_cyclic_rejected ---\n";
 
     TestContext ctx;
-    ctx.prob.tensors = {{48,48},{48,48},{48,48},{48,48},{48,48}};
-    // op0: T0 -> T1, T2    (two outputs)
-    // op1: T1 -> T3
-    // op2: T2, T3 -> T4
+    // Chain with recomputation (same as bottleneck bridge):
+    //   op0: T0 → T1
+    //   op1: T1 → T2
+    //   op2: T1, T2 → T3
+    ctx.prob.tensors = {{48,48},{48,48},{48,48},{48,48}};
     ctx.prob.ops = {
-        {OpType::Pointwise, {0}, {1, 2}, 300},  // op0
-        {OpType::Pointwise, {1}, {3}, 300},      // op1
-        {OpType::Pointwise, {2, 3}, {4}, 300},   // op2
+        {OpType::Pointwise, {0}, {1}, 300},       // op0
+        {OpType::Pointwise, {1}, {2}, 300},       // op1
+        {OpType::Pointwise, {1, 2}, {3}, 300},    // op2
     };
     ctx.prob.fast_memory_capacity = 50000;
     ctx.prob.slow_memory_bandwidth = 10;
@@ -292,15 +293,16 @@ void test_de_recompute_cyclic_rejected() {
     CHECK("cyclic: partition acyclic", ctx.part.is_acyclic());
     CHECK("cyclic: op0 in 2 groups", ctx.part.groups_of(0).size() == 2);
 
-    // Removing op0 from G0 would make G0={op1}. op1 needs T1 from G1.
-    // But G0->G1 exists (T3). G1 is forward-reachable from G0.
-    // All remaining copies of op0 (just G1) are forward-reachable from G0. -> CYCLE.
+    // Removing op0 from G0 would make G0={op1}. op1 needs T1 from op0.
+    // T1 must come from G1. But G0→G1 exists (T2). G1 is forward-reachable
+    // from G0. All remaining copies of op0 (just G1) are forward-reachable
+    // from G0. -> CYCLE.
     CHECK("cyclic: de_recompute op0 from G0 rejected by acyclic_local",
           !ctx.part.acyclic_de_recompute_local(0, 0));
 
-    // Removing op0 from G1 is also cyclic: G1={op2}. op2 needs T2 (produced
-    // by op0). After removing op0 from G1, T2 must come from G0. But G0 is
-    // forward-reachable from G1 (via T1 -> op1 in G0). -> CYCLE.
+    // Removing op0 from G1: G1={op2}. op2 needs T1 (from op0) and T2 (from
+    // op1 in G0). T1 must come from G0. But G1→G0 would be needed (op2 needs
+    // T2 from G0), and G0→G1 (op1 produces T2 consumed by G1). CYCLE.
     CHECK("cyclic: de_recompute op0 from G1 also rejected",
           !ctx.part.acyclic_de_recompute_local(0, 1));
 

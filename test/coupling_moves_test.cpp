@@ -609,9 +609,11 @@ void test_split_chain_transferred() {
 // boundary inputs of G1.
 static Problem make_two_output() {
     Problem p;
+    // T0 input, T1=op0 output, T2=op1 output, T3=op2 output
     for (int i = 0; i <= 3; i++) p.tensors.push_back({32, 32});
-    p.ops.push_back({OpType::Pointwise, {0},    {1, 2}, 300});  // Op0
-    p.ops.push_back({OpType::Pointwise, {1, 2}, {3},    300});  // Op1
+    p.ops.push_back({OpType::Pointwise, {0}, {1}, 300});     // Op0: T0 -> T1
+    p.ops.push_back({OpType::Pointwise, {0}, {2}, 300});     // Op1: T0 -> T2
+    p.ops.push_back({OpType::Pointwise, {1, 2}, {3}, 300});  // Op2: T1,T2 -> T3
     p.fast_memory_capacity = 5000;
     p.slow_memory_bandwidth = 10;
     p.native_w = 32;
@@ -623,7 +625,14 @@ static Problem make_two_output() {
 static CoupledPartition make_two_output_cp() {
     static Problem p = make_two_output();
     static DAG d = DAG::build(p);
+    // G0={op0, op1} produces T1 and T2; G1={op2} consumes both.
     Partition part = Partition::trivial(p, d);
+    // Merge op0 and op1 into group 0
+    FlatSet<size_t> merged = {0, 1};
+    part.groups[0].ops = merged;
+    part.groups[0].cost = part.eval_set(merged);
+    part.groups[1].alive = false;
+    part.rebuild_index();
     part.finalize();
     CoupledPartition cp;
     cp.init_from(std::move(part));
@@ -634,34 +643,35 @@ void test_couple_add_to_existing_edge() {
     std::cout << "--- test_couple_add_to_existing_edge ---\n";
     auto cp = make_two_output_cp();
 
-    // First COUPLE: G0→G1 via T1 — creates new edge.
-    auto r1 = apply_couple(cp, 0, 1, 1);
+    // G0={op0,op1}, G1 dead, G2={op2}.
+    // First COUPLE: G0→G2 via T1 — creates new edge.
+    auto r1 = apply_couple(cp, 0, 2, 1);
     CHECK("first couple succeeded", !r1.empty());
-    CHECK("edge G0→G1 exists", cp.next_group[0] == 1);
-    CHECK_EQ("retained set size = 1", cp.retained[{0,1}].size(), 1);
+    CHECK("edge G0→G2 exists", cp.next_group[0] == 2);
+    CHECK_EQ("retained set size = 1", cp.retained[{0,2}].size(), 1);
 
     // Duplicate: coupling T1 again must fail (already retained).
-    auto r_dup = apply_couple(cp, 0, 1, 1);
+    auto r_dup = apply_couple(cp, 0, 2, 1);
     CHECK("duplicate couple fails", r_dup.empty());
-    CHECK_EQ("retained set still 1 after duplicate", cp.retained[{0,1}].size(), 1);
+    CHECK_EQ("retained set still 1 after duplicate", cp.retained[{0,2}].size(), 1);
 
     // eval_couple for T1 on existing edge must be infeasible (duplicate guard).
-    auto ev_dup = eval_couple(cp, 0, 1, 1);
+    auto ev_dup = eval_couple(cp, 0, 2, 1);
     CHECK("eval_couple duplicate infeasible", !ev_dup.feasible);
 
-    // Second COUPLE: G0→G1 via T2 — adds to existing edge.
-    auto ev2 = eval_couple(cp, 0, 1, 2);
+    // Second COUPLE: G0→G2 via T2 — adds to existing edge.
+    auto ev2 = eval_couple(cp, 0, 2, 2);
     CHECK("eval_couple T2 on existing edge feasible", ev2.feasible);
 
-    auto r2 = apply_couple(cp, 0, 1, 2);
+    auto r2 = apply_couple(cp, 0, 2, 2);
     CHECK("second couple succeeded", !r2.empty());
-    CHECK_EQ("retained set size = 2", cp.retained[{0,1}].size(), 2);
-    CHECK("T1 still retained", cp.retained[{0,1}].count(1) > 0);
-    CHECK("T2 now retained",   cp.retained[{0,1}].count(2) > 0);
+    CHECK_EQ("retained set size = 2", cp.retained[{0,2}].size(), 2);
+    CHECK("T1 still retained", cp.retained[{0,2}].count(1) > 0);
+    CHECK("T2 now retained",   cp.retained[{0,2}].count(2) > 0);
 
     // Edge pointers unchanged.
-    CHECK("next_group[0] still 1", cp.next_group[0] == 1);
-    CHECK("prev_group[1] still 0", cp.prev_group[1] == 0);
+    CHECK("next_group[0] still 2", cp.next_group[0] == 2);
+    CHECK("prev_group[2] still 0", cp.prev_group[2] == 0);
 
     CHECK("consistent", cp_is_consistent(cp));
 }
@@ -670,23 +680,15 @@ void test_couple_add_blocked_when_edge_missing() {
     std::cout << "--- test_couple_add_blocked_when_edge_missing ---\n";
     auto cp = make_two_output_cp();
 
-    // G0→G1 edge does not exist yet. Trying to add T2 to it must fail
-    // because eval_couple checks existing_edge || new_edge.
-    // For a new edge, the call is valid. So let's try adding T1 to G0→G2
-    // where G2 doesn't exist — that's a bounds check.
-    // More useful: try eval_couple(G0, G1, T2) without any edge: it's a new-edge
-    // attempt, which should succeed (not an existing-edge case at all).
-    // Test the truly blocked case: G0 already coupled to G1 via T1, then try
-    // eval_couple(G0, G2, T2) — G0 is not free, G2 is not G1's continuation.
-    apply_couple(cp, 0, 1, 1);  // G0→G1 via T1
-    // G0 is now non-free (next_group[0]=1). There's no G2. Verify infeasible.
-    // Use index 99 (out of range) — should return infeasible without crashing.
+    // G0={op0,op1}, G2={op2}. Couple G0→G2 via T1 first.
+    apply_couple(cp, 0, 2, 1);  // G0→G2 via T1
+    // G0 is now non-free (next_group[0]=2). Out-of-range target must fail.
     auto ev = eval_couple(cp, 0, 99, 2);
     CHECK("out-of-range gb infeasible", !ev.feasible);
 
-    // Also verify: eval_couple(G0, G1, T2) with G0→G1 already set = existing edge,
-    // which IS feasible (this path is the new behavior).
-    auto ev2 = eval_couple(cp, 0, 1, 2);
+    // eval_couple(G0, G2, T2) with G0→G2 already set = existing edge,
+    // which IS feasible (adding T2 to the existing edge).
+    auto ev2 = eval_couple(cp, 0, 2, 2);
     CHECK("existing edge eval feasible", ev2.feasible);
 }
 

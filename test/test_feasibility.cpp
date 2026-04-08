@@ -202,26 +202,22 @@ void test_diamond_merge_source_sink() {
 // ============================================================================
 // Bottleneck-3br pattern: recompute bridge removal
 //
-//   Op 13: inputs=[T18], outputs=[T19]
-//   Op 14: inputs=[T19], outputs=[T20]
-//   Op 15: inputs=[T19, T20], outputs=[T21]
+//   Op 0: inputs=[T0], outputs=[T1]
+//   Op 1: inputs=[T1], outputs=[T2]
+//   Op 2: inputs=[T1, T2], outputs=[T3]
 //
-// Groups: G0={13,14}, G1={13,15} (op 13 recomputed)
-// DE_RECOMPUTE: kill G0's copy of op 13 → G0 becomes {14}
-//   Now {14} needs T19 from G1, and G1={13,15} needs T20 from {14} → CYCLE
+// Groups: G0={0,1}, G1={0,2} (op 0 recomputed)
+// DE_RECOMPUTE: kill G0's copy of op 0 → G0 becomes {1}
+//   Now {1} needs T1 from G1, and G1={0,2} needs T2 from {1} → CYCLE
 // ============================================================================
 
 TestGraph make_bottleneck_bridge() {
     TestGraph g;
-    g.ensure_tensors(22);
-    // We only need ops 13-15, but they reference tensors 18-21
-    // Pad with dummy ops 0-12
-    for (size_t i = 0; i < 13; i++)
-        g.add_op({}, {});  // dummy ops
+    g.ensure_tensors(4);
 
-    g.add_op({18}, {19});       // op 13
-    g.add_op({19}, {20});       // op 14
-    g.add_op({19, 20}, {21});   // op 15
+    g.add_op({0}, {1});       // op 0
+    g.add_op({1}, {2});       // op 1
+    g.add_op({1, 2}, {3});    // op 2
 
     g.prob.fast_memory_capacity = 40000;
     g.prob.slow_memory_bandwidth = 10;
@@ -233,23 +229,23 @@ void test_bottleneck_recompute_bridge() {
     std::cerr << "test_bottleneck_recompute_bridge... ";
     auto g = make_bottleneck_bridge();
 
-    // Setup: G0={13,14}, G1={13,15}, op 13 recomputed
-    g.set_groups({{13, 14}, {13, 15}});
+    // Setup: G0={0,1}, G1={0,2}, op 0 recomputed
+    g.set_groups({{0, 1}, {0, 2}});
     std::vector<bool> alive = {true, true};
 
-    // Current state: acyclic (G0 produces T19 internally, G1 gets T20 from G0)
+    // Current state: acyclic (G0 produces T1 internally, G1 gets T2 from G0)
     assert(g.is_acyclic(alive, 2));
 
-    // EJECT op 13 from G0: G0 becomes {14}, new G2={13}
-    // Groups: G0={14}, G1={13,15}, G2={13}
-    // This should be acyclic: G2={13} → G0={14} → G1={13,15}
-    g.set_groups({{14}, {13, 15}, {13}});
+    // EJECT op 0 from G0: G0 becomes {1}, new G2={0}
+    // Groups: G0={1}, G1={0,2}, G2={0}
+    // This should be acyclic: G2={0} → G0={1} → G1={0,2}
+    g.set_groups({{1}, {0, 2}, {0}});
     alive = {true, true, true};
     assert(g.is_acyclic(alive, 3));
 
-    // Now DE_RECOMPUTE: kill G2={13} (op 13 covered by G1)
-    // Remaining: G0={14}, G1={13,15}
-    // G0 needs T19 (from op 13, in G1). G1 needs T20 (from op 14, in G0).
+    // Now DE_RECOMPUTE: kill G2={0} (op 0 covered by G1)
+    // Remaining: G0={1}, G1={0,2}
+    // G0 needs T1 (from op 0, in G1). G1 needs T2 (from op 1, in G0).
     // CYCLE!
     alive = {true, true, false};  // G2 killed
     assert(!g.is_acyclic(alive, 2));

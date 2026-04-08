@@ -21,12 +21,9 @@ DAG DAG::build(const Problem& prob) {
 
     // Map tensors to producers / consumers
     for (size_t i = 0; i < d.num_ops; i++) {
-        for (auto t : prob.ops[i].outputs) {
-            // Assert unique producer (validated by read_problem, but defensive).
-            assert(d.tensor_producer[t] < 0 &&
-                   "tensor produced by multiple ops");
-            d.tensor_producer[t] = (int)i;
-        }
+        size_t t = prob.ops[i].output();
+        assert(d.tensor_producer[t] < 0 && "tensor produced by multiple ops");
+        d.tensor_producer[t] = (int)i;
     }
     for (size_t i = 0; i < d.num_ops; i++) {
         for (auto t : prob.ops[i].inputs) {

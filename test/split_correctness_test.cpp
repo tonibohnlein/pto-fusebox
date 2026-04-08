@@ -225,29 +225,33 @@ void test_split_non_bridge_rejected() {
     std::cout << "--- test_split_non_bridge_rejected ---\n";
 
     TestContext ctx;
-    // T0=input, T1=op0->op1, T2=op0->op2, T3=op1->op2, T4=op2 output
+    // Diamond: op0→T1→op2, op1→T2→op3, op2→T3→op3 (no bridge edges)
+    //   op0: T0 → T1
+    //   op1: T0 → T2
+    //   op2: T1 → T3
+    //   op3: T2, T3 → T4
     ctx.prob.tensors = {{48,48},{48,48},{48,48},{48,48},{48,48}};
     ctx.prob.ops = {
-        {OpType::Pointwise, {0}, {1, 2}, 300},  // op0: T0 -> T1, T2
-        {OpType::Pointwise, {1}, {3}, 300},      // op1: T1 -> T3
-        {OpType::Pointwise, {2, 3}, {4}, 300},   // op2: T2, T3 -> T4
+        {OpType::Pointwise, {0}, {1}, 300},      // op0: T0 -> T1
+        {OpType::Pointwise, {0}, {2}, 300},       // op1: T0 -> T2
+        {OpType::Pointwise, {1}, {3}, 300},       // op2: T1 -> T3
+        {OpType::Pointwise, {2, 3}, {4}, 300},   // op3: T2, T3 -> T4
     };
     ctx.prob.fast_memory_capacity = 50000;
     ctx.prob.slow_memory_bandwidth = 10;
     ctx.prob.native_w = 48;
     ctx.prob.native_h = 48;
 
-    // All 3 ops in one group
-    ctx.build_partition({{0, 1, 2}});
+    // All 4 ops in one group
+    ctx.build_partition({{0, 1, 2, 3}});
 
-    // (op0, op1) is NOT a bridge: removing it leaves op0 still connected to
-    // op2 via T2, and op1 connected to op2 via T3. The undirected neighbor
-    // graph remains connected.
-    auto sr = ctx.part.eval_split(0, 1, 0);
+    // (op0, op2) is NOT a bridge: removing it leaves op0 connected to op1,
+    // and op2 connected to op3, with op1 connected to op3 via T2.
+    auto sr = ctx.part.eval_split(0, 2, 0);
     CHECK("non_bridge: infeasible", !sr.feasible);
 
-    // Also try (op0, op2) -- not a bridge for same reason
-    auto sr2 = ctx.part.eval_split(0, 2, 0);
+    // Also try (op1, op3) -- not a bridge for same reason
+    auto sr2 = ctx.part.eval_split(1, 3, 0);
     CHECK("non_bridge_02: infeasible", !sr2.feasible);
 }
 
