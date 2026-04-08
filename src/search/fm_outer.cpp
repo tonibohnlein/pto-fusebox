@@ -24,40 +24,33 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
 
         double effective_drift = std::clamp(base_drift * temperature, 0.05, 2.0);
 
-        // Each pass starts from the original input partition, exploring a
-        // different neighborhood via its unique seed + initial active ops.
+        // Each pass starts from the best found so far
         Partition current(part);
 
         FMConfig pass_cfg = cfg.pass_config;
         pass_cfg.seed = (unsigned)(pass_cfg.seed + pass * 7);
         pass_cfg.max_drift_fraction = effective_drift;
-        pass_cfg.deadline = cfg.deadline;  // propagate wall-clock cutoff
+        pass_cfg.deadline = cfg.deadline;
 
         auto pass_result = fm_inner_pass(std::move(current), pass_cfg);
         result.total_passes++;
         result.total_moves += pass_result.moves_applied;
 
-        // Track the pass's best candidate
-        double pass_best_cost = pass_result.best_cost;
-        Partition pass_best_part = std::move(pass_result.best_partition);
-
-        // Greedy descent on end state — explores a different basin than
-        // where FM's internal best came from.
-        if (pass_result.moves_applied > 0) {
-            result.end_cost = pass_result.end_cost;
-            result.end_partition = pass_result.end_partition;
-
-            auto descended = greedy_descent(std::move(pass_result.end_partition));
-            if (descended.total_cost() < pass_best_cost - 0.001) {
-                pass_best_cost = descended.total_cost();
-                pass_best_part = std::move(descended);
-            }
+        if (pass_result.moves_applied == 0) {
+            if (++no_improve >= cfg.max_no_improve) break;
+            continue;
         }
 
-        if (pass_best_cost < result.best_cost - 0.001) {
-            double improvement = result.best_cost - pass_best_cost;
-            result.best_cost = pass_best_cost;
-            result.best_partition = std::move(pass_best_part);
+        // Greedy descent on FM best
+        Partition candidate = greedy_descent(std::move(pass_result.best_partition));
+        double candidate_cost = candidate.total_cost();
+
+        if (candidate_cost < result.best_cost - 0.001) {
+            double improvement = result.best_cost - candidate_cost;
+            result.best_cost = candidate_cost;
+            result.best_partition = candidate;
+            // Start next pass from improved partition
+            part = std::move(candidate);
             result.improving_passes++;
             no_improve = 0;
 
@@ -65,9 +58,7 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
                 std::cerr << "    FM pass " << pass << ": improved to "
                           << result.best_cost << " (delta=" << improvement << ")\n";
         } else {
-            no_improve++;
-
-            if (no_improve >= cfg.max_no_improve) {
+            if (++no_improve >= cfg.max_no_improve) {
                 if (g_verbose)
                     std::cerr << "    FM: " << cfg.max_no_improve
                               << " non-improving passes, stopping\n";

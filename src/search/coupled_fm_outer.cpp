@@ -33,7 +33,7 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
         double temperature  = 0.1 + 0.9 * 0.5 * (1.0 + std::cos(progress * M_PI));
         double effective_drift = std::clamp(base_drift * temperature, 0.05, 2.0);
 
-        // Each pass starts from the same input (explore different neighbourhood)
+        // Each pass starts from the best found so far
         CoupledPartition current = cp;
 
         FMConfig pass_cfg               = cfg.pass_config;
@@ -45,26 +45,22 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
         result.total_passes++;
         result.total_moves += pass_result.moves_applied;
 
-        double        pass_best_cost = pass_result.best_cost;
-        CoupledPartition pass_best_cp  = std::move(pass_result.best_cp);
-
-        // Greedy descent on end state — explores a different basin
-        if (pass_result.moves_applied > 0) {
-            result.end_cost = pass_result.end_cost;
-            result.end_cp   = std::move(pass_result.end_cp);
-
-            double greedy_cost = coupling_greedy_descent(result.end_cp, feasibly_ret,
-                                                          cfg.deadline);
-            if (greedy_cost < pass_best_cost - 0.001) {
-                pass_best_cost = greedy_cost;
-                pass_best_cp   = result.end_cp;
-            }
+        if (pass_result.moves_applied == 0) {
+            if (++no_improve >= cfg.max_no_improve) break;
+            continue;
         }
 
-        if (pass_best_cost < result.best_cost - 0.001) {
-            double improvement = result.best_cost - pass_best_cost;
-            result.best_cost   = pass_best_cost;
-            result.best_cp     = std::move(pass_best_cp);
+        // Greedy descent on FM best
+        CoupledPartition candidate = std::move(pass_result.best_cp);
+        double candidate_cost = coupling_greedy_descent(candidate, feasibly_ret,
+                                                         cfg.deadline);
+
+        if (candidate_cost < result.best_cost - 0.001) {
+            double improvement = result.best_cost - candidate_cost;
+            result.best_cost = candidate_cost;
+            result.best_cp   = candidate;
+            // Start next pass from improved partition
+            cp = std::move(candidate);
             result.improving_passes++;
             no_improve = 0;
 
