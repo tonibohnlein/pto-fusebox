@@ -827,6 +827,110 @@ void test_eval_recompute_diamond() {
     CHECK("diamond recompute checks agree", mismatches == 0);
 }
 
+void test_eval_split_vs_partition() {
+    std::cout << "=== test_eval_split_vs_partition ===\n";
+    // Chain with merged group: G0={Op0,Op1,Op2}, G3={Op3}
+    // Split G0 at each bridge and compare with partition.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2};
+    part.groups[0].cost = part.eval_set({0, 1, 2});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Split {Op0,Op1,Op2} at bridge (Op0,Op1): side_a={Op0}, side_b={Op1,Op2}
+    FlatSet<size_t> side_a1 = {0}, side_b1 = {1, 2};
+    bool part_ok1 = part.acyclic_split_local(side_a1, side_b1, 0);
+    bool gdag_ok1 = !gdag.eval_split(part, side_a1, side_b1, 0);
+    CHECK("split (Op0)|(Op1,Op2) agree", part_ok1 == gdag_ok1);
+
+    // Split at bridge (Op1,Op2): side_a={Op0,Op1}, side_b={Op2}
+    FlatSet<size_t> side_a2 = {0, 1}, side_b2 = {2};
+    bool part_ok2 = part.acyclic_split_local(side_a2, side_b2, 0);
+    bool gdag_ok2 = !gdag.eval_split(part, side_a2, side_b2, 0);
+    CHECK("split (Op0,Op1)|(Op2) agree", part_ok2 == gdag_ok2);
+
+    // Diamond with merged group: test split there too
+    auto p2 = make_diamond();
+    auto d2 = DAG::build(p2);
+    auto part2 = Partition::trivial(p2, d2);
+    // Merge G0+G2: {Op0, Op2}
+    part2.groups[0].ops = {0, 2};
+    part2.groups[0].cost = part2.eval_set({0, 2});
+    part2.groups[2].alive = false;
+    part2.rebuild_index();
+
+    GroupDAG gdag2;
+    gdag2.build(part2);
+
+    FlatSet<size_t> sa = {0}, sb = {2};
+    bool p2_ok = part2.acyclic_split_local(sa, sb, 0);
+    bool g2_ok = !gdag2.eval_split(part2, sa, sb, 0);
+    CHECK("diamond split (Op0)|(Op2) agree", p2_ok == g2_ok);
+}
+
+void test_eval_extract_vs_partition() {
+    std::cout << "=== test_eval_extract_vs_partition ===\n";
+    // Wide diamond: extract various op subsets and compare.
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    // Test extracting pairs of ops
+    for (size_t a = 0; a < p.num_ops(); a++) {
+        for (size_t b = a + 1; b < p.num_ops(); b++) {
+            FlatSet<size_t> extract = {a, b};
+            bool part_ok = part.acyclic_extract_local(extract);
+            bool gdag_ok = !gdag.eval_extract(part, extract);
+            if (part_ok != gdag_ok) {
+                std::cout << "  MISMATCH: extract {" << a << "," << b << "}"
+                          << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all extract pairs agree", mismatches == 0);
+}
+
+void test_eval_add_ops_into_vs_partition() {
+    std::cout << "=== test_eval_add_ops_into_vs_partition ===\n";
+    // Wide diamond: try adding each op into each other group.
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    for (size_t op = 0; op < p.num_ops(); op++) {
+        for (size_t gi = 0; gi < part.groups.size(); gi++) {
+            if (!part.groups[gi].alive) continue;
+            if (part.groups[gi].ops.count(op)) continue;
+            FlatSet<size_t> new_ops = {op};
+            bool part_ok = part.acyclic_add_ops_into(new_ops, gi);
+            bool gdag_ok = !gdag.eval_add_ops_into(part, new_ops, gi);
+            if (part_ok != gdag_ok) {
+                std::cout << "  MISMATCH: add op" << op << " into G" << gi
+                          << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all add_ops_into agree", mismatches == 0);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -857,6 +961,10 @@ int main() {
     test_eval_de_recompute_vs_partition();
     test_eval_steal_diamond();
     test_eval_recompute_diamond();
+
+    test_eval_split_vs_partition();
+    test_eval_extract_vs_partition();
+    test_eval_add_ops_into_vs_partition();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";

@@ -304,6 +304,169 @@ bool GroupDAG::eval_steal(const Partition& part, size_t op,
     return false;
 }
 
+bool GroupDAG::eval_split(const Partition& part, const FlatSet<size_t>& side_a,
+                          const FlatSet<size_t>& side_b, size_t ga) const {
+    if (!part.prob || !part.dag) return false;
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
+
+    // After split: ga becomes side_a, new group gb becomes side_b.
+    // Compute virtual successors of each side and check if any external
+    // path leads back to either side.
+    //
+    // Build virtual successor sets for side_a and side_b by scanning ops.
+    // Then BFS from those external successors, checking if we reach back.
+    size_t n = succs_.size();
+    thread_local std::vector<bool> in_split;
+    in_split.assign(n + 1, false);  // +1 for virtual gb
+    if (ga < n) in_split[ga] = true;
+    size_t gb_virtual = n;  // virtual index for side_b
+    in_split[gb_virtual] = true;
+
+    auto is_in_side = [&](size_t op) {
+        return side_a.count(op) || side_b.count(op);
+    };
+
+    thread_local std::vector<bool> vis;
+    vis.assign(n, false);
+    thread_local std::vector<size_t> q;
+    q.clear();
+    size_t front = 0;
+
+    // Seed: external successors of side_a and side_b
+    auto seed_ops = [&](const FlatSet<size_t>& ops) {
+        for (auto op : ops) {
+            size_t t = prob.ops[op].output();
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (is_in_side(cop)) continue;
+                for (auto gc : part.groups_of(cop)) {
+                    if (!part.groups[gc].alive || gc == ga || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push_back(gc);
+                }
+            }
+        }
+    };
+    seed_ops(side_a);
+    seed_ops(side_b);
+
+    // BFS: cycle if any external group has an output consumed by side_a or side_b
+    while (front < q.size()) {
+        size_t cur = q[front++];
+        for (auto op : part.groups[cur].ops) {
+            size_t t = prob.ops[op].output();
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (is_in_side(cop)) return true;  // path back to split → cycle
+                for (auto gc : part.groups_of(cop)) {
+                    if (!part.groups[gc].alive || gc == ga || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push_back(gc);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool GroupDAG::eval_extract(const Partition& part,
+                             const FlatSet<size_t>& extract_ops) const {
+    if (!part.prob || !part.dag || extract_ops.empty()) return false;
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
+
+    // Virtual group gnew = extract_ops.
+    // Seed BFS with external successors of gnew.
+    // Cycle if BFS reaches a group that produces a tensor consumed by gnew.
+    size_t n = succs_.size();
+    thread_local std::vector<bool> vis;
+    vis.assign(n, false);
+    thread_local std::vector<size_t> q;
+    q.clear();
+    size_t front = 0;
+
+    for (auto op : extract_ops) {
+        size_t t = prob.ops[op].output();
+        for (auto cop : dag.tensor_consumers[t]) {
+            if (extract_ops.count(cop)) continue;
+            for (auto gc : part.groups_of(cop)) {
+                if (!part.groups[gc].alive || vis[gc]) continue;
+                vis[gc] = true;
+                q.push_back(gc);
+            }
+        }
+    }
+
+    while (front < q.size()) {
+        size_t cur = q[front++];
+        for (auto op : part.groups[cur].ops) {
+            if (extract_ops.count(op)) continue;
+            size_t t = prob.ops[op].output();
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (extract_ops.count(cop)) return true;  // path back → cycle
+                for (auto gc : part.groups_of(cop)) {
+                    if (!part.groups[gc].alive || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push_back(gc);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool GroupDAG::eval_add_ops_into(const Partition& part,
+                                  const FlatSet<size_t>& new_ops,
+                                  size_t gi) const {
+    if (!part.prob || !part.dag || new_ops.empty()) return false;
+    if (gi >= part.groups.size()) return false;
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
+
+    // Merged set = new_ops ∪ groups[gi].ops.
+    // Same BFS as merge: seed from external successors, check if path back.
+    auto in_merged = [&](size_t op) {
+        return new_ops.count(op) || part.groups[gi].ops.count(op);
+    };
+
+    size_t n = succs_.size();
+    thread_local std::vector<bool> vis;
+    vis.assign(n, false);
+    vis[gi] = true;  // skip gi in BFS
+    thread_local std::vector<size_t> q;
+    q.clear();
+    size_t front = 0;
+
+    auto seed = [&](size_t op) {
+        size_t t = prob.ops[op].output();
+        for (auto cop : dag.tensor_consumers[t]) {
+            if (in_merged(cop)) continue;
+            for (auto gc : part.groups_of(cop)) {
+                if (!part.groups[gc].alive || vis[gc]) continue;
+                vis[gc] = true;
+                q.push_back(gc);
+            }
+        }
+    };
+    for (auto op : new_ops) seed(op);
+    for (auto op : part.groups[gi].ops) seed(op);
+
+    while (front < q.size()) {
+        size_t cur = q[front++];
+        for (auto op : part.groups[cur].ops) {
+            size_t t = prob.ops[op].output();
+            for (auto cop : dag.tensor_consumers[t]) {
+                if (in_merged(cop)) return true;  // path back → cycle
+                for (auto gc : part.groups_of(cop)) {
+                    if (!part.groups[gc].alive || vis[gc]) continue;
+                    vis[gc] = true;
+                    q.push_back(gc);
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void GroupDAG::apply_generic(const Partition& part,
                               const FlatSet<size_t>& affected) {
     update(part, affected);

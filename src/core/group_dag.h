@@ -106,6 +106,20 @@ public:
     // copies are reachable from ga / from external consumers.
     bool eval_de_recompute(const Partition& part, size_t op, size_t ga) const;
 
+    // SPLIT(ga into side_a, side_b): check if splitting creates a cycle.
+    // Temporarily applies the split to check, then undoes it.
+    bool eval_split(const Partition& part, const FlatSet<size_t>& side_a,
+                    const FlatSet<size_t>& side_b, size_t ga) const;
+
+    // EXTRACT(extract_ops from their groups → new group): check if the
+    // new virtual group creates a cycle with existing groups.
+    bool eval_extract(const Partition& part, const FlatSet<size_t>& extract_ops) const;
+
+    // ADD_OPS_INTO(new_ops into gi): check if adding ops to gi creates a cycle.
+    // The merged set is new_ops ∪ groups[gi].ops.
+    bool eval_add_ops_into(const Partition& part, const FlatSet<size_t>& new_ops,
+                           size_t gi) const;
+
     // Apply: recompute edges for affected groups and repair topo order.
     void apply_generic(const Partition& part, const FlatSet<size_t>& affected);
 
