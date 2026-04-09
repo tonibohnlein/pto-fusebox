@@ -383,23 +383,41 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                                  const std::vector<size_t>& chain_b) {
     if (!cp.part.prob || !cp.part.dag) return true;
 
-    FlatSet<size_t> in_G(chain_a.begin(), chain_a.end());
-    for (auto g : chain_b) in_G.insert(g);
-
     size_t n = cp.part.groups.size();
+
+    // Thread-local bool vector for in_G membership (avoids FlatSet allocation).
+    thread_local std::vector<bool> is_in_G;
+    thread_local std::vector<size_t> in_G_list;  // for cleanup
+    is_in_G.assign(n, false);
+    in_G_list.clear();
+    for (auto g : chain_a) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
+    for (auto g : chain_b) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
 
     // For external groups, look up their chain head (cached).
     auto head_of_g = [&](size_t g) -> size_t {
-        if (g >= n || !cp.part.groups[g].alive || in_G.count(g)) return SIZE_MAX;
+        if (g >= n || !cp.part.groups[g].alive || is_in_G[g]) return SIZE_MAX;
         return cp.chain_head_cached(g);
     };
 
     // BFS over external chain heads reachable from G.
-    FlatSet<size_t> vis_heads;
-    std::queue<size_t> q;
+    // Use thread-local bool vector + vector-based queue to avoid allocations.
+    thread_local std::vector<bool> vis_head_flags;
+    thread_local std::vector<size_t> vis_head_list;
+    vis_head_flags.assign(n, false);
+    vis_head_list.clear();
+    thread_local std::vector<size_t> bfs_queue;
+    bfs_queue.clear();
+    size_t bfs_front = 0;
+
+    auto enqueue_head = [&](size_t hj) {
+        if (hj == SIZE_MAX || hj >= n || vis_head_flags[hj]) return;
+        vis_head_flags[hj] = true;
+        vis_head_list.push_back(hj);
+        bfs_queue.push_back(hj);
+    };
 
     // Seed: external direct successors of each group in G.
-    for (auto gi : in_G) {
+    for (auto gi : in_G_list) {
         if (!cp.part.groups[gi].alive) continue;
         for (auto op : cp.part.groups[gi].ops) {
             {
@@ -407,11 +425,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                 for (auto cop : cp.part.dag->tensor_consumers[t]) {
                     if (cp.part.groups[gi].ops.count(cop)) continue;
                     for (auto gj : cp.part.groups_of(cop)) {
-                        if (!cp.part.groups[gj].alive || in_G.count(gj)) continue;
-                        size_t hj = head_of_g(gj);
-                        if (hj == SIZE_MAX || vis_heads.count(hj)) continue;
-                        vis_heads.insert(hj);
-                        q.push(hj);
+                        if (!cp.part.groups[gj].alive || is_in_G[gj]) continue;
+                        enqueue_head(head_of_g(gj));
                     }
                 }
             }
@@ -420,8 +435,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
 
     // BFS through external chains; cycle if any group in an external chain
     // produces a tensor consumed by a group in G.
-    while (!q.empty()) {
-        size_t h_cur = q.front(); q.pop();
+    while (bfs_front < bfs_queue.size()) {
+        size_t h_cur = bfs_queue[bfs_front++];
         // Walk all groups in this external chain.
         size_t g_cur = h_cur;
         for (size_t steps = 0; steps <= n && g_cur != SIZE_MAX; steps++) {
@@ -433,11 +448,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                         if (cp.part.groups[g_cur].ops.count(cop)) continue;
                         for (auto gj : cp.part.groups_of(cop)) {
                             if (!cp.part.groups[gj].alive) continue;
-                            if (in_G.count(gj)) return false;  // external path back into G
-                            size_t hj = head_of_g(gj);
-                            if (hj == SIZE_MAX || vis_heads.count(hj)) continue;
-                            vis_heads.insert(hj);
-                            q.push(hj);
+                            if (is_in_G[gj]) return false;  // external path back into G
+                            enqueue_head(head_of_g(gj));
                         }
                     }
                 }
