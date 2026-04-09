@@ -43,11 +43,8 @@ struct FMMove {
 // locked: set of ops that cannot initiate moves (skip if op is locked)
 // ============================================================================
 
-class GroupDAG;  // forward declaration
-
 FMMove best_move_for(const Partition& part, size_t op,
-                     const FlatSet<size_t>& locked = {},
-                     const GroupDAG* gdag = nullptr);
+                     const FlatSet<size_t>& locked = {});
 
 // ============================================================================
 // Apply an FM move to the partition. Returns the set of affected group indices

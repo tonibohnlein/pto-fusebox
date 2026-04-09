@@ -3,6 +3,7 @@
 #include "core/types.h"
 #include "core/dag.h"
 #include "core/subgraph.h"
+#include "core/group_dag.h"
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -88,7 +89,13 @@ struct Partition {
     // --- Index maintenance ---
 
     // Rebuild op_to_groups_ from scratch.  Call after any mutation.
+    // Also updates the incremental GroupDAG if it has been built.
     void rebuild_index();
+
+    // Access the incremental group DAG.  Built lazily on first access,
+    // then maintained incrementally by rebuild_index().
+    GroupDAG& group_dag();
+    const GroupDAG& group_dag() const;
 
     // Rebuild group-level DAG (group_preds/succs/in_deg/tensor_to_group).
     // Must be called after rebuild_index() since it relies on op_to_groups_.
@@ -278,4 +285,6 @@ private:
     mutable std::vector<std::vector<bool>> fwd_cache_;
     mutable std::vector<uint32_t> fwd_cache_gen_;
     uint32_t fwd_gen_ = 0;
+    mutable GroupDAG gdag_;
+    mutable bool gdag_built_ = false;
 };

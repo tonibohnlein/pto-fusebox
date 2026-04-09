@@ -1,7 +1,6 @@
 #include "search/fm_search.h"
 #include "search/partition_moves.h"
 #include "search/structural_ops.h"
-#include "core/group_dag.h"
 #include <algorithm>
 #include <iostream>
 #include <cassert>
@@ -103,8 +102,7 @@ static bool split_creates_ephemeral_gap_local(
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     const FlatSet<size_t>& locked,
-                     const GroupDAG* gdag) {
+                     const FlatSet<size_t>& locked) {
     if (locked.count(op)) return {};
 
     FMMove best;
@@ -119,8 +117,7 @@ FMMove best_move_for(const Partition& part, size_t op,
     if (op_in_multiple) {
         for (auto gx : groups_of_x) {
             if (!part.groups[gx].alive) continue;
-            if (gdag ? gdag->eval_de_recompute(part, op, gx)
-                    : !part.acyclic_de_recompute_local(op, gx)) continue;
+            if (!part.acyclic_de_recompute_local(op, gx)) continue;
             auto dr = partition_moves::eval_de_recompute(part, gx, op);
             if (dr.feasible && dr.saving > best.saving)
                 best = FMMove{FMMove::DE_RECOMPUTE, op, gx, SIZE_MAX, SIZE_MAX, dr.saving};
@@ -134,8 +131,7 @@ FMMove best_move_for(const Partition& part, size_t op,
         // Ejecting a recomputed op is equivalent to DE_RECOMPUTE: the op's
         // outputs become external deps for the remainder.  Must check
         // acyclicity to prevent cycles through the op's other group(s).
-        if (op_in_multiple && (gdag ? gdag->eval_de_recompute(part, op, gx)
-                                    : !part.acyclic_de_recompute_local(op, gx))) continue;
+        if (op_in_multiple && !part.acyclic_de_recompute_local(op, gx)) continue;
 
         auto er = part.eval_eject(op, gx);
         if (er.feasible && er.saving > best.saving)
@@ -149,8 +145,7 @@ FMMove best_move_for(const Partition& part, size_t op,
 
         // INTERNAL_EJECT
         if (!eject_creates_ephemeral_gap(part, op, gx)) {
-            if (op_in_multiple && (gdag ? gdag->eval_de_recompute(part, op, gx)
-                                    : !part.acyclic_de_recompute_local(op, gx))) continue;
+            if (op_in_multiple && !part.acyclic_de_recompute_local(op, gx)) continue;
             auto er = part.eval_eject(op, gx);
             if (er.feasible && er.saving > best.saving) {
                 FMMove candidate;
@@ -169,8 +164,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             auto sr = part.eval_split(u_lo, u_hi, gx);
             if (sr.feasible && sr.saving > best.saving) {
                 if (!split_creates_ephemeral_gap_local(part, sr.side_a, sr.side_b, gx)
-                    && (gdag ? !gdag->eval_split(part, sr.side_a, sr.side_b, gx)
-                             : part.acyclic_split_local(sr.side_a, sr.side_b, gx)))
+                    && part.acyclic_split_local(sr.side_a, sr.side_b, gx))
                     best = FMMove{FMMove::SPLIT, op, gx, SIZE_MAX, v, sr.saving};
             }
         }
@@ -229,9 +223,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                     double new_gx_cost = gxc->cost;
                     double saving = (part.groups[gi].cost + part.groups[gx].cost)
                                     - (new_gi_cost + new_gx_cost);
-                    if (saving > best.saving &&
-                        (gdag ? !gdag->eval_steal(part, op, gx, gi)
-                              : part.acyclic_steal_local(op, gx, gi))) {
+                    if (saving > best.saving && part.acyclic_steal_local(op, gx, gi)) {
                         // Gap check: reuse new_gi (already built) + reconstruct new_gx
                         FlatSet<size_t> new_gx = part.groups[gx].ops;
                         new_gx.erase(op);
@@ -249,8 +241,7 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (std::find(merge_checked.begin(), merge_checked.end(), pair_key)
                 == merge_checked.end()) {
                 merge_checked.push_back(pair_key);
-                if (gdag ? !gdag->eval_merge(gi, gx)
-                        : part.acyclic_merge_local(gi, gx)) {
+                if (part.acyclic_merge_local(gi, gx)) {
                     FlatSet<size_t> merged_ops = part.groups[gi].ops;
                     merged_ops.insert(part.groups[gx].ops.begin(),
                                       part.groups[gx].ops.end());
@@ -267,8 +258,7 @@ FMMove best_move_for(const Partition& part, size_t op,
         }
 
         // RECOMPUTE: copy op into gi (stays in source groups too)
-        if (gdag ? !gdag->eval_recompute(part, op, gi)
-                : part.acyclic_recompute_local(op, gi)) {
+        if (part.acyclic_recompute_local(op, gi)) {
             auto rr = partition_moves::eval_recompute(part, op, gi);
             size_t gx = groups_of_x.empty() ? 0 : groups_of_x[0];
             if (rr.feasible && rr.saving > best.saving)
@@ -318,8 +308,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                                                consumer_groups.end());
 
                 // TENSOR_MERGE: local group-level BFS at eval time
-                if (gdag ? !gdag->merge_creates_cycle(group_list)
-                        : part.acyclic_merge_local(group_list)) {
+                if (part.acyclic_merge_local(group_list)) {
                     auto tmr = partition_moves::eval_tensor_merge(part, group_list);
                     if (tmr.feasible && tmr.saving > best.saving) {
                         FMMove candidate;
@@ -338,8 +327,7 @@ FMMove best_move_for(const Partition& part, size_t op,
                                                  consumer_ops_vec.end());
                     if (prod >= 0) extract_ops.insert((size_t)prod);
 
-                    if (gdag ? !gdag->eval_extract(part, extract_ops)
-                            : part.acyclic_extract_local(extract_ops)) {
+                    if (part.acyclic_extract_local(extract_ops)) {
                         auto ter = partition_moves::eval_tensor_extract(
                             part, extract_ops, group_list);
                         if (ter.feasible && ter.saving > best.saving) {
