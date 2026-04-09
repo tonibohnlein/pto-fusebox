@@ -473,6 +473,25 @@ void GroupDAG::apply_generic(const Partition& part,
 }
 
 // ============================================================================
+// Direct edge manipulation (for coupling edges)
+// ============================================================================
+
+void GroupDAG::add_edge(size_t from, size_t to) {
+    ensure_size(std::max(from, to) + 1);
+    succs_[from].insert(to);
+    preds_[to].insert(from);
+}
+
+void GroupDAG::remove_edge(size_t from, size_t to) {
+    if (from < succs_.size()) succs_[from].erase(to);
+    if (to < preds_.size()) preds_[to].erase(from);
+}
+
+void GroupDAG::rebuild_topo(const Partition& part) {
+    compute_topo_order(part);
+}
+
+// ============================================================================
 // Topological order
 // ============================================================================
 

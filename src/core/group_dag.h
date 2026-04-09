@@ -123,6 +123,19 @@ public:
     // Apply: recompute edges for affected groups and repair topo order.
     void apply_generic(const Partition& part, const FlatSet<size_t>& affected);
 
+    // --- Direct edge manipulation (for coupling edges) ---
+
+    // Add a directed edge from→to. Does NOT recompute topo order.
+    // Call rebuild_topo() after all edges are added.
+    void add_edge(size_t from, size_t to);
+
+    // Remove a directed edge from→to. Does NOT recompute topo order.
+    void remove_edge(size_t from, size_t to);
+
+    // Recompute topological order from current edges.
+    // Call after add_edge/remove_edge batch.
+    void rebuild_topo(const Partition& part);
+
     size_t size() const { return succs_.size(); }
     bool empty() const { return succs_.empty(); }
 

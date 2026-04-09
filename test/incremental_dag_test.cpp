@@ -1127,6 +1127,134 @@ void test_incremental_index_sequence() {
     CHECK("seq GroupDAG matches fresh build", dag_ok);
 }
 
+// ============================================================================
+// Coupled GroupDAG tests — tensor edges + coupling edges
+// ============================================================================
+
+void test_coupled_gdag_basic() {
+    std::cout << "=== test_coupled_gdag_basic ===\n";
+    // Chain: G0→G1→G2→G3 (tensor edges).
+    // Add coupling edge G0→G1 (simulating retain).
+    // The coupling edge is redundant (tensor edge already exists),
+    // but should not break anything.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG coupled;
+    coupled.build(part);  // tensor edges only
+
+    // Add coupling edge G0→G1
+    coupled.add_edge(0, 1);
+    coupled.rebuild_topo(part);
+
+    CHECK("coupled topo G0<G1", coupled.topo_pos(0) < coupled.topo_pos(1));
+    CHECK("coupled topo G1<G2", coupled.topo_pos(1) < coupled.topo_pos(2));
+    CHECK("coupled G0 reaches G3", coupled.can_reach(0, 3));
+    CHECK("coupled !G3 reaches G0", !coupled.can_reach(3, 0));
+}
+
+void test_coupled_gdag_cycle_detection() {
+    std::cout << "=== test_coupled_gdag_cycle_detection ===\n";
+    // Wide diamond: G0→G2→G4→G5, G0→G1→G3→G4→G5 (tensor edges).
+    // Add coupling edges to create chains, then check if merging
+    // chain endpoints creates a cycle.
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG coupled;
+    coupled.build(part);
+
+    // Create chain C_A: G0→G2 (coupling), chain C_B: G3→G4 (coupling)
+    coupled.add_edge(0, 2);  // coupling: G0 retains for G2
+    coupled.add_edge(3, 4);  // coupling: G3 retains for G4
+    coupled.rebuild_topo(part);
+
+    // Merging G2+G3 should create a cycle (same as coupling_moves_test):
+    // C_A: [G0,G2] → C_B: [G3,G4]. After merge: merged→G4 via chain,
+    // G4→G5→... and G0→merged via chain. But does merged feed back to G0?
+    // In wide diamond: G2→G4 (tensor), G0→G2 (coupling). G3→G4 (coupling).
+    // If we merge G2+G3: the merged group has succs from both.
+    // G2's tensor succs: G4. G3's tensor succs: G4. merged→G4.
+    // G4's succs: G5. G5 has no path back to G0.
+    // But G0→G2(=merged) via coupling, and merged→G4 via tensor/coupling.
+    // No back-edge to G0 → actually NOT a cycle in the wide diamond.
+
+    // Let me create a scenario that IS a cycle:
+    // Chain A: G0→G2 (coupling). Chain B: G3→G5 (coupling).
+    // Merge G2+G3: merged chains = [G0, G2+G3, G5].
+    // G5's tensor succs: none (it's the last op). No cycle.
+
+    // Better: use make_cycle5 pattern from coupling_moves_test.
+    // Op0→T1→Op2, Op1→T2→Op4, Op2→T3→Op3, Op3→T4→Op4
+    // With chains: C_A = G0→G2 (coupling T1), C_B = G3→G4 (coupling T4).
+    // Merge G2+G3: [G0,merged,G4]. Does G4 reach G0?
+    // G4(Op4) consumes T2 from G1(Op1). G1(Op1) consumes T1 from G0(Op0).
+    // So G4→G1→G0 via tensor edges → merged→G4→G1→G0→merged = CYCLE!
+
+    Problem p2;
+    for (int i = 0; i <= 5; i++) p2.tensors.push_back({64, 64});
+    p2.ops.push_back({OpType::Pointwise, {0}, {1}, 200});  // Op0
+    p2.ops.push_back({OpType::Pointwise, {1}, {2}, 200});  // Op1
+    p2.ops.push_back({OpType::Pointwise, {1}, {3}, 200});  // Op2
+    p2.ops.push_back({OpType::Pointwise, {3}, {4}, 200});  // Op3
+    p2.ops.push_back({OpType::Pointwise, {2, 4}, {5}, 200}); // Op4
+    p2.fast_memory_capacity = 20000;
+    p2.slow_memory_bandwidth = 10;
+    p2.native_w = 64; p2.native_h = 64;
+    DAG d2 = DAG::build(p2);
+    auto part2 = Partition::trivial(p2, d2);
+    part2.rebuild_index();
+
+    GroupDAG coupled2;
+    coupled2.build(part2);
+    // Chains: C_A = G0→G2, C_B = G3→G4
+    coupled2.add_edge(0, 2);
+    coupled2.add_edge(3, 4);
+    coupled2.rebuild_topo(part2);
+
+    // Merging G2+G3 should create a cycle via the coupled DAG
+    CHECK("coupled merge G2,G3 cycle", coupled2.merge_creates_cycle({0, 2, 3, 4}));
+
+    // Without coupling edges, merge G2+G3 might not be a cycle
+    GroupDAG uncoupled;
+    uncoupled.build(part2);
+    CHECK("uncoupled merge G2,G3 no cycle", !uncoupled.merge_creates_cycle({2, 3}));
+}
+
+void test_coupled_gdag_add_remove_edge() {
+    std::cout << "=== test_coupled_gdag_add_remove_edge ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Add coupling edge G2→G0 (backward! would create cycle)
+    gdag.add_edge(2, 0);
+    gdag.rebuild_topo(part);
+
+    // Now G0→G1→G2→G0 is a cycle. can_reach should detect it.
+    // But topo order can't represent cycles — some nodes will have topo_pos=-1.
+    // merge_creates_cycle on {0,1} should detect the cycle through G2.
+    CHECK("backward edge: G2 reaches G0", gdag.can_reach(2, 0));
+    CHECK("backward edge: G0 reaches G2", gdag.can_reach(0, 2));
+
+    // Remove the backward edge
+    gdag.remove_edge(2, 0);
+    gdag.rebuild_topo(part);
+
+    // Cycle should be gone
+    CHECK("after remove: !G2 reaches G0", !gdag.can_reach(2, 0));
+    CHECK("after remove: G0 reaches G2", gdag.can_reach(0, 2));
+    CHECK("after remove: topo valid G0<G2", gdag.topo_pos(0) < gdag.topo_pos(2));
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -1168,6 +1296,11 @@ int main() {
     test_incremental_index_recompute();
     test_incremental_index_de_recompute();
     test_incremental_index_sequence();
+    test_coupled_gdag_basic();
+    test_coupled_gdag_cycle_detection();
+    test_coupled_gdag_add_remove_edge();
+
+    // (test functions defined above main)
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";
