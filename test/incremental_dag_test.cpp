@@ -6,6 +6,7 @@
 #include "core/group_dag.h"
 #include "core/types.h"
 #include "partition/partition.h"
+#include "search/fm_search.h"
 #include "search/partition_moves.h"
 #include <iostream>
 
@@ -931,6 +932,201 @@ void test_eval_add_ops_into_vs_partition() {
     CHECK("all add_ops_into agree", mismatches == 0);
 }
 
+// ============================================================================
+// Verify incremental index (op_to_groups_) after apply_fm_move
+// ============================================================================
+
+static void verify_index(const Partition& part, const char* label) {
+    // Build expected index from scratch
+    std::vector<std::vector<size_t>> expected(part.prob->num_ops());
+    for (size_t gi = 0; gi < part.groups.size(); gi++)
+        if (part.groups[gi].alive)
+            for (auto op : part.groups[gi].ops)
+                expected[op].push_back(gi);
+
+    bool ok = true;
+    for (size_t op = 0; op < part.prob->num_ops(); op++) {
+        auto got = part.groups_of(op);
+        auto& exp = expected[op];
+        std::sort(exp.begin(), exp.end());
+        auto got_sorted = got;
+        std::sort(got_sorted.begin(), got_sorted.end());
+        if (got_sorted != exp) {
+            std::cout << "  INDEX MISMATCH at " << label << ": op" << op
+                      << " got={";
+            for (auto g : got) std::cout << g << ",";
+            std::cout << "} expected={";
+            for (auto g : exp) std::cout << g << ",";
+            std::cout << "}\n";
+            ok = false;
+        }
+    }
+    CHECK(label, ok);
+}
+
+void test_incremental_index_steal() {
+    std::cout << "=== test_incremental_index_steal ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.group_dag();  // trigger lazy build
+
+    FMMove m;
+    m.type = FMMove::STEAL;
+    m.op = 1; m.ga = 1; m.gb = 0; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("steal applied", !affected.empty());
+    verify_index(part, "steal index correct");
+}
+
+void test_incremental_index_merge() {
+    std::cout << "=== test_incremental_index_merge ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.group_dag();
+
+    FMMove m;
+    m.type = FMMove::MERGE;
+    m.op = 0; m.ga = 0; m.gb = 1; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("merge applied", !affected.empty());
+    verify_index(part, "merge index correct");
+}
+
+void test_incremental_index_eject() {
+    std::cout << "=== test_incremental_index_eject ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    // Merge first to have a multi-op group
+    part.groups[0].ops = {0, 1, 2};
+    part.groups[0].cost = part.eval_set({0, 1, 2});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+    part.rebuild_index();
+    part.group_dag();
+
+    FMMove m;
+    m.type = FMMove::EJECT;
+    m.op = 1; m.ga = 0; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("eject applied", !affected.empty());
+    verify_index(part, "eject index correct");
+}
+
+void test_incremental_index_split() {
+    std::cout << "=== test_incremental_index_split ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.groups[0].ops = {0, 1, 2};
+    part.groups[0].cost = part.eval_set({0, 1, 2});
+    part.groups[1].alive = false;
+    part.groups[2].alive = false;
+    part.rebuild_index();
+    part.group_dag();
+
+    FMMove m;
+    m.type = FMMove::SPLIT;
+    m.op = 0; m.op2 = 1; m.ga = 0; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("split applied", !affected.empty());
+    verify_index(part, "split index correct");
+}
+
+void test_incremental_index_recompute() {
+    std::cout << "=== test_incremental_index_recompute ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.group_dag();
+
+    // Recompute op0 into G1
+    FMMove m;
+    m.type = FMMove::RECOMPUTE;
+    m.op = 0; m.ga = 0; m.gb = 1; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("recompute applied", !affected.empty());
+    verify_index(part, "recompute index correct");
+    CHECK("op0 in 2 groups", part.groups_of(0).size() == 2);
+}
+
+void test_incremental_index_de_recompute() {
+    std::cout << "=== test_incremental_index_de_recompute ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    // Set up recomputation: op0 in G0 and G1
+    part.groups[1].ops.insert(0);
+    part.groups[1].cost = part.eval_set(part.groups[1].ops);
+    part.rebuild_index();
+    part.group_dag();
+
+    CHECK("op0 in 2 groups before", part.groups_of(0).size() == 2);
+
+    FMMove m;
+    m.type = FMMove::DE_RECOMPUTE;
+    m.op = 0; m.ga = 1; m.saving = 1.0;
+    auto affected = apply_fm_move(part, m);
+    CHECK("de_recompute applied", !affected.empty());
+    verify_index(part, "de_recompute index correct");
+    CHECK("op0 in 1 group after", part.groups_of(0).size() == 1);
+}
+
+void test_incremental_index_sequence() {
+    std::cout << "=== test_incremental_index_sequence ===\n";
+    // Apply a sequence of moves and verify index after each
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.group_dag();
+
+    // Move 1: Steal op1 from G1 to G0
+    {
+        FMMove m;
+        m.type = FMMove::STEAL; m.op = 1; m.ga = 1; m.gb = 0; m.saving = 1.0;
+        auto aff = apply_fm_move(part, m);
+        CHECK("seq steal applied", !aff.empty());
+        verify_index(part, "seq after steal");
+    }
+
+    // Move 2: Steal op2 from G2 to G0
+    {
+        FMMove m;
+        m.type = FMMove::STEAL; m.op = 2; m.ga = 2; m.gb = 0; m.saving = 1.0;
+        auto aff = apply_fm_move(part, m);
+        CHECK("seq steal2 applied", !aff.empty());
+        verify_index(part, "seq after steal2");
+    }
+
+    // Move 3: Split G0 at bridge (0,1)
+    {
+        FMMove m;
+        m.type = FMMove::SPLIT; m.op = 0; m.op2 = 1; m.ga = 0; m.saving = 1.0;
+        auto aff = apply_fm_move(part, m);
+        if (!aff.empty()) {
+            verify_index(part, "seq after split");
+        } else {
+            std::cout << "  (split not feasible, skip)\n";
+        }
+    }
+
+    // Verify GroupDAG also matches
+    GroupDAG fresh;
+    fresh.build(part);
+    bool dag_ok = true;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        if (part.group_dag().succs(gi) != fresh.succs(gi)) dag_ok = false;
+    }
+    CHECK("seq GroupDAG matches fresh build", dag_ok);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -965,6 +1161,13 @@ int main() {
     test_eval_split_vs_partition();
     test_eval_extract_vs_partition();
     test_eval_add_ops_into_vs_partition();
+    test_incremental_index_steal();
+    test_incremental_index_merge();
+    test_incremental_index_eject();
+    test_incremental_index_split();
+    test_incremental_index_recompute();
+    test_incremental_index_de_recompute();
+    test_incremental_index_sequence();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";

@@ -451,40 +451,32 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         }
         case FMMove::EJECT:
         case FMMove::INTERNAL_EJECT: {
-            // op ejected from m.ga → singleton. Remainder may split.
-            // Capture ga's old ops to compute delta.
+            // Capture ga's old ops before apply modifies them
             FlatSet<size_t> old_ga_ops = part.groups[m.ga].ops;
             affected = partition_moves::apply_eject(part, m.op, m.ga);
             if (affected.empty()) return {};
-            // Remove old ga mappings for ops that moved
+            // Remove old ga mappings for ALL ops that were in ga
             for (auto op : old_ga_ops)
                 part.index_remove(op, m.ga);
-            // Re-add for all affected groups (ga remainder + new groups)
-            for (auto gi : affected)
-                if (part.groups[gi].alive)
-                    for (auto op : part.groups[gi].ops)
-                        part.index_add(op, gi);
+            // Re-add ONLY for ga (remainder). New groups created by add_group
+            // already have their op_to_groups_ entries from add_group().
+            if (part.groups[m.ga].alive)
+                for (auto op : part.groups[m.ga].ops)
+                    part.index_add(op, m.ga);
             break;
         }
         case FMMove::SPLIT: {
-            // Capture side_b ops (they'll move to new group)
             auto sr = part.eval_split(m.op, m.op2, m.ga);
             std::vector<size_t> side_b_ops(sr.side_b.begin(), sr.side_b.end());
             affected = partition_moves::apply_split(part, m.op, m.op2, m.ga);
             if (affected.empty()) return {};
-            // side_b ops moved from ga to the new group
-            size_t gb_new = SIZE_MAX;
-            for (auto gi : affected) if (gi != m.ga) { gb_new = gi; break; }
-            if (gb_new != SIZE_MAX) {
-                for (auto op : side_b_ops) {
-                    part.index_remove(op, m.ga);
-                    part.index_add(op, gb_new);
-                }
-            }
+            // side_b ops moved from ga to new group (add_group handles new group index).
+            // Just remove old ga mappings for side_b ops.
+            for (auto op : side_b_ops)
+                part.index_remove(op, m.ga);
             break;
         }
         case FMMove::TENSOR_MERGE: {
-            // Capture ops from killed groups
             std::vector<std::pair<size_t, std::vector<size_t>>> killed_ops;
             size_t survivor = m.tensor_groups[0];
             for (size_t i = 1; i < m.tensor_groups.size(); i++) {
@@ -504,45 +496,55 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
         case FMMove::TENSOR_EXTRACT: {
             FlatSet<size_t> extract_ops(m.tensor_consumer_ops.begin(),
                                          m.tensor_consumer_ops.end());
-            // Track which group each extracted op came from
-            std::vector<std::pair<size_t, size_t>> op_sources; // (op, old_gi)
-            for (auto op : extract_ops)
-                for (auto gi : part.groups_of(op))
-                    if (part.groups[gi].alive)
-                        op_sources.push_back({op, gi});
+            // Capture old source group ops before apply
+            std::vector<std::pair<size_t, FlatSet<size_t>>> old_source_ops;
+            for (auto gi : m.tensor_groups)
+                if (part.groups[gi].alive)
+                    old_source_ops.push_back({gi, part.groups[gi].ops});
             affected = partition_moves::apply_tensor_extract(part, extract_ops,
                                                               m.tensor_groups);
             if (affected.empty()) return {};
-            // Find new group (the one containing extract_ops)
-            size_t new_gi = SIZE_MAX;
-            for (auto gi : affected)
-                if (part.groups[gi].alive && part.groups[gi].ops.count(*extract_ops.begin()))
-                    { new_gi = gi; break; }
-            // Remove old, add new
-            for (auto [op, old_gi] : op_sources)
-                part.index_remove(op, old_gi);
-            // Re-add for all affected groups
-            for (auto gi : affected)
+            // Remove old source ops, re-add for source groups (NOT new groups
+            // — add_group already handled those).
+            for (auto& [gi, old_ops] : old_source_ops) {
+                for (auto op : old_ops)
+                    part.index_remove(op, gi);
                 if (part.groups[gi].alive)
                     for (auto op : part.groups[gi].ops)
                         part.index_add(op, gi);
+            }
             break;
         }
         case FMMove::FORCE_RECOMPUTE: {
+            // apply_force_recompute calls rebuild_index() internally.
+            // That handles op_to_groups_ fully. Just update GroupDAG.
             auto frr = partition_moves::eval_force_recompute(part, m.op2);
-            // Complex: creates multiple new groups, modifies existing
-            // Fall back to full rebuild
             affected = partition_moves::apply_force_recompute(part, m.op2, frr);
             if (affected.empty()) return {};
-            part.rebuild_index(affected);
-            goto skip_index_update;
+            part.index_update_dag(affected);
+            goto skip_incremental;
         }
         case FMMove::TENSOR_EXTRACT_SPLIT: {
+            // Complex: multiple sub-groups created. Capture old state.
+            FlatSet<size_t> tes_all_ops;
+            for (auto& sg : m.split_extract_result.sub_groups)
+                for (auto op : sg) tes_all_ops.insert(op);
+            std::vector<std::pair<size_t, FlatSet<size_t>>> old_source_ops;
+            for (auto gi : m.tensor_groups)
+                if (part.groups[gi].alive)
+                    old_source_ops.push_back({gi, part.groups[gi].ops});
             affected = partition_moves::apply_tensor_extract_split(
                 part, m.split_extract_result, m.tensor_groups);
             if (affected.empty()) return {};
-            part.rebuild_index(affected);
-            goto skip_index_update;
+            // Remove old source ops, re-add for source groups only
+            for (auto& [gi, old_ops] : old_source_ops) {
+                for (auto op : old_ops)
+                    part.index_remove(op, gi);
+                if (part.groups[gi].alive)
+                    for (auto op : part.groups[gi].ops)
+                        part.index_add(op, gi);
+            }
+            break;
         }
         default:
             return {};
@@ -550,7 +552,7 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     part.index_update_dag(affected);
 
-skip_index_update:
+skip_incremental:
 
 #ifndef NDEBUG
     // Verify incremental index matches full rebuild
