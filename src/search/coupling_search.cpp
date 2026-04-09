@@ -383,9 +383,6 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                                  const std::vector<size_t>& chain_b) {
     if (!cp.part.prob || !cp.part.dag) return true;
 
-    // Two singleton (free) groups can never create a chain-level cycle.
-    if (chain_a.size() <= 1 && chain_b.size() <= 1) return true;
-
     FlatSet<size_t> in_G(chain_a.begin(), chain_a.end());
     for (auto g : chain_b) in_G.insert(g);
 
@@ -419,28 +416,6 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                 }
             }
         }
-    }
-
-    // Quick filter: use group-level forward reachability to check if any
-    // seeded external group can reach back into G.  If not, no cycle possible.
-    if (!q.empty()) {
-        bool any_back_edge = false;
-        // Check: for each group in G, is it forward-reachable from any seed?
-        // Equivalently: for each seed head h, does fwd(h) intersect G?
-        for (auto h : vis_heads) {
-            // Walk the chain from head h to check all groups
-            size_t g_walk = h;
-            for (size_t s = 0; s <= n && g_walk != SIZE_MAX; s++) {
-                if (!cp.part.groups[g_walk].alive) break;
-                const auto& fwd = cp.part.cached_forward_reachable(g_walk);
-                for (auto gi : in_G)
-                    if (gi < fwd.size() && fwd[gi]) { any_back_edge = true; break; }
-                if (any_back_edge) break;
-                g_walk = (g_walk < cp.next_group.size()) ? cp.next_group[g_walk] : SIZE_MAX;
-            }
-            if (any_back_edge) break;
-        }
-        if (!any_back_edge) return true;
     }
 
     // BFS through external chains; cycle if any group in an external chain
