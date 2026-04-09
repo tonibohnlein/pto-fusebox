@@ -116,12 +116,18 @@ void CoupledPartition::fix_chain_couplings() {
             if (!part.groups[ga].alive || !part.groups[gb].alive) continue;
 
             // Temporarily disconnect ga→gb and check if reconnecting
-            // would create a cycle.
+            // would create a cycle — using full chain merge check.
             next_group[ga] = SIZE_MAX;
             prev_group[gb] = SIZE_MAX;
             invalidate_chain_cache();  // rebuild coupled DAG without this edge
 
-            bool would_cycle = coupled_dag().can_reach(gb, ga);
+            // Check: would reconnecting chain_of(ga) → chain_of(gb) create a cycle?
+            auto chain_a = chain_of(ga);
+            auto chain_b = chain_of(gb);
+            std::vector<size_t> all;
+            all.insert(all.end(), chain_a.begin(), chain_a.end());
+            all.insert(all.end(), chain_b.begin(), chain_b.end());
+            bool would_cycle = coupled_dag().merge_creates_cycle(all);
 
             if (would_cycle) {
                 // Leave disconnected — remove this coupling link.

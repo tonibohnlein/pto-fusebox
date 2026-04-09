@@ -1169,6 +1169,9 @@ FlatSet<size_t> apply_coupled_fm_move(CoupledPartition& cp,
                 validate_group_edges(g);
         }
 
+        // Invalidate coupled GroupDAG after partition moves modify coupling state.
+        cp.invalidate_chain_cache();
+
         return affected;
     }
 
