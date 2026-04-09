@@ -385,21 +385,14 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
 
     size_t n = cp.part.groups.size();
 
-    // Thread-local bool vector for in_G membership (avoids FlatSet allocation).
+    // Mark all groups in both chains as "in G".
     thread_local std::vector<bool> is_in_G;
-    thread_local std::vector<size_t> in_G_list;  // for cleanup
+    thread_local std::vector<size_t> in_G_list;
     is_in_G.assign(n, false);
     in_G_list.clear();
     for (auto g : chain_a) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
     for (auto g : chain_b) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
 
-    // BFS over external groups reachable from G via group-level edges.
-    // A group-level edge gi→gj exists when some op in gi produces a tensor
-    // consumed by an op in gj (and they're different groups).
-    // Cycle: if BFS from G reaches back into G through external groups.
-    //
-    // Unlike the old chain-based BFS, this walks individual groups (no
-    // chain_head lookup, no chain-walking inner loop).
     thread_local std::vector<bool> vis_group;
     vis_group.assign(n, false);
     thread_local std::vector<size_t> bfs_queue;
@@ -412,9 +405,9 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
         bfs_queue.push_back(gj);
     };
 
-    // Seed: external direct successors of each group in G.
+    // Seed: external direct successors of all groups in G.
     for (auto gi : in_G_list) {
-        if (!cp.part.groups[gi].alive) continue;
+        if (gi >= n || !cp.part.groups[gi].alive) continue;
         for (auto op : cp.part.groups[gi].ops) {
             size_t t = cp.part.prob->ops[op].output();
             for (auto cop : cp.part.dag->tensor_consumers[t]) {
@@ -427,8 +420,7 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
         }
     }
 
-    // BFS through external groups; cycle if any external group produces
-    // a tensor consumed by a group in G.
+    // BFS through external groups; cycle if we reach a target group.
     while (bfs_front < bfs_queue.size()) {
         size_t g_cur = bfs_queue[bfs_front++];
         for (auto op : cp.part.groups[g_cur].ops) {
@@ -437,8 +429,8 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
                 if (cp.part.groups[g_cur].ops.count(cop)) continue;
                 for (auto gj : cp.part.groups_of(cop)) {
                     if (!cp.part.groups[gj].alive) continue;
-                    if (is_in_G[gj]) return false;  // external path back into G
-                    enqueue_group(gj);
+                    if (is_in_G[gj]) return false;  // external path back into G → cycle
+                    if (!is_in_G[gj]) enqueue_group(gj);
                 }
             }
         }
