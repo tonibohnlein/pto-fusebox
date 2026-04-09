@@ -448,6 +448,232 @@ void test_apply_eject_method() {
     CHECK("apply_eject matches full", verify_matches_full(gdag, part, "apply_eject"));
 }
 
+// ============================================================================
+// Cycle detection tests — verify GroupDAG catches cycles correctly
+// ============================================================================
+
+// Wider diamond with more paths:
+//   Op0: T0 → T1
+//   Op1: T0 → T2
+//   Op2: T1 → T3
+//   Op3: T2 → T4
+//   Op4: T3, T4 → T5
+//   Op5: T5 → T6
+static Problem make_wide_diamond() {
+    Problem p;
+    p.tensors = {{64,64},{64,64},{64,64},{64,64},{64,64},{64,64},{64,64}};
+    p.ops = {
+        {OpType::Pointwise, {0}, {1}, 300},       // Op0
+        {OpType::Pointwise, {0}, {2}, 300},       // Op1
+        {OpType::Pointwise, {1}, {3}, 300},       // Op2
+        {OpType::Pointwise, {2}, {4}, 300},       // Op3
+        {OpType::Pointwise, {3, 4}, {5}, 300},    // Op4
+        {OpType::Pointwise, {5}, {6}, 300},       // Op5
+    };
+    p.fast_memory_capacity = 20000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 64; p.native_h = 64;
+    return p;
+}
+
+void test_cycle_merge_endpoints() {
+    std::cout << "=== test_cycle_merge_endpoints ===\n";
+    // Wide diamond trivial partition: G0→G2→G4→G5, G1→G3→G4→G5
+    // Merging first and last group (G0+G5) creates a cycle:
+    //   merged(G0,G5) → G2 → G4 → merged(G0,G5) → cycle
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    CHECK("merge G0,G5 creates cycle", gdag.eval_merge(0, 5));
+    CHECK("merge G0,G4 creates cycle", gdag.eval_merge(0, 4));
+    CHECK("merge G1,G4 creates cycle", gdag.eval_merge(1, 4));
+
+    // These should NOT create cycles:
+    CHECK("merge G0,G1 no cycle", !gdag.eval_merge(0, 1));
+    CHECK("merge G2,G3 no cycle", !gdag.eval_merge(2, 3));
+    CHECK("merge G4,G5 no cycle", !gdag.eval_merge(4, 5));
+    CHECK("merge G0,G2 no cycle", !gdag.eval_merge(0, 2));
+    CHECK("merge G1,G3 no cycle", !gdag.eval_merge(1, 3));
+}
+
+void test_cycle_merge_after_steal() {
+    std::cout << "=== test_cycle_merge_after_steal ===\n";
+    // Chain: G0→G1→G2→G3.
+    // Steal Op1 from G1 to G0: G0={Op0,Op1}, G1 dead.
+    // After: G0→G2→G3 (safe steal, no cycle).
+    // Then check: merging G0 with G3 would create cycle via G2.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Steal Op1 from G1 to G0 (safe: G0={Op0,Op1}, G1 dies)
+    auto affected = partition_moves::apply_steal(part, 1, 1, 0);
+    CHECK("steal applied", !affected.empty());
+    part.rebuild_index();
+    gdag.apply_steal(part, affected);
+
+    CHECK("post-steal adjacency correct", verify_matches_full(gdag, part, "steal"));
+    CHECK("post-steal G0 reaches G2", gdag.can_reach(0, 2));
+    CHECK("post-steal G0 reaches G3", gdag.can_reach(0, 3));
+
+    // Merging G0+G3: G0={Op0,Op1}→G2→G3. merged→G2→merged = cycle.
+    CHECK("post-steal merge G0,G3 cycle", gdag.eval_merge(0, 3));
+    // Merging G0+G2: G0→G2 is forward, no reverse → safe.
+    CHECK("post-steal merge G0,G2 no cycle", !gdag.eval_merge(0, 2));
+}
+
+void test_cycle_multi_merge() {
+    std::cout << "=== test_cycle_multi_merge ===\n";
+    // Wide diamond: merging G2+G3 (parallel branches) is safe.
+    // Then merging result with G0 should still be safe (G0 feeds both).
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Merge G2+G3 (parallel, safe)
+    CHECK("merge G2,G3 no cycle", !gdag.eval_merge(2, 3));
+    double mc = part.eval_set({2, 3});
+    auto a1 = partition_moves::apply_merge(part, 2, 3, mc);
+    part.rebuild_index();
+    gdag.apply_merge(part, 2, 3, a1);
+    CHECK("post-merge matches", verify_matches_full(gdag, part, "merge23"));
+
+    // Now G2={Op2,Op3}. Merge G2+G4 should be safe (G2 feeds G4).
+    CHECK("merge G2,G4 no cycle", !gdag.eval_merge(2, 4));
+
+    // But merge G0+G4 should create cycle: G0→G2→G4 and G0→G1→G4
+    CHECK("merge G0,G4 cycle", gdag.eval_merge(0, 4));
+}
+
+void test_cycle_reachability_transitivity() {
+    std::cout << "=== test_cycle_reachability_transitivity ===\n";
+    // Chain: G0→G1→G2→G3.
+    // Verify transitive reachability in both directions.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Forward reachability
+    CHECK("G0→G1", gdag.can_reach(0, 1));
+    CHECK("G0→G2", gdag.can_reach(0, 2));
+    CHECK("G0→G3", gdag.can_reach(0, 3));
+    CHECK("G1→G2", gdag.can_reach(1, 2));
+    CHECK("G1→G3", gdag.can_reach(1, 3));
+    CHECK("G2→G3", gdag.can_reach(2, 3));
+
+    // No reverse reachability
+    CHECK("!G1→G0", !gdag.can_reach(1, 0));
+    CHECK("!G2→G0", !gdag.can_reach(2, 0));
+    CHECK("!G3→G0", !gdag.can_reach(3, 0));
+    CHECK("!G2→G1", !gdag.can_reach(2, 1));
+    CHECK("!G3→G1", !gdag.can_reach(3, 1));
+    CHECK("!G3→G2", !gdag.can_reach(3, 2));
+
+    // Self-reachability
+    CHECK("G0→G0", gdag.can_reach(0, 0));
+    CHECK("G3→G3", gdag.can_reach(3, 3));
+}
+
+void test_cycle_topo_consistency_after_moves() {
+    std::cout << "=== test_cycle_topo_consistency_after_moves ===\n";
+    // After every move, verify topo order is consistent with edges:
+    // for every edge gi→gj, topo_pos[gi] < topo_pos[gj].
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    auto check_topo_consistent = [&](const char* label) {
+        for (size_t gi = 0; gi < gdag.size(); gi++) {
+            if (gdag.topo_pos(gi) < 0) continue;
+            for (auto gj : gdag.succs(gi)) {
+                if (gdag.topo_pos(gj) < 0) continue;
+                if (gdag.topo_pos(gi) >= gdag.topo_pos(gj)) {
+                    std::cout << "  TOPO VIOLATION at " << label
+                              << ": G" << gi << "(pos=" << gdag.topo_pos(gi)
+                              << ") → G" << gj << "(pos=" << gdag.topo_pos(gj) << ")\n";
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    CHECK("initial topo consistent", check_topo_consistent("initial"));
+
+    // Merge G2+G3
+    double mc = part.eval_set({2, 3});
+    auto a1 = partition_moves::apply_merge(part, 2, 3, mc);
+    part.rebuild_index();
+    gdag.apply_merge(part, 2, 3, a1);
+    CHECK("post-merge23 topo consistent", check_topo_consistent("merge23"));
+
+    // Merge G0+G1
+    double mc2 = part.eval_set({0, 1});
+    auto a2 = partition_moves::apply_merge(part, 0, 1, mc2);
+    part.rebuild_index();
+    gdag.apply_merge(part, 0, 1, a2);
+    CHECK("post-merge01 topo consistent", check_topo_consistent("merge01"));
+
+    // Merge G0+G2 (now G0={Op0,Op1}, G2={Op2,Op3})
+    double mc3 = part.eval_set({0, 1, 2, 3});
+    auto a3 = partition_moves::apply_merge(part, 0, 2, mc3);
+    part.rebuild_index();
+    gdag.apply_merge(part, 0, 2, a3);
+    CHECK("post-merge02 topo consistent", check_topo_consistent("merge02"));
+}
+
+void test_cycle_compare_with_partition_acyclic_checks() {
+    std::cout << "=== test_cycle_compare_with_partition_acyclic_checks ===\n";
+    // Verify GroupDAG.eval_merge agrees with Partition.acyclic_merge_local
+    // on various merge candidates.
+    auto p = make_wide_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Test all pairs
+    size_t ng = part.groups.size();
+    int mismatches = 0;
+    for (size_t ga = 0; ga < ng; ga++) {
+        if (!part.groups[ga].alive) continue;
+        for (size_t gb = ga + 1; gb < ng; gb++) {
+            if (!part.groups[gb].alive) continue;
+            bool part_ok = part.acyclic_merge_local(ga, gb);
+            bool gdag_ok = !gdag.eval_merge(ga, gb);
+            if (part_ok != gdag_ok) {
+                std::cout << "  MISMATCH: merge G" << ga << ",G" << gb
+                          << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all merge pairs agree with partition", mismatches == 0);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -467,6 +693,12 @@ int main() {
     test_apply_merge_method();
     test_apply_steal_method();
     test_apply_eject_method();
+    test_cycle_merge_endpoints();
+    test_cycle_merge_after_steal();
+    test_cycle_multi_merge();
+    test_cycle_reachability_transitivity();
+    test_cycle_topo_consistency_after_moves();
+    test_cycle_compare_with_partition_acyclic_checks();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";
