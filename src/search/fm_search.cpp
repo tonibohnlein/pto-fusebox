@@ -476,7 +476,7 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             return {};
     }
 
-    part.rebuild_index();
+    part.rebuild_index(affected);
 
 #ifndef NDEBUG
     // Debug: verify no op was lost by this move

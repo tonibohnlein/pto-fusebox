@@ -52,8 +52,21 @@ void Partition::rebuild_index() {
             for (auto op : groups[i].ops)
                 op_to_groups_[op].push_back(i);
     invalidate_fwd_cache();
-    // Rebuild group DAG if it was previously built
+    // Full rebuild of group DAG if it was previously built
     if (gdag_built_) gdag_.build(*this);
+}
+
+void Partition::rebuild_index(const FlatSet<size_t>& affected) {
+    // Same as rebuild_index() for op_to_groups_ (must be full rebuild
+    // since ops may have moved between arbitrary groups).
+    op_to_groups_.assign(prob->num_ops(), {});
+    for (size_t i = 0; i < groups.size(); i++)
+        if (groups[i].alive)
+            for (auto op : groups[i].ops)
+                op_to_groups_[op].push_back(i);
+    invalidate_fwd_cache();
+    // Incremental update of group DAG for affected groups only
+    if (gdag_built_) gdag_.update(*this, affected);
 }
 
 GroupDAG& Partition::group_dag() {

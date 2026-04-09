@@ -92,6 +92,10 @@ struct Partition {
     // Also updates the incremental GroupDAG if it has been built.
     void rebuild_index();
 
+    // Rebuild op_to_groups_ + incremental GroupDAG update for affected groups.
+    // Cheaper than rebuild_index() when only a few groups changed.
+    void rebuild_index(const FlatSet<size_t>& affected);
+
     // Access the incremental group DAG.  Built lazily on first access,
     // then maintained incrementally by rebuild_index().
     GroupDAG& group_dag();
