@@ -393,68 +393,54 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
     for (auto g : chain_a) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
     for (auto g : chain_b) if (g < n) { is_in_G[g] = true; in_G_list.push_back(g); }
 
-    // For external groups, look up their chain head (cached).
-    auto head_of_g = [&](size_t g) -> size_t {
-        if (g >= n || !cp.part.groups[g].alive || is_in_G[g]) return SIZE_MAX;
-        return cp.chain_head_cached(g);
-    };
-
-    // BFS over external chain heads reachable from G.
-    // Use thread-local bool vector + vector-based queue to avoid allocations.
-    thread_local std::vector<bool> vis_head_flags;
-    thread_local std::vector<size_t> vis_head_list;
-    vis_head_flags.assign(n, false);
-    vis_head_list.clear();
+    // BFS over external groups reachable from G via group-level edges.
+    // A group-level edge gi→gj exists when some op in gi produces a tensor
+    // consumed by an op in gj (and they're different groups).
+    // Cycle: if BFS from G reaches back into G through external groups.
+    //
+    // Unlike the old chain-based BFS, this walks individual groups (no
+    // chain_head lookup, no chain-walking inner loop).
+    thread_local std::vector<bool> vis_group;
+    vis_group.assign(n, false);
     thread_local std::vector<size_t> bfs_queue;
     bfs_queue.clear();
     size_t bfs_front = 0;
 
-    auto enqueue_head = [&](size_t hj) {
-        if (hj == SIZE_MAX || hj >= n || vis_head_flags[hj]) return;
-        vis_head_flags[hj] = true;
-        vis_head_list.push_back(hj);
-        bfs_queue.push_back(hj);
+    auto enqueue_group = [&](size_t gj) {
+        if (gj >= n || vis_group[gj]) return;
+        vis_group[gj] = true;
+        bfs_queue.push_back(gj);
     };
 
     // Seed: external direct successors of each group in G.
     for (auto gi : in_G_list) {
         if (!cp.part.groups[gi].alive) continue;
         for (auto op : cp.part.groups[gi].ops) {
-            {
-                size_t t = cp.part.prob->ops[op].output();
-                for (auto cop : cp.part.dag->tensor_consumers[t]) {
-                    if (cp.part.groups[gi].ops.count(cop)) continue;
-                    for (auto gj : cp.part.groups_of(cop)) {
-                        if (!cp.part.groups[gj].alive || is_in_G[gj]) continue;
-                        enqueue_head(head_of_g(gj));
-                    }
+            size_t t = cp.part.prob->ops[op].output();
+            for (auto cop : cp.part.dag->tensor_consumers[t]) {
+                if (cp.part.groups[gi].ops.count(cop)) continue;
+                for (auto gj : cp.part.groups_of(cop)) {
+                    if (!cp.part.groups[gj].alive || is_in_G[gj]) continue;
+                    enqueue_group(gj);
                 }
             }
         }
     }
 
-    // BFS through external chains; cycle if any group in an external chain
-    // produces a tensor consumed by a group in G.
+    // BFS through external groups; cycle if any external group produces
+    // a tensor consumed by a group in G.
     while (bfs_front < bfs_queue.size()) {
-        size_t h_cur = bfs_queue[bfs_front++];
-        // Walk all groups in this external chain.
-        size_t g_cur = h_cur;
-        for (size_t steps = 0; steps <= n && g_cur != SIZE_MAX; steps++) {
-            if (!cp.part.groups[g_cur].alive) break;
-            for (auto op : cp.part.groups[g_cur].ops) {
-                {
-                    size_t t = cp.part.prob->ops[op].output();
-                    for (auto cop : cp.part.dag->tensor_consumers[t]) {
-                        if (cp.part.groups[g_cur].ops.count(cop)) continue;
-                        for (auto gj : cp.part.groups_of(cop)) {
-                            if (!cp.part.groups[gj].alive) continue;
-                            if (is_in_G[gj]) return false;  // external path back into G
-                            enqueue_head(head_of_g(gj));
-                        }
-                    }
+        size_t g_cur = bfs_queue[bfs_front++];
+        for (auto op : cp.part.groups[g_cur].ops) {
+            size_t t = cp.part.prob->ops[op].output();
+            for (auto cop : cp.part.dag->tensor_consumers[t]) {
+                if (cp.part.groups[g_cur].ops.count(cop)) continue;
+                for (auto gj : cp.part.groups_of(cop)) {
+                    if (!cp.part.groups[gj].alive) continue;
+                    if (is_in_G[gj]) return false;  // external path back into G
+                    enqueue_group(gj);
                 }
             }
-            g_cur = (g_cur < cp.next_group.size()) ? cp.next_group[g_cur] : SIZE_MAX;
         }
     }
     return true;
