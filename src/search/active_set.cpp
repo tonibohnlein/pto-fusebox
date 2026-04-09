@@ -2,8 +2,8 @@
 #include <iostream>
 #include <queue>
 
-ActiveSet::ActiveSet(const Partition& part, double floor)
-    : part_(&part), heap_(part.prob->num_ops()), floor_(floor) {}
+ActiveSet::ActiveSet(const Partition& part, double floor, const GroupDAG* gdag)
+    : part_(&part), gdag_(gdag), heap_(part.prob->num_ops()), floor_(floor) {}
 
 // ============================================================================
 // Activation
@@ -11,7 +11,7 @@ ActiveSet::ActiveSet(const Partition& part, double floor)
 
 void ActiveSet::recompute_and_update(size_t op) {
     if (locked_.count(op)) return;
-    auto move = best_move_for(*part_, op, locked_);
+    auto move = best_move_for(*part_, op, locked_, gdag_);
     if (move.valid() && move.saving > -floor_)
         heap_.push_or_update(op, move);
     else

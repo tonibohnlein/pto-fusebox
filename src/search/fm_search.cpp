@@ -1,6 +1,7 @@
 #include "search/fm_search.h"
 #include "search/partition_moves.h"
 #include "search/structural_ops.h"
+#include "core/group_dag.h"
 #include <algorithm>
 #include <iostream>
 #include <cassert>
@@ -102,7 +103,8 @@ static bool split_creates_ephemeral_gap_local(
 // ============================================================================
 
 FMMove best_move_for(const Partition& part, size_t op,
-                     const FlatSet<size_t>& locked) {
+                     const FlatSet<size_t>& locked,
+                     const GroupDAG* gdag) {
     if (locked.count(op)) return {};
 
     FMMove best;
@@ -241,7 +243,8 @@ FMMove best_move_for(const Partition& part, size_t op,
             if (std::find(merge_checked.begin(), merge_checked.end(), pair_key)
                 == merge_checked.end()) {
                 merge_checked.push_back(pair_key);
-                if (part.acyclic_merge_local(gi, gx)) {
+                if (gdag ? !gdag->eval_merge(gi, gx)
+                        : part.acyclic_merge_local(gi, gx)) {
                     FlatSet<size_t> merged_ops = part.groups[gi].ops;
                     merged_ops.insert(part.groups[gx].ops.begin(),
                                       part.groups[gx].ops.end());
@@ -308,7 +311,8 @@ FMMove best_move_for(const Partition& part, size_t op,
                                                consumer_groups.end());
 
                 // TENSOR_MERGE: local group-level BFS at eval time
-                if (part.acyclic_merge_local(group_list)) {
+                if (gdag ? !gdag->merge_creates_cycle(group_list)
+                        : part.acyclic_merge_local(group_list)) {
                     auto tmr = partition_moves::eval_tensor_merge(part, group_list);
                     if (tmr.feasible && tmr.saving > best.saving) {
                         FMMove candidate;

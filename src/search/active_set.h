@@ -15,9 +15,12 @@
 //   - Refresh: recompute moves for ops in affected groups
 // ============================================================================
 
+class GroupDAG;  // forward declaration
+
 class ActiveSet {
 public:
-    ActiveSet(const Partition& part, double floor = 0.0);
+    ActiveSet(const Partition& part, double floor = 0.0,
+              const GroupDAG* gdag = nullptr);
 
     // --- Activation ---
     void activate(size_t op);
@@ -40,6 +43,7 @@ public:
 
 private:
     const Partition* part_;
+    const GroupDAG* gdag_ = nullptr;
     PairingHeap<FMMove> heap_;
     FlatSet<size_t> locked_;
     double floor_ = 0.0;  // reject moves with saving < -floor

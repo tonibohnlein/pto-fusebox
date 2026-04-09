@@ -1,5 +1,6 @@
 #include "search/verbose.h"
 #include "search/fm_pass.h"
+#include "core/group_dag.h"
 #include <algorithm>
 #include <cassert>
 #include <iostream>
@@ -70,11 +71,15 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     double max_drift = result.start_cost * cfg.max_drift_fraction;
     double floor = result.start_cost * cfg.floor_fraction;
 
+    // Build group DAG for fast acyclicity checks during this pass.
+    GroupDAG gdag;
+    gdag.build(part);
+
     // Step 1: activate random subset of border ops
     auto candidates = all_activatable_ops(part);
     auto initial = random_subset_n(candidates, cfg.init_count, cfg.seed);
 
-    ActiveSet active(part, floor);
+    ActiveSet active(part, floor, &gdag);
     for (auto op : initial)
         active.activate(op);
 
@@ -151,6 +156,9 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
             continue;
         }
         if (move.type >= 0 && move.type < NUM_TYPES) type_applied[move.type]++;
+
+        // Update group DAG incrementally for the affected groups.
+        gdag.update(part, affected);
 
 #ifndef NDEBUG
         {
