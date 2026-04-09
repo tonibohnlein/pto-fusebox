@@ -94,6 +94,7 @@ struct Partition {
     // Must be called after rebuild_index() since it relies on op_to_groups_.
     void rebuild_group_dag();
 
+
     // Finalize for use by ordering algorithms.
     //
     // Phase 1 search (greedy descent + FM) mutates ops/cost but never updates
