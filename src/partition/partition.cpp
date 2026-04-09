@@ -57,15 +57,31 @@ void Partition::rebuild_index() {
 }
 
 void Partition::rebuild_index(const FlatSet<size_t>& affected) {
-    // Same as rebuild_index() for op_to_groups_ (must be full rebuild
-    // since ops may have moved between arbitrary groups).
+    // Full op_to_groups_ rebuild + incremental GroupDAG.
     op_to_groups_.assign(prob->num_ops(), {});
     for (size_t i = 0; i < groups.size(); i++)
         if (groups[i].alive)
             for (auto op : groups[i].ops)
                 op_to_groups_[op].push_back(i);
     invalidate_fwd_cache();
-    // Incremental update of group DAG for affected groups only
+    if (gdag_built_) gdag_.update(*this, affected);
+}
+
+void Partition::index_remove(size_t op, size_t gi) {
+    if (op >= op_to_groups_.size()) return;
+    auto& gs = op_to_groups_[op];
+    gs.erase(std::remove(gs.begin(), gs.end(), gi), gs.end());
+    invalidate_fwd_cache();
+}
+
+void Partition::index_add(size_t op, size_t gi) {
+    if (op_to_groups_.size() <= op)
+        op_to_groups_.resize(op + 1);
+    op_to_groups_[op].push_back(gi);
+    invalidate_fwd_cache();
+}
+
+void Partition::index_update_dag(const FlatSet<size_t>& affected) {
     if (gdag_built_) gdag_.update(*this, affected);
 }
 

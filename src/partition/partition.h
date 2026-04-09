@@ -93,8 +93,20 @@ struct Partition {
     void rebuild_index();
 
     // Rebuild op_to_groups_ + incremental GroupDAG update for affected groups.
-    // Cheaper than rebuild_index() when only a few groups changed.
     void rebuild_index(const FlatSet<size_t>& affected);
+
+    // --- Incremental index primitives ---
+    // Update op_to_groups_ and GroupDAG when ops move between groups.
+    // Call AFTER modifying groups[gi].ops.
+
+    // Remove op→gi mapping from op_to_groups_.
+    void index_remove(size_t op, size_t gi);
+
+    // Add op→gi mapping to op_to_groups_.
+    void index_add(size_t op, size_t gi);
+
+    // Update GroupDAG edges for the given groups (after ops moved).
+    void index_update_dag(const FlatSet<size_t>& affected);
 
     // Access the incremental group DAG.  Built lazily on first access,
     // then maintained incrementally by rebuild_index().

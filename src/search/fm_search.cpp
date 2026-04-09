@@ -413,38 +413,61 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
     if (!m.valid()) return {};
     FlatSet<size_t> affected;
 
+    bool needs_full_rebuild = false;
+
     switch (m.type) {
         case FMMove::STEAL: {
-            // FMMove::STEAL: op moves FROM m.ga INTO m.gb
+            // op moves FROM m.ga INTO m.gb — simple index update
             affected = partition_moves::apply_steal(part, m.op, m.ga, m.gb);
             if (affected.empty()) return {};
+            part.index_remove(m.op, m.ga);
+            part.index_add(m.op, m.gb);
             break;
         }
         case FMMove::MERGE: {
-            // ga survives, gb killed
+            // ga absorbs gb's ops, gb killed — move all gb ops to ga in index
+            // Capture gb's ops before apply_merge modifies them
+            std::vector<size_t> gb_ops_copy(part.groups[m.gb].ops.begin(),
+                                             part.groups[m.gb].ops.end());
             affected = partition_moves::apply_merge(part, m.ga, m.gb);
             if (affected.empty()) return {};
+            for (auto op : gb_ops_copy) {
+                part.index_remove(op, m.gb);
+                part.index_add(op, m.ga);
+            }
             break;
         }
         case FMMove::RECOMPUTE: {
+            // op added to m.gb (stays in original groups too)
             affected = partition_moves::apply_recompute(part, m.op, m.gb);
             if (affected.empty()) return {};
+            part.index_add(m.op, m.gb);
+            break;
+        }
+        case FMMove::DE_RECOMPUTE: {
+            // op removed from m.ga
+            affected = partition_moves::apply_de_recompute(part, m.ga, m.op);
+            if (affected.empty()) return {};
+            part.index_remove(m.op, m.ga);
             break;
         }
         case FMMove::EJECT:
         case FMMove::INTERNAL_EJECT: {
             affected = partition_moves::apply_eject(part, m.op, m.ga);
             if (affected.empty()) return {};
+            needs_full_rebuild = true;  // creates new groups, complex
             break;
         }
         case FMMove::SPLIT: {
             affected = partition_moves::apply_split(part, m.op, m.op2, m.ga);
             if (affected.empty()) return {};
+            needs_full_rebuild = true;  // creates new group
             break;
         }
         case FMMove::TENSOR_MERGE: {
             affected = partition_moves::apply_tensor_merge(part, m.tensor_groups);
             if (affected.empty()) return {};
+            needs_full_rebuild = true;  // multiple groups merged
             break;
         }
         case FMMove::TENSOR_EXTRACT: {
@@ -453,30 +476,55 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             affected = partition_moves::apply_tensor_extract(part, extract_ops,
                                                               m.tensor_groups);
             if (affected.empty()) return {};
-            break;
-        }
-        case FMMove::DE_RECOMPUTE: {
-            affected = partition_moves::apply_de_recompute(part, m.ga, m.op);
-            if (affected.empty()) return {};
+            needs_full_rebuild = true;  // creates new group
             break;
         }
         case FMMove::FORCE_RECOMPUTE: {
             auto frr = partition_moves::eval_force_recompute(part, m.op2);
             affected = partition_moves::apply_force_recompute(part, m.op2, frr);
             if (affected.empty()) return {};
+            needs_full_rebuild = true;  // creates new groups
             break;
         }
         case FMMove::TENSOR_EXTRACT_SPLIT: {
             affected = partition_moves::apply_tensor_extract_split(
                 part, m.split_extract_result, m.tensor_groups);
             if (affected.empty()) return {};
+            needs_full_rebuild = true;
             break;
         }
         default:
             return {};
     }
 
-    part.rebuild_index(affected);
+    if (needs_full_rebuild) {
+        part.rebuild_index(affected);
+    } else {
+        part.index_update_dag(affected);
+#ifndef NDEBUG
+        // Verify incremental index matches full rebuild
+        {
+            std::vector<std::vector<size_t>> expected(part.prob->num_ops());
+            for (size_t i = 0; i < part.groups.size(); i++)
+                if (part.groups[i].alive)
+                    for (auto op : part.groups[i].ops)
+                        expected[op].push_back(i);
+            for (size_t op = 0; op < part.prob->num_ops(); op++) {
+                auto got = part.groups_of(op);
+                auto exp = expected[op];
+                std::sort(exp.begin(), exp.end());
+                if (got.size() != exp.size() || got != exp) {
+                    std::cerr << "INDEX MISMATCH: op" << op
+                              << " got={";
+                    for (auto g : got) std::cerr << g << ",";
+                    std::cerr << "} expected={";
+                    for (auto g : exp) std::cerr << g << ",";
+                    std::cerr << "} move_type=" << (int)m.type << "\n";
+                }
+            }
+        }
+#endif
+    }
 
 #ifndef NDEBUG
     // Debug: verify no op was lost by this move
