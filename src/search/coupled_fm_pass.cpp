@@ -100,14 +100,6 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
 
         CoupledFMMove move = *move_opt;
 
-        // Deferred chain-level acyclicity check for MERGE/TENSOR_MERGE
-        // (skipped in best_coupled_move_for_op for speed).
-        if (move.type == CoupledFMMove::MERGE) {
-            if (!acyclic_chain_merge_groups(cp, {move.ga, move.gb})) continue;
-        } else if (move.type == CoupledFMMove::TENSOR_MERGE) {
-            if (!acyclic_chain_merge_groups(cp, move.tensor_groups)) continue;
-        }
-
         // Extra locks before apply
         std::vector<size_t> extra_locks;
         if (move.type == CoupledFMMove::MERGE) {
