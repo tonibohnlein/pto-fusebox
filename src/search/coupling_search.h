@@ -59,7 +59,10 @@ struct CoupledPartition {
     size_t chain_head_cached(size_t g) const;    // cached version (lazy, invalidated on coupling change)
     size_t chain_tail(size_t g) const;           // follow next_group to end
     std::vector<size_t> chain_of(size_t g) const; // head-to-tail group list
-    void invalidate_chain_cache() const { chain_head_cache_.clear(); }
+    void invalidate_chain_cache() const {
+        chain_head_cache_.clear();
+        coupled_gdag_built_ = false;
+    }
 
 private:
     mutable std::vector<size_t> chain_head_cache_;
@@ -76,6 +79,18 @@ public:
             if (tensors.count(t)) return true;
         return false;
     }
+
+    // --- Coupled GroupDAG ---
+    // Group adjacency (tensor edges) + coupling edges (next_group).
+    // Used for fast cycle detection, replacing acyclic_chain_merge BFS.
+    GroupDAG& coupled_dag();
+    const GroupDAG& coupled_dag() const;
+    void rebuild_coupled_dag();
+
+private:
+    mutable GroupDAG coupled_gdag_;
+    mutable bool coupled_gdag_built_ = false;
+public:
 
     // --- Cost ---
 

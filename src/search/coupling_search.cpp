@@ -32,8 +32,32 @@ void CoupledPartition::init_from(Partition p, CostCache* cache) {
     retained.clear();
 }
 
+void CoupledPartition::rebuild_coupled_dag() {
+    // Build from partition's tensor edges
+    coupled_gdag_.build(part);
+    // Add coupling edges
+    for (size_t g = 0; g < next_group.size(); g++)
+        if (next_group[g] != SIZE_MAX && g < part.groups.size() &&
+            part.groups[g].alive && next_group[g] < part.groups.size() &&
+            part.groups[next_group[g]].alive)
+            coupled_gdag_.add_edge(g, next_group[g]);
+    coupled_gdag_.rebuild_topo(part);
+    coupled_gdag_built_ = true;
+}
+
+GroupDAG& CoupledPartition::coupled_dag() {
+    if (!coupled_gdag_built_) rebuild_coupled_dag();
+    return coupled_gdag_;
+}
+
+const GroupDAG& CoupledPartition::coupled_dag() const {
+    if (!coupled_gdag_built_)
+        const_cast<CoupledPartition*>(this)->rebuild_coupled_dag();
+    return coupled_gdag_;
+}
+
 void CoupledPartition::invalidate_couplings() {
-    invalidate_chain_cache();
+    invalidate_chain_cache();  // also invalidates coupled_gdag_
     const DAG& dag = *part.dag;
     for (size_t g = 0; g < next_group.size(); g++) {
         size_t h = next_group[g];
@@ -76,7 +100,7 @@ void CoupledPartition::invalidate_couplings() {
 }
 
 void CoupledPartition::fix_chain_couplings() {
-    invalidate_chain_cache();
+    invalidate_chain_cache();  // also invalidates coupled_gdag_
     // Mutations can create new group DAG edges that make existing coupling links
     // form a cycle in the chain-level DAG.  Detect and remove them.
     //
@@ -91,24 +115,24 @@ void CoupledPartition::fix_chain_couplings() {
             if (gb == SIZE_MAX) continue;
             if (!part.groups[ga].alive || !part.groups[gb].alive) continue;
 
-            // Temporarily disconnect ga→gb so chain_of correctly splits.
+            // Temporarily disconnect ga→gb and check if reconnecting
+            // would create a cycle.
             next_group[ga] = SIZE_MAX;
             prev_group[gb] = SIZE_MAX;
+            invalidate_chain_cache();  // rebuild coupled DAG without this edge
 
-            auto chain_a = chain_of(ga);
-            auto chain_b = chain_of(gb);
+            bool would_cycle = coupled_dag().can_reach(gb, ga);
 
-            // Restore the link.
-            next_group[ga] = gb;
-            prev_group[gb] = ga;
-
-            if (!acyclic_chain_merge(*this, chain_a, chain_b)) {
-                // Remove this coupling link.
-                next_group[ga] = SIZE_MAX;
-                prev_group[gb] = SIZE_MAX;
+            if (would_cycle) {
+                // Leave disconnected — remove this coupling link.
                 retained.erase({ga, gb});
                 changed = true;
                 break;  // Restart — chain heads changed.
+            } else {
+                // Restore the link — no cycle.
+                next_group[ga] = gb;
+                prev_group[gb] = ga;
+                invalidate_chain_cache();
             }
         }
     }
@@ -448,13 +472,16 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
 
 bool acyclic_chain_merge_groups(const CoupledPartition& cp,
                                   const std::vector<size_t>& groups) {
+    // Collect all groups in the chains of the merge candidates.
     std::vector<size_t> all_in_chains;
     for (auto g : groups) {
         if (g >= cp.part.groups.size() || !cp.part.groups[g].alive) continue;
         auto ch = cp.chain_of(g);
         all_in_chains.insert(all_in_chains.end(), ch.begin(), ch.end());
     }
-    return acyclic_chain_merge(cp, all_in_chains, {});
+    if (all_in_chains.size() < 2) return true;
+    // Check if merging these groups creates a cycle in the coupled DAG.
+    return !cp.coupled_dag().merge_creates_cycle(all_in_chains);
 }
 
 // ============================================================================
@@ -488,12 +515,9 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
     }
 
     // Chain-level acyclicity: the merged chain (chain_of(ga) ++ chain_of(gb))
-    // must not create a cycle in the chain-level DAG.  The stronger chain-level
-    // check (vs the old acyclic_merge_local) BFS's through entire external
-    // chains, catching cross-chain dependency cycles.
-    auto chain_a = cp.chain_of(ga);
-    auto chain_b = cp.chain_of(gb);
-    if (!acyclic_chain_merge(cp, chain_a, chain_b)) return {};
+    // Cycle check: adding coupling edge ga→gb creates a cycle iff
+    // gb can already reach ga in the coupled DAG (tensor + coupling edges).
+    if (cp.coupled_dag().can_reach(gb, ga)) return {};
 
     // Cost delta: (cost before) - (cost after adding retention).
     auto ga_enter  = cp.entering_for(ga);
@@ -674,10 +698,8 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     if (!cp.part.groups[g_dst].ops.count(op_a_dst)) return {};
     if (!is_boundary_input_of(cp.part.groups[g_dst].ops, t, dag)) return {};
 
-    // Chain-level acyclicity: same check as COUPLE.
-    auto chain_a = cp.chain_of(ga);
-    auto chain_b = cp.chain_of(g_dst);
-    if (!acyclic_chain_merge(cp, chain_a, chain_b)) return {};
+    // Cycle check: coupling ga→g_dst. Cycle iff g_dst reaches ga.
+    if (cp.coupled_dag().can_reach(g_dst, ga)) return {};
 
     // Split g_dst at bridge (op_a_dst, op_b_dst): side_a gets op_a_dst.
     auto sr = cp.part.eval_split(op_a_dst, op_b_dst, g_dst);
