@@ -2,6 +2,7 @@
 #include "search/local_search.h"
 #include "search/fm_search.h"
 #include "search/feasibility.h"
+#include "core/group_dag.h"
 #include "util/pairing_heap.h"
 #include <iostream>
 #include <cassert>
@@ -15,9 +16,12 @@ Partition greedy_descent(Partition part) {
     const size_t num_ops = part.prob->num_ops();
     PairingHeap<FMMove> heap(num_ops);
 
+    GroupDAG gdag;
+    gdag.build(part);
+
     // Initialize: best move per op (no locked ops for greedy)
     for (size_t op = 0; op < num_ops; op++) {
-        auto m = best_move_for(part, op);
+        auto m = best_move_for(part, op, {}, &gdag);
         if (m.valid() && m.saving > 0.001)
             heap.push_or_update(op, m);
     }
@@ -41,6 +45,8 @@ Partition greedy_descent(Partition part) {
             rejected++;
             continue;
         }
+
+        gdag.apply_generic(part, affected);
 
 #ifndef NDEBUG
         {
@@ -73,7 +79,7 @@ Partition greedy_descent(Partition part) {
 
         // Update each affected op in the heap
         for (auto op : affected_ops) {
-            auto fresh = best_move_for(part, op);
+            auto fresh = best_move_for(part, op, {}, &gdag);
             if (fresh.valid() && fresh.saving > 0.001)
                 heap.push_or_update(op, fresh);
             else
