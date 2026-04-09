@@ -6,6 +6,7 @@
 #include "core/group_dag.h"
 #include "core/types.h"
 #include "partition/partition.h"
+#include "search/coupling_search.h"
 #include "search/fm_search.h"
 #include "search/partition_moves.h"
 #include <iostream>
@@ -1255,6 +1256,190 @@ void test_coupled_gdag_add_remove_edge() {
     CHECK("after remove: topo valid G0<G2", gdag.topo_pos(0) < gdag.topo_pos(2));
 }
 
+// ============================================================================
+// Cross-validate coupled GroupDAG against old acyclic_chain_merge
+// ============================================================================
+
+// The cycle5 topology from coupling_moves_test:
+//   Op0→T1→Op2, Op1→T2→Op4, Op2→T3→Op3, Op3→T4→Op4, Op4→T5
+static Problem make_cycle5() {
+    Problem p;
+    for (int i = 0; i <= 5; i++) p.tensors.push_back({64, 64});
+    p.ops.push_back({OpType::Pointwise, {0}, {1}, 200});  // Op0
+    p.ops.push_back({OpType::Pointwise, {1}, {2}, 200});  // Op1
+    p.ops.push_back({OpType::Pointwise, {1}, {3}, 200});  // Op2
+    p.ops.push_back({OpType::Pointwise, {3}, {4}, 200});  // Op3
+    p.ops.push_back({OpType::Pointwise, {2, 4}, {5}, 200}); // Op4
+    p.fast_memory_capacity = 20000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 64; p.native_h = 64;
+    p.retainable_tensors = {1, 2, 3, 4};
+    return p;
+}
+
+void test_coupled_gdag_vs_old_chain_merge() {
+    std::cout << "=== test_coupled_gdag_vs_old_chain_merge ===\n";
+    // Build coupled partition with chains, then compare
+    // acyclic_chain_merge_groups vs coupled_dag().merge_creates_cycle
+    // for all group pairs.
+    auto p = make_cycle5();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.finalize();
+    CoupledPartition cp;
+    cp.init_from(std::move(part));
+
+    // Set up chains: C_A = G0→G2, C_B = G3→G4
+    apply_couple(cp, 0, 2, 1);  // T1
+    apply_couple(cp, 3, 4, 4);  // T4
+
+    // Compare acyclic_chain_merge_groups vs coupled_dag().merge_creates_cycle
+    // for all group pairs
+    int mismatches = 0;
+    size_t ng = cp.part.groups.size();
+    for (size_t ga = 0; ga < ng; ga++) {
+        if (!cp.part.groups[ga].alive) continue;
+        for (size_t gb = ga + 1; gb < ng; gb++) {
+            if (!cp.part.groups[gb].alive) continue;
+
+            bool old_ok = acyclic_chain_merge_groups(cp, {ga, gb});
+
+            // For the coupled DAG, collect all chain groups
+            std::vector<size_t> all_chain_groups;
+            auto ch_a = cp.chain_of(ga);
+            auto ch_b = cp.chain_of(gb);
+            all_chain_groups.insert(all_chain_groups.end(), ch_a.begin(), ch_a.end());
+            all_chain_groups.insert(all_chain_groups.end(), ch_b.begin(), ch_b.end());
+            // Deduplicate
+            std::sort(all_chain_groups.begin(), all_chain_groups.end());
+            all_chain_groups.erase(std::unique(all_chain_groups.begin(),
+                                                all_chain_groups.end()),
+                                    all_chain_groups.end());
+
+            bool new_ok = !cp.coupled_dag().merge_creates_cycle(all_chain_groups);
+
+            if (old_ok != new_ok) {
+                std::cout << "  MISMATCH: merge G" << ga << ",G" << gb
+                          << " old=" << old_ok << " new=" << new_ok
+                          << " chains=[";
+                for (auto g : all_chain_groups) std::cout << g << ",";
+                std::cout << "]\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all chain merge checks agree", mismatches == 0);
+}
+
+void test_coupled_gdag_couple_eval() {
+    std::cout << "=== test_coupled_gdag_couple_eval ===\n";
+    // Test that coupled_dag().can_reach(gb, ga) gives the right answer
+    // for COUPLE(ga→gb) on the cycle5 topology.
+    auto p = make_cycle5();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.finalize();
+    CoupledPartition cp;
+    cp.init_from(std::move(part));
+
+    // No coupling yet. Test all COUPLE candidates:
+    // COUPLE(ga→gb) is acyclic iff merging chain_of(ga) ∪ chain_of(gb)
+    // does NOT create a cycle in the coupled DAG.
+    int mismatches = 0;
+    size_t ng = cp.part.groups.size();
+    for (size_t ga = 0; ga < ng; ga++) {
+        if (!cp.part.groups[ga].alive) continue;
+        for (size_t gb = 0; gb < ng; gb++) {
+            if (ga == gb || !cp.part.groups[gb].alive) continue;
+
+            bool old_ok = acyclic_chain_merge_groups(cp, {ga, gb});
+
+            // New check: merge chain groups in coupled DAG
+            auto chain_a = cp.chain_of(ga);
+            auto chain_b = cp.chain_of(gb);
+            std::vector<size_t> all;
+            all.insert(all.end(), chain_a.begin(), chain_a.end());
+            all.insert(all.end(), chain_b.begin(), chain_b.end());
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
+            bool new_ok = !cp.coupled_dag().merge_creates_cycle(all);
+
+            if (old_ok != new_ok) {
+                std::cout << "  MISMATCH: couple G" << ga << "→G" << gb
+                          << " old=" << old_ok << " new=" << new_ok
+                          << " chains=[";
+                for (auto g : all) std::cout << g << ",";
+                std::cout << "]\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all couple evals agree (no chains)", mismatches == 0);
+
+    // Now add chains and re-test
+    apply_couple(cp, 0, 2, 1);
+    apply_couple(cp, 3, 4, 4);
+
+    mismatches = 0;
+    for (size_t ga = 0; ga < ng; ga++) {
+        if (!cp.part.groups[ga].alive) continue;
+        if (ga >= cp.next_group.size() || cp.next_group[ga] != SIZE_MAX) continue;
+        for (size_t gb = 0; gb < ng; gb++) {
+            if (ga == gb || !cp.part.groups[gb].alive) continue;
+            if (gb >= cp.prev_group.size() || cp.prev_group[gb] != SIZE_MAX) continue;
+
+            bool old_ok = acyclic_chain_merge_groups(cp, {ga, gb});
+
+            auto chain_a = cp.chain_of(ga);
+            auto chain_b = cp.chain_of(gb);
+            std::vector<size_t> all;
+            all.insert(all.end(), chain_a.begin(), chain_a.end());
+            all.insert(all.end(), chain_b.begin(), chain_b.end());
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
+            bool new_ok = !cp.coupled_dag().merge_creates_cycle(all);
+
+            if (old_ok != new_ok) {
+                std::cout << "  MISMATCH: couple G" << ga << "→G" << gb
+                          << " (with chains) old=" << old_ok << " new=" << new_ok
+                          << " chains=[";
+                for (auto g : all) std::cout << g << ",";
+                std::cout << "]\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all couple evals agree (with chains)", mismatches == 0);
+}
+
+void test_coupled_gdag_merge_after_coupling() {
+    std::cout << "=== test_coupled_gdag_merge_after_coupling ===\n";
+    // Set up chains, then test MERGE candidates
+    auto p = make_cycle5();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.finalize();
+    CoupledPartition cp;
+    cp.init_from(std::move(part));
+
+    apply_couple(cp, 0, 2, 1);
+    apply_couple(cp, 3, 4, 4);
+
+    // The key test from coupling_moves_test: merge G2+G3 should create cycle
+    bool old_ok = acyclic_chain_merge_groups(cp, {2, 3});
+    CHECK("old: merge G2,G3 creates cycle", !old_ok);
+
+    std::vector<size_t> all_chains;
+    auto ch2 = cp.chain_of(2);  // [0, 2]
+    auto ch3 = cp.chain_of(3);  // [3, 4]
+    all_chains.insert(all_chains.end(), ch2.begin(), ch2.end());
+    all_chains.insert(all_chains.end(), ch3.begin(), ch3.end());
+    bool new_ok = !cp.coupled_dag().merge_creates_cycle(all_chains);
+    CHECK("new: merge G2,G3 creates cycle", !new_ok);
+
+    CHECK("old and new agree on G2,G3", old_ok == new_ok);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -1299,8 +1484,9 @@ int main() {
     test_coupled_gdag_basic();
     test_coupled_gdag_cycle_detection();
     test_coupled_gdag_add_remove_edge();
-
-    // (test functions defined above main)
+    test_coupled_gdag_vs_old_chain_merge();
+    test_coupled_gdag_couple_eval();
+    test_coupled_gdag_merge_after_coupling();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";

@@ -515,9 +515,16 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
     }
 
     // Chain-level acyclicity: the merged chain (chain_of(ga) ++ chain_of(gb))
-    // Cycle check: adding coupling edge ga→gb creates a cycle iff
-    // gb can already reach ga in the coupled DAG (tensor + coupling edges).
-    if (cp.coupled_dag().can_reach(gb, ga)) return {};
+    // Cycle check: coupling chain_of(ga)→chain_of(gb). Cycle iff the merged
+    // chains create a back-edge through external groups in the coupled DAG.
+    {
+        auto chain_a = cp.chain_of(ga);
+        auto chain_b = cp.chain_of(gb);
+        std::vector<size_t> all;
+        all.insert(all.end(), chain_a.begin(), chain_a.end());
+        all.insert(all.end(), chain_b.begin(), chain_b.end());
+        if (cp.coupled_dag().merge_creates_cycle(all)) return {};
+    }
 
     // Cost delta: (cost before) - (cost after adding retention).
     auto ga_enter  = cp.entering_for(ga);
@@ -698,8 +705,15 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     if (!cp.part.groups[g_dst].ops.count(op_a_dst)) return {};
     if (!is_boundary_input_of(cp.part.groups[g_dst].ops, t, dag)) return {};
 
-    // Cycle check: coupling ga→g_dst. Cycle iff g_dst reaches ga.
-    if (cp.coupled_dag().can_reach(g_dst, ga)) return {};
+    // Cycle check: coupling chain_of(ga)→chain_of(g_dst).
+    {
+        auto chain_a = cp.chain_of(ga);
+        auto chain_b = cp.chain_of(g_dst);
+        std::vector<size_t> all;
+        all.insert(all.end(), chain_a.begin(), chain_a.end());
+        all.insert(all.end(), chain_b.begin(), chain_b.end());
+        if (cp.coupled_dag().merge_creates_cycle(all)) return {};
+    }
 
     // Split g_dst at bridge (op_a_dst, op_b_dst): side_a gets op_a_dst.
     auto sr = cp.part.eval_split(op_a_dst, op_b_dst, g_dst);
