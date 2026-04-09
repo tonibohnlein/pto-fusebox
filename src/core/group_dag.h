@@ -74,30 +74,39 @@ public:
     }
 
     // --- Move-specific eval/apply ---
+    //
     // eval_* returns true if the move would create a cycle.
-    // apply_* applies the structural change and repairs topo order.
-    // All assume rebuild_index() has NOT yet been called (pre-move state).
+    // All eval methods use OR-semantics for recomputation: when an op exists
+    // in multiple groups, a dependency on its output is satisfied if AT LEAST
+    // ONE producer group can be scheduled before the consumer.
+    //
+    // apply_generic recomputes edges for affected groups and repairs topo order.
+    // Call after rebuild_index() on the partition.
 
     // MERGE(ga absorbs gb): contract two nodes.
-    // Eval: does any external successor of {ga,gb} reach back to {ga,gb}?
+    // Cycle iff external successors of {ga,gb} reach back to {ga,gb}.
     bool eval_merge(size_t ga, size_t gb) const;
-    void apply_merge(const Partition& part, size_t ga, size_t gb,
-                     const FlatSet<size_t>& affected);
 
     // STEAL(op from ga to gb): move op between groups.
-    // Eval: after moving op, do the new edges create a cycle?
+    // Three checks with OR-semantics:
+    //   1. gb gains op → gb's new input dependencies create a cycle?
+    //   2. ga loses op → if op's output was consumed internally, ga now
+    //      depends on remaining copies. Cycle iff ALL copies reachable from ga.
+    //   3. External consumers of op's output lose ga as source. Cycle iff
+    //      ALL remaining sources reachable from each consumer.
     bool eval_steal(const Partition& part, size_t op, size_t from, size_t to) const;
-    void apply_steal(const Partition& part, const FlatSet<size_t>& affected);
 
-    // SPLIT(ga into side_a at ga, side_b at gb_new): expand one node into two.
-    void apply_split(const Partition& part, const FlatSet<size_t>& affected);
+    // RECOMPUTE(op into gb): add op to gb (op stays in other groups).
+    // gb gains new input dependencies. Cycle iff ALL producer groups of each
+    // input are reachable from gb (no source can precede gb).
+    bool eval_recompute(const Partition& part, size_t op, size_t gb) const;
 
-    // EJECT(op from ga → singleton): remove op, may split remainder.
-    void apply_eject(const Partition& part, const FlatSet<size_t>& affected);
+    // DE_RECOMPUTE(op from ga): remove op's copy from ga.
+    // ga loses op's output as internal source. Cycle iff ALL remaining
+    // copies are reachable from ga / from external consumers.
+    bool eval_de_recompute(const Partition& part, size_t op, size_t ga) const;
 
-    // Generic apply: recompute edges for affected groups and repair topo order.
-    // Works for any move type. The specific apply_* methods above are shortcuts
-    // that may be faster for common cases.
+    // Apply: recompute edges for affected groups and repair topo order.
     void apply_generic(const Partition& part, const FlatSet<size_t>& affected);
 
     size_t size() const { return succs_.size(); }

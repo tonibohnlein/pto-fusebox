@@ -182,44 +182,126 @@ bool GroupDAG::eval_merge(size_t ga, size_t gb) const {
     return merge_creates_cycle({ga, gb});
 }
 
-void GroupDAG::apply_merge(const Partition& part, size_t ga, size_t gb,
-                            const FlatSet<size_t>& affected) {
-    apply_generic(part, affected);
+bool GroupDAG::eval_recompute(const Partition& part, size_t op, size_t gb) const {
+    if (!part.prob || !part.dag) return false;
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
+
+    // Adding op to gb: for each input T of op not already consumed in gb,
+    // gb gains a new OR-constraint.  Cycle iff ALL producer groups of T
+    // are reachable from gb (none can be placed before gb).
+    for (auto t : prob.ops[op].inputs) {
+        // Skip if T already consumed by another op in gb
+        bool already = false;
+        for (auto cop : dag.tensor_consumers[t])
+            if (cop != op && part.groups[gb].ops.count(cop)) { already = true; break; }
+        if (already) continue;
+
+        int prod = dag.tensor_producer[t];
+        if (prod < 0) continue;
+        if (part.groups[gb].ops.count((size_t)prod)) continue;  // internal
+
+        // OR: need at least one producer group NOT reachable from gb
+        bool any_free = false;
+        for (auto gp : part.groups_of((size_t)prod)) {
+            if (gp != gb && part.groups[gp].alive && !can_reach(gb, gp)) {
+                any_free = true;
+                break;
+            }
+        }
+        if (!any_free) return true;  // cycle
+    }
+    return false;
+}
+
+bool GroupDAG::eval_de_recompute(const Partition& part, size_t op, size_t ga) const {
+    if (!part.prob || !part.dag) return false;
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
+
+    // Removing op from ga: build set S = groups_of(op) − {ga} (remaining copies)
+    std::vector<size_t> S;
+    for (auto gother : part.groups_of(op))
+        if (gother != ga && part.groups[gother].alive) S.push_back(gother);
+
+    size_t t = prob.ops[op].output();
+
+    // Part 1: internal consumers in ga lose their ephemeral source.
+    // ga now needs T from S.  Cycle iff ALL gP ∈ S are reachable from ga.
+    bool consumed_in_ga = false;
+    for (auto cop : dag.tensor_consumers[t])
+        if (cop != op && part.groups[ga].ops.count(cop)) { consumed_in_ga = true; break; }
+    if (consumed_in_ga) {
+        bool any_free = false;
+        for (auto gP : S)
+            if (!can_reach(ga, gP)) { any_free = true; break; }
+        if (!any_free) return true;
+    }
+
+    // Part 2: external consumers that got T from ga now must get it from S.
+    // For each consumer group gc: cycle iff ALL gP ∈ S are reachable from gc.
+    if (!S.empty()) {
+        for (auto cop : dag.tensor_consumers[t]) {
+            if (part.groups[ga].ops.count(cop)) continue;  // internal
+            for (auto gc : part.groups_of(cop)) {
+                if (!part.groups[gc].alive || gc == ga) continue;
+                bool any_free = false;
+                for (auto gP : S)
+                    if (!can_reach(gc, gP)) { any_free = true; break; }
+                if (!any_free) return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool GroupDAG::eval_steal(const Partition& part, size_t op,
                            size_t from, size_t to) const {
-    // After stealing, `from` loses edges related to op's tensors,
-    // `to` gains them. Check if the new edges create a cycle.
-    // Quick check: if `to` cannot currently reach `from`, no new cycle
-    // is possible (the steal only adds edges from `to`'s predecessors
-    // to `to`, not backward edges).
-    // But stealing can also change `from`'s edges — a tensor that was
-    // internal to `from` might become a boundary output.
-    // Conservative: just check if `to` can reach `from` via the current DAG.
-    // If yes, adding more edges from `to` might tighten the constraint.
-    // For now, defer to apply_generic + repair_topo_order for correctness.
-    // The fast path is: if topo_pos_[to] > topo_pos_[from], no cycle.
-    if (topo_pos_[to] >= 0 && topo_pos_[from] >= 0 &&
-        topo_pos_[to] > topo_pos_[from])
-        return false;
-    // Can't rule it out cheaply — caller should apply and check.
-    return true;  // conservative: might create cycle
-}
+    if (!part.prob || !part.dag) return false;
 
-void GroupDAG::apply_steal(const Partition& part,
-                            const FlatSet<size_t>& affected) {
-    apply_generic(part, affected);
-}
+    // Part 1: `to` gains op → same check as recompute(op, to)
+    if (eval_recompute(part, op, to)) return true;
 
-void GroupDAG::apply_split(const Partition& part,
-                            const FlatSet<size_t>& affected) {
-    apply_generic(part, affected);
-}
+    // Part 2: `from` loses op → same check as de_recompute(op, from)
+    // BUT: op moves to `to`, not removed entirely. So the source set S
+    // includes `to` in addition to any existing copies (excluding `from`).
+    const auto& prob = *part.prob;
+    const auto& dag = *part.dag;
 
-void GroupDAG::apply_eject(const Partition& part,
-                            const FlatSet<size_t>& affected) {
-    apply_generic(part, affected);
+    std::vector<size_t> S;
+    if (part.groups[to].alive) S.push_back(to);
+    for (auto gother : part.groups_of(op))
+        if (gother != from && gother != to && part.groups[gother].alive)
+            S.push_back(gother);
+
+    size_t t = prob.ops[op].output();
+
+    // Part 2a: internal consumers in `from` lose ephemeral source
+    bool consumed_in_from = false;
+    for (auto cop : dag.tensor_consumers[t])
+        if (cop != op && part.groups[from].ops.count(cop))
+            { consumed_in_from = true; break; }
+    if (consumed_in_from) {
+        bool any_free = false;
+        for (auto gP : S)
+            if (!can_reach(from, gP)) { any_free = true; break; }
+        if (!any_free) return true;
+    }
+
+    // Part 3: external consumers of op's output lose `from` as source
+    if (!S.empty()) {
+        for (auto cop : dag.tensor_consumers[t]) {
+            for (auto gc : part.groups_of(cop)) {
+                if (!part.groups[gc].alive || gc == from || gc == to) continue;
+                bool any_free = false;
+                for (auto gP : S)
+                    if (!can_reach(gc, gP)) { any_free = true; break; }
+                if (!any_free) return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 void GroupDAG::apply_generic(const Partition& part,

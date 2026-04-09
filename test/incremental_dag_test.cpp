@@ -402,7 +402,7 @@ void test_apply_merge_method() {
     double mc = part.eval_set({0, 1});
     auto affected = partition_moves::apply_merge(part, 0, 1, mc);
     part.rebuild_index();
-    gdag.apply_merge(part, 0, 1, affected);
+    gdag.apply_generic(part, affected);
 
     CHECK("apply_merge matches full", verify_matches_full(gdag, part, "apply_merge"));
     CHECK("topo still valid G0<G3", gdag.topo_pos(0) < gdag.topo_pos(3));
@@ -420,7 +420,7 @@ void test_apply_steal_method() {
 
     auto affected = partition_moves::apply_steal(part, 1, 1, 0);
     part.rebuild_index();
-    gdag.apply_steal(part, affected);
+    gdag.apply_generic(part, affected);
 
     CHECK("apply_steal matches full", verify_matches_full(gdag, part, "apply_steal"));
 }
@@ -443,7 +443,7 @@ void test_apply_eject_method() {
     if (!er.feasible) { std::cout << "  skip\n"; return; }
     auto affected = partition_moves::apply_eject(part, 1, 0);
     part.rebuild_index();
-    gdag.apply_eject(part, affected);
+    gdag.apply_generic(part, affected);
 
     CHECK("apply_eject matches full", verify_matches_full(gdag, part, "apply_eject"));
 }
@@ -519,7 +519,7 @@ void test_cycle_merge_after_steal() {
     auto affected = partition_moves::apply_steal(part, 1, 1, 0);
     CHECK("steal applied", !affected.empty());
     part.rebuild_index();
-    gdag.apply_steal(part, affected);
+    gdag.apply_generic(part, affected);
 
     CHECK("post-steal adjacency correct", verify_matches_full(gdag, part, "steal"));
     CHECK("post-steal G0 reaches G2", gdag.can_reach(0, 2));
@@ -548,7 +548,7 @@ void test_cycle_multi_merge() {
     double mc = part.eval_set({2, 3});
     auto a1 = partition_moves::apply_merge(part, 2, 3, mc);
     part.rebuild_index();
-    gdag.apply_merge(part, 2, 3, a1);
+    gdag.apply_generic(part, a1);
     CHECK("post-merge matches", verify_matches_full(gdag, part, "merge23"));
 
     // Now G2={Op2,Op3}. Merge G2+G4 should be safe (G2 feeds G4).
@@ -625,21 +625,21 @@ void test_cycle_topo_consistency_after_moves() {
     double mc = part.eval_set({2, 3});
     auto a1 = partition_moves::apply_merge(part, 2, 3, mc);
     part.rebuild_index();
-    gdag.apply_merge(part, 2, 3, a1);
+    gdag.apply_generic(part, a1);
     CHECK("post-merge23 topo consistent", check_topo_consistent("merge23"));
 
     // Merge G0+G1
     double mc2 = part.eval_set({0, 1});
     auto a2 = partition_moves::apply_merge(part, 0, 1, mc2);
     part.rebuild_index();
-    gdag.apply_merge(part, 0, 1, a2);
+    gdag.apply_generic(part, a2);
     CHECK("post-merge01 topo consistent", check_topo_consistent("merge01"));
 
     // Merge G0+G2 (now G0={Op0,Op1}, G2={Op2,Op3})
     double mc3 = part.eval_set({0, 1, 2, 3});
     auto a3 = partition_moves::apply_merge(part, 0, 2, mc3);
     part.rebuild_index();
-    gdag.apply_merge(part, 0, 2, a3);
+    gdag.apply_generic(part, a3);
     CHECK("post-merge02 topo consistent", check_topo_consistent("merge02"));
 }
 
@@ -674,6 +674,159 @@ void test_cycle_compare_with_partition_acyclic_checks() {
     CHECK("all merge pairs agree with partition", mismatches == 0);
 }
 
+void test_eval_steal_vs_partition() {
+    std::cout << "=== test_eval_steal_vs_partition ===\n";
+    // Compare GroupDAG::eval_steal with Partition::acyclic_steal_local
+    // on all valid steal candidates in a chain.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    for (size_t op = 0; op < p.num_ops(); op++) {
+        for (size_t from = 0; from < part.groups.size(); from++) {
+            if (!part.groups[from].alive || !part.groups[from].ops.count(op)) continue;
+            for (size_t to = 0; to < part.groups.size(); to++) {
+                if (to == from || !part.groups[to].alive) continue;
+                bool part_ok = part.acyclic_steal_local(op, from, to);
+                bool gdag_ok = !gdag.eval_steal(part, op, from, to);
+                if (part_ok != gdag_ok) {
+                    std::cout << "  MISMATCH: steal op" << op << " from G" << from
+                              << " to G" << to << " partition=" << part_ok
+                              << " gdag=" << gdag_ok << "\n";
+                    mismatches++;
+                }
+            }
+        }
+    }
+    CHECK("all steal checks agree", mismatches == 0);
+}
+
+void test_eval_recompute_vs_partition() {
+    std::cout << "=== test_eval_recompute_vs_partition ===\n";
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    for (size_t op = 0; op < p.num_ops(); op++) {
+        for (size_t gb = 0; gb < part.groups.size(); gb++) {
+            if (!part.groups[gb].alive) continue;
+            if (part.groups[gb].ops.count(op)) continue;  // already in gb
+            bool part_ok = part.acyclic_recompute_local(op, gb);
+            bool gdag_ok = !gdag.eval_recompute(part, op, gb);
+            if (part_ok != gdag_ok) {
+                std::cout << "  MISMATCH: recompute op" << op << " into G" << gb
+                          << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("all recompute checks agree", mismatches == 0);
+}
+
+void test_eval_de_recompute_vs_partition() {
+    std::cout << "=== test_eval_de_recompute_vs_partition ===\n";
+    // Need a partition with recomputation to test de_recompute.
+    // Chain: G0={Op0,Op1}, G1={Op0,Op2}, G2={Op3} — Op0 recomputed.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    // Set up recomputation: Op0 in both G0 and G1
+    part.groups[0].ops = {0, 1};
+    part.groups[0].cost = part.eval_set({0, 1});
+    part.groups[1].ops = {0, 2};
+    part.groups[1].cost = part.eval_set({0, 2});
+    part.groups[2].alive = false;  // Op2 moved to G1
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    // Op0 is in G0 and G1
+    CHECK("op0 in 2 groups", part.groups_of(0).size() == 2);
+
+    // Compare de_recompute checks
+    int mismatches = 0;
+    for (size_t gi = 0; gi < part.groups.size(); gi++) {
+        if (!part.groups[gi].alive) continue;
+        if (!part.groups[gi].ops.count(0)) continue;
+        bool part_ok = part.acyclic_de_recompute_local(0, gi);
+        bool gdag_ok = !gdag.eval_de_recompute(part, 0, gi);
+        if (part_ok != gdag_ok) {
+            std::cout << "  MISMATCH: de_recompute op0 from G" << gi
+                      << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+            mismatches++;
+        }
+    }
+    CHECK("all de_recompute checks agree", mismatches == 0);
+}
+
+void test_eval_steal_diamond() {
+    std::cout << "=== test_eval_steal_diamond ===\n";
+    // Diamond: more complex steal scenarios
+    auto p = make_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    for (size_t op = 0; op < p.num_ops(); op++) {
+        for (size_t from = 0; from < part.groups.size(); from++) {
+            if (!part.groups[from].alive || !part.groups[from].ops.count(op)) continue;
+            for (size_t to = 0; to < part.groups.size(); to++) {
+                if (to == from || !part.groups[to].alive) continue;
+                bool part_ok = part.acyclic_steal_local(op, from, to);
+                bool gdag_ok = !gdag.eval_steal(part, op, from, to);
+                if (part_ok != gdag_ok) {
+                    std::cout << "  MISMATCH: steal op" << op << " from G" << from
+                              << " to G" << to << " partition=" << part_ok
+                              << " gdag=" << gdag_ok << "\n";
+                    mismatches++;
+                }
+            }
+        }
+    }
+    CHECK("diamond steal checks agree", mismatches == 0);
+}
+
+void test_eval_recompute_diamond() {
+    std::cout << "=== test_eval_recompute_diamond ===\n";
+    auto p = make_diamond();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+
+    GroupDAG gdag;
+    gdag.build(part);
+
+    int mismatches = 0;
+    for (size_t op = 0; op < p.num_ops(); op++) {
+        for (size_t gb = 0; gb < part.groups.size(); gb++) {
+            if (!part.groups[gb].alive || part.groups[gb].ops.count(op)) continue;
+            bool part_ok = part.acyclic_recompute_local(op, gb);
+            bool gdag_ok = !gdag.eval_recompute(part, op, gb);
+            if (part_ok != gdag_ok) {
+                std::cout << "  MISMATCH: recompute op" << op << " into G" << gb
+                          << " partition=" << part_ok << " gdag=" << gdag_ok << "\n";
+                mismatches++;
+            }
+        }
+    }
+    CHECK("diamond recompute checks agree", mismatches == 0);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -699,6 +852,11 @@ int main() {
     test_cycle_reachability_transitivity();
     test_cycle_topo_consistency_after_moves();
     test_cycle_compare_with_partition_acyclic_checks();
+    test_eval_steal_vs_partition();
+    test_eval_recompute_vs_partition();
+    test_eval_de_recompute_vs_partition();
+    test_eval_steal_diamond();
+    test_eval_recompute_diamond();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";
