@@ -444,6 +444,8 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
     // Handle affected groups: re-evaluate costs, split disconnected components,
     // kill empty groups.  No rebuild_index needed — this loop only uses
     // groups[gi].ops directly, not groups_of().
+    // Collect new groups separately to avoid modifying affected_groups during iteration.
+    FlatSet<size_t> new_group_indices;
     for (auto gi : affected_groups) {
         if (!part.groups[gi].alive) continue;
         if (part.groups[gi].ops.empty()) {
@@ -463,15 +465,21 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
             part.groups[gi].cost = (nc < 1e17) ? nc : 1e18;
             for (size_t c = 1; c < comps.size(); c++) {
                 double cc = part.eval_set(comps[c]);
-                part.add_group(std::move(comps[c]), (cc < 1e17) ? cc : 1e18);
+                size_t ng = part.add_group(std::move(comps[c]), (cc < 1e17) ? cc : 1e18);
+                new_group_indices.insert(ng);
             }
         }
     }
 
     // Create the new {P, C_i} groups
     for (auto& [cop, cost] : new_groups) {
-        part.add_group({prod_op, cop}, cost);
+        size_t ng = part.add_group({prod_op, cop}, cost);
+        new_group_indices.insert(ng);
     }
+
+    // Merge new groups into affected set for rebuild_index
+    for (auto ng : new_group_indices)
+        affected_groups.insert(ng);
 
     part.rebuild_index(affected_groups);
     return part;

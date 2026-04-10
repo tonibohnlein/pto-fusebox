@@ -103,22 +103,23 @@ bool GroupDAG::merge_creates_cycle(const std::vector<size_t>& merge_set) const {
     if (merge_set.size() <= 1) return false;
     size_t n = succs_.size();
 
-    // Fast path: if all groups in merge_set are in a contiguous topo region
-    // with no external group in between that has edges to/from the set,
-    // there's no cycle.  Check: find min/max topo_pos of the merge set.
-    // If no external successor of the set has topo_pos <= max_topo, no cycle.
+    // Fast path: if all groups in merge_set have valid topo positions and
+    // occupy a contiguous topo region with no external group in between that
+    // has edges to/from the set, there's no cycle.
+    //
+    // Skip fast path if ANY group has topo_pos_ == -1 (can happen when the
+    // coupled DAG contains cycles from coupling + tensor edges, so Kahn's
+    // doesn't assign positions to all nodes).
     int min_pos = INT_MAX, max_pos = -1;
+    bool all_have_topo = true;
     for (auto g : merge_set) {
-        if (g < n && topo_pos_[g] >= 0) {
-            min_pos = std::min(min_pos, topo_pos_[g]);
-            max_pos = std::max(max_pos, topo_pos_[g]);
-        }
+        if (g >= n) continue;
+        if (topo_pos_[g] < 0) { all_have_topo = false; break; }
+        min_pos = std::min(min_pos, topo_pos_[g]);
+        max_pos = std::max(max_pos, topo_pos_[g]);
     }
 
-    if (min_pos != INT_MAX) {
-        // Quick check: all external successors must have topo_pos > max_pos.
-        // If any external successor has topo_pos <= max_pos, it MIGHT reach
-        // back into the merge set — fall through to BFS.
+    if (all_have_topo && min_pos != INT_MAX) {
         thread_local std::vector<bool> in_merge;
         in_merge.assign(n, false);
         for (auto g : merge_set)
@@ -129,7 +130,7 @@ bool GroupDAG::merge_creates_cycle(const std::vector<size_t>& merge_set) const {
             if (gi >= n) continue;
             for (auto gj : succs_[gi]) {
                 if (in_merge[gj]) continue;
-                if (topo_pos_[gj] >= 0 && topo_pos_[gj] <= max_pos) {
+                if (topo_pos_[gj] < 0 || topo_pos_[gj] <= max_pos) {
                     need_bfs = true;
                     break;
                 }
@@ -403,7 +404,7 @@ bool GroupDAG::eval_add_ops_into(const Partition& part,
         return new_ops.count(op) || part.groups[gi].ops.count(op);
     };
 
-    size_t n = succs_.size();
+    size_t n = std::max(succs_.size(), part.groups.size());
     thread_local std::vector<bool> vis;
     vis.assign(n, false);
     vis[gi] = true;  // skip gi in BFS
