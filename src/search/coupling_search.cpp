@@ -122,12 +122,15 @@ void CoupledPartition::fix_chain_couplings() {
             invalidate_chain_cache();  // rebuild coupled DAG without this edge
 
             // Check: would reconnecting chain_of(ga) → chain_of(gb) create a cycle?
+            // Use the partition's GroupDAG (tensor edges only) — NOT the coupled
+            // DAG, because coupling edges are chain-internal and don't create
+            // cross-chain dependencies in to_solution's chain-level DAG.
             auto chain_a = chain_of(ga);
             auto chain_b = chain_of(gb);
             std::vector<size_t> all;
             all.insert(all.end(), chain_a.begin(), chain_a.end());
             all.insert(all.end(), chain_b.begin(), chain_b.end());
-            bool would_cycle = coupled_dag().merge_creates_cycle(all);
+            bool would_cycle = part.group_dag().merge_creates_cycle(all);
 
             if (would_cycle) {
                 // Leave disconnected — remove this coupling link.
@@ -486,8 +489,10 @@ bool acyclic_chain_merge_groups(const CoupledPartition& cp,
         all_in_chains.insert(all_in_chains.end(), ch.begin(), ch.end());
     }
     if (all_in_chains.size() < 2) return true;
-    // Check if merging these groups creates a cycle in the coupled DAG.
-    return !cp.coupled_dag().merge_creates_cycle(all_in_chains);
+    // Check if merging these chain groups creates a cycle via tensor edges.
+    // Use partition GroupDAG (tensor edges only) — coupling edges are
+    // chain-internal and don't create cross-chain dependencies.
+    return !cp.part.group_dag().merge_creates_cycle(all_in_chains);
 }
 
 // ============================================================================
@@ -520,16 +525,16 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
         if (it != cp.retained.end() && it->second.count(t)) return {};
     }
 
-    // Chain-level acyclicity: the merged chain (chain_of(ga) ++ chain_of(gb))
-    // Cycle check: coupling chain_of(ga)→chain_of(gb). Cycle iff the merged
-    // chains create a back-edge through external groups in the coupled DAG.
+    // Chain-level acyclicity: merging chain_of(ga) and chain_of(gb) must not
+    // create a cycle via tensor edges between external groups. Use the partition
+    // GroupDAG (tensor edges only) — coupling edges are chain-internal.
     {
         auto chain_a = cp.chain_of(ga);
         auto chain_b = cp.chain_of(gb);
         std::vector<size_t> all;
         all.insert(all.end(), chain_a.begin(), chain_a.end());
         all.insert(all.end(), chain_b.begin(), chain_b.end());
-        if (cp.coupled_dag().merge_creates_cycle(all)) return {};
+        if (cp.part.group_dag().merge_creates_cycle(all)) return {};
     }
 
     // Cost delta: (cost before) - (cost after adding retention).
@@ -711,14 +716,15 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     if (!cp.part.groups[g_dst].ops.count(op_a_dst)) return {};
     if (!is_boundary_input_of(cp.part.groups[g_dst].ops, t, dag)) return {};
 
-    // Cycle check: coupling chain_of(ga)→chain_of(g_dst).
+    // Cycle check: coupling chain_of(ga)→chain_of(g_dst). Use partition
+    // GroupDAG (tensor edges only) — coupling edges are chain-internal.
     {
         auto chain_a = cp.chain_of(ga);
         auto chain_b = cp.chain_of(g_dst);
         std::vector<size_t> all;
         all.insert(all.end(), chain_a.begin(), chain_a.end());
         all.insert(all.end(), chain_b.begin(), chain_b.end());
-        if (cp.coupled_dag().merge_creates_cycle(all)) return {};
+        if (cp.part.group_dag().merge_creates_cycle(all)) return {};
     }
 
     // Split g_dst at bridge (op_a_dst, op_b_dst): side_a gets op_a_dst.
