@@ -307,62 +307,37 @@ bool GroupDAG::eval_steal(const Partition& part, size_t op,
 bool GroupDAG::eval_split(const Partition& part, const FlatSet<size_t>& side_a,
                           const FlatSet<size_t>& side_b, size_t ga) const {
     if (!part.prob || !part.dag) return false;
-    const auto& prob = *part.prob;
-    const auto& dag = *part.dag;
-
-    // After split: ga becomes side_a, new group gb becomes side_b.
-    // Compute virtual successors of each side and check if any external
-    // path leads back to either side.
-    //
-    // Build virtual successor sets for side_a and side_b by scanning ops.
-    // Then BFS from those external successors, checking if we reach back.
     size_t n = succs_.size();
-    thread_local std::vector<bool> in_split;
-    in_split.assign(n + 1, false);  // +1 for virtual gb
-    if (ga < n) in_split[ga] = true;
-    size_t gb_virtual = n;  // virtual index for side_b
-    in_split[gb_virtual] = true;
+    if (ga >= n) return false;
 
-    auto is_in_side = [&](size_t op) {
-        return side_a.count(op) || side_b.count(op);
-    };
+    // After split: ga becomes side_a, virtual gb becomes side_b.
+    // Use precomputed succs_ for BFS. ga's current successors are the
+    // starting point — they consume tensors produced by ga (= side_a ∪ side_b).
 
     thread_local std::vector<bool> vis;
     vis.assign(n, false);
+    vis[ga] = true;  // don't revisit ga
     thread_local std::vector<size_t> q;
     q.clear();
     size_t front = 0;
 
-    // Seed: external successors of side_a and side_b
-    auto seed_ops = [&](const FlatSet<size_t>& ops) {
-        for (auto op : ops) {
-            size_t t = prob.ops[op].output();
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (is_in_side(cop)) continue;
-                for (auto gc : part.groups_of(cop)) {
-                    if (!part.groups[gc].alive || gc == ga || vis[gc]) continue;
-                    vis[gc] = true;
-                    q.push_back(gc);
-                }
-            }
-        }
-    };
-    seed_ops(side_a);
-    seed_ops(side_b);
+    // Seed: ga's current successors (external groups that depend on ga)
+    for (auto gj : succs_[ga]) {
+        if (!part.groups[gj].alive || vis[gj]) continue;
+        vis[gj] = true;
+        q.push_back(gj);
+    }
 
-    // BFS: cycle if any external group has an output consumed by side_a or side_b
+    // BFS through external groups using succs_.
+    // Cycle if we reach a group that feeds back into ga.
+    // Since ga is split, "feeds into ga" means the group has ga as a successor.
     while (front < q.size()) {
         size_t cur = q[front++];
-        for (auto op : part.groups[cur].ops) {
-            size_t t = prob.ops[op].output();
-            for (auto cop : dag.tensor_consumers[t]) {
-                if (is_in_side(cop)) return true;  // path back to split → cycle
-                for (auto gc : part.groups_of(cop)) {
-                    if (!part.groups[gc].alive || gc == ga || vis[gc]) continue;
-                    vis[gc] = true;
-                    q.push_back(gc);
-                }
-            }
+        for (auto gj : succs_[cur]) {
+            if (gj == ga) return true;  // path back to split group → cycle
+            if (!part.groups[gj].alive || vis[gj]) continue;
+            vis[gj] = true;
+            q.push_back(gj);
         }
     }
     return false;

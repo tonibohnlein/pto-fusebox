@@ -430,28 +430,7 @@ bool Partition::acyclic_split_local(const FlatSet<size_t>& side_a,
                                      const FlatSet<size_t>& side_b,
                                      size_t ga) const {
     if (!prob || !dag) return true;
-
-    // Temporarily apply the split, rebuild GroupDAG, check acyclicity.
-    // We need the post-split state because splitting can resolve existing
-    // cycles (not just create new ones).
-    Partition& mut = const_cast<Partition&>(*this);
-    auto saved_ops = mut.groups[ga].ops;
-    double saved_cost = mut.groups[ga].cost;
-
-    mut.groups[ga].ops = side_a;
-    size_t gb = mut.groups.size();
-    mut.groups.push_back({side_b, 0.0, true, 0, std::nullopt, {}});
-    mut.rebuild_index();
-
-    bool ok = mut.is_acyclic();
-
-    // Undo
-    mut.groups.pop_back();
-    mut.groups[ga].ops = std::move(saved_ops);
-    mut.groups[ga].cost = saved_cost;
-    mut.rebuild_index();
-
-    return ok;
+    return !group_dag().eval_split(*this, side_a, side_b, ga);
 }
 
 double Partition::eval_set(const FlatSet<size_t>& ops) const {
