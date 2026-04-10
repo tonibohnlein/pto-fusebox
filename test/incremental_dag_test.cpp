@@ -9,7 +9,9 @@
 #include "search/coupling_search.h"
 #include "search/fm_search.h"
 #include "search/partition_moves.h"
+#include "search/evolution.h"
 #include <iostream>
+#include <random>
 
 static int g_pass = 0, g_fail = 0;
 static void CHECK(const char* l, bool c) {
@@ -1440,6 +1442,231 @@ void test_coupled_gdag_merge_after_coupling() {
     CHECK("old and new agree on G2,G3", old_ok == new_ok);
 }
 
+// ============================================================================
+// Regression tests for bugs fixed in the incremental index handlers.
+//
+// Bug 1 (STEAL): Stealing an op that disconnects the source group into
+//   components. apply_steal creates new groups for extra components via
+//   add_group, but the old STEAL index handler only updated the stolen op's
+//   index — ops in the split-off components kept stale ga entries.
+//
+// Bug 2 (DE_RECOMPUTE): Same pattern — removing a recomputed copy can
+//   disconnect the source group.
+//
+// Bug 3 (mutate_force_recompute): New groups from add_group were not
+//   included in affected_groups, causing rebuild_index(affected) to miss
+//   GroupDAG edges for those groups.
+//
+// Bug 4 (chain cycle detection): fix_chain_couplings and eval_couple used
+//   the coupled GroupDAG (tensor+coupling edges) for cycle detection, but
+//   to_solution's chain-level DAG uses tensor edges only. Coupling edges
+//   are chain-internal and shouldn't affect cross-chain cycle detection.
+// ============================================================================
+
+// Fan-out problem: op0→T1, op0→T2, op1(T1)→T3, op2(T2)→T4, op3(T3)→T5
+// This allows group {op0, op1, op2} where stealing op0 leaves {op1, op2}
+// disconnected (op1 needs T1 from op0, op2 needs T2 from op0 — but op1 and
+// op2 are independent).
+//
+// Actually we need a shape where removing an op disconnects the REMAINDER.
+// Better: tree with shared input.
+//   op0(T0)→T1, op1(T0)→T2, op2(T1)→T3, op3(T2)→T4, op4(T3)→T5
+// Group {op0, op1} with op2,op3,op4 separate.
+// Steal op0 from {op0, op1} leaves {op1} — no disconnect, just shrinks.
+//
+// We need: group {A, B, C} where B connects A and C.
+// A(T_in)→T_ab, B(T_ab)→T_bc, C(T_bc)→T_out — but stealing B creates a cycle.
+//
+// Solution: use a fan-in at the source group level.
+//   op0(T0)→T1, op1(T0)→T2, op2(T1,T2)→T3, op3(T3)→T4, op4(T4)→T5
+// Group {op0, op1, op2} — op2 connects op0 and op1 via consuming both outputs.
+// Steal op2 from G0={op0,op1,op2} into G1={op3}:
+//   G0 disconnects into {op0} and {op1} (they share input T0 but aren't
+//   connected via internal tensor edges — op0→T1, op1→T2, no shared consumer).
+static Problem make_fanin5() {
+    Problem p;
+    p.tensors = {{64,64},{64,64},{64,64},{64,64},{64,64},{64,64}};
+    p.ops = {
+        {OpType::Pointwise, {0}, {1}, 300},    // op0: T0→T1
+        {OpType::Pointwise, {0}, {2}, 300},    // op1: T0→T2
+        {OpType::Pointwise, {1, 2}, {3}, 300}, // op2: T1,T2→T3
+        {OpType::Pointwise, {3}, {4}, 300},    // op3: T3→T4
+        {OpType::Pointwise, {4}, {5}, 300},    // op4: T4→T5
+    };
+    p.fast_memory_capacity = 50000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 64; p.native_h = 64;
+    return p;
+}
+
+void test_steal_disconnects_source() {
+    std::cout << "=== test_steal_disconnects_source ===\n";
+    // G0={op0,op1,op2}, G1={op3}, G2={op4}
+    // Steal op2 from G0 into G1.
+    // G0={op0,op1} — op0 and op1 are disconnected (no shared internal tensor).
+    // apply_steal splits G0 into {op0} (G0) and {op1} (new group).
+    auto p = make_fanin5();
+    auto d = DAG::build(p);
+    Partition part;
+    part.prob = &p; part.dag = &d;
+    part.groups.push_back({{0,1,2}, 1.0, true, 0, {}, {}});  // G0
+    part.groups.push_back({{3}, 1.0, true, 0, {}, {}});       // G1
+    part.groups.push_back({{4}, 1.0, true, 0, {}, {}});       // G2
+    part.rebuild_index();
+    part.group_dag();
+
+    // Use apply_steal with precomputed costs to bypass eval_set
+    FlatSet<size_t> old_ga_ops = part.groups[0].ops;
+    auto affected = partition_moves::apply_steal(part, 2, 0, 1, 1.0, 1.0);
+    if (!affected.empty()) {
+        // Manually do the incremental index update (same as apply_fm_move STEAL)
+        for (auto op : old_ga_ops)
+            part.index_remove(op, 0);
+        if (part.groups[0].alive)
+            for (auto op : part.groups[0].ops)
+                part.index_add(op, 0);
+        part.index_add(2, 1);  // op2 moved to G1
+        part.index_update_dag(affected);
+    }
+    CHECK("steal disconnect: move applied", !affected.empty());
+
+    // Verify index: every op must be covered by exactly the right groups
+    verify_index(part, "steal disconnect: index correct");
+
+    // Verify coverage: no op lost
+    bool all_covered = true;
+    for (size_t i = 0; i < p.num_ops(); i++) {
+        bool found = false;
+        for (auto gi : part.groups_of(i))
+            if (part.groups[gi].alive) { found = true; break; }
+        if (!found) { all_covered = false; break; }
+    }
+    CHECK("steal disconnect: all ops covered", all_covered);
+
+    // Verify GroupDAG matches fresh build
+    auto& gdag = part.group_dag();
+    CHECK("steal disconnect: GroupDAG correct",
+          verify_matches_full(gdag, part, "steal disconnect"));
+}
+
+void test_de_recompute_disconnects_source() {
+    std::cout << "=== test_de_recompute_disconnects_source ===\n";
+    // G0={op0,op1,op2}, G1={op2,op3}, G2={op4}
+    // op2 is recomputed (in G0 and G1).
+    // DE_RECOMPUTE op2 from G0 → G0={op0,op1} disconnects into {op0} and {op1}.
+    auto p = make_fanin5();
+    auto d = DAG::build(p);
+    Partition part;
+    part.prob = &p; part.dag = &d;
+    part.groups.push_back({{0,1,2}, 1.0, true, 0, {}, {}});  // G0
+    part.groups.push_back({{2,3}, 1.0, true, 0, {}, {}});     // G1 (op2 recomp)
+    part.groups.push_back({{4}, 1.0, true, 0, {}, {}});        // G2
+    part.rebuild_index();
+    part.group_dag();
+
+    FlatSet<size_t> old_ga_ops = part.groups[0].ops;
+    auto affected = partition_moves::apply_de_recompute(part, 0, 2, 1.0);
+    if (!affected.empty()) {
+        // Manually do incremental index update (same as apply_fm_move DE_RECOMPUTE)
+        for (auto op : old_ga_ops)
+            part.index_remove(op, 0);
+        if (part.groups[0].alive)
+            for (auto op : part.groups[0].ops)
+                part.index_add(op, 0);
+        part.index_update_dag(affected);
+    }
+    CHECK("de_recompute disconnect: move applied", !affected.empty());
+
+    verify_index(part, "de_recompute disconnect: index correct");
+
+    bool all_covered = true;
+    for (size_t i = 0; i < p.num_ops(); i++) {
+        bool found = false;
+        for (auto gi : part.groups_of(i))
+            if (part.groups[gi].alive) { found = true; break; }
+        if (!found) { all_covered = false; break; }
+    }
+    CHECK("de_recompute disconnect: all ops covered", all_covered);
+
+    auto& gdag = part.group_dag();
+    CHECK("de_recompute disconnect: GroupDAG correct",
+          verify_matches_full(gdag, part, "de_recompute disconnect"));
+}
+
+void test_force_recompute_affected_groups() {
+    std::cout << "=== test_force_recompute_affected_groups ===\n";
+    // After mutate_force_recompute, the GroupDAG must match a fresh build.
+    // The bug was that new groups from add_group weren't in affected_groups.
+    auto p = make_fanin5();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.group_dag();
+
+    // Run force_recompute mutation several times with different seeds
+    for (unsigned seed = 0; seed < 20; seed++) {
+        std::mt19937 rng(seed);
+        auto mutated = mutate_force_recompute(part, rng);
+        mutated.rebuild_index();  // ensure op_to_groups_ is fresh
+        if (mutated.num_alive() != part.num_alive() ||
+            mutated.total_cost() != part.total_cost()) {
+            // Mutation applied — verify GroupDAG
+            auto& gdag = mutated.group_dag();
+            bool ok = verify_matches_full(gdag, mutated,
+                                           "force_recompute GroupDAG");
+            CHECK("force_recompute: GroupDAG matches after mutation", ok);
+            // Verify coverage
+            bool covered = true;
+            for (size_t i = 0; i < p.num_ops(); i++) {
+                bool found = false;
+                for (auto gi : mutated.groups_of(i))
+                    if (mutated.groups[gi].alive) { found = true; break; }
+                if (!found) { covered = false; break; }
+            }
+            CHECK("force_recompute: all ops covered", covered);
+        }
+    }
+}
+
+void test_chain_cycle_uses_tensor_edges_only() {
+    std::cout << "=== test_chain_cycle_uses_tensor_edges_only ===\n";
+    // Verify that chain-level cycle detection uses tensor edges (partition
+    // GroupDAG), not coupling edges (coupled GroupDAG).
+    //
+    // Build: G0→G1→G2→G3 (tensor edges chain).
+    // Couple G0→G1 (coupling edge).
+    // Now check: can we couple G2→G3?
+    // With tensor edges only: G0→G1→G2→G3, merging {G2,G3} doesn't create a
+    //   cycle (no external path back to {G2,G3}).
+    // With coupled DAG: G0→G1 coupling edge is present, but it's chain-internal
+    //   and shouldn't affect the G2→G3 cycle check.
+    auto p = make_chain4();
+    auto d = DAG::build(p);
+    auto part = Partition::trivial(p, d);
+    part.rebuild_index();
+    part.finalize();
+
+    CoupledPartition cp;
+    cp.part = part;
+    cp.next_group.assign(part.groups.size(), SIZE_MAX);
+    cp.prev_group.assign(part.groups.size(), SIZE_MAX);
+
+    // Couple G0→G1
+    cp.next_group[0] = 1;
+    cp.prev_group[1] = 0;
+    size_t t1 = p.ops[0].output();
+    cp.retained[{0, 1}].insert(t1);
+
+    // Check: can we couple G2→G3?
+    size_t t3 = p.ops[2].output();
+    auto ev = eval_couple(cp, 2, 3, t3);
+    CHECK("chain cycle: G2→G3 coupling is feasible", ev.feasible);
+
+    // Also verify acyclic_chain_merge_groups works
+    bool ok = acyclic_chain_merge_groups(cp, {2, 3});
+    CHECK("chain cycle: acyclic_chain_merge_groups({2,3}) is true", ok);
+}
+
 int main() {
     test_full_build();
     test_can_reach();
@@ -1487,6 +1714,11 @@ int main() {
     test_coupled_gdag_vs_old_chain_merge();
     test_coupled_gdag_couple_eval();
     test_coupled_gdag_merge_after_coupling();
+
+    test_steal_disconnects_source();
+    test_de_recompute_disconnects_source();
+    test_force_recompute_affected_groups();
+    test_chain_cycle_uses_tensor_edges_only();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed out of "
               << (g_pass + g_fail) << " tests\n";
