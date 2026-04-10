@@ -415,10 +415,18 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
 
     switch (m.type) {
         case FMMove::STEAL: {
+            // Capture ga's old ops before apply (steal may split ga into components)
+            FlatSet<size_t> old_ga_ops = part.groups[m.ga].ops;
             affected = partition_moves::apply_steal(part, m.op, m.ga, m.gb);
             if (affected.empty()) return {};
-            // op moved from m.ga to m.gb
-            part.index_remove(m.op, m.ga);
+            // Remove stale ga entries for ALL old ga ops
+            for (auto op : old_ga_ops)
+                part.index_remove(op, m.ga);
+            // Re-add for ga's remaining ops (first component)
+            if (part.groups[m.ga].alive)
+                for (auto op : part.groups[m.ga].ops)
+                    part.index_add(op, m.ga);
+            // m.op moved to gb (add_group for new components already handled by apply_steal)
             part.index_add(m.op, m.gb);
             break;
         }
@@ -443,10 +451,18 @@ FlatSet<size_t> apply_fm_move(Partition& part, const FMMove& m) {
             break;
         }
         case FMMove::DE_RECOMPUTE: {
+            // Capture ga's old ops before apply (de_recompute may split ga)
+            FlatSet<size_t> old_ga_ops = part.groups[m.ga].ops;
             affected = partition_moves::apply_de_recompute(part, m.ga, m.op);
             if (affected.empty()) return {};
-            // op removed from m.ga
-            part.index_remove(m.op, m.ga);
+            // Remove stale ga entries for ALL old ga ops
+            for (auto op : old_ga_ops)
+                part.index_remove(op, m.ga);
+            // Re-add for ga's remaining ops (first component).
+            // New component groups already have their entries from add_group().
+            if (part.groups[m.ga].alive)
+                for (auto op : part.groups[m.ga].ops)
+                    part.index_add(op, m.ga);
             break;
         }
         case FMMove::EJECT:
