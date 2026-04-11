@@ -452,8 +452,8 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     FlatSet<size_t> new_gb = is_eject ? FlatSet<size_t>{op} : part.groups[gb].ops;
     if (!is_eject) new_gb.insert(op);
 
-    auto orig_en_ga = cp.entering_for(ga);
-    auto orig_re_ga = cp.retain_for(ga);
+    const auto& orig_en_ga = cp.entering_for(ga);
+    const auto& orig_re_ga = cp.retain_for(ga);
     auto en_ga = orig_en_ga;
     auto re_ga = orig_re_ga;
     auto en_gb = is_eject ? FlatSet<size_t>{} : cp.entering_for(gb);
@@ -567,7 +567,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         for (size_t step = 0; step < max_steps && cur != SIZE_MAX; step++) {
             if (cur == ga || cur == gb || !part.groups[cur].alive) break;
             double old_cur = cp.group_cost(cur);
-            auto cur_retain = cp.retain_for(cur);
+            const auto& cur_retain = cp.retain_for(cur);
             double new_cur = eval_coupled_group_cost(
                 cp, part.groups[cur].ops, cur_enter, cur_retain);
             if (std::abs(old_cur - new_cur) < 0.001) break;  // no change, stop
@@ -584,8 +584,8 @@ static double coupled_steal_saving(const CoupledPartition& cp,
 
     // gb's edges: if gb gains op, its retained tensors may change boundary status
     if (!is_eject) {
-        auto orig_re_gb = cp.retain_for(gb);
-        auto orig_en_gb = cp.entering_for(gb);
+        const auto& orig_re_gb = cp.retain_for(gb);
+        const auto& orig_en_gb = cp.entering_for(gb);
 
         // gb_next: if gb's retain changed (re_gb != orig_re_gb), next's entering changed
         if (gb_next_orig != SIZE_MAX && gb_next_orig != ga && re_gb != orig_re_gb) {

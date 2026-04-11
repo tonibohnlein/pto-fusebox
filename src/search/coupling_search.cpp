@@ -186,16 +186,18 @@ std::vector<size_t> CoupledPartition::chain_of(size_t g) const {
     return result;
 }
 
-FlatSet<size_t> CoupledPartition::entering_for(size_t g) const {
-    if (g >= prev_group.size() || prev_group[g] == SIZE_MAX) return {};
+const FlatSet<size_t>& CoupledPartition::entering_for(size_t g) const {
+    static const FlatSet<size_t> empty;
+    if (g >= prev_group.size() || prev_group[g] == SIZE_MAX) return empty;
     auto it = retained.find({prev_group[g], g});
-    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
+    return (it != retained.end()) ? it->second : empty;
 }
 
-FlatSet<size_t> CoupledPartition::retain_for(size_t g) const {
-    if (g >= next_group.size() || next_group[g] == SIZE_MAX) return {};
+const FlatSet<size_t>& CoupledPartition::retain_for(size_t g) const {
+    static const FlatSet<size_t> empty;
+    if (g >= next_group.size() || next_group[g] == SIZE_MAX) return empty;
     auto it = retained.find({g, next_group[g]});
-    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
+    return (it != retained.end()) ? it->second : empty;
 }
 
 // ============================================================================
@@ -204,8 +206,8 @@ FlatSet<size_t> CoupledPartition::retain_for(size_t g) const {
 
 double CoupledPartition::group_cost(size_t g) const {
     if (!part.groups[g].alive) return 0.0;
-    auto en = entering_for(g);
-    auto re = retain_for(g);
+    const auto& en = entering_for(g);
+    const auto& re = retain_for(g);
     if (en.empty() && re.empty()) return part.groups[g].cost;
     // Use cache: no .sg required.
     if (part.cache) {
@@ -374,8 +376,8 @@ Solution CoupledPartition::to_solution() const {
             // Always evaluate via cache/subgraph so we get the actual TileConfig
             // back — grp.best_cfg may be unset ({0,0,0}) for groups created by
             // mutations that never called finalize().
-            auto enter = entering_for(g);
-            auto ret   = retain_for(g);
+            const auto& enter = entering_for(g);
+            const auto& ret   = retain_for(g);
             CostResult cr;
             if (part.cache)
                 cr = part.cache->evaluate_with_context(grp.ops, enter, ret, prob, dag);

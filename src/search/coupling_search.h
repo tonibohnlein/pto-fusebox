@@ -69,9 +69,9 @@ private:
 public:
 
     // Tensors entering group g from its chain predecessor's retained set.
-    FlatSet<size_t> entering_for(size_t g) const;
+    const FlatSet<size_t>& entering_for(size_t g) const;
     // Tensors group g must retain for its chain successor.
-    FlatSet<size_t> retain_for(size_t g) const;
+    const FlatSet<size_t>& retain_for(size_t g) const;
 
     // Check whether a specific tensor is retained across any coupling edge.
     bool is_retained(size_t t) const {

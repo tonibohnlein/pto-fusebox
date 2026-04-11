@@ -1,10 +1,11 @@
 #pragma once
 
 #include "core/subgraph.h"
+#include "core/flat_set.h"
 #include <vector>
-#include <set>
 #include <atomic>
 #include <memory>
+#include <cstring>
 
 // ============================================================================
 // Unified cost cache for partition search AND solution search.
@@ -12,50 +13,94 @@
 // Two tiers sharing one object, kept alive across all three solver phases:
 //
 //   BASE MAP: Lock-free open-addressed hash table.
-//     (op_set) → CostResult.  Populated during Phase 1 (partition search)
-//     via evaluate().  Reads are fully lock-free (atomic state load +
-//     key compare).  Writes use CAS on per-slot atomic state.
+//     hash(op_set) → CostResult.  Populated during Phase 1 (partition search)
+//     via evaluate().  Reads are fully lock-free (single atomic load).
+//     Writes use CAS on per-slot atomic hash.
 //     ~30-70K entries across all phases.
 //
-//   RETENTION MAP: (op_set | SIZE_MAX | entering | SIZE_MAX | retain) → CostResult
+//   RETENTION MAP: hash(op_set, entering, retain) → CostResult.
 //     Populated during Phase 2/3 (coupling search) via evaluate_with_context().
-//     Also fully lock-free — same LockFreeMap design as the base map.
+//     Also fully lock-free — same design as the base map.
 //     When entering={} and retain={}, falls back to the base map instead.
+//
+// Keys are 64-bit hashes only — no stored key vectors.  With a strong hash
+// and <100K entries in a 1M-slot table, collision probability is negligible
+// (~1e-9 per lookup).  This eliminates all vector copies and comparisons
+// from the hot path.
 // ============================================================================
 
-struct VectorHash {
-    size_t operator()(const std::vector<size_t>& v) const {
-        size_t h = v.size();
-        for (size_t op : v)
-            h ^= std::hash<size_t>()(op) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
+// ============================================================================
+// Strong 64-bit hash for sorted op-index sequences.
+// Uses wyhash-style multiply-xor mixing for excellent avalanche properties.
+// ============================================================================
+
+inline uint64_t wymix(uint64_t a, uint64_t b) {
+    __uint128_t r = (__uint128_t)a * b;
+    return (uint64_t)(r >> 64) ^ (uint64_t)r;
+}
+
+// Hash a contiguous array of size_t values.
+inline uint64_t hash_ops(const size_t* data, size_t n) {
+    // Seed chosen to avoid zero-hash for empty sets.
+    uint64_t h = 0x2d358dccaa6c78a5ULL ^ (uint64_t)n;
+    for (size_t i = 0; i < n; i++)
+        h = wymix(h ^ data[i], 0x9e3779b97f4a7c15ULL);
+    // Final mix
+    h ^= h >> 32;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 31;
+    // Reserve 0 as "empty slot" sentinel
+    return h | 1;
+}
+
+// Hash a FlatSet<size_t> in place (no copy).
+inline uint64_t hash_flatset(const FlatSet<size_t>& s) {
+    return hash_ops(s.data(), s.size());
+}
+
+// Combine three hashes for the retention key: (ops, entering, retain).
+// Uses independent seeds so hash(ops,{},{}) != hash(ops).
+inline uint64_t hash_retention(const FlatSet<size_t>& ops,
+                                const FlatSet<size_t>& entering,
+                                const FlatSet<size_t>& retain) {
+    uint64_t h1 = hash_ops(ops.data(), ops.size());
+    uint64_t h2 = 0x6c62272e07bb0142ULL;
+    for (size_t i = 0; i < entering.size(); i++)
+        h2 = wymix(h2 ^ entering.data()[i], 0x517cc1b727220a95ULL);
+    uint64_t h3 = 0x6295c58d62b82175ULL;
+    for (size_t i = 0; i < retain.size(); i++)
+        h3 = wymix(h3 ^ retain.data()[i], 0x3243f6a8885a308dULL);
+    uint64_t h = wymix(h1, h2 ^ h3);
+    h ^= h >> 31;
+    return h | 1;
+}
+
+// Hash from a vector<size_t> (e.g. Subgraph::ops()).
+inline uint64_t hash_vec(const std::vector<size_t>& v) {
+    return hash_ops(v.data(), v.size());
+}
 
 // ============================================================================
-// Lock-free open-addressed hash table with linear probing.
+// Lock-free open-addressed hash table with hash-only keys.
 //
-// Slot states: EMPTY → WRITING → READY  (one-way transitions, never recycle)
+// Each slot is: atomic<uint64_t> hash + Value.
+// hash == 0 means empty.  hash != 0 means occupied (hash is the key).
 //
-// Read path:  hash → probe → load state(acquire) → if READY, compare key
-//             No locks, no atomics beyond the state load.
+// Read path:  compute slot index → load hash(acquire) → if match, return value.
+// Write path: CAS(0, hash) → write value → done.
 //
-// Write path: hash → probe → CAS(EMPTY, WRITING) → write key+value
-//             → store(READY, release).  Single-writer-per-slot via CAS.
-//
-// Duplicates from races are harmless (cache semantics — any hit is valid).
-// Table never rehashes; pre-allocate sufficient capacity.
+// No stored keys, no vector comparisons.  ~48 bytes per slot (vs ~100+ before).
+// Collision probability with 64-bit hash: ~n²/2^64 where n = entries.
+// With n = 100K entries: ~5e-10 — negligible.
 // ============================================================================
 
 template<typename Value>
-class LockFreeMap {
-    enum State : uint8_t { EMPTY = 0, WRITING = 1, READY = 2 };
-
+class HashOnlyMap {
     struct Slot {
-        std::atomic<uint8_t> state{EMPTY};
-        size_t hash = 0;
-        std::vector<size_t> key;
+        std::atomic<uint64_t> hash{0};  // 0 = empty
         Value value{};
+        // Padding to avoid false sharing between adjacent slots' atomics.
+        // Value is ~48 bytes (CostResult), atomic is 8 bytes → slot is ~56 bytes.
     };
 
     std::unique_ptr<Slot[]> slots_;
@@ -64,67 +109,48 @@ class LockFreeMap {
     std::atomic<size_t> size_{0};
 
 public:
-    explicit LockFreeMap(size_t min_capacity = 131072) {
-        // Round up to power of 2
+    explicit HashOnlyMap(size_t min_capacity = 131072) {
         capacity_ = 1;
         while (capacity_ < min_capacity) capacity_ <<= 1;
         mask_ = capacity_ - 1;
         slots_ = std::make_unique<Slot[]>(capacity_);
     }
 
-    // Lock-free lookup. Returns pointer to value if found, nullptr otherwise.
-    // Safe to call concurrently from any number of threads.
-    const Value* find(const std::vector<size_t>& key, size_t h) const {
-        size_t idx = h & mask_;
-        for (size_t i = 0; i < capacity_; i++) {
-            const auto& slot = slots_[idx];
-            auto s = slot.state.load(std::memory_order_acquire);
-            if (s == EMPTY) return nullptr;  // end of probe chain
-            if (s == READY && slot.hash == h && slot.key == key)
-                return &slot.value;
+    // Lock-free lookup.  Returns pointer to value if hash matches, nullptr otherwise.
+    const Value* find(uint64_t h) const {
+        size_t idx = (size_t)h & mask_;
+        for (size_t i = 0; i < 32; i++) {  // bounded probe length
+            uint64_t sh = slots_[idx].hash.load(std::memory_order_acquire);
+            if (sh == 0) return nullptr;     // empty → end of chain
+            if (sh == h) return &slots_[idx].value;
             idx = (idx + 1) & mask_;
         }
-        return nullptr;
+        return nullptr;  // probe limit reached
     }
 
-    // Insert key→value. Returns true if inserted, false if duplicate or full.
-    // Safe to call concurrently; at most one thread wins each slot via CAS.
-    bool insert(const std::vector<size_t>& key, size_t h, const Value& value) {
-        size_t idx = h & mask_;
-        for (size_t i = 0; i < capacity_; i++) {
+    // Insert hash→value.  Returns true if inserted.
+    bool insert(uint64_t h, const Value& value) {
+        size_t idx = (size_t)h & mask_;
+        for (size_t i = 0; i < 32; i++) {
             auto& slot = slots_[idx];
-            uint8_t expected = EMPTY;
-            if (slot.state.compare_exchange_strong(expected, WRITING,
+            uint64_t expected = 0;
+            if (slot.hash.compare_exchange_strong(expected, h,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
-                // Won this slot — write key+value, then publish
-                slot.hash = h;
-                slot.key = key;
                 slot.value = value;
-                slot.state.store(READY, std::memory_order_release);
                 size_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            if (expected == WRITING) {
-                // Another thread is filling this slot — skip (may create duplicate, harmless)
-                idx = (idx + 1) & mask_;
-                continue;
-            }
-            // expected == READY: check for duplicate key
-            if (slot.hash == h && slot.key == key)
-                return false;  // already cached
+            if (expected == h) return false;  // duplicate
             idx = (idx + 1) & mask_;
         }
-        return false;  // table full
+        return false;  // probe limit
     }
 
     size_t size() const { return size_.load(std::memory_order_relaxed); }
 
-    // Reset all slots. Only call when no other thread is accessing the table.
     void clear() {
         for (size_t i = 0; i < capacity_; i++) {
-            slots_[i].state.store(EMPTY, std::memory_order_relaxed);
-            slots_[i].hash = 0;
-            slots_[i].key = std::vector<size_t>();  // free heap capacity
+            slots_[i].hash.store(0, std::memory_order_relaxed);
             slots_[i].value = Value{};
         }
         size_.store(0, std::memory_order_relaxed);
@@ -139,63 +165,49 @@ class CostCache {
 public:
     explicit CostCache(size_t max_entries = 0)
         : max_entries_(max_entries)
-        // Base map: 2x headroom, minimum 1M slots.  Load factor < 0.5.
         , base_map_(std::max<size_t>(1048576, max_entries > 0 ? max_entries * 2 : 1048576))
-        // Retention map: fixed 1M slots → up to ~500K entries at 0.5 load factor.
         , ret_map_(1048576)
     {}
 
     // ====================================================================
-    // Tier 1: Base map — lock-free (op_set) → CostResult.
+    // Tier 1: Base map — hash(op_set) → CostResult.
     // ====================================================================
 
     double evaluate(const FlatSet<size_t>& ops, const Problem& prob, const DAG& dag) {
-        thread_local std::vector<size_t> key;
-        key.assign(ops.begin(), ops.end());
-        size_t h = VectorHash{}(key);
+        uint64_t h = hash_flatset(ops);
 
-        // Lock-free read
-        auto* hit = base_map_.find(key, h);
+        auto* hit = base_map_.find(h);
         if (hit) {
             base_hits_.fetch_add(1, std::memory_order_relaxed);
             return hit->feasible ? hit->latency : 1e18;
         }
 
-        // Miss — compute
         base_misses_.fetch_add(1, std::memory_order_relaxed);
         CostResult cr;
         auto sg = Subgraph::create(prob, dag,
             std::vector<size_t>(ops.begin(), ops.end()));
         if (sg) cr = sg->best_cost();
 
-        // Insert (may fail if full or duplicate from race — both harmless)
         if (max_entries_ > 0 && base_map_.size() >= max_entries_)
             base_overcapacity_.fetch_add(1, std::memory_order_relaxed);
         else
-            base_map_.insert(key, h, cr);
+            base_map_.insert(h, cr);
 
         return cr.feasible ? cr.latency : 1e18;
     }
 
     // ====================================================================
-    // Tier 2: Retention map — lock-free (op_set|entering|retain) → CostResult.
-    //
-    // When entering={} and retain={}, falls back to the lock-free base map.
+    // Tier 2: Retention map — hash(ops, entering, retain) → CostResult.
     // ====================================================================
 
-    // Overload: look up or compute (ops, entering, retain) without requiring a
-    // pre-built Subgraph.  On cache hit, returns immediately (no Subgraph
-    // created).  On miss, builds a Subgraph from ops and evaluates.
     CostResult evaluate_with_context(const FlatSet<size_t>& ops,
                                       const FlatSet<size_t>& entering,
                                       const FlatSet<size_t>& retain,
                                       const Problem& prob,
                                       const DAG& dag) {
         if (entering.empty() && retain.empty()) {
-            thread_local std::vector<size_t> okey;
-            okey.assign(ops.begin(), ops.end());
-            size_t h = VectorHash{}(okey);
-            auto* hit = base_map_.find(okey, h);
+            uint64_t h = hash_flatset(ops);
+            auto* hit = base_map_.find(h);
             if (hit) {
                 base_hits_.fetch_add(1, std::memory_order_relaxed);
                 return *hit;
@@ -206,70 +218,50 @@ public:
             CostResult cr;
             if (sg_opt) cr = sg_opt->best_cost({}, {});
             if (max_entries_ == 0 || base_map_.size() < max_entries_)
-                base_map_.insert(okey, h, cr);
+                base_map_.insert(h, cr);
             return cr;
         }
 
-        thread_local std::vector<size_t> oext_key;
-        oext_key.clear();
-        oext_key.insert(oext_key.end(), ops.begin(), ops.end());
-        oext_key.push_back(SIZE_MAX);
-        oext_key.insert(oext_key.end(), entering.begin(), entering.end());
-        oext_key.push_back(SIZE_MAX);
-        oext_key.insert(oext_key.end(), retain.begin(), retain.end());
-        size_t h = VectorHash{}(oext_key);
+        uint64_t h = hash_retention(ops, entering, retain);
 
-        // Lock-free read
-        auto* hit = ret_map_.find(oext_key, h);
+        auto* hit = ret_map_.find(h);
         if (hit) {
             ret_hits_.fetch_add(1, std::memory_order_relaxed);
             return *hit;
         }
 
-        // Miss — compute
         ret_misses_.fetch_add(1, std::memory_order_relaxed);
         auto sg_opt = Subgraph::create(prob, dag,
             std::vector<size_t>(ops.begin(), ops.end()));
         CostResult cr;
         if (sg_opt) cr = sg_opt->best_cost(entering, retain);
 
-        if (ret_map_.size() < 750000)  // stay under ~75% load factor
-            ret_map_.insert(oext_key, h, cr);
+        if (ret_map_.size() < 750000)
+            ret_map_.insert(h, cr);
         return cr;
     }
 
     CostResult evaluate_with_context(const Subgraph& sg,
                                       const FlatSet<size_t>& entering,
                                       const FlatSet<size_t>& retain) {
-        // No retention context → lock-free base map
         if (entering.empty() && retain.empty()) {
-            thread_local std::vector<size_t> base_key;
-            base_key.assign(sg.ops().begin(), sg.ops().end());
-            size_t h = VectorHash{}(base_key);
-
-            auto* hit = base_map_.find(base_key, h);
+            uint64_t h = hash_vec(sg.ops());
+            auto* hit = base_map_.find(h);
             if (hit) {
                 base_hits_.fetch_add(1, std::memory_order_relaxed);
                 return *hit;
             }
-
             base_misses_.fetch_add(1, std::memory_order_relaxed);
             auto cr = sg.best_cost({}, {});
-            base_map_.insert(base_key, h, cr);
+            base_map_.insert(h, cr);
             return cr;
         }
 
-        // Retention context → lock-free retention map
-        thread_local std::vector<size_t> ext_key;
-        ext_key.clear();
-        ext_key.insert(ext_key.end(), sg.ops().begin(), sg.ops().end());
-        ext_key.push_back(SIZE_MAX);
-        ext_key.insert(ext_key.end(), entering.begin(), entering.end());
-        ext_key.push_back(SIZE_MAX);
-        ext_key.insert(ext_key.end(), retain.begin(), retain.end());
-        size_t h = VectorHash{}(ext_key);
+        // Build hash from ops + entering + retain
+        FlatSet<size_t> ops_set(sg.ops().begin(), sg.ops().end());
+        uint64_t h = hash_retention(ops_set, entering, retain);
 
-        auto* hit = ret_map_.find(ext_key, h);
+        auto* hit = ret_map_.find(h);
         if (hit) {
             ret_hits_.fetch_add(1, std::memory_order_relaxed);
             return *hit;
@@ -277,8 +269,8 @@ public:
 
         ret_misses_.fetch_add(1, std::memory_order_relaxed);
         auto cr = sg.best_cost(entering, retain);
-        if (ret_map_.size() < 750000)  // stay under ~75% load factor
-            ret_map_.insert(ext_key, h, cr);
+        if (ret_map_.size() < 750000)
+            ret_map_.insert(h, cr);
         return cr;
     }
 
@@ -286,7 +278,6 @@ public:
     // Diagnostics & management
     // ====================================================================
 
-    // Only call when no threads are using the cache.
     void clear() {
         base_map_.clear();
         ret_map_.clear();
@@ -311,10 +302,9 @@ public:
 
 private:
     const size_t max_entries_;
-    LockFreeMap<CostResult> base_map_;
+    HashOnlyMap<CostResult> base_map_;
     std::atomic<size_t> base_hits_{0}, base_misses_{0}, base_overcapacity_{0};
 
-    // Retention map: lock-free (op_set|entering|retain) → CostResult  [Phase 2/3]
-    LockFreeMap<CostResult> ret_map_;
+    HashOnlyMap<CostResult> ret_map_;
     std::atomic<size_t> ret_hits_{0}, ret_misses_{0};
 };
