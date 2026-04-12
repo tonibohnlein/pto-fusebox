@@ -92,6 +92,9 @@ inline uint64_t hash_vec(const std::vector<size_t>& v) {
 // No stored keys, no vector comparisons.  ~48 bytes per slot (vs ~100+ before).
 // Collision probability with 64-bit hash: ~n²/2^64 where n = entries.
 // With n = 100K entries: ~5e-10 — negligible.
+//
+// No size counter — avoiding shared atomic contention. Size is approximated
+// from a per-thread counter that's collected lazily.
 // ============================================================================
 
 template<typename Value>
@@ -99,8 +102,6 @@ class HashOnlyMap {
     struct Slot {
         std::atomic<uint64_t> hash{0};  // 0 = empty
         Value value{};
-        // Padding to avoid false sharing between adjacent slots' atomics.
-        // Value is ~48 bytes (CostResult), atomic is 8 bytes → slot is ~56 bytes.
     };
 
     std::unique_ptr<Slot[]> slots_;
@@ -158,6 +159,24 @@ public:
 };
 
 // ============================================================================
+// Per-thread cache statistics — avoids cross-thread atomic contention on
+// the hot path. Each thread accumulates locally; sums are computed on demand.
+// ============================================================================
+struct alignas(64) CacheStats {
+    uint64_t base_hits = 0;
+    uint64_t base_misses = 0;
+    uint64_t ret_hits = 0;
+    uint64_t ret_misses = 0;
+    uint64_t base_overcapacity = 0;
+    uint64_t _pad[3];  // pad to 64 bytes (one cache line) to avoid false sharing
+};
+
+inline CacheStats& thread_cache_stats() {
+    thread_local CacheStats stats;
+    return stats;
+}
+
+// ============================================================================
 // CostCache
 // ============================================================================
 
@@ -167,7 +186,10 @@ public:
         : max_entries_(max_entries)
         , base_map_(std::max<size_t>(1048576, max_entries > 0 ? max_entries * 2 : 1048576))
         , ret_map_(1048576)
-    {}
+    {
+        auto& s = thread_cache_stats();
+        s.base_hits = s.base_misses = s.ret_hits = s.ret_misses = s.base_overcapacity = 0;
+    }
 
     // ====================================================================
     // Tier 1: Base map — hash(op_set) → CostResult.
@@ -178,18 +200,18 @@ public:
 
         auto* hit = base_map_.find(h);
         if (hit) {
-            base_hits_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().base_hits++;
             return hit->feasible ? hit->latency : 1e18;
         }
 
-        base_misses_.fetch_add(1, std::memory_order_relaxed);
+        thread_cache_stats().base_misses++;
         CostResult cr;
         auto sg = Subgraph::create(prob, dag,
             std::vector<size_t>(ops.begin(), ops.end()));
         if (sg) cr = sg->best_cost();
 
         if (max_entries_ > 0 && base_map_.size() >= max_entries_)
-            base_overcapacity_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().base_overcapacity++;
         else
             base_map_.insert(h, cr);
 
@@ -209,10 +231,10 @@ public:
             uint64_t h = hash_flatset(ops);
             auto* hit = base_map_.find(h);
             if (hit) {
-                base_hits_.fetch_add(1, std::memory_order_relaxed);
+                thread_cache_stats().base_hits++;
                 return *hit;
             }
-            base_misses_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().base_misses++;
             auto sg_opt = Subgraph::create(prob, dag,
                 std::vector<size_t>(ops.begin(), ops.end()));
             CostResult cr;
@@ -226,18 +248,17 @@ public:
 
         auto* hit = ret_map_.find(h);
         if (hit) {
-            ret_hits_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().ret_hits++;
             return *hit;
         }
 
-        ret_misses_.fetch_add(1, std::memory_order_relaxed);
+        thread_cache_stats().ret_misses++;
         auto sg_opt = Subgraph::create(prob, dag,
             std::vector<size_t>(ops.begin(), ops.end()));
         CostResult cr;
         if (sg_opt) cr = sg_opt->best_cost(entering, retain);
 
-        if (ret_map_.size() < 750000)
-            ret_map_.insert(h, cr);
+        ret_map_.insert(h, cr);
         return cr;
     }
 
@@ -248,29 +269,27 @@ public:
             uint64_t h = hash_vec(sg.ops());
             auto* hit = base_map_.find(h);
             if (hit) {
-                base_hits_.fetch_add(1, std::memory_order_relaxed);
+                thread_cache_stats().base_hits++;
                 return *hit;
             }
-            base_misses_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().base_misses++;
             auto cr = sg.best_cost({}, {});
             base_map_.insert(h, cr);
             return cr;
         }
 
-        // Build hash from ops + entering + retain
         FlatSet<size_t> ops_set(sg.ops().begin(), sg.ops().end());
         uint64_t h = hash_retention(ops_set, entering, retain);
 
         auto* hit = ret_map_.find(h);
         if (hit) {
-            ret_hits_.fetch_add(1, std::memory_order_relaxed);
+            thread_cache_stats().ret_hits++;
             return *hit;
         }
 
-        ret_misses_.fetch_add(1, std::memory_order_relaxed);
+        thread_cache_stats().ret_misses++;
         auto cr = sg.best_cost(entering, retain);
-        if (ret_map_.size() < 750000)
-            ret_map_.insert(h, cr);
+        ret_map_.insert(h, cr);
         return cr;
     }
 
@@ -281,21 +300,20 @@ public:
     void clear() {
         base_map_.clear();
         ret_map_.clear();
-        base_hits_.store(0, std::memory_order_relaxed);
-        base_misses_.store(0, std::memory_order_relaxed);
-        base_overcapacity_.store(0, std::memory_order_relaxed);
-        ret_hits_.store(0, std::memory_order_relaxed);
-        ret_misses_.store(0, std::memory_order_relaxed);
+        auto& s = thread_cache_stats();
+        s.base_hits = s.base_misses = s.ret_hits = s.ret_misses = s.base_overcapacity = 0;
     }
 
-    size_t base_hits()    const { return base_hits_.load(std::memory_order_relaxed); }
-    size_t base_misses()  const { return base_misses_.load(std::memory_order_relaxed); }
-    size_t ret_hits()     const { return ret_hits_.load(std::memory_order_relaxed); }
-    size_t ret_misses()   const { return ret_misses_.load(std::memory_order_relaxed); }
+    // These return per-thread counts only (not cross-thread sum).
+    // Used for end-of-run diagnostic logging from the main thread.
+    size_t base_hits()    const { return thread_cache_stats().base_hits; }
+    size_t base_misses()  const { return thread_cache_stats().base_misses; }
+    size_t ret_hits()     const { return thread_cache_stats().ret_hits; }
+    size_t ret_misses()   const { return thread_cache_stats().ret_misses; }
 
     size_t hits()         const { return base_hits(); }
     size_t misses()       const { return base_misses(); }
-    size_t overcapacity() const { return base_overcapacity_.load(std::memory_order_relaxed); }
+    size_t overcapacity() const { return thread_cache_stats().base_overcapacity; }
     size_t size()         const { return base_map_.size(); }
     size_t ret_size()     const { return ret_map_.size(); }
     size_t max_entries()  const { return max_entries_; }
@@ -303,8 +321,6 @@ public:
 private:
     const size_t max_entries_;
     HashOnlyMap<CostResult> base_map_;
-    std::atomic<size_t> base_hits_{0}, base_misses_{0}, base_overcapacity_{0};
 
     HashOnlyMap<CostResult> ret_map_;
-    std::atomic<size_t> ret_hits_{0}, ret_misses_{0};
 };

@@ -243,7 +243,7 @@ Solution coupling_parallel_search(
                             parent_retained_list.push_back({edge.first, tensors});
                 }
                 child_part.cache = &cache;
-                if (partition_has_gap(child_part) || !child_part.is_acyclic()) {
+                if (partition_has_gap(child_part)) {  // partition_has_gap checks acyclicity internally
                     total_tasks.fetch_add(1);
                     tasks_since_improve.fetch_add(1);
                     continue;
@@ -316,7 +316,7 @@ Solution coupling_parallel_search(
                     }
                     cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
                     auto is_ret = [&](size_t t) { return cp_copy.is_retained(t); };
-                    if (partition_has_gap(cp_copy.part, is_ret) || !cp_copy.part.is_acyclic()) {
+                    if (partition_has_gap(cp_copy.part, is_ret)) {
                         total_tasks.fetch_add(1);
                         tasks_since_improve.fetch_add(1);
                         continue;
@@ -324,7 +324,7 @@ Solution coupling_parallel_search(
                     cp_child = std::move(cp_copy);
                     origin = "mutate(" + std::to_string(num_muts) + ")";
                 } else {
-                    if (partition_has_gap(*result) || !result->is_acyclic()) {
+                    if (partition_has_gap(*result)) {
                         total_tasks.fetch_add(1);
                         tasks_since_improve.fetch_add(1);
                         continue;
@@ -348,7 +348,7 @@ Solution coupling_parallel_search(
                 }
                 cp_copy = mutate_compound_coupled(std::move(cp_copy), num_muts, rng);
                 auto is_ret2 = [&](size_t t) { return cp_copy.is_retained(t); };
-                if (partition_has_gap(cp_copy.part, is_ret2) || !cp_copy.part.is_acyclic()) {
+                if (partition_has_gap(cp_copy.part, is_ret2)) {
                     total_tasks.fetch_add(1);
                     tasks_since_improve.fetch_add(1);
                     continue;

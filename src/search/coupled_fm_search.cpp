@@ -417,23 +417,25 @@ static double coupled_recompute_saving(const CoupledPartition& cp,
     FlatSet<size_t> new_gb = part.groups[gb].ops;
     new_gb.insert(op);
 
-    auto en_gb = cp.entering_for(gb);
-    auto re_gb = cp.retain_for(gb);
+    const auto& orig_en_gb = cp.entering_for(gb);
+    const auto& re_gb      = cp.retain_for(gb);
 
     // After adding op, some entering tensors may become internal
     // (op produces them → now produced inside gb). Filter.
-    if (!en_gb.empty()) {
-        FlatSet<size_t> valid;
-        for (auto t : en_gb)
-            if (is_boundary_input_of(new_gb, t, *part.dag)) valid.insert(t);
-        en_gb = std::move(valid);
+    FlatSet<size_t> en_gb;
+    bool filtered = false;
+    if (!orig_en_gb.empty()) {
+        for (auto t : orig_en_gb)
+            if (is_boundary_input_of(new_gb, t, *part.dag)) en_gb.insert(t);
+        filtered = true;
     }
+    const FlatSet<size_t>& en_gb_for_new = filtered ? en_gb : orig_en_gb;
     // Retain tensors: op might consume a retained tensor internally,
     // but that doesn't change its boundary-output status — still produced
     // by gb for the next group. No filtering needed for retain.
 
-    double old_cost = cp.group_cost(gb);
-    double new_cost = eval_coupled_group_cost(cp, new_gb, en_gb, re_gb);
+    double old_cost = eval_coupled_group_cost(cp, part.groups[gb].ops, orig_en_gb, re_gb);
+    double new_cost = eval_coupled_group_cost(cp, new_gb, en_gb_for_new, re_gb);
     if (new_cost >= 1e17) return -1e18;
     return old_cost - new_cost;
 }
@@ -547,12 +549,15 @@ static double coupled_steal_saving(const CoupledPartition& cp,
 
     // ga_prev: if ga's entering changed, ga_prev's retain context changed
     if (ga_prev != SIZE_MAX && ga_prev != gb && en_ga != orig_en_ga) {
-        double old_prev = cp.group_cost(ga_prev);
+        const auto& prev_enter_ref = cp.entering_for(ga_prev);
+        const auto& prev_retain_ref = cp.retain_for(ga_prev);
+        double old_prev = eval_coupled_group_cost(cp, part.groups[ga_prev].ops,
+                                                   prev_enter_ref, prev_retain_ref);
         // ga_prev retains tensors for ga. If en_ga is now empty, prev loses all retain.
         // If en_ga shrank, prev retains only the remaining tensors.
-        auto prev_retain = en_ga.empty() ? FlatSet<size_t>{} : en_ga;
+        const auto& new_prev_retain = en_ga;  // can be empty
         double new_prev = eval_coupled_group_cost(
-            cp, part.groups[ga_prev].ops, cp.entering_for(ga_prev), prev_retain);
+            cp, part.groups[ga_prev].ops, prev_enter_ref, new_prev_retain);
         neighbor_delta += old_prev - new_prev;
     }
 
@@ -566,8 +571,10 @@ static double coupled_steal_saving(const CoupledPartition& cp,
         size_t max_steps = part.groups.size();
         for (size_t step = 0; step < max_steps && cur != SIZE_MAX; step++) {
             if (cur == ga || cur == gb || !part.groups[cur].alive) break;
-            double old_cur = cp.group_cost(cur);
+            const auto& cur_enter_orig = cp.entering_for(cur);
             const auto& cur_retain = cp.retain_for(cur);
+            double old_cur = eval_coupled_group_cost(
+                cp, part.groups[cur].ops, cur_enter_orig, cur_retain);
             double new_cur = eval_coupled_group_cost(
                 cp, part.groups[cur].ops, cur_enter, cur_retain);
             if (std::abs(old_cur - new_cur) < 0.001) break;  // no change, stop
@@ -589,24 +596,38 @@ static double coupled_steal_saving(const CoupledPartition& cp,
 
         // gb_next: if gb's retain changed (re_gb != orig_re_gb), next's entering changed
         if (gb_next_orig != SIZE_MAX && gb_next_orig != ga && re_gb != orig_re_gb) {
-            double old_next = cp.group_cost(gb_next_orig);
-            auto next_enter = re_gb.empty() ? FlatSet<size_t>{} : re_gb;
+            const auto& next_enter_orig = cp.entering_for(gb_next_orig);
+            const auto& next_retain = cp.retain_for(gb_next_orig);
+            double old_next = eval_coupled_group_cost(
+                cp, part.groups[gb_next_orig].ops, next_enter_orig, next_retain);
             double new_next = eval_coupled_group_cost(
-                cp, part.groups[gb_next_orig].ops, next_enter, cp.retain_for(gb_next_orig));
+                cp, part.groups[gb_next_orig].ops, re_gb, next_retain);
             neighbor_delta += old_next - new_next;
         }
 
         // gb_prev: if gb's entering changed (en_gb != orig_en_gb), prev's retain changed
         if (gb_prev_orig != SIZE_MAX && gb_prev_orig != ga && en_gb != orig_en_gb) {
-            double old_prev = cp.group_cost(gb_prev_orig);
-            auto prev_retain = en_gb.empty() ? FlatSet<size_t>{} : en_gb;
+            const auto& prev_enter = cp.entering_for(gb_prev_orig);
+            const auto& prev_retain_orig = cp.retain_for(gb_prev_orig);
+            double old_prev = eval_coupled_group_cost(
+                cp, part.groups[gb_prev_orig].ops, prev_enter, prev_retain_orig);
             double new_prev = eval_coupled_group_cost(
-                cp, part.groups[gb_prev_orig].ops, cp.entering_for(gb_prev_orig), prev_retain);
+                cp, part.groups[gb_prev_orig].ops, prev_enter, en_gb);
             neighbor_delta += old_prev - new_prev;
         }
     }
 
-    double old_cost = cp.group_cost(ga) + (is_eject ? 0.0 : cp.group_cost(gb));
+    // Use already-fetched orig_en_ga / orig_re_ga to avoid re-doing map lookups.
+    double old_ga_cost = eval_coupled_group_cost(cp, part.groups[ga].ops,
+                                                  orig_en_ga, orig_re_ga);
+    double old_gb_cost = 0.0;
+    if (!is_eject) {
+        const auto& orig_en_gb = cp.entering_for(gb);
+        const auto& orig_re_gb = cp.retain_for(gb);
+        old_gb_cost = eval_coupled_group_cost(cp, part.groups[gb].ops,
+                                               orig_en_gb, orig_re_gb);
+    }
+    double old_cost = old_ga_cost + old_gb_cost;
 
     // Account for disconnected components in the remainder.
     // First component keeps ga's coupling context, additional components are uncoupled.
@@ -684,7 +705,15 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
         retain = std::move(valid_retain);
     }
 
-    double old_cost = cp.group_cost(ga) + cp.group_cost(gb);
+    // Compute old costs directly to avoid duplicate map lookups in group_cost.
+    const auto& orig_en_ga_m = cp.entering_for(ga);
+    const auto& orig_re_ga_m = cp.retain_for(ga);
+    const auto& orig_en_gb_m = cp.entering_for(gb);
+    const auto& orig_re_gb_m = cp.retain_for(gb);
+    double old_cost = eval_coupled_group_cost(cp, part.groups[ga].ops,
+                                               orig_en_ga_m, orig_re_ga_m)
+                    + eval_coupled_group_cost(cp, part.groups[gb].ops,
+                                               orig_en_gb_m, orig_re_gb_m);
     double merged_cost = eval_coupled_group_cost(cp, merged, entering, retain);
     if (merged_cost >= 1e17) return -1e18;
 
@@ -702,9 +731,12 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     // gb's prev loses its retain if NOT transferred (ga already had a prev)
     if (gb_prev != SIZE_MAX && gb_prev != ga && gb_prev != gb &&
         merged_prev != gb_prev) {
-        double old_p = cp.group_cost(gb_prev);
+        const auto& gp_enter = cp.entering_for(gb_prev);
+        const auto& gp_retain = cp.retain_for(gb_prev);
+        double old_p = eval_coupled_group_cost(cp, part.groups[gb_prev].ops,
+                                                 gp_enter, gp_retain);
         double new_p = eval_coupled_group_cost(
-            cp, part.groups[gb_prev].ops, cp.entering_for(gb_prev), {});
+            cp, part.groups[gb_prev].ops, gp_enter, {});
         if (new_p >= 1e17) return -1e18;
         neighbor_delta += old_p - new_p;
     }
@@ -712,9 +744,12 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     // gb's next loses its entering if NOT transferred (ga already had a next)
     if (gb_next != SIZE_MAX && gb_next != ga && gb_next != gb &&
         merged_next != gb_next) {
-        double old_n = cp.group_cost(gb_next);
+        const auto& gn_enter = cp.entering_for(gb_next);
+        const auto& gn_retain = cp.retain_for(gb_next);
+        double old_n = eval_coupled_group_cost(cp, part.groups[gb_next].ops,
+                                                 gn_enter, gn_retain);
         double new_n = eval_coupled_group_cost(
-            cp, part.groups[gb_next].ops, {}, cp.retain_for(gb_next));
+            cp, part.groups[gb_next].ops, {}, gn_retain);
         if (new_n >= 1e17) return -1e18;
         neighbor_delta += old_n - new_n;
     }
@@ -723,12 +758,15 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     if (merged_prev != SIZE_MAX && entering.empty()) {
         // Check if prev originally HAD retain to the merged group
         bool had_retain = false;
-        if (merged_prev == ga_prev && !cp.entering_for(ga).empty()) had_retain = true;
-        if (merged_prev == gb_prev && !cp.entering_for(gb).empty()) had_retain = true;
+        if (merged_prev == ga_prev && !orig_en_ga_m.empty()) had_retain = true;
+        if (merged_prev == gb_prev && !orig_en_gb_m.empty()) had_retain = true;
         if (had_retain) {
-            double old_p = cp.group_cost(merged_prev);
+            const auto& mp_enter = cp.entering_for(merged_prev);
+            const auto& mp_retain = cp.retain_for(merged_prev);
+            double old_p = eval_coupled_group_cost(cp, part.groups[merged_prev].ops,
+                                                     mp_enter, mp_retain);
             double new_p = eval_coupled_group_cost(
-                cp, part.groups[merged_prev].ops, cp.entering_for(merged_prev), {});
+                cp, part.groups[merged_prev].ops, mp_enter, {});
             if (new_p >= 1e17) return -1e18;
             neighbor_delta += old_p - new_p;
         }
@@ -737,12 +775,15 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     // Merged next loses entering if retain became empty after filtering
     if (merged_next != SIZE_MAX && retain.empty()) {
         bool had_entering = false;
-        if (merged_next == ga_next && !cp.retain_for(ga).empty()) had_entering = true;
-        if (merged_next == gb_next && !cp.retain_for(gb).empty()) had_entering = true;
+        if (merged_next == ga_next && !orig_re_ga_m.empty()) had_entering = true;
+        if (merged_next == gb_next && !orig_re_gb_m.empty()) had_entering = true;
         if (had_entering) {
-            double old_n = cp.group_cost(merged_next);
+            const auto& mn_enter = cp.entering_for(merged_next);
+            const auto& mn_retain = cp.retain_for(merged_next);
+            double old_n = eval_coupled_group_cost(cp, part.groups[merged_next].ops,
+                                                     mn_enter, mn_retain);
             double new_n = eval_coupled_group_cost(
-                cp, part.groups[merged_next].ops, {}, cp.retain_for(merged_next));
+                cp, part.groups[merged_next].ops, {}, mn_retain);
             if (new_n >= 1e17) return -1e18;
             neighbor_delta += old_n - new_n;
         }
@@ -762,7 +803,12 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
         for (auto op : cp.part.groups[groups[i]].ops) merged.insert(op);
 
     double old_cost = 0;
-    for (auto g : groups) old_cost += cp.group_cost(g);
+    for (auto g : groups) {
+        const auto& g_enter = cp.entering_for(g);
+        const auto& g_retain = cp.retain_for(g);
+        old_cost += eval_coupled_group_cost(cp, cp.part.groups[g].ops,
+                                              g_enter, g_retain);
+    }
 
     FlatSet<size_t> merge_set(groups.begin(), groups.end());
 

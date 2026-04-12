@@ -540,32 +540,41 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
     }
 
     // Cost delta: (cost before) - (cost after adding retention).
-    auto ga_enter  = cp.entering_for(ga);
-    auto ga_retain = cp.retain_for(ga);   // {} (ga is chain tail)
-    auto gb_enter  = cp.entering_for(gb); // {} (gb is chain head)
-    auto gb_retain = cp.retain_for(gb);
-
-    double cost_before = cp.group_cost(ga) + cp.group_cost(gb);
+    const auto& ga_enter  = cp.entering_for(ga);
+    const auto& ga_retain = cp.retain_for(ga);   // {} (ga is chain tail)
+    const auto& gb_enter  = cp.entering_for(gb); // {} (gb is chain head)
+    const auto& gb_retain = cp.retain_for(gb);
 
     auto new_ga_retain = ga_retain; new_ga_retain.insert(t);
     auto new_gb_enter  = gb_enter;  new_gb_enter.insert(t);
 
-    CostResult r_ga, r_gb;
+    // Compute old + new costs in one batch (avoids double map lookups via group_cost).
+    CostResult r_ga_old, r_gb_old, r_ga_new, r_gb_new;
     if (cp.part.cache) {
-        r_ga = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
-                                                     ga_enter, new_ga_retain,
-                                                     *cp.part.prob, dag);
-        r_gb = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
-                                                     new_gb_enter, gb_retain,
-                                                     *cp.part.prob, dag);
+        r_ga_old = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, ga_retain,
+                                                         *cp.part.prob, dag);
+        r_gb_old = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         gb_enter, gb_retain,
+                                                         *cp.part.prob, dag);
+        r_ga_new = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, new_ga_retain,
+                                                         *cp.part.prob, dag);
+        r_gb_new = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         new_gb_enter, gb_retain,
+                                                         *cp.part.prob, dag);
     } else {
         if (!cp.part.groups[ga].sg || !cp.part.groups[gb].sg) return {};
-        r_ga = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
-        r_gb = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
+        r_ga_old = cp.part.groups[ga].sg->best_cost(ga_enter, ga_retain);
+        r_gb_old = cp.part.groups[gb].sg->best_cost(gb_enter, gb_retain);
+        r_ga_new = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
+        r_gb_new = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
     }
-    if (!r_ga.feasible || !r_gb.feasible) return {};
+    if (!r_ga_new.feasible || !r_gb_new.feasible) return {};
 
-    return {true, cost_before - (r_ga.latency + r_gb.latency)};
+    double cost_before = (r_ga_old.feasible ? r_ga_old.latency : 1e18)
+                       + (r_gb_old.feasible ? r_gb_old.latency : 1e18);
+    return {true, cost_before - (r_ga_new.latency + r_gb_new.latency)};
 }
 
 CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
@@ -596,32 +605,42 @@ CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
         if (!available) return {};  // would create ephemeral gap
     }
 
-    auto ga_enter  = cp.entering_for(ga);
-    auto ga_retain = cp.retain_for(ga);
-    auto gb_enter  = cp.entering_for(gb);
-    auto gb_retain = cp.retain_for(gb);
-
-    double cost_before = cp.group_cost(ga) + cp.group_cost(gb);
+    const auto& ga_enter  = cp.entering_for(ga);
+    const auto& ga_retain = cp.retain_for(ga);
+    const auto& gb_enter  = cp.entering_for(gb);
+    const auto& gb_retain = cp.retain_for(gb);
 
     auto new_ga_retain = ga_retain; new_ga_retain.erase(t);
     auto new_gb_enter  = gb_enter;  new_gb_enter.erase(t);
 
-    CostResult r_ga, r_gb;
+    // Compute old + new costs in one batch to avoid double map lookups
+    // (group_cost would re-fetch entering_for/retain_for internally).
+    CostResult r_ga_old, r_gb_old, r_ga_new, r_gb_new;
     if (cp.part.cache) {
-        r_ga = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
-                                                     ga_enter, new_ga_retain,
-                                                     *cp.part.prob, *cp.part.dag);
-        r_gb = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
-                                                     new_gb_enter, gb_retain,
-                                                     *cp.part.prob, *cp.part.dag);
+        r_ga_old = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, ga_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_gb_old = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         gb_enter, gb_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_ga_new = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, new_ga_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_gb_new = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         new_gb_enter, gb_retain,
+                                                         *cp.part.prob, *cp.part.dag);
     } else {
         if (!cp.part.groups[ga].sg || !cp.part.groups[gb].sg) return {};
-        r_ga = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
-        r_gb = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
+        r_ga_old = cp.part.groups[ga].sg->best_cost(ga_enter, ga_retain);
+        r_gb_old = cp.part.groups[gb].sg->best_cost(gb_enter, gb_retain);
+        r_ga_new = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
+        r_gb_new = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
     }
-    if (!r_ga.feasible || !r_gb.feasible) return {};
+    if (!r_ga_new.feasible || !r_gb_new.feasible) return {};
 
-    return {true, cost_before - (r_ga.latency + r_gb.latency)};
+    double cost_before = (r_ga_old.feasible ? r_ga_old.latency : 1e18)
+                       + (r_gb_old.feasible ? r_gb_old.latency : 1e18);
+    return {true, cost_before - (r_ga_new.latency + r_gb_new.latency)};
 }
 
 // ============================================================================
