@@ -64,3 +64,10 @@ void reset_mutation_stats();
 Partition crossover(const Partition& parent_a, const Partition& parent_b,
                     std::mt19937& rng,
                     const MerkleHashes* mh = nullptr);
+
+// DAG-cut crossover: split the DAG at a random topological cut, pick the
+// best left-half and right-half from a set of candidates (must be from
+// different pool entries), and combine them.
+Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
+                             const DAG& dag, const Problem& prob,
+                             CostCache* cache, std::mt19937& rng);

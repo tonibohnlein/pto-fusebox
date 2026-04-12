@@ -232,15 +232,33 @@ Solution coupling_parallel_search(
                 //     then inherit coupling edges where possible ---
                 Partition child_part;
                 std::vector<std::pair<size_t, FlatSet<size_t>>> parent_retained_list;
+                bool used_dag_cut = false;
                 {
                     std::shared_lock lock(pool.mutex());
-                    auto [p1, p2] = pool.select_for_crossover(rng);
-                    child_part = crossover(pool[p1].cp.part, pool[p2].cp.part,
-                                           rng, cfg.merkle);
-                    // Collect retained tensors from both parents for seeding
-                    for (auto pidx : {p1, p2})
-                        for (auto& [edge, tensors] : pool[pidx].cp.retained)
-                            parent_retained_list.push_back({edge.first, tensors});
+
+                    bool use_dag_cut = (rng() % 2 == 0) && pool.size() >= 3;
+                    if (use_dag_cut) {
+                        // DAG-cut crossover: collect top candidates from pool
+                        size_t k = std::min<size_t>(5, pool.size());
+                        std::vector<const Partition*> candidates;
+                        for (size_t ci = 0; ci < k; ci++)
+                            candidates.push_back(&pool[ci].cp.part);
+                        child_part = crossover_dag_cut(candidates, dag, prob,
+                                                        &cache, rng);
+                        used_dag_cut = true;
+                        // Collect retained tensors from all candidates for seeding
+                        for (size_t ci = 0; ci < k; ci++)
+                            for (auto& [edge, tensors] : pool[ci].cp.retained)
+                                parent_retained_list.push_back({edge.first, tensors});
+                    } else {
+                        auto [p1, p2] = pool.select_for_crossover(rng);
+                        child_part = crossover(pool[p1].cp.part, pool[p2].cp.part,
+                                               rng, cfg.merkle);
+                        // Collect retained tensors from both parents for seeding
+                        for (auto pidx : {p1, p2})
+                            for (auto& [edge, tensors] : pool[pidx].cp.retained)
+                                parent_retained_list.push_back({edge.first, tensors});
+                    }
                 }
                 child_part.cache = &cache;
                 if (partition_has_gap(child_part)) {  // partition_has_gap checks acyclicity internally
@@ -291,7 +309,7 @@ Solution coupling_parallel_search(
                         }
                     }
                 }
-                origin = "xover";
+                origin = used_dag_cut ? "dagcut" : "xover";
 
             } else if (do_symm) {
                 // --- Symmetry mutation: inject or align representatives ---

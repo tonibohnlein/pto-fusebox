@@ -980,3 +980,172 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
 
     return child;
 }
+
+// ============================================================================
+// DAG-Cut Crossover
+//
+// 1. Pick random topological cut point I.
+// 2. Score each candidate on the left half (ops with topo_pos ≤ I) and
+//    right half (topo_pos > I) independently.
+// 3. Pick best left-scorer and best right-scorer (must be different).
+// 4. Combine: left parent's groups for the left half, right parent's
+//    groups for the right half.  Straddling groups are truncated.
+//    Uncovered ops become singletons.
+// ============================================================================
+
+Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
+                             const DAG& dag, const Problem& prob,
+                             CostCache* cache, std::mt19937& rng) {
+    if (candidates.size() < 2)
+        return candidates.empty() ? Partition::trivial(prob, dag) : *candidates[0];
+
+    size_t n_ops = prob.num_ops();
+    if (n_ops < 4) return *candidates[0];
+
+    // 1. Pick random cut index in [margin, n_ops-1-margin]
+    size_t margin = std::max<size_t>(1, n_ops * 15 / 100);
+    std::uniform_int_distribution<size_t> cut_dist(margin, n_ops - 1 - margin);
+    size_t cut = cut_dist(rng);
+
+    // 2. Score each candidate on left and right halves.
+    //    A group "fits left" if ALL ops have topo_position ≤ cut.
+    //    A group "fits right" if ALL ops have topo_position > cut.
+    //    Score = total_cost_of_fitting_groups / num_ops_covered (lower better).
+    struct HalfScore {
+        double cost = 0;
+        size_t ops_covered = 0;
+        double score() const {
+            return ops_covered > 0 ? cost / (double)ops_covered : 1e18;
+        }
+    };
+
+    size_t nc = candidates.size();
+    std::vector<HalfScore> left_scores(nc), right_scores(nc);
+
+    for (size_t ci = 0; ci < nc; ci++) {
+        const Partition& p = *candidates[ci];
+        for (size_t gi = 0; gi < p.groups.size(); gi++) {
+            if (!p.groups[gi].alive) continue;
+            bool all_left = true, all_right = true;
+            for (auto op : p.groups[gi].ops) {
+                size_t pos = dag.topo_position(op);
+                if (pos > cut) all_left = false;
+                if (pos <= cut) all_right = false;
+            }
+            if (all_left) {
+                left_scores[ci].cost += p.groups[gi].cost;
+                left_scores[ci].ops_covered += p.groups[gi].ops.size();
+            }
+            if (all_right) {
+                right_scores[ci].cost += p.groups[gi].cost;
+                right_scores[ci].ops_covered += p.groups[gi].ops.size();
+            }
+        }
+    }
+
+    // 3. Pick best left-scorer and best right-scorer.
+    //    Must be from different pool entries to ensure recombination.
+    size_t li = 0, ri = 0;
+    for (size_t ci = 1; ci < nc; ci++) {
+        if (left_scores[ci].score() < left_scores[li].score()) li = ci;
+        if (right_scores[ci].score() < right_scores[ri].score()) ri = ci;
+    }
+    if (li == ri) {
+        // Keep the side with the bigger advantage over its runner-up.
+        // Reassign the other side to its runner-up.
+        std::vector<size_t> left_order(nc), right_order(nc);
+        std::iota(left_order.begin(), left_order.end(), 0);
+        std::iota(right_order.begin(), right_order.end(), 0);
+        std::sort(left_order.begin(), left_order.end(), [&](size_t a, size_t b) {
+            return left_scores[a].score() < left_scores[b].score();
+        });
+        std::sort(right_order.begin(), right_order.end(), [&](size_t a, size_t b) {
+            return right_scores[a].score() < right_scores[b].score();
+        });
+        double left_gap = (nc > 1) ? left_scores[left_order[1]].score() - left_scores[li].score() : 0;
+        double right_gap = (nc > 1) ? right_scores[right_order[1]].score() - right_scores[ri].score() : 0;
+        if (left_gap >= right_gap && nc > 1)
+            ri = right_order[1];
+        else if (nc > 1)
+            li = left_order[1];
+    }
+
+    const Partition& parent_left  = *candidates[li];
+    const Partition& parent_right = *candidates[ri];
+
+    // 4. Build child partition.
+    Partition child;
+    child.prob = &prob;
+    child.dag = &dag;
+    child.cache = cache;
+
+    // Track which ops are covered by the child
+    std::vector<bool> covered(n_ops, false);
+
+    // Add left parent's groups that fit entirely in left half
+    for (size_t gi = 0; gi < parent_left.groups.size(); gi++) {
+        if (!parent_left.groups[gi].alive) continue;
+        bool all_left = true;
+        for (auto op : parent_left.groups[gi].ops)
+            if (dag.topo_position(op) > cut) { all_left = false; break; }
+        if (all_left) {
+            child.add_group(parent_left.groups[gi].ops,
+                            parent_left.groups[gi].cost);
+            for (auto op : parent_left.groups[gi].ops) covered[op] = true;
+        }
+    }
+
+    // Add right parent's groups that fit entirely in right half
+    for (size_t gi = 0; gi < parent_right.groups.size(); gi++) {
+        if (!parent_right.groups[gi].alive) continue;
+        bool all_right = true;
+        for (auto op : parent_right.groups[gi].ops)
+            if (dag.topo_position(op) <= cut) { all_right = false; break; }
+        if (all_right) {
+            child.add_group(parent_right.groups[gi].ops,
+                            parent_right.groups[gi].cost);
+            for (auto op : parent_right.groups[gi].ops) covered[op] = true;
+        }
+    }
+
+    // Truncate straddling groups from each parent
+    auto add_truncated = [&](const Partition& parent, bool left_side) {
+        for (size_t gi = 0; gi < parent.groups.size(); gi++) {
+            if (!parent.groups[gi].alive) continue;
+            FlatSet<size_t> kept;
+            for (auto op : parent.groups[gi].ops) {
+                if (covered[op]) continue;
+                bool on_side = left_side
+                    ? (dag.topo_position(op) <= cut)
+                    : (dag.topo_position(op) > cut);
+                if (on_side) kept.insert(op);
+            }
+            if (kept.empty()) continue;
+            double cost = child.eval_set(kept);
+            if (cost >= 1e17) continue;  // infeasible after truncation
+            child.add_group(std::move(kept), cost);
+            // Mark covered (re-read from last added group since kept was moved)
+            for (auto op : child.groups.back().ops) covered[op] = true;
+        }
+    };
+    add_truncated(parent_left, true);
+    add_truncated(parent_right, false);
+
+    // Uncovered ops → singletons
+    for (size_t op = 0; op < n_ops; op++) {
+        if (covered[op]) continue;
+        double cost = child.eval_set({op});
+        child.add_group({op}, (cost < 1e17) ? cost : 1e18);
+    }
+
+    child.rebuild_index();
+
+    // Validate
+    if (partition_has_gap(child)) {
+        // Fall back to the better parent
+        return (parent_left.total_cost() <= parent_right.total_cost())
+            ? parent_left : parent_right;
+    }
+
+    return child;
+}
