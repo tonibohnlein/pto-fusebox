@@ -434,8 +434,17 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
                 std::string name = (idx < n_strats) ? strategies[idx].name : "random";
 
-                // Quick greedy descent (no FM)
                 part.rebuild_index();
+
+                // Add pre-greedy partition for diversity (if valid)
+                if (!partition_has_gap(part)) {
+                    Partition pre_greedy = part;
+                    pre_greedy.rebuild_index();
+                    std::lock_guard<std::mutex> lk(pool_mutex);
+                    seed_pool.push_back(std::move(pre_greedy));
+                }
+
+                // Quick greedy descent (no FM)
                 part = greedy_descent(std::move(part));
                 part.rebuild_index();
 

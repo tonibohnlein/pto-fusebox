@@ -66,6 +66,7 @@ for f in "$BENCH_DIR"/*.json; do
     fi
     
     count=$((count + 1))
+    sleep 1
 done
 
 echo ""

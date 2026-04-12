@@ -57,6 +57,10 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag,
 Partition init_reverse_topo(const Problem& prob, const DAG& dag,
                             CostCache* cache = nullptr);
 
+// Group ops sharing input tensors + their producer (data-locality focus)
+Partition init_tensor_aligned(const Problem& prob, const DAG& dag,
+                               CostCache* cache = nullptr);
+
 // Random partition: start from singletons, apply random merges.
 // Produces different results each call (internal atomic counter for seeds).
 Partition init_random(const Problem& prob, const DAG& dag,

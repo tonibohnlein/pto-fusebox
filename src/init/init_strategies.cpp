@@ -408,16 +408,99 @@ Partition init_random(const Problem& prob, const DAG& dag, CostCache* cache) {
 }
 
 // ============================================================================
+// Tensor-aligned: group ops that share input tensors.
+//
+// For each tensor T (sorted by size descending), try to merge all consumers
+// of T into one group.  If the producer of T is a separate group, try to
+// merge it in too.  This produces groups aligned around shared data,
+// maximizing internal tensor reuse (ephemeral classification).
+// ============================================================================
+
+Partition init_tensor_aligned(const Problem& prob, const DAG& dag,
+                               CostCache* cache) {
+    Partition p = Partition::trivial(prob, dag);
+    p.cache = cache;
+
+    // Sort tensors by size (largest first — merge around big shared tensors)
+    std::vector<size_t> tensor_order(prob.num_tensors());
+    std::iota(tensor_order.begin(), tensor_order.end(), 0);
+    std::sort(tensor_order.begin(), tensor_order.end(),
+        [&](size_t a, size_t b) {
+            int64_t sa = prob.tensors[a].width * prob.tensors[a].height;
+            int64_t sb = prob.tensors[b].width * prob.tensors[b].height;
+            return sa > sb;
+        });
+
+    for (auto t : tensor_order) {
+        const auto& consumers = dag.tensor_consumers[t];
+        if (consumers.size() < 2) continue;
+        int prod = dag.tensor_producer[t];
+
+        // Find the group of the first alive consumer
+        size_t target_gi = SIZE_MAX;
+        for (auto cop : consumers) {
+            for (auto gi : p.groups_of(cop))
+                if (p.groups[gi].alive) { target_gi = gi; break; }
+            if (target_gi != SIZE_MAX) break;
+        }
+        if (target_gi == SIZE_MAX) continue;
+
+        // Try to merge other consumers' groups into target
+        for (auto cop : consumers) {
+            for (auto gi : p.groups_of(cop)) {
+                if (gi == target_gi || !p.groups[gi].alive) continue;
+                FlatSet<size_t> merged = p.groups[target_gi].ops;
+                merged.insert(p.groups[gi].ops.begin(), p.groups[gi].ops.end());
+                if (p.creates_ephemeral_gap(merged, target_gi, gi)) continue;
+                if (!p.acyclic_merge_local(target_gi, gi)) continue;
+                double cost = p.eval_set(merged);
+                if (cost >= 1e17) continue;
+                p.groups[target_gi].ops = std::move(merged);
+                p.groups[target_gi].cost = cost;
+                p.groups[target_gi].gen++;
+                p.groups[gi].alive = false;
+                p.groups[gi].gen++;
+                p.rebuild_index();
+                break;  // gi invalidated, restart consumer loop
+            }
+        }
+
+        // Try to merge producer into the target group
+        if (prod >= 0) {
+            for (auto gi : p.groups_of((size_t)prod)) {
+                if (gi == target_gi || !p.groups[gi].alive) continue;
+                FlatSet<size_t> merged = p.groups[target_gi].ops;
+                merged.insert(p.groups[gi].ops.begin(), p.groups[gi].ops.end());
+                if (p.creates_ephemeral_gap(merged, target_gi, gi)) continue;
+                if (!p.acyclic_merge_local(target_gi, gi)) continue;
+                double cost = p.eval_set(merged);
+                if (cost >= 1e17) continue;
+                p.groups[target_gi].ops = std::move(merged);
+                p.groups[target_gi].cost = cost;
+                p.groups[target_gi].gen++;
+                p.groups[gi].alive = false;
+                p.groups[gi].gen++;
+                p.rebuild_index();
+                break;
+            }
+        }
+    }
+
+    return p;
+}
+
+// ============================================================================
 // Registry and selection
 // ============================================================================
 
 std::vector<InitStrategy> all_init_strategies() {
     return {
-        {"trivial",     init_trivial},
-        {"chain+edge",  init_chain_then_edge},
-        {"seed+grow",   init_seed_and_grow},
-        {"rev-topo",    init_reverse_topo},
-        {"random",      init_random},
+        {"trivial",       init_trivial},
+        {"chain+edge",    init_chain_then_edge},
+        {"seed+grow",     init_seed_and_grow},
+        {"rev-topo",      init_reverse_topo},
+        {"tensor-align",  init_tensor_aligned},
+        {"random",        init_random},
     };
 }
 
