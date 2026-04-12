@@ -1108,7 +1108,10 @@ Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
         }
     }
 
-    // Truncate straddling groups from each parent
+    // Truncate straddling groups from each parent.
+    // If the truncated group would create an ephemeral gap (tensor produced
+    // and consumed internally, but also needed by an external op that can't
+    // get it from anywhere else), split it into singletons instead.
     auto add_truncated = [&](const Partition& parent, bool left_side) {
         for (size_t gi = 0; gi < parent.groups.size(); gi++) {
             if (!parent.groups[gi].alive) continue;
@@ -1121,11 +1124,63 @@ Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
                 if (on_side) kept.insert(op);
             }
             if (kept.empty()) continue;
+            if (kept.size() == 1) {
+                size_t op = *kept.begin();
+                double c = child.eval_set({op});
+                child.add_group({op}, (c < 1e17) ? c : 1e18);
+                covered[op] = true;
+                continue;
+            }
             double cost = child.eval_set(kept);
-            if (cost >= 1e17) continue;  // infeasible after truncation
-            child.add_group(std::move(kept), cost);
-            // Mark covered (re-read from last added group since kept was moved)
-            for (auto op : child.groups.back().ops) covered[op] = true;
+            if (cost >= 1e17) {
+                // Infeasible as a group — add as singletons
+                for (auto op : kept) {
+                    if (covered[op]) continue;
+                    double c = child.eval_set({op});
+                    child.add_group({op}, (c < 1e17) ? c : 1e18);
+                    covered[op] = true;
+                }
+                continue;
+            }
+            // Check for ephemeral gaps in the truncated group: if any tensor
+            // is produced+consumed internally (ephemeral) but also has an
+            // external consumer that can't get it from another group, the
+            // truncated group creates a gap.  In that case, split to singletons.
+            bool has_gap = false;
+            for (auto op : kept) {
+                size_t t = prob.ops[op].output();
+                // Is t consumed by another op inside kept?
+                bool consumed_internal = false;
+                for (auto cop : dag.tensor_consumers[t])
+                    if (cop != op && kept.count(cop)) { consumed_internal = true; break; }
+                if (!consumed_internal) continue;  // t is boundary output, no issue
+                // t is ephemeral in kept. Check external consumers.
+                for (auto cop : dag.tensor_consumers[t]) {
+                    if (kept.count(cop)) continue;  // internal
+                    // cop needs t from outside. Is t available as boundary output
+                    // from any already-added child group?
+                    bool available = false;
+                    for (size_t cgi = 0; cgi < child.groups.size(); cgi++) {
+                        if (!child.groups[cgi].alive) continue;
+                        if (child.groups[cgi].ops.count(op) &&
+                            is_boundary_output_of(child.groups[cgi].ops, t, dag))
+                            { available = true; break; }
+                    }
+                    if (!available) { has_gap = true; break; }
+                }
+                if (has_gap) break;
+            }
+            if (has_gap) {
+                for (auto op : kept) {
+                    if (covered[op]) continue;
+                    double c = child.eval_set({op});
+                    child.add_group({op}, (c < 1e17) ? c : 1e18);
+                    covered[op] = true;
+                }
+            } else {
+                child.add_group(std::move(kept), cost);
+                for (auto op : child.groups.back().ops) covered[op] = true;
+            }
         }
     };
     add_truncated(parent_left, true);
