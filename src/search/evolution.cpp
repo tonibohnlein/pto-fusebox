@@ -120,7 +120,7 @@ Partition mutate_merge(Partition part, std::mt19937& rng) {
 
     auto affected = partition_moves::apply_merge(part, ga, gb, merged_cost);
     if (affected.empty()) return part;
-    part.rebuild_index();
+    part.rebuild_index(affected);
     return part;
 }
 
@@ -154,7 +154,7 @@ Partition mutate_split(Partition part, std::mt19937& rng) {
 
     auto affected = partition_moves::apply_split(part, op_a, op_b, gi, &sr);
     if (affected.empty()) return part;
-    part.rebuild_index();
+    part.rebuild_index(affected);
     return part;
 }
 
@@ -202,7 +202,7 @@ Partition mutate_reassign(Partition part, std::mt19937& rng) {
 
     auto affected = partition_moves::apply_steal(part, op, src_gi, dst_gi);
     if (affected.empty()) return part;
-    part.rebuild_index();
+    part.rebuild_index(affected);
     return part;
 }
 
@@ -250,7 +250,7 @@ Partition mutate_eject(Partition part, std::mt19937& rng) {
 
     auto affected = partition_moves::apply_eject(part, op, gi, &er);
     if (affected.empty()) return part;
-    part.rebuild_index();
+    part.rebuild_index(affected);
     return part;
 }
 
@@ -303,7 +303,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
             double merged_cost = old_cost - mr.saving;
             auto affected = partition_moves::apply_tensor_merge(part, group_list, merged_cost);
             if (!affected.empty()) {
-                part.rebuild_index();
+                part.rebuild_index(affected);
                 return part;
             }
         }
@@ -324,7 +324,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
         if (er.feasible) {
             auto affected = partition_moves::apply_tensor_extract(part, extract_ops, group_list);
             if (!affected.empty()) {
-                part.rebuild_index();
+                part.rebuild_index(affected);
                 return part;
             }
         }
@@ -338,7 +338,7 @@ Partition mutate_tensor_merge(Partition part, std::mt19937& rng) {
             auto affected = partition_moves::apply_tensor_extract_split(
                 part, sr, group_list);
             if (!affected.empty()) {
-                part.rebuild_index();
+                part.rebuild_index(affected);
                 return part;
             }
         }
@@ -371,19 +371,20 @@ Partition mutate_de_recompute(Partition part, std::mt19937& rng) {
 
     // Greedy removal: try each candidate, re-checking after each removal.
     bool any_applied = false;
+    FlatSet<size_t> last_affected;
     for (auto [gi, op] : candidates) {
         if (!part.groups[gi].alive) continue;
         if (!part.groups[gi].ops.count(op)) continue;
         // rebuild_index deferred — must refresh before acyclicity check
-        if (any_applied) { part.rebuild_index(); any_applied = false; }
+        if (any_applied) { part.rebuild_index(last_affected); any_applied = false; }
         if (!part.acyclic_de_recompute_local(op, gi)) continue;
         auto r = partition_moves::eval_de_recompute(part, gi, op);
         if (!r.feasible) continue;
         double new_ga_cost = part.groups[gi].cost - r.saving;
-        auto affected = partition_moves::apply_de_recompute(part, gi, op, new_ga_cost);
-        if (!affected.empty()) any_applied = true;
+        last_affected = partition_moves::apply_de_recompute(part, gi, op, new_ga_cost);
+        if (!last_affected.empty()) any_applied = true;
     }
-    if (any_applied) part.rebuild_index();
+    if (any_applied) part.rebuild_index(last_affected);
     return part;
 }
 
@@ -443,6 +444,8 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
     // Handle affected groups: re-evaluate costs, split disconnected components,
     // kill empty groups.  No rebuild_index needed — this loop only uses
     // groups[gi].ops directly, not groups_of().
+    // Collect new groups separately to avoid modifying affected_groups during iteration.
+    FlatSet<size_t> new_group_indices;
     for (auto gi : affected_groups) {
         if (!part.groups[gi].alive) continue;
         if (part.groups[gi].ops.empty()) {
@@ -462,17 +465,23 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
             part.groups[gi].cost = (nc < 1e17) ? nc : 1e18;
             for (size_t c = 1; c < comps.size(); c++) {
                 double cc = part.eval_set(comps[c]);
-                part.add_group(std::move(comps[c]), (cc < 1e17) ? cc : 1e18);
+                size_t ng = part.add_group(std::move(comps[c]), (cc < 1e17) ? cc : 1e18);
+                new_group_indices.insert(ng);
             }
         }
     }
 
     // Create the new {P, C_i} groups
     for (auto& [cop, cost] : new_groups) {
-        part.add_group({prod_op, cop}, cost);
+        size_t ng = part.add_group({prod_op, cop}, cost);
+        new_group_indices.insert(ng);
     }
 
-    part.rebuild_index();
+    // Merge new groups into affected set for rebuild_index
+    for (auto ng : new_group_indices)
+        affected_groups.insert(ng);
+
+    part.rebuild_index(affected_groups);
     return part;
 }
 
@@ -581,7 +590,7 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
             if (ev.feasible && ev.saving > -1e17) {
                 auto aff = apply_retain_force_split(cp, g, op_a, op_b, split_tensor);
                 if (!aff.empty()) {
-                    cp.part.rebuild_index();
+                    cp.part.rebuild_index(aff);
                     cp.part.rebuild_group_dag();
                 }
             }
@@ -639,7 +648,7 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
                 if (ev.feasible && ev.saving > -1e17) {
                     auto aff = apply_force_retain(cp, ga, g_dst, op_a_dst, op_b_dst, t);
                     if (!aff.empty()) {
-                        cp.part.rebuild_index();
+                        cp.part.rebuild_index(aff);
                         cp.part.rebuild_group_dag();
                     }
                 }
@@ -687,7 +696,7 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
             if (ev.feasible && ev.saving > -1e17) {
                 auto aff = apply_ephemeral_fuse(cp, op_p, c1, g_c2, t);
                 if (!aff.empty()) {
-                    cp.part.rebuild_index();
+                    cp.part.rebuild_index(aff);
                     cp.part.rebuild_group_dag();
                 }
             }

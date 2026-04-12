@@ -70,6 +70,9 @@ FMPassResult fm_inner_pass(Partition part, const FMConfig& cfg) {
     double max_drift = result.start_cost * cfg.max_drift_fraction;
     double floor = result.start_cost * cfg.floor_fraction;
 
+    // Ensure group DAG is built for fast acyclicity checks.
+    part.group_dag();
+
     // Step 1: activate random subset of border ops
     auto candidates = all_activatable_ops(part);
     auto initial = random_subset_n(candidates, cfg.init_count, cfg.seed);

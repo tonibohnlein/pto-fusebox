@@ -15,6 +15,9 @@ Partition greedy_descent(Partition part) {
     const size_t num_ops = part.prob->num_ops();
     PairingHeap<FMMove> heap(num_ops);
 
+    // Ensure group DAG is built for fast acyclicity checks.
+    part.group_dag();
+
     // Initialize: best move per op (no locked ops for greedy)
     for (size_t op = 0; op < num_ops; op++) {
         auto m = best_move_for(part, op);
@@ -41,6 +44,7 @@ Partition greedy_descent(Partition part) {
             rejected++;
             continue;
         }
+
 
 #ifndef NDEBUG
         {

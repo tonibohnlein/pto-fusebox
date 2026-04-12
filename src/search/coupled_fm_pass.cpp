@@ -145,7 +145,10 @@ CoupledFMPassResult coupled_fm_inner_pass(CoupledPartition cp,
             }
         }
 
-        double total_before = cp.total_cost();
+        [[maybe_unused]] double total_before = 0;
+#ifndef NDEBUG
+        total_before = cp.total_cost();
+#endif
         auto affected = apply_coupled_fm_move(cp, move);
         if (affected.empty()) {
             int t = (int)move.type;

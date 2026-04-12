@@ -32,8 +32,32 @@ void CoupledPartition::init_from(Partition p, CostCache* cache) {
     retained.clear();
 }
 
+void CoupledPartition::rebuild_coupled_dag() {
+    // Build from partition's tensor edges
+    coupled_gdag_.build(part);
+    // Add coupling edges
+    for (size_t g = 0; g < next_group.size(); g++)
+        if (next_group[g] != SIZE_MAX && g < part.groups.size() &&
+            part.groups[g].alive && next_group[g] < part.groups.size() &&
+            part.groups[next_group[g]].alive)
+            coupled_gdag_.add_edge(g, next_group[g]);
+    coupled_gdag_.rebuild_topo(part);
+    coupled_gdag_built_ = true;
+}
+
+GroupDAG& CoupledPartition::coupled_dag() {
+    if (!coupled_gdag_built_) rebuild_coupled_dag();
+    return coupled_gdag_;
+}
+
+const GroupDAG& CoupledPartition::coupled_dag() const {
+    if (!coupled_gdag_built_)
+        const_cast<CoupledPartition*>(this)->rebuild_coupled_dag();
+    return coupled_gdag_;
+}
+
 void CoupledPartition::invalidate_couplings() {
-    invalidate_chain_cache();
+    invalidate_chain_cache();  // also invalidates coupled_gdag_
     const DAG& dag = *part.dag;
     for (size_t g = 0; g < next_group.size(); g++) {
         size_t h = next_group[g];
@@ -76,7 +100,7 @@ void CoupledPartition::invalidate_couplings() {
 }
 
 void CoupledPartition::fix_chain_couplings() {
-    invalidate_chain_cache();
+    invalidate_chain_cache();  // also invalidates coupled_gdag_
     // Mutations can create new group DAG edges that make existing coupling links
     // form a cycle in the chain-level DAG.  Detect and remove them.
     //
@@ -91,24 +115,33 @@ void CoupledPartition::fix_chain_couplings() {
             if (gb == SIZE_MAX) continue;
             if (!part.groups[ga].alive || !part.groups[gb].alive) continue;
 
-            // Temporarily disconnect ga→gb so chain_of correctly splits.
+            // Temporarily disconnect ga→gb and check if reconnecting
+            // would create a cycle — using full chain merge check.
             next_group[ga] = SIZE_MAX;
             prev_group[gb] = SIZE_MAX;
+            invalidate_chain_cache();  // rebuild coupled DAG without this edge
 
+            // Check: would reconnecting chain_of(ga) → chain_of(gb) create a cycle?
+            // Use the partition's GroupDAG (tensor edges only) — NOT the coupled
+            // DAG, because coupling edges are chain-internal and don't create
+            // cross-chain dependencies in to_solution's chain-level DAG.
             auto chain_a = chain_of(ga);
             auto chain_b = chain_of(gb);
+            std::vector<size_t> all;
+            all.insert(all.end(), chain_a.begin(), chain_a.end());
+            all.insert(all.end(), chain_b.begin(), chain_b.end());
+            bool would_cycle = part.group_dag().merge_creates_cycle(all);
 
-            // Restore the link.
-            next_group[ga] = gb;
-            prev_group[gb] = ga;
-
-            if (!acyclic_chain_merge(*this, chain_a, chain_b)) {
-                // Remove this coupling link.
-                next_group[ga] = SIZE_MAX;
-                prev_group[gb] = SIZE_MAX;
+            if (would_cycle) {
+                // Leave disconnected — remove this coupling link.
                 retained.erase({ga, gb});
                 changed = true;
                 break;  // Restart — chain heads changed.
+            } else {
+                // Restore the link — no cycle.
+                next_group[ga] = gb;
+                prev_group[gb] = ga;
+                invalidate_chain_cache();
             }
         }
     }
@@ -153,16 +186,18 @@ std::vector<size_t> CoupledPartition::chain_of(size_t g) const {
     return result;
 }
 
-FlatSet<size_t> CoupledPartition::entering_for(size_t g) const {
-    if (g >= prev_group.size() || prev_group[g] == SIZE_MAX) return {};
+const FlatSet<size_t>& CoupledPartition::entering_for(size_t g) const {
+    static const FlatSet<size_t> empty;
+    if (g >= prev_group.size() || prev_group[g] == SIZE_MAX) return empty;
     auto it = retained.find({prev_group[g], g});
-    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
+    return (it != retained.end()) ? it->second : empty;
 }
 
-FlatSet<size_t> CoupledPartition::retain_for(size_t g) const {
-    if (g >= next_group.size() || next_group[g] == SIZE_MAX) return {};
+const FlatSet<size_t>& CoupledPartition::retain_for(size_t g) const {
+    static const FlatSet<size_t> empty;
+    if (g >= next_group.size() || next_group[g] == SIZE_MAX) return empty;
     auto it = retained.find({g, next_group[g]});
-    return (it != retained.end()) ? it->second : FlatSet<size_t>{};
+    return (it != retained.end()) ? it->second : empty;
 }
 
 // ============================================================================
@@ -171,8 +206,8 @@ FlatSet<size_t> CoupledPartition::retain_for(size_t g) const {
 
 double CoupledPartition::group_cost(size_t g) const {
     if (!part.groups[g].alive) return 0.0;
-    auto en = entering_for(g);
-    auto re = retain_for(g);
+    const auto& en = entering_for(g);
+    const auto& re = retain_for(g);
     if (en.empty() && re.empty()) return part.groups[g].cost;
     // Use cache: no .sg required.
     if (part.cache) {
@@ -341,8 +376,8 @@ Solution CoupledPartition::to_solution() const {
             // Always evaluate via cache/subgraph so we get the actual TileConfig
             // back — grp.best_cfg may be unset ({0,0,0}) for groups created by
             // mutations that never called finalize().
-            auto enter = entering_for(g);
-            auto ret   = retain_for(g);
+            const auto& enter = entering_for(g);
+            const auto& ret   = retain_for(g);
             CostResult cr;
             if (part.cache)
                 cr = part.cache->evaluate_with_context(grp.ops, enter, ret, prob, dag);
@@ -448,13 +483,18 @@ static bool acyclic_chain_merge(const CoupledPartition& cp,
 
 bool acyclic_chain_merge_groups(const CoupledPartition& cp,
                                   const std::vector<size_t>& groups) {
+    // Collect all groups in the chains of the merge candidates.
     std::vector<size_t> all_in_chains;
     for (auto g : groups) {
         if (g >= cp.part.groups.size() || !cp.part.groups[g].alive) continue;
         auto ch = cp.chain_of(g);
         all_in_chains.insert(all_in_chains.end(), ch.begin(), ch.end());
     }
-    return acyclic_chain_merge(cp, all_in_chains, {});
+    if (all_in_chains.size() < 2) return true;
+    // Check if merging these chain groups creates a cycle via tensor edges.
+    // Use partition GroupDAG (tensor edges only) — coupling edges are
+    // chain-internal and don't create cross-chain dependencies.
+    return !cp.part.group_dag().merge_creates_cycle(all_in_chains);
 }
 
 // ============================================================================
@@ -487,41 +527,54 @@ CouplingEvalResult eval_couple(const CoupledPartition& cp,
         if (it != cp.retained.end() && it->second.count(t)) return {};
     }
 
-    // Chain-level acyclicity: the merged chain (chain_of(ga) ++ chain_of(gb))
-    // must not create a cycle in the chain-level DAG.  The stronger chain-level
-    // check (vs the old acyclic_merge_local) BFS's through entire external
-    // chains, catching cross-chain dependency cycles.
-    auto chain_a = cp.chain_of(ga);
-    auto chain_b = cp.chain_of(gb);
-    if (!acyclic_chain_merge(cp, chain_a, chain_b)) return {};
+    // Chain-level acyclicity: merging chain_of(ga) and chain_of(gb) must not
+    // create a cycle via tensor edges between external groups. Use the partition
+    // GroupDAG (tensor edges only) — coupling edges are chain-internal.
+    {
+        auto chain_a = cp.chain_of(ga);
+        auto chain_b = cp.chain_of(gb);
+        std::vector<size_t> all;
+        all.insert(all.end(), chain_a.begin(), chain_a.end());
+        all.insert(all.end(), chain_b.begin(), chain_b.end());
+        if (cp.part.group_dag().merge_creates_cycle(all)) return {};
+    }
 
     // Cost delta: (cost before) - (cost after adding retention).
-    auto ga_enter  = cp.entering_for(ga);
-    auto ga_retain = cp.retain_for(ga);   // {} (ga is chain tail)
-    auto gb_enter  = cp.entering_for(gb); // {} (gb is chain head)
-    auto gb_retain = cp.retain_for(gb);
-
-    double cost_before = cp.group_cost(ga) + cp.group_cost(gb);
+    const auto& ga_enter  = cp.entering_for(ga);
+    const auto& ga_retain = cp.retain_for(ga);   // {} (ga is chain tail)
+    const auto& gb_enter  = cp.entering_for(gb); // {} (gb is chain head)
+    const auto& gb_retain = cp.retain_for(gb);
 
     auto new_ga_retain = ga_retain; new_ga_retain.insert(t);
     auto new_gb_enter  = gb_enter;  new_gb_enter.insert(t);
 
-    CostResult r_ga, r_gb;
+    // Compute old + new costs in one batch (avoids double map lookups via group_cost).
+    CostResult r_ga_old, r_gb_old, r_ga_new, r_gb_new;
     if (cp.part.cache) {
-        r_ga = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
-                                                     ga_enter, new_ga_retain,
-                                                     *cp.part.prob, dag);
-        r_gb = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
-                                                     new_gb_enter, gb_retain,
-                                                     *cp.part.prob, dag);
+        r_ga_old = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, ga_retain,
+                                                         *cp.part.prob, dag);
+        r_gb_old = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         gb_enter, gb_retain,
+                                                         *cp.part.prob, dag);
+        r_ga_new = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, new_ga_retain,
+                                                         *cp.part.prob, dag);
+        r_gb_new = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         new_gb_enter, gb_retain,
+                                                         *cp.part.prob, dag);
     } else {
         if (!cp.part.groups[ga].sg || !cp.part.groups[gb].sg) return {};
-        r_ga = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
-        r_gb = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
+        r_ga_old = cp.part.groups[ga].sg->best_cost(ga_enter, ga_retain);
+        r_gb_old = cp.part.groups[gb].sg->best_cost(gb_enter, gb_retain);
+        r_ga_new = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
+        r_gb_new = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
     }
-    if (!r_ga.feasible || !r_gb.feasible) return {};
+    if (!r_ga_new.feasible || !r_gb_new.feasible) return {};
 
-    return {true, cost_before - (r_ga.latency + r_gb.latency)};
+    double cost_before = (r_ga_old.feasible ? r_ga_old.latency : 1e18)
+                       + (r_gb_old.feasible ? r_gb_old.latency : 1e18);
+    return {true, cost_before - (r_ga_new.latency + r_gb_new.latency)};
 }
 
 CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
@@ -552,32 +605,42 @@ CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
         if (!available) return {};  // would create ephemeral gap
     }
 
-    auto ga_enter  = cp.entering_for(ga);
-    auto ga_retain = cp.retain_for(ga);
-    auto gb_enter  = cp.entering_for(gb);
-    auto gb_retain = cp.retain_for(gb);
-
-    double cost_before = cp.group_cost(ga) + cp.group_cost(gb);
+    const auto& ga_enter  = cp.entering_for(ga);
+    const auto& ga_retain = cp.retain_for(ga);
+    const auto& gb_enter  = cp.entering_for(gb);
+    const auto& gb_retain = cp.retain_for(gb);
 
     auto new_ga_retain = ga_retain; new_ga_retain.erase(t);
     auto new_gb_enter  = gb_enter;  new_gb_enter.erase(t);
 
-    CostResult r_ga, r_gb;
+    // Compute old + new costs in one batch to avoid double map lookups
+    // (group_cost would re-fetch entering_for/retain_for internally).
+    CostResult r_ga_old, r_gb_old, r_ga_new, r_gb_new;
     if (cp.part.cache) {
-        r_ga = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
-                                                     ga_enter, new_ga_retain,
-                                                     *cp.part.prob, *cp.part.dag);
-        r_gb = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
-                                                     new_gb_enter, gb_retain,
-                                                     *cp.part.prob, *cp.part.dag);
+        r_ga_old = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, ga_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_gb_old = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         gb_enter, gb_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_ga_new = cp.part.cache->evaluate_with_context(cp.part.groups[ga].ops,
+                                                         ga_enter, new_ga_retain,
+                                                         *cp.part.prob, *cp.part.dag);
+        r_gb_new = cp.part.cache->evaluate_with_context(cp.part.groups[gb].ops,
+                                                         new_gb_enter, gb_retain,
+                                                         *cp.part.prob, *cp.part.dag);
     } else {
         if (!cp.part.groups[ga].sg || !cp.part.groups[gb].sg) return {};
-        r_ga = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
-        r_gb = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
+        r_ga_old = cp.part.groups[ga].sg->best_cost(ga_enter, ga_retain);
+        r_gb_old = cp.part.groups[gb].sg->best_cost(gb_enter, gb_retain);
+        r_ga_new = cp.part.groups[ga].sg->best_cost(ga_enter, new_ga_retain);
+        r_gb_new = cp.part.groups[gb].sg->best_cost(new_gb_enter, gb_retain);
     }
-    if (!r_ga.feasible || !r_gb.feasible) return {};
+    if (!r_ga_new.feasible || !r_gb_new.feasible) return {};
 
-    return {true, cost_before - (r_ga.latency + r_gb.latency)};
+    double cost_before = (r_ga_old.feasible ? r_ga_old.latency : 1e18)
+                       + (r_gb_old.feasible ? r_gb_old.latency : 1e18);
+    return {true, cost_before - (r_ga_new.latency + r_gb_new.latency)};
 }
 
 // ============================================================================
@@ -674,10 +737,16 @@ CouplingEvalResult eval_force_retain(const CoupledPartition& cp,
     if (!cp.part.groups[g_dst].ops.count(op_a_dst)) return {};
     if (!is_boundary_input_of(cp.part.groups[g_dst].ops, t, dag)) return {};
 
-    // Chain-level acyclicity: same check as COUPLE.
-    auto chain_a = cp.chain_of(ga);
-    auto chain_b = cp.chain_of(g_dst);
-    if (!acyclic_chain_merge(cp, chain_a, chain_b)) return {};
+    // Cycle check: coupling chain_of(ga)→chain_of(g_dst). Use partition
+    // GroupDAG (tensor edges only) — coupling edges are chain-internal.
+    {
+        auto chain_a = cp.chain_of(ga);
+        auto chain_b = cp.chain_of(g_dst);
+        std::vector<size_t> all;
+        all.insert(all.end(), chain_a.begin(), chain_a.end());
+        all.insert(all.end(), chain_b.begin(), chain_b.end());
+        if (cp.part.group_dag().merge_creates_cycle(all)) return {};
+    }
 
     // Split g_dst at bridge (op_a_dst, op_b_dst): side_a gets op_a_dst.
     auto sr = cp.part.eval_split(op_a_dst, op_b_dst, g_dst);
