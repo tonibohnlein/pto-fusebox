@@ -176,7 +176,14 @@ Solution coupling_parallel_search(
 
     if (!has_deadline) {
         pool.sort_by_cost();
-        return pool[0].cp.to_solution();
+        for (size_t i = 0; i < pool.size(); i++) {
+            auto sol = pool[i].cp.to_solution();
+            auto vr = sol.validate();
+            if (vr.valid) return sol;
+            std::cerr << "WARNING: pool[" << i << "] (cost="
+                      << pool[i].cost << ") invalid: " << vr.error << "\n";
+        }
+        return pool[0].cp.to_solution();  // all invalid, return best anyway
     }
 
     // ----------------------------------------------------------------
@@ -438,5 +445,14 @@ Solution coupling_parallel_search(
               << " best=" << pool.best_cost()
               << " evo=" << evo_tasks_done.load() << " tasks\n";
 
+    // Try pool entries best-to-worst until one converts to a valid solution.
+    for (size_t i = 0; i < pool.size(); i++) {
+        auto sol = pool[i].cp.to_solution();
+        auto vr = sol.validate();
+        if (vr.valid) return sol;
+        std::cerr << "WARNING: pool[" << i << "] (cost="
+                  << pool[i].cost << ") invalid: " << vr.error << "\n";
+    }
+    // All invalid — return best anyway (solver.cpp will fall back to uncoupled)
     return pool[0].cp.to_solution();
 }
