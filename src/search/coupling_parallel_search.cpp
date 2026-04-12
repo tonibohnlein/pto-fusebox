@@ -368,6 +368,18 @@ Solution coupling_parallel_search(
             auto fm = coupled_fm_outer_loop(std::move(cp_child), feasibly_ret, fc, &cache);
 
             CoupledPartition child_cp = std::move(fm.best_cp);
+
+            // Reject if FM pass introduced an ephemeral gap.
+            {
+                child_cp.part.rebuild_index();
+                auto is_ret = [&](size_t t) { return child_cp.is_retained(t); };
+                if (partition_has_gap(child_cp.part, is_ret)) {
+                    total_tasks.fetch_add(1);
+                    tasks_since_improve.fetch_add(1);
+                    continue;
+                }
+            }
+
             double cost = child_cp.total_cost();
 
             double current_best;
