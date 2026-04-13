@@ -326,10 +326,7 @@ Solution coupling_parallel_search(
                     size_t pi = pool.select_for_mutation(rng);
                     parent_part = pool[pi].cp.part;
                 }
-                auto result = (rng() % 2 == 0)
-                    ? symm_mutations::inject_representative_solution(
-                          std::move(parent_part), *cfg.symm_ctx, prob, dag, rng)
-                    : symm_mutations::align_symmetric_reps(
+                auto result = symm_mutations::align_symmetric_reps(
                           std::move(parent_part), *cfg.symm_ctx, prob, dag, rng);
                 if (!result) {
                     // Fallback to compound mutation

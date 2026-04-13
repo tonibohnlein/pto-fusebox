@@ -284,23 +284,35 @@ std::optional<Partition> inject_representative_solution(
     std::mt19937& rng)
 {
     // Collect usable patterns (have cached solutions)
+    // Minimum coverage: patterns covering <5% of ops are too small to be useful.
+    size_t min_ops = std::max<size_t>(4, prob.num_ops() / 20);
+
     std::vector<size_t> usable_parallel;
     for (size_t i = 0; i < ctx.parallel.size(); i++)
         if (!ctx.parallel_solutions[i].empty() &&
-            ctx.parallel[i].symmetry >= 2)
+            ctx.parallel[i].symmetry >= 2 &&
+            ctx.parallel[i].component_size() * ctx.parallel[i].symmetry >= min_ops)
             usable_parallel.push_back(i);
 
     std::vector<size_t> usable_series;
     for (size_t i = 0; i < ctx.series.size(); i++)
         if (!ctx.series_solutions[i].empty() &&
-            ctx.series[i].num_blocks >= 2)
+            ctx.series[i].num_blocks >= 2 &&
+            ctx.series[i].total_ops() >= min_ops)
             usable_series.push_back(i);
 
     size_t total = usable_parallel.size() + usable_series.size();
     if (total == 0) return std::nullopt;
 
-    // Pick random usable pattern
-    size_t pick = rng() % total;
+    // Pick pattern weighted by coverage (total ops in pattern).
+    std::vector<double> weights;
+    for (auto pi : usable_parallel)
+        weights.push_back((double)(ctx.parallel[pi].component_size() *
+                                    ctx.parallel[pi].symmetry));
+    for (auto si : usable_series)
+        weights.push_back((double)ctx.series[si].total_ops());
+    std::discrete_distribution<size_t> pat_dist(weights.begin(), weights.end());
+    size_t pick = pat_dist(rng);
 
     if (pick < usable_parallel.size()) {
         // Parallel pattern
@@ -407,23 +419,35 @@ std::optional<Partition> align_symmetric_reps(
     const Problem& prob, const DAG& dag,
     std::mt19937& rng)
 {
-    // Collect usable patterns
+    // Collect usable patterns (filter tiny ones: <5% coverage)
+    size_t min_ops_align = std::max<size_t>(4, prob.num_ops() / 20);
+
     std::vector<size_t> usable_parallel;
     for (size_t i = 0; i < ctx.parallel.size(); i++)
         if (ctx.parallel[i].symmetry >= 2 &&
-            ctx.parallel[i].component_size() >= 2)
+            ctx.parallel[i].component_size() >= 2 &&
+            ctx.parallel[i].component_size() * ctx.parallel[i].symmetry >= min_ops_align)
             usable_parallel.push_back(i);
 
     std::vector<size_t> usable_series;
     for (size_t i = 0; i < ctx.series.size(); i++)
         if (ctx.series[i].num_blocks >= 2 &&
-            ctx.series[i].block_size >= 2)
+            ctx.series[i].block_size >= 2 &&
+            ctx.series[i].total_ops() >= min_ops_align)
             usable_series.push_back(i);
 
     size_t total = usable_parallel.size() + usable_series.size();
     if (total == 0) return std::nullopt;
 
-    size_t pick = rng() % total;
+    // Pick pattern weighted by coverage (total ops in pattern).
+    std::vector<double> weights;
+    for (auto pi : usable_parallel)
+        weights.push_back((double)(ctx.parallel[pi].component_size() *
+                                    ctx.parallel[pi].symmetry));
+    for (auto si : usable_series)
+        weights.push_back((double)ctx.series[si].total_ops());
+    std::discrete_distribution<size_t> pat_dist(weights.begin(), weights.end());
+    size_t pick = pat_dist(rng);
 
     if (pick < usable_parallel.size()) {
         // Parallel pattern
@@ -431,24 +455,31 @@ std::optional<Partition> align_symmetric_reps(
         auto& pat = ctx.parallel[pi];
         size_t k = pat.components.size();
 
-        // Pick donor component with cheapest current grouping cost
+        // Pick donor component randomly, biased toward cheaper grouping cost.
         size_t donor = 0;
         std::vector<FlatSet<size_t>> donor_config;
         {
-            double best_donor_cost = 1e18;
+            std::vector<std::pair<double, size_t>> candidates;  // (cost, index)
+            std::vector<std::vector<FlatSet<size_t>>> configs(k);
             for (size_t ci = 0; ci < k; ci++) {
-                auto config = extract_config_from_partition(part, pat.components[ci]);
-                if (config.empty()) continue;
+                configs[ci] = extract_config_from_partition(part, pat.components[ci]);
+                if (configs[ci].empty()) continue;
                 double cost = 0;
-                for (auto& g : config) cost += part.eval_set(g);
-                if (cost < best_donor_cost) {
-                    best_donor_cost = cost;
-                    donor = ci;
-                    donor_config = std::move(config);
-                }
+                for (auto& g : configs[ci]) cost += part.eval_set(g);
+                candidates.push_back({cost, ci});
             }
+            if (candidates.empty()) return std::nullopt;
+            // Softmax selection: weight = exp(-cost / temperature)
+            double min_cost = candidates[0].first;
+            for (auto& [c, _] : candidates) min_cost = std::min(min_cost, c);
+            std::vector<double> weights;
+            for (auto& [c, _] : candidates)
+                weights.push_back(std::exp(-(c - min_cost) / std::max(1.0, min_cost * 0.1)));
+            std::discrete_distribution<size_t> donor_dist(weights.begin(), weights.end());
+            size_t picked = donor_dist(rng);
+            donor = candidates[picked].second;
+            donor_config = std::move(configs[donor]);
         }
-        if (donor_config.empty()) return std::nullopt;
 
         // Collect all ops in the pattern
         FlatSet<size_t> all_pattern_ops;
@@ -483,26 +514,32 @@ std::optional<Partition> align_symmetric_reps(
         auto& pat = ctx.series[si];
         size_t k = pat.blocks.size();
 
-        // Pick donor block with cheapest current grouping cost
+        // Pick donor block randomly, biased toward cheaper grouping cost.
         size_t donor = 0;
         std::vector<FlatSet<size_t>> donor_config;
         {
-            double best_donor_cost = 1e18;
+            std::vector<std::pair<double, size_t>> candidates;
+            std::vector<std::vector<FlatSet<size_t>>> configs(k);
             for (size_t bi = 0; bi < k; bi++) {
                 FlatSet<size_t> block_ops(pat.blocks[bi].begin(),
                                            pat.blocks[bi].end());
-                auto config = extract_config_from_partition(part, block_ops);
-                if (config.empty()) continue;
+                configs[bi] = extract_config_from_partition(part, block_ops);
+                if (configs[bi].empty()) continue;
                 double cost = 0;
-                for (auto& g : config) cost += part.eval_set(g);
-                if (cost < best_donor_cost) {
-                    best_donor_cost = cost;
-                    donor = bi;
-                    donor_config = std::move(config);
-                }
+                for (auto& g : configs[bi]) cost += part.eval_set(g);
+                candidates.push_back({cost, bi});
             }
+            if (candidates.empty()) return std::nullopt;
+            double min_cost = candidates[0].first;
+            for (auto& [c, _] : candidates) min_cost = std::min(min_cost, c);
+            std::vector<double> weights;
+            for (auto& [c, _] : candidates)
+                weights.push_back(std::exp(-(c - min_cost) / std::max(1.0, min_cost * 0.1)));
+            std::discrete_distribution<size_t> donor_dist(weights.begin(), weights.end());
+            size_t picked = donor_dist(rng);
+            donor = candidates[picked].second;
+            donor_config = std::move(configs[donor]);
         }
-        if (donor_config.empty()) return std::nullopt;
 
         FlatSet<size_t> all_pattern_ops;
         for (auto& block : pat.blocks)
