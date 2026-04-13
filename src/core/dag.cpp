@@ -107,14 +107,18 @@ std::vector<size_t> DAG::topo_sort() const {
     for (size_t i = 0; i < num_ops; i++)
         in_deg[i] = (int)op_preds[i].size();
 
-    std::queue<size_t> q;
+    // Min-heap on op index: when multiple ops are ready, pick the one with
+    // the smallest index.  This preserves the original op ordering as much
+    // as possible, which helps series symmetry detection align blocks with
+    // the natural layer structure of generated benchmarks.
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> q;
     for (size_t i = 0; i < num_ops; i++)
         if (in_deg[i] == 0) q.push(i);
 
     std::vector<size_t> order;
     order.reserve(num_ops);
     while (!q.empty()) {
-        auto u = q.front(); q.pop();
+        auto u = q.top(); q.pop();
         order.push_back(u);
         for (auto v : op_succs[u])
             if (--in_deg[v] == 0) q.push(v);
