@@ -391,24 +391,40 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 size_t pool_sz = pool.size();
                 int task_id = total_tasks.load();
                 bool do_crossover = (pool_sz >= 2) && (task_id % 3 == 0);
-                bool do_symm = !do_crossover &&
+
+                // Symmetry frequency scales with pattern count
+                bool do_symm = false;
+                if (!do_crossover &&
                     symm_ready.load(std::memory_order_acquire) &&
-                    !symm_ctx.empty() && (rng() % 5 == 0);
+                    !symm_ctx.empty()) {
+                    size_t n_patterns = symm_ctx.parallel.size()
+                                     + symm_ctx.series.size();
+                    int symm_pct = (n_patterns >= 3) ? 40 : 25;
+                    do_symm = ((int)(rng() % 100) < symm_pct);
+                }
 
                 if (do_crossover) {
-                    auto [p1, p2] = pool.select_for_crossover(rng);
-                    child = crossover(pool[p1].partition, pool[p2].partition, rng, mhp);
+                    bool use_dag_cut = (rng() % 2 == 0) && pool_sz >= 3;
+                    if (use_dag_cut) {
+                        size_t k = std::min<size_t>(5, pool_sz);
+                        std::vector<const Partition*> candidates;
+                        for (size_t ci = 0; ci < k; ci++)
+                            candidates.push_back(&pool[ci].partition);
+                        child = crossover_dag_cut(candidates, dag, prob,
+                                                   &shared_cache, rng);
+                        origin = "dagcut";
+                    } else {
+                        auto [p1, p2] = pool.select_for_crossover(rng);
+                        child = crossover(pool[p1].partition, pool[p2].partition, rng, mhp);
+                        origin = "xover";
+                    }
                     child.cache = &shared_cache;
-                    origin = "xover";
                 } else if (do_symm) {
                     size_t pi = pool.select_for_mutation(rng);
                     Partition parent(pool[pi].partition);
                     lock.unlock();
 
-                    auto result = (rng() % 2 == 0)
-                        ? symm_mutations::inject_representative_solution(
-                            std::move(parent), symm_ctx, prob, dag, rng)
-                        : symm_mutations::align_symmetric_reps(
+                    auto result = symm_mutations::align_symmetric_reps(
                             std::move(parent), symm_ctx, prob, dag, rng);
                     if (result) {
                         child = std::move(*result);
