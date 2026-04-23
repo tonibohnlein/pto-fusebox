@@ -106,6 +106,7 @@ set(TEST_SOURCES
     test/tensor_merge_correctness_test.cpp
     test/tensor_extract_correctness_test.cpp
     test/regression_test.cpp
+    test/granule_bound_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

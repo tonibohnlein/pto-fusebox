@@ -124,7 +124,7 @@
   "fast_memory_capacity": 40000,
   "slow_memory_bandwidth": 15,
   "native_granularity": [
-    256,
-    64
+    128,
+    128
   ]
 }

@@ -186,25 +186,18 @@ void test_sub_native_spatial_still_full_compute() {
     // because you have 4× more tiles
     CHECK("sub-native more expensive", c_half.latency > c_native.latency);
 
-    // Above-native: [256,256,1] scale = ceil(256/128)*ceil(256/128) = 4.
-    // 1 tile, compute = 1000 × 4 = 4000. Same total as [64,64]!
-    // (Padding in the other direction: hardware does 4 native passes per tile.)
-    //
-    // Working set at [256,256,1]: pw_in(256*256) + out(256*256) = 131072.
-    // Must set capacity > 131072 so the tile is feasible.
+    // Above-native: per issues #74 Q1, #78 Q3, #80 Q3, #81 Q1, cfg > native
+    // is invalid. We now reject these configs rather than padding them.
     Problem p2;
     p2.tensors = {{256,256},{256,256}};
     p2.ops = {{OpType::Pointwise,{0},{1},1000}};
-    p2.fast_memory_capacity = 200000;  // >= 2*256*256=131072
+    p2.fast_memory_capacity = 200000;
     p2.slow_memory_bandwidth = 10;
     p2.native_w = 128; p2.native_h = 128;
     DAG d2 = DAG::build(p2);
     auto sg2 = make_sg(p2, d2, {0});
-    auto c_above = sg2.compute_cost(TC(256,256,1));
-    CHECK("above-native feasible", c_above.feasible);
-    CHECK_EQ_I("above-native: 1 tile", c_above.num_spatial_tiles, 1);
-    // scale=4, compute=4000, mem=(256*256/10)*2=13107.2. lat=max(4000,13107.2)=13107.2.
-    CHECK_EQ("above-native lat=13107.2", c_above.latency, 13107.2);
+    CHECK("above-native cfg rejected by is_valid_tiling",
+          !sg2.is_valid_tiling(TC(256,256,1)));
 }
 
 // ============================================================================

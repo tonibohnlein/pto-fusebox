@@ -466,7 +466,8 @@ void test_pw_sink_rule() {
              {OpType::Pointwise,{2},{3},500}};
     p.fast_memory_capacity = 80000;
     p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
+    // native raised to 256 so cfg.k=256 stays within the super-native bound.
+    p.native_w = 256; p.native_h = 256;
     DAG d = DAG::build(p);
 
     auto sg = Subgraph::create(p, d, {0,1});

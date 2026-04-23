@@ -641,8 +641,9 @@ void test_matmul_pw_fusion_K() {
            {OpType::Pointwise, {2}, {3}, 500}};
   p.fast_memory_capacity = 100000;
   p.slow_memory_bandwidth = 10;
-  p.native_w = 128;
-  p.native_h = 128;
+  // native raised to 256 to accommodate cfg.k=256 used in divisor checks.
+  p.native_w = 256;
+  p.native_h = 256;
   DAG d = DAG::build(p);
 
   auto sg = Subgraph::create(p, d, {0, 1});
@@ -681,8 +682,10 @@ void test_nonpow2_tiling() {
   p.ops = {{OpType::MatMul, {0, 1}, {2}, 2000}};
   p.fast_memory_capacity = 200000;
   p.slow_memory_bandwidth = 10;
-  p.native_w = 128;
-  p.native_h = 128;
+  // native raised to exercise non-pow2 divisor (192) without hitting the
+  // super-native bound.
+  p.native_w = 256;
+  p.native_h = 256;
   DAG d = DAG::build(p);
   auto sg = Subgraph::create(p, d, {0});
 

@@ -113,6 +113,16 @@ private:
   FlatSet<size_t> boundary_inputs_;
   FlatSet<size_t> boundary_outputs_;
   FlatSet<size_t> ephemeral_;
+  // Ephemerals split by producer-op type. Used for the granule-fit check in
+  // is_valid_tiling:
+  //   PW producer: slice ≤ (cfg.w, cfg.h) — PW has no k-loop, one granule
+  //                per execution.
+  //   MM producer: slice ≤ native — MM's internal k-loop covers multiple
+  //                native-sized steps; the bound is the hardware limit.
+  // Defensive: mostly subsumed by cfg ≤ native + role propagation, but cheap
+  // and catches role-propagation surprises in long op chains.
+  std::vector<size_t> pw_produced_ephemerals_;
+  std::vector<size_t> mm_produced_ephemerals_;
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;

@@ -402,7 +402,9 @@ void test_recompute_optimal() {
              {OpType::Pointwise,{1},{3},100}}; // Op2: T1→T3
     p.fast_memory_capacity = 60000;
     p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
+    // native raised to 256 so PW-produced ephemeral T1 (256²) can be
+    // covered by a single granule (granule-fit check).
+    p.native_w = 256; p.native_h = 256;
 
     DAG d = DAG::build(p);
     Partition tmp; tmp.prob = &p; tmp.dag = &d;

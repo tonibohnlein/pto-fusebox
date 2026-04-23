@@ -77,7 +77,9 @@ static Problem make_Y_instance6() {
     };
     p.fast_memory_capacity = 60000;           // T1(65536) > 60000 → can't retain
     p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
+    // native raised to 256 so PW-produced ephemeral T1 (256²) fits in
+    // granule when cfg.w = cfg.h = 256 (granule-fit check).
+    p.native_w = 256; p.native_h = 256;
     return p;
 }
 

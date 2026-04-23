@@ -90,7 +90,11 @@
       "Bash(./build/mlsys benchmarks/mlsys-2026-1.json /tmp/test_sol.json)",
       "Bash(git stash:*)",
       "Bash(ctest --output-on-failure -j2)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(/home/toni/work/mlsys26/build/tests/subgraph_test)"
+      "Bash(cmake*)",
+      "Bash(make*)",
+      "Bash(cd*)"
     ],
     "additionalDirectories": [
       "/tmp"

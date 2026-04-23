@@ -120,7 +120,8 @@ void test_retain_these_asymmetric_rhs() {
     p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
     p.fast_memory_capacity = 500000;
     p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
+    // native raised to 256 so cfg.w=256 stays within the super-native bound.
+    p.native_w = 256; p.native_h = 256;
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0});
 

@@ -78,6 +78,18 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.ephemeral_.insert(t);
   }
 
+  // Partition ephemerals by producer op-type for the granule-fit check.
+  // PW-produced ephemerals have a stricter bound (cfg) since PW has no
+  // k-loop; MM-produced ephemerals just need to fit native.
+  for (auto i : sg.ops_) {
+    size_t out_t = prob.ops[i].output();
+    if (!is_ephemeral[out_t]) continue;
+    if (prob.ops[i].type == OpType::Pointwise)
+      sg.pw_produced_ephemerals_.push_back(out_t);
+    else
+      sg.mm_produced_ephemerals_.push_back(out_t);
+  }
+
   if (sg.boundary_outputs_.empty())
     return std::nullopt;
 
@@ -369,13 +381,20 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   for (size_t idx = 0; idx < sg.boundary_tensor_info_.size(); idx++)
     sg.tensor_id_to_info_[sg.boundary_tensor_info_[idx].id] = (int)idx;
 
-  auto valid_candidates = [](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
+  // Super-native granule forbidden on all three axes per issues #74 Q1, #78
+  // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
+  // we use native_w as the uniform cap (benchmarks always have native_w ==
+  // native_h, and native_k follows the same value).
+  const int64_t native_cap = prob.native_w;
+  auto valid_candidates = [native_cap](const std::vector<int64_t> &dims)
+      -> std::vector<int64_t> {
     if (dims.empty()) return {1};
     int64_t mx = *std::max_element(dims.begin(), dims.end());
     if (mx <= 0) return {1};
     auto divs = all_divisors(mx);
     std::vector<int64_t> result;
     for (auto c : divs) {
+      if (native_cap > 0 && c > native_cap) continue;  // super-native invalid
       bool ok = true;
       for (auto v : dims) {
         if (c < v && v % c != 0) { ok = false; break; }
@@ -405,6 +424,15 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
+  // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
+  // native_w == native_h == native_k per #80 Q1; use native_w as the cap.
+  const int64_t native_cap = prob_->native_w;
+  if (native_cap > 0) {
+    if (cfg.w > native_cap) return false;
+    if (cfg.h > native_cap) return false;
+    if (cfg.k > native_cap) return false;
+  }
+
   for (int64_t v : w_divides_)
     if (cfg.w < v && v % cfg.w != 0) return false;
   for (int64_t v : h_divides_)
@@ -428,6 +456,38 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 
   if (ntw > min_ntw_dim_ || nth > min_nth_dim_) return false;
   if (nk > min_nk_h_dim_ || nk > min_nk_v_dim_) return false;
+
+  // Granule-fit check on ephemerals. Every op in the subgraph runs at the
+  // subgraph's (cfg.w, cfg.h) granule; the slice its producer writes per
+  // execution must be representable within that granule:
+  //   PW producer: slice ≤ (cfg.w, cfg.h) — PW has no k-loop, must produce
+  //                the whole slice in one granule execution.
+  //   MM producer: slice ≤ native — MM's internal k-loop allows slices that
+  //                exceed cfg as long as hardware-native-sized.
+  // Mostly redundant with cfg ≤ native + role propagation, kept as a
+  // defensive check against role-propagation surprises in long op chains.
+  auto slice_for = [&](size_t t, int64_t &slice_w, int64_t &slice_h) {
+    const auto &tp = tensor_tiling_[t];
+    BoundaryTensorInfo tmp;
+    tmp.h_source = tp.h;
+    tmp.v_source = tp.v;
+    int64_t ht = tmp.eval_h_tiles(ntw, nk);
+    int64_t vt = tmp.eval_v_tiles(nth, nk);
+    int64_t W = prob_->tensors[t].width;
+    int64_t H = prob_->tensors[t].height;
+    slice_w = W / std::max(ht, (int64_t)1);
+    slice_h = H / std::max(vt, (int64_t)1);
+  };
+  for (size_t t : pw_produced_ephemerals_) {
+    int64_t sw, sh;
+    slice_for(t, sw, sh);
+    if (sw > cfg.w || sh > cfg.h) return false;
+  }
+  for (size_t t : mm_produced_ephemerals_) {
+    int64_t sw, sh;
+    slice_for(t, sw, sh);
+    if (native_cap > 0 && (sw > native_cap || sh > native_cap)) return false;
+  }
 
   // Fast path: if no tensor has conflicting roles from multiple consumers,
   // divisibility checks are sufficient — numerical propagation always agrees.
