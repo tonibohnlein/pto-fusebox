@@ -55,9 +55,6 @@ target_link_libraries(evaluate solver_lib Threads::Threads)
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 
-# Reference evaluator (standalone, no solver_lib dependency)
-add_executable(reference_evaluator src/pipeline/reference_evaluator.cpp)
-target_compile_features(reference_evaluator PRIVATE cxx_std_17)
 
 # --- Tests ---
 enable_testing()
