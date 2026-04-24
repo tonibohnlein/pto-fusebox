@@ -7,65 +7,8 @@
 #include "search/coupling_search.h"  // eval_couple, apply_couple, apply_uncouple
 #include "symmetry/merkle_hash.h"
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <iostream>
-
-// --- Mutation statistics (thread-safe) ---
-static std::atomic<uint64_t> g_mut_total_requested{0};
-static std::atomic<uint64_t> g_mut_total_applied{0};
-static std::atomic<uint64_t> g_mut_total_attempts{0};
-static std::atomic<uint64_t> g_mut_per_type_attempts[6]{};
-static std::atomic<uint64_t> g_mut_per_type_applied[6]{};
-
-// Crossover statistics
-static std::atomic<uint64_t> g_xover_calls{0};
-static std::atomic<uint64_t> g_xover_clusters{0};
-static std::atomic<uint64_t> g_xover_eval_set_calls{0};
-static std::atomic<uint64_t> g_xover_gap_rejects{0};
-
-void print_mutation_stats() {
-    uint64_t req = g_mut_total_requested.load();
-    uint64_t app = g_mut_total_applied.load();
-    uint64_t att = g_mut_total_attempts.load();
-    if (att == 0 && g_xover_calls.load() == 0) return;
-    if (att > 0) {
-        std::cerr << "  Mutation stats: " << app << "/" << req << " applied/requested"
-                  << "  (" << att << " attempts, "
-                  << (att > 0 ? (int)(100.0 * app / att) : 0) << "% success rate)\n";
-        const char* names[] = {"merge", "split", "reassign", "eject",
-                               "tensor_merge", "force_recompute"};
-        for (int i = 0; i < 6; i++) {
-            uint64_t a = g_mut_per_type_attempts[i].load();
-            uint64_t s = g_mut_per_type_applied[i].load();
-            if (a > 0)
-                std::cerr << "    " << names[i] << ": " << s << "/" << a
-                          << " (" << (int)(100.0 * s / a) << "%)\n";
-        }
-    }
-    uint64_t xc = g_xover_calls.load();
-    if (xc > 0) {
-        std::cerr << "  Crossover stats: " << xc << " calls"
-                  << ", avg clusters=" << g_xover_clusters.load() / xc
-                  << ", avg evals=" << g_xover_eval_set_calls.load() / xc
-                  << ", gap_rejects=" << g_xover_gap_rejects.load()
-                  << " (" << (int)(100.0 * g_xover_gap_rejects.load() / xc) << "%)\n";
-    }
-}
-
-void reset_mutation_stats() {
-    g_mut_total_requested = 0;
-    g_mut_total_applied = 0;
-    g_mut_total_attempts = 0;
-    for (int i = 0; i < 6; i++) {
-        g_mut_per_type_attempts[i] = 0;
-        g_mut_per_type_applied[i] = 0;
-    }
-    g_xover_calls = 0;
-    g_xover_clusters = 0;
-    g_xover_eval_set_calls = 0;
-    g_xover_gap_rejects = 0;
-}
 
 // Under the new ephemeral rule, a tensor produced AND consumed inside a group
 // is always ephemeral. partition_has_gap() checks BOTH acyclicity AND
@@ -712,8 +655,6 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
     int attempts = 0;
     int consecutive_fails = 0;
 
-    g_mut_total_requested.fetch_add(num_mutations, std::memory_order_relaxed);
-
     // --- Pre-filter: determine which mutation types can fire on this partition ---
     // 0=merge, 1=split, 2=reassign, 3=eject, 4=tensor_merge, 5=force_recompute
     const auto& dag = *part.dag;
@@ -793,12 +734,10 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
             case 5: part = mutate_force_recompute(std::move(part), rng);  break;
         }
 
-        g_mut_per_type_attempts[choice].fetch_add(1, std::memory_order_relaxed);
         bool did_apply = (part.num_alive() != before_groups || part.total_cost() != before_cost);
         if (did_apply) {
             applied++;
             consecutive_fails = 0;
-            g_mut_per_type_applied[choice].fetch_add(1, std::memory_order_relaxed);
 
             // Recompute eligible types — partition structure changed
             eligible = compute_eligible(part);
@@ -835,9 +774,6 @@ Partition mutate_compound(Partition part, int num_mutations, std::mt19937& rng) 
         }
 #endif
     }
-
-    g_mut_total_attempts.fetch_add(attempts, std::memory_order_relaxed);
-    g_mut_total_applied.fetch_add(applied, std::memory_order_relaxed);
 
     return part;
 }
@@ -889,10 +825,6 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     for (auto& [k, _] : clusters) cluster_keys.push_back(k);
     std::shuffle(cluster_keys.begin(), cluster_keys.end(), rng);
 
-    g_xover_calls.fetch_add(1, std::memory_order_relaxed);
-    g_xover_clusters.fetch_add(cluster_keys.size(), std::memory_order_relaxed);
-    uint64_t local_evals = 0;
-    
     Partition child;
     child.prob = &prob;
     child.dag = &dag;
@@ -920,7 +852,6 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
             FlatSet<size_t> merged = child.groups[gi].ops;
             for (auto op : cluster) merged.insert(op);
             double c = child.eval_set(merged);
-            local_evals++;
             if (c < 1e17 && c < best_cost) {
                 best_cost = c;
                 best_gi = gi;
@@ -929,8 +860,7 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
 
         // Also evaluate the cluster as standalone
         double standalone = child.eval_set(cluster);
-        local_evals++;
-        
+
         if (best_gi != SIZE_MAX && best_cost < standalone + 100) {
             // Merge into existing group — incremental index update
             child.merge_ops_into(best_gi, cluster);
@@ -946,13 +876,10 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
             // Last resort: singletons
             for (auto op : cluster) {
                 double c = child.eval_set({op});
-                local_evals++;
                 child.add_group({op}, c);
             }
         }
     }
-
-    g_xover_eval_set_calls.fetch_add(local_evals, std::memory_order_relaxed);
 
     // Single rebuild at the end for cleanup (removes dead entries, etc.)
     child.rebuild_index();
@@ -960,7 +887,6 @@ Partition crossover(const Partition& parent_a, const Partition& parent_b,
     // Safety: crossover can create cycles or mixed-consumer violations
     // when splicing clusters from two parents.
     if (partition_has_gap(child)) {
-        g_xover_gap_rejects.fetch_add(1, std::memory_order_relaxed);
         return (parent_a.total_cost() <= parent_b.total_cost()) ? parent_a : parent_b;
     }
     

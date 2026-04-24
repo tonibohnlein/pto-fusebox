@@ -52,10 +52,6 @@ CoupledPartition mutate_compound_coupled(CoupledPartition cp,
                                           int num_mutations,
                                           std::mt19937& rng);
 
-// --- Mutation statistics ---
-void print_mutation_stats();
-void reset_mutation_stats();
-
 // --- Crossover ---
 
 // Agreement-based crossover (Sanders & Schulz style):

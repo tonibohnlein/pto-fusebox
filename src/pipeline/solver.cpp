@@ -2,7 +2,7 @@
 #include "partition/partition.h"
 #include "core/cost_cache.h"
 #include "search/parallel_search.h"
-#include "search/evolution.h"      // print_mutation_stats, reset_mutation_stats
+#include "search/evolution.h"
 #include "search/local_search.h"   // partition_has_gap, greedy_descent
 #include "search/coupling_parallel_search.h"
 #include "search/symm_mutations.h"
@@ -158,8 +158,6 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
 
     std::cerr << "  Partition pool: " << partition_pool.size()
               << " entries, best=" << partition_pool[0].total_cost() << "\n";
-    print_mutation_stats();
-    reset_mutation_stats();
 
     // Null partition cache pointers — partitions don't need the cache after
     // Phase 1 (finalize() uses Subgraph::create directly). The shared_cache
