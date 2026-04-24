@@ -47,9 +47,12 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
             continue;
         }
 
-        // Greedy descent on FM best
-        Partition candidate = greedy_descent(std::move(pass_result.best_partition));
-        double candidate_cost = candidate.total_cost();
+        // Use FM's own best (no per-pass greedy: that was previously collapsing
+        // FM's drift exploration back to the nearest local minimum, partially
+        // undoing the whole point of drift-budgeted search. The refinement
+        // step lives at the end of the pipeline — see evo task.)
+        Partition candidate = std::move(pass_result.best_partition);
+        double candidate_cost = pass_result.best_cost;
 
         // Record last-pass end state for diversity (caller may kick from here).
         result.end_partition = candidate;

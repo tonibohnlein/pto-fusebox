@@ -54,12 +54,13 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
             continue;
         }
 
-        // Greedy descent on FM best
+        // Use FM's own best directly. The per-pass greedy here was partially
+        // undoing FM's drift-based exploration; refinement happens once at
+        // the end of the evo task via coupling_greedy_descent on fm.best_cp.
         CoupledPartition candidate = std::move(pass_result.best_cp);
-        double candidate_cost = coupling_greedy_descent(candidate, feasibly_ret,
-                                                         cfg.deadline);
+        double candidate_cost = pass_result.best_cost;
 
-        // Record last-pass end state for diversity.
+        // Record last-pass end state.
         result.end_cp   = candidate;
         result.end_cost = candidate_cost;
 

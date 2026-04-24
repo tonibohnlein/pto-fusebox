@@ -203,7 +203,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::atomic<int> evo_improving{0};
     std::atomic<int64_t> evo_fm_ms_total{0};      // total FM time across all evo tasks
     std::atomic<int> evo_fm_passes_total{0};       // total FM inner passes across evo
-    std::atomic<int> kick_fired{0};               // diversity-kick path fired count
     int early_stop_threshold = num_threads * 25;
 
     std::cerr << "  Init: " << gen0_tasks << " tasks on " << num_threads << " threads\n";
@@ -325,7 +324,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                     kicked.rebuild_index();
                     if (!partition_has_gap(kicked) &&
                         kick_cost < fm_result.cost - 0.01) {
-                        kick_fired.fetch_add(1);
                         kick_result = {std::move(kicked), kick_cost,
                             "kick+" + strategies[task.strategy_idx].name};
                     }
@@ -490,7 +488,6 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 if (!partition_has_gap(refined)) {
                     double refined_cost = refined.total_cost();
                     if (refined_cost < fm_result.cost - 0.01) {
-                        kick_fired.fetch_add(1);
                         refined_result = {std::move(refined), refined_cost,
                                           "kick+" + origin};
                     }
@@ -555,8 +552,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     if (n_evo > 0) {
         std::cerr << "  Evo: " << n_evo << " tasks (" << n_evo_imp << " improving)";
         std::cerr << "  FM: " << evo_passes << " passes, "
-                  << (n_evo > 0 ? evo_ms / n_evo : 0) << "ms/task avg"
-                  << "  kicks=" << kick_fired.load();
+                  << (n_evo > 0 ? evo_ms / n_evo : 0) << "ms/task avg";
     }
     std::cerr << "\n";
     std::cerr << "  Cache: " << shared_cache.size() << " entries, "
