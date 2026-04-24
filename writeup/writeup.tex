@@ -63,12 +63,10 @@ config is cheap.
 
 Feasibility is a first-class concept. \texttt{Subgraph::create} refuses any
 op-set that has mixed internal/external consumers of the same tensor,
-inconsistent boundary-output dimensions, or a disconnected sub-DAG. The
-PW-sink rule ($k{=}1$ whenever a Pointwise produces a boundary output) is
-baked into the precomputed candidate set for $k$. Tiling divisibility
-($w \mid W_{\text{out}}$, etc.) is precomputed as a fast-path intersection.
-These invariants are verified by 47 unit/integration tests covering each
-move and each cost-model branch.
+inconsistent boundary-output dimensions, or a disconnected sub-DAG.
+Tiling divisibility ($w \mid W_{\text{out}}$, etc.) is precomputed as a
+fast-path intersection. These invariants are verified by 47
+unit/integration tests covering each move and each cost-model branch.
 
 \section{Partition search}
 
@@ -83,16 +81,24 @@ Each move validates acyclicity on the condensed group DAG before
 evaluation (modified Kahn with OR-semantics for recomputed ops) and
 ephemeral-gap preservation (mixed-consumer constraint).
 
-\subsection{FM with drift}
+\subsection{Greedy descent and FM}
 
-An FM pass forms an active set from a small random seed of ops and
-then iterates: pop the best move across the active set, apply it, lock
-the moved op so it cannot initiate again this pass, and expand the
-active set with the neighbouring ops of the affected groups (which are
-re-evaluated with the locked set in mind). We accept worsening moves
-up to a \emph{drift budget} $\varepsilon \cdot C_0$ below the best
-snapshot seen so far; once the cumulative gain drops beyond this bound
-the pass aborts. The outer loop restarts each subsequent pass from the
+A greedy descent and an FM pass share the same move generators and the
+same active-set data structure; they differ in how they explore. Greedy
+seeds the active set with every op, never locks, and only accepts
+strictly improving moves -- monotone by construction and therefore
+guaranteed to converge to a local minimum. We run it whenever we need
+to pull a perturbed partition back into a valley: at the end of every
+initialisation strategy (before FM) and as a refinement polish on the
+best partition FM returns. An FM pass, by contrast,
+forms an active set from a small random seed of ops and then iterates:
+pop the best move across the active set, apply it, lock the moved op
+so it cannot initiate again this pass, and expand the active set with
+the neighbouring ops of the affected groups (which are re-evaluated
+with the locked set in mind). We accept worsening moves up to a
+\emph{drift budget} $\varepsilon \cdot C_0$ below the best snapshot
+seen so far; once the cumulative gain drops beyond this bound the pass
+aborts. The outer loop restarts each subsequent pass from the
 running best partition, with a cosine-annealed drift fraction that
 decays from wide exploration at pass~0 to tight refinement near the
 end. Each pass also returns its perturbed end state so that the
@@ -198,15 +204,14 @@ evaluations automatically reuse Phase~1 work.
 index updated in-place on every move and a compact \texttt{GroupDAG}
 with $O(|E|)$ \texttt{merge\_creates\_cycle} checks. Dirty sets are
 propagated from the affected groups to their DAG neighbours so only
-impacted moves are re-evaluated, and the move-audit pattern
-(\texttt{doc/move\_audit\_pattern.md}) replays each move in a
+impacted moves are re-evaluated, and every move is replayed in a
 sandboxed copy before commit to catch any invariant violation at
 write time rather than discovering it downstream.
 
 \textbf{Parallelism.} Init, FM, and evolution tasks run on up to 8
-threads behind a work-stealing task queue; task granularity is a full
-FM outer loop, so lock contention on the diversity pool is negligible.
-All shared state (cost cache, pool) is either lock-free or
+threads dispatched from a shared atomic task counter; task granularity
+is a full FM outer loop, so lock contention on the diversity pool is
+negligible. All shared state (cost cache, pool) is either lock-free or
 coarse-grained mutex-guarded.
 
 \textbf{Safety margins.} The budget is clamped to 95\,\% of the posted

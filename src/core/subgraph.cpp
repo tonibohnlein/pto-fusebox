@@ -189,6 +189,53 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
+    // Detect simple MM→PW epilogue pattern (issue #82):
+    //   All sinks are PW, and walking backward from PW sinks through PW-only
+    //   chains reaches exactly one MM. That MM is the "effective sink" —
+    //   its k-loop runs, accumulates into its ephemeral output, then the PW
+    //   chain fires once on the completed tile. Per #82 this is always valid.
+    //
+    //   When detected: output_K_ = effective sink MM's K, and we mark it in
+    //   is_sink_op_vec_ so tiling propagation gives it FROM_NK inputs.
+    if (sg.has_pw_sink_ && sg.has_matmul_ && sg.output_K_ == 1) {
+      size_t found_mm = SIZE_MAX;
+      bool valid = true;
+      for (auto s : sink_ops) {
+        if (prob.ops[s].type != OpType::Pointwise) {
+          valid = false; break;  // mixed MM+PW sinks handled above
+        }
+        // BFS backward through PW-only chain from this PW sink
+        std::vector<size_t> stack = {s};
+        std::vector<bool> visited(num_ops, false);
+        visited[s] = true;
+        while (!stack.empty() && valid) {
+          size_t op = stack.back(); stack.pop_back();
+          for (auto t : prob.ops[op].inputs) {
+            int prod = dag.tensor_producer[t];
+            if (prod < 0 || !is_in_sg[(size_t)prod]) continue;
+            if (visited[(size_t)prod]) continue;
+            visited[(size_t)prod] = true;
+            if (prob.ops[(size_t)prod].type == OpType::MatMul) {
+              if (found_mm != SIZE_MAX && found_mm != (size_t)prod)
+                valid = false;  // multiple MMs feed PW chain
+              found_mm = (size_t)prod;
+            } else {
+              stack.push_back((size_t)prod);
+            }
+          }
+        }
+      }
+      if (valid && found_mm != SIZE_MAX) {
+        sg.has_simple_epilogue_ = true;
+        sg.output_K_ = sg.op_K(found_mm);
+        sg.is_sink_op_vec_[found_mm] = true;
+        // Record the ephemeral accumulator tensor
+        size_t accum_t = prob.ops[found_mm].output();
+        if (is_ephemeral[accum_t])
+          sg.ephemeral_accumulators_.push_back(accum_t);
+      }
+    }
+
     std::vector<std::vector<size_t>> eph_consumers(num_tensors);
     for (auto i : sg.ops_)
       for (auto t : prob.ops[i].inputs)
@@ -487,8 +534,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
   //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
   //     (full reduction in one pass).
-  sg.ks_cand_ = sg.has_pw_sink_ ? std::vector<int64_t>{sg.output_K_}
-                                 : valid_candidates(sg.k_divides_);
+  // Exception: simple MM→PW epilogue (#82) — enumerate k candidates
+  //   since the MM's k-loop completes before PW fires.
+  if (sg.has_pw_sink_ && !sg.has_simple_epilogue_)
+    sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
+  else
+    sg.ks_cand_ = valid_candidates(sg.k_divides_);
 
   return sg;
 }
@@ -514,7 +565,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     if (cfg.w < v && v % cfg.w != 0) return false;
   for (int64_t v : h_divides_)
     if (cfg.h < v && v % cfg.h != 0) return false;
-  if (!has_pw_sink_) {
+  if (!has_pw_sink_ || has_simple_epilogue_) {
     for (int64_t v : k_divides_) {
       // Per #75: cfg.k > op_K is physically undefined — there's nothing
       // to stream into the back half of the k-granule, and whatever gets
@@ -533,8 +584,8 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
 
-  // PW-sink: no temporal tiling allowed.
-  if (has_pw_sink_ && nk > 1) return false;
+  // PW-sink: no temporal tiling allowed, UNLESS simple MM→PW epilogue (#82).
+  if (has_pw_sink_ && !has_simple_epilogue_ && nk > 1) return false;
 
   // Issue #71 Rules 2/3: prologue-PW geometric condition. A PW that feeds
   // an MM's LHS (via PW-only chain) requires cfg.w ≥ matmul.K so a single
@@ -668,6 +719,14 @@ int64_t Subgraph::working_set_unchecked(const TileConfig &cfg,
   for (auto t : retain_these)
     if (!retained_from_prev.count(t))
       ws += prob_->tensors[t].size();
+
+  // Ephemeral MM accumulators in MM→PW epilogue patterns (#82):
+  // The MM output is ephemeral but physically resident in fast memory as an
+  // accumulator across all k-steps. Costs w×h per spatial tile.
+  if (nk > 1) {
+    for (auto t : ephemeral_accumulators_)
+      ws += cfg.w * cfg.h;
+  }
 
   return ws;
 }

@@ -107,6 +107,7 @@ set(TEST_SOURCES
     test/multi_role_test.cpp
     test/large_subgraph_test.cpp
     test/prologue_pw_test.cpp
+    test/epilogue_splitk_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

@@ -132,9 +132,15 @@ private:
   std::vector<size_t> pw_produced_ephemerals_;
   std::vector<size_t> mm_produced_ephemerals_;
 
+  // Ephemeral MM outputs that serve as accumulators in MM→PW epilogue patterns.
+  // These are physically resident in fast memory across all k-steps (w×h each).
+  // Only populated when has_simple_epilogue_ is true.
+  std::vector<size_t> ephemeral_accumulators_;
+
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
   bool has_pw_sink_ = false;
+  bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
 
