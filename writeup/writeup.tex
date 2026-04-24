@@ -75,10 +75,12 @@ move and each cost-model branch.
 The partition layer minimises the sum of subgraph costs assuming no
 retention. The state is a set of groups (op subsets); moves are
 \textsc{merge}, \textsc{steal}, \textsc{recompute}, \textsc{eject},
-\textsc{internal-eject}, \textsc{split}, and two tensor-level operators
-that work on shared inputs (\textsc{tensor-merge}/\textsc{tensor-extract}).
+\textsc{internal-eject}, and \textsc{split}, plus two tensor-level
+operators restricted to the FM layer -- \textsc{tensor-merge} (fuse all
+groups containing consumers of a shared input tensor) and
+\textsc{tensor-extract} (pull just the consumer ops into a new group).
 Each move validates acyclicity on the condensed group DAG before
-evaluation (modified Kahn with OR-semantics for recomputed ops), and
+evaluation (modified Kahn with OR-semantics for recomputed ops) and
 ephemeral-gap preservation (mixed-consumer constraint).
 
 \subsection{FM with drift}
@@ -90,11 +92,12 @@ active set with the neighbouring ops of the affected groups (which are
 re-evaluated with the locked set in mind). We accept worsening moves
 up to a \emph{drift budget} $\varepsilon \cdot C_0$ below the best
 snapshot seen so far; once the cumulative gain drops beyond this bound
-the pass aborts. The outer loop applies cosine-annealed temperature to
-the floor/drift fractions and a multiplicative \emph{heat} that widens
-the search after each non-improving pass and narrows it after each
-improvement. On non-improving passes we also run a greedy-kick from
-the perturbed end state -- a cheap way to land in an adjacent basin.
+the pass aborts. The outer loop restarts each subsequent pass from the
+running best partition, with a cosine-annealed drift fraction that
+decays from wide exploration at pass~0 to tight refinement near the
+end. Each pass also returns its perturbed end state so that the
+evolutionary layer can reseed from a still-drifting partition rather
+than always from a local minimum.
 
 \subsection{Evolutionary pool}
 
@@ -121,56 +124,27 @@ strictly better or sufficiently far from the nearest neighbour.
 
 \section{Symmetry detection}
 
-ML workloads are full of exact structural repetition -- parallel
-attention heads, MoE experts, transformer blocks stacked in series --
-and exploiting that repetition is far cheaper than re-searching for it.
-We detect symmetry once up front and feed it back into initialisation,
-mutation, crossover, and pool diversity.
-
-\textbf{Merkle fingerprints.} Each op gets a structural hash built by
-two directional passes over the DAG. The forward hash composes an op's
-init hash (type, base cost, input/output tensor shapes) with the sorted
-forward hashes of its predecessors, iterated up to the longest-chain
-depth so information fully propagates. The backward hash does the same
-from successors. An op's \emph{combined} hash $\mathit{fwd}\oplus
-\mathit{bwd}$ uniquely identifies its global structural role: two ops
-share a combined hash iff their entire predecessor and successor cones
-are isomorphic, with matching tensor dimensions. Hashing iterates to a
-fixed point in $O(\mathit{chain}\cdot |\mathrm{ops}|)$ time and is
-computed once at the start of the pipeline.
-
-\textbf{Parallel patterns.} The forward-only hash is used to form
-\emph{orbits} -- sets of ops with identical predecessor cones. An
-orbit-level DAG is built with top/bottom topological-distance labels,
-and orbits are grown into connected \emph{components} by a two-phase
-merger: Phase~1 merges only same-symmetry adjacent orbits (preserving
-the replication factor), Phase~2 greedily extends while allowing the
-symmetry to drop, as long as it stays $>1$. A level constraint (top
-and bottom ranges may differ by at most one) prevents creating cycles
-in the condensed super-node DAG. The output is a list of
-\texttt{SymmetricPattern}s, each reporting $N$ isomorphic components
-with matching op lists.
-
-\textbf{Series patterns.} A separate detector scans the topological
-order for consecutive blocks of $K$ ops with identical internal
-structure and inter-block wiring (using the iteration-0 init hash so
-that chain-end effects don't break the match). Transformer stacks,
-deep chains and MoE expert towers typically surface as one series
-pattern covering the bulk of the graph.
-
-\textbf{Consumption.} Patterns feed four parts of the search: (i)~a
-\texttt{symm\_init} strategy that solves the partition on the
-representative component and replicates the grouping to the others,
-giving a high-quality seed for free on symmetric inputs; (ii)~a
-coverage-weighted symmetric-mutation operator that applies a random
-partition edit to every replica simultaneously, so the child stays on
-the symmetric manifold; (iii)~DAG-cut crossover, which restricts donor
-regions to Merkle-equivalent slices so the cut boundaries are known to
-match; (iv)~pool-diversity canonicalisation, where \texttt{merkle\_%
-canonicalise} rank-matches ops within each equivalence class between
-two partitions before computing ARI, ensuring that two labellings that
-differ only by a symmetry permutation hash to distance~0 rather than
-a spurious positive.
+ML graphs are full of exact repetition (parallel heads, MoE experts,
+stacked transformer blocks) and reusing a good grouping across replicas
+is cheaper than re-searching for it. We precompute a directed Merkle
+fingerprint per op: a forward hash composed from the op's init hash
+(type, base cost, I/O shapes) and the sorted forward hashes of its
+predecessors, iterated to a fixed point, plus a symmetric backward
+hash; the combined hash identifies ops whose full predecessor and
+successor cones are isomorphic. Equivalence classes of the forward
+hash are grown into parallel \texttt{SymmetricPattern}s via a two-phase
+orbit-level merger with a top/bottom level constraint to prevent
+cycles, and a separate scan of the topological order extracts
+\texttt{SeriesPattern}s -- consecutive blocks of $K$ ops with matching
+internal and inter-block wiring. These patterns feed four places in
+the search: \texttt{symm\_init} replicates a solved partition from one
+component to all the others; a coverage-weighted symmetric-mutation
+operator edits every replica simultaneously so the child stays on the
+symmetric manifold; DAG-cut crossover restricts donor slices to
+Merkle-equivalent regions so the cut boundaries match; and
+\texttt{merkle\_canonicalise} rank-matches ops within each class
+before ARI distance, so partitions that differ only by a symmetry
+permutation hash to distance~0.
 
 \section{Retention and coupling}
 
@@ -181,27 +155,64 @@ The cost of a coupled pair recomputes both endpoints with retention
 context and caches the result in a second cost-cache tier
 (\texttt{evaluate\_with\_context}).
 
-The coupled-partition layer runs its own FM/evo loop with coupling-aware
-moves (\textsc{couple}, \textsc{decouple}, \textsc{reroute}, plus all
-partition moves lifted to respect chains). Phase~2 seeds the coupling
-pool from ordering heuristics (DFS retain-score and beam-search
-ordering); Phase~3 lets the coupled FM evo explore from there until
-the deadline. The final solution falls back to the uncoupled best
-partition if the coupled candidate fails validation.
+The coupled-partition layer runs its own FM/evo loop with all eight
+partition moves lifted to respect chains, plus five coupling-specific
+moves: \textsc{couple}/\textsc{uncouple} add or remove a coupling edge
+$g_a\to g_b$ carrying a tensor $t$; \textsc{retain-force-split} splits a
+group at a bridge edge so that an internal tensor becomes a boundary
+output and immediately couples the two halves; \textsc{force-retain}
+splits the destination group so a coupling that would otherwise
+overflow fast memory becomes feasible; and \textsc{ephemeral-fuse}
+extracts a producer and one of its consumers into a fresh group where
+the shared tensor is ephemeral, and couples that group to the remaining
+consumer. Each move validates chain-level acyclicity via a lifted BFS
+reachability check before any cost evaluation.
+
+Phase~2 seeds the coupling pool from ordering heuristics (DFS
+retain-score and beam-search ordering) applied to every partition in
+the Phase~1 pool, plus a random-coupling variant for diversity;
+Phase~3 lets the coupled FM evo explore from there until the deadline.
+The final solution falls back to the uncoupled best partition if the
+coupled candidate fails validation.
 
 \section{Engineering notes}
 
-A two-tier shared cost cache memoises \texttt{eval\_set} results keyed
-by the sorted op-set, with a second tier adding (entering, retain) for
-coupling; all workers share one instance and hit rates exceed 90\,\%
-after the first generation. The partition maintains an op$\to$group
-index and a compact \texttt{GroupDAG} so cycle checks and dirty-set
-propagation are $O(|E|)$ per move. Search is embarrassingly parallel at
-task granularity (one FM outer loop per task), using up to 8 threads
-with a mutex-guarded diversity pool. The budget is clamped to 95\,\% of
-the posted timeout and propagated as an absolute deadline, so every FM
-pass and cost evaluation checks wall time and exits cleanly before the
-harness kills the process.
+\textbf{Cost cache.} Every partition move and every coupling move
+triggers a subgraph cost evaluation, so the cache is the hot path of
+the whole solver. We use a two-tier lock-free open-addressed table
+(\texttt{src/core/cost\_cache.h}): the base tier keys $\text{hash}%
+(\text{sorted op-set}) \to \texttt{CostResult}$ and serves all
+Phase~1 evaluations; the retention tier extends the key with
+(entering, retain) sets and serves the coupled search. Keys are stored
+as 64-bit wyhash-style fingerprints with no backing op-index
+vector -- a correctness shortcut justified by a per-lookup collision
+probability below $10^{-9}$ at realistic populations -- so a lookup is
+a single atomic load and writes are a CAS on a per-slot atomic hash.
+All threads and all phases share one cache instance; Phase~2/3 rely on
+Phase~1 having warmed the base tier. Hit rates are well above 90\,\%
+after the first generation, and the retention tier falls through to
+the base tier when entering and retain are both empty so coupled
+evaluations automatically reuse Phase~1 work.
+
+\textbf{Incremental indexing.} The partition maintains an op$\to$group
+index updated in-place on every move and a compact \texttt{GroupDAG}
+with $O(|E|)$ \texttt{merge\_creates\_cycle} checks. Dirty sets are
+propagated from the affected groups to their DAG neighbours so only
+impacted moves are re-evaluated, and the move-audit pattern
+(\texttt{doc/move\_audit\_pattern.md}) replays each move in a
+sandboxed copy before commit to catch any invariant violation at
+write time rather than discovering it downstream.
+
+\textbf{Parallelism.} Init, FM, and evolution tasks run on up to 8
+threads behind a work-stealing task queue; task granularity is a full
+FM outer loop, so lock contention on the diversity pool is negligible.
+All shared state (cost cache, pool) is either lock-free or
+coarse-grained mutex-guarded.
+
+\textbf{Safety margins.} The budget is clamped to 95\,\% of the posted
+timeout and propagated as an absolute deadline, so every FM pass and
+cost evaluation checks wall time and exits cleanly before the harness
+kills the process.
 
 \section{Results}
 
