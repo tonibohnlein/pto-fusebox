@@ -2384,25 +2384,19 @@ void test_2mm_chain_nk2_temporal() {
     //   stream_load = 1638.4 + 819.2 = 2457.6
     //   out_evict = 409.6
     //
-    // comp_per_step (new model: only SINK ops divide by nk):
-    //   Op0 (non-sink, cost=2000): nk_adj=1, op_scale=max(128/128,1)×max(64/128,1)=1.
-    //     2000/1 * 1 = 2000.
-    //   Op1 (sink, cost=4000): nk_adj=nk=2, op_scale=max(64/128,1)×max(64/128,1)=1.
-    //     4000/2 * 1 = 2000.
-    //   comp_per_step = 4000.
+    // comp_per_step (per PROBLEM.md Ex5: every op amortizes across nk):
+    //   (Op0 + Op1) / nk = (2000 + 4000) / 2 = 3000
     //
     // RowMajor tile_cost with nk=2:
-    //   tile_cost(once, row, col) = step0 + last
-    //     per_tile_io = tile(0) + once(0) + row(819.2 if row_fresh) + col(0)
-    //     step0 = max(4000, per_tile_io + 2457.6)
-    //     last  = max(4000, 2457.6 + 409.6) = max(4000, 2867.2) = 4000
+    //   step0 = max(3000, per_tile_io + 2457.6)
+    //   last  = max(3000, 2457.6 + 409.6) = max(3000, 2867.2) = 3000
     //
-    //   first       = tile_cost(T,T,T): per_tile_io=819.2, step0=max(4000,3276.8)=4000, total=8000
-    //   row_trans    = tile_cost(F,T,F): per_tile_io=819.2, step0=4000, total=8000
-    //   within_row   = tile_cost(F,F,T): per_tile_io=0, step0=max(4000,2457.6)=4000, total=8000
+    //   first       = tile_cost(T,T,T): per_tile_io=819.2, step0=3276.8, total=6276.8
+    //   row_trans    = tile_cost(F,T,F): per_tile_io=819.2, step0=3276.8, total=6276.8
+    //   within_row   = tile_cost(F,F,T): per_tile_io=0, step0=max(3000,2457.6)=3000, total=6000
     //
     //   n_row_trans = nth-1 = 1, n_within = (ntw-1)*nth = 2
-    //   latency = 8000 + 1*8000 + 2*8000 = 32000
+    //   latency = 6276.8 + 1*6276.8 + 2*6000 = 24553.6
     //
     // Timeline (RowMajor snake, ntw=2, nth=2, nk=2):
     //

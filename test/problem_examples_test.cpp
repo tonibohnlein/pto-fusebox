@@ -176,7 +176,7 @@ static Problem ex3_problem() {
     p.ops = {{OpType::Pointwise,{0},{1},1500},
              {OpType::Pointwise,{1},{2},1500},
              {OpType::Pointwise,{1,2},{3},1500}};
-    p.fast_memory_capacity = 70000;  // increased: 3B needs 65536 for sg1
+    p.fast_memory_capacity = 50000;  // matches PROBLEM.md Ex3
     p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     return p;
@@ -391,27 +391,26 @@ void test_ex5_strategy_b() {
     CHECK_EQ_I("5B tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("5B k_passes", c.num_k_passes, 4);
 
-    // Compute per step (new model: only sink Op1 divides by nk=4):
-    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
-    //   Op1 (sink):     2000/4 * scale=1 = 500
-    //   Total = 2500
-    CHECK_EQ("5B comp/step", c.compute_per_step, 2500.0);
+    // Per PROBLEM.md Ex5 Strategy B: the fused chain co-pipelines k-slices,
+    // so every MM (sink and non-sink) amortizes its compute across nk.
+    //   compute_per_step = (Op0 + Op1) / nk = (2000 + 2000) / 4 = 1000
+    CHECK_EQ("5B comp/step", c.compute_per_step, 1000.0);
 
     // IO (ntw=1, nth=1):
     //   T0: (FIXED_1, FROM_NTH) → once_load = 16384/10 = 1638.4
     //   T1: (FROM_NK, FIXED_1)  → stream = 4096/10 = 409.6
     //   T2: (FROM_NTW, FROM_NK) → stream = 4096/10 = 409.6; stream_total = 819.2
     //   T4: out_evict = 1638.4
-    // k=0: max(2500, once(1638.4)+stream(819.2)) = max(2500, 2457.6) = 2500
-    // k=1: max(2500, stream(819.2)) = 2500
-    // k=2: same → 2500
-    // k=3: max(2500, stream(819.2)+evict(1638.4)) = max(2500, 2457.6) = 2500
-    // Total = 4 × 2500 = 10000
-    CHECK_EQ("5B latency", c.latency, 10000.0);
+    // k=0: max(1000, once(1638.4)+stream(819.2)) = max(1000, 2457.6) = 2457.6
+    // k=1: max(1000, stream(819.2)) = 1000
+    // k=2: same → 1000
+    // k=3: max(1000, stream(819.2)+evict(1638.4)) = max(1000, 2457.6) = 2457.6
+    // Total = 2457.6 + 1000 + 1000 + 2457.6 = 6915.2  (matches PROBLEM.md)
+    CHECK_EQ("5B latency", c.latency, 6915.2);
 
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("5B solution valid", sol.validate().valid);
-    CHECK_EQ("5B solution total", sol.total_latency(), 10000.0);
+    CHECK_EQ("5B solution total", sol.total_latency(), 6915.2);
 }
 
 // ==========================================================================

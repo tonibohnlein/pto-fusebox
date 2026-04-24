@@ -730,8 +730,11 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       op_scale = std::max(slice_w / native_w, 1.0) *
                  std::max(slice_h / native_h, 1.0);
     }
-    const double nk_adjusted = is_sink_op_vec_[i] ? (double)nk : 1.0;
-    comp_per_step += c / nk_adjusted * op_scale;
+    // Per PROBLEM.md Example 5: when the unified execution grid has k<K,
+    // every op's compute is amortized across the nk k-steps (the whole
+    // subgraph co-pipelines partial k-slices — no op materializes its
+    // output before the sink). Divide by nk uniformly.
+    comp_per_step += c / (double)nk * op_scale;
   }
   result.compute_per_step = comp_per_step;
 

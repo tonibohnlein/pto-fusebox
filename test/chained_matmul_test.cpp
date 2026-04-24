@@ -94,23 +94,21 @@ void test_chain2() {
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // Compute per step (new model: only sink Op1 divides by nk=4):
-    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
-    //   Op1 (sink):     2000/4 * scale=1 = 500
-    //   Total = 2500
-    CHECK_EQ("comp/step", c.compute_per_step, 2500.0);
+    // Compute per step (per PROBLEM.md Ex5: every op amortizes across nk):
+    //   (Op0 + Op1) / nk = (2000 + 2000) / 4 = 1000
+    CHECK_EQ("comp/step", c.compute_per_step, 1000.0);
 
     // IO (ntw=1, nth=1):
     //   T0: (FIXED_1, FROM_NTH) → once_load = 128×128/10 = 1638.4
     //   T1: (FROM_NK, FIXED_1)  → stream_slice = 32×128/10 = 409.6
     //   T2: (FROM_NTW, FROM_NK) → stream_slice = 128×32/10 = 409.6; stream_total = 819.2
     //   T4: out_evict = 1638.4
-    // k=0: max(2500, once(1638.4)+stream(819.2)) = max(2500, 2457.6) = 2500
-    // k=1: max(2500, stream(819.2)) = 2500
-    // k=2: same → 2500
-    // k=3: max(2500, stream(819.2)+evict(1638.4)) = max(2500, 2457.6) = 2500
-    // Total = 4 × 2500 = 10000
-    CHECK_EQ("latency", c.latency, 10000.0);
+    // k=0: max(1000, once(1638.4)+stream(819.2))   = 2457.6
+    // k=1: max(1000, stream(819.2))                = 1000
+    // k=2: max(1000, stream(819.2))                = 1000
+    // k=3: max(1000, stream(819.2)+evict(1638.4))  = 2457.6
+    // Total = 2457.6 + 1000 + 1000 + 2457.6 = 6915.2
+    CHECK_EQ("latency", c.latency, 6915.2);
 
     // --- Also test at [128,128,64]: 2 k-passes ---
     auto c64 = sg.compute_cost(TC(128,128,64));
@@ -185,12 +183,9 @@ void test_chain3() {
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // Compute per step (new model: only sink Op2 divides by nk=4):
-    //   Op0 (non-sink): 2000/1 * scale=1 = 2000
-    //   Op1 (non-sink): 2000/1 * scale=1 = 2000
-    //   Op2 (sink):     2000/4 * scale=1 = 500
-    //   Total = 4500
-    CHECK_EQ("comp/step", c.compute_per_step, 4500.0);
+    // Compute per step (per PROBLEM.md Ex5: every op amortizes across nk):
+    //   (Op0 + Op1 + Op2) / nk = (2000 + 2000 + 2000) / 4 = 1500
+    CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
 
     // IO (ntw=1, nth=1, 1 spatial tile):
     //   T1: (FIXED_1, FIXED_1) → once_load = 128×128/10 = 1638.4
@@ -198,11 +193,11 @@ void test_chain3() {
     //   T3: (FROM_NK, FIXED_1)  → stream = 32×128/10 = 409.6
     //   T5: (FROM_NTW, FROM_NK) → stream = 128×32/10 = 409.6; stream_total = 819.2
     //   T6: out_evict = 1638.4
-    // d=0: max(4500, once(3276.8)+stream(819.2)) = max(4500, 4096) = 4500
-    // d=1,2: max(4500, stream(819.2)) = 4500
-    // d=3: max(4500, stream(819.2)+evict(1638.4)) = max(4500, 2457.6) = 4500
-    // Total = 4 × 4500 = 18000
-    CHECK_EQ("latency", c.latency, 18000.0);
+    // d=0: max(1500, once(3276.8)+stream(819.2)) = 4096
+    // d=1,2: max(1500, stream(819.2))            = 1500
+    // d=3: max(1500, stream(819.2)+evict(1638.4)) = 2457.6
+    // Total = 4096 + 1500 + 1500 + 2457.6 = 9553.6
+    CHECK_EQ("latency", c.latency, 9553.6);
 
     // --- Verify via breakdown ---
     double B = 10.0;
@@ -210,17 +205,17 @@ void test_chain3() {
     double col = 128.0 * 128.0 / B;          // T0: 1638.4
     double stream = 2.0 * 32.0 * 128.0 / B;  // T3+T5: 819.2
     double evict = 128.0 * 128.0 / B;        // T6: 1638.4
-    double comp = 4500.0;
+    double comp = 1500.0;
 
-    double k0 = std::max(comp, once + col + stream);   // max(4500,4096)=4500
-    double k_mid = std::max(comp, stream);              // max(4500,819.2)=4500
-    double k_last = std::max(comp, stream + evict);     // max(4500,2457.6)=4500
-    CHECK_EQ("k=0 lat", k0, 4500.0);
-    CHECK_EQ("k=mid lat", k_mid, 4500.0);
-    CHECK_EQ("k=3 lat", k_last, 4500.0);
+    double k0 = std::max(comp, once + col + stream);   // max(1500,4096)=4096
+    double k_mid = std::max(comp, stream);              // max(1500,819.2)=1500
+    double k_last = std::max(comp, stream + evict);     // max(1500,2457.6)=2457.6
+    CHECK_EQ("k=0 lat", k0, 4096.0);
+    CHECK_EQ("k=mid lat", k_mid, 1500.0);
+    CHECK_EQ("k=3 lat", k_last, 2457.6);
 
     double total_hand = k0 + 2 * k_mid + k_last;
-    CHECK_EQ("hand total", total_hand, 18000.0);
+    CHECK_EQ("hand total", total_hand, 9553.6);
     CHECK_EQ("matches compute_cost", c.latency, total_hand);
 }
 

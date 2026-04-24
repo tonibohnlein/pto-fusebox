@@ -92,10 +92,9 @@ void test_fanin_cost_k32() {
     CHECK("feasible", c.feasible);
     CHECK_EQ_I("tiles", c.num_spatial_tiles, 1);
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
-    // New model: only sink Op2 divides by nk=4.
-    // Op0 (non-sink): 2000/1*1=2000. Op1 (non-sink): 2000/1*1=2000. Op2 (sink): 2000/4*1=500.
-    // Total = 4500
-    CHECK_EQ("comp/step", c.compute_per_step, 4500.0);
+    // Per PROBLEM.md Ex5: every op amortizes across nk.
+    //   (Op0 + Op1 + Op2) / nk = (2000+2000+2000)/4 = 1500
+    CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
 
     double B = 10.0;
     // IO (ntw=1, nth=1):
@@ -104,18 +103,18 @@ void test_fanin_cost_k32() {
     //   T3: (FIXED_1, FROM_NK)  → stream = 128×32/10 = 409.6  (LHS of non-sink Op1)
     //   T4: (FROM_NTW, FIXED_1) → once_load = 128×128/10 = 1638.4  (ntw=1)
     //   stream_total = 819.2;  once_total = 3276.8
-    // k=0: max(4500, once(3276.8)+stream(819.2)) = max(4500, 4096) = 4500
-    double k0 = std::max(4500.0, 2*128.0*128.0/B + 2*32.0*128.0/B);
-    CHECK_EQ("k=0", k0, 4500.0);
-    // k=1,2: max(4500, stream(819.2)) = 4500
-    double k_mid = std::max(4500.0, 2*32.0*128.0/B);
-    CHECK_EQ("k_mid", k_mid, 4500.0);
-    // k=3: max(4500, stream(819.2)+evict(1638.4)) = max(4500, 2457.6) = 4500
-    double k_last = std::max(4500.0, 2*32.0*128.0/B + 128.0*128.0/B);
-    CHECK_EQ("k_last", k_last, 4500.0);
+    // k=0: max(1500, once(3276.8)+stream(819.2)) = 4096
+    double k0 = std::max(1500.0, 2*128.0*128.0/B + 2*32.0*128.0/B);
+    CHECK_EQ("k=0", k0, 4096.0);
+    // k=1,2: max(1500, stream(819.2)) = 1500
+    double k_mid = std::max(1500.0, 2*32.0*128.0/B);
+    CHECK_EQ("k_mid", k_mid, 1500.0);
+    // k=3: max(1500, stream(819.2)+evict(1638.4)) = 2457.6
+    double k_last = std::max(1500.0, 2*32.0*128.0/B + 128.0*128.0/B);
+    CHECK_EQ("k_last", k_last, 2457.6);
 
-    double total = k0 + 2*k_mid + k_last;  // 4 × 4500 = 18000
-    CHECK_EQ("total hand", total, 18000.0);
+    double total = k0 + 2*k_mid + k_last;  // 4096 + 1500 + 1500 + 2457.6 = 9553.6
+    CHECK_EQ("total hand", total, 9553.6);
     CHECK_EQ("total code", c.latency, total);
 }
 
@@ -126,23 +125,22 @@ void test_fanin_cost_k64() {
     auto c = sg.compute_cost(TC(128,128,64));
 
     CHECK_EQ_I("k_passes", c.num_k_passes, 2);
-    // New model: only sink Op2 divides by nk=2.
-    // Op0 (non-sink): 2000/1*1=2000. Op1 (non-sink): 2000/1*1=2000. Op2 (sink): 2000/2*1=1000.
-    // Total = 5000
-    CHECK_EQ("comp/step", c.compute_per_step, 5000.0);
+    // Per PROBLEM.md Ex5: every op amortizes across nk.
+    //   (Op0 + Op1 + Op2) / nk = (2000+2000+2000)/2 = 3000
+    CHECK_EQ("comp/step", c.compute_per_step, 3000.0);
 
     double B = 10.0;
     // IO (ntw=1, nth=1):
     //   T0: once_load = 1638.4; T4: once_load = 1638.4; once_total = 3276.8
     //   T1: stream = 64×128/10 = 819.2; T3: stream = 128×64/10 = 819.2; stream_total = 1638.4
     //   T6: evict = 1638.4
-    // k=0: max(5000, once(3276.8)+stream(1638.4)) = max(5000, 4915.2) = 5000
-    double k0 = std::max(5000.0, 2*128.0*128.0/B + 2*64.0*128.0/B);
-    CHECK_EQ("k=0", k0, 5000.0);
-    // k=1 (last): max(5000, stream(1638.4)+evict(1638.4)) = max(5000, 3276.8) = 5000
-    double k1 = std::max(5000.0, 2*64.0*128.0/B + 128.0*128.0/B);
-    CHECK_EQ("k=1", k1, 5000.0);
-    CHECK_EQ("total", c.latency, k0+k1);  // 10000
+    // k=0: max(3000, once(3276.8)+stream(1638.4)) = 4915.2
+    double k0 = std::max(3000.0, 2*128.0*128.0/B + 2*64.0*128.0/B);
+    CHECK_EQ("k=0", k0, 4915.2);
+    // k=1 (last): max(3000, stream(1638.4)+evict(1638.4)) = 3276.8
+    double k1 = std::max(3000.0, 2*64.0*128.0/B + 128.0*128.0/B);
+    CHECK_EQ("k=1", k1, 3276.8);
+    CHECK_EQ("total", c.latency, k0+k1);  // 4915.2 + 3276.8 = 8192
 }
 
 // ============================================================================
@@ -183,10 +181,9 @@ void test_fanin_nonsquare() {
     auto c = sg.compute_cost(TC(128,128,32));
     CHECK_EQ_I("k_passes", c.num_k_passes, 4);
 
-    // New model: only sink Op2 divides by nk=4.
-    // Op0 (non-sink): 2000/1*1=2000. Op1 (non-sink): 2000/1*1=2000. Op2 (sink): 2000/4*1=500.
-    // Total = 4500
-    CHECK_EQ("comp/step", c.compute_per_step, 4500.0);
+    // Per PROBLEM.md Ex5: every op amortizes across nk.
+    //   (Op0 + Op1 + Op2) / nk = (2000+2000+2000)/4 = 1500
+    CHECK_EQ("comp/step", c.compute_per_step, 1500.0);
 
     double B = 10.0;
     // IO (ntw=1, nth=1):
@@ -195,17 +192,17 @@ void test_fanin_nonsquare() {
     //   T3: (FIXED_1, FROM_NK)  → stream = 256×32/10 = 819.2  (T3 is 256×128; LHS of Op1)
     //   T4: (FROM_NTW, FIXED_1) → once_load = 128×256/10 = 3276.8  (T4 is 128×256; ntw=1)
     //   T6: evict = 128×128/10 = 1638.4
-    // k=0: max(4500, once(1638.4+3276.8)+stream(409.6+819.2)) = max(4500, 6144) = 6144  (IO-bound)
-    double k0 = std::max(4500.0, 128.0*128.0/B + 128.0*256.0/B + 32.0*128.0/B + 256.0*32.0/B);
+    // k=0: max(1500, once(4915.2)+stream(1228.8)) = 6144  (IO-bound)
+    double k0 = std::max(1500.0, 128.0*128.0/B + 128.0*256.0/B + 32.0*128.0/B + 256.0*32.0/B);
     CHECK_EQ("k=0", k0, 6144.0);
-    // k=1,2: max(4500, stream(1228.8)) = 4500
-    double k_mid = std::max(4500.0, 32.0*128.0/B + 256.0*32.0/B);
-    CHECK_EQ("k_mid", k_mid, 4500.0);
-    // k=3: max(4500, stream(1228.8)+evict(1638.4)) = max(4500, 2867.2) = 4500
-    double k_last = std::max(4500.0, 32.0*128.0/B + 256.0*32.0/B + 128.0*128.0/B);
-    CHECK_EQ("k_last", k_last, 4500.0);
+    // k=1,2: max(1500, stream(1228.8)) = 1500
+    double k_mid = std::max(1500.0, 32.0*128.0/B + 256.0*32.0/B);
+    CHECK_EQ("k_mid", k_mid, 1500.0);
+    // k=3: max(1500, stream(1228.8)+evict(1638.4)) = 2867.2
+    double k_last = std::max(1500.0, 32.0*128.0/B + 256.0*32.0/B + 128.0*128.0/B);
+    CHECK_EQ("k_last", k_last, 2867.2);
 
-    double total = k0 + 2*k_mid + k_last;  // 6144 + 2×4500 + 4500 = 19644
+    double total = k0 + 2*k_mid + k_last;  // 6144 + 1500 + 1500 + 2867.2 = 12011.2
     CHECK_EQ("total", c.latency, total);
 }
 
@@ -224,9 +221,9 @@ void test_fanin_unfused() {
     CHECK_EQ("each op", c0.latency, 4915.2);
     double unfused = c0.latency + c1.latency + c2.latency;  // 14745.6
     CHECK_EQ("unfused", unfused, 14745.6);
-    // Fused = 18000
-    std::cout << "  Unfused=" << unfused << " Fused=18000 (saved "
-              << (int)(100*(unfused-18000.0)/unfused) << "%)\n";
+    // Fused fan-in = 9553.6 under the uniform /nk model (see test_fanin_cost_k32)
+    std::cout << "  Unfused=" << unfused << " Fused=9553.6 (saved "
+              << (int)(100*(unfused-9553.6)/unfused) << "%)\n";
 }
 
 // ============================================================================
@@ -244,8 +241,8 @@ void test_fanin_partial() {
     CHECK_EQ_I("ws", sg02.working_set(TC(128,128,32)), 40960);
 
     auto c02 = sg02.compute_cost(TC(128,128,32));
-    // Same as chain of 2: Op0 non-sink(2000) + Op2 sink(500) = comp 2500, total = 10000
-    CHECK_EQ("latency", c02.latency, 10000.0);
+    // Same as chain of 2 (spec Ex5): (Op0+Op2)/4 = 1000/step, total = 6915.2
+    CHECK_EQ("latency", c02.latency, 6915.2);
 
     auto sg1 = make_sg(p, d, {1});
     auto c1 = sg1.compute_cost(TC(128,128,32));
@@ -268,8 +265,8 @@ void test_fanin_solution() {
     auto sg = make_sg(p, d, {0, 1, 2});
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("valid", sol.validate().valid);
-    // Full fan-in fused: comp=4500, total=18000
-    CHECK_EQ("total", sol.total_latency(), 18000.0);
+    // Full fan-in fused (spec-aligned model): comp=1500/step, total=9553.6
+    CHECK_EQ("total", sol.total_latency(), 9553.6);
 }
 
 // ============================================================================
