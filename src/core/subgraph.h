@@ -54,6 +54,14 @@ public:
 
   bool has_matmul() const { return has_matmul_; }
 
+  // Number of distinct role-signature entries for a tensor in this subgraph.
+  // Returns 0 for non-boundary tensors. Multi-role tensors (per #70 + #73)
+  // return >1. Mainly for tests and diagnostics.
+  size_t boundary_entries_for(size_t tensor_id) const {
+    if (tensor_id >= tensor_id_to_infos_.size()) return 0;
+    return tensor_id_to_infos_[tensor_id].size();
+  }
+
   // Reduction dimension for a specific MatMul op (= LHS tensor width).
   int64_t op_K(size_t op_idx) const {
     return prob_->tensors[prob_->ops[op_idx].inputs[0]].width;
@@ -127,7 +135,6 @@ private:
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
   bool has_pw_sink_ = false;
-  bool has_tiling_conflict_ = false;  // tensor gets conflicting roles → need numerical check
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
 
@@ -217,21 +224,15 @@ private:
   };
   std::vector<TilePair> tensor_tiling_;
 
-  // Minimum tensor dimension for each tile-count source.
-  // Used by is_valid_tiling to reject configs where derived tile counts
-  // (ntw, nth, nk) exceed tensor dimensions — which causes zero-size slices.
-  // Precomputed in create() from tensor_tiling_ sources.
-  int64_t min_ntw_dim_ = INT64_MAX;   // min width  among FROM_NTW tensors
-  int64_t min_nth_dim_ = INT64_MAX;   // min height among FROM_NTH tensors
-  int64_t min_nk_h_dim_ = INT64_MAX;  // min width  among h_source=FROM_NK tensors
-  int64_t min_nk_v_dim_ = INT64_MAX;  // min height among v_source=FROM_NK tensors
-
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;
 
-  // Flat lookup: tensor index → index into boundary_tensor_info_, or -1.
-  // Enables O(1) lookup in working_set for the retained_from_prev scan.
-  // Sized to prob_->num_tensors() and populated by create().
-  std::vector<int> tensor_id_to_info_;
+  // Flat lookup: tensor index → list of indices into boundary_tensor_info_.
+  // Empty list means the tensor isn't a boundary tensor of this subgraph.
+  // A tensor can have multiple entries when it's used under multiple distinct
+  // role signatures (per issues #70 + #73 — working set sums distinct slices).
+  // Currently populated 1:1 per tensor; multi-entry materialization is
+  // introduced in a follow-up step.
+  std::vector<std::vector<int>> tensor_id_to_infos_;
 };

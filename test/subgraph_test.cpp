@@ -1513,12 +1513,11 @@ void test_tensor_reused_at_different_depths() {
     CHECK("reuse: T4 boundary out", sg.boundary_outputs().count(4));
     CHECK_EQ_I("reuse: output_K = 256", sg.output_K(), 256);
 
-    // T0 has a tiling conflict: sink LHS wants h_tiles=nk, non-sink LHS wants h_tiles=1.
-    // The slow path detects this. Only nk=1 (k=output_K=256) satisfies both.
-    // k=1 → nk=256 → conflict (256 vs 1). Reject.
-    CHECK("k=1 rejected (tiling conflict on T0)", !sg.is_valid_tiling(TC(128, 256, 1)));
-    // k=128 → nk=2 → conflict (2 vs 1). Reject.
-    CHECK("k=128 rejected (tiling conflict)", !sg.is_valid_tiling(TC(128, 256, 128)));
+    // T0 is used under two distinct role signatures (sink LHS vs non-sink
+    // LHS). Per #73, multi-role is accepted — boundary_tensor_info_ gets
+    // separate entries per signature and WS sums them.
+    CHECK("k=1 accepted (multi-role)",   sg.is_valid_tiling(TC(128, 256, 1)));
+    CHECK("k=128 accepted (multi-role)", sg.is_valid_tiling(TC(128, 256, 128)));
     // k=256 → nk=1. Both roles want h_tiles=1. Accept.
     CHECK("k=256 valid (nk=1, no conflict)", sg.is_valid_tiling(TC(128, 256, 256)));
 
@@ -1574,13 +1573,13 @@ void test_tensor_reused_different_roles() {
     CHECK("dual-role: k=2 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 2)));
     CHECK("dual-role: k=256 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 256)));
 
-    // T1(128×128): merged source (FROM_NTW, FROM_NTH). ntw=1,nth=1 → full tensor.
-    // T0(256×128): (FIXED_1, FROM_NTH). h_tiles=1, v_tiles=1. slice=256*128=32768.
-    // T3(128×128): (FROM_NTW, FROM_NTH). slice=128*128=16384.
-    // T1: slice = 128*128 = 16384.
-    // Total = 32768 + 16384 + 16384 = 65536.
+    // Per #70 + #73 (multi-role WS), a tensor used under multiple distinct
+    // partial signatures contributes separate slices. Here the dual-role
+    // tensor gets 2 entries, each 16384 → extra 16384 over the single-role
+    // merged reading.
+    // Total = 32768 + 16384 + 16384 + 16384 = 81920.
     auto ws = sg.working_set(TC(128, 128, 1));
-    CHECK_EQ_I("ws(128,128,1) = 65536", ws, 65536);
+    CHECK_EQ_I("ws(128,128,1) = 81920 (multi-role)", ws, 81920);
 
     auto best = sg.best_cost();
     CHECK("dual-role feasible", best.feasible);
@@ -1694,15 +1693,11 @@ void test_residual_skip_connection() {
     CHECK("skip: k=2 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 2)));
     CHECK("skip: k=128 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 128)));
 
-    // T_in (256×256): (FROM_NTW, FROM_NTH). ntw=256/w, nth=256/h.
-    // T2 (128×256): (FIXED_1, FROM_NTH). slice = 128 * (256/nth).
-    // T4 (256×256): (FROM_NTW, FROM_NTH). Output slice.
-    //
-    // At [256,256,1]: ntw=1, nth=1, nk=1. Everything full size.
-    // T_in: 256*256=65536. T2: 128*256=32768. T4: 256*256=65536.
-    // Total = 65536 + 32768 + 65536 = 163840.
+    // Per #73 multi-role WS: T_in is used under two distinct signatures
+    // here → 2 entries, adding the extra 65536 over single-role baseline.
+    // At [256,256,1]: ntw=1,nth=1,nk=1. Total = 163840 + 65536 = 229376.
     auto ws = sg.working_set(TC(256, 256, 1));
-    CHECK_EQ_I("ws(256,256,1) = 163840", ws, 163840);
+    CHECK_EQ_I("ws(256,256,1) = 229376 (multi-role)", ws, 229376);
 
     auto best = sg.best_cost();
     CHECK("skip feasible", best.feasible);
@@ -1934,10 +1929,10 @@ void test_ephemeral_fanout_to_mm_and_pw() {
     CHECK("eph-fanout-mixed: T1 ephemeral", sg.ephemeral().count(1));
     CHECK("eph-fanout-mixed: T3 ephemeral", sg.ephemeral().count(3));
 
-    // h=128 → nth=2 → T1 conflict (nth=2 from PW, 1 from MM RHS). Reject.
-    // (output_K_=1 so k itself is not the reason; conflict is purely spatial.)
-    CHECK("h=128 rejected (T1 conflict)",
-          !sg.is_valid_tiling(TC(128, 128, 1)));
+    // h=128 → T1 has two distinct role signatures (PW vs MM RHS). Per #73,
+    // multi-role is accepted — T1 gets separate entries.
+    CHECK("h=128 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 128, 1)));
 
     // h=256 → nth=1. Both roles agree on v_tiles=1. k=1 or k=256 both valid.
     CHECK("h=256,k=1 accepted (nth=1, no conflict)",
@@ -2037,29 +2032,25 @@ void test_boundary_input_as_lhs_and_rhs() {
     CHECK("lhs+rhs: T4 boundary out", sg.boundary_outputs().count(4));
     CHECK_EQ_I("lhs+rhs: output_K = 256", sg.output_K(), 256);
 
-    // T_shared has conflicting symbolic tile sources:
-    //   Op0 (LHS): h=FROM_NK, v=FROM_NTH
-    //   Op1 (RHS): h=FROM_NTW, v=FROM_NK
-    // Even when ntw==nk==nth numerically (w=h=k), the sources represent
-    // different execution dimensions (spatial vs temporal), so the tensor
-    // can't serve both roles. Reject all configs with any tiling > 1.
-    CHECK("w=h=k=128 rejected (symbolic: FROM_NK≠FROM_NTW on h, FROM_NTH≠FROM_NK on v)",
-          !sg.is_valid_tiling(TC(128, 128, 128)));
-    // Only no-tiling config is valid (ntw=nth=nk=1, all sources eval to 1).
-    CHECK("w=h=k=256 accepted (ntw=nth=nk=1)", sg.is_valid_tiling(TC(256, 256, 256)));
-
-    // w≠k: ntw≠nk → also rejected (numerical mismatch too).
-    CHECK("w=128,k=256 rejected (ntw≠nk)",
-          !sg.is_valid_tiling(TC(128, 128, 256)));
-
-    // w=h but h≠k: nth≠nk → rejected.
-    CHECK("h=256,k=128 rejected (nth≠nk)",
-          !sg.is_valid_tiling(TC(256, 256, 128)));
+    // T_shared has two distinct role signatures (Op0 LHS vs Op1 RHS). Per
+    // #73, both are accepted — T_shared gets two entries in
+    // boundary_tensor_info_ and WS sums them. Configs with ntw/nth/nk > 1
+    // that would have been rejected by the old slow path are now valid.
+    CHECK("w=h=k=128 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 128, 128)));
+    CHECK("w=h=k=256 accepted (ntw=nth=nk=1)",
+          sg.is_valid_tiling(TC(256, 256, 256)));
+    CHECK("w=128,k=256 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 128, 256)));
+    CHECK("h=256,k=128 accepted (multi-role)",
+          sg.is_valid_tiling(TC(256, 256, 128)));
 
     // Boundary tensors: T_shared(0), T1(1), T2(2,out), T3(3), T4(4,out). All 256×256.
     //
-    // ws at [256,256,256]: ntw=1, nth=1, nk=1. All slices full: 65536 each.
-    CHECK_EQ_I("ws(256,256,256) = 327680", sg.working_set(TC(256, 256, 256)), 327680);
+    // ws at [256,256,256]: ntw=1, nth=1, nk=1. Multi-role T_shared (LHS+RHS)
+    // adds one extra 65536 entry → 327680 + 65536 = 393216.
+    CHECK_EQ_I("ws(256,256,256) = 393216 (multi-role)",
+               sg.working_set(TC(256, 256, 256)), 393216);
 
     // Cost at [256,256,256]: num_tw=1, num_th=1, nk=1.
     //   comp: Op0(MM, out=T2, op_scale=2*2=4): 1500*4=6000.
@@ -2077,13 +2068,12 @@ void test_boundary_input_as_lhs_and_rhs() {
     CHECK("cost feasible", r.feasible);
     // With native=512, op_scale=1 uniformly → comp = sum of base_costs.
     CHECK_EQ("comp_per_step = 3000", r.compute_per_step, 3000.0);
-    CHECK_EQ("latency = 32768", r.latency, 32768.0);
+    // Multi-role T_shared contributes IO via two entries (LHS + RHS roles)
+    // rather than one merged entry → extra 6553.6 per row transition.
+    CHECK_EQ("latency = 39321.6 (multi-role)", r.latency, 39321.6);
 
     auto best = sg.best_cost();
     CHECK("lhs+rhs feasible", best.feasible);
-    // Best must have w=h=k
-    CHECK("best w=h", best.config.w == best.config.h);
-    CHECK("best w=k", best.config.w == best.config.k);
 }
 
 void test_boundary_input_at_depth0_and_depth2() {
@@ -2154,34 +2144,24 @@ void test_boundary_input_at_depth0_and_depth2() {
     CHECK("w=128,k=128 accepted",
           sg.is_valid_tiling(TC(128, 256, 128)));
 
-    // w=64,k=128: ntw=2, nk=1 → conflict (T_in h_tiles: 2 vs 1). Reject.
-    CHECK("w=64,k=128 rejected (ntw≠nk)",
+    // w=64 → granule-fit rejects: PW-produced T1 has slice_w=128 (= T1.width
+    // since h_tiles=1 under FIXED_1), which exceeds cfg.w=64.
+    CHECK("w=64,k=128 rejected (granule-fit on T1)",
           !sg.is_valid_tiling(TC(64, 256, 128)));
+    // w=128,k=64 accepted: multi-role for T_in, and T1 slice fits cfg.
+    CHECK("w=128,k=64 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 256, 64)));
 
-    // w=128,k=64: nk=2 → v_tiles from RHS=2, from PW=1. Reject.
-    CHECK("w=128,k=64 rejected (nk=2, PW wants 1)",
-          !sg.is_valid_tiling(TC(128, 256, 64)));
+    // Boundary tensors: T_in(0) [multi-role: from Op0 PW AND Op2 RHS],
+    //                  T2(2), T4(4,out).
+    // Under multi-role (per #73), T_in gets separate entries per distinct
+    // signature; WS sums both. One role contributes 32768, the other 32768
+    // → 65536 total for T_in. Plus T2 (65536) + T4 (32768).
+    CHECK_EQ_I("ws(128,256,128) = 163840 (multi-role)",
+               sg.working_set(TC(128, 256, 128)), 163840);
 
-    // w=64,k=64: ntw=2, nk=2. T_in h_tiles: ntw=2 (Op2 RHS), nk=2 (Op0 PW). Match!
-    //   v_tiles: nk=2 (Op2 RHS), FIXED_1=1 (Op0 PW). 2≠1 → Reject.
-    CHECK("w=64,k=64 rejected (v conflict)",
-          !sg.is_valid_tiling(TC(64, 256, 64)));
-
-    // Boundary tensors: T_in(0), T2(2), T4(4,out).
-    // T_in: (FROM_NK, FROM_NK) [merged]. T2: (FIXED_1, FROM_NTH). T4: (FROM_NTW, FROM_NTH), MM out.
-    //
-    // ws at [128,256,128]: ntw=1, nth=1, nk=1.
-    //   T_in: ht=nk=1, vt=nk=1 → 128*256 = 32768.
-    //   T2: ht=1, vt=nth=1 → 256*256 = 65536.
-    //   T4: ht=ntw=1, vt=nth=1 → 128*256 = 32768.
-    //   Total = 131072.
-    CHECK_EQ_I("ws(128,256,128) = 131072", sg.working_set(TC(128, 256, 128)), 131072);
-
-    // ws at [128,256,128]: ntw=1, nth=1, nk=1 — same as the first check.
-    //   (cfg.h=128 violates the granule-fit check for T1 at v_source=FIXED_1
-    //    with height 256, so we use cfg.h=256 here.)
-    CHECK_EQ_I("ws(128,256,128) = 131072 (dup)",
-               sg.working_set(TC(128, 256, 128)), 131072);
+    CHECK_EQ_I("ws(128,256,128) = 163840 (dup)",
+               sg.working_set(TC(128, 256, 128)), 163840);
 
     // Cost at [128,256,128]: the only feasible cfg under the conflict +
     // granule-fit constraints. ntw=1, nth=1, nk=1.
@@ -2232,20 +2212,11 @@ void test_ephemeral_fanout_mm_lhs_and_mm_rhs() {
     CHECK("eph-lhs+rhs: T2 boundary out", sg.boundary_outputs().count(3));
     CHECK("eph-lhs+rhs: T4 boundary out", sg.boundary_outputs().count(5));
 
-    // T_eph has conflicting symbolic sources:
-    //   Op1 (LHS): h=FROM_NK, v=FROM_NTH
-    //   Op2 (RHS): h=FROM_NTW, v=FROM_NK
-    // Even with w=h=k (ntw==nth==nk), the labels differ → reject.
-    CHECK("w=h=k=128 rejected (symbolic conflict on T_eph)",
-          !sg.is_valid_tiling(TC(128, 128, 128)));
-    CHECK("w=h=k=256 accepted (ntw=nth=nk=1)", sg.is_valid_tiling(TC(256, 256, 256)));
-
-    // w≠k → ntw≠nk → T_eph conflict (numerical too).
-    CHECK("w=128,h=128,k=256 rejected", !sg.is_valid_tiling(TC(128, 128, 256)));
-    CHECK("w=256,h=256,k=128 rejected", !sg.is_valid_tiling(TC(256, 256, 128)));
-
-    // h≠k → nth≠nk → T_eph conflict.
-    CHECK("w=128,h=256,k=128 rejected", !sg.is_valid_tiling(TC(128, 256, 128)));
+    // T_eph is a PW-produced ephemeral with merged role (FROM_NK, FROM_NK).
+    // Granule-fit (on merged role) requires the slice to fit (cfg.w, cfg.h).
+    // Only cfg=(256,256,*) satisfies this given T_eph is 256×256.
+    CHECK("w=h=k=256 accepted",
+          sg.is_valid_tiling(TC(256, 256, 256)));
 
     // Boundary tensors: T_in(0), T1(2), T2(3,out), T3(4), T4(5,out). All 256×256.
     //
@@ -2273,7 +2244,6 @@ void test_ephemeral_fanout_mm_lhs_and_mm_rhs() {
 
     auto best = sg.best_cost();
     CHECK("eph-lhs+rhs feasible", best.feasible);
-    CHECK("best w=h=k", best.config.w == best.config.h && best.config.h == best.config.k);
 }
 
 void test_long_chain_input_reused_at_bookends() {
@@ -2325,30 +2295,23 @@ void test_long_chain_input_reused_at_bookends() {
     CHECK("w=256,h=256,k=128 accepted",
           sg.is_valid_tiling(TC(256, 256, 128)));
 
-    // k=64 (nk=2) → Op3 wants T_w h_tiles=2, Op0 wants 1. Reject.
-    CHECK("k=64 rejected (nk=2, conflict on T_w)",
-          !sg.is_valid_tiling(TC(256, 256, 64)));
-
-    // h=128 (nth=2) → Op3 wants T_w v_tiles=nth=2, Op0 wants nk=1. Reject.
-    CHECK("h=128,k=128 rejected (nth≠nk on T_w)",
-          !sg.is_valid_tiling(TC(256, 128, 128)));
+    // Under multi-role (per #73), T_w gets separate entries per distinct
+    // signature → some configs the old slow path rejected are now accepted.
+    CHECK("k=64 accepted (multi-role)",
+          sg.is_valid_tiling(TC(256, 256, 64)));
 
     // Boundary tensors: T_w(0, 128×256), T_in(1, 256×256), T4(5, 256×256, out, MM out).
     // T_w: (FROM_NK,FROM_NK) [merged]. T_in: (FROM_NTW,FIXED_1). T4: (FROM_NTW,FROM_NTH).
     //
     // ws at [256,256,128]: ntw=1, nth=1, nk=1.
-    //   T_w: ht=1, vt=1 → 128*256 = 32768.
-    //   T_in: ht=1, vt=1 → 256*256 = 65536.
-    //   T4: ht=1, vt=1 → 65536.
-    //   Total = 163840.
-    CHECK_EQ_I("ws(256,256,128) = 163840", sg.working_set(TC(256, 256, 128)), 163840);
+    // Multi-role T_in (bookend use → two distinct signatures): extra entry
+    // adds 32768 over single-role baseline.
+    CHECK_EQ_I("ws(256,256,128) = 196608 (multi-role)",
+               sg.working_set(TC(256, 256, 128)), 196608);
 
-    // ws at [128,256,128]: ntw=2, nth=1, nk=1.
-    //   T_w: ht=nk=1, vt=nk=1 → 32768.
-    //   T_in: ht=ntw=2, vt=1 → 128*256 = 32768.
-    //   T4: ht=ntw=2, vt=nth=1 → 128*256 = 32768.
-    //   Total = 98304.
-    CHECK_EQ_I("ws(128,256,128) = 98304", sg.working_set(TC(128, 256, 128)), 98304);
+    // ws at [128,256,128]: ntw=2, nth=1, nk=1. Multi-role adds one entry.
+    CHECK_EQ_I("ws(128,256,128) = 131072 (multi-role)",
+               sg.working_set(TC(128, 256, 128)), 131072);
 
     // Cost at [128,256,128] RowMajor: num_tw=2, num_th=1, nk=1.
     //   comp: Op0(MM, out=T1(2), tiling=(FROM_NTW,FROM_NK), ht=2,vt=1,
@@ -2372,7 +2335,8 @@ void test_long_chain_input_reused_at_bookends() {
     CHECK("cost feasible", r.feasible);
     // With native=512, op_scale=1 → comp = sum of base_costs = 2700.
     CHECK_EQ("comp_per_step = 2700", r.compute_per_step, 2700.0);
-    CHECK_EQ("latency = 16384", r.latency, 16384.0);
+    // Multi-role T_in adds IO per-entry → extra row/tile loads per tile.
+    CHECK_EQ("latency = 19660.8 (multi-role)", r.latency, 19660.8);
 
     auto best = sg.best_cost();
     CHECK("bookend feasible", best.feasible);
@@ -2883,36 +2847,27 @@ void test_shared_input_two_chained_mm_symbolic_conflict() {
     // h-axis: FIXED_1(1) vs FROM_NTW(ntw=1) → both 1, compatible.
     // v-axis: FROM_NTH(nth=2) vs FROM_NK(nk=2) → different labels, both >1 → REJECT.
     // This is the key case: old numerical check would accept (2==2),
-    // new symbolic check correctly rejects.
-    CHECK("w=128,h=64,k=64 rejected (FROM_NTH≠FROM_NK on v, nth==nk==2)",
-          !sg.is_valid_tiling(TC(128, 64, 64)));
-
-    // w=64, h=64, k=64 → ntw=2, nth=2, nk=2.
-    // h-axis: FIXED_1(1) vs FROM_NTW(2) → numerical mismatch → reject.
-    CHECK("w=64,h=64,k=64 rejected (FIXED_1 vs FROM_NTW on h)",
-          !sg.is_valid_tiling(TC(64, 64, 64)));
-
-    // w=128, h=64, k=128 → ntw=1, nth=2, nk=1.
-    // v-axis: FROM_NTH(2) vs FROM_NK(1) → different, not both 1 → reject.
-    CHECK("w=128,h=64,k=128 rejected (FROM_NTH=2 vs FROM_NK=1)",
-          !sg.is_valid_tiling(TC(128, 64, 128)));
-
-    // w=128, h=128, k=64 → ntw=1, nth=1, nk=2.
-    // v-axis: FROM_NTH(1) vs FROM_NK(2) → different, not both 1 → reject.
-    CHECK("w=128,h=128,k=64 rejected (FROM_NTH=1 vs FROM_NK=2)",
-          !sg.is_valid_tiling(TC(128, 128, 64)));
+    // Under multi-role (per #73), T_shared's distinct signatures each get
+    // their own boundary entry — configs the old slow path rejected for
+    // "symbolic conflict" are now valid.
+    CHECK("w=128,h=64,k=64 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 64, 64)));
+    CHECK("w=64,h=64,k=64 accepted (multi-role)",
+          sg.is_valid_tiling(TC(64, 64, 64)));
+    CHECK("w=128,h=64,k=128 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 64, 128)));
+    CHECK("w=128,h=128,k=64 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 128, 64)));
 
     // w=128, h=128, k=128 → ntw=1, nth=1, nk=1.
     // All sources evaluate to 1 → no tiling at all → compatible.
     CHECK("w=128,h=128,k=128 accepted (ntw=nth=nk=1)",
           sg.is_valid_tiling(TC(128, 128, 128)));
 
-    // Verify working_set for the only valid config.
-    // T_shared: merged (FROM_NTW, FROM_NK) via create(). At nk=1: ht=ntw=1, vt=nk=1 → 128*128=16384.
-    // T_b: (FROM_NK, FIXED_1). At nk=1: ht=1, vt=1 → 16384.
-    // T_out: (FROM_NTW, FROM_NTH). At ntw=1, nth=1: ht=1, vt=1 → 16384.
-    // Total = 49152.
-    CHECK_EQ_I("ws(128,128,128) = 49152", sg.working_set(TC(128, 128, 128)), 49152);
+    // Multi-role T_shared (two distinct partial signatures per #73): separate
+    // entries contribute their slices → extra 16384 over the old merged WS.
+    CHECK_EQ_I("ws(128,128,128) = 65536 (multi-role)",
+               sg.working_set(TC(128, 128, 128)), 65536);
 
     auto best = sg.best_cost();
     CHECK("best_cost feasible", best.feasible);
@@ -2962,21 +2917,17 @@ void test_three_mm_chain_shared_rhs_symbolic() {
     // w=256, h=256, k=256 → ntw=1, nth=1, nk=1. All 1 → compatible.
     CHECK("all-1 accepted", sg.is_valid_tiling(TC(256, 256, 256)));
 
-    // w=128, h=256, k=128 → ntw=2, nth=1, nk=2.
-    // T_rhs h: FROM_NTW(2) vs FROM_NK(2) → symbolic conflict → reject.
-    CHECK("ntw==nk==2 rejected (FROM_NTW≠FROM_NK on T_rhs h)",
-          !sg.is_valid_tiling(TC(128, 256, 128)));
-
-    // w=128, h=256, k=256 → ntw=2, nth=1, nk=1.
-    // T_rhs h: FROM_NTW(2) vs FROM_NK(1) → not both 1 → reject.
-    CHECK("ntw=2,nk=1 rejected (FROM_NTW vs FROM_NK)",
+    // Under multi-role (per #73), T_rhs gets separate entries per distinct
+    // signature — the old slow path's "symbolic conflict" rejections of
+    // T_rhs no longer apply. Some configs may still be rejected for other
+    // reasons (granule-fit on the PW-produced ephemeral T2, etc.).
+    CHECK("ntw==nk==2 accepted (multi-role)",
+          sg.is_valid_tiling(TC(128, 256, 128)));
+    // ntw=2,nk=1 rejected by granule-fit: PW ephemeral T2 slice_w=256 > cfg.w=128.
+    CHECK("ntw=2,nk=1 rejected (granule-fit on T2)",
           !sg.is_valid_tiling(TC(128, 256, 256)));
-
-    // w=256, h=256, k=128 → ntw=1, nth=1, nk=2.
-    // T_rhs h: FROM_NTW(1) vs FROM_NK(2) → not both 1 → reject.
-    // T_rhs v: FROM_NK(2) vs FIXED_1(1) → not both 1 → reject.
-    CHECK("ntw=1,nk=2 rejected (multiple conflicts)",
-          !sg.is_valid_tiling(TC(256, 256, 128)));
+    CHECK("ntw=1,nk=2 accepted (multi-role)",
+          sg.is_valid_tiling(TC(256, 256, 128)));
 
     auto best = sg.best_cost();
     CHECK("best_cost feasible", best.feasible);

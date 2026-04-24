@@ -247,10 +247,25 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     struct TilePair { TS h; TS v; bool assigned = false; };
     std::vector<TilePair> tsrc(num_tensors);
 
+    // Per-tensor set of distinct role signatures. Powers the multi-entry
+    // boundary_tensor_info_ materialization per issues #70 + #73:
+    //   FULL signature (FIXED_1, FIXED_1) dominates — collapse to one full
+    //     entry, drop partials (#70).
+    //   Multiple distinct partial signatures → one entry each, working set
+    //     sums them (#73). Capped at 2 partials per the row/col simplification.
+    struct RoleSig { TS h; TS v; };
+    std::vector<std::vector<RoleSig>> roles_per_tensor(num_tensors);
+    auto push_role = [&](size_t t, TS h, TS v) {
+      for (auto &r : roles_per_tensor[t])
+        if (r.h == h && r.v == v) return;  // dedup identical signatures
+      roles_per_tensor[t].push_back({h, v});
+    };
+
     for (auto i : sg.ops_) {
       if (!sg.is_sink_op_vec_[i]) continue;
       { size_t t = prob.ops[i].output();
-        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true}; }
+        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
+        push_role(t, TS::FROM_NTW, TS::FROM_NTH); }
     }
 
     auto merge_source = [](TS existing, TS incoming) -> TS {
@@ -258,17 +273,15 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       return existing;
     };
 
-    bool has_tiling_conflict = false;
-
     auto assign_or_check = [&](size_t t, TS new_h, TS new_v) {
+      push_role(t, new_h, new_v);
       if (!tsrc[t].assigned) {
         tsrc[t] = {new_h, new_v, true};
       } else {
-        // Detect if this tensor gets conflicting roles from different consumers.
-        // A conflict means the numerical propagation in is_valid_tiling could
-        // fail for some (ntw, nth, nk) values — we can't skip it.
-        if (tsrc[t].h != new_h || tsrc[t].v != new_v)
-          has_tiling_conflict = true;
+        // Merge for the tsrc-based tensor_tiling_ (used by op_scale in
+        // compute_cost). Multi-role is tracked separately in
+        // roles_per_tensor and materialized as distinct entries in
+        // boundary_tensor_info_ per #70 + #73.
         tsrc[t].h = merge_source(tsrc[t].h, new_h);
         tsrc[t].v = merge_source(tsrc[t].v, new_v);
       }
@@ -297,8 +310,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
-    sg.has_tiling_conflict_ = has_tiling_conflict;
-
     sg.tensor_tiling_.resize(num_tensors);
     for (size_t t = 0; t < num_tensors; t++) {
       if (tsrc[t].assigned) {
@@ -306,49 +317,70 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
     }
 
-    // Compute minimum tensor dimensions per tile-count source.
-    // This covers ALL tensors in the subgraph (boundary + ephemeral),
-    // so is_valid_tiling can reject configs where derived tile counts
-    // (ntw, nth, nk) would exceed any tensor's dimension.
-    for (auto op_idx : sg.ops_) {
-      auto check = [&](size_t t) {
-        if (!tsrc[t].assigned) return;
-        int64_t W = prob.tensors[t].width;
-        int64_t H = prob.tensors[t].height;
-        if (tsrc[t].h == TS::FROM_NTW) sg.min_ntw_dim_ = std::min(sg.min_ntw_dim_, W);
-        if (tsrc[t].h == TS::FROM_NK)  sg.min_nk_h_dim_ = std::min(sg.min_nk_h_dim_, W);
-        if (tsrc[t].v == TS::FROM_NTH) sg.min_nth_dim_ = std::min(sg.min_nth_dim_, H);
-        if (tsrc[t].v == TS::FROM_NK)  sg.min_nk_v_dim_ = std::min(sg.min_nk_v_dim_, H);
-      };
-      for (auto t : prob.ops[op_idx].inputs) check(t);
-      { size_t t = prob.ops[op_idx].output(); check(t); }
-    }
+    // Tensor-dim bounds (formerly min_*_dim_) are now checked per-entry in
+    // is_valid_tiling rather than precomputed from the merged tsrc role.
+    // Necessary for correctness under multi-role: each entry has its own
+    // (h_source, v_source) signature, and each imposes its own bound.
 
-    std::vector<int> tensor_in_info(num_tensors, -1);
-    auto ensure = [&](size_t t) -> size_t {
-      if (tensor_in_info[t] < 0) {
-        tensor_in_info[t] = (int)sg.boundary_tensor_info_.size();
+    // Materialize boundary_tensor_info_ entries, one per distinct retained
+    // role signature per tensor. Rules:
+    //   #70 collapse: if any signature is FULL (FIXED_1, FIXED_1), it
+    //     subsumes all partials — keep only the full entry. Full move covers
+    //     any partial access.
+    //   2-partial limit: if no full and >2 distinct partial signatures
+    //     remain, reject the subgraph. Keeps the data structure bounded.
+    std::vector<std::vector<int>> tensor_in_info(num_tensors);
+    bool too_many_partials = false;
+    auto ensure = [&](size_t t) -> const std::vector<int>& {
+      if (!tensor_in_info[t].empty()) return tensor_in_info[t];
+
+      // Fallback if no consumer pushed a role (shouldn't happen for tensors
+      // we actually process, but be safe).
+      if (roles_per_tensor[t].empty() && tsrc[t].assigned)
+        push_role(t, tsrc[t].h, tsrc[t].v);
+
+      auto &roles = roles_per_tensor[t];
+
+      // #70 collapse: full role subsumes all others.
+      bool has_full = false;
+      for (auto &r : roles)
+        if (r.h == TS::FIXED_1 && r.v == TS::FIXED_1) { has_full = true; break; }
+
+      std::vector<RoleSig> retained;
+      if (has_full) {
+        retained.push_back({TS::FIXED_1, TS::FIXED_1});
+      } else {
+        retained = roles;
+        if (retained.size() > 2) too_many_partials = true;
+      }
+
+      for (auto &r : retained) {
         BoundaryTensorInfo info;
         info.id = t;
         info.full_size = prob.tensors[t].width * prob.tensors[t].height;
-        if (tsrc[t].assigned) {
-          info.h_source = tsrc[t].h;
-          info.v_source = tsrc[t].v;
-        }
+        info.h_source = r.h;
+        info.v_source = r.v;
+        tensor_in_info[t].push_back((int)sg.boundary_tensor_info_.size());
         sg.boundary_tensor_info_.push_back(info);
       }
-      return (size_t)tensor_in_info[t];
+      return tensor_in_info[t];
     };
 
     for (auto t : sg.boundary_inputs_) {
-      size_t idx = ensure(t);
-      if (is_produced[t]) sg.boundary_tensor_info_[idx].is_internally_produced = true;
+      const auto &indices = ensure(t);
+      if (is_produced[t])
+        for (int idx : indices)
+          sg.boundary_tensor_info_[idx].is_internally_produced = true;
     }
 
     for (auto t : sg.boundary_outputs_) {
-      size_t idx = ensure(t);
-      sg.boundary_tensor_info_[idx].is_boundary_out = true;
-      sg.boundary_tensor_info_[idx].is_internally_produced = is_produced[t];
+      const auto &indices = ensure(t);
+      // Eviction is per-tensor, priced at the producer's output tile size.
+      // Flag exactly one entry to avoid N× eviction.
+      if (!indices.empty())
+        sg.boundary_tensor_info_[indices[0]].is_boundary_out = true;
+      for (int idx : indices)
+        sg.boundary_tensor_info_[idx].is_internally_produced = is_produced[t];
     }
 
     for (auto op_idx : sg.ops_) {
@@ -356,8 +388,9 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       if (op.type == OpType::MatMul) {
         size_t out = op.output();
         if (sg.boundary_outputs_.count(out)) {
-          size_t idx = ensure(out);
-          sg.boundary_tensor_info_[idx].is_mm_out = true;
+          const auto &indices = ensure(out);
+          if (!indices.empty())
+            sg.boundary_tensor_info_[indices[0]].is_mm_out = true;
         }
       }
     }
@@ -366,20 +399,23 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       {
         size_t t = prob.ops[op_idx].output();
         if (sg.boundary_outputs_.count(t) && is_produced[t]) {
-          size_t idx = ensure(t);
+          const auto &indices = ensure(t);
           bool used_internally = false;
           for (auto cop : dag.tensor_consumers[t])
             if (is_in_sg[cop]) { used_internally = true; break; }
           if (used_internally)
-            sg.boundary_tensor_info_[idx].is_internally_produced = true;
+            for (int idx : indices)
+              sg.boundary_tensor_info_[idx].is_internally_produced = true;
         }
       }
     }
+
+    if (too_many_partials) return std::nullopt;
   }
 
-  sg.tensor_id_to_info_.assign(num_tensors, -1);
+  sg.tensor_id_to_infos_.assign(num_tensors, std::vector<int>{});
   for (size_t idx = 0; idx < sg.boundary_tensor_info_.size(); idx++)
-    sg.tensor_id_to_info_[sg.boundary_tensor_info_[idx].id] = (int)idx;
+    sg.tensor_id_to_infos_[sg.boundary_tensor_info_[idx].id].push_back((int)idx);
 
   // Super-native granule forbidden on all three axes per issues #74 Q1, #78
   // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
@@ -454,8 +490,36 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   // PW-sink: no temporal tiling allowed.
   if (has_pw_sink_ && nk > 1) return false;
 
-  if (ntw > min_ntw_dim_ || nth > min_nth_dim_) return false;
-  if (nk > min_nk_h_dim_ || nk > min_nk_v_dim_) return false;
+  // Per-entry tensor-dim bounds (per #70 + #73 multi-role). For each
+  // distinct role signature of each boundary tensor, ensure the derived
+  // tile count doesn't exceed the tensor's dim in that direction (otherwise
+  // slice < 1). Replaces the old min_*_dim_ bounds which were computed from
+  // the single merged role — incorrect when a tensor's roles disagree on
+  // which axis is tiled how.
+  // Divisibility isn't enforced here; the existing w_divides_ / h_divides_ /
+  // k_divides_ checks cover the cfg-granule divisibility, and non-integer
+  // slices are tolerated by compute_cost's floating-point accounting.
+  for (const auto &info : boundary_tensor_info_) {
+    int64_t ht = info.eval_h_tiles(ntw, nk);
+    int64_t vt = info.eval_v_tiles(nth, nk);
+    int64_t W = prob_->tensors[info.id].width;
+    int64_t H = prob_->tensors[info.id].height;
+    if (ht > W || vt > H) return false;
+  }
+  // Ephemerals aren't in boundary_tensor_info_; use tensor_tiling_ (single
+  // merged role — ephemerals aren't materialized per-role since they're
+  // zero-cost per #77 and don't affect WS/IO accounting).
+  for (size_t t : ephemeral_) {
+    const auto &tp = tensor_tiling_[t];
+    BoundaryTensorInfo tmp;
+    tmp.h_source = tp.h;
+    tmp.v_source = tp.v;
+    int64_t ht = tmp.eval_h_tiles(ntw, nk);
+    int64_t vt = tmp.eval_v_tiles(nth, nk);
+    int64_t W = prob_->tensors[t].width;
+    int64_t H = prob_->tensors[t].height;
+    if (ht > W || vt > H) return false;
+  }
 
   // Granule-fit check on ephemerals. Every op in the subgraph runs at the
   // subgraph's (cfg.w, cfg.h) granule; the slice its producer writes per
@@ -489,116 +553,12 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     if (native_cap > 0 && (sw > native_cap || sh > native_cap)) return false;
   }
 
-  // Fast path: if no tensor has conflicting roles from multiple consumers,
-  // divisibility checks are sufficient — numerical propagation always agrees.
-  if (!has_tiling_conflict_)
-    return true;
-
-  // Slow path: symbolic propagation to catch multi-role conflicts.
-  //
-  // The old numerical approach compared tile counts (e.g. h_tiles=ntw vs
-  // h_tiles=nk).  When ntw==nk the numbers coincide, but the tiling
-  // dimensions are semantically different: ntw varies across spatial columns,
-  // nk varies across temporal k-steps.  A tensor can't serve both roles.
-  //
-  // Fix: propagate TileSource labels.  Two different non-FIXED labels on the
-  // same axis → reject.  Both evaluating to 1 (no actual tiling) is the only
-  // exception — with one tile there's no positional ambiguity.
-
-  using TS = BoundaryTensorInfo::TileSource;
-
-  thread_local std::vector<TS> h_src, v_src;
-  thread_local std::vector<bool> assigned;
-  size_t nt = prob_->num_tensors();
-  h_src.resize(nt);
-  v_src.resize(nt);
-  assigned.assign(nt, false);
-
-  auto eval_ts = [&](TS s) -> int64_t {
-    switch (s) {
-      case TS::FIXED_1:  return 1;
-      case TS::FROM_NTW: return ntw;
-      case TS::FROM_NTH: return nth;
-      case TS::FROM_NK:  return nk;
-    }
-    return 1;
-  };
-
-  // Symbolic compatibility: same label → OK.  Both evaluate to 1 → OK
-  // (no tiling, no positional ambiguity).  Otherwise reject.
-  auto compat = [&](TS existing, TS incoming) -> bool {
-    if (existing == incoming) return true;
-    return eval_ts(existing) == 1 && eval_ts(incoming) == 1;
-  };
-
-  // Merge: prefer a non-FIXED label (more informative for future checks).
-  auto merge_ts = [](TS a, TS b) -> TS {
-    return (a != TS::FIXED_1) ? a : b;
-  };
-
-  for (auto op_idx : ops_) {
-    if (is_sink_op_vec_[op_idx]) {
-      size_t out = prob_->ops[op_idx].output();
-      h_src[out] = TS::FROM_NTW;
-      v_src[out] = TS::FROM_NTH;
-      assigned[out] = true;
-    }
-  }
-
-  for (auto op_idx : reverse_topo_ops_) {
-    const auto &op = prob_->ops[op_idx];
-    size_t out = op.output();
-
-    if (!assigned[out]) {
-      h_src[out] = TS::FROM_NTW;
-      v_src[out] = TS::FROM_NTH;
-      assigned[out] = true;
-    }
-
-    TS out_h = h_src[out];
-    TS out_v = v_src[out];
-
-    auto assign_or_reject = [&](size_t t, TS new_h, TS new_v) -> bool {
-      if (assigned[t]) {
-        if (!compat(h_src[t], new_h) || !compat(v_src[t], new_v))
-          return false;
-        h_src[t] = merge_ts(h_src[t], new_h);
-        v_src[t] = merge_ts(v_src[t], new_v);
-      } else {
-        h_src[t] = new_h;
-        v_src[t] = new_v;
-        assigned[t] = true;
-      }
-      return true;
-    };
-
-    if (op.type == OpType::Pointwise) {
-      for (auto in : op.inputs)
-        if (!assign_or_reject(in, out_h, out_v)) return false;
-    } else {
-      bool is_sink = is_sink_op_vec_[op_idx];
-
-      TS lhs_h = is_sink ? TS::FROM_NK  : TS::FIXED_1;
-      TS lhs_v = out_v;
-      TS rhs_h = out_h;
-      TS rhs_v = is_sink ? TS::FROM_NK  : TS::FIXED_1;
-
-      if (!assign_or_reject(op.inputs[0], lhs_h, lhs_v)) return false;
-      if (!assign_or_reject(op.inputs[1], rhs_h, rhs_v)) return false;
-    }
-  }
-
-  // Verify propagated tile counts don't exceed tensor dimensions.
-  for (size_t t = 0; t < nt; t++) {
-    if (!assigned[t]) continue;
-    int64_t ht = eval_ts(h_src[t]);
-    int64_t vt = eval_ts(v_src[t]);
-    int64_t W = prob_->tensors[t].width;
-    int64_t H = prob_->tensors[t].height;
-    if (ht > W || vt > H) return false;
-    if (W % ht != 0 || H % vt != 0) return false;
-  }
-
+  // Multi-role tensors are now modeled explicitly via multi-entry
+  // boundary_tensor_info_ (per #70 + #73); divisibility checks above cover
+  // shape constraints across all role orientations, and the 2-partial limit
+  // is enforced at Subgraph::create. No symbolic-propagation conflict check
+  // is needed — the former slow path rejected exactly the multi-role configs
+  // #73 now accepts.
   return true;
 }
 
@@ -638,7 +598,7 @@ int64_t Subgraph::working_set_unchecked(const TileConfig &cfg,
   }
 
   for (auto t : retained_from_prev) {
-    if (t < tensor_id_to_info_.size() && tensor_id_to_info_[t] >= 0)
+    if (t < tensor_id_to_infos_.size() && !tensor_id_to_infos_[t].empty())
       continue;
     ws += prob_->tensors[t].size();
   }
