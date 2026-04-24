@@ -651,22 +651,29 @@ void test_matmul_pw_fusion_K() {
   CHECK_EQ_I("fused max_K", sg->max_K(), 256);
   CHECK("T2 ephemeral", sg->ephemeral().count(2));
 
-  // PW-only sink (T3 produced by PW, T2 ephemeral so MM is not a sink):
-  // output_K_=1, nk=1 for any k. All k values valid.
+  // Simple MM→PW epilogue (#82): output_K_ comes from the effective sink
+  // MM (here: the only MM). cfg.k candidates are divisors of K=256; at
+  // each, MM accumulates into T2 over nk steps, PW fires once per tile.
+  CHECK_EQ_I("epilogue: output_K = 256", sg->output_K(), 256);
   CHECK("k=256 accepted (nk=1)", sg->is_valid_tiling({128, 128, 256, SnakeDir::None}));
-  CHECK("k=64 accepted (nk=1)", sg->is_valid_tiling({128, 128, 64, SnakeDir::None}));
-  CHECK("k=1 accepted (nk=1)", sg->is_valid_tiling({128, 128, 1, SnakeDir::None}));
+  CHECK("k=64 accepted (nk=4)",  sg->is_valid_tiling({128, 128, 64,  SnakeDir::None}));
+  CHECK("k=1 accepted (nk=256)", sg->is_valid_tiling({128, 128, 1,   SnakeDir::None}));
 
-  // With k=1 (best for PW-only sink), nk = 1
+  // At cfg.k=1: nk = 256/1 = 256. Per-step compute is amortized (uniform
+  // /nk rule per PROBLEM.md Ex5):
+  //   comp/step = (MM:2000 + PW:500) / 256 × scale(1) = 9.765625
+  // Total compute = 2500 across 256 iterations → 2500 sum of base_costs.
   auto c = sg->compute_cost(N(128, 128, 1));
-  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 1);
-  // comp_per_step = (MM:2000 + PW:500) / 1 × scale(1) = 2500
-  CHECK_EQ("fused comp/step", c.compute_per_step, 2500.0);
+  CHECK_EQ_I("fused k_passes (k=1)", c.num_k_passes, 256);
+  CHECK_EQ("fused comp/step",        c.compute_per_step, 9.765625);
+  CHECK_EQ("fused compute total",
+           c.compute_per_step * c.num_spatial_tiles * c.num_k_passes, 2500.0);
 
-  // best_cost picks k=1 (best for PW-only sink: output_K_=1)
+  // best_cost now enumerates k divisors of K=256; the chosen k minimizes
+  // the total latency subject to ws ≤ fast_memory_capacity.
   auto best = sg->best_cost();
   CHECK("best feasible", best.feasible);
-  CHECK_EQ_I("best k=1", best.config.k, 1);
+  CHECK("best k divides K=256", 256 % best.config.k == 0);
 }
 
 // ==================== Non-power-of-2 tiling ====================

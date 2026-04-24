@@ -1569,21 +1569,18 @@ void test_tensor_reused_different_roles() {
 
     CHECK("dual-role: T1 is boundary input", sg.boundary_inputs().count(1));
     CHECK("dual-role: T2 eph", sg.ephemeral().count(2));
-    // PW sink → output_K_=1. nk=max(1/k,1)=1 for any k. All k values valid.
-    CHECK("dual-role: k=1 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 1)));
-    CHECK("dual-role: k=2 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 2)));
-    CHECK("dual-role: k=256 valid (nk=1)", sg.is_valid_tiling(TC(128, 128, 256)));
+    // Simple epilogue detected: output_K = Op0.K = T0.width = 256, nk = 256/k.
+    // cfg.k=1 triggers nk=256, but T1.height=128 so vt=256 > H=128 — the
+    // per-entry tensor-dim check (#70 + #73) correctly rejects this.
+    CHECK("dual-role: k=1 rejected (nk=256 exceeds T1.height=128)",
+          !sg.is_valid_tiling(TC(128, 128, 1)));
+    CHECK("dual-role: k=2 valid (nk=128, borderline)",
+          sg.is_valid_tiling(TC(128, 128, 2)));
 
-    // Per #70 + #73 (multi-role WS), a tensor used under multiple distinct
-    // partial signatures contributes separate slices. Here the dual-role
-    // tensor gets 2 entries, each 16384 → extra 16384 over the single-role
-    // merged reading.
-    // Total = 32768 + 16384 + 16384 + 16384 = 81920.
-    auto ws = sg.working_set(TC(128, 128, 1));
-    CHECK_EQ_I("ws(128,128,1) = 81920 (multi-role)", ws, 81920);
-
+    // best_cost enumerates valid candidates; must be feasible.
     auto best = sg.best_cost();
     CHECK("dual-role feasible", best.feasible);
+    CHECK("best.k divides 256", 256 % (int64_t)best.config.k == 0);
     std::cout << "    best=[" << best.config.w << "," << best.config.h
               << "," << best.config.k << "] lat=" << best.latency << "\n";
 }
@@ -1682,16 +1679,24 @@ void test_residual_skip_connection() {
     CHECK("skip: T3 eph", sg.ephemeral().count(3));
     CHECK("skip: T4 boundary out", sg.boundary_outputs().count(4));
 
-    // PW sink → output_K_=1. nk=max(1/k,1)=1 for any k. All k values valid.
-    CHECK("skip: k=1 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 1)));
-    CHECK("skip: k=2 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 2)));
-    CHECK("skip: k=128 valid (nk=1)", sg.is_valid_tiling(TC(256, 256, 128)));
+    // Simple epilogue detected: output_K = Op1 MM's K = T2.width = 128.
+    // Valid cfg.k must divide 128 and satisfy the zero-slice check.
+    CHECK("skip: k=1 valid",   sg.is_valid_tiling(TC(256, 256, 1)));
+    CHECK("skip: k=2 valid",   sg.is_valid_tiling(TC(256, 256, 2)));
+    CHECK("skip: k=128 valid", sg.is_valid_tiling(TC(256, 256, 128)));
 
-    // Per #73 multi-role WS: T_in is used under two distinct signatures
-    // here → 2 entries, adding the extra 65536 over single-role baseline.
-    // At [256,256,1]: ntw=1,nth=1,nk=1. Total = 163840 + 65536 = 229376.
+    // At cfg=[256,256,1] (nk=128 via simple epilogue):
+    //   T2 LHS of MM (FROM_NK, FROM_NTH): 128/128 × 256/1 = 256
+    //   T_in role 1 from Op0 PW (FROM_NTW, FROM_NK): 256/1 × 256/128 = 512
+    //   T_in role 2 from Op2 PW (FROM_NTW, FROM_NTH): 256×256 = 65536
+    //   T4 boundary out (FROM_NTW, FROM_NTH): 65536
+    //   T3 ephemeral MM accumulator (nk>1, simple epilogue): 256×256 = 65536
+    //   Total = 197376
+    // Note: compared to the old nk=1 model (ws=229376), split-K here actually
+    // shrinks T_in's MM-role slice (65536 → 512) and T2 (32768 → 256),
+    // at the cost of adding the T3 accumulator (+65536).  Net ~32K smaller.
     auto ws = sg.working_set(TC(256, 256, 1));
-    CHECK_EQ_I("ws(256,256,1) = 229376 (multi-role)", ws, 229376);
+    CHECK_EQ_I("ws(256,256,1) = 197376 (simple epilogue)", ws, 197376);
 
     auto best = sg.best_cost();
     CHECK("skip feasible", best.feasible);
@@ -1938,32 +1943,37 @@ void test_ephemeral_fanout_to_mm_and_pw() {
     CHECK("w=64,h=256 accepted",
           sg.is_valid_tiling(TC(64, 256, 1)));
 
-    // Boundary tensors: T0(128×256), T2(256×256), T4(128×256, out).
-    // Tile sources: T0 (FROM_NTW, FROM_NTH), T2 (FIXED_1, FROM_NTH), T4 (FROM_NTW, FROM_NTH).
-    // No FROM_NK sources, so ws is the same at any valid nk=1 config.
+    // Simple epilogue detected: output_K = Op1.K = T2.width = 256, nk = 256/k.
+    // Op1 (middle MM) is promoted to effective sink — its inputs get
+    // FROM_NK and the accumulator T3 adds cfg.w × cfg.h to the WS.
     //
-    // ws at [128,256,1]: ntw=1, nth=1, nk=1.
-    //   T0: ht=1, vt=1 → 128*256 = 32768.
-    //   T2: ht=1, vt=1 → 256*256 = 65536.
-    //   T4: ht=1, vt=1 → 128*256 = 32768.
-    //   Total = 131072.
-    CHECK_EQ_I("ws(128,256,1) = 131072", sg.working_set(TC(128, 256, 1)), 131072);
+    // ws at [128,256,1] (ntw=1, nth=1, nk=256):
+    //   T0 (merged role via T1 ephemeral → FROM_NTW, FROM_NK): 128/1 × 256/256 = 128
+    //   T2 LHS of MM (FROM_NK, FROM_NTH): 256/256 × 256/1 = 256
+    //   T4 boundary out (FROM_NTW, FROM_NTH): 128 × 256 = 32768
+    //   T3 ephemeral MM accumulator (simple epilogue, nk>1): 128 × 256 = 32768
+    //   Total = 65920
+    CHECK_EQ_I("ws(128,256,1) = 65920 (simple epilogue)",
+               sg.working_set(TC(128, 256, 1)), 65920);
 
-    // ws at [64,256,1]: ntw=2, nth=1.
-    //   T0: ht=2, vt=1 → 64*256 = 16384.
-    //   T2: ht=1, vt=1 → 65536 (FIXED_1 in h).
-    //   T4: ht=2, vt=1 → 16384.
-    //   Total = 98304.
-    CHECK_EQ_I("ws(64,256,1) = 98304", sg.working_set(TC(64, 256, 1)), 98304);
+    // ws at [64,256,1] (ntw=2, nth=1, nk=256):
+    //   T0: 128/2 × 256/256 = 64
+    //   T2: 256/256 × 256/1 = 256
+    //   T4: 64 × 256 = 16384
+    //   T3 accumulator: 64 × 256 = 16384
+    //   Total = 33088
+    CHECK_EQ_I("ws(64,256,1) = 33088 (simple epilogue)",
+               sg.working_set(TC(64, 256, 1)), 33088);
 
-    // Cost at [128,256,1]: num_tw=1, num_th=1, nk=1. has_matmul=true.
-    // With native=512, op_scale=1 uniformly (all slices ≤ native).
-    //   comp = Op0(100) + Op1(1000) + Op2(100) = 1200.
-    //   IO unchanged from original: 13107.2 dominates compute.
+    // Cost at [128,256,1] (nk=256):
+    //   comp/step = (Op0 + Op1 + Op2) / nk = (100+1000+100)/256 = 4.6875
     auto r = sg.compute_cost(TC(128, 256, 1, SnakeDir::RowMajor));
     CHECK("cost feasible", r.feasible);
-    CHECK_EQ("comp_per_step = 1200", r.compute_per_step, 1200.0);
-    CHECK_EQ("latency = 13107.2", r.latency, 13107.2);
+    CHECK_EQ("comp_per_step = 4.6875 (simple epilogue, uniform /nk)",
+             r.compute_per_step, 4.6875);
+    // Sanity: total compute = sum of base_costs
+    CHECK_EQ("total compute = 1200",
+             r.compute_per_step * r.num_spatial_tiles * r.num_k_passes, 1200.0);
 
     auto best = sg.best_cost();
     CHECK("eph-fanout-mixed feasible", best.feasible);
@@ -2596,13 +2606,15 @@ void test_single_mm_nk2_stream_only() {
 
 void test_mm_pw_chain_nk2_mixed_io() {
     std::cout << "--- test_mm_pw_chain_nk2_mixed_io ---\n";
-    // MM → PW chain where the PW is sink. PW sink → output_K_ = 1.
-    // nk = max(1/k, 1) = 1 for any k. No temporal dimension regardless of k.
+    // MM → PW chain where PW is the sole sink.  Per #82 simple-epilogue
+    // detection: output_K_ now comes from the MM's K (not forced to 1),
+    // and split-K is permitted on the MM's k-loop.
     //
     // Op0: MM T_a(128×128) @ T_b(128×128) → T_c(128×128)  [K=128]
     // Op1: PW T_c → T_out(128×128)
     //
-    // has_pw_sink_ = true → ks_cand_ = {output_K_} = {1}.
+    // Detection: one MM found via backward BFS from PW → simple epilogue.
+    // output_K_ = 128.  ks_cand_ enumerates divisors of K.
 
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
@@ -2614,27 +2626,32 @@ void test_mm_pw_chain_nk2_mixed_io() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    CHECK_EQ_I("pw_sink: output_K = 1", sg.output_K(), 1);
+    CHECK_EQ_I("simple epilogue: output_K = 128 (MM's K)", sg.output_K(), 128);
 
-    // output_K_=1: nk=max(1/k,1)=1 for any k. All k values valid.
-    CHECK("pw_sink: k=1 valid", sg.is_valid_tiling(TC(128, 128, 1)));
-    CHECK("pw_sink: k=128 valid", sg.is_valid_tiling(TC(128, 128, 128)));
+    // cfg.k must divide K=128 and ≤ native.
+    CHECK("cfg.k=1 valid",    sg.is_valid_tiling(TC(128, 128, 1)));
+    CHECK("cfg.k=64 valid",   sg.is_valid_tiling(TC(128, 128, 64)));
+    CHECK("cfg.k=128 valid",  sg.is_valid_tiling(TC(128, 128, 128)));
+    CHECK("cfg.k=96 invalid (96∤128)",
+          !sg.is_valid_tiling(TC(128, 128, 96)));
 
-    // With nk=1 and ntw=1, nth=1: all tile counts are 1.
-    // T_a: (FIXED_1, FROM_NTH) → ht=1, vt=1 → 128*128=16384
-    // T_b: (FROM_NTW, FIXED_1) → ht=1, vt=1 → 16384
-    // T_out: (FROM_NTW, FROM_NTH) → ht=1, vt=1 → 16384
-    // ws = 49152
-    CHECK_EQ_I("ws(128,128,1) = 49152", sg.working_set(TC(128, 128, 1)), 49152);
+    // At cfg=[128,128,1] (nk=128):
+    //   T_a LHS (FROM_NK, FROM_NTH): 128/128 × 128/1 = 1×128  = 128
+    //   T_b RHS (FROM_NTW, FROM_NK): 128/1   × 128/128 = 128×1 = 128
+    //   T_out (FROM_NTW, FROM_NTH): 128×128  = 16384
+    //   T_c  ephemeral MM accumulator (nk>1): 128×128 = 16384
+    //   total = 33024
+    CHECK_EQ_I("ws(128,128,1) = 33024 (split-K)", sg.working_set(TC(128,128,1)), 33024);
 
-    // Cost: comp = 2000/1 * 1 + 500/1 * 1 = 2500 (nk=1).
-    // IO: T_a once_load=1638.4, T_b once_load=1638.4, T_out evict=1638.4.
-    // nk=1: tile_cost = max(2500, 3276.8 + 0 + 1638.4) = max(2500, 4915.2) = 4915.2
-    // 1 tile → latency = 4915.2
+    // Per-step compute (uniform /nk amortization):
+    //   (2000 + 500) / 128 = 19.53125
     auto r = sg.compute_cost(TC(128, 128, 1, SnakeDir::RowMajor));
-    CHECK("pw_sink cost feasible", r.feasible);
-    CHECK_EQ("pw_sink comp = 2500", r.compute_per_step, 2500.0);
-    CHECK_EQ("pw_sink latency = 4915.2", r.latency, 4915.2);
+    CHECK("pw_sink cost feasible",           r.feasible);
+    CHECK_EQ_I("num_k_passes = 128",         r.num_k_passes, 128);
+    CHECK_EQ("comp/step = 19.53125",         r.compute_per_step, 19.53125);
+    // Sanity: total compute across 1 × 128 iters = 2500 (sum of base_costs).
+    CHECK_EQ("total compute = 2500",
+             r.compute_per_step * r.num_spatial_tiles * r.num_k_passes, 2500.0);
 }
 
 // ============================================================================
@@ -2650,11 +2667,12 @@ void test_mm_pw_chain_nk2_mixed_io() {
 // The k written to the solution file equals 1 (output_K_).
 // ============================================================================
 
-void test_pw_sink_best_cost_no_temporal_mm_pw_chain() {
-    std::cout << "--- test_pw_sink_best_cost_no_temporal_mm_pw_chain ---\n";
-    // MM → PW chain (PW is sole sink):
-    // Op0: MM T0(128×128) @ T1(128×128) → T2(128×128)  [K=128]
-    // Op1: PW T2 → T3(128×128)  [sink]
+void test_pw_sink_best_cost_mm_pw_chain_split_k() {
+    std::cout << "--- test_pw_sink_best_cost_mm_pw_chain_split_k ---\n";
+    // MM → PW chain (PW is sole sink). Simple epilogue detected (#82).
+    //   Op0: MM T0(128×128) @ T1(128×128) → T2(128×128)  [K=128]
+    //   Op1: PW T2 → T3(128×128)  [sink]
+    // With generous capacity, best_cost can freely pick the optimal k.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},
@@ -2665,18 +2683,18 @@ void test_pw_sink_best_cost_no_temporal_mm_pw_chain() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    // output_K_ = 1 (PW sink).
-    CHECK_EQ_I("mm_pw chain: output_K = 1", sg.output_K(), 1);
+    // output_K_ comes from the MM (simple epilogue), not forced to 1.
+    CHECK_EQ_I("mm_pw chain: output_K = 128", sg.output_K(), 128);
 
-    // best_cost() only tries k=1 (ks_cand_ = {1}), giving nk=1.
+    // best_cost enumerates k ∈ divisors(128); picks the minimum-latency one.
     auto best = sg.best_cost();
     CHECK("mm_pw chain: best_cost feasible", best.feasible);
-    CHECK_EQ_I("mm_pw chain: num_k_passes = 1", best.num_k_passes, 1);
-    CHECK_EQ_I("mm_pw chain: best k = 1", (int64_t)best.config.k, 1);
-
-    // output_K_=1: nk=max(1/k,1)=1 for any k. All k values valid.
-    CHECK("mm_pw k=2 valid", sg.is_valid_tiling(TC(128, 128, 2)));
-    CHECK("mm_pw k=64 valid", sg.is_valid_tiling(TC(128, 128, 64)));
+    CHECK("mm_pw chain: best.k divides K=128", 128 % (int64_t)best.config.k == 0);
+    // Split-K configs are valid now:
+    CHECK("mm_pw cfg.k=64 valid (nk=2)",  sg.is_valid_tiling(TC(128, 128, 64)));
+    CHECK("mm_pw cfg.k=1  valid (nk=128)", sg.is_valid_tiling(TC(128, 128, 1)));
+    // k must still divide K:
+    CHECK("mm_pw cfg.k=3 invalid (3∤128)", !sg.is_valid_tiling(TC(128, 128, 3)));
 }
 
 void test_pw_cosink_no_temporal_tiling() {
@@ -2708,18 +2726,16 @@ void test_pw_cosink_no_temporal_tiling() {
     CHECK("cosink k=128 valid", sg.is_valid_tiling(TC(128, 128, 128)));
 }
 
-void test_pw_sink_no_temporal_tight_memory() {
-    std::cout << "--- test_pw_sink_no_temporal_tight_memory ---\n";
-    // Tight memory: pure MM sink would be forced to use nk > 1.
-    // MM+PW must NOT use temporal tiling even under memory pressure.
-    // With spatial tiling only (nk=1), the working set is reduced by
-    // smaller w and h tiles.
+void test_pw_sink_temporal_allowed_under_tight_memory() {
+    std::cout << "--- test_pw_sink_temporal_allowed_under_tight_memory ---\n";
+    // Under tight memory, the simple-epilogue detection (#82) means the
+    // MM's k-loop CAN be split.  That split shrinks the streamed strips
+    // enough to meet the capacity constraint — exactly the motivation
+    // for the feature.
     //
     // Op0: MM T0(128×128) @ T1(128×128) → T2(128×128)  [K=128]
     // Op1: PW T2 → T3(128×128)  [sink]
-    //
-    // output_K_ = 1. ks_cand_ = {1}. At {128,128,1}: ws = T0+T1+T3 = 3×16384 = 49152.
-    // Capacity = 5000. Must tile spatially: e.g. {8,8,1} → T0 slice small, feasible.
+    // capacity = 5000.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},
@@ -2730,11 +2746,20 @@ void test_pw_sink_no_temporal_tight_memory() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    CHECK_EQ_I("tight mm_pw: output_K = 1", sg.output_K(), 1);
+    // Simple epilogue detected → output_K reflects the MM's K.
+    CHECK_EQ_I("tight mm_pw: output_K = 128 (simple epilogue)",
+               sg.output_K(), 128);
 
     auto best = sg.best_cost();
-    // Regardless of whether a feasible tiling is found, it must not use nk > 1
-    CHECK_EQ_I("tight mm_pw: num_k_passes = 1", best.num_k_passes, 1);
+    CHECK("tight mm_pw: best_cost feasible", best.feasible);
+    // At cap=5000, nk=1 at [128,128,128] is 49152 → INFEASIBLE.
+    // Split-K (spatial and/or temporal) is required to fit.
+    CHECK("tight mm_pw: [128,128,128] infeasible (too big at nk=1)",
+          !sg.is_feasible(TC(128, 128, 128)));
+    // Split-K options are now available; verify any one fits.  Example:
+    // cfg=[8,8,1] nk=128 → T0 slice 8, T1 slice 8, T_out 64, accum 64 = 144.
+    CHECK("tight mm_pw: [8,8,1] feasible (split spatial + split K)",
+          sg.is_feasible(TC(8, 8, 1)));
 }
 
 void test_pure_mm_sink_temporal_allowed() {
@@ -2976,9 +3001,9 @@ int main() {
     test_mm_pw_chain_nk2_mixed_io();
 
     // Section 12: PW-sink temporal tiling rejection
-    test_pw_sink_best_cost_no_temporal_mm_pw_chain();
+    test_pw_sink_best_cost_mm_pw_chain_split_k();
     test_pw_cosink_no_temporal_tiling();
-    test_pw_sink_no_temporal_tight_memory();
+    test_pw_sink_temporal_allowed_under_tight_memory();
     test_pure_mm_sink_temporal_allowed();
 
     // Section 11: symbolic tile-source conflict detection

@@ -178,16 +178,26 @@ void test_solve_mm_pw_chain() {
     auto deadline = Clock::now() + std::chrono::milliseconds(500);
     auto sol = solve(p, d, deadline);
     check_solution("solve/mm_pw", sol, p, base);
-    // Verify PW-only sink rule: when MM+PW are fused (MM output is ephemeral),
-    // output_K_=1 so best k=1 (nk=1 for any k). Solver should pick k=1.
+    // Under the simple MM→PW epilogue (#82), cfg.k can legally split the
+    // MM's k-loop; the solver is free to pick any k that divides the MM's
+    // K. We only check structural validity (k ≥ 1, divides K).
     for (size_t i = 0; i < sol.num_steps(); i++) {
         bool has_mm = false, has_pw = false;
+        int64_t mm_K = 0;
         for (auto op : sol.step(i).subgraph.ops()) {
-            if (p.ops[op].type == OpType::MatMul) has_mm = true;
-            else has_pw = true;
+            if (p.ops[op].type == OpType::MatMul) {
+                has_mm = true;
+                // Op0 style K = LHS tensor width.
+                mm_K = p.tensors[p.ops[op].inputs[0]].width;
+            } else {
+                has_pw = true;
+            }
         }
-        if (has_mm && has_pw)
-            CHECK("MM+PW step: k=1 (PW-only sink)", sol.step(i).config.k == 1);
+        if (has_mm && has_pw) {
+            int64_t k = sol.step(i).config.k;
+            CHECK("MM+PW step: k ≥ 1",           k >= 1);
+            CHECK("MM+PW step: k divides mm_K", mm_K == 0 || mm_K % k == 0);
+        }
     }
     std::cout << "    trivial=" << base << " solved=" << sol.total_latency()
               << " steps=" << sol.num_steps() << "\n";
@@ -378,32 +388,36 @@ void test_phase3_coupling_no_retain() {
 
 void test_invariant_pw_sink_k1() {
     std::cout << "--- test_invariant_pw_sink_k1 ---\n";
-    // Every step in the final solution that has a MM feeding a PW sink
-    // (PW-only sink: MM output is ephemeral) must have k=1 (output_K_=1).
-    // For make_mm_pw_chain(), MM output T2 is ephemeral → PW-only sink.
+    // Per #82 simple MM→PW epilogue: in a fused MM+PW step, cfg.k may
+    // legally split the MM's K.  The invariant is that cfg.k divides
+    // the effective MM's K — NOT that cfg.k == 1.
     auto p = make_mm_pw_chain(); DAG d = DAG::build(p);
     auto deadline = Clock::now() + std::chrono::milliseconds(400);
     auto sol = solve(p, d, deadline);
-
-    // PW-only sink: output_K_=1, best k=1.
-    const int64_t expected_k = 1;
 
     bool found_mm_pw = false;
     bool k_ok = true;
     for (size_t i = 0; i < sol.num_steps(); i++) {
         bool has_mm = false, has_pw_sink = false;
+        int64_t mm_K = 0;
         for (auto op : sol.step(i).subgraph.ops()) {
-            if (p.ops[op].type == OpType::MatMul) has_mm = true;
-            else has_pw_sink = true;
+            if (p.ops[op].type == OpType::MatMul) {
+                has_mm = true;
+                mm_K = p.tensors[p.ops[op].inputs[0]].width;
+            } else {
+                has_pw_sink = true;
+            }
         }
         if (has_mm && has_pw_sink) {
             found_mm_pw = true;
-            if (sol.step(i).config.k != expected_k) k_ok = false;
+            int64_t k = sol.step(i).config.k;
+            // cfg.k must divide MM's K, be at least 1.
+            if (k < 1 || (mm_K > 0 && mm_K % k != 0)) k_ok = false;
         }
     }
-    // If MM and PW were fused into the same step, k must equal 1 (PW-only sink)
+    // If MM and PW were fused into the same step, cfg.k must be a K-divisor.
     if (found_mm_pw)
-        CHECK("PW-sink k=1 in fused MM+PW step", k_ok);
+        CHECK("fused MM+PW step: cfg.k divides MM's K", k_ok);
     else {
         g_pass++;  // not fused — constraint trivially satisfied
         std::cout << "    MM and PW not fused (k=1 constraint trivially met)\n";

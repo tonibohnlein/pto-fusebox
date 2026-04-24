@@ -467,33 +467,23 @@ void test_splitk_fusion() {
 }
 
 // ========================================================================
-// Instance 8: "Separate MM+PW beats fused under new cost model"
+// Instance 8: "Fused MM+PW beats separate under simple-epilogue (#82)"
 //
 // Op0: MM T0(256x256)@T1(256x256)→T2(256x256). K=256.
 // Op1: PW T2(256x256)→T3(256x256).
 // base=3000 each. cap=80000, B=10.
 //
-// Under the new cost model (only sink ops divide by nk):
-// Fused {Op0,Op1}: T2 ephemeral. has_pw_sink_ → nk=1 always.
-//   Op0 (non-sink MM) is NOT divided by nk: pays full comp=3000 per tile.
-//   Op1 (sink PW): comp=3000/1=3000.
-//   comp_per_step=6000 dominates. Feasible configs need WS≤80000.
-//   At [128,128,1]: WS=T0(256*128)+T1(256*128)+T3(128*128)=32768+32768+16384=81920>80000.
-//   Best feasible: [64,128,1] or [128,64,1]. WS=57344, 8 spatial tiles.
-//   total=8×6000=48000.
+// Simple MM→PW epilogue (#82): output_K = 256, split-K enabled.
+//   Fused {Op0,Op1} runs the MM's k-loop in nk steps, accumulates into T2
+//   (ephemeral, w×h), then fires PW once.  Separate would evict+reload
+//   the 256×256 T2 (2×65536/10 = 13107.2 of extra IO).
 //
-// Separate {Op0}: sink MM at [128,128,32], nk=4. comp=3000/4=750 per k-step.
-//   stream=2×409.6=819.2, evict=1638.4.
-//   tile=max(750,819.2)+2×max(750,819.2)+max(750,819.2+1638.4)
-//      =819.2+2×819.2+2457.6=4915.2. 4 spatial tiles → 4×4915.2=19660.8.
-// Separate {Op1}: sink PW, 4 tiles × 3276.8=13107.2.
-// Sep=19660.8+13107.2=32768. Fused=48000. sep < fused.
-//
-// Solver should find separate (or better).
+// The feature eliminates that roundtrip, so fused now BEATS separate.
+// The solver should pick (or beat) the fused solution.
 // ========================================================================
 
 void test_retain_helps() {
-    std::cout << "=== Instance 8: Separate MM+PW beats fused (new model) ===\n";
+    std::cout << "=== Instance 8: Fused MM+PW beats separate (simple epilogue #82) ===\n";
     Problem p;
     p.tensors = {{256,256},{256,256},{256,256},{256,256}};
     p.ops = {{OpType::MatMul,{0,1},{2},3000},
@@ -508,12 +498,13 @@ void test_retain_helps() {
     double sep = tmp.eval_set({0}) + tmp.eval_set({1});
 
     std::cout << "  fused=" << fused << " sep=" << sep << "\n";
-    // Under the new model, non-sink MM in fused group loses nk discount → fused > sep.
-    CHECK("sep < fused", sep < fused);
+    // Simple epilogue enables split-K + ephemeral T2, so fused ≤ separate.
+    CHECK("fused ≤ sep (simple epilogue avoids T2 roundtrip)", fused <= sep);
 
     DAG _dag = DAG::build(p); auto sol = solve(p, _dag);
     std::cout << "  solver: " << sol.total_latency() << "\n";
-    CHECK_LE("solver ≤ sep", sol.total_latency(), sep + 1);
+    // Solver finds fused (or something even better).
+    CHECK_LE("solver ≤ fused", sol.total_latency(), fused + 1);
 }
 
 // ========================================================================

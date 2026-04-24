@@ -473,14 +473,15 @@ void test_pw_sink_rule() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("MM+PW fused valid", sg.has_value());
 
-    // PW sink + matmul: output_K_=1 (PW-sink subgraph).
-    // nk = max(output_K_/k, 1) = max(1/k, 1) = 1 for all k → all k valid.
-    CHECK("k=256 valid (nk=1)", sg->is_valid_tiling({128,128,256,SnakeDir::None}));
-    CHECK("k=128 valid (nk=1)", sg->is_valid_tiling({128,128,128,SnakeDir::None}));
-    CHECK("k=1 valid (nk=1)", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+    // Simple MM→PW epilogue (#82): output_K = MM's K = 256. Split-K allowed.
+    // cfg.k must divide K and respect the super-native bound.
+    CHECK("k=256 valid (nk=1)",  sg->is_valid_tiling({128,128,256,SnakeDir::None}));
+    CHECK("k=128 valid (nk=2)",  sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+    CHECK("k=1 valid (nk=256)",  sg->is_valid_tiling({128,128,1,  SnakeDir::None}));
 
     auto best = sg->best_cost();
-    CHECK("best k=1", best.config.k == 1);
+    CHECK("best feasible",        best.feasible);
+    CHECK("best k divides K=256", 256 % (int64_t)best.config.k == 0);
 
     // Fused should still beat separate (saves T2 transfer)
     Partition tmp; tmp.prob = &p; tmp.dag = &d;

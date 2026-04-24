@@ -201,7 +201,8 @@ void test_retain_two_step_chain() {
 void test_retain_fused_mm_pw_k1() {
     std::cout << "--- test_retain_fused_mm_pw_k1 ---\n";
     // Op0: MM T0@T1→T2. Op1: PW T2→T3. Fused, T2 eph. K=128.
-    // PW-only sink (T3 produced by PW, T2 ephemeral): output_K_=1, all k valid.
+    // With simple MM→PW epilogue (#82), output_K = MM's K = 128 and
+    // split-K is allowed. best_cost picks whichever cfg.k minimizes latency.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000},{OpType::Pointwise,{2},{3},500}};
@@ -212,16 +213,15 @@ void test_retain_fused_mm_pw_k1() {
     auto sg = Subgraph::create(p, d, {0,1});
     CHECK("has_pw_sink", sg.has_value());
 
-    // PW-only sink (T3 produced by PW, T2 ephemeral so MM is not a sink):
-    // output_K_=1, nk=1 for any k. All k values valid.
-    CHECK("k=128 accepted (nk=1)", sg->is_valid_tiling({128,128,128,SnakeDir::None}));
-    CHECK("k=32 accepted (nk=1)", sg->is_valid_tiling({128,128,32,SnakeDir::None}));
-    CHECK("k=1 accepted (nk=1)", sg->is_valid_tiling({128,128,1,SnakeDir::None}));
+    // Simple epilogue: cfg.k must divide K=128.
+    CHECK("k=128 accepted (nk=1)",   sg->is_valid_tiling({128,128,128,SnakeDir::None}));
+    CHECK("k=32 accepted (nk=4)",    sg->is_valid_tiling({128,128,32, SnakeDir::None}));
+    CHECK("k=1 accepted (nk=128)",   sg->is_valid_tiling({128,128,1,  SnakeDir::None}));
 
-    // best_cost picks k=1 (best for PW-only sink: output_K_=1)
+    // best_cost should produce a feasible solution with cfg.k dividing 128.
     auto best = sg->best_cost();
     CHECK("best feasible", best.feasible);
-    CHECK("best k=1", best.config.k == 1);
+    CHECK("best k divides K=128", 128 % (int64_t)best.config.k == 0);
 }
 
 // ==================== Snake × retain cross-product tests ====================

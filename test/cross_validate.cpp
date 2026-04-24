@@ -50,18 +50,70 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
     int nth = std::max((int)(prob.tensors[sink_out].height / cfg.h), 1);
 
     bool has_pw_sink = false;
+    bool has_matmul = false;
     for (auto s : sinks)
         if (prob.ops[s].type == OpType::Pointwise) has_pw_sink = true;
+    for (auto i : sg.ops())
+        if (prob.ops[i].type == OpType::MatMul) has_matmul = true;
 
     int64_t output_K = 1;
-    if (!has_pw_sink)
-        for (auto s : sinks)
-            if (prob.ops[s].type == OpType::MatMul) {
-                output_K = prob.tensors[prob.ops[s].inputs[0]].width;
-                break;
-            }
+    bool has_mm_sink = false;
+    for (auto s : sinks)
+        if (prob.ops[s].type == OpType::MatMul) {
+            output_K = prob.tensors[prob.ops[s].inputs[0]].width;
+            has_mm_sink = true;
+            break;
+        }
 
-    int d_tiles = has_pw_sink ? 1 : std::max((int)(output_K / cfg.k), 1);
+    // Simple MM→PW epilogue detection (mirrors Subgraph::create, #82):
+    //   All sinks are PW, at least one MM in subgraph, and backward BFS
+    //   from each PW sink through PW-only chains converges on ONE MM.
+    //   That MM becomes the "effective sink" — gets d_tiles-style tiling.
+    std::set<size_t> effective_sink_mms;  // treat these as sinks for IO/tiling
+    if (has_pw_sink && has_matmul && !has_mm_sink) {
+        size_t found_mm = SIZE_MAX;
+        bool valid = true;
+        std::set<size_t> sg_ops(sg.ops().begin(), sg.ops().end());
+        for (auto s : sinks) {
+            if (prob.ops[s].type != OpType::Pointwise) { valid = false; break; }
+            std::vector<size_t> stack = {s};
+            std::set<size_t> visited = {s};
+            while (!stack.empty() && valid) {
+                size_t op = stack.back(); stack.pop_back();
+                for (auto t : prob.ops[op].inputs) {
+                    // walk backward: find producer that's in the subgraph
+                    size_t producer = SIZE_MAX;
+                    for (auto j : sg_ops) {
+                        for (auto jt : prob.ops[j].outputs)
+                            if (jt == t) { producer = j; break; }
+                        if (producer != SIZE_MAX) break;
+                    }
+                    if (producer == SIZE_MAX) continue;
+                    if (visited.count(producer)) continue;
+                    visited.insert(producer);
+                    if (prob.ops[producer].type == OpType::MatMul) {
+                        if (found_mm != SIZE_MAX && found_mm != producer)
+                            valid = false;
+                        found_mm = producer;
+                    } else {
+                        stack.push_back(producer);
+                    }
+                }
+            }
+        }
+        if (valid && found_mm != SIZE_MAX) {
+            effective_sink_mms.insert(found_mm);
+            output_K = prob.tensors[prob.ops[found_mm].inputs[0]].width;
+        }
+    }
+
+    // d_tiles = nk:
+    //   PW-only sink & no simple epilogue → nk=1.
+    //   MM sink or simple epilogue → nk = output_K / cfg.k.
+    bool simple_epilogue = !effective_sink_mms.empty();
+    int d_tiles = (has_pw_sink && !simple_epilogue)
+                    ? 1
+                    : std::max((int)(output_K / cfg.k), 1);
     result.num_spatial_tiles = ntw * nth;
     result.num_k_passes = d_tiles;
 
@@ -107,7 +159,11 @@ static CostResult simulate(const Subgraph& sg, TileConfig cfg,
             for (auto op_idx : rev_topo) {
                 const auto& op = prob.ops[op_idx];
                 size_t out = op.outputs[0];
-                bool is_sink = op_succs[op_idx].empty();
+                // Effective sink: topology sink OR marked as simple-epilogue
+                // effective-sink MM (mirrors Subgraph::create promoting the
+                // MM to sink for tiling purposes).
+                bool is_sink = op_succs[op_idx].empty()
+                               || effective_sink_mms.count(op_idx);
 
                 // Propagate h/v tiles and positions
                 if (op.type == OpType::Pointwise) {
