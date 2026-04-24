@@ -28,6 +28,14 @@ endif()
 # Threading support
 find_package(Threads REQUIRED)
 
+# Option: statically link libstdc++ and libgcc so the binary is portable
+# across Linux distros (glibc still dynamic — required for pthread, DNS).
+# Usage: cmake -DSTATIC_STDLIB=ON -DCMAKE_BUILD_TYPE=Release ..
+option(STATIC_STDLIB "Statically link libstdc++ and libgcc" OFF)
+if(STATIC_STDLIB)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+endif()
+
 # All source files can include from src/
 include_directories(${CMAKE_SOURCE_DIR}/src)
 

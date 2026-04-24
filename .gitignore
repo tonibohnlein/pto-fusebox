@@ -4,6 +4,7 @@
 build/*
 build-debug/*
 build-rel-dbg/*
+build-ubuntu22/*
 
 # Compiled Object files
 *.slo
