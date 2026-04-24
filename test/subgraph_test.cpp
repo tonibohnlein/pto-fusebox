@@ -198,8 +198,10 @@ void test_is_valid_tiling_matmul_k_must_divide_K() {
     CHECK("k=48 valid",  sg.is_valid_tiling(TC(128, 128, 48)));
     CHECK("k=96 valid",  sg.is_valid_tiling(TC(128, 128, 96)));
     CHECK("k=64 invalid (64∤96)", !sg.is_valid_tiling(TC(128, 128, 64)));
-    // k=128 >= 96: gran>=dim is valid (max(96/128,1) = 1 tile)
-    CHECK("k=128 valid (128>=96)", sg.is_valid_tiling(TC(128, 128, 128)));
+    // Per #75: cfg.k > op_K is physically undefined (nothing to stream
+    // into the back half of the k-granule). With MM.K=96, k=128 is invalid.
+    CHECK("k=128 rejected (128 > op_K=96, per #75)",
+          !sg.is_valid_tiling(TC(128, 128, 128)));
 }
 
 // ============================================================================
@@ -452,20 +454,17 @@ void test_nk_exceeds_tensor_dim_chained_matmul() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    // output_K = T2.width = 256. k=1 → nk=256.
-    // T0 (64×256) has v_source=FROM_NK → v_tiles=256, H/256=1. Borderline valid.
-    // T1 (256×64) has v_source=FIXED_1 → v_tiles=1. OK.
-    // T3 (64×256) has v_source=FROM_NK → v_tiles=256, H/256=1. Borderline valid.
-    CHECK("k=1 valid (borderline nk=256, min_dim=256)",
+    // Multi-K subgraph: Op0's K = T0.width = 64, Op1's K = T2.width = 256.
+    // Per #75, cfg.k ≤ min(K) = 64 is required.
+    CHECK("k=1 valid (≤ min K)",
           sg.is_valid_tiling(TC(64, 256, 1)));
+    CHECK("k=64 valid (= min K=64)",
+          sg.is_valid_tiling(TC(64, 256, 64)));
+    CHECK("k=128 rejected (> Op0's K=64, per #75)",
+          !sg.is_valid_tiling(TC(64, 256, 128)));
+    CHECK("k=256 rejected (> Op0's K=64, per #75)",
+          !sg.is_valid_tiling(TC(64, 256, 256)));
 
-    // k=128 → nk=2. All dims >= 2. Must be valid.
-    CHECK("k=128 valid (nk=2)", sg.is_valid_tiling(TC(64, 256, 128)));
-
-    // k=256 → nk=1. Trivially valid.
-    CHECK("k=256 valid (nk=1)", sg.is_valid_tiling(TC(64, 256, 256)));
-
-    // Verify working set is reasonable (no zero slices)
     auto ws = sg.working_set(TC(64, 256, 1));
     CHECK("ws with k=1 is positive", ws > 0 && ws != INT64_MAX);
     std::cout << "    ws(k=1) = " << ws << "\n";
@@ -933,24 +932,22 @@ void test_nk_exceeds_small_tensor_rejected() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0});
 
-    // K=512, RHS.height=128. nk=512/k.
-    // k=1 → nk=512. T1 v_tiles=512 > T1.height=128. Must reject.
+    // This test constructs an ill-formed MM where LHS.width=512 ≠ RHS.height=128.
+    // Our add_constraint logic treats both as K_param dimensions, so
+    // k_divides_ = {128, 512}. Per #75, cfg.k ≤ min = 128.
+    // k=1 → rejected by tile-dim bound (nk=512 > T1.height=128).
     CHECK("k=1 rejected (nk=512 > RHS.height=128)",
           !sg.is_valid_tiling(TC(256, 256, 1)));
-
-    // k=2 → nk=256 > 128. Must reject.
     CHECK("k=2 rejected (nk=256 > 128)",
           !sg.is_valid_tiling(TC(256, 256, 2)));
-
-    // k=4 → nk=128 = T1.height=128. Borderline, must accept.
-    CHECK("k=4 accepted (nk=128 = RHS.height=128)",
+    // k=4 accepted (nk=128 = T1.height, and cfg.k=4 ≤ min(k_divides_)).
+    CHECK("k=4 accepted (nk=128)",
           sg.is_valid_tiling(TC(256, 256, 4)));
-
-    // k=128 → nk=4 ≤ 128. Valid.
-    CHECK("k=128 accepted (nk=4)", sg.is_valid_tiling(TC(256, 128, 128)));
-
-    // k=512 → nk=1. Valid.
-    CHECK("k=512 accepted (nk=1)", sg.is_valid_tiling(TC(256, 256, 512)));
+    CHECK("k=128 accepted (= min(k_divides_))",
+          sg.is_valid_tiling(TC(256, 128, 128)));
+    // k=512 rejected (> min(k_divides_)=128, per #75).
+    CHECK("k=512 rejected (> min(k_divides_)=128, per #75)",
+          !sg.is_valid_tiling(TC(256, 256, 512)));
 
     // Verify working set is sane for valid configs (no zero slices)
     auto ws4 = sg.working_set(TC(256, 256, 4));
@@ -1400,8 +1397,10 @@ void test_mm_pw_mm_chain() {
     CHECK("k=2 accepted (nk=128 = T0.height)",
           sg.is_valid_tiling(TC(128, 128, 2)));
 
-    // k=256 → nk=1. Accept.
-    CHECK("k=256 accepted (nk=1)", sg.is_valid_tiling(TC(128, 128, 256)));
+    // k=256 rejected per #75: k_divides_ includes 128 (from T3.height as
+    // RHS K_param), and cfg.k > min(k_divides_) is physically undefined.
+    CHECK("k=256 rejected (> min K, per #75)",
+          !sg.is_valid_tiling(TC(128, 128, 256)));
 
     auto ws = sg.working_set(TC(128, 128, 2));
     CHECK("ws(k=2) positive", ws > 0 && ws != INT64_MAX);
@@ -1630,10 +1629,11 @@ void test_bottleneck_3branch_pattern() {
     CHECK("k=1 rejected", !sg.is_valid_tiling(TC(256, 128, 1)));
     // k=2 → nk=256 > 128
     CHECK("k=2 rejected", !sg.is_valid_tiling(TC(256, 128, 2)));
-    // k=4 → nk=128 = 128
+    // k=4 → nk=128 = 128. ≤ min(k_divides_).
     CHECK("k=4 accepted", sg.is_valid_tiling(TC(256, 128, 4)));
-    // k=512 → nk=1
-    CHECK("k=512 accepted", sg.is_valid_tiling(TC(256, 128, 512)));
+    // k=512 rejected per #75 (cfg.k > min(k_divides_) = 128 from T_small).
+    CHECK("k=512 rejected (> min K, per #75)",
+          !sg.is_valid_tiling(TC(256, 128, 512)));
 
     auto ws = sg.working_set(TC(256, 128, 4));
     CHECK("ws(k=4) positive", ws > 0 && ws != INT64_MAX);
@@ -2451,31 +2451,22 @@ void test_2mm_chain_nk2_temporal() {
     CHECK_EQ_I("2mm: output_width = 128", sg.output_width(), 128);
     CHECK_EQ_I("2mm: output_height = 128", sg.output_height(), 128);
 
-    // Tiling validity: k must divide K0=128 and K1=256.
+    // Tiling validity: k must divide K0=128 and K1=256, and per #75 cfg.k
+    // ≤ min(K) = 128.
     CHECK("w=64,h=64,k=128 valid", sg.is_valid_tiling(TC(64, 64, 128)));
     CHECK("w=64,h=64,k=64 valid", sg.is_valid_tiling(TC(64, 64, 64)));
-    // k=256 ≥ K0=128, so the divisibility check is skipped (tile covers full dim).
-    // nk = output_K/k = 256/256 = 1. Valid.
-    CHECK("k=256 valid (k≥K0, nk=1)", sg.is_valid_tiling(TC(64, 64, 256)));
-    // k=192 < K0=128? No, 192>128, skip. But 256%192=64≠0 for K1. Check: 192<256 && 256%192=64≠0 → invalid.
+    // k=256 rejected per #75: cfg.k > min(K)=128.
+    CHECK("k=256 rejected (> min K=128, per #75)",
+          !sg.is_valid_tiling(TC(64, 64, 256)));
     CHECK("k=192 invalid (256%192≠0)", !sg.is_valid_tiling(TC(64, 64, 192)));
 
     // Working set at [64,64,128] (ntw=2, nth=2, nk=2)
     CHECK_EQ_I("ws(64,64,128) = 36864", sg.working_set(TC(64, 64, 128)), 36864);
-
     // Working set at [128,128,128] (ntw=1, nth=1, nk=2)
-    // T_a: ht=1, vt=1 → 128*128 = 16384
-    // T_b: ht=nk=2, vt=1 → 128*128 = 16384
-    // T_d: ht=1, vt=nk=2 → 128*128 = 16384
-    // T_e: ht=1, vt=1 → 128*128 = 16384
-    // Total = 65536
     CHECK_EQ_I("ws(128,128,128) = 65536", sg.working_set(TC(128, 128, 128)), 65536);
-
-    // Working set at [128,128,256] (ntw=1, nth=1, nk=1)
-    // All tile counts = 1 → full tensor slices.
-    // T_a: 128*128=16384, T_b: 256*128=32768, T_d: 128*256=32768, T_e: 128*128=16384
-    // Total = 98304
-    CHECK_EQ_I("ws(128,128,256) = 98304", sg.working_set(TC(128, 128, 256)), 98304);
+    // ws(128,128,256) is INT64_MAX now since cfg.k=256 is rejected.
+    CHECK_EQ_I("ws(128,128,256) rejected (INT64_MAX)",
+               sg.working_set(TC(128, 128, 256)), INT64_MAX);
 
     // Cost at [64,64,128] RowMajor (ntw=2, nth=2, nk=2)
     auto r = sg.compute_cost(TC(64, 64, 128, SnakeDir::RowMajor));
@@ -2914,8 +2905,13 @@ void test_three_mm_chain_shared_rhs_symbolic() {
     CHECK("3mm: T_rhs input", sg.boundary_inputs().count(1));
     CHECK_EQ_I("3mm: output_K = 256", sg.output_K(), 256);
 
-    // w=256, h=256, k=256 → ntw=1, nth=1, nk=1. All 1 → compatible.
-    CHECK("all-1 accepted", sg.is_valid_tiling(TC(256, 256, 256)));
+    // Multi-K subgraph: Op0.K=128, Op2.K=256. Per #75 cfg.k ≤ min(K)=128.
+    // cfg.k=256 (would have nk=1 for Op2 alone) is rejected because Op0.K
+    // is only 128.
+    CHECK("k=256 rejected (> min K=128, per #75)",
+          !sg.is_valid_tiling(TC(256, 256, 256)));
+    CHECK("k=128 accepted (= min K)",
+          sg.is_valid_tiling(TC(256, 256, 128)));
 
     // Under multi-role (per #73), T_rhs gets separate entries per distinct
     // signature — the old slow path's "symbolic conflict" rejections of

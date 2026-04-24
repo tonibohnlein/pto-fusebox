@@ -338,6 +338,86 @@ void test_non_square_chain() {
 }
 
 // ============================================================================
+// Issue #75 / #71 multi-K rule (organizer's example)
+//
+// Per the organizer's #75 ruling: "k ≤ K_op must hold for every matmul in
+// the subgraph. ... If you pick k = 256 while Op_C's reduction is only 128,
+// there's nothing to stream into the back half of the granule — no data to
+// reduce, and whatever gets summed in would corrupt the result."
+//
+// We construct a chained subgraph where two MMs have differing K values,
+// and verify our is_valid_tiling enforces cfg.k ≤ min(K).
+// ============================================================================
+
+void test_multi_k_organizer_example() {
+    std::cout << "--- test_multi_k_organizer_example ---\n";
+    // Two-MM chain with different K values:
+    //   MM_A:  T0(K_A=64) × T1 → T_inter   (non-sink, K_A = T0.width = 64)
+    //   MM_B:  T_inter × T2(K_B=128) → T3  (sink, K_B = T_inter.width = 128)
+    //
+    // Tensor shapes: T0(64×128) [w=64=K_A, h=128]; T1(128×64) [w=128, h=64=K_A]
+    //                T_inter(128×128); T2(128×128); T3(128×128)
+    Problem p;
+    p.tensors = {{64,128},{128,64},{128,128},{128,128},{128,128}};
+    //            T0       T1       T_inter   T2        T3
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 1000},   // MM_A: K_A=64
+             {OpType::MatMul, {2,3}, {4}, 2000}};  // MM_B (sink): K_B=128
+    p.fast_memory_capacity = 200000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0, 1});
+
+    // K values: MM_A.K = 64, MM_B.K = 128. min(K) = 64. Per #75, cfg.k ≤ 64.
+    CHECK("k=32 valid (≤ min K=64)",
+          sg.is_valid_tiling(TC(64, 128, 32)));
+    CHECK("k=64 valid (= min K=64)",
+          sg.is_valid_tiling(TC(64, 128, 64)));
+    // The interesting case from #75: cfg.k=128 matches MM_B.K but exceeds
+    // MM_A.K. Per the organizer, INVALID — MM_A has nothing to feed into
+    // the back half of the 128-wide k-granule.
+    CHECK("k=128 rejected (> MM_A.K=64, per #75)",
+          !sg.is_valid_tiling(TC(64, 128, 128)));
+}
+
+// Single-MM case (negative control): cfg.k=128 with K=128 should be fine.
+// Verifies the fix doesn't over-reject when there's only one K value.
+void test_single_k_control() {
+    std::cout << "--- test_single_k_control ---\n";
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 100000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    CHECK("k=128 (= K) accepted",  sg.is_valid_tiling(TC(128, 128, 128)));
+    CHECK("k=64 (< K) accepted",   sg.is_valid_tiling(TC(128, 128, 64)));
+}
+
+// Single-MM with native > K: the fix matters even for single-MM if cfg.k
+// is allowed beyond K but within native (e.g., native=256, K=128).
+void test_single_mm_cfg_k_above_op_K() {
+    std::cout << "--- test_single_mm_cfg_k_above_op_K ---\n";
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 100000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 256; p.native_h = 256;  // native bigger than K
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    CHECK("k=128 (= K) accepted", sg.is_valid_tiling(TC(128, 128, 128)));
+    // Without #75 fix, cfg.k=256 would slip through (≤ native, divides nothing
+    // larger). Per #75, cfg.k > op_K is physically undefined → reject.
+    CHECK("k=256 rejected (> op_K=128, per #75)",
+          !sg.is_valid_tiling(TC(128, 128, 256)));
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -351,6 +431,10 @@ int main() {
     test_mixed_mm_pw_chain();
     test_multi_sink_fan_out();
     test_non_square_chain();
+
+    test_multi_k_organizer_example();
+    test_single_k_control();
+    test_single_mm_cfg_k_above_op_K();
 
     std::cout << "\n=== " << g_pass << " passed, " << g_fail
               << " failed ===\n";

@@ -474,8 +474,13 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   for (int64_t v : h_divides_)
     if (cfg.h < v && v % cfg.h != 0) return false;
   if (!has_pw_sink_) {
-    for (int64_t v : k_divides_)
+    for (int64_t v : k_divides_) {
+      // Per #75: cfg.k > op_K is physically undefined — there's nothing
+      // to stream into the back half of the k-granule, and whatever gets
+      // summed in would corrupt the accumulator.
+      if (cfg.k > v) return false;
       if (cfg.k < v && v % cfg.k != 0) return false;
+    }
   }
   // For PW-sink subgraphs k is irrelevant (nk is always 1): skip k
   // divisibility but enforce nk == 1 explicitly below.
