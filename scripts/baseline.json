@@ -1,217 +1,217 @@
 {
   "asym-native-attn": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 40080.8
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 40514.0
   },
   "asym-native-chain": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 176947.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 229376.0
   },
   "bert-block": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 8752849.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 8819662.0
   },
   "custom-bottleneck-3br": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 293764.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 329440.0
   },
   "custom-convlike-6layer": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
-    "latency": 729297.6
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 820871.0
   },
   "custom-deep-narrow-20": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 40960.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 49152.0
   },
   "custom-enc-dec-2x3": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 60120.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 59294.0
   },
   "custom-fandia-8wide": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 249036.8
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 262144.0
   },
   "custom-irregular-5layer": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 134424.5
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 149852.0
   },
   "custom-moe-4expert": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
-    "latency": 212838.4
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 275098.0
   },
   "custom-multipath-6": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 219965.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 266581.0
   },
   "custom-multiscale-3": {
-    "commit": "cd51bc4",
-    "date": "2026-03-27",
-    "latency": 114146.8
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 123699.0
   },
   "custom-reschain-8": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 536829.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 557565.0
   },
   "custom-shared-weights-5": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 130252.8
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 145818.0
   },
   "custom-tight-10ops": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 2320148.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 2883584.0
   },
   "custom-transformer-large": {
-    "commit": "cd51bc4",
-    "date": "2026-03-27",
-    "latency": 1264707.7
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 1357668.0
   },
   "custom-transformer-small": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 92435.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 109600.0
   },
   "custom-transformer-stress": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 35839183.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 35842807.0
   },
   "deep-chain-40": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 81920.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 98304.0
   },
   "embedding": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 533088.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 539034.0
   },
   "example_problem": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 3277.0
   },
   "hydra-net": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 132639.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 166729.0
   },
   "large-moe": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
-    "latency": 190263.4
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 202809.0
   },
   "large-tensor": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 98304000.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 189524869.0
   },
   "llama-mlp": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 3122133.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 3146648.0
   },
   "mega-gnn": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 163304.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 166403.0
   },
   "mega-xformer": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
-    "latency": 97670739.8
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 99016180.0
   },
   "mixed-unet": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 842211.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 881021.0
   },
   "mlsys-2026-1": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 314573.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 419430.0
   },
   "mlsys-2026-13": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
-    "latency": 5783313.3
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 11586437.0
   },
   "mlsys-2026-17": {
-    "commit": "915edd7",
-    "date": "2026-03-25",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 4966400.0
   },
   "mlsys-2026-5": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 825143.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 822836.0
   },
   "mlsys-2026-9": {
-    "commit": "cd51bc4",
-    "date": "2026-03-27",
-    "latency": 20704051.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 44160901.0
   },
   "multi-output": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 40413.9
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 42598.0
   },
   "multi-shared": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 253864.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 257141.0
   },
   "pure-pw": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 23200.0
   },
   "recompute-diamond": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 799539.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 856944.0
   },
   "recompute-ladder": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 344064.0
   },
   "stacked-xformer": {
-    "commit": "5f8f250",
-    "date": "2026-04-13",
-    "latency": 2157526.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 2214389.0
   },
   "tall-skinny": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 1757888.0
   },
   "ultra-high-bw": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 448000.0
   },
   "ultra-low-bw": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
-    "latency": 524288.0
+    "commit": "a20f861",
+    "date": "2026-04-24",
+    "latency": 983040.0
   },
   "ultra-tight": {
-    "commit": "c91b168",
-    "date": "2026-03-24",
+    "commit": "a20f861",
+    "date": "2026-04-24",
     "latency": 1415578.0
   }
 }
