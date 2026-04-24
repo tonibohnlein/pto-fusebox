@@ -18,6 +18,11 @@ static void CHECK(const char* l, bool c) {
     if (c) g_pass++;
     else { g_fail++; std::cout << "  FAIL: " << l << "\n"; }
 }
+static void CHECK_EQ_I(const char* l, int64_t got, int64_t exp) {
+    if (got == exp) g_pass++;
+    else { g_fail++; std::cout << "  FAIL: " << l
+           << " got=" << got << " exp=" << exp << "\n"; }
+}
 
 static TileConfig TC(int64_t w, int64_t h, int64_t k,
                      SnakeDir s = SnakeDir::None) { return {w, h, k, s}; }
@@ -178,6 +183,113 @@ void test_granule_fit_mm_ephemeral_trivially_holds() {
 }
 
 // ============================================================================
+// Extended native-bound coverage
+// ============================================================================
+
+// cfg exactly at native is accepted; cfg just one above is rejected.
+void test_native_boundary_exact() {
+    std::cout << "--- test_native_boundary_exact ---\n";
+    // Pick tensors that include 129 as a tensor dim to make cfg=129 meaningful
+    // for divisibility. Use tensors=258 so 129 divides 258.
+    Problem p;
+    p.tensors = {{258,258},{258,258},{258,258}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 500000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    // cfg=128 exactly at native — accepted (258 is not divisible by 128,
+    // but 128 | 258? 258/128=2.015 so no. But w_divides check uses either
+    // direction; 258 = 2*128+2, not multiple. So w=128 rejected by
+    // divisibility, not native bound. Use cfg.w=258 instead... but 258>128.
+    // Reshape to 256 tensors instead.
+    Problem p2;
+    p2.tensors = {{256,256},{256,256},{256,256}};
+    p2.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p2.fast_memory_capacity = 500000;
+    p2.slow_memory_bandwidth = 10;
+    p2.native_w = 128; p2.native_h = 128;
+    DAG d2 = DAG::build(p2);
+    auto sg2 = make_sg(p2, d2, {0});
+
+    CHECK("cfg=(128,128,128) exactly at native — accepted",
+          sg2.is_valid_tiling(TC(128,128,128)));
+    CHECK("cfg=(256,128,128) one above native w — rejected",
+          !sg2.is_valid_tiling(TC(256,128,128)));
+    CHECK("cfg=(128,256,128) one above native h — rejected",
+          !sg2.is_valid_tiling(TC(128,256,128)));
+    CHECK("cfg=(128,128,256) one above native k — rejected",
+          !sg2.is_valid_tiling(TC(128,128,256)));
+
+    (void)sg;  // unused
+}
+
+// Native=256 (larger): cfg up to 256 is valid, over → rejected.
+void test_native_256_boundary() {
+    std::cout << "--- test_native_256_boundary ---\n";
+    Problem p;
+    p.tensors = {{512,512},{512,512},{512,512}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 2000000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 256; p.native_h = 256;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    CHECK("cfg=(256,256,256) at native — accepted",
+          sg.is_valid_tiling(TC(256,256,256)));
+    CHECK("cfg=(128,128,128) below native — accepted",
+          sg.is_valid_tiling(TC(128,128,128)));
+    CHECK("cfg=(512,256,256) above native — rejected",
+          !sg.is_valid_tiling(TC(512,256,256)));
+    CHECK("cfg=(256,512,256) above native — rejected",
+          !sg.is_valid_tiling(TC(256,512,256)));
+    CHECK("cfg=(256,256,512) above native — rejected",
+          !sg.is_valid_tiling(TC(256,256,512)));
+}
+
+// Zero and negative cfg rejected.
+void test_zero_or_negative_cfg_rejected() {
+    std::cout << "--- test_zero_or_negative_cfg_rejected ---\n";
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 100000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    CHECK("cfg.w=0 rejected",  !sg.is_valid_tiling(TC(0,128,128)));
+    CHECK("cfg.h=0 rejected",  !sg.is_valid_tiling(TC(128,0,128)));
+    CHECK("cfg.k=0 rejected",  !sg.is_valid_tiling(TC(128,128,0)));
+    CHECK("cfg.w=-1 rejected", !sg.is_valid_tiling(TC(-1,128,128)));
+}
+
+// Sub-native cfg produces more spatial tiles (padding waste). Verify by
+// comparing num_spatial_tiles at different cfg sizes.
+void test_sub_native_more_tiles() {
+    std::cout << "--- test_sub_native_more_tiles ---\n";
+    Problem p;
+    p.tensors = {{256,256},{256,256},{256,256}};
+    p.ops = {{OpType::MatMul, {0,1}, {2}, 2000}};
+    p.fast_memory_capacity = 500000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0});
+
+    // Output 256×256. At cfg.w/h=128 (native): 2×2 = 4 tiles.
+    // At cfg.w/h=64 (sub-native): 4×4 = 16 tiles. 4× more work.
+    auto c_native = sg.compute_cost(TC(128,128,128));
+    auto c_sub    = sg.compute_cost(TC(64, 64, 64));
+    CHECK_EQ_I("cfg=128 spatial tiles",  c_native.num_spatial_tiles, 4);
+    CHECK_EQ_I("cfg=64  spatial tiles",  c_sub.num_spatial_tiles,    16);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -189,6 +301,11 @@ int main() {
     test_small_native_all_subdivisors_ok();
     test_granule_fit_pw_ephemeral_rejects_when_slice_exceeds_cfg();
     test_granule_fit_mm_ephemeral_trivially_holds();
+
+    test_native_boundary_exact();
+    test_native_256_boundary();
+    test_zero_or_negative_cfg_rejected();
+    test_sub_native_more_tiles();
 
     std::cout << "\n=== " << g_pass << " passed, "
               << g_fail << " failed ===\n";

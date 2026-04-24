@@ -108,6 +108,7 @@ set(TEST_SOURCES
     test/regression_test.cpp
     test/granule_bound_test.cpp
     test/multi_role_test.cpp
+    test/large_subgraph_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
