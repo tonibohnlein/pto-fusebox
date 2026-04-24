@@ -137,22 +137,19 @@ void test_granule_fit_pw_ephemeral_rejects_when_slice_exceeds_cfg() {
     DAG d = DAG::build(p);
     auto sg = make_sg(p, d, {0, 1});
 
-    // At nk=1 (cfg.k=256): T1 slice_w = 256. PW granule (cfg.w, cfg.h) must
-    // hold it, so cfg.w ≥ 256 required.
-    CHECK("cfg=(256,256,256) nk=1, fits", sg.is_valid_tiling(TC(256,256,256)));
-    CHECK("cfg=(128,256,256) nk=1, slice_w=256>cfg.w=128 REJECTED",
+    // Per #71 Rule 2 (prologue-PW LHS geometric condition): cfg.w ≥ K=256
+    // required regardless of nk. A single PW tile must span the full K-axis.
+    CHECK("cfg=(256,256,256) cfg.w = K accepted",
+          sg.is_valid_tiling(TC(256,256,256)));
+    CHECK("cfg=(128,256,256) cfg.w < K rejected (Rule 2)",
           !sg.is_valid_tiling(TC(128,256,256)));
-
-    // At nk=2 (cfg.k=128): T1 slice_w = 128. PW granule cfg.w must ≥ 128.
-    CHECK("cfg=(128,256,128) nk=2, slice_w=128=cfg.w OK",
-          sg.is_valid_tiling(TC(128,256,128)));
-    CHECK("cfg=(64,256,128) nk=2, slice_w=128>cfg.w=64 REJECTED",
+    CHECK("cfg=(128,256,128) cfg.w < K rejected (Rule 2)",
+          !sg.is_valid_tiling(TC(128,256,128)));
+    CHECK("cfg=(64,256,128)  cfg.w < K rejected (Rule 2)",
           !sg.is_valid_tiling(TC(64,256,128)));
-
-    // At nk=4 (cfg.k=64): T1 slice_w = 64. PW granule cfg.w must ≥ 64.
-    CHECK("cfg=(64,256,64) nk=4, slice_w=64=cfg.w OK",
-          sg.is_valid_tiling(TC(64,256,64)));
-    CHECK("cfg=(32,256,64) nk=4, slice_w=64>cfg.w=32 REJECTED",
+    CHECK("cfg=(64,256,64)   cfg.w < K rejected (Rule 2)",
+          !sg.is_valid_tiling(TC(64,256,64)));
+    CHECK("cfg=(32,256,64)   cfg.w < K rejected (Rule 2)",
           !sg.is_valid_tiling(TC(32,256,64)));
 }
 

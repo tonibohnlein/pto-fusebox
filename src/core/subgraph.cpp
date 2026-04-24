@@ -90,6 +90,47 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.mm_produced_ephemerals_.push_back(out_t);
   }
 
+  // Issue #71 Rules 2/3 (prologue-PW geometric condition):
+  //   PW feeds a downstream MM's LHS (directly or through PW chain) →
+  //     require cfg.w ≥ matmul.K
+  //   PW feeds a downstream MM's RHS → require cfg.h ≥ matmul.K
+  // For each PW op in the subgraph, forward-BFS through PW-only chains to
+  // any MM it reaches; note the role (LHS/RHS) and record the MM's K.
+  // Subgraph-level thresholds = max K across all such pairs.
+  for (auto i : sg.ops_) {
+    if (prob.ops[i].type != OpType::Pointwise) continue;
+    // BFS forward through subgraph, crossing only PW→PW edges. A PW that
+    // reaches an MM via PW-only chain is a "prologue" of that MM.
+    std::vector<size_t> stack = {i};
+    std::vector<bool> visited(num_ops, false);
+    visited[i] = true;
+    while (!stack.empty()) {
+      size_t op = stack.back(); stack.pop_back();
+      size_t out_t = prob.ops[op].output();
+      for (auto cop : dag.tensor_consumers[out_t]) {
+        if (!is_in_sg[cop] || visited[cop]) continue;
+        visited[cop] = true;
+        const auto &cop_op = prob.ops[cop];
+        if (cop_op.type == OpType::MatMul) {
+          int64_t K = prob.tensors[cop_op.inputs[0]].width;
+          // Determine LHS vs RHS by which input slot the propagated tensor
+          // occupies. `out_t` here is the *immediate* downstream tensor we
+          // arrived at via the BFS edge; for PW-chain intermediates this
+          // still lands on the MM's LHS/RHS slot correctly since PW
+          // preserves shape and chain identity.
+          if (cop_op.inputs[0] == out_t)
+            sg.prologue_cfg_w_min_ = std::max(sg.prologue_cfg_w_min_, K);
+          if (cop_op.inputs.size() > 1 && cop_op.inputs[1] == out_t)
+            sg.prologue_cfg_h_min_ = std::max(sg.prologue_cfg_h_min_, K);
+          // Stop — MM materializes its output, so downstream-of-MM is a
+          // separate concern (that MM's epilogue, not this PW's prologue).
+        } else if (cop_op.type == OpType::Pointwise) {
+          stack.push_back(cop);
+        }
+      }
+    }
+  }
+
   if (sg.boundary_outputs_.empty())
     return std::nullopt;
 
@@ -494,6 +535,15 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 
   // PW-sink: no temporal tiling allowed.
   if (has_pw_sink_ && nk > 1) return false;
+
+  // Issue #71 Rules 2/3: prologue-PW geometric condition. A PW that feeds
+  // an MM's LHS (via PW-only chain) requires cfg.w ≥ matmul.K so a single
+  // PW tile spans the full LHS K-axis; feeding RHS requires cfg.h ≥ matmul.K.
+  // Applies at all nk — the constraint is geometric (PW tile shape vs
+  // K-axis), not conditional on split-K. No prologue PW → thresholds are 0
+  // and these checks are no-ops.
+  if (cfg.w < prologue_cfg_w_min_) return false;
+  if (cfg.h < prologue_cfg_h_min_) return false;
 
   // Per-entry tensor-dim bounds (per #70 + #73 multi-role). For each
   // distinct role signature of each boundary tensor, ensure the derived

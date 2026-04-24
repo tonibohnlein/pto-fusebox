@@ -269,13 +269,17 @@ void test_steal_pw_from_mm_group() {
     std::cout << "=== test_steal_pw_from_mm_group ===\n";
     // Op0: PW T0→T1. Op1: MM T1@T2→T3. Start: {Op0,Op1},{...}
     // Steal Op0 out of the fused group.
+    //
+    // Rule 2 (issue #71): PW feeding MM LHS requires cfg.w ≥ matmul.K.
+    // Here K = T1.width = 256, so we need native_w ≥ 256 for the fused
+    // {Op0,Op1} group to admit any valid tiling.
     Problem p;
     p.tensors = {{256,256},{256,256},{256,256},{256,256}};
     p.ops = {{OpType::Pointwise,{0},{1},500},
              {OpType::MatMul,{1,2},{3},3000}};
     p.fast_memory_capacity = 80000;
     p.slow_memory_bandwidth = 10;
-    p.native_w = 128; p.native_h = 128;
+    p.native_w = 256; p.native_h = 256;
     DAG d = DAG::build(p);
     auto part = Partition::trivial(p, d);
     part.groups[0].ops = {0, 1};
@@ -287,7 +291,7 @@ void test_steal_pw_from_mm_group() {
     // Actually boundary_neighbors checks DAG preds/succs OUTSIDE group.
     // Op0 has pred=none (T0 is graph input). Op0's succs: Op1 (inside). Not boundary!
     // So we need a third group for moves to exist.
-    
+
     // Add Op2: PW T3→T4
     p.tensors.push_back({256,256}); // T4
     p.ops.push_back({OpType::Pointwise,{3},{4},500});

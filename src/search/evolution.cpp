@@ -416,12 +416,13 @@ Partition mutate_force_recompute(Partition part, std::mt19937& rng) {
     const auto& consumers = dag.tensor_consumers[t];
 
     // For each consumer C_i, form a new group {P, C_i}.
-    // First check that each {P, C_i} is feasible (fits in fast memory).
+    // All-or-nothing: if any pair is infeasible, abort (same cycle-avoidance
+    // reasoning as eval_force_recompute in partition_moves.cpp).
     std::vector<std::pair<size_t, double>> new_groups;  // (consumer_op, cost)
     for (auto cop : consumers) {
         FlatSet<size_t> ops = {prod_op, cop};
         double cost = part.eval_set(ops);
-        if (cost >= 1e17) continue;  // doesn't fit → skip this consumer
+        if (cost >= 1e17) return part;  // abort: infeasible pair
         new_groups.push_back({cop, cost});
     }
     if (new_groups.empty()) return part;  // no feasible {P, C_i} pair

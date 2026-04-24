@@ -765,11 +765,17 @@ ForceRecomputeResult eval_force_recompute(const Partition& p, size_t tensor_id) 
     for (auto gi : affected_groups)
         old_cost_sum += p.groups[gi].cost;
 
-    // For each consumer, check if {P, C_i} is feasible
+    // For each consumer, check if {P, C_i} is feasible.
+    // All-or-nothing: if any pair is infeasible, abort. Partial extraction
+    // (pairing P with only some consumers) would leave unpaired consumers
+    // reading P's output from the new {P, C_j} groups, while those new
+    // groups depend on the unpaired consumers' chains — creating cycles
+    // in the condensed group DAG. The all-or-nothing rule keeps the move
+    // safe without a full acyclicity check.
     for (auto cop : consumers) {
         FlatSet<size_t> pair_ops = {prod_op, cop};
         double pair_cost = p.eval_set(pair_ops);
-        if (pair_cost >= 1e17) continue;  // infeasible
+        if (pair_cost >= 1e17) return r;  // abort: infeasible pair
         r.consumer_ops.push_back(cop);
         r.pair_costs.push_back(pair_cost);
         new_cost_sum += pair_cost;

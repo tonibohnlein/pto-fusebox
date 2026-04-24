@@ -138,6 +138,16 @@ private:
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
 
+  // Prologue-PW geometric condition (issue #71 Rules 2/3):
+  //   Pointwise feeding a matmul's LHS → require cfg.w ≥ matmul.K
+  //   Pointwise feeding a matmul's RHS → require cfg.h ≥ matmul.K
+  // Without this, the matmul's k-loop would ask for LHS/RHS data a single
+  // PW tile hasn't produced yet — violating per-tile execution.
+  // Populated per-subgraph as the max K across all such PW→MM pairs.
+  // Zero means "no constraint" (no prologue PW of the relevant orientation).
+  int64_t prologue_cfg_w_min_ = 0;
+  int64_t prologue_cfg_h_min_ = 0;
+
   // Role-based tiling constraints.
   std::vector<int64_t> w_divides_;
   std::vector<int64_t> h_divides_;
