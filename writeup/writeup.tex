@@ -204,12 +204,15 @@ evaluations automatically reuse Phase~1 work.
 index updated in-place on every move and a compact \texttt{GroupDAG}
 with $O(|E|)$ \texttt{merge\_creates\_cycle} checks. Dirty sets are
 propagated from the affected groups to their DAG neighbours so only
-impacted moves are re-evaluated, and every move is replayed in a
-sandboxed copy before commit to catch any invariant violation at
-write time rather than discovering it downstream.
+impacted moves are re-evaluated. Every move is split into a pure
+\texttt{eval\_*} that checks feasibility and cost without mutating
+state and an \texttt{apply\_*} that commits; each FM pass additionally
+takes a lightweight checkpoint of the group state so a worsening pass
+can roll back to its best snapshot cleanly.
 
-\textbf{Parallelism.} Init, FM, and evolution tasks run on up to 8
-threads dispatched from a shared atomic task counter; task granularity
+\textbf{Parallelism.} Init, FM, and evolution tasks run on
+\texttt{hardware\_concurrency()} threads (8 on the contest host)
+dispatched from a shared atomic task counter; task granularity
 is a full FM outer loop, so lock contention on the diversity pool is
 negligible. All shared state (cost cache, pool) is either lock-free or
 coarse-grained mutex-guarded.
