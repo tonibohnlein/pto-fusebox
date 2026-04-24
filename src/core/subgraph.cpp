@@ -631,9 +631,16 @@ int64_t Subgraph::working_set_unchecked(const TileConfig &cfg,
 
   int64_t ws = 0;
 
+  // Multi-role tensors have N entries in boundary_tensor_info_ for the same
+  // tensor id. A retained_from_prev tensor is physically one resident copy
+  // (full_size), not one per role — dedupe to avoid double-counting.
+  // retain_these is already handled once below, outside the per-entry loop.
+  FlatSet<size_t> retained_counted;
+
   for (auto &info : boundary_tensor_info_) {
     if (retained_from_prev.count(info.id)) {
-      ws += info.full_size;
+      if (retained_counted.insert(info.id).second)
+        ws += info.full_size;
       continue;
     }
     if (retain_these.count(info.id)) {

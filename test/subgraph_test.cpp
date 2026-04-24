@@ -2457,56 +2457,53 @@ void test_2mm_chain_nk2_temporal() {
                sg.working_set(TC(128, 128, 256)), INT64_MAX);
 
     // Cost at [64,64,128] RowMajor (ntw=2, nth=2, nk=2)
+    // Per PROBLEM.md Ex5 (uniform /nk): comp_per_step = (Op0+Op1)/nk = 6000/2 = 3000.
+    // RowMajor tile_cost with nk=2:
+    //   first(T,T,T): per_tile_io=819.2, step0=max(3000,3276.8)=3276.8, last=3000, total=6276.8
+    //   row_trans(F,T,F): per_tile_io=819.2, step0=3276.8, last=3000, total=6276.8
+    //   within(F,F,T): per_tile_io=0, step0=max(3000,2457.6)=3000, last=3000, total=6000
+    //   latency = 6276.8 + 1*6276.8 + 2*6000 = 24553.6
     auto r = sg.compute_cost(TC(64, 64, 128, SnakeDir::RowMajor));
     CHECK("cost feasible", r.feasible);
-    CHECK_EQ("comp_per_step = 4000", r.compute_per_step, 4000.0);
-    CHECK_EQ("latency = 32000", r.latency, 32000.0);
+    CHECK_EQ("comp_per_step = 3000", r.compute_per_step, 3000.0);
+    CHECK_EQ("latency = 24553.6", r.latency, 24553.6);
 
     // Cost at [64,64,64] RowMajor (ntw=2, nth=2, nk=4)
-    // comp_per_step (new model: only sink divides by nk):
-    //   Op0 (non-sink): 2000/1*1=2000. Op1 (sink): 4000/4*1=1000. Total=3000.
+    // Uniform /nk: comp_per_step = (2000+4000)/4 = 1500.
     //
     // IO slices (k=64, nk=4):
-    //   T_a: ht=1, vt=nth=2 → 128*64=8192, slice_io=819.2 → row_load
-    //   T_b: ht=nk=4, vt=1 → (256/4)*128=64*128=8192, slice_io=819.2 → stream
-    //   T_d: ht=ntw=2, vt=nk=4 → 64*(256/4)=64*64=4096, slice_io=409.6 → stream
-    //   T_e: internally produced. out_evict: ht=2,vt=2 → 64*64=4096, 409.6
+    //   T_a: ht=1, vt=2 → 128*64=8192, slice_io=819.2 → row_load
+    //   T_b: ht=4, vt=1 → 64*128=8192, slice_io=819.2 → stream
+    //   T_d: ht=2, vt=4 → 64*64=4096, slice_io=409.6 → stream
+    //   T_e: internally produced. out_evict: ht=2,vt=2 → 4096, 409.6
+    //   stream = 1228.8, row_load = 819.2, out_evict = 409.6
     //
-    //   stream = 819.2 + 409.6 = 1228.8, row_load = 819.2, out_evict = 409.6
+    // tile_cost nk=4 (comp=1500):
+    //   step0 = max(1500, per_tile_io + 1228.8)
+    //   mid = 2 * max(1500, 1228.8) = 2 * 1500 = 3000
+    //   last = max(1500, 1228.8+409.6) = max(1500, 1638.4) = 1638.4
     //
-    // tile_cost nk=4:
-    //   step0 = max(comp, per_tile_io + stream)
-    //   mid = (nk-2) * max(comp, stream) = 2 * max(3000, 1228.8) = 2 * 3000 = 6000
-    //   last = max(comp, stream + out_evict) = max(3000, 1228.8+409.6) = max(3000, 1638.4) = 3000
-    //
-    // RowMajor:
-    //   first(T,T,T): per_tile_io=819.2, step0=max(3000,819.2+1228.8)=max(3000,2048)=3000.
-    //     total = 3000 + 6000 + 3000 = 12000
-    //   row_trans(F,T,F): same as first (once=0). per_tile_io=819.2, step0=3000.
-    //     total = 12000
-    //   within(F,F,T): per_tile_io=0, step0=max(3000,1228.8)=3000.
-    //     total = 3000 + 6000 + 3000 = 12000
-    //
-    //   latency = 12000 + 1*12000 + 2*12000 = 48000
+    //   first(T,T,T): per_tile_io=819.2, step0=max(1500,2048)=2048.
+    //     total = 2048 + 3000 + 1638.4 = 6686.4
+    //   row_trans(F,T,F): per_tile_io=819.2, step0=2048, total=6686.4
+    //   within(F,F,T): per_tile_io=0, step0=1500, total=1500+3000+1638.4=6138.4
+    //   latency = 6686.4 + 1*6686.4 + 2*6138.4 = 25649.6
     auto r2 = sg.compute_cost(TC(64, 64, 64, SnakeDir::RowMajor));
     CHECK("cost nk=4 feasible", r2.feasible);
-    CHECK_EQ("comp_per_step nk=4 = 3000", r2.compute_per_step, 3000.0);
-    CHECK_EQ("latency nk=4 = 48000", r2.latency, 48000.0);
+    CHECK_EQ("comp_per_step nk=4 = 1500", r2.compute_per_step, 1500.0);
+    CHECK_EQ("latency nk=4 = 25649.6", r2.latency, 25649.6);
 
-    // Cost at [64,64,128] with nk=2, ColMajor — different reuse pattern.
-    // comp_per_step = 4000 (same as RowMajor).
-    // ColMajor: sweep columns, snake reversal between columns.
-    //   first(T,T,T): per_tile_io=row_load(819.2). step0=max(4000,3276.8)=4000. last=4000. total=8000.
-    //   col_trans(F,F,T): per_tile_io=0. step0=max(4000,2457.6)=4000. last=4000. total=8000.
-    //   within(F,T,F): per_tile_io=row_load(819.2). step0=max(4000,3276.8)=4000. total=8000.
-    //
-    //   n_col_trans = ntw-1=1, n_within = (nth-1)*ntw = 2
-    //   latency = 8000 + 1*8000 + 2*8000 = 32000
-    //   (compute-bound throughout; ColMajor = RowMajor for this subgraph)
+    // Cost at [64,64,128] with nk=2, ColMajor.
+    // comp_per_step = 3000 (same as RowMajor).
+    //   first(T,T,T): per_tile_io=819.2, step0=3276.8, last=3000, total=6276.8
+    //   col_trans(F,F,T): per_tile_io=0, step0=max(3000,2457.6)=3000, last=3000, total=6000
+    //   within(F,T,F): per_tile_io=819.2, step0=3276.8, last=3000, total=6276.8
+    //   n_col_trans = 1, n_within = 2
+    //   latency = 6276.8 + 1*6000 + 2*6276.8 = 24830.4
     auto r3 = sg.compute_cost(TC(64, 64, 128, SnakeDir::ColMajor));
     CHECK("cost ColMajor feasible", r3.feasible);
-    CHECK_EQ("comp_per_step ColMajor = 4000", r3.compute_per_step, 4000.0);
-    CHECK_EQ("latency ColMajor = 32000", r3.latency, 32000.0);
+    CHECK_EQ("comp_per_step ColMajor = 3000", r3.compute_per_step, 3000.0);
+    CHECK_EQ("latency ColMajor = 24830.4", r3.latency, 24830.4);
 
     // Verify best_cost finds a feasible solution.
     auto best = sg.best_cost();

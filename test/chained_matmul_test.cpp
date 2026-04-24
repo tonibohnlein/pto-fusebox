@@ -288,7 +288,8 @@ void test_chain2_solution() {
     auto sg = make_sg(p, d, {0, 1});
     Solution sol(p, d, {{std::move(sg), TC(128,128,32), {}}});
     CHECK("valid", sol.validate().valid);
-    CHECK_EQ("total=10000", sol.total_latency(), 10000.0);
+    // Matches PROBLEM.md Ex5 Strategy B (uniform /nk): 6915.2
+    CHECK_EQ("total=6915.2", sol.total_latency(), 6915.2);
 }
 
 // ============================================================================

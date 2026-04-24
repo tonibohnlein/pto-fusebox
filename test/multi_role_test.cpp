@@ -412,6 +412,91 @@ void test_multi_role_ephemeral_accepted() {
 }
 
 // ============================================================================
+// Retained-from-previous: a retained tensor is physically ONE resident copy,
+// so its full_size must be counted exactly once in WS — not once per role
+// entry.  Regression test for the double-count bug in working_set_unchecked.
+//
+// Setup: T1 appears under TWO distinct roles (LHS of MM_A + RHS of MM_B),
+// so it has 2 entries in boundary_tensor_info_.  With T1 in retained_from_prev:
+//   CORRECT:  ws = full(T1) + other_boundary_slices
+//   BUGGY:    ws = 2 * full(T1) + other_boundary_slices   (adds per-entry)
+// ============================================================================
+
+void test_retained_multi_role_single_count() {
+    std::cout << "--- test_retained_multi_role_single_count ---\n";
+    // T1 is both LHS of MM_A and RHS of MM_B → 2 role entries.
+    //   MM_A: T1 × T2 → T3   (T1 as LHS)
+    //   MM_B: T4 × T1 → T5   (T1 as RHS)
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128},{128,128}};
+    //            T0        T1        T2        T3        T4        T5
+    p.ops = {{OpType::MatMul, {1, 2}, {3}, 2000},
+             {OpType::MatMul, {4, 1}, {5}, 2000}};
+    p.fast_memory_capacity = 10'000'000;   // generous, isolates WS accounting
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0, 1});
+
+    CHECK_EQ_I("T1 has 2 role entries", entries_for(sg, 1), 2);
+
+    auto cfg = TC(128, 128, 128);
+
+    // No retention: T1 contributes slice per role + T2,T3,T4,T5 full slices.
+    // At cfg=[128,128,128] every slice is 128*128=16384; total = 6*16384 = 98304.
+    int64_t ws_none = sg.working_set(cfg, {}, {});
+    CHECK_EQ_I("ws(no retain) = 98304", ws_none, 98304);
+
+    // T1 retained_from_prev: T1 is resident once (full_size = 16384),
+    // its per-role slices drop out. T2,T3,T4,T5 still carry their slices.
+    //   expected = 16384 (T1 full) + 4*16384 (T2..T5) = 81920
+    // Buggy code gave 98304 (added T1 full twice, once per entry).
+    int64_t ws_retained = sg.working_set(cfg, {1}, {});
+    CHECK_EQ_I("ws(T1 retained) = 81920 (single count)", ws_retained, 81920);
+
+    // Sanity: retention strictly shrinks WS vs no-retain.
+    CHECK("retention shrinks WS", ws_retained < ws_none);
+
+    // Symmetric case: retain a single-role tensor (T2, one LHS-of-MM_A entry)
+    // to confirm the dedup path doesn't break the common single-entry case.
+    CHECK_EQ_I("T2 has 1 role entry", entries_for(sg, 2), 1);
+    int64_t ws_t2 = sg.working_set(cfg, {2}, {});
+    //   expected = T1 roles (2 * 16384) + T2 full (16384) + T3,T4,T5 (3 * 16384)
+    //            = 32768 + 16384 + 49152 = 98304
+    // (T2's slice size equals full_size at this cfg, so numerically the same
+    //  as ws_none; the dedup path just doesn't change anything for single-role.)
+    CHECK_EQ_I("ws(T2 retained, single-role)", ws_t2, 98304);
+}
+
+// ============================================================================
+// retain_these: the counterpart on the output side already used the correct
+// once-per-tensor loop, but verify it stays that way if the entry loop ever
+// gets refactored.
+// ============================================================================
+
+void test_retain_these_multi_role_single_count() {
+    std::cout << "--- test_retain_these_multi_role_single_count ---\n";
+    // Same topology: T1 dual-role. Retain T1 on exit (retain_these).
+    Problem p;
+    p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128},{128,128}};
+    p.ops = {{OpType::MatMul, {1, 2}, {3}, 2000},
+             {OpType::MatMul, {4, 1}, {5}, 2000}};
+    p.fast_memory_capacity = 10'000'000;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    DAG d = DAG::build(p);
+    auto sg = make_sg(p, d, {0, 1});
+
+    auto cfg = TC(128, 128, 128);
+
+    // T1 is a boundary INPUT (not an output), so retain_these={1} means
+    // "keep it resident on exit for the next step" — same full-size
+    // footprint accounting as retained_from_prev.
+    int64_t ws = sg.working_set(cfg, {}, {1});
+    CHECK_EQ_I("ws(T1 in retain_these) = 81920", ws, 81920);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -430,6 +515,9 @@ int main() {
     test_multi_role_pw_dedups_with_mm();
     test_shared_weight_at_multiple_depths();
     test_multi_role_ephemeral_accepted();
+
+    test_retained_multi_role_single_count();
+    test_retain_these_multi_role_single_count();
 
     std::cout << "\n=== " << g_pass << " passed, " << g_fail
               << " failed ===\n";
