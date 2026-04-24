@@ -404,10 +404,29 @@ Solution coupling_parallel_search(
 
             double cost = child_cp.total_cost();
 
+            // Greedy refinement kick on FM's best — cheap polish that catches
+            // any local coupling/partition moves FM left behind.  Inserted as
+            // a separate pool entry so both the FM state and the refined state
+            // are present and can seed future evo tasks.
+            CouplingPoolEntry refined_entry;
+            if (cost < 1e17 && Clock::now() < deadline) {
+                CoupledPartition refined_cp = child_cp;
+                double refined_cost = coupling_greedy_descent(refined_cp, feasibly_ret, deadline);
+                refined_cp.part.rebuild_index();
+                auto is_ret_r = [&](size_t t) { return refined_cp.is_retained(t); };
+                if (!partition_has_gap(refined_cp.part, is_ret_r) &&
+                    refined_cost < cost - 0.01) {
+                    refined_entry = CouplingPoolEntry(std::move(refined_cp), refined_cost,
+                                                      "kick+" + origin);
+                }
+            }
+
             double current_best;
             {
                 std::unique_lock lock(pool.mutex());
                 pool.insert(CouplingPoolEntry(std::move(child_cp), cost, origin));
+                if (refined_entry.cost < 1e17)
+                    pool.insert(std::move(refined_entry));
                 current_best = pool.best_cost();
             }
 

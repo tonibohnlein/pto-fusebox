@@ -9,6 +9,12 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
     FMOuterResult result;
     result.best_partition = part;
     result.best_cost = part.total_cost();
+    // Initialize end_* to the starting state; we'll overwrite with the last
+    // pass's post-greedy candidate below.  Without this, end_cost stayed at
+    // the default 1e18 and the diversity-kick path in parallel_search silently
+    // never fired.
+    result.end_partition = part;
+    result.end_cost = result.best_cost;
 
     int no_improve = 0;
     auto outer_start = SteadyClock::now();
@@ -44,6 +50,10 @@ FMOuterResult fm_outer_loop(Partition part, const FMOuterConfig& cfg) {
         // Greedy descent on FM best
         Partition candidate = greedy_descent(std::move(pass_result.best_partition));
         double candidate_cost = candidate.total_cost();
+
+        // Record last-pass end state for diversity (caller may kick from here).
+        result.end_partition = candidate;
+        result.end_cost = candidate_cost;
 
         if (candidate_cost < result.best_cost - 0.001) {
             double improvement = result.best_cost - candidate_cost;

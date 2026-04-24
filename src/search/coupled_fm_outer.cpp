@@ -20,6 +20,10 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
     CoupledFMOuterResult result;
     result.best_cp   = cp;
     result.best_cost = cp.total_cost();
+    // Initialize end_* so callers that read them (for diversity kicks, pool
+    // seeding, etc.) get a valid state rather than the default 1e18/empty.
+    result.end_cp    = cp;
+    result.end_cost  = result.best_cost;
 
     int no_improve  = 0;
     auto outer_start = SteadyClock::now();
@@ -54,6 +58,10 @@ CoupledFMOuterResult coupled_fm_outer_loop(CoupledPartition        cp,
         CoupledPartition candidate = std::move(pass_result.best_cp);
         double candidate_cost = coupling_greedy_descent(candidate, feasibly_ret,
                                                          cfg.deadline);
+
+        // Record last-pass end state for diversity.
+        result.end_cp   = candidate;
+        result.end_cost = candidate_cost;
 
         if (candidate_cost < result.best_cost - 0.001) {
             double improvement = result.best_cost - candidate_cost;

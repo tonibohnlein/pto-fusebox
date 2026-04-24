@@ -203,6 +203,7 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     std::atomic<int> evo_improving{0};
     std::atomic<int64_t> evo_fm_ms_total{0};      // total FM time across all evo tasks
     std::atomic<int> evo_fm_passes_total{0};       // total FM inner passes across evo
+    std::atomic<int> kick_fired{0};               // diversity-kick path fired count
     int early_stop_threshold = num_threads * 25;
 
     std::cerr << "  Init: " << gen0_tasks << " tasks on " << num_threads << " threads\n";
@@ -316,15 +317,18 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 if (partition_has_gap(fm_result.partition))
                     fm_result.cost = 1e18;
 
-                // Greedy-kick end state for diversity
+                // Greedy refinement kick on FM's best (same pattern as evo).
                 PoolEntry kick_result;
-                if (fm.end_cost < 1e17 && fm.end_cost > fm.best_cost + 0.01) {
-                    auto kicked = greedy_descent(std::move(fm.end_partition));
+                if (fm_result.cost < 1e17) {
+                    auto kicked = greedy_descent(fm_result.partition);
                     double kick_cost = kicked.total_cost();
                     kicked.rebuild_index();
-                    if (!partition_has_gap(kicked))
+                    if (!partition_has_gap(kicked) &&
+                        kick_cost < fm_result.cost - 0.01) {
+                        kick_fired.fetch_add(1);
                         kick_result = {std::move(kicked), kick_cost,
                             "kick+" + strategies[task.strategy_idx].name};
+                    }
                 }
 
                 {
@@ -452,18 +456,10 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
                 continue;
             }
 
-            // One greedy pass on the mutated child: if it improves, use the
-            // greedy result as the FM starting point; otherwise start from the
-            // raw mutation result.
-            {
-                double pre_greedy = child.total_cost();
-                Partition greedy_child = greedy_descent(child);
-                if (!partition_has_gap(greedy_child) &&
-                    greedy_child.total_cost() < pre_greedy - 0.01)
-                    child = std::move(greedy_child);
-            }
-
-            // FM outer loop (no lock held — this takes seconds)
+            // Pipeline: evo moves → FM → greedy refinement on FM's best.
+            // (No pre-FM greedy: the evo moves are the intended exploration
+            //  step and pre-descent would collapse that exploration back to
+            //  the seed basin.)
             FMOuterConfig fc = cfg.fm;
             fc.max_passes = std::min(fc.max_passes, 20);
             fc.max_no_improve = std::min(fc.max_no_improve, 8);
@@ -478,28 +474,34 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
             evo_fm_ms_total.fetch_add(fm.elapsed_ms);
             evo_fm_passes_total.fetch_add(fm.total_passes);
 
-            // Validate and insert FM best under unique lock
+            // Insert FM's best solution.
             PoolEntry fm_result(std::move(fm.best_partition), fm.best_cost, origin);
             fm_result.partition.rebuild_index();
             if (partition_has_gap(fm_result.partition))
                 fm_result.cost = 1e18;
 
-            // Greedy-kick end state for diversity
-            PoolEntry kick_result;
-            if (fm.end_cost < 1e17 && fm.end_cost > fm.best_cost + 0.01 &&
-                Clock::now() < deadline) {
-                auto kicked = greedy_descent(std::move(fm.end_partition));
-                double kick_cost = kicked.total_cost();
-                kicked.rebuild_index();
-                if (!partition_has_gap(kicked))
-                    kick_result = {std::move(kicked), kick_cost, "kick+" + origin};
+            // Greedy refinement kick on FM's best: cheap polish, inserted as
+            // a separate entry so the pool has both the FM state and the
+            // refined state (they may differ by a few moves FM left behind).
+            PoolEntry refined_result;
+            if (fm_result.cost < 1e17 && Clock::now() < deadline) {
+                auto refined = greedy_descent(fm_result.partition);
+                refined.rebuild_index();
+                if (!partition_has_gap(refined)) {
+                    double refined_cost = refined.total_cost();
+                    if (refined_cost < fm_result.cost - 0.01) {
+                        kick_fired.fetch_add(1);
+                        refined_result = {std::move(refined), refined_cost,
+                                          "kick+" + origin};
+                    }
+                }
             }
 
             double current_best;
             {
                 std::unique_lock lock(pool.mutex());
                 if (fm_result.cost < 1e17) pool.insert(std::move(fm_result));
-                if (kick_result.cost < 1e17) pool.insert(std::move(kick_result));
+                if (refined_result.cost < 1e17) pool.insert(std::move(refined_result));
                 current_best = pool.best_cost();
             }
 
@@ -553,7 +555,8 @@ std::vector<Partition> parallel_search(const Problem& prob, const DAG& dag,
     if (n_evo > 0) {
         std::cerr << "  Evo: " << n_evo << " tasks (" << n_evo_imp << " improving)";
         std::cerr << "  FM: " << evo_passes << " passes, "
-                  << (n_evo > 0 ? evo_ms / n_evo : 0) << "ms/task avg";
+                  << (n_evo > 0 ? evo_ms / n_evo : 0) << "ms/task avg"
+                  << "  kicks=" << kick_fired.load();
     }
     std::cerr << "\n";
     std::cerr << "  Cache: " << shared_cache.size() << " entries, "
