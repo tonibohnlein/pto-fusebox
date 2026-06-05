@@ -82,6 +82,7 @@ set(TEST_SOURCES
     test/gain_update_test.cpp
     test/retain_snake_test.cpp
     test/constructed_optima_test.cpp
+    test/ascend_910b_test.cpp
     test/cost_cache_test.cpp
     test/evolution_test.cpp
     test/sanity_test.cpp

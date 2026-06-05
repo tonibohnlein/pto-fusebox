@@ -11,13 +11,37 @@
 // Tensor & Op
 // ============================================================================
 
+// Element data type — lets the cost model size tensors in BYTES (Ascend
+// capacities and bandwidth are byte-based), not just element counts.
+enum class DType { FP32, FP16, BF16, INT32, INT16, INT8, BOOL };
+
+inline int dtype_bytes(DType dt) {
+    switch (dt) {
+        case DType::FP32:
+        case DType::INT32: return 4;
+        case DType::FP16:
+        case DType::BF16:
+        case DType::INT16: return 2;
+        case DType::INT8:
+        case DType::BOOL:  return 1;
+    }
+    return 4;
+}
+
 struct Tensor {
     int64_t width;
     int64_t height;
-    int64_t size() const { return width * height; }
+    DType dtype = DType::FP32;  // default keeps legacy element-count instances valid
+
+    int64_t size() const { return width * height; }                            // elements
+    int64_t size_bytes() const { return width * height * dtype_bytes(dtype); }  // bytes
 };
 
-enum class OpType { MatMul, Pointwise };
+// Coarse op category. Broadcast and the reduction AXIS are inferred from
+// input/output shapes (a Reduction collapses a dim [H,W]->[H,1]; a broadcast
+// input has extent 1 in a dim it is consumed along). The enum only carries what
+// shapes cannot disambiguate (reduction vs matmul-contraction vs elementwise).
+enum class OpType { MatMul, Pointwise, Reduction };
 
 struct Op {
     OpType type;
@@ -39,6 +63,15 @@ struct Problem {
     int64_t fast_memory_capacity;
     int64_t slow_memory_bandwidth;
     int64_t native_w, native_h;
+
+    // --- Ascend 910B extensions (defaults = one 910B die) ---------------------
+    // Compute parallelizes across these cores; DDR bandwidth is shared (one HBM).
+    int num_cube_cores = 24;     // AIC cores — matmul
+    int num_vector_cores = 48;   // AIV cores — pointwise / reduction
+    // Per-core local-memory budgets in BYTES. 0 = fall back to
+    // fast_memory_capacity (so legacy element-count instances are unchanged).
+    int64_t vec_capacity = 0;    // per-vector-core UB (910B: 192*1024)
+    int64_t cube_capacity = 0;   // per-cube-core L0c accumulator budget (910B: 128*1024)
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
