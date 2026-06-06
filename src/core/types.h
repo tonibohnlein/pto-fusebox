@@ -41,7 +41,9 @@ struct Tensor {
 // input/output shapes (a Reduction collapses a dim [H,W]->[H,1]; a broadcast
 // input has extent 1 in a dim it is consumed along). The enum only carries what
 // shapes cannot disambiguate (reduction vs matmul-contraction vs elementwise).
-enum class OpType { MatMul, Pointwise, Reduction };
+// Opaque = data-dependent (gather/scatter/sort) or relayout (transpose/reshape/
+// concat) ops the unified-grid tiling can't fuse through — a barrier in the DAG.
+enum class OpType { MatMul, Pointwise, Reduction, Opaque };
 
 struct Op {
     OpType type;
