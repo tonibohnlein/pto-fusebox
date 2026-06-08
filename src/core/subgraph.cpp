@@ -55,6 +55,27 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
   }
 
+  // 910B: subgraphs must be UNIT-HOMOGENEOUS. Cube (MatMul) and vector
+  // (Pointwise/Reduction) ops run on different cores; their handoff routes
+  // through DDR (no free ephemeral) and the unified single grid can't express
+  // cube/vector overlap — so they are never fused into one group. Opaque ops
+  // (gather/scatter/sort/transpose) are barriers: singleton groups only.
+  // Gated on parallel-core mode; single-context (cores==1) keeps the
+  // competition behavior (mixed fusion allowed).
+  if (prob.num_cube_cores > 1 || prob.num_vector_cores > 1) {
+    bool has_cube = false, has_vector = false, has_opaque = false;
+    for (auto i : sg.ops_) {
+      switch (prob.ops[i].type) {
+        case OpType::MatMul: has_cube = true; break;
+        case OpType::Pointwise:
+        case OpType::Reduction: has_vector = true; break;
+        case OpType::Opaque: has_opaque = true; break;
+      }
+    }
+    if (has_cube && has_vector) return std::nullopt;            // no cube↔vector fusion
+    if (has_opaque && sg.ops_.size() > 1) return std::nullopt;  // Opaque is a barrier
+  }
+
   // Classify ephemerals
   //
   // Rule: a tensor produced AND consumed inside this subgraph is ephemeral.
@@ -908,6 +929,24 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
     result.latency = first +
                      (double)n_col_trans * col_trans +
                      (double)n_within * within;
+  }
+
+  // 910B parallel-core roofline (gated on parallel mode; cores==1 leaves the
+  // single-context latency above untouched). Compute parallelizes across the
+  // unit's cores — spatial tiles AND split-K give num_tiles*nk independent work
+  // units — while DDR bandwidth is a SHARED floor (one HBM) that does not divide.
+  const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
+  if (n_cores > 1) {
+    const double total_compute = (double)num_tiles * nk * comp_per_step;
+    const double eff = (double)std::min<int64_t>((int64_t)num_tiles * nk, n_cores);
+    double total_io = 0.0;  // shared DDR traffic (full-tensor; ignores matmul revisit)
+    for (const auto& info : boundary_tensor_info_) {
+      if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
+        total_io += (double)info.full_size * inv_B;  // load
+      if (info.is_boundary_out && !retain_these.count(info.id))
+        total_io += (double)info.full_size * inv_B;  // evict
+    }
+    result.latency = std::max(total_compute / eff, total_io);
   }
 
   return result;

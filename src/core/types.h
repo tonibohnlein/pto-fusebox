@@ -66,10 +66,13 @@ struct Problem {
     int64_t slow_memory_bandwidth;
     int64_t native_w, native_h;
 
-    // --- Ascend 910B extensions (defaults = one 910B die) ---------------------
+    // --- Ascend 910B extensions ----------------------------------------------
     // Compute parallelizes across these cores; DDR bandwidth is shared (one HBM).
-    int num_cube_cores = 24;     // AIC cores — matmul
-    int num_vector_cores = 48;   // AIV cores — pointwise / reduction
+    // Default 1 = SINGLE-CONTEXT: the parallel roofline + unit-homogeneity
+    // constraint are inert, so legacy/competition instances are unchanged. The
+    // 910B path (adapter / tests) sets the real counts (cube 24, vector 48).
+    int num_cube_cores = 1;      // AIC cores — matmul
+    int num_vector_cores = 1;    // AIV cores — pointwise / reduction
     // Per-core local-memory budgets in BYTES. 0 = fall back to
     // fast_memory_capacity (so legacy element-count instances are unchanged).
     int64_t vec_capacity = 0;    // per-vector-core UB (910B: 192*1024)

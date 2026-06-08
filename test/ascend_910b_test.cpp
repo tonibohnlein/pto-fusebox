@@ -33,6 +33,8 @@ static void RED(const char* l, bool c) {
     if (c) g_pass++;
     else { g_red++; std::cout << "  RED (todo): " << l << "\n"; }
 }
+// Activate the 910B parallel model (one die): 24 cube + 48 vector cores.
+static void set_910b(Problem& p) { p.num_cube_cores = 24; p.num_vector_cores = 48; }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
 static void test_A_pointwise_memory_bound() {
@@ -44,6 +46,7 @@ static void test_A_pointwise_memory_bound() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
+    set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("A: subgraph builds", (bool)sg);
@@ -59,19 +62,21 @@ static void test_B_thin_matmul_parallel() {
     Problem p;
     // C[w=128,h=128] = A[w=K=2048,h=128] @ B[w=128,h=K=2048]
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};
-    p.ops = {{OpType::MatMul, {0, 1}, {2}, 100000}};  // compute-heavy
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};  // compute-heavy (2.4M = 24*100k)
     p.fast_memory_capacity = 1 << 20;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
+    set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("B: subgraph builds", (bool)sg);
     double lat = sg->best_cost().latency;
-    std::cout << "    best latency = " << lat << " (single-context); 24 cube cores idle but 1\n";
-    // Output == native → 1 spatial tile → single-context model runs on ONE core.
-    // 910B target: split-K across num_cube_cores → at least a 2x parallel speedup.
-    RED("B: parallelized across cube cores (lat <= 50000)", lat <= 50000.0);
+    std::cout << "    best latency = " << lat << " (910B); single-context (1 core) would be ~2.4M\n";
+    // Output == native → 1 spatial tile. Split-K across the 24 cube cores
+    // (config enumeration picks a small k => nk independent work units) divides
+    // the 2.4M compute by ~24 -> ~100000, vs 2.4M on a single core.
+    CHECK("B: split-K parallelizes across cube cores (lat <= 200000)", lat <= 200000.0);
 }
 
 // --- C: pointwise fusion — fused beats separate ------------------------------
@@ -84,6 +89,7 @@ static void test_C_pointwise_fusion() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
+    set_910b(p);
     DAG dag = DAG::build(p);
     double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
     double s0 = Subgraph::create(p, dag, {0})->best_cost().latency;
@@ -103,16 +109,17 @@ static void test_D_mixed_cube_vector() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
+    set_910b(p);
     DAG dag = DAG::build(p);
-    double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
-    double sep = Subgraph::create(p, dag, {0})->best_cost().latency +
-                 Subgraph::create(p, dag, {1})->best_cost().latency;
-    double cprime = 128.0 * 128 / 10;  // one C' transfer
-    std::cout << "    fused = " << fused << "  separate = " << sep << "  C'xfer = " << cprime << "\n";
-    // Current model frees C' entirely (saves load+store = 2*C'). On 910B the
-    // cube->vector handoff routes through DDR (GM pipe), so fusion can save at
-    // most the avoided kernel launch — NOT the full materialization of C'.
-    RED("D: cube->vector intermediate not fully free", fused >= sep - 2 * cprime + 1.0);
+    // 910B: matmul (cube) + relu (vector) can't share a subgraph — the unit-
+    // homogeneity constraint rejects the mixed group, so the cube->vector edge
+    // is never an intra-group "free" ephemeral. The per-unit singletons stay
+    // valid (each runs on its own core pool, pipelined at the kernel level).
+    auto mixed = Subgraph::create(p, dag, {0, 1});
+    std::cout << "    mixed group accepted? " << (mixed.has_value() ? "yes" : "no (rejected)") << "\n";
+    CHECK("D: mixed cube+vector group is rejected", !mixed.has_value());
+    CHECK("D: matmul-only subgraph valid", Subgraph::create(p, dag, {0}).has_value());
+    CHECK("D: relu-only subgraph valid", Subgraph::create(p, dag, {1}).has_value());
 }
 
 // --- softmax: reduction-chain schema (cost model is the next increment) -------
