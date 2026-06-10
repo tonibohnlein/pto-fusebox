@@ -349,6 +349,47 @@ static void test_two_matmul() {
     // (fusing two matmuls only helps LATENCY when DDR-bound — by keeping the
     // intermediate T on-chip; under compute saturation the cores still do M1+M2).
     CHECK("2MM: chained fused == M1+M2 when compute-bound", std::abs(fused - (m1 + m2)) < 1.0);
+
+    // (2) INDEPENDENT shared-input: Q=X@Wq, K=X@Wk (same X). Both cube, no
+    // intermediate between them — fusing only saves re-reading X (negligible
+    // vs compute here), so fused == sum.
+    {
+        Problem q;  // 0X[Kc,M] 1Wq[N,Kc] 2Q[N,M] 3Wk[N,Kc] 4K[N,M]
+        int64_t M = 128, Kc = 256, N = 128;
+        q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
+        q.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * Kc}, {OpType::MatMul, {0, 3}, {4}, 16384 * Kc}};
+        q.fast_memory_capacity = 1 << 26; q.slow_memory_bandwidth = 10;
+        q.native_w = 128; q.native_h = 128; set_910b(q);
+        DAG dq = DAG::build(q);
+        double a = Subgraph::create(q, dq, {0})->best_cost().latency;
+        double b = Subgraph::create(q, dq, {1})->best_cost().latency;
+        double f = Subgraph::create(q, dq, {0, 1})->best_cost().latency;
+        CHECK("2MM: independent shared-input fused == sum (compute-bound)", std::abs(f - (a + b)) < 1.0);
+    }
+
+    // (3) ACCUMULATE C=(A@B)+(E@F): graph-level split-K — two matmuls summed by
+    // a vector add. The add is a DIFFERENT unit (vector), so it CANNOT fuse with
+    // the cube matmuls: {mm,mm,add} is rejected; the two cube matmuls alone are
+    // a valid group. This is the manual parallel-K-split, with the add as merge.
+    {
+        Problem a;  // 0A 1B 2P=A@B  3E 4F 5Q=E@F  6C=P+Q
+        int64_t M = 128, K = 256, N = 128;
+        a.tensors = {{K, M}, {N, K}, {N, M}, {K, M}, {N, K}, {N, M}, {N, M}};
+        a.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * K},
+                 {OpType::MatMul, {3, 4}, {5}, 16384 * K},
+                 {OpType::Pointwise, {2, 5}, {6}, N * M}};
+        a.fast_memory_capacity = 1 << 26; a.slow_memory_bandwidth = 10;
+        a.native_w = 128; a.native_h = 128; set_910b(a);
+        DAG da = DAG::build(a);
+        CHECK("2MM: accumulate {mm,mm,add} rejected (cube+vector not homogeneous)",
+              !Subgraph::create(a, da, {0, 1, 2}).has_value());
+        CHECK("2MM: accumulate {mm,add} rejected (cube+vector)",
+              !Subgraph::create(a, da, {0, 2}).has_value());
+        CHECK("2MM: accumulate two cube matmuls {mm,mm} is a valid group",
+              Subgraph::create(a, da, {0, 1}).has_value());
+        CHECK("2MM: accumulate add alone is a valid vector group",
+              Subgraph::create(a, da, {2}).has_value());
+    }
 }
 
 // --- sweep output shape: spatial parallelism vs split-K transition -----------

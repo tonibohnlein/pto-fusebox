@@ -69,6 +69,10 @@ Problem read_problem(const std::string& filename) {
             op.type = OpType::MatMul;
         } else if (type_str == "Pointwise") {
             op.type = OpType::Pointwise;
+        } else if (type_str == "Reduction") {
+            op.type = OpType::Reduction;
+        } else if (type_str == "Opaque") {
+            op.type = OpType::Opaque;
         } else {
             std::cerr << "Error: unknown op type '" << type_str
                       << "' for op " << i << "\n";
@@ -143,6 +147,14 @@ Problem read_problem(const std::string& filename) {
         std::cerr << "Error: hardware parameters must be positive\n";
         std::exit(1);
     }
+
+    // Optional 910B parallel-core fields. Absent => defaults (1/1/0) keep the
+    // single-context competition behavior. Present => the parallel roofline +
+    // unit-homogeneity constraint activate (cube 24 / vector 48 cores, etc.).
+    if (j.contains("num_cube_cores"))   p.num_cube_cores   = j["num_cube_cores"].get<int>();
+    if (j.contains("num_vector_cores")) p.num_vector_cores = j["num_vector_cores"].get<int>();
+    if (j.contains("cube_capacity"))    p.cube_capacity    = j["cube_capacity"].get<int64_t>();
+    if (j.contains("vec_capacity"))     p.vec_capacity     = j["vec_capacity"].get<int64_t>();
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.

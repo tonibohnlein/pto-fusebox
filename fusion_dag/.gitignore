@@ -1,0 +1,3 @@
+# Regeneratable intermediates (re-create with scripts/render_fusion_dag.sh)
+*_sol.json
+*.dot
