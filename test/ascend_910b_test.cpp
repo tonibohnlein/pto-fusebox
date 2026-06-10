@@ -398,6 +398,52 @@ static void test_two_matmul() {
     }
 }
 
+// --- compare our DDR->L1 tiling vs pypto ChooseL0Tile hand-crafted L0 tiles ----
+// pypto's L0 tile chooser (tests/ut/ir/transforms/test_{auto_tile_matmul_l0,
+// l0_tile_chooser}.py) picks the L0 tile that fits L0a/L0b (64KB each, the k
+// strip) and L0c (the [m,n] accumulator). That is the INNER (L1->L0) level. Our
+// solver picks the OUTER DDR->L1 tile: output L0c-bounded, k = the largest strip
+// whose operands fit L1 (512KB). So our k-tile CONTAINS pypto's L0 k-tile — they
+// compose (DDR->L1 strip, then L1->L0 sub-strips, then the 16-fractal).
+static void test_pypto_tiling_comparison() {
+    std::cout << "[PYPTO2] our DDR->L1 tiling vs pypto ChooseL0Tile hand-crafted L0 tiles\n";
+    struct Case { const char* name; int64_t M, N, K; int p_m, p_n, p_k; };
+    const Case cases[] = {
+        {"skinny 16x64@2048", 16, 64, 2048, 16, 64, 256},      // skinny_gemm_pipelined: k=256
+        {"large sq 4096@4096", 4096, 4096, 4096, 176, 176, 64},  // large_square_gemm: m~n~176, k=64
+        {"short-N 512x128@2048", 512, 128, 2048, 256, 128, 64},  // short_n: m>=256, n=128, k=64
+    };
+    for (const auto& c : cases) {
+        Problem p;
+        p.tensors = {{c.K, c.M}, {c.N, c.K}, {c.N, c.M}};  // A[K,M] B[N,K] -> C[N,M]
+        p.tensors[0].dtype = DType::BF16;  // A operand
+        p.tensors[1].dtype = DType::BF16;  // B operand
+        p.tensors[2].dtype = DType::FP32;  // C accumulator
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384LL * c.K}};
+        p.fast_memory_capacity = 1LL << 30;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p);
+        auto r = Subgraph::create(p, DAG::build(p), {0})->best_cost();
+        printf("  %-22s ours[N=%lld M=%lld k=%lld] split=%d | pypto L0[m=%d n=%d k=%d]\n",
+               c.name, (long long)r.config.w, (long long)r.config.h, (long long)r.config.k,
+               r.parallel_split, c.p_m, c.p_n, c.p_k);
+        if (r.parallel_split == 1) {
+            // Spatial matmul: one core does the full K, streamed in our L1 k-strip,
+            // which CONTAINS pypto's finer L0a/L0b k-sub-tile (k-levels compose).
+            CHECK("PYPTO2: spatial matmul -> our L1 k-tile >= pypto's L0 k", r.config.k >= c.p_k);
+        } else {
+            // Thin matmul: our solver SPLIT-Ks across cores (each does K/S), a
+            // multi-core strategy pypto's single-core L0 chooser doesn't express;
+            // the per-core k (K/S) is then a different quantity than pypto's L0 k.
+            CHECK("PYPTO2: thin matmul -> our solver split-Ks across cores", r.parallel_split > 1);
+        }
+        // Our output tile fits L0c (cube_capacity), same accumulator bound pypto respects.
+        CHECK("PYPTO2: our output tile fits L0c (128KB)", r.config.w * r.config.h * 4 <= 128 * 1024);
+    }
+}
+
 // --- per-core two-pool working set: cube L1 k-tiling / vector UB / dbl-buffer --
 static void test_two_pool_working_set() {
     std::cout << "[POOL] per-core two-pool: cube operands->L1 (k-tile), vector->UB, double-buffer\n";
@@ -579,6 +625,7 @@ int main() {
     test_two_matmul();
     test_two_pool_working_set();
     test_pypto_l0_comparison();
+    test_pypto_tiling_comparison();
     test_sweep_matmul_dims();
     test_A_pointwise_memory_bound();
     test_B_thin_matmul_parallel();

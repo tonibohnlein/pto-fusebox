@@ -1,0 +1,37 @@
+{
+ "widths": [
+  4096,
+  1
+ ],
+ "heights": [
+  4,
+  4
+ ],
+ "op_types": [
+  "Reduction"
+ ],
+ "inputs": [
+  [
+   0
+  ]
+ ],
+ "outputs": [
+  [
+   1
+  ]
+ ],
+ "base_costs": [
+  16384000
+ ],
+ "fast_memory_capacity": 67108864,
+ "slow_memory_bandwidth": 10,
+ "native_granularity": [
+  128,
+  128
+ ],
+ "num_cube_cores": 24,
+ "num_vector_cores": 48,
+ "cube_capacity": 131072,
+ "l1_capacity": 524288,
+ "vec_capacity": 196608
+}

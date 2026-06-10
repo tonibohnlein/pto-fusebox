@@ -1085,6 +1085,11 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         result.cores_used = (int)effS;
         result.compute_bound = (total_compute / effS) >= ddrS;
         result.ddr_traffic = ddrS;
+        // Effective per-core k-strip: split-K gives each core only K/S of the
+        // contraction, so its L1 k-tile is min(cfg.k, K/S), 16-aligned — NOT the
+        // full-K-based cfg.k (which would over-state what a core streams).
+        const int64_t per_core_k = std::max<int64_t>(16, (max_K_ / S / 16) * 16);
+        result.config.k = std::min(cfg.k, per_core_k);
       } else {
         result.latency = lat1;
         result.parallel_split = 1;

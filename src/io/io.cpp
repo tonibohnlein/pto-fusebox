@@ -48,6 +48,23 @@ Problem read_problem(const std::string& filename) {
 
     const size_t num_tensors = p.num_tensors();
 
+    // Optional per-tensor dtype (default FP32) — used by the 910B byte-based
+    // two-pool working set. Accepts "FP32"/"FP16"/"BF16"/"INT32"/"INT16"/
+    // "INT8"/"BOOL".
+    if (j.contains("dtypes")) {
+        auto& dts = j["dtypes"];
+        for (size_t i = 0; i < dts.size() && i < num_tensors; i++) {
+            const auto& s = dts[i].get_ref<const std::string&>();
+            if (s == "FP16") p.tensors[i].dtype = DType::FP16;
+            else if (s == "BF16") p.tensors[i].dtype = DType::BF16;
+            else if (s == "INT32") p.tensors[i].dtype = DType::INT32;
+            else if (s == "INT16") p.tensors[i].dtype = DType::INT16;
+            else if (s == "INT8") p.tensors[i].dtype = DType::INT8;
+            else if (s == "BOOL") p.tensors[i].dtype = DType::BOOL;
+            else p.tensors[i].dtype = DType::FP32;
+        }
+    }
+
     // --- Ops ---
     auto& inputs     = j["inputs"];
     auto& outputs    = j["outputs"];
@@ -178,7 +195,13 @@ Problem read_problem(const std::string& filename) {
     // actually beneficial for a given schedule; this set is the permissive
     // upper bound of candidates.
     // -------------------------------------------------------------------------
-    {
+    // 910B: NO cross-subgraph retention. Each subgraph runs across the cores;
+    // data crossing a subgraph boundary (incl. the cube<->vector handoff) routes
+    // through DDR/GM, and there is no single shared fast memory that persists a
+    // tensor across subgraph executions (L1/L0c and UB are per-core, transient).
+    // So retainable_tensors stays empty — the per-core working set never pins a
+    // cross-subgraph tensor. (Competition single-core keeps the original logic.)
+    if (p.num_cube_cores <= 1 && p.num_vector_cores <= 1) {
         std::vector<size_t> consumer_count(num_tensors, 0);
         for (auto& op : p.ops)
             for (auto t : op.inputs)
