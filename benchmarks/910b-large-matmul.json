@@ -1,0 +1,38 @@
+{
+ "widths": [
+  2048,
+  2048,
+  2048
+ ],
+ "heights": [
+  2048,
+  2048,
+  2048
+ ],
+ "op_types": [
+  "MatMul"
+ ],
+ "inputs": [
+  [
+   0,
+   1
+  ]
+ ],
+ "outputs": [
+  [
+   2
+  ]
+ ],
+ "base_costs": [
+  33554432
+ ],
+ "fast_memory_capacity": 67108864,
+ "slow_memory_bandwidth": 10,
+ "native_granularity": [
+  128,
+  128
+ ],
+ "num_cube_cores": 24,
+ "num_vector_cores": 48,
+ "cube_capacity": 131072
+}

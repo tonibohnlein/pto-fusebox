@@ -457,12 +457,26 @@ static void test_sweep_matmul_dims() {
     int sk = Subgraph::create(pk, DAG::build(pk), {0})->best_cost().parallel_split;
     std::cout << "    128x128 K=8192 -> split=" << sk << "\n";
     CHECK("SWEEP: 128x128 large-K reload-bound -> split-K", sk > 1);
+    // A LARGE matmul fills the L0c accumulator: the tile area approaches
+    // cube_capacity/4 (=32768 elems). This is WHY big matmuls get big tiles and
+    // only small outputs get small ones — the cap is L0c, not a fixed granule.
+    auto rbig = Subgraph::create(mk_mm(1024, 1024, 512, 16384 * 512),
+                                 DAG::build(mk_mm(1024, 1024, 512, 1)), {0});
+    auto pbig = mk_mm(1024, 1024, 512, 16384 * 512);
+    auto cbig = Subgraph::create(pbig, DAG::build(pbig), {0})->best_cost();
+    std::cout << "    1024x1024 -> tile[" << cbig.config.w << "x" << cbig.config.h
+              << "] area=" << (cbig.config.w * cbig.config.h) << " (L0c/4=32768)\n";
+    CHECK("SWEEP: large output gets a big L0c-filling tile (area >= 128x128)",
+          cbig.config.w * cbig.config.h >= 128 * 128);
+    (void)rbig;
 }
 
 // --- visualization: print every scenario's solver solution -------------------
 static void test_visualize() {
     std::cout << "\n==================== SOLVER SOLUTION VISUALIZATION ====================\n";
-    std::cout << "-- single matmul: spatial-fills-cores for any decent output (K=512) --\n";
+    std::cout << "-- single matmul: large outputs get the L0c-max tile (128x256) --\n";
+    viz_row("square 2048x2048", mk_mm(2048, 2048, 2048, 16384 * 2048), {0});
+    viz_row("square 1024x1024", mk_mm(1024, 1024, 512, 16384 * 512), {0});
     viz_row("square 256x256", mk_mm(256, 256, 512, 16384 * 512), {0});
     viz_row("square 768x768", mk_mm(768, 768, 512, 16384 * 512), {0});
     std::cout << "-- single matmul: tiny / large-K outputs -> split-K --\n";

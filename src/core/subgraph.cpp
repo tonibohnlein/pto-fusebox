@@ -1032,7 +1032,14 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
       const double ddr1 = (reload + out_store) * inv_B;
       const double lat1 = std::max(total_compute / eff1, ddr1);
-      const int64_t S = std::max<int64_t>(1, (n_cores + num_tiles - 1) / num_tiles);  // fill cores
+      // Split-K factor to fill the cores, BOUNDED by K/16: each split partial
+      // must hold at least one 16-deep fractal of the contraction, so K cannot be
+      // split more than K/16 ways. Without this the model would "fill" the cores
+      // by over-splitting a tiny output (e.g. S=24 on K=256 => 10-deep partials,
+      // physically impossible) and wrongly favor an oversized tile.
+      const int64_t s_want = (n_cores + num_tiles - 1) / num_tiles;
+      const int64_t s_max = std::max<int64_t>(1, max_K_ / 16);
+      const int64_t S = std::max<int64_t>(1, std::min(s_want, s_max));
       const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
       const double ddrS = (reload + (double)S * out_store) * inv_B;
       const double latS = std::max(total_compute / effS, ddrS);
