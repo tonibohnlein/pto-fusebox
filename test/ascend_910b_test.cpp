@@ -507,7 +507,7 @@ static void test_pypto_l0_comparison() {
     p.native_h = 128;
     set_910b(p);
     auto r = Subgraph::create(p, DAG::build(p), {0})->best_cost();
-    std::cout << "    pypto L0 (hand-crafted): out tile[16,64] Acc, K tiled by 16, 1 core sequential\n";
+    std::cout << "    pypto L0 (hand-crafted): out tile[16,64] Acc, k=256 (ChooseL0Tile), 1 core sequential\n";
     std::cout << "    our solver (DDR->L1)   : out tile[" << r.config.w << "," << r.config.h
               << "] k=" << r.config.k << " spatial=" << r.num_spatial_tiles
               << " split-K=" << r.parallel_split << " cores=" << r.cores_used << "\n";
