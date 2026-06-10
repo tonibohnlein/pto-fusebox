@@ -53,6 +53,15 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       int64_t Ki = prob.tensors[prob.ops[i].inputs[0]].width;
       sg.max_K_ = std::max(sg.max_K_, Ki);
     }
+    if (prob.ops[i].type == OpType::Reduction) {
+      sg.has_reduction_ = true;
+      // Reduced axis = the dim that collapses (input extent -> 1 in the output).
+      size_t in0 = prob.ops[i].inputs[0], out = prob.ops[i].output();
+      if (prob.tensors[out].width < prob.tensors[in0].width)
+        sg.reduced_axis_ = 1;  // width  (row reduction: [H,W] -> [H,1])
+      else if (prob.tensors[out].height < prob.tensors[in0].height)
+        sg.reduced_axis_ = 2;  // height (col reduction: [H,W] -> [1,W])
+    }
   }
 
   // 910B: subgraphs must be UNIT-HOMOGENEOUS. Cube (MatMul) and vector
@@ -407,6 +416,17 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
       if (op.type == OpType::Pointwise) {
         for (auto t : op.inputs) assign_or_check(t, out_h, out_v);
+      } else if (op.type == OpType::Reduction) {
+        // A reduction has ONE input and collapses one axis: the input is read
+        // FULL along the reduced axis (FIXED_1) and follows the output tiling
+        // along the other. Must NOT take the matmul LHS/RHS path below, which
+        // dereferences op.inputs[1] (a single-input reduction has none).
+        for (auto t : op.inputs) {
+          if (sg.reduced_axis_ == 2)
+            assign_or_check(t, out_h, TS::FIXED_1);  // height reduced
+          else
+            assign_or_check(t, TS::FIXED_1, out_v);  // width reduced (default)
+        }
       } else {
         size_t lhs = op.inputs[0], rhs = op.inputs[1];
         if (sg.is_sink_op_vec_[op_idx]) {
@@ -559,6 +579,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   sg.ws_cand_ = valid_candidates(sg.w_divides_);
   sg.hs_cand_ = valid_candidates(sg.h_divides_);
+  // Reduction: the reduced axis cannot be spatially split — the whole row/col
+  // is needed to reduce it — so the tile spans the FULL reduced extent (lifting
+  // the native cap on that axis, like a cube tile). Only the non-reduced axis
+  // is tiled, giving the spatial (per-core) parallelism. 910B-only.
+  if (sg.has_reduction_ && sg.reduced_axis_ == 1)
+    sg.ws_cand_ = std::vector<int64_t>{sg.out_W_};
+  else if (sg.has_reduction_ && sg.reduced_axis_ == 2)
+    sg.hs_cand_ = std::vector<int64_t>{sg.out_H_};
   // PW-sink subgraphs: force k = output_K_ so nk == 1 (no temporal tiling).
   //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
   //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
@@ -592,8 +620,10 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     if (cfg.w * cfg.h * 4 > prob_->cube_capacity) return false;  // [w,h] FP32 accumulator fits L0c
   } else if (native_cap > 0) {
     // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
-    if (cfg.w > native_cap) return false;
-    if (cfg.h > native_cap) return false;
+    // Exception: a reduction's reduced axis spans the full extent (super-native
+    // by necessity — the whole row/col is one reduction), so exempt that axis.
+    if (!(has_reduction_ && reduced_axis_ == 1) && cfg.w > native_cap) return false;
+    if (!(has_reduction_ && reduced_axis_ == 2) && cfg.h > native_cap) return false;
     if (cfg.k > native_cap) return false;
   }
 
@@ -979,7 +1009,18 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
       // the shared full-tensor floor (no cross-core reload to model here).
-      const double total_compute = (double)num_tiles * nk * comp_per_step;
+      // For a reduction subgraph the reduced axis is fixed (full extent), so the
+      // element-wise work is INVARIANT to tiling — use the summed base_cost and
+      // avoid the native padding penalty on the small non-reduced tiles we need
+      // to fill cores (same rationale as the matmul fix). num_tiles is then the
+      // non-reduced (spatial) tile count, since the reduced axis is untiled.
+      double total_compute;
+      if (has_reduction_) {
+        total_compute = 0.0;
+        for (auto i : ops_) total_compute += (double)prob_->ops[i].base_cost;
+      } else {
+        total_compute = (double)num_tiles * nk * comp_per_step;
+      }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       double total_io = 0.0;
       for (const auto& info : boundary_tensor_info_) {
@@ -988,7 +1029,22 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         if (info.is_boundary_out && !retain_these.count(info.id))
           total_io += (double)info.full_size * inv_B;
       }
-      result.latency = std::max(total_compute / eff, total_io);
+      double lat = std::max(total_compute / eff, total_io);
+      // Reduction split: when the spatial (non-reduced) tiles can't fill the
+      // cores, split the REDUCED axis across cores — each core reduces its slice
+      // to a partial, then partials merge across cores via DDR. The partial is
+      // the thin reduced output (out_H_ for a width-reduction, out_W_ for a
+      // height-reduction), so the merge is cheap — the flash-attention insight.
+      // Taken only when it helps. Mirrors matmul split-K.
+      if (has_reduction_ && num_tiles < n_cores) {
+        const int64_t S = (n_cores + num_tiles - 1) / num_tiles;  // cores per spatial tile
+        const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
+        const double merge =
+            (double)(S - 1) * (double)(reduced_axis_ == 1 ? out_H_ : out_W_) * inv_B;
+        const double latS = std::max(total_compute / effS, total_io + merge);
+        lat = std::min(lat, latS);
+      }
+      result.latency = lat;
     }
   }
 

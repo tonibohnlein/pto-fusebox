@@ -139,6 +139,14 @@ private:
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
+  // 910B reduction (vector): a Reduction couples its reduced axis (the whole
+  // row/col must be present to reduce it), so the tile spans the FULL reduced
+  // dim and only the non-reduced dim is tiled for spatial parallelism. The
+  // reduced axis may still be split ACROSS cores (override), paying a thin
+  // per-partial merge. reduced_axis_: 0=none, 1=width, 2=height. Competition
+  // never emits Reduction, so these stay default on the single-context path.
+  bool has_reduction_ = false;
+  int reduced_axis_ = 0;
   bool has_pw_sink_ = false;
   bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;

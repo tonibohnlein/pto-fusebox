@@ -16,6 +16,7 @@
 #include "core/subgraph.h"
 #include "core/types.h"
 
+#include <cmath>
 #include <iostream>
 
 static int g_pass = 0, g_fail = 0, g_red = 0;
@@ -129,7 +130,7 @@ static void test_D_mixed_cube_vector() {
 
 // --- softmax: reduction-chain schema (cost model is the next increment) -------
 static void test_softmax_reduction_schema() {
-    std::cout << "[softmax] reduction-chain schema (reduction-k cost model = TODO)\n";
+    std::cout << "[softmax] reduction-chain — fused cost + fusion benefit\n";
     // A[W=4096, H=128], softmax along each row (reduce over W):
     //   rowmax : A -> m[1,128]          Reduction over width
     //   exp    : A, m(broadcast) -> e   Pointwise + broadcast input m
@@ -145,13 +146,58 @@ static void test_softmax_reduction_schema() {
              {OpType::Pointwise, {0, 1}, {2}, 4096 * 128},
              {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
              {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
-    DAG dag = DAG::build(p);
-    CHECK("softmax: 4-op DAG builds", p.num_ops() == 4);
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
     CHECK("softmax: rowmax reduces width to 1", p.tensors[1].width == 1);
     CHECK("softmax: m broadcast back to W in exp", p.tensors[2].width == 4096);
-    // Reduction-k cost modeling (online accumulator) is the next increment —
-    // do NOT call best_cost() on a Reduction op yet (unhandled in Subgraph).
-    std::cout << "    schema OK; reduction-k cost model is the next step\n";
+    DAG dag = DAG::build(p);
+    // Fused: one vector subgraph — A in, out out; m/e/s are ephemeral (the whole
+    // softmax stays on-chip, only the [H,W] input/output touch DDR).
+    auto fused_sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    CHECK("softmax: fused vector subgraph builds", (bool)fused_sg);
+    double fused = fused_sg->best_cost().latency;
+    CHECK("softmax: fused cost is finite (tiling feasible)", std::isfinite(fused));
+    // Split into the two natural halves {rowmax,exp} + {rowsum,div}: now the
+    // intermediate e[H,W] is a boundary tensor — written by the first group and
+    // re-read by the second (an extra [H,W] DDR round-trip). Fusing all four
+    // keeps e ephemeral, eliminating it. (Per-op split is degenerate here: a
+    // broadcast [1,H] input alone is infeasible, so we compare feasible halves.)
+    double half1 = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
+    double half2 = Subgraph::create(p, dag, {2, 3})->best_cost().latency;
+    std::cout << "    fused=" << fused << "  split halves=" << (half1 + half2)
+              << " (" << half1 << "+" << half2 << ")\n";
+    CHECK("softmax: fused < split halves (ephemeral e avoids a DDR round-trip)",
+          fused < half1 + half2);
+}
+
+// --- R: few-row reduction — split the reduced axis across vector cores --------
+// Reduction analog of split-K (test F): only the non-reduced dim (rows) gives
+// spatial parallelism, so a few-row reduction can't fill the 48 vector cores
+// spatially. Splitting the reduced axis across cores fills them, paying only a
+// thin per-partial merge (out_H_ here) — the flash-style parallel reduction.
+static void test_R_reduction_split() {
+    std::cout << "[R] few-row reduction — split reduced axis across vector cores\n";
+    Problem p;
+    p.tensors = {{4096, 4}, {1, 4}};                       // A[4 rows x 4096], rowmax -> m[1,4]
+    p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}};  // compute-heavy
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    Problem p1 = p;
+    p1.num_cube_cores = 1;
+    p1.num_vector_cores = 1;  // single-context baseline (no parallel override)
+    DAG dag = DAG::build(p);
+    double par = Subgraph::create(p, dag, {0})->best_cost().latency;
+    DAG dag1 = DAG::build(p1);
+    double single = Subgraph::create(p1, dag1, {0})->best_cost().latency;
+    std::cout << "    48 cores (split reduced)=" << par << "  1 core=" << single << "\n";
+    CHECK("R: 4 rows but split-reduced fills cores (large speedup vs 1 core)",
+          par < single / 5.0);
 }
 
 // --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
@@ -250,6 +296,7 @@ int main() {
     test_C_pointwise_fusion();
     test_D_mixed_cube_vector();
     test_softmax_reduction_schema();
+    test_R_reduction_split();
     test_E_matmul_2d_vs_1d();
     test_F_split_k();
     test_G_super_native_tile();
