@@ -33,8 +33,13 @@ static void RED(const char* l, bool c) {
     if (c) g_pass++;
     else { g_red++; std::cout << "  RED (todo): " << l << "\n"; }
 }
-// Activate the 910B parallel model (one die): 24 cube + 48 vector cores.
-static void set_910b(Problem& p) { p.num_cube_cores = 24; p.num_vector_cores = 48; }
+// Activate the 910B parallel model (one die): 24 cube + 48 vector cores,
+// L0c accumulator = 128 KB/core (the cube tile bound, replacing the native cap).
+static void set_910b(Problem& p) {
+    p.num_cube_cores = 24;
+    p.num_vector_cores = 48;
+    p.cube_capacity = 128 * 1024;
+}
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
 static void test_A_pointwise_memory_bound() {
@@ -149,12 +154,75 @@ static void test_softmax_reduction_schema() {
     std::cout << "    schema OK; reduction-k cost model is the next step\n";
 }
 
+// --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
+static void test_E_matmul_2d_vs_1d() {
+    std::cout << "[E] matmul tile shape — balanced (2D) reloads less than skewed (1D)\n";
+    Problem p;
+    p.tensors = {{512, 512}, {512, 512}, {512, 512}};  // A, B, C : M=N=K=512
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};       // tiny compute -> memory-bound
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0});
+    CHECK("E: subgraph builds", (bool)sg);
+    double balanced = sg->compute_cost(TileConfig{256, 128, 512}).latency;  // w·h=32K, ratio 2:1
+    double skewed = sg->compute_cost(TileConfig{512, 64, 512}).latency;     // w·h=32K, ratio 8:1
+    std::cout << "    balanced[w256,h128]=" << balanced << "  skewed[w512,h64]=" << skewed << "\n";
+    CHECK("E: balanced (2D) tile reloads less than skewed (1D)", balanced < skewed);
+}
+
+// --- F: split-K parallelizes a thin matmul (beats single-core) ---------------
+static void test_F_split_k() {
+    std::cout << "[F] thin matmul — split-K across cube cores beats single-core\n";
+    Problem p;
+    p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048 (1 native tile)
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    Problem p1 = p;
+    p1.num_cube_cores = 1;
+    p1.num_vector_cores = 1;  // single-context baseline
+    DAG dag = DAG::build(p);
+    double par = Subgraph::create(p, dag, {0})->best_cost().latency;
+    DAG dag1 = DAG::build(p1);
+    double single = Subgraph::create(p1, dag1, {0})->best_cost().latency;
+    std::cout << "    24 cores (split-K)=" << par << "  1 core=" << single << "\n";
+    CHECK("F: split-K gives a large speedup vs single core", par < single / 5.0);
+}
+
+// --- G: cube tile can exceed native 128 (L0c bound, not the native cap) -------
+static void test_G_super_native_tile() {
+    std::cout << "[G] matmul tile can be >128 (L0c bound, not the native cap)\n";
+    Problem p;
+    p.tensors = {{512, 512}, {512, 512}, {512, 512}};  // M=N=K=512
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};       // memory-bound -> prefers big balanced tile
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto best = Subgraph::create(p, dag, {0})->best_cost();
+    std::cout << "    best tile = " << best.config.w << "x" << best.config.h << "\n";
+    CHECK("G: best tile exceeds native 128 (super-native, L0c-bounded)",
+          best.config.w > 128 || best.config.h > 128);
+}
+
 int main() {
     test_A_pointwise_memory_bound();
     test_B_thin_matmul_parallel();
     test_C_pointwise_fusion();
     test_D_mixed_cube_vector();
     test_softmax_reduction_schema();
+    test_E_matmul_2d_vs_1d();
+    test_F_split_k();
+    test_G_super_native_tile();
     std::cout << "\n=== pass=" << g_pass << " fail=" << g_fail << " red(todo)=" << g_red << " ===\n";
     return g_fail;  // RED items are the spec; only hard CHECK failures break the build
 }

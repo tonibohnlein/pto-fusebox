@@ -530,22 +530,30 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
   // we use native_w as the uniform cap (benchmarks always have native_w ==
   // native_h, and native_k follows the same value).
-  const int64_t native_cap = prob.native_w;
-  auto valid_candidates = [native_cap](const std::vector<int64_t> &dims)
-      -> std::vector<int64_t> {
+  // Candidate caps. Competition / vector subgraphs: native cap, no alignment.
+  // 910B matmul (cube) subgraphs: NO native cap (the L0c bound is enforced in
+  // is_valid_tiling) and 16-fractal alignment — bigger DDR->L1 tiles are good
+  // (L1->L0 pipelining + amortization); the native granule belongs to the later
+  // AutoTileMatmulL0 pass. Gated so non-matmul / single-context is unchanged.
+  const bool matmul_910b = (prob.num_cube_cores > 1) && sg.has_matmul_ && (prob.cube_capacity > 0);
+  const int64_t cand_cap = matmul_910b ? 0 : prob.native_w;
+  const int64_t cand_align = matmul_910b ? 16 : 1;
+  auto valid_candidates = [&](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
     if (dims.empty()) return {1};
     int64_t mx = *std::max_element(dims.begin(), dims.end());
     if (mx <= 0) return {1};
     auto divs = all_divisors(mx);
     std::vector<int64_t> result;
     for (auto c : divs) {
-      if (native_cap > 0 && c > native_cap) continue;  // super-native invalid
+      if (cand_cap > 0 && c > cand_cap) continue;          // super-native (competition)
+      if (cand_align > 1 && c % cand_align != 0) continue;  // fractal-aligned (matmul)
       bool ok = true;
       for (auto v : dims) {
         if (c < v && v % c != 0) { ok = false; break; }
       }
       if (ok) result.push_back(c);
     }
+    if (result.empty()) result.push_back(matmul_910b ? std::min(mx, (int64_t)16) : (int64_t)1);
     return result;
   };
 
@@ -573,10 +581,17 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
-  // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
-  // native_w == native_h == native_k per #80 Q1; use native_w as the cap.
+  // 910B matmul (cube) subgraphs: the tile is a DDR->L1 panel, bounded by the
+  // L0c accumulator (output [w,h] fits L0c) and 16-fractal alignment — NOT the
+  // competition native cap (a cube/L0 granule applied later by AutoTileMatmulL0).
+  // Gated; otherwise the competition's super-native-forbidden rule applies.
   const int64_t native_cap = prob_->native_w;
-  if (native_cap > 0) {
+  const bool matmul_910b = (prob_->num_cube_cores > 1) && has_matmul_ && (prob_->cube_capacity > 0);
+  if (matmul_910b) {
+    if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;       // fractal-aligned
+    if (cfg.w * cfg.h * 4 > prob_->cube_capacity) return false;  // [w,h] FP32 accumulator fits L0c
+  } else if (native_cap > 0) {
+    // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
     if (cfg.w > native_cap) return false;
     if (cfg.h > native_cap) return false;
     if (cfg.k > native_cap) return false;
@@ -677,7 +692,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   for (size_t t : mm_produced_ephemerals_) {
     int64_t sw, sh;
     slice_for(t, sw, sh);
-    if (native_cap > 0 && (sw > native_cap || sh > native_cap)) return false;
+    if (!matmul_910b && native_cap > 0 && (sw > native_cap || sh > native_cap)) return false;
   }
 
   // Multi-role tensors are now modeled explicitly via multi-entry
@@ -938,15 +953,34 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
   if (n_cores > 1) {
     const double total_compute = (double)num_tiles * nk * comp_per_step;
-    const double eff = (double)std::min<int64_t>((int64_t)num_tiles * nk, n_cores);
-    double total_io = 0.0;  // shared DDR traffic (full-tensor; ignores matmul revisit)
-    for (const auto& info : boundary_tensor_info_) {
-      if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
-        total_io += (double)info.full_size * inv_B;  // load
-      if (info.is_boundary_out && !retain_these.count(info.id))
-        total_io += (double)info.full_size * inv_B;  // evict
+    if (has_matmul_) {
+      // Matmul (cube). Distribution-aware reload MNK*(1/w + 1/h) favors big,
+      // balanced (2D) tiles — each output tile streams its A row-strip + B
+      // col-strip once, so a square/large tile reloads less. Split-K across
+      // cores is the fallback when spatial tiles can't fill the cores, paying a
+      // per-partial output-merge.
+      const double M = (double)out_H_, N = (double)out_W_, K = (double)max_K_;
+      const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h);
+      const double out_store = M * N;
+      const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
+      const double lat1 = std::max(total_compute / eff1, (reload + out_store) * inv_B);
+      const int64_t S = std::max<int64_t>(1, (n_cores + num_tiles - 1) / num_tiles);  // fill cores
+      const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
+      const double latS = std::max(total_compute / effS, (reload + (double)S * out_store) * inv_B);
+      result.latency = std::min(lat1, latS);  // take split-K only if it actually helps
+    } else {
+      // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
+      // the shared full-tensor floor (no cross-core reload to model here).
+      const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
+      double total_io = 0.0;
+      for (const auto& info : boundary_tensor_info_) {
+        if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
+          total_io += (double)info.full_size * inv_B;
+        if (info.is_boundary_out && !retain_these.count(info.id))
+          total_io += (double)info.full_size * inv_B;
+      }
+      result.latency = std::max(total_compute / eff, total_io);
     }
-    result.latency = std::max(total_compute / eff, total_io);
   }
 
   return result;
