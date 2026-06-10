@@ -952,13 +952,21 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   // units — while DDR bandwidth is a SHARED floor (one HBM) that does not divide.
   const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
   if (n_cores > 1) {
-    const double total_compute = (double)num_tiles * nk * comp_per_step;
     if (has_matmul_) {
-      // Matmul (cube). Distribution-aware reload MNK*(1/w + 1/h) favors big,
-      // balanced (2D) tiles — each output tile streams its A row-strip + B
-      // col-strip once, so a square/large tile reloads less. Split-K across
-      // cores is the fallback when spatial tiles can't fill the cores, paying a
-      // per-partial output-merge.
+      // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
+      // 16-aligned cube tiles have no padding (the op_scale native-128 padding
+      // is a single-level competition artifact that belongs at the L0 fractal,
+      // not at our DDR->L1 level). Basis = per-native-tile base_cost x #native
+      // output tiles, independent of the chosen [w,h].
+      double mm_base = 0.0;
+      for (auto i : ops_)
+        if (prob_->ops[i].type == OpType::MatMul) mm_base += (double)prob_->ops[i].base_cost;
+      const double total_compute =
+          mm_base * ((double)out_W_ / prob_->native_w) * ((double)out_H_ / prob_->native_h);
+      // Distribution-aware reload MNK*(1/w + 1/h) favors big, balanced (2D)
+      // tiles — each output tile streams its A row-strip + B col-strip once, so
+      // a square/large tile reloads less. Split-K across cores is the fallback
+      // when spatial tiles can't fill the cores, paying a per-partial merge.
       const double M = (double)out_H_, N = (double)out_W_, K = (double)max_K_;
       const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h);
       const double out_store = M * N;
@@ -971,6 +979,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
       // the shared full-tensor floor (no cross-core reload to model here).
+      const double total_compute = (double)num_tiles * nk * comp_per_step;
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       double total_io = 0.0;
       for (const auto& info : boundary_tensor_info_) {

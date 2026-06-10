@@ -214,6 +214,36 @@ static void test_G_super_native_tile() {
           best.config.w > 128 || best.config.h > 128);
 }
 
+// --- H: split-K (big tile) beats spatial-fill (small tiles) on RELOAD --------
+// F shows split-K beats a single core; H shows *why it is chosen over the
+// spatial alternative*: filling the cores spatially needs tiny tiles, and small
+// tiles reload far more input. With the op_scale fix the matmul compute is
+// invariant to the tile (16-aligned => no fractal padding), so the gap below is
+// pure reload — split-K wins for the right reason, not a native-128 artifact.
+static void test_H_split_k_beats_spatial() {
+    std::cout << "[H] thin matmul — split-K on a big tile beats small-tile spatial-fill\n";
+    Problem p;
+    p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0});
+    CHECK("H: subgraph builds", (bool)sg);
+    // Big [128,128] = 1 spatial tile -> model splits K across the 24 cube cores.
+    // Small [16,16] = 64 spatial tiles -> fills cores spatially, but each tile
+    // reloads its A row-strip + B col-strip => 8x the DDR traffic of the big tile.
+    double big_splitk = sg->compute_cost(TileConfig{128, 128, 2048}).latency;
+    double small_spatial = sg->compute_cost(TileConfig{16, 16, 2048}).latency;
+    std::cout << "    big[128x128]+split-K=" << big_splitk
+              << "  small[16x16] spatial=" << small_spatial << "\n";
+    CHECK("H: split-K (big tile) beats spatial-fill (small tiles) on reload",
+          big_splitk < small_spatial);
+}
+
 int main() {
     test_A_pointwise_memory_bound();
     test_B_thin_matmul_parallel();
@@ -223,6 +253,7 @@ int main() {
     test_E_matmul_2d_vs_1d();
     test_F_split_k();
     test_G_super_native_tile();
+    test_H_split_k_beats_spatial();
     std::cout << "\n=== pass=" << g_pass << " fail=" << g_fail << " red(todo)=" << g_red << " ===\n";
     return g_fail;  // RED items are the spec; only hard CHECK failures break the build
 }
