@@ -446,15 +446,17 @@ static void test_pypto_tiling_comparison() {
             // the per-core k (K/S) is then a different quantity than pypto's L0 k.
             CHECK("PYPTO2: thin matmul -> our solver split-Ks across cores", r.parallel_split > 1);
         }
-        // Our output tile fits L0c (cube_capacity), same accumulator bound pypto respects.
-        CHECK("PYPTO2: our output tile fits L0c (128KB)", r.config.w * r.config.h * 4 <= 128 * 1024);
+        // Our level bounds OPERANDS by L1 (not the output by L0c — that L0c
+        // accumulator sub-tiling is pypto/AutoTileMatmulL0's L1->L0 job).
+        long long opnd = (long long)r.config.k * (r.config.w + r.config.h) * 2;  // BF16 strips
+        CHECK("PYPTO2: our operand strips fit L1 (512KB)", opnd <= 512 * 1024);
     }
 }
 
 // --- per-core two-pool working set: cube L1 k-tiling / vector UB / dbl-buffer --
 static void test_two_pool_working_set() {
     std::cout << "[POOL] per-core two-pool: cube operands->L1 (k-tile), vector->UB, double-buffer\n";
-    // Cube: out[128,256] = L0c-max output, K=4096 FP32. Full-K operand strips
+    // Cube: out[128,256], K=4096 FP32 (L1 bounds the operands, not the output). Full-K operand strips
     // (4096*(128+256)*4 = 6 MB) blow the 512 KB L1, so the DDR->L1 k-tile must
     // shrink to fit — this is the cube k-tiling, set by the L1 bound.
     Problem c;
@@ -547,38 +549,37 @@ static void test_sweep_matmul_dims() {
         CHECK("SWEEP: split-K factor is non-increasing as output grows", s <= prev_split);
         prev_split = s;
     }
-    // Tiny 16x16 output = 1 fractal tile << 24 cores -> must split-K; a large
-    // 1024x1024 fills the cores spatially -> no split-K.
+    // Tiny 16x16 output = 1 fractal tile << 24 cores -> heavy split-K. As the
+    // output grows the solver fills the cores SPATIALLY (with big L1-bounded
+    // tiles), so the split factor falls sharply. A huge 4096x4096 reaches pure
+    // spatial (>=24 big tiles, split=1).
     auto ps = mk_mm(16, 16, 512, 16384 * 512);
-    auto pl = mk_mm(1024, 1024, 512, 16384 * 512);
-    CHECK("SWEEP: 16x16 output split-Ks across cores (tiny output)",
-          Subgraph::create(ps, DAG::build(ps), {0})->best_cost().parallel_split > 1);
-    CHECK("SWEEP: 1024x1024 output is pure spatial (no split-K)",
-          Subgraph::create(pl, DAG::build(pl), {0})->best_cost().parallel_split == 1);
+    auto pl = mk_mm(4096, 4096, 512, 16384 * 512);
+    int split_tiny = Subgraph::create(ps, DAG::build(ps), {0})->best_cost().parallel_split;
+    int split_huge = Subgraph::create(pl, DAG::build(pl), {0})->best_cost().parallel_split;
+    CHECK("SWEEP: tiny 16x16 output split-Ks heavily across cores", split_tiny > 1);
+    CHECK("SWEEP: split-K falls sharply as output grows (huge << tiny)", split_huge < split_tiny);
     // Same tiny output but LARGE K: split-K stays preferred because small spatial
     // tiles would be reload-bound (test H's mechanism), not just under-filled.
     auto pk = mk_mm(128, 128, 8192, 2400000);
     int sk = Subgraph::create(pk, DAG::build(pk), {0})->best_cost().parallel_split;
     std::cout << "    128x128 K=8192 -> split=" << sk << "\n";
     CHECK("SWEEP: 128x128 large-K reload-bound -> split-K", sk > 1);
-    // A LARGE matmul fills the L0c accumulator: the tile area approaches
-    // cube_capacity/4 (=32768 elems). This is WHY big matmuls get big tiles and
-    // only small outputs get small ones — the cap is L0c, not a fixed granule.
-    auto rbig = Subgraph::create(mk_mm(1024, 1024, 512, 16384 * 512),
-                                 DAG::build(mk_mm(1024, 1024, 512, 1)), {0});
+    // A LARGE matmul gets a big DDR<->L1 tile (operand strips fill L1, NOT the
+    // L0c accumulator — that sub-tiling is the later L1->L0 pass). So the output
+    // tile can exceed L0c; only small outputs are forced small.
     auto pbig = mk_mm(1024, 1024, 512, 16384 * 512);
     auto cbig = Subgraph::create(pbig, DAG::build(pbig), {0})->best_cost();
     std::cout << "    1024x1024 -> tile[" << cbig.config.w << "x" << cbig.config.h
-              << "] area=" << (cbig.config.w * cbig.config.h) << " (L0c/4=32768)\n";
-    CHECK("SWEEP: large output gets a big L0c-filling tile (area >= 128x128)",
-          cbig.config.w * cbig.config.h >= 128 * 128);
-    (void)rbig;
+              << "] area=" << (cbig.config.w * cbig.config.h) << " (output may exceed L0c)\n";
+    CHECK("SWEEP: large output gets a big L1-bounded tile (area >= 256x256)",
+          cbig.config.w * cbig.config.h >= 256 * 256);
 }
 
 // --- visualization: print every scenario's solver solution -------------------
 static void test_visualize() {
     std::cout << "\n==================== SOLVER SOLUTION VISUALIZATION ====================\n";
-    std::cout << "-- single matmul: large outputs get the L0c-max tile (128x256) --\n";
+    std::cout << "-- single matmul: large outputs get a big L1-bounded tile (output may exceed L0c) --\n";
     viz_row("square 2048x2048", mk_mm(2048, 2048, 2048, 16384 * 2048), {0});
     viz_row("square 1024x1024", mk_mm(1024, 1024, 512, 16384 * 512), {0});
     viz_row("square 256x256", mk_mm(256, 256, 512, 16384 * 512), {0});

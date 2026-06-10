@@ -569,7 +569,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // is_valid_tiling) and 16-fractal alignment — bigger DDR->L1 tiles are good
   // (L1->L0 pipelining + amortization); the native granule belongs to the later
   // AutoTileMatmulL0 pass. Gated so non-matmul / single-context is unchanged.
-  const bool matmul_910b = (prob.num_cube_cores > 1) && sg.has_matmul_ && (prob.cube_capacity > 0);
+  const bool matmul_910b = (prob.num_cube_cores > 1) && sg.has_matmul_ && (prob.l1_capacity > 0);
   const int64_t cand_cap = matmul_910b ? 0 : prob.native_w;
   const int64_t cand_align = matmul_910b ? 16 : 1;
   auto valid_candidates = [&](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
@@ -632,15 +632,17 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
-  // 910B matmul (cube) subgraphs: the tile is a DDR->L1 panel, bounded by the
-  // L0c accumulator (output [w,h] fits L0c) and 16-fractal alignment — NOT the
-  // competition native cap (a cube/L0 granule applied later by AutoTileMatmulL0).
-  // Gated; otherwise the competition's super-native-forbidden rule applies.
+  // 910B matmul (cube) subgraphs: the tile is a DDR->L1 panel. Our LEVEL is
+  // DDR<->L1, so the only on-chip bound here is 16-fractal alignment + the L1
+  // operand-strip budget (checked in fits_on_chip). The output tile [w,h] is NOT
+  // bounded by L0c at this level — accumulating [w,h] within the 128KB L0c is the
+  // LATER L1->L0 pass's job (AutoTileMatmulL0 sub-tiles [w,h] into L0c [m,n]). So
+  // a >L0c output tile is legal here; the cost model's split-K merge term keeps
+  // it from growing without bound. Gated; else the competition native cap applies.
   const int64_t native_cap = prob_->native_w;
-  const bool matmul_910b = (prob_->num_cube_cores > 1) && has_matmul_ && (prob_->cube_capacity > 0);
+  const bool matmul_910b = (prob_->num_cube_cores > 1) && has_matmul_ && (prob_->l1_capacity > 0);
   if (matmul_910b) {
-    if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;       // fractal-aligned
-    if (cfg.w * cfg.h * 4 > prob_->cube_capacity) return false;  // [w,h] FP32 accumulator fits L0c
+    if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // fractal-aligned only
   } else if (native_cap > 0) {
     // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
     // Exception: a reduction's reduced axis spans the full extent (super-native
@@ -861,7 +863,10 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
   }
   // Double-buffering reserves half of each STREAMING pool (L1/UB) for prefetch.
   const double f = prob_->double_buffer ? 0.5 : 1.0;
-  if (cube)  // output -> L0c is bounded separately in is_valid_tiling (w*h*4)
+  // Our level is DDR<->L1/UB. Cube: only the operand strips must fit L1 (the
+  // output accumulates in L0c — the LATER L1->L0 pass's concern, NOT bounded
+  // here). Vector: the whole tile fits UB.
+  if (cube)
     return (double)operand_bytes <= (double)prob_->l1_capacity * f;
   return (double)ub_bytes <= (double)prob_->vec_capacity * f;
 }
