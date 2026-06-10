@@ -17,6 +17,7 @@
 #include "core/types.h"
 
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 
 static int g_pass = 0, g_fail = 0, g_red = 0;
@@ -289,7 +290,155 @@ static void test_H_split_k_beats_spatial() {
           big_splitk < small_spatial);
 }
 
+// Single matmul C[N,M] = A[K,M] @ B[N,K]. base_cost = per-native-tile FLOPs.
+static Problem mk_mm(int64_t M, int64_t N, int64_t K, int64_t cost) {
+    Problem p;
+    p.tensors = {{K, M}, {N, K}, {N, M}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, cost}};
+    p.fast_memory_capacity = 1 << 26;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    return p;
+}
+
+// Print the solver's chosen solution: tile [w x h], #spatial tiles, the
+// parallel split (matmul split-K S / reduction split; 1 = pure spatial),
+// effective cores, and whether compute- or DDR-bound.
+static void viz_row(const char* name, const Problem& p, std::vector<size_t> ops) {
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, ops);
+    printf("  %-22s ", name);
+    if (!sg) { printf("NULLOPT\n"); return; }
+    auto r = sg->best_cost();
+    printf("out[%4lldx%-4lld] K=%-5lld tile[%4lldx%-4lld] sp=%-3d split=%-2d cores=%-2d %-9s lat=%.0f\n",
+           (long long)sg->output_width(), (long long)sg->output_height(), (long long)sg->max_K(),
+           (long long)r.config.w, (long long)r.config.h, r.num_spatial_tiles,
+           r.parallel_split, r.cores_used, r.compute_bound ? "[compute]" : "[DDR]", r.latency);
+}
+
+// Build a chained two-matmul C=(A@B)@D and an independent pair Q=X@Wq,K=X@Wk.
+static Problem mk_chained(int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t c1, int64_t c2) {
+    Problem p;  // A[K1,M] B[N1,K1] -> T[N1,M]; T[N1,M] D[N2,N1] -> C[N2,M]
+    p.tensors = {{K1, M}, {N1, K1}, {N1, M}, {N2, N1}, {N2, M}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, c1}, {OpType::MatMul, {2, 3}, {4}, c2}};
+    p.fast_memory_capacity = 1 << 26;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    return p;
+}
+
+// --- two matmuls: chained fusion compute is sane; split-K is per-matmul -------
+static void test_two_matmul() {
+    std::cout << "[2MM] two-matmul subgraph: chained fusion compute + per-matmul split-K\n";
+    // Chained, compute-heavy. base_cost = native^2 * K (per-native-tile FLOPs).
+    auto p = mk_chained(128, 256, 128, 64, 16384 * 256, 16384 * 128);
+    DAG dag = DAG::build(p);
+    double m1 = Subgraph::create(p, dag, {0})->best_cost().latency;
+    double m2 = Subgraph::create(p, dag, {1})->best_cost().latency;
+    double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
+    std::cout << "    M1=" << m1 << " M2=" << m2 << " fused=" << fused << "\n";
+    // Fused does BOTH matmuls' work — must not undercut either part (the old bug
+    // scaled all compute by the narrower sink output, so fused < M1 alone).
+    CHECK("2MM: chained fused >= each part (compute counted per-matmul)",
+          fused >= m1 - 0.5 && fused >= m2 - 0.5);
+    // Compute-bound: fused latency == sum of the two compute loads on shared cores
+    // (fusing two matmuls only helps LATENCY when DDR-bound — by keeping the
+    // intermediate T on-chip; under compute saturation the cores still do M1+M2).
+    CHECK("2MM: chained fused == M1+M2 when compute-bound", std::abs(fused - (m1 + m2)) < 1.0);
+}
+
+// --- sweep output shape: spatial parallelism vs split-K transition -----------
+static void test_sweep_matmul_dims() {
+    std::cout << "[SWEEP] single matmul, compute-heavy K=512 — strategy vs output shape\n";
+    // With 16-fractal alignment, a [w,h] output sub-tiles into up to (w/16)(h/16)
+    // spatial tiles, so the 24 cube cores fill SPATIALLY for any output >= a few
+    // hundred wide. Split-K is the fallback only when even 16-aligned sub-tiling
+    // yields fewer than #cores tiles — i.e. a TINY output. As L grows the solver
+    // shifts split-K -> pure spatial; the split factor is non-increasing.
+    int prev_split = 1 << 30;
+    for (int L : {16, 32, 64, 256, 1024}) {
+        auto p = mk_mm(L, L, 512, 16384 * 512);
+        char nm[32];
+        snprintf(nm, sizeof(nm), "square %dx%d", L, L);
+        viz_row(nm, p, {0});
+        int s = Subgraph::create(p, DAG::build(p), {0})->best_cost().parallel_split;
+        CHECK("SWEEP: split-K factor is non-increasing as output grows", s <= prev_split);
+        prev_split = s;
+    }
+    // Tiny 16x16 output = 1 fractal tile << 24 cores -> must split-K; a large
+    // 1024x1024 fills the cores spatially -> no split-K.
+    auto ps = mk_mm(16, 16, 512, 16384 * 512);
+    auto pl = mk_mm(1024, 1024, 512, 16384 * 512);
+    CHECK("SWEEP: 16x16 output split-Ks across cores (tiny output)",
+          Subgraph::create(ps, DAG::build(ps), {0})->best_cost().parallel_split > 1);
+    CHECK("SWEEP: 1024x1024 output is pure spatial (no split-K)",
+          Subgraph::create(pl, DAG::build(pl), {0})->best_cost().parallel_split == 1);
+    // Same tiny output but LARGE K: split-K stays preferred because small spatial
+    // tiles would be reload-bound (test H's mechanism), not just under-filled.
+    auto pk = mk_mm(128, 128, 8192, 2400000);
+    int sk = Subgraph::create(pk, DAG::build(pk), {0})->best_cost().parallel_split;
+    std::cout << "    128x128 K=8192 -> split=" << sk << "\n";
+    CHECK("SWEEP: 128x128 large-K reload-bound -> split-K", sk > 1);
+}
+
+// --- visualization: print every scenario's solver solution -------------------
+static void test_visualize() {
+    std::cout << "\n==================== SOLVER SOLUTION VISUALIZATION ====================\n";
+    std::cout << "-- single matmul: spatial-fills-cores for any decent output (K=512) --\n";
+    viz_row("square 256x256", mk_mm(256, 256, 512, 16384 * 512), {0});
+    viz_row("square 768x768", mk_mm(768, 768, 512, 16384 * 512), {0});
+    std::cout << "-- single matmul: tiny / large-K outputs -> split-K --\n";
+    viz_row("tiny 16x16", mk_mm(16, 16, 512, 16384 * 512), {0});
+    viz_row("tiny 64x64", mk_mm(64, 64, 512, 16384 * 512), {0});
+    viz_row("128x128 K=8192", mk_mm(128, 128, 8192, 2400000), {0});
+    std::cout << "-- single matmul: memory-bound (cheap compute) -> big balanced tile --\n";
+    viz_row("square 512x512 cheap", mk_mm(512, 512, 512, 512), {0});
+    std::cout << "-- two matmuls --\n";
+    {
+        auto p = mk_chained(128, 256, 128, 64, 16384 * 256, 16384 * 128);
+        DAG dag = DAG::build(p);
+        viz_row("chained M1 (A@B)", p, {0});
+        viz_row("chained M2 (T@D)", p, {1});
+        viz_row("chained FUSED", p, {0, 1});
+    }
+    std::cout << "-- vector: pointwise / softmax / reduction --\n";
+    {
+        Problem p;
+        p.tensors = {{4096, 128}, {1, 128}, {4096, 128}, {1, 128}, {4096, 128}};
+        p.ops = {{OpType::Reduction, {0}, {1}, 4096 * 128 / 4},
+                 {OpType::Pointwise, {0, 1}, {2}, 4096 * 128},
+                 {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
+                 {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
+        p.fast_memory_capacity = 1 << 24;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p);
+        viz_row("softmax fused", p, {0, 1, 2, 3});
+        viz_row("rowmax alone", p, {0});
+    }
+    {
+        Problem p;
+        p.tensors = {{4096, 4}, {1, 4}};
+        p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}};
+        p.fast_memory_capacity = 1 << 24;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p);
+        viz_row("few-row reduction", p, {0});
+    }
+    std::cout << "======================================================================\n\n";
+}
+
 int main() {
+    test_visualize();
+    test_two_matmul();
+    test_sweep_matmul_dims();
     test_A_pointwise_memory_bound();
     test_B_thin_matmul_parallel();
     test_C_pointwise_fusion();

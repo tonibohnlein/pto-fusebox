@@ -115,4 +115,11 @@ struct CostResult {
     int num_k_passes = 0;
     double compute_per_step = 0;
     TileConfig config;
+
+    // 910B parallel-roofline introspection (set by the cores>1 override). Lets
+    // tests visualize the chosen strategy and the eventual emit act on it.
+    int parallel_split = 1;      // cores ganged per spatial tile: matmul split-K S /
+                                 // reduction split S. 1 = pure spatial parallelism.
+    int cores_used = 1;          // effective cores busy (<= total unit cores)
+    bool compute_bound = false;  // latency limited by compute (vs the shared DDR floor)
 };

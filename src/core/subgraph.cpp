@@ -1000,13 +1000,18 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
       // 16-aligned cube tiles have no padding (the op_scale native-128 padding
       // is a single-level competition artifact that belongs at the L0 fractal,
-      // not at our DDR->L1 level). Basis = per-native-tile base_cost x #native
-      // output tiles, independent of the chosen [w,h].
-      double mm_base = 0.0;
-      for (auto i : ops_)
-        if (prob_->ops[i].type == OpType::MatMul) mm_base += (double)prob_->ops[i].base_cost;
-      const double total_compute =
-          mm_base * ((double)out_W_ / prob_->native_w) * ((double)out_H_ / prob_->native_h);
+      // not at our DDR->L1 level). Sum each matmul's own work scaled by ITS
+      // output (#native tiles) — for a CHAINED group the intermediate has a
+      // different shape than the sink, so a single sink-scaled basis would
+      // mis-count it. Single matmul: output == sink, identical to before.
+      double total_compute = 0.0;
+      for (auto i : ops_) {
+        if (prob_->ops[i].type != OpType::MatMul) continue;
+        size_t o = prob_->ops[i].output();
+        total_compute += (double)prob_->ops[i].base_cost *
+                         ((double)prob_->tensors[o].width / prob_->native_w) *
+                         ((double)prob_->tensors[o].height / prob_->native_h);
+      }
       // Distribution-aware reload MNK*(1/w + 1/h) favors big, balanced (2D)
       // tiles — each output tile streams its A row-strip + B col-strip once, so
       // a square/large tile reloads less. Split-K across cores is the fallback
@@ -1015,11 +1020,23 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h);
       const double out_store = M * N;
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
-      const double lat1 = std::max(total_compute / eff1, (reload + out_store) * inv_B);
+      const double ddr1 = (reload + out_store) * inv_B;
+      const double lat1 = std::max(total_compute / eff1, ddr1);
       const int64_t S = std::max<int64_t>(1, (n_cores + num_tiles - 1) / num_tiles);  // fill cores
       const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
-      const double latS = std::max(total_compute / effS, (reload + (double)S * out_store) * inv_B);
-      result.latency = std::min(lat1, latS);  // take split-K only if it actually helps
+      const double ddrS = (reload + (double)S * out_store) * inv_B;
+      const double latS = std::max(total_compute / effS, ddrS);
+      if (latS < lat1) {  // split-K only if it actually helps
+        result.latency = latS;
+        result.parallel_split = (int)S;
+        result.cores_used = (int)effS;
+        result.compute_bound = (total_compute / effS) >= ddrS;
+      } else {
+        result.latency = lat1;
+        result.parallel_split = 1;
+        result.cores_used = (int)eff1;
+        result.compute_bound = (total_compute / eff1) >= ddr1;
+      }
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
       // the shared full-tensor floor (no cross-core reload to model here).
@@ -1044,6 +1061,9 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
           total_io += (double)info.full_size * inv_B;
       }
       double lat = std::max(total_compute / eff, total_io);
+      result.parallel_split = 1;
+      result.cores_used = (int)eff;
+      result.compute_bound = (total_compute / eff) >= total_io;
       // Reduction split: when the spatial (non-reduced) tiles can't fill the
       // cores, split the REDUCED axis across cores — each core reduces its slice
       // to a partial, then partials merge across cores via DDR. The partial is
@@ -1056,7 +1076,12 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         const double merge =
             (double)(S - 1) * (double)(reduced_axis_ == 1 ? out_H_ : out_W_) * inv_B;
         const double latS = std::max(total_compute / effS, total_io + merge);
-        lat = std::min(lat, latS);
+        if (latS < lat) {
+          lat = latS;
+          result.parallel_split = (int)S;
+          result.cores_used = (int)effS;
+          result.compute_bound = (total_compute / effS) >= (total_io + merge);
+        }
       }
       result.latency = lat;
     }
