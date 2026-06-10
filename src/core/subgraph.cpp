@@ -1073,29 +1073,31 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
       const double ddr1 = (reload + out_store) * inv_B;
       const double lat1 = std::max(total_compute / eff1, ddr1);
-      // Split-K factor S = how many cube cores share one output tile's K. It must
-      // give a CLEAN, EVEN, 16-aligned slice of the contraction: each partial does
-      // exactly K/S, so S must DIVIDE K/16 (=> K/S is a 16-aligned divisor of K).
-      // Cap S at cores/num_tiles so num_tiles*S <= cores (never exceed 24 cubes).
-      // No clean S fitting the cap => no split-K (S=1, pure spatial).
-      const int64_t kfrac = std::max<int64_t>(1, max_K_ / 16);          // #16-deep fractals in K
-      const int64_t s_cap = std::max<int64_t>(1, (int64_t)n_cores / std::max<int64_t>(1, num_tiles));
-      int64_t S = 1;
-      for (int64_t d = 1; d <= s_cap; d++)
-        if (kfrac % d == 0) S = d;  // largest divisor of K/16 that is <= s_cap
-      const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
+      // Split-K: one output tile parallelizes up to K/16 ways (one partial per
+      // 16-deep fractal of the contraction). Fill up to n_cores of the
+      // num_tiles*(K/16) total fractal-partials. The fractal distribution may be
+      // UNEVEN across cores (latency ~ ceil(work/cores)); we do NOT require an
+      // even divisor split, since that would idle cores for no latency gain.
+      // cores_used < n_cores only when there genuinely aren't n_cores work-units.
+      const int64_t kfrac = std::max<int64_t>(1, max_K_ / 16);  // #16-deep fractals in K
+      const int64_t cores_used = std::min<int64_t>(n_cores, num_tiles * kfrac);
+      const int64_t S = std::max<int64_t>(1, (cores_used + num_tiles - 1) / num_tiles);  // avg split/tile
+      const double effS = (double)cores_used;
       const double ddrS = (reload + (double)S * out_store) * inv_B;
       const double latS = std::max(total_compute / effS, ddrS);
-      if (S > 1 && latS < lat1) {  // split-K only if a clean S helps
+      if (S > 1 && latS < lat1) {  // split-K only if it helps
         result.latency = latS;
         result.parallel_split = (int)S;
-        result.cores_used = (int)effS;
+        result.cores_used = (int)cores_used;
         result.compute_bound = (total_compute / effS) >= ddrS;
         result.ddr_traffic = ddrS;
-        // Per-core k-strip: split-K gives each core an EVEN K/S of the contraction
-        // (S | K/16, so K/S is a 16-aligned divisor of K). The L1 k-tile is then
-        // min(cfg.k, K/S) -- still a clean divisor of K (both operands are).
-        const int64_t per_core_k = max_K_ / S;  // 16-aligned divisor of K (S | K/16)
+        // Per-core contraction share = ceil(K/16 / S) fractals (16-aligned). The
+        // L1 k-tile is the largest DIVISOR of K not exceeding that share (and not
+        // exceeding cfg.k) -- so the displayed k cleanly divides K.
+        const int64_t share_k = ((kfrac + S - 1) / S) * 16;  // 16-aligned per-core K share
+        int64_t per_core_k = 16;
+        for (int64_t d = std::min(share_k, max_K_); d >= 16; d -= 16)
+          if (max_K_ % d == 0) { per_core_k = d; break; }  // largest divisor of K <= share
         result.config.k = std::min(cfg.k, per_core_k);
       } else {
         result.latency = lat1;

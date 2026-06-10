@@ -456,11 +456,12 @@ static void test_pypto_tiling_comparison() {
 // --- per-core two-pool working set: cube L1 k-tiling / vector UB / dbl-buffer --
 static void test_two_pool_working_set() {
     std::cout << "[POOL] per-core two-pool: cube operands->L1 (k-tile), vector->UB, double-buffer\n";
-    // Cube: out[128,256], K=4096 FP32 (L1 bounds the operands, not the output). Full-K operand strips
-    // (4096*(128+256)*4 = 6 MB) blow the 512 KB L1, so the DDR->L1 k-tile must
-    // shrink to fit — this is the cube k-tiling, set by the L1 bound.
+    // Cube: a LARGE spatial output (split=1, so split-K doesn't cap k) with big K.
+    // The DDR->L1 k-tile is set purely by the L1 operand budget; full-K strips
+    // blow 512 KB L1, so k shrinks to fit. (A small output would split-K and the
+    // per-core K-share would cap k instead, masking the L1 effect.)
     Problem c;
-    c.tensors = {{4096, 256}, {128, 4096}, {128, 256}};  // A[K,M] B[N,K] -> C[N,M]
+    c.tensors = {{4096, 2048}, {2048, 4096}, {2048, 2048}};  // A[K,M] B[N,K] -> C[N,M], out 2048^2
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 4096}};
     c.fast_memory_capacity = 1 << 28;
     c.slow_memory_bandwidth = 10;
@@ -469,8 +470,9 @@ static void test_two_pool_working_set() {
     set_910b(c);
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
     long long opnd = (long long)rc.config.k * (rc.config.w + rc.config.h) * 4;  // FP32 operand bytes
-    std::cout << "    cube out[128,256] K=4096: tile[" << rc.config.w << "x" << rc.config.h
-              << "] k=" << rc.config.k << " operand=" << opnd << "B (L1=" << (512 * 1024) << ")\n";
+    std::cout << "    cube out[2048,2048] K=4096: tile[" << rc.config.w << "x" << rc.config.h
+              << "] k=" << rc.config.k << " split=" << rc.parallel_split
+              << " operand=" << opnd << "B (L1=" << (512 * 1024) << ")\n";
     CHECK("POOL: cube k-tiled to fit L1 (k < full K=4096)", rc.config.k < 4096);
     CHECK("POOL: cube operand strips fit L1 (512KB)", opnd <= 512 * 1024);
     // Double-buffering halves L1 -> a strictly smaller k-tile.
