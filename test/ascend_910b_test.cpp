@@ -398,13 +398,18 @@ static void test_two_matmul() {
     }
 }
 
-// --- compare our DDR->L1 tiling vs pypto ChooseL0Tile hand-crafted L0 tiles ----
-// pypto's L0 tile chooser (tests/ut/ir/transforms/test_{auto_tile_matmul_l0,
-// l0_tile_chooser}.py) picks the L0 tile that fits L0a/L0b (64KB each, the k
-// strip) and L0c (the [m,n] accumulator). That is the INNER (L1->L0) level. Our
-// solver picks the OUTER DDR->L1 tile: output L0c-bounded, k = the largest strip
-// whose operands fit L1 (512KB). So our k-tile CONTAINS pypto's L0 k-tile — they
-// compose (DDR->L1 strip, then L1->L0 sub-strips, then the 16-fractal).
+// --- compare our DDR->L1 tile vs pypto ChooseL0Tile (mind the two levels!) -----
+// Memory chain: DDR -> L1/Mat(512KB) -> L0a/L0b(64KB ea) -> cube -> L0c(128KB acc).
+// pypto ChooseL0Tile (tests/ut/ir/transforms/test_{auto_tile_matmul_l0,
+// l0_tile_chooser}.py) is the L1->L0 level: output [m,n] in L0c, k-FRAGMENT in
+// L0a/L0b (so its k=64 is the L1->L0 k). OUR solver is the DDR->L1 level: output
+// [w,h] in L0c, k-STRIP in L1 (so our k is the DDR->L1 k). Two axes:
+//   OUTPUT tile: SAME level (both bound by L0c) -> directly comparable. Ours uses
+//                clean divisors ([128,256]); pypto allows aligned-padded ([176,176]).
+//   k-tile:      DIFFERENT, ADJACENT levels. Our DDR->L1 k-strip CONTAINS pypto's
+//                L1->L0 k-fragments (512 = 8 x 64) -- a composition, NOT a same-
+//                level k comparison. The true like-for-like pypto DDR->L1 k is the
+//                author's pl.range chunking in examples/, not ChooseL0Tile.
 static void test_pypto_tiling_comparison() {
     std::cout << "[PYPTO2] our DDR->L1 tiling vs pypto ChooseL0Tile hand-crafted L0 tiles\n";
     struct Case { const char* name; int64_t M, N, K; int p_m, p_n, p_k; };
@@ -430,9 +435,11 @@ static void test_pypto_tiling_comparison() {
                c.name, (long long)r.config.w, (long long)r.config.h, (long long)r.config.k,
                r.parallel_split, c.p_m, c.p_n, c.p_k);
         if (r.parallel_split == 1) {
-            // Spatial matmul: one core does the full K, streamed in our L1 k-strip,
-            // which CONTAINS pypto's finer L0a/L0b k-sub-tile (k-levels compose).
-            CHECK("PYPTO2: spatial matmul -> our L1 k-tile >= pypto's L0 k", r.config.k >= c.p_k);
+            // Spatial matmul: one core does the full K, streamed in our DDR->L1
+            // k-strip, which CONTAINS pypto's L1->L0 k-fragments (composition
+            // across adjacent levels — NOT a same-level k comparison).
+            CHECK("PYPTO2: spatial -> our DDR->L1 k-strip >= pypto's L1->L0 k-fragment",
+                  r.config.k >= c.p_k);
         } else {
             // Thin matmul: our solver SPLIT-Ks across cores (each does K/S), a
             // multi-core strategy pypto's single-core L0 chooser doesn't express;
