@@ -1148,9 +1148,30 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
           } else if (!parallel) {
             take = r.latency < best.latency;  // competition: strict-min, unchanged
           } else {
+            // 910B lexicographic tiebreak among equal-latency tiles:
+            //   1. lower DDR traffic   — matmul reuse (less reload); flat for PW
+            //   2. more cores used     — fill the unit's cores (parallelism)
+            //   3. larger tile area    — best vectorization / least per-tile
+            //      overhead (avoids the degenerate 1xN / 16x16 picks)
+            // Memory-bound PW has flat latency AND flat DDR, so keys 2-3 choose a
+            // sensible big core-filling tile instead of the smallest candidate.
             const double tol = 1e-6 * std::max(1.0, best.latency);
-            take = (r.latency < best.latency - tol) ||
-                   (r.latency <= best.latency + tol && r.ddr_traffic < best.ddr_traffic);
+            const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
+            const long long ra = (long long)r.config.w * r.config.h;
+            const long long ba = (long long)best.config.w * best.config.h;
+            if (r.latency < best.latency - tol) {
+              take = true;
+            } else if (r.latency > best.latency + tol) {
+              take = false;
+            } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
+              take = true;
+            } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
+              take = false;
+            } else if (r.cores_used != best.cores_used) {
+              take = r.cores_used > best.cores_used;
+            } else {
+              take = ra > ba;
+            }
           }
           if (take) best = r;
         }
