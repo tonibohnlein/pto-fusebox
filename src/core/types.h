@@ -73,10 +73,18 @@ struct Problem {
     // 910B path (adapter / tests) sets the real counts (cube 24, vector 48).
     int num_cube_cores = 1;      // AIC cores — matmul
     int num_vector_cores = 1;    // AIV cores — pointwise / reduction
-    // Per-core local-memory budgets in BYTES. 0 = fall back to
-    // fast_memory_capacity (so legacy element-count instances are unchanged).
+    // Per-core local-memory budgets in BYTES. 0 = fall back to the single
+    // fast_memory_capacity pool (so legacy element-count instances are
+    // unchanged). The 910B feasibility check forks on cube-vs-vector:
+    //   cube subgraph : operand strips -> L1, output accumulator -> L0c
+    //   vector subgraph: tile + ephemerals -> UB
     int64_t vec_capacity = 0;    // per-vector-core UB (910B: 192*1024)
-    int64_t cube_capacity = 0;   // per-cube-core L0c accumulator budget (910B: 128*1024)
+    int64_t cube_capacity = 0;   // per-cube-core L0c accumulator (910B: 128*1024)
+    int64_t l1_capacity = 0;     // per-cube-core L1/Mat operand pool (910B: 512*1024)
+    // Ping-pong double-buffering: reserve half of each STREAMING pool (L1 / UB)
+    // for prefetch of the next tile while the current one computes. Halves the
+    // effective L1 and UB budgets. Off => single-buffer (full budget).
+    bool double_buffer = false;
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }

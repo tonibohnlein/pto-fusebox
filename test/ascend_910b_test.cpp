@@ -40,7 +40,9 @@ static void RED(const char* l, bool c) {
 static void set_910b(Problem& p) {
     p.num_cube_cores = 24;
     p.num_vector_cores = 48;
-    p.cube_capacity = 128 * 1024;
+    p.cube_capacity = 128 * 1024;   // L0c accumulator (output)
+    p.l1_capacity = 512 * 1024;     // L1/Mat operand pool (cube)
+    p.vec_capacity = 192 * 1024;    // UB (vector)
 }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
@@ -214,8 +216,10 @@ static void test_E_matmul_2d_vs_1d() {
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("E: subgraph builds", (bool)sg);
-    double balanced = sg->compute_cost(TileConfig{256, 128, 512}).latency;  // w·h=32K, ratio 2:1
-    double skewed = sg->compute_cost(TileConfig{512, 64, 512}).latency;     // w·h=32K, ratio 8:1
+    // k chosen to fit the L1 operand pool (reload is k-independent — it streams
+    // the full K either way — so this still isolates the 2D-vs-1D tile shape).
+    double balanced = sg->compute_cost(TileConfig{256, 128, 128}).latency;  // w·h=32K, ratio 2:1
+    double skewed = sg->compute_cost(TileConfig{512, 64, 64}).latency;      // w·h=32K, ratio 8:1
     std::cout << "    balanced[w256,h128]=" << balanced << "  skewed[w512,h64]=" << skewed << "\n";
     CHECK("E: balanced (2D) tile reloads less than skewed (1D)", balanced < skewed);
 }
@@ -282,7 +286,9 @@ static void test_H_split_k_beats_spatial() {
     // Big [128,128] = 1 spatial tile -> model splits K across the 24 cube cores.
     // Small [16,16] = 64 spatial tiles -> fills cores spatially, but each tile
     // reloads its A row-strip + B col-strip => 8x the DDR traffic of the big tile.
-    double big_splitk = sg->compute_cost(TileConfig{128, 128, 2048}).latency;
+    // k fits L1 (big tile's operand strips are larger, so it needs a smaller k);
+    // reload streams the full K=2048 regardless, so the comparison still holds.
+    double big_splitk = sg->compute_cost(TileConfig{128, 128, 512}).latency;
     double small_spatial = sg->compute_cost(TileConfig{16, 16, 2048}).latency;
     std::cout << "    big[128x128]+split-K=" << big_splitk
               << "  small[16x16] spatial=" << small_spatial << "\n";
@@ -392,6 +398,48 @@ static void test_two_matmul() {
     }
 }
 
+// --- per-core two-pool working set: cube L1 k-tiling / vector UB / dbl-buffer --
+static void test_two_pool_working_set() {
+    std::cout << "[POOL] per-core two-pool: cube operands->L1 (k-tile), vector->UB, double-buffer\n";
+    // Cube: out[128,256] = L0c-max output, K=4096 FP32. Full-K operand strips
+    // (4096*(128+256)*4 = 6 MB) blow the 512 KB L1, so the DDR->L1 k-tile must
+    // shrink to fit — this is the cube k-tiling, set by the L1 bound.
+    Problem c;
+    c.tensors = {{4096, 256}, {128, 4096}, {128, 256}};  // A[K,M] B[N,K] -> C[N,M]
+    c.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 4096}};
+    c.fast_memory_capacity = 1 << 28;
+    c.slow_memory_bandwidth = 10;
+    c.native_w = 128;
+    c.native_h = 128;
+    set_910b(c);
+    auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
+    long long opnd = (long long)rc.config.k * (rc.config.w + rc.config.h) * 4;  // FP32 operand bytes
+    std::cout << "    cube out[128,256] K=4096: tile[" << rc.config.w << "x" << rc.config.h
+              << "] k=" << rc.config.k << " operand=" << opnd << "B (L1=" << (512 * 1024) << ")\n";
+    CHECK("POOL: cube k-tiled to fit L1 (k < full K=4096)", rc.config.k < 4096);
+    CHECK("POOL: cube operand strips fit L1 (512KB)", opnd <= 512 * 1024);
+    // Double-buffering halves L1 -> a strictly smaller k-tile.
+    Problem cd = c;
+    cd.double_buffer = true;
+    auto rcd = Subgraph::create(cd, DAG::build(cd), {0})->best_cost();
+    std::cout << "    double-buffer on: k=" << rcd.config.k << " (single-buffer k=" << rc.config.k << ")\n";
+    CHECK("POOL: double-buffering shrinks the cube k-tile (half L1)", rcd.config.k < rc.config.k);
+    // Vector: a pointwise tile (in + out resident) must fit the 192 KB UB.
+    Problem v;
+    v.tensors = {{512, 512}, {512, 512}};
+    v.ops = {{OpType::Pointwise, {0}, {1}, 100}};
+    v.fast_memory_capacity = 1 << 28;
+    v.slow_memory_bandwidth = 10;
+    v.native_w = 128;
+    v.native_h = 128;
+    set_910b(v);
+    auto rv = Subgraph::create(v, DAG::build(v), {0})->best_cost();
+    long long ub = (long long)rv.config.w * rv.config.h * 2 * 4;  // in + out, FP32
+    std::cout << "    vector tile[" << rv.config.w << "x" << rv.config.h << "] footprint=" << ub
+              << "B (UB=" << (192 * 1024) << ")\n";
+    CHECK("POOL: vector tile fits UB (192KB)", ub <= 192 * 1024);
+}
+
 // --- compare vs a hand-crafted pypto tiling (test_auto_tile_matmul_l0.py) -----
 // That pypto test fixes the L0-LEVEL tiling for a thin matmul: output tile
 // [16,64] in the Acc/L0c, the K=2048 contraction tiled by the 16-fractal, run
@@ -421,8 +469,11 @@ static void test_pypto_l0_comparison() {
     CHECK("PYPTO: our solver split-Ks the thin L0 matmul across cube cores", r.parallel_split > 1);
     // The output is too small to tile spatially — one DDR->L1 tile == the whole output.
     CHECK("PYPTO: our DDR->L1 tile keeps the full output (1 spatial tile)", r.num_spatial_tiles == 1);
-    // Our k spans the FULL contraction; the 16-fractal K-loop is pypto's L0 level.
-    CHECK("PYPTO: our k-tile is the full contraction (16-fractal is pypto's L0)", r.config.k == 2048);
+    // Three k-levels now compose: OUR DDR->L1 k-tile (largest k whose operand
+    // strips fit L1, < full K=2048), then AutoTileMatmulL0's 16-fractal K-loop
+    // inside each core, then the hardware. So our k is L1-bounded, not full K.
+    CHECK("PYPTO: our k is L1-tiled at the DDR->L1 level (16 <= k < K)",
+          r.config.k >= 16 && r.config.k < 2048);
 }
 
 // --- sweep output shape: spatial parallelism vs split-K transition -----------
@@ -526,6 +577,7 @@ static void test_visualize() {
 int main() {
     test_visualize();
     test_two_matmul();
+    test_two_pool_working_set();
     test_pypto_l0_comparison();
     test_sweep_matmul_dims();
     test_A_pointwise_memory_bound();

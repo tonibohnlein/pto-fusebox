@@ -114,6 +114,16 @@ private:
                                 const FlatSet<size_t> &retained_from_prev,
                                 const FlatSet<size_t> &retain_these) const;
 
+  // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
+  //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
+  //   vector: tile + ephemerals fit UB (vec_capacity)
+  // double_buffer halves the streaming pools (L1/UB). When the relevant 910B
+  // pool budgets are 0 (legacy/competition), falls back to the single
+  // fast_memory_capacity element-count check.
+  bool fits_on_chip(const TileConfig &cfg,
+                    const FlatSet<size_t> &retained_from_prev,
+                    const FlatSet<size_t> &retain_these) const;
+
   const Problem *prob_ = nullptr;
   const DAG *dag_ = nullptr;
   std::vector<size_t> ops_;

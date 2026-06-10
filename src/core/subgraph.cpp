@@ -612,12 +612,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   else
     sg.ks_cand_ = valid_candidates(sg.k_divides_);
 
-  // 910B cube tile: the DDR->L1 tile spans the FULL contraction (the cube
-  // accumulates all of K into the [w,h] L0c output). The 16-fractal k-loop is
-  // AutoTileMatmulL0's level, not ours — so don't enumerate sub-K k-tiles here
-  // (which only produced the meaningless k=16 display). 910B-only.
+  // 910B cube tile: enumerate 16-aligned k candidates (the DDR->L1 k-tile — how
+  // much of the contraction's operand strips fit in L1). The output accumulates
+  // across k-passes in L0c, so k doesn't change compute/parallelism; the L1
+  // working-set bound picks the largest feasible k (fewest passes). This is a
+  // DIFFERENT level from AutoTileMatmulL0's 16-fractal k-loop. 910B-only;
+  // valid_candidates already produced 16-aligned divisors of max_K_ above.
   if (matmul_910b)
-    sg.ks_cand_ = std::vector<int64_t>{std::max(sg.max_K_, (int64_t)1)};
+    sg.ks_cand_ = valid_candidates(sg.k_divides_);
 
   return sg;
 }
@@ -829,12 +831,46 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   return working_set_unchecked(cfg, retained_from_prev, retain_these);
 }
 
+// 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
+// the per-tile slice footprint IS the per-core footprint. Fork on cube/vector.
+bool Subgraph::fits_on_chip(const TileConfig &cfg,
+                            const FlatSet<size_t> &retained_from_prev,
+                            const FlatSet<size_t> &retain_these) const {
+  const bool cube = (prob_->num_cube_cores > 1) && has_matmul_ && prob_->l1_capacity > 0;
+  const bool vec = (prob_->num_vector_cores > 1) && !has_matmul_ && prob_->vec_capacity > 0;
+  if (!cube && !vec)  // legacy/competition: single element-count pool
+    return working_set_unchecked(cfg, retained_from_prev, retain_these) <=
+           prob_->fast_memory_capacity;
+
+  const int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
+  const int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
+  const int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
+
+  int64_t operand_bytes = 0;  // cube -> L1
+  int64_t ub_bytes = 0;       // vector -> UB (everything resident)
+  for (const auto &info : boundary_tensor_info_) {
+    if (retained_from_prev.count(info.id) || retain_these.count(info.id)) continue;
+    int64_t ht = info.eval_h_tiles(ntw, nk);
+    int64_t vt = info.eval_v_tiles(nth, nk);
+    const int64_t W = prob_->tensors[info.id].width, H = prob_->tensors[info.id].height;
+    ht = std::max(std::min(ht, W), (int64_t)1);
+    vt = std::max(std::min(vt, H), (int64_t)1);
+    const int64_t bytes = (W / ht) * (H / vt) * dtype_bytes(prob_->tensors[info.id].dtype);
+    ub_bytes += bytes;
+    if (!info.is_boundary_out) operand_bytes += bytes;  // inputs stream through L1
+  }
+  // Double-buffering reserves half of each STREAMING pool (L1/UB) for prefetch.
+  const double f = prob_->double_buffer ? 0.5 : 1.0;
+  if (cube)  // output -> L0c is bounded separately in is_valid_tiling (w*h*4)
+    return (double)operand_bytes <= (double)prob_->l1_capacity * f;
+  return (double)ub_bytes <= (double)prob_->vec_capacity * f;
+}
+
 bool Subgraph::is_feasible(const TileConfig &cfg,
                            const FlatSet<size_t> &retained_from_prev,
                            const FlatSet<size_t> &retain_these) const {
   return is_valid_tiling(cfg) &&
-         working_set_unchecked(cfg, retained_from_prev, retain_these) <=
-             prob_->fast_memory_capacity;
+         fits_on_chip(cfg, retained_from_prev, retain_these);
 }
 
 // ============================================================================
@@ -849,7 +885,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
   result.working_set = working_set(cfg, retained_from_prev, retain_these);
 
-  if (result.working_set > prob_->fast_memory_capacity)
+  if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
     return result;
   result.feasible = true;
 
@@ -1141,10 +1177,9 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
         // compute_cost → working_set → is_valid_tiling.
         TileConfig base_cfg{ww, hh, kk, SnakeDir::None};
         if (!is_valid_tiling(base_cfg)) continue;
-        // Working set depends on (w,h,k) only, not snake direction.
+        // Feasibility depends on (w,h,k) only, not snake direction.
         // Check once here to skip all snake variants for infeasible tiles.
-        int64_t ws = working_set_unchecked(base_cfg, retained_from_prev, retain_these);
-        if (ws > prob_->fast_memory_capacity) continue;
+        if (!fits_on_chip(base_cfg, retained_from_prev, retain_these)) continue;
         for (auto sd : snakes) {
           TileConfig cfg{ww, hh, kk, sd};
           auto r = compute_cost(cfg, retained_from_prev, retain_these);
@@ -1176,8 +1211,10 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
               take = false;
             } else if (r.cores_used != best.cores_used) {
               take = r.cores_used > best.cores_used;
-            } else {
+            } else if (ra != ba) {
               take = ra > ba;
+            } else {
+              take = r.config.k > best.config.k;  // larger k => fewer L1 passes
             }
           }
           if (take) best = r;

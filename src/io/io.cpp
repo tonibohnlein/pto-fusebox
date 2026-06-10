@@ -155,6 +155,8 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("num_vector_cores")) p.num_vector_cores = j["num_vector_cores"].get<int>();
     if (j.contains("cube_capacity"))    p.cube_capacity    = j["cube_capacity"].get<int64_t>();
     if (j.contains("vec_capacity"))     p.vec_capacity     = j["vec_capacity"].get<int64_t>();
+    if (j.contains("l1_capacity"))      p.l1_capacity      = j["l1_capacity"].get<int64_t>();
+    if (j.contains("double_buffer"))    p.double_buffer    = j["double_buffer"].get<bool>();
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
