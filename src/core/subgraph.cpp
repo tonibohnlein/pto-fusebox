@@ -612,6 +612,13 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   else
     sg.ks_cand_ = valid_candidates(sg.k_divides_);
 
+  // 910B cube tile: the DDR->L1 tile spans the FULL contraction (the cube
+  // accumulates all of K into the [w,h] L0c output). The 16-fractal k-loop is
+  // AutoTileMatmulL0's level, not ours — so don't enumerate sub-K k-tiles here
+  // (which only produced the meaningless k=16 display). 910B-only.
+  if (matmul_910b)
+    sg.ks_cand_ = std::vector<int64_t>{std::max(sg.max_K_, (int64_t)1)};
+
   return sg;
 }
 
@@ -645,7 +652,10 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     if (cfg.w < v && v % cfg.w != 0) return false;
   for (int64_t v : h_divides_)
     if (cfg.h < v && v % cfg.h != 0) return false;
-  if (!has_pw_sink_ || has_simple_epilogue_) {
+  // 910B cube tile spans the full contraction (k = max_K_, accumulated in L0c);
+  // the competition's per-op k-divisibility (temporal-tiling correctness) does
+  // not apply, and for a chained group max_K_ may exceed a smaller op's K.
+  if ((!has_pw_sink_ || has_simple_epilogue_) && !matmul_910b) {
     for (int64_t v : k_divides_) {
       // Per #75: cfg.k > op_K is physically undefined — there's nothing
       // to stream into the back half of the k-granule, and whatever gets
@@ -1031,11 +1041,13 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         result.parallel_split = (int)S;
         result.cores_used = (int)effS;
         result.compute_bound = (total_compute / effS) >= ddrS;
+        result.ddr_traffic = ddrS;
       } else {
         result.latency = lat1;
         result.parallel_split = 1;
         result.cores_used = (int)eff1;
         result.compute_bound = (total_compute / eff1) >= ddr1;
+        result.ddr_traffic = ddr1;
       }
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
@@ -1064,6 +1076,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       result.parallel_split = 1;
       result.cores_used = (int)eff;
       result.compute_bound = (total_compute / eff) >= total_io;
+      result.ddr_traffic = total_io;
       // Reduction split: when the spatial (non-reduced) tiles can't fill the
       // cores, split the REDUCED axis across cores — each core reduces its slice
       // to a partial, then partials merge across cores via DDR. The partial is
@@ -1081,6 +1094,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
           result.parallel_split = (int)S;
           result.cores_used = (int)effS;
           result.compute_bound = (total_compute / effS) >= (total_io + merge);
+          result.ddr_traffic = total_io + merge;
         }
       }
       result.latency = lat;
@@ -1104,6 +1118,13 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
   }
 
   CostResult best;
+  // 910B: among equal-latency tiles prefer the one with LESS DDR traffic — a
+  // big balanced tile that fills the cores via a little split-K beats tiny
+  // spatial tiles that nominally fill them but reload far more (and have no
+  // L1->L0 reuse). Competition (cores==1) keeps the original strict-min so its
+  // chosen tiles, and the 49/49 evaluator results, are byte-identical.
+  const bool parallel =
+      (has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores) > 1;
 
   for (int64_t ww : ws_cand_) {
     for (int64_t hh : hs_cand_) {
@@ -1120,9 +1141,18 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
         for (auto sd : snakes) {
           TileConfig cfg{ww, hh, kk, sd};
           auto r = compute_cost(cfg, retained_from_prev, retain_these);
-          if (r.feasible && r.latency < best.latency) {
-            best = r;
+          if (!r.feasible) continue;
+          bool take;
+          if (best.latency == std::numeric_limits<double>::infinity()) {
+            take = true;
+          } else if (!parallel) {
+            take = r.latency < best.latency;  // competition: strict-min, unchanged
+          } else {
+            const double tol = 1e-6 * std::max(1.0, best.latency);
+            take = (r.latency < best.latency - tol) ||
+                   (r.latency <= best.latency + tol && r.ddr_traffic < best.ddr_traffic);
           }
+          if (take) best = r;
         }
       }
     }

@@ -1,0 +1,35 @@
+{
+ "widths": [
+  512,
+  512
+ ],
+ "heights": [
+  512,
+  512
+ ],
+ "op_types": [
+  "Pointwise"
+ ],
+ "inputs": [
+  [
+   0
+  ]
+ ],
+ "outputs": [
+  [
+   1
+  ]
+ ],
+ "base_costs": [
+  100
+ ],
+ "fast_memory_capacity": 16777216,
+ "slow_memory_bandwidth": 10,
+ "native_granularity": [
+  128,
+  128
+ ],
+ "num_cube_cores": 24,
+ "num_vector_cores": 48,
+ "cube_capacity": 131072
+}

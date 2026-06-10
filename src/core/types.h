@@ -122,4 +122,7 @@ struct CostResult {
                                  // reduction split S. 1 = pure spatial parallelism.
     int cores_used = 1;          // effective cores busy (<= total unit cores)
     bool compute_bound = false;  // latency limited by compute (vs the shared DDR floor)
+    double ddr_traffic = 0.0;    // DDR bytes/BW for this tile (reload + merge). Secondary
+                                 // objective: among equal-latency tiles prefer less DDR
+                                 // (=> larger, balanced tiles with better L1/L0 reuse).
 };

@@ -392,6 +392,39 @@ static void test_two_matmul() {
     }
 }
 
+// --- compare vs a hand-crafted pypto tiling (test_auto_tile_matmul_l0.py) -----
+// That pypto test fixes the L0-LEVEL tiling for a thin matmul: output tile
+// [16,64] in the Acc/L0c, the K=2048 contraction tiled by the 16-fractal, run
+// SINGLE-core sequentially (tile.matmul -> tile.matmul_acc K-loop). Our solver
+// works one level UP (DDR->L1, multi-core): for the same thin matmul it keeps
+// the whole [16,64] output as ONE tile and SPLIT-Ks the contraction across the
+// 24 cube cores. The two compose: our cross-core split-K partial, then pypto's
+// per-core fractal K-loop inside each core. So our solver ADDS the parallelism
+// the single-core L0 pass cannot express; they don't conflict.
+static void test_pypto_l0_comparison() {
+    std::cout << "[PYPTO] test_auto_tile_matmul_l0 matmul (M16 N64 K2048) vs our solver\n";
+    // out[N=64, M=16] = A[K=2048, M=16] @ B[N=64, K=2048]; base = per-native FLOPs.
+    Problem p;
+    p.tensors = {{2048, 16}, {64, 2048}, {64, 16}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 2048}};
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p);
+    auto r = Subgraph::create(p, DAG::build(p), {0})->best_cost();
+    std::cout << "    pypto L0 (hand-crafted): out tile[16,64] Acc, K tiled by 16, 1 core sequential\n";
+    std::cout << "    our solver (DDR->L1)   : out tile[" << r.config.w << "," << r.config.h
+              << "] k=" << r.config.k << " spatial=" << r.num_spatial_tiles
+              << " split-K=" << r.parallel_split << " cores=" << r.cores_used << "\n";
+    // Thin output (16x64) << 24 cores => our level parallelizes via split-K.
+    CHECK("PYPTO: our solver split-Ks the thin L0 matmul across cube cores", r.parallel_split > 1);
+    // The output is too small to tile spatially — one DDR->L1 tile == the whole output.
+    CHECK("PYPTO: our DDR->L1 tile keeps the full output (1 spatial tile)", r.num_spatial_tiles == 1);
+    // Our k spans the FULL contraction; the 16-fractal K-loop is pypto's L0 level.
+    CHECK("PYPTO: our k-tile is the full contraction (16-fractal is pypto's L0)", r.config.k == 2048);
+}
+
 // --- sweep output shape: spatial parallelism vs split-K transition -----------
 static void test_sweep_matmul_dims() {
     std::cout << "[SWEEP] single matmul, compute-heavy K=512 — strategy vs output shape\n";
@@ -479,6 +512,7 @@ static void test_visualize() {
 int main() {
     test_visualize();
     test_two_matmul();
+    test_pypto_l0_comparison();
     test_sweep_matmul_dims();
     test_A_pointwise_memory_bound();
     test_B_thin_matmul_parallel();
