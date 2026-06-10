@@ -147,6 +147,10 @@ private:
   // never emits Reduction, so these stay default on the single-context path.
   bool has_reduction_ = false;
   int reduced_axis_ = 0;
+  // Full extent of the reduced axis (the un-reduced data width/height the tile
+  // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
+  // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).
+  int64_t reduced_extent_ = 0;
   bool has_pw_sink_ = false;
   bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;

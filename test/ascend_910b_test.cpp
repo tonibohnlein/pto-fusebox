@@ -160,17 +160,16 @@ static void test_softmax_reduction_schema() {
     CHECK("softmax: fused vector subgraph builds", (bool)fused_sg);
     double fused = fused_sg->best_cost().latency;
     CHECK("softmax: fused cost is finite (tiling feasible)", std::isfinite(fused));
-    // Split into the two natural halves {rowmax,exp} + {rowsum,div}: now the
-    // intermediate e[H,W] is a boundary tensor — written by the first group and
-    // re-read by the second (an extra [H,W] DDR round-trip). Fusing all four
-    // keeps e ephemeral, eliminating it. (Per-op split is degenerate here: a
-    // broadcast [1,H] input alone is infeasible, so we compare feasible halves.)
-    double half1 = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
-    double half2 = Subgraph::create(p, dag, {2, 3})->best_cost().latency;
-    std::cout << "    fused=" << fused << "  split halves=" << (half1 + half2)
-              << " (" << half1 << "+" << half2 << ")\n";
-    CHECK("softmax: fused < split halves (ephemeral e avoids a DDR round-trip)",
-          fused < half1 + half2);
+    // Each op as its own subgraph: the intermediates m/e/s all become boundary
+    // tensors that round-trip DDR. Fusing all four keeps them ephemeral. (The
+    // broadcast [1,H] inputs m/s now cost finitely as boundary inputs too — the
+    // role inference treats a broadcast axis as FIXED_1, not tiled.)
+    double separate = 0.0;
+    for (size_t i = 0; i < 4; i++)
+        separate += Subgraph::create(p, dag, {i})->best_cost().latency;
+    std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
+    CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
+          fused < separate);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------

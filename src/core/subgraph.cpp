@@ -57,10 +57,13 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.has_reduction_ = true;
       // Reduced axis = the dim that collapses (input extent -> 1 in the output).
       size_t in0 = prob.ops[i].inputs[0], out = prob.ops[i].output();
-      if (prob.tensors[out].width < prob.tensors[in0].width)
+      if (prob.tensors[out].width < prob.tensors[in0].width) {
         sg.reduced_axis_ = 1;  // width  (row reduction: [H,W] -> [H,1])
-      else if (prob.tensors[out].height < prob.tensors[in0].height)
+        sg.reduced_extent_ = std::max(sg.reduced_extent_, prob.tensors[in0].width);
+      } else if (prob.tensors[out].height < prob.tensors[in0].height) {
         sg.reduced_axis_ = 2;  // height (col reduction: [H,W] -> [1,W])
+        sg.reduced_extent_ = std::max(sg.reduced_extent_, prob.tensors[in0].height);
+      }
     }
   }
 
@@ -415,7 +418,18 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       TS out_v = tsrc[out].v;
 
       if (op.type == OpType::Pointwise) {
-        for (auto t : op.inputs) assign_or_check(t, out_h, out_v);
+        // Broadcast-aware: an input with extent 1 on an axis the output tiles
+        // is REUSED across all tiles, not split — so it is FIXED_1 on that axis,
+        // not FROM_NT*. Without this a [1,N] broadcast input looks like it has
+        // ntw/nth tiles but only one element, and is_valid_tiling rejects it
+        // (derived tile count > tensor dim).
+        for (auto t : op.inputs) {
+          TS th = (prob.tensors[t].width == 1 && prob.tensors[out].width > 1)
+                      ? TS::FIXED_1 : out_h;
+          TS tv = (prob.tensors[t].height == 1 && prob.tensors[out].height > 1)
+                      ? TS::FIXED_1 : out_v;
+          assign_or_check(t, th, tv);
+        }
       } else if (op.type == OpType::Reduction) {
         // A reduction has ONE input and collapses one axis: the input is read
         // FULL along the reduced axis (FIXED_1) and follows the output tiling
@@ -584,9 +598,9 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // the native cap on that axis, like a cube tile). Only the non-reduced axis
   // is tiled, giving the spatial (per-core) parallelism. 910B-only.
   if (sg.has_reduction_ && sg.reduced_axis_ == 1)
-    sg.ws_cand_ = std::vector<int64_t>{sg.out_W_};
+    sg.ws_cand_ = std::vector<int64_t>{std::max(sg.out_W_, sg.reduced_extent_)};
   else if (sg.has_reduction_ && sg.reduced_axis_ == 2)
-    sg.hs_cand_ = std::vector<int64_t>{sg.out_H_};
+    sg.hs_cand_ = std::vector<int64_t>{std::max(sg.out_H_, sg.reduced_extent_)};
   // PW-sink subgraphs: force k = output_K_ so nk == 1 (no temporal tiling).
   //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
   //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
