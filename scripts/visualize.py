@@ -240,8 +240,13 @@ def generate_solution_dot(input_data, output_data, out_filepath):
                 else:
                     snake_str = "ColMajor"
             
+            split_list = output_data.get('splits', [])
+            split = split_list[first_step] if len(split_list) > first_step else 1
+            # split>1 = parallel split-K (cube) / reduction split (vector) across cores
+            split_str = f"\\nsplit-K x{split}" if split and split > 1 else ""
+
             step_str = ",".join(map(str, steps))
-            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}\\nLat: {lat:.1f}\\n{snake_str}"
+            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}{split_str}\\nLat: {lat:.1f}\\n{snake_str}"
             lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
         else:
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"

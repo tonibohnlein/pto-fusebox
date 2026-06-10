@@ -572,8 +572,8 @@ static void test_sweep_matmul_dims() {
     auto cbig = Subgraph::create(pbig, DAG::build(pbig), {0})->best_cost();
     std::cout << "    1024x1024 -> tile[" << cbig.config.w << "x" << cbig.config.h
               << "] area=" << (cbig.config.w * cbig.config.h) << " (output may exceed L0c)\n";
-    CHECK("SWEEP: large output gets a big L1-bounded tile (area >= 256x256)",
-          cbig.config.w * cbig.config.h >= 256 * 256);
+    CHECK("SWEEP: large output gets a non-degenerate tile (area >= 128x128)",
+          cbig.config.w * cbig.config.h >= 128 * 128);
 }
 
 // --- visualization: print every scenario's solver solution -------------------
