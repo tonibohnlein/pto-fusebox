@@ -1055,17 +1055,35 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // output (#native tiles) — for a CHAINED group the intermediate has a
       // different shape than the sink, so a single sink-scaled basis would
       // mis-count it. Single matmul: output == sink, identical to before.
+      // In-subgraph produced/consumed sets: an operand is ephemeral (on-chip) iff
+      // produced within the subgraph; an op is a boundary-output op iff its output
+      // is not consumed within the subgraph.
+      FlatSet<size_t> produced, consumed;
+      for (auto i : ops_) {
+        produced.insert(prob_->ops[i].output());
+        for (auto t : prob_->ops[i].inputs) consumed.insert(t);
+      }
       double total_compute = 0.0;
       for (auto i : ops_) {
         if (prob_->ops[i].type != OpType::MatMul) continue;
         size_t o = prob_->ops[i].output();
+        // RECOMPUTE under the M-partition: an INTERMEDIATE matmul's output is a
+        // sink left-operand band, shared by all sink COLUMN-tiles in the same
+        // M-band. When the sink fills the cores over M alone (num_tw==1) the band
+        // is produced once — truly ephemeral. When M can't fill the cores and the
+        // sink tiles over N (num_tw>1), each owning core recomputes the band, so
+        // the intermediate compute is paid num_tw times. (The alternative — share
+        // the band across cores via DDR — is just splitting the subgraph, costed
+        // separately; the partitioner picks the cheaper.) Boundary/sink outputs
+        // are produced once: factor 1.
+        const double recompute = consumed.count(o) ? (double)num_tw : 1.0;
         if (prob_->cube_compute_cost > 0) {
           // 910B machine model: count the 16x16x16 cube fractals the matmul
           // implies = (out_W/16)(out_H/16)(K/16), times the per-fractal cube cost.
           const double Km = (double)prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
           const double fractals = ((double)prob_->tensors[o].width / 16.0) *
                                   ((double)prob_->tensors[o].height / 16.0) * (Km / 16.0);
-          total_compute += fractals * (double)prob_->cube_compute_cost;
+          total_compute += fractals * (double)prob_->cube_compute_cost * recompute;
         } else {
           // Legacy: per-op base_cost interpreted as per-native-128-tile cost.
           total_compute += (double)prob_->ops[i].base_cost *
@@ -1090,14 +1108,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       //     lands on the subgraph output only.
       const double M = (double)out_H_, N = (double)out_W_;
       auto sat = [&](double cores) { return std::max(1.0, (double)n_cores / cores); };
-      // In-subgraph produced/consumed sets: an operand is ephemeral (on-chip)
-      // iff produced within the subgraph; an op is a boundary-output op iff its
-      // output is not consumed within the subgraph.
-      FlatSet<size_t> produced, consumed;
-      for (auto i : ops_) {
-        produced.insert(prob_->ops[i].output());
-        for (auto t : prob_->ops[i].inputs) consumed.insert(t);
-      }
+      // (produced/consumed sets built above for the recompute factor are reused.)
       // Sink output store = sum over boundary outputs, byte-based (intermediates
       // are is_internally_produced and excluded).
       double out_store = 0.0;

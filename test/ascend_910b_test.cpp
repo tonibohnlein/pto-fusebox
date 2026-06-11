@@ -362,8 +362,10 @@ static Problem mk_chained(int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t
 // --- two matmuls: chained fusion compute is sane; split-K is per-matmul -------
 static void test_two_matmul() {
     std::cout << "[2MM] two-matmul subgraph: chained fusion compute + per-matmul split-K\n";
-    // Chained, compute-heavy. base_cost = native^2 * K (per-native-tile FLOPs).
-    auto p = mk_chained(128, 256, 128, 64, 16384 * 256, 16384 * 128);
+    // Chained, FAT sink E[128,256] (fills the cores so the fused case needs no
+    // heavy split-K), large intermediate C[256,256]. base_cost ignored (geometry).
+    auto p = mk_chained(256, 512, 256, 128, 16384 * 512, 16384 * 256);
+    p.cube_compute_cost = 1000;  // DDR-relevant regime (see test_fusion_decision_matrix)
     DAG dag = DAG::build(p);
     double m1 = Subgraph::create(p, dag, {0})->best_cost().latency;
     double m2 = Subgraph::create(p, dag, {1})->best_cost().latency;
@@ -374,12 +376,12 @@ static void test_two_matmul() {
     CHECK("2MM: chained fused >= each part (compute counted per-matmul)",
           fused >= m1 - 0.5 && fused >= m2 - 0.5);
     // BSP model: the intermediate T is EPHEMERAL when fused (kept on-chip via the
-    // M-partition, no DDR round-trip). Separately, mm2 must reload T from DDR. So
-    // fusion strictly helps — fused < M1 + M2 — even when largely compute-bound.
-    // (Under the old hidden-merge model these were equal; the on-chip intermediate
-    // benefit was invisible.) The fused floor is the pure compute backbone
-    // (ΣW/cores) with no merge tail, since the sink fills the cores spatially.
-    CHECK("2MM: chained fused < M1+M2 (fusion keeps the intermediate on-chip)",
+    // M-partition, no DDR round-trip), so separately mm2 must reload T from DDR.
+    // With a fat sink the fused case parallelizes mostly over M (little recompute),
+    // so fusion strictly helps — fused < M1 + M2. (For a THIN sink the fused case
+    // is forced into split-K or N-tile recompute and can LOSE — see test_fusion_
+    // decision_matrix; that is the correct, faithful outcome, not a regression.)
+    CHECK("2MM: chained (fat sink) fused < M1+M2 (keeps intermediate on-chip)",
           fused < m1 + m2 - 0.5);
 
     // (2) INDEPENDENT shared-input: Q=X@Wq, K=X@Wk (same X). Both cube, no
@@ -706,9 +708,49 @@ static void test_visualize() {
     std::cout << "======================================================================\n\n";
 }
 
+// --- fusion decision matrix: fuse only when it strictly helps -----------------
+// Encodes the BSP + recompute model's verdicts. A fused chain is parallelized
+// over the SHARED dim M; an intermediate is ephemeral ONLY when M fills the
+// cores (num_tw==1). When the sink must tile over N (M too small, or a thin
+// sink), each sink column-tile recomputes the intermediate band (compute x
+// num_tw) — so fusion can LOSE to splitting, which round-trips the intermediate
+// via DDR instead. The partitioner picks the cheaper; these assert which wins.
+static void test_fusion_decision_matrix() {
+    std::cout << "[FDM] fusion decision matrix (fuse iff strictly cheaper than split)\n";
+    auto cmp = [](const char* tag, int64_t M, int64_t K1, int64_t N1, int64_t N2) {
+        auto p = mk_chained(M, K1, N1, N2, 1000, 1000);
+        // Lower the cube cost into the regime where DDR matters (matches the
+        // benchmarks). At set_910b's 4096 the chain is so compute-bound that the
+        // intermediate's round-trip is fully hidden and fusion is latency-neutral
+        // for ALL shapes — the fuse-vs-split decision only varies once DDR binds.
+        p.cube_compute_cost = 1000;
+        DAG dag = DAG::build(p);
+        auto fz = Subgraph::create(p, dag, {0, 1});
+        double f = fz ? fz->best_cost().latency : 1e18;
+        double s = Subgraph::create(p, dag, {0})->best_cost().latency +
+                   Subgraph::create(p, dag, {1})->best_cost().latency;
+        std::cout << "    " << tag << ": fused=" << f << " split=" << s
+                  << (f < s ? "  -> FUSE" : "  -> SPLIT") << "\n";
+        return std::pair<double, double>(f, s);
+    };
+    // FAT sink, big intermediate, M fills cores -> fusion saves the C round-trip.
+    auto win = cmp("fuse-wins (fat sink, big C)", 256, 512, 256, 128);
+    CHECK("FDM: fat-sink chain FUSES (fused < split)", win.first < win.second - 0.5);
+    // Small M -> sink tiles over N2 -> intermediate recomputed per column-tile ->
+    // fusion costs more than splitting (which round-trips C via DDR once).
+    auto sm = cmp("small-M (N2-tiled, recompute)", 64, 256, 256, 512);
+    CHECK("FDM: small-M chain SPLITS (recompute makes fusion lose)", sm.first > sm.second + 0.5);
+    // Wide intermediate (huge C compute): recomputing it per column-tile dwarfs
+    // its DDR round-trip -> split.
+    auto wide = cmp("wide-C (huge intermediate)", 256, 512, 2048, 256);
+    CHECK("FDM: wide-intermediate chain SPLITS (recompute >> round-trip)",
+          wide.first > wide.second + 0.5);
+}
+
 int main() {
     test_visualize();
     test_two_matmul();
+    test_fusion_decision_matrix();
     test_two_pool_working_set();
     test_geometry_compute();
     test_pypto_l0_comparison();
