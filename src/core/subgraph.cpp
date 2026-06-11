@@ -1108,19 +1108,14 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       }
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
-      // the shared full-tensor floor (no cross-core reload to model here).
-      // For a reduction subgraph the reduced axis is fixed (full extent), so the
-      // element-wise work is INVARIANT to tiling — use the summed base_cost and
-      // avoid the native padding penalty on the small non-reduced tiles we need
-      // to fill cores (same rationale as the matmul fix). num_tiles is then the
-      // non-reduced (spatial) tile count, since the reduced axis is untiled.
-      double total_compute;
-      if (has_reduction_) {
-        total_compute = 0.0;
-        for (auto i : ops_) total_compute += (double)prob_->ops[i].base_cost;
-      } else {
-        total_compute = (double)num_tiles * nk * comp_per_step;
-      }
+      // the shared full-tensor floor (no cross-core reload to model here). The
+      // element-wise work is INVARIANT to tiling (each element is touched once),
+      // so use the summed base_cost — NOT num_tiles*op_scale, whose native-128
+      // padding would inflate compute for the small sub-128 tiles we need to fill
+      // the cores, wrongly favouring fewer tiles / fewer cores. (Same fix as the
+      // matmul path; applies to pointwise and reduction alike.)
+      double total_compute = 0.0;
+      for (auto i : ops_) total_compute += (double)prob_->ops[i].base_cost;
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       double total_io = 0.0;
       for (const auto& info : boundary_tensor_info_) {
