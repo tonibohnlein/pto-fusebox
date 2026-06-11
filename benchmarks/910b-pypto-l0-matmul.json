@@ -35,5 +35,6 @@
  "num_cube_cores": 24,
  "num_vector_cores": 48,
  "cube_capacity": 131072,
- "l1_capacity": 524288
+ "l1_capacity": 524288,
+ "vec_capacity": 196608
 }

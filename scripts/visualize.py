@@ -6,6 +6,29 @@ def load_json(filepath):
     with open(filepath, 'r') as f:
         return json.load(f)
 
+def hw_legend(d):
+    """Instance-legend label. Lists the Ascend 910B per-die specs when the 910B
+    fields are present, else the single-pool competition info."""
+    gran = d.get('native_granularity', 'Unknown')
+    if isinstance(gran, list):
+        gran = "x".join(map(str, gran))
+    bw = d.get('slow_memory_bandwidth', '?')
+    if d.get('num_cube_cores', 1) > 1 or d.get('num_vector_cores', 1) > 1:
+        kb = lambda x: f"{d.get(x, 0) // 1024}KB"
+        lines = [
+            "Ascend 910B (1 die)",
+            f"Cube/AIC: {d.get('num_cube_cores')} cores   Vector/AIV: {d.get('num_vector_cores')} cores",
+            f"L1/Mat (operands): {kb('l1_capacity')}   L0c/Acc (output): {kb('cube_capacity')}",
+            f"UB (vector): {kb('vec_capacity')}",
+            f"HBM bandwidth: {bw}   double-buffer: {'on' if d.get('double_buffer') else 'off'}",
+            f"Cube fractal: 16x16x16   tile align: 16",
+        ]
+    else:
+        lines = [f"Fast Mem: {d.get('fast_memory_capacity', 0) / 1000.0:.1f} K",
+                 f"Slow Mem BW: {bw}",
+                 f"Native Granularity: {gran}"]
+    return "Instance Info\\n" + "\\n".join(lines)
+
 def generate_instance_dot(input_data, out_filepath):
     """Generates a DOT file for the raw problem instance."""
     lines = [
@@ -22,7 +45,7 @@ def generate_instance_dot(input_data, out_filepath):
     if isinstance(gran, list):
         gran = "x".join(map(str, gran))
     
-    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} K\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    info_label = hw_legend(input_data)
     lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 
@@ -77,7 +100,7 @@ def generate_solution_dot(input_data, output_data, out_filepath):
     if isinstance(gran, list):
         gran = "x".join(map(str, gran))
     
-    info_label = f"Instance Info\\nFast Mem: {cap_kb:.1f} K\\nSlow Mem BW: {bw}\\nNative Granularity: {gran}"
+    info_label = hw_legend(input_data)
     lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 

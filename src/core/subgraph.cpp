@@ -1070,8 +1070,12 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const double M = (double)out_H_, N = (double)out_W_, K = (double)max_K_;
       const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h);
       const double out_store = M * N;
+      // DDR bandwidth scales with the cores issuing DMA, saturating at n_cores:
+      // eff_bw = HBM * min(1, cores/n_cores), so a DDR-bound tile on too few cores
+      // pays HBM/cores, not the full floor. One core can't saturate HBM.
+      auto sat = [&](double cores) { return std::max(1.0, (double)n_cores / cores); };
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
-      const double ddr1 = (reload + out_store) * inv_B;
+      const double ddr1 = (reload + out_store) * inv_B * sat(eff1);
       const double lat1 = std::max(total_compute / eff1, ddr1);
       // Split-K: one output tile parallelizes up to K/16 ways (one partial per
       // 16-deep fractal of the contraction). Fill up to n_cores of the
@@ -1083,7 +1087,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const int64_t cores_used = std::min<int64_t>(n_cores, num_tiles * kfrac);
       const int64_t S = std::max<int64_t>(1, (cores_used + num_tiles - 1) / num_tiles);  // avg split/tile
       const double effS = (double)cores_used;
-      const double ddrS = (reload + (double)S * out_store) * inv_B;
+      const double ddrS = (reload + (double)S * out_store) * inv_B * sat(effS);
       const double latS = std::max(total_compute / effS, ddrS);
       if (S > 1 && latS < lat1) {  // split-K only if it helps
         result.latency = latS;
@@ -1124,10 +1128,13 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         if (info.is_boundary_out && !retain_these.count(info.id))
           total_io += (double)info.full_size * inv_B;
       }
-      double lat = std::max(total_compute / eff, total_io);
+      // Same DDR bandwidth-saturation factor as the cube: HBM needs many cores'
+      // DMA engines to saturate, so a DDR-bound tile on too few vector cores pays.
+      const double sat_v = std::max(1.0, (double)n_cores / eff);
+      double lat = std::max(total_compute / eff, total_io * sat_v);
       result.parallel_split = 1;
       result.cores_used = (int)eff;
-      result.compute_bound = (total_compute / eff) >= total_io;
+      result.compute_bound = (total_compute / eff) >= total_io * sat_v;
       result.ddr_traffic = total_io;
       // Reduction split: when the spatial (non-reduced) tiles can't fill the
       // cores, split the REDUCED axis across cores — each core reduces its slice
