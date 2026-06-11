@@ -1059,9 +1059,19 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       for (auto i : ops_) {
         if (prob_->ops[i].type != OpType::MatMul) continue;
         size_t o = prob_->ops[i].output();
-        total_compute += (double)prob_->ops[i].base_cost *
-                         ((double)prob_->tensors[o].width / prob_->native_w) *
-                         ((double)prob_->tensors[o].height / prob_->native_h);
+        if (prob_->cube_compute_cost > 0) {
+          // 910B machine model: count the 16x16x16 cube fractals the matmul
+          // implies = (out_W/16)(out_H/16)(K/16), times the per-fractal cube cost.
+          const double Km = (double)prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
+          const double fractals = ((double)prob_->tensors[o].width / 16.0) *
+                                  ((double)prob_->tensors[o].height / 16.0) * (Km / 16.0);
+          total_compute += fractals * (double)prob_->cube_compute_cost;
+        } else {
+          // Legacy: per-op base_cost interpreted as per-native-128-tile cost.
+          total_compute += (double)prob_->ops[i].base_cost *
+                           ((double)prob_->tensors[o].width / prob_->native_w) *
+                           ((double)prob_->tensors[o].height / prob_->native_h);
+        }
       }
       // Distribution-aware reload MNK*(1/w + 1/h) favors big, balanced (2D)
       // tiles — each output tile streams its A row-strip + B col-strip once, so
@@ -1119,7 +1129,23 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // the cores, wrongly favouring fewer tiles / fewer cores. (Same fix as the
       // matmul path; applies to pointwise and reduction alike.)
       double total_compute = 0.0;
-      for (auto i : ops_) total_compute += (double)prob_->ops[i].base_cost;
+      for (auto i : ops_) {
+        if (prob_->vector_compute_cost > 0) {
+          // 910B machine model: the vector unit processes vector_lanes elements
+          // per SIMD step, so compute = ceil(#elements / lanes) * per-step cost.
+          // #elements = the op's largest tensor (the [H,W] grid). lanes is a
+          // machine parameter (SIMD width) to calibrate; default 1 (per-element).
+          int64_t elems = (int64_t)prob_->tensors[prob_->ops[i].output()].width *
+                          prob_->tensors[prob_->ops[i].output()].height;
+          for (auto t : prob_->ops[i].inputs)
+            elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
+          const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
+          const int64_t steps = (elems + lanes - 1) / lanes;
+          total_compute += (double)steps * (double)prob_->vector_compute_cost;
+        } else {
+          total_compute += (double)prob_->ops[i].base_cost;  // legacy
+        }
+      }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       double total_io = 0.0;
       for (const auto& info : boundary_tensor_info_) {

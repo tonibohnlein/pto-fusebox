@@ -398,6 +398,50 @@ static void test_two_matmul() {
     }
 }
 
+// --- machine-cost compute model: geometry x per-step cost (910B) --------------
+// Cube compute = (#16x16x16 fractals) * cube_compute_cost. Vector compute =
+// ceil(#elements / vector_lanes) * vector_compute_cost. Both are MACHINE params
+// (not per-op base_cost). Opt-in: when the params are 0 the model falls back to
+// base_cost (so the rest of the suite is unchanged).
+static void test_geometry_compute() {
+    std::cout << "[GEOM] machine-cost compute: cube=#fractals*cost, vector=#steps*cost\n";
+    // Cube: out[128,128], K=2048 -> 128/16 * 128/16 * 2048/16 = 8192 fractals.
+    Problem c;
+    c.tensors = {{2048, 128}, {128, 2048}, {128, 128}};
+    c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost IGNORED when cube_compute_cost set
+    c.fast_memory_capacity = 1 << 26; c.slow_memory_bandwidth = 10; c.native_w = 128; c.native_h = 128;
+    set_910b(c);
+    c.cube_compute_cost = 1000;  // per fractal (machine param)
+    auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
+    const double fractals = 128.0 / 16 * 128.0 / 16 * 2048.0 / 16;  // 8192
+    const double exp_c = fractals * 1000.0 / rc.cores_used;
+    std::cout << "    cube: fractals=" << (long long)fractals << " cores=" << rc.cores_used
+              << " -> lat=" << rc.latency << " (expect " << exp_c << ")\n";
+    CHECK("GEOM: cube compute = #fractals * cube_cost (compute-bound)",
+          rc.compute_bound && std::abs(rc.latency - exp_c) < 1.0);
+
+    // Vector: pointwise [512,512] -> 262144 elements; lanes=256 -> 1024 SIMD steps.
+    auto run_vec = [](int64_t lanes) {
+        Problem v;
+        v.tensors = {{512, 512}, {512, 512}};
+        v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
+        v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10; v.native_w = 128; v.native_h = 128;
+        set_910b(v);
+        v.vector_compute_cost = 10000;  // per SIMD step
+        v.vector_lanes = lanes;
+        return Subgraph::create(v, DAG::build(v), {0})->best_cost();
+    };
+    auto rv = run_vec(256);
+    const double steps = std::ceil(512.0 * 512 / 256);  // 1024
+    const double exp_v = steps * 10000.0 / rv.cores_used;
+    std::cout << "    vector: 262144 elems / 256 lanes = " << (long long)steps << " steps cores="
+              << rv.cores_used << " -> lat=" << rv.latency << " (expect " << exp_v << ")\n";
+    CHECK("GEOM: vector compute = ceil(#elements/lanes) * step_cost (compute-bound)",
+          rv.compute_bound && std::abs(rv.latency - exp_v) < 1.0);
+    // Doubling the lanes halves the SIMD steps -> halves the vector compute.
+    CHECK("GEOM: 2x vector_lanes halves the vector compute", run_vec(128).latency > rv.latency * 1.9);
+}
+
 // --- compare our DDR->L1 tile vs pypto ChooseL0Tile (mind the two levels!) -----
 // Memory chain: DDR -> L1/Mat(512KB) -> L0a/L0b(64KB ea) -> cube -> L0c(128KB acc).
 // pypto ChooseL0Tile (tests/ut/ir/transforms/test_{auto_tile_matmul_l0,
@@ -634,6 +678,7 @@ int main() {
     test_visualize();
     test_two_matmul();
     test_two_pool_working_set();
+    test_geometry_compute();
     test_pypto_l0_comparison();
     test_pypto_tiling_comparison();
     test_sweep_matmul_dims();

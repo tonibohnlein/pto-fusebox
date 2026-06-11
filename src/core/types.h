@@ -81,6 +81,17 @@ struct Problem {
     int64_t vec_capacity = 0;    // per-vector-core UB (910B: 192*1024)
     int64_t cube_capacity = 0;   // per-cube-core L0c accumulator (910B: 128*1024)
     int64_t l1_capacity = 0;     // per-cube-core L1/Mat operand pool (910B: 512*1024)
+    // 910B compute is derived from TILE GEOMETRY x a machine cost, NOT a per-op
+    // padded-native-tile base_cost (the competition model). cube_compute_cost is
+    // the time for one 16x16x16 cube fractal; vector_compute_cost is the time per
+    // vector element. 0 => fall back to the per-op base_cost (legacy/competition).
+    // cube does one 16x16x16 fractal per step; vector processes vector_lanes
+    // elements per SIMD step. compute = (#steps) x (per-step cost). vector_lanes
+    // is a machine parameter (SIMD width) to be calibrated later; 0 => treat as 1
+    // (per-element). The cube step is fixed at the 16x16x16 fractal (hardware).
+    int64_t cube_compute_cost = 0;    // cost per 16x16x16 cube fractal step
+    int64_t vector_compute_cost = 0;  // cost per vector SIMD step
+    int64_t vector_lanes = 0;         // elements per vector SIMD step (0 => 1)
     // Ping-pong double-buffering: reserve half of each STREAMING pool (L1 / UB)
     // for prefetch of the next tile while the current one computes. Halves the
     // effective L1 and UB budgets. Off => single-buffer (full budget).

@@ -174,6 +174,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("vec_capacity"))     p.vec_capacity     = j["vec_capacity"].get<int64_t>();
     if (j.contains("l1_capacity"))      p.l1_capacity      = j["l1_capacity"].get<int64_t>();
     if (j.contains("double_buffer"))    p.double_buffer    = j["double_buffer"].get<bool>();
+    if (j.contains("cube_compute_cost"))   p.cube_compute_cost   = j["cube_compute_cost"].get<int64_t>();
+    if (j.contains("vector_compute_cost")) p.vector_compute_cost = j["vector_compute_cost"].get<int64_t>();
+    if (j.contains("vector_lanes"))        p.vector_lanes        = j["vector_lanes"].get<int64_t>();
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
