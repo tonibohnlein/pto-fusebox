@@ -222,6 +222,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["subgraphs"]         = json::array();
     j["granularities"]     = json::array();
     j["splits"]            = json::array();  // 910B parallel split-K / reduction split per step
+    j["cores"]             = json::array();  // 910B cube/vector cores used per step
     j["tensors_to_retain"] = json::array();
     j["traversal_orders"]  = json::array();
     j["subgraph_latencies"] = json::array();
@@ -232,9 +233,13 @@ void write_solution(const std::string& filename, const Solution& sol) {
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
-        // Parallel split for this tile (cube split-K / vector reduction split);
-        // 1 = pure spatial. Computed for the chosen config (no re-search).
-        j["splits"].push_back(step.subgraph.compute_cost(cfg).parallel_split);
+        // Parallel split + cores used for this tile (cube split-K / vector
+        // reduction split; 1 = pure spatial). Computed for the chosen config.
+        {
+            auto cr = step.subgraph.compute_cost(cfg);
+            j["splits"].push_back(cr.parallel_split);
+            j["cores"].push_back(cr.cores_used);
+        }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
 
