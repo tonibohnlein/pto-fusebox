@@ -1078,8 +1078,18 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // a square/large tile reloads less. Split-K across cores is the fallback
       // when spatial tiles can't fill the cores, paying a per-partial merge.
       const double M = (double)out_H_, N = (double)out_W_, K = (double)max_K_;
-      const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h);
-      const double out_store = M * N;
+      // DDR is byte-based: operand strips are re-streamed in the matmul's operand
+      // dtype (e.g. BF16=2B), the output is stored in its dtype. (Representative
+      // dtype from the first matmul; uniform in practice.)
+      int op_bytes = 4, out_bytes = 4;
+      for (auto i : ops_)
+        if (prob_->ops[i].type == OpType::MatMul) {
+          op_bytes = dtype_bytes(prob_->tensors[prob_->ops[i].inputs[0]].dtype);
+          out_bytes = dtype_bytes(prob_->tensors[prob_->ops[i].output()].dtype);
+          break;
+        }
+      const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h) * op_bytes;
+      const double out_store = M * N * out_bytes;
       // DDR bandwidth scales with the cores issuing DMA, saturating at n_cores:
       // eff_bw = HBM * min(1, cores/n_cores), so a DDR-bound tile on too few cores
       // pays HBM/cores, not the full floor. One core can't saturate HBM.
@@ -1147,12 +1157,13 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         }
       }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
-      double total_io = 0.0;
+      double total_io = 0.0;  // byte-based: each boundary tensor in its own dtype
       for (const auto& info : boundary_tensor_info_) {
+        const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
         if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
-          total_io += (double)info.full_size * inv_B;
+          total_io += bytes * inv_B;
         if (info.is_boundary_out && !retain_these.count(info.id))
-          total_io += (double)info.full_size * inv_B;
+          total_io += bytes * inv_B;
       }
       // Same DDR bandwidth-saturation factor as the cube: HBM needs many cores'
       // DMA engines to saturate, so a DDR-bound tile on too few vector cores pays.

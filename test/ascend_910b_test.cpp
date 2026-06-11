@@ -47,7 +47,7 @@ static void set_910b(Problem& p) {
     // fractals * cube_compute_cost; vector = ceil(#elements/vector_lanes) *
     // vector_compute_cost. These are PLACEHOLDER values (relative units) until
     // grounded from real 910B specs; the per-op base_cost is now ignored.
-    p.cube_compute_cost = 1000;      // per 16x16x16 cube fractal
+    p.cube_compute_cost = 4096;     // per 16x16x16 cube fractal
     p.vector_compute_cost = 1;      // per vector SIMD step
     p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
 }
@@ -68,8 +68,8 @@ static void test_A_pointwise_memory_bound() {
     CHECK("A: subgraph builds", (bool)sg);
     double lat = sg->best_cost().latency;
     std::cout << "    best latency = " << lat << "\n";
-    // load T0 + store T1 = 2 * 512*512/10 = 52428.8 — independent of tile size.
-    CHECK_EQ("A: latency == DDR floor (52428.8)", lat, 52428.8);
+    // byte-based: (load T0 + store T1) = 2 * 512*512 * 4B / 10 = 209715.2 (tile-invariant).
+    CHECK_EQ("A: latency == DDR floor (byte-based, 209715.2)", lat, 209715.2);
 }
 
 // --- B: thin matmul — should parallelize via split-K across cube cores --------
@@ -91,7 +91,7 @@ static void test_B_thin_matmul_parallel() {
     // Geometry compute = #16x16x16 fractals * cube_compute_cost; one core alone
     // would take that whole serial time. Split-K across the 24 cube cores divides
     // it ~24x. (Absolute value depends on the machine cost; assert the parallelism.)
-    const double serial = (128.0 / 16) * (128.0 / 16) * (2048.0 / 16) * 1000.0;  // #fractals * cube_cost
+    const double serial = (128.0 / 16) * (128.0 / 16) * (2048.0 / 16) * p.cube_compute_cost;  // #fractals * cube_cost
     std::cout << "    best latency = " << r.latency << " cores=" << r.cores_used
               << " split=" << r.parallel_split << " (1-core serial=" << serial << ")\n";
     CHECK("B: split-K fills the 24 cube cores", r.cores_used == 24 && r.parallel_split > 1);
@@ -248,15 +248,15 @@ static void test_F_split_k() {
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
-    Problem p1 = p;
-    p1.num_cube_cores = 1;
-    p1.num_vector_cores = 1;  // single-context baseline
     DAG dag = DAG::build(p);
     double par = Subgraph::create(p, dag, {0})->best_cost().latency;
-    DAG dag1 = DAG::build(p1);
-    double single = Subgraph::create(p1, dag1, {0})->best_cost().latency;
-    std::cout << "    24 cores (split-K)=" << par << "  1 core=" << single << "\n";
-    CHECK("F: split-K gives a large speedup vs single core", par < single / 5.0);
+    // Geometry serial = the whole fractal compute on one cube core. Split-K across
+    // the 24 cube cores must divide it ~24x. Compare against the geometry serial,
+    // not a cores=1 competition baseline (different model: base_cost padded-native
+    // tile vs fractal geometry — not apples-to-apples).
+    const double serial = (128.0 / 16) * (128.0 / 16) * (2048.0 / 16) * p.cube_compute_cost;
+    std::cout << "    24 cores (split-K)=" << par << "  1-core serial=" << serial << "\n";
+    CHECK("F: split-K gives a large speedup vs single core", par < serial / 5.0);
 }
 
 // --- G: cube tile can exceed native 128 (L0c bound, not the native cap) -------
@@ -424,10 +424,10 @@ static void test_geometry_compute() {
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost IGNORED when cube_compute_cost set
     c.fast_memory_capacity = 1 << 26; c.slow_memory_bandwidth = 10; c.native_w = 128; c.native_h = 128;
     set_910b(c);
-    c.cube_compute_cost = 1000;  // per fractal (machine param)
+    c.cube_compute_cost = 10000;  // per fractal (machine param)
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
     const double fractals = 128.0 / 16 * 128.0 / 16 * 2048.0 / 16;  // 8192
-    const double exp_c = fractals * 1000.0 / rc.cores_used;
+    const double exp_c = fractals * 10000.0 / rc.cores_used;
     std::cout << "    cube: fractals=" << (long long)fractals << " cores=" << rc.cores_used
               << " -> lat=" << rc.latency << " (expect " << exp_c << ")\n";
     CHECK("GEOM: cube compute = #fractals * cube_cost (compute-bound)",
@@ -440,13 +440,13 @@ static void test_geometry_compute() {
         v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
         v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10; v.native_w = 128; v.native_h = 128;
         set_910b(v);
-        v.vector_compute_cost = 10000;  // per SIMD step
+        v.vector_compute_cost = 40000;  // per SIMD step
         v.vector_lanes = lanes;
         return Subgraph::create(v, DAG::build(v), {0})->best_cost();
     };
     auto rv = run_vec(256);
     const double steps = std::ceil(512.0 * 512 / 256);  // 1024
-    const double exp_v = steps * 10000.0 / rv.cores_used;
+    const double exp_v = steps * 40000.0 / rv.cores_used;
     std::cout << "    vector: 262144 elems / 256 lanes = " << (long long)steps << " steps cores="
               << rv.cores_used << " -> lat=" << rv.latency << " (expect " << exp_v << ")\n";
     CHECK("GEOM: vector compute = ceil(#elements/lanes) * step_cost (compute-bound)",
