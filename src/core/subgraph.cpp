@@ -1073,55 +1073,88 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
                            ((double)prob_->tensors[o].height / prob_->native_h);
         }
       }
-      // Distribution-aware reload MNK*(1/w + 1/h) favors big, balanced (2D)
-      // tiles — each output tile streams its A row-strip + B col-strip once, so
-      // a square/large tile reloads less. Split-K across cores is the fallback
-      // when spatial tiles can't fill the cores, paying a per-partial merge.
-      const double M = (double)out_H_, N = (double)out_W_, K = (double)max_K_;
-      // DDR is byte-based: operand strips are re-streamed in the matmul's operand
-      // dtype (e.g. BF16=2B), the output is stored in its dtype. (Representative
-      // dtype from the first matmul; uniform in practice.)
-      int op_bytes = 4, out_bytes = 4;
-      for (auto i : ops_)
-        if (prob_->ops[i].type == OpType::MatMul) {
-          op_bytes = dtype_bytes(prob_->tensors[prob_->ops[i].inputs[0]].dtype);
-          out_bytes = dtype_bytes(prob_->tensors[prob_->ops[i].output()].dtype);
-          break;
-        }
-      const double reload = M * N * K * (1.0 / (double)cfg.w + 1.0 / (double)cfg.h) * op_bytes;
-      const double out_store = M * N * out_bytes;
-      // DDR bandwidth scales with the cores issuing DMA, saturating at n_cores:
-      // eff_bw = HBM * min(1, cores/n_cores), so a DDR-bound tile on too few cores
-      // pays HBM/cores, not the full floor. One core can't saturate HBM.
+      // --- BSP/superstep matmul roofline (910B; no shared L2) ----------------
+      // Parallelize the (possibly fused-chain) subgraph over the SHARED output
+      // dim M: each core owns a sink-output band and computes its own
+      // intermediate slices ON-CHIP. Consequences:
+      //   * DDR counts only (a) boundary/graph-input operands and (b) the sink
+      //     output store. Intermediate tensors are EPHEMERAL (zero DDR) — a
+      //     deeper matmul's partials are computed independently per output tile,
+      //     never crossing cores, so they need no barrier.
+      //   * The ONLY barrier is a sink split-K merge. With no shared L2, the S
+      //     partials reduce through DDR strictly AFTER compute, so it is charged
+      //     ADDITIVELY (a BSP superstep), never hidden under the streaming
+      //     roofline. Intermediate k-split is disallowed: it would round-trip the
+      //     intermediate through DDR, i.e. be no better than splitting the
+      //     subgraph there (which also frees independent tiling) — so any k-split
+      //     lands on the subgraph output only.
+      const double M = (double)out_H_, N = (double)out_W_;
       auto sat = [&](double cores) { return std::max(1.0, (double)n_cores / cores); };
-      const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);  // S=1 (spatial only)
+      // In-subgraph produced/consumed sets: an operand is ephemeral (on-chip)
+      // iff produced within the subgraph; an op is a boundary-output op iff its
+      // output is not consumed within the subgraph.
+      FlatSet<size_t> produced, consumed;
+      for (auto i : ops_) {
+        produced.insert(prob_->ops[i].output());
+        for (auto t : prob_->ops[i].inputs) consumed.insert(t);
+      }
+      // Sink output store = sum over boundary outputs, byte-based (intermediates
+      // are is_internally_produced and excluded).
+      double out_store = 0.0;
+      for (const auto& info : boundary_tensor_info_)
+        if (info.is_boundary_out)
+          out_store += (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
+      // Operand reload: per matmul op, boundary operands only. The distribution-
+      // aware MNK*(1/w + 1/h) splits into a left-operand (1/w) and right-operand
+      // (1/h) term; a non-sink op tiles its intermediate FULL-width (w_i = N_i)
+      // under the M-partition, so only its M-band height h is tiled.
+      double reload = 0.0;
+      for (auto i : ops_) {
+        if (prob_->ops[i].type != OpType::MatMul) continue;
+        const size_t lhs = prob_->ops[i].inputs[0];
+        const size_t rhs = prob_->ops[i].inputs[1];
+        const size_t o   = prob_->ops[i].output();
+        const double N_i = (double)prob_->tensors[o].width;
+        const double M_i = (double)prob_->tensors[o].height;
+        const double K_i = (double)prob_->tensors[lhs].width;       // contraction
+        const bool is_boundary_op = !consumed.count(o);
+        const double w_i = is_boundary_op ? std::min((double)cfg.w, N_i) : N_i;
+        const double h_i = std::min((double)cfg.h, M_i);            // shared M-band
+        if (!produced.count(lhs))   // left operand [K_i, M_i] streamed from DDR
+          reload += M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
+        if (!produced.count(rhs))   // right operand [N_i, K_i] streamed from DDR
+          reload += M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
+      }
+      // S=1 (spatial-only): no cross-core reduction, so the output store streams
+      // out as tiles complete (overlaps compute) — classic roofline, no barrier.
+      const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);
       const double ddr1 = (reload + out_store) * inv_B * sat(eff1);
       const double lat1 = std::max(total_compute / eff1, ddr1);
-      // Split-K: one output tile parallelizes up to K/16 ways (one partial per
-      // 16-deep fractal of the contraction). Fill up to n_cores of the
-      // num_tiles*(K/16) total fractal-partials. The fractal distribution may be
-      // UNEVEN across cores (latency ~ ceil(work/cores)); we do NOT require an
-      // even divisor split, since that would idle cores for no latency gain.
-      // cores_used < n_cores only when there genuinely aren't n_cores work-units.
-      const int64_t kfrac = std::max<int64_t>(1, max_K_ / 16);  // #16-deep fractals in K
-      const int64_t cores_used = std::min<int64_t>(n_cores, num_tiles * kfrac);
-      const int64_t S = std::max<int64_t>(1, (cores_used + num_tiles - 1) / num_tiles);  // avg split/tile
+      // Sink split-K: gang up to output_K_/16 partials per sink tile to fill the
+      // cores. Streaming phase (operand reload overlaps partial-compute) is a
+      // roofline; the S partials then reduce through DDR AFTER compute — an
+      // ADDITIVE barrier S*out_store*inv_B (the BSP superstep). output_K_ is the
+      // sink matmul's contraction (NOT max_K_, which may be a deeper stage's K).
+      const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
+      const int64_t cores_used = std::min<int64_t>(n_cores, (int64_t)num_tiles * kfrac);
+      const int64_t S = std::max<int64_t>(1, (cores_used + num_tiles - 1) / num_tiles);
       const double effS = (double)cores_used;
-      const double ddrS = (reload + (double)S * out_store) * inv_B * sat(effS);
-      const double latS = std::max(total_compute / effS, ddrS);
-      if (S > 1 && latS < lat1) {  // split-K only if it helps
+      const double stream_ddrS = reload * inv_B * sat(effS);
+      const double streamS = std::max(total_compute / effS, stream_ddrS);
+      const double merge_tail = (double)S * out_store * inv_B * sat(effS);  // BSP barrier
+      const double latS = streamS + merge_tail;
+      if (S > 1 && latS < lat1) {  // sink split-K only if it helps
         result.latency = latS;
         result.parallel_split = (int)S;
         result.cores_used = (int)cores_used;
-        result.compute_bound = (total_compute / effS) >= ddrS;
-        result.ddr_traffic = ddrS;
-        // Per-core contraction share = ceil(K/16 / S) fractals (16-aligned). The
-        // L1 k-tile is the largest DIVISOR of K not exceeding that share (and not
-        // exceeding cfg.k) -- so the displayed k cleanly divides K.
-        const int64_t share_k = ((kfrac + S - 1) / S) * 16;  // 16-aligned per-core K share
+        result.compute_bound = (total_compute / effS) >= stream_ddrS;  // streaming phase
+        result.ddr_traffic = stream_ddrS + merge_tail;
+        // Per-core contraction share = ceil(output_K_/16 / S) fractals (16-aligned);
+        // the L1 k-tile is the largest divisor of output_K_ not exceeding it.
+        const int64_t share_k = ((kfrac + S - 1) / S) * 16;
         int64_t per_core_k = 16;
-        for (int64_t d = std::min(share_k, max_K_); d >= 16; d -= 16)
-          if (max_K_ % d == 0) { per_core_k = d; break; }  // largest divisor of K <= share
+        for (int64_t d = std::min(share_k, output_K_); d >= 16; d -= 16)
+          if (output_K_ % d == 0) { per_core_k = d; break; }
         result.config.k = std::min(cfg.k, per_core_k);
       } else {
         result.latency = lat1;

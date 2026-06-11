@@ -74,10 +74,13 @@ static void test_A_pointwise_memory_bound() {
 
 // --- B: thin matmul — should parallelize via split-K across cube cores --------
 static void test_B_thin_matmul_parallel() {
-    std::cout << "[B] thin matmul C[128,128], K=2048 — should split-K across cube cores\n";
+    std::cout << "[B] thin matmul C[64,64], K=2048 — should split-K across cube cores\n";
     Problem p;
-    // C[w=128,h=128] = A[w=K=2048,h=128] @ B[w=128,h=K=2048]
-    p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};
+    // C[w=64,h=64] = A[w=K=2048,h=64] @ B[w=64,h=K=2048]. Output is only 4x4 = 16
+    // native-16 tiles < 24 cores, so even 16-aligned spatial sub-tiling cannot
+    // fill the cores — split-K is genuinely required. (A 128x128 output, by
+    // contrast, is 8x8 = 64 tiles and fills the cores SPATIALLY, no split-K.)
+    p.tensors = {{2048, 64}, {64, 2048}, {64, 64}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};  // compute-heavy (2.4M = 24*100k)
     p.fast_memory_capacity = 1 << 20;
     p.slow_memory_bandwidth = 10;
@@ -91,7 +94,7 @@ static void test_B_thin_matmul_parallel() {
     // Geometry compute = #16x16x16 fractals * cube_compute_cost; one core alone
     // would take that whole serial time. Split-K across the 24 cube cores divides
     // it ~24x. (Absolute value depends on the machine cost; assert the parallelism.)
-    const double serial = (128.0 / 16) * (128.0 / 16) * (2048.0 / 16) * p.cube_compute_cost;  // #fractals * cube_cost
+    const double serial = (64.0 / 16) * (64.0 / 16) * (2048.0 / 16) * p.cube_compute_cost;  // #fractals * cube_cost
     std::cout << "    best latency = " << r.latency << " cores=" << r.cores_used
               << " split=" << r.parallel_split << " (1-core serial=" << serial << ")\n";
     CHECK("B: split-K fills the 24 cube cores", r.cores_used == 24 && r.parallel_split > 1);
@@ -263,9 +266,15 @@ static void test_F_split_k() {
 static void test_G_super_native_tile() {
     std::cout << "[G] matmul tile can be >128 (L0c bound, not the native cap)\n";
     Problem p;
-    p.tensors = {{512, 512}, {512, 512}, {512, 512}};  // M=N=K=512
-    p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};       // memory-bound -> prefers big balanced tile
-    p.fast_memory_capacity = 1 << 24;
+    // Large 1024x1024 output: among the equal-latency split=1 configs (>=24
+    // spatial tiles, compute-bound), the reload tiebreak prefers the BIGGEST
+    // balanced tile — here ~256x128 (= L0c-bounded: 256*128*4B = 131072 = L0c).
+    // A 512x512 output is too small: a >128 balanced tile would yield <24 tiles
+    // and need split-K (a merge tail), so it falls back to <=128 tiles. The point
+    // stands — tiles are bounded by L0c (128KB), not the native 128.
+    p.tensors = {{512, 1024}, {1024, 512}, {1024, 1024}};  // M=N=1024, K=512
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};
+    p.fast_memory_capacity = 1 << 26;
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
@@ -364,10 +373,14 @@ static void test_two_matmul() {
     // scaled all compute by the narrower sink output, so fused < M1 alone).
     CHECK("2MM: chained fused >= each part (compute counted per-matmul)",
           fused >= m1 - 0.5 && fused >= m2 - 0.5);
-    // Compute-bound: fused latency == sum of the two compute loads on shared cores
-    // (fusing two matmuls only helps LATENCY when DDR-bound — by keeping the
-    // intermediate T on-chip; under compute saturation the cores still do M1+M2).
-    CHECK("2MM: chained fused == M1+M2 when compute-bound", std::abs(fused - (m1 + m2)) < 1.0);
+    // BSP model: the intermediate T is EPHEMERAL when fused (kept on-chip via the
+    // M-partition, no DDR round-trip). Separately, mm2 must reload T from DDR. So
+    // fusion strictly helps — fused < M1 + M2 — even when largely compute-bound.
+    // (Under the old hidden-merge model these were equal; the on-chip intermediate
+    // benefit was invisible.) The fused floor is the pure compute backbone
+    // (ΣW/cores) with no merge tail, since the sink fills the cores spatially.
+    CHECK("2MM: chained fused < M1+M2 (fusion keeps the intermediate on-chip)",
+          fused < m1 + m2 - 0.5);
 
     // (2) INDEPENDENT shared-input: Q=X@Wq, K=X@Wk (same X). Both cube, no
     // intermediate between them — fusing only saves re-reading X (negligible
@@ -581,8 +594,12 @@ static void test_pypto_l0_comparison() {
               << " split-K=" << r.parallel_split << " cores=" << r.cores_used << "\n";
     // Thin output (16x64) << 24 cores => our level parallelizes via split-K.
     CHECK("PYPTO: our solver split-Ks the thin L0 matmul across cube cores", r.parallel_split > 1);
-    // The output is too small to tile spatially — one DDR->L1 tile == the whole output.
-    CHECK("PYPTO: our DDR->L1 tile keeps the full output (1 spatial tile)", r.num_spatial_tiles == 1);
+    // BSP model: the split-K merge is an additive tail S*out_store, so the solver
+    // spreads a LITTLE spatially (here 2 tiles) to halve the partial count S and
+    // shrink the tail, rather than putting the whole output in one tile and
+    // split-K'ing it 24 ways. The invariant is that it FILLS the cores (spatial x
+    // split), not that it keeps a single spatial tile.
+    CHECK("PYPTO: solver fills the cube cores (spatial x split-K)", r.cores_used == 24);
     // Three k-levels now compose: OUR DDR->L1 k-tile (largest k whose operand
     // strips fit L1, < full K=2048), then AutoTileMatmulL0's 16-fractal K-loop
     // inside each core, then the hardware. So our k is L1-bounded, not full K.
@@ -618,12 +635,14 @@ static void test_sweep_matmul_dims() {
     int split_huge = Subgraph::create(pl, DAG::build(pl), {0})->best_cost().parallel_split;
     CHECK("SWEEP: tiny 16x16 output split-Ks heavily across cores", split_tiny > 1);
     CHECK("SWEEP: split-K falls sharply as output grows (huge << tiny)", split_huge < split_tiny);
-    // Same tiny output but LARGE K: split-K stays preferred because small spatial
-    // tiles would be reload-bound (test H's mechanism), not just under-filled.
-    auto pk = mk_mm(128, 128, 8192, 2400000);
+    // Thin output (64x64 = 16 native-16 tiles < 24 cores) with LARGE K: spatial
+    // sub-tiling can't fill the cores, so split-K is required. (128x128 = 64 tiles
+    // would fill spatially under the BSP model and take split=1 — large K raises
+    // COMPUTE, keeping it compute-bound and spatial, not split-K.)
+    auto pk = mk_mm(64, 64, 8192, 2400000);
     int sk = Subgraph::create(pk, DAG::build(pk), {0})->best_cost().parallel_split;
-    std::cout << "    128x128 K=8192 -> split=" << sk << "\n";
-    CHECK("SWEEP: 128x128 large-K reload-bound -> split-K", sk > 1);
+    std::cout << "    64x64 K=8192 -> split=" << sk << "\n";
+    CHECK("SWEEP: 64x64 thin output, large K -> split-K fills cores", sk > 1);
     // A LARGE matmul gets a big DDR<->L1 tile (operand strips fill L1, NOT the
     // L0c accumulator — that sub-tiling is the later L1->L0 pass). So the output
     // tile can exceed L0c; only small outputs are forced small.
