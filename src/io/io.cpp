@@ -226,6 +226,8 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["granularities"]     = json::array();
     j["splits"]            = json::array();  // 910B parallel split-K / reduction split per step
     j["cores"]             = json::array();  // 910B cube/vector cores used per step
+    j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
+    j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
     j["tensors_to_retain"] = json::array();
     j["traversal_orders"]  = json::array();
     j["subgraph_latencies"] = json::array();
@@ -242,6 +244,31 @@ void write_solution(const std::string& filename, const Solution& sol) {
             auto cr = step.subgraph.compute_cost(cfg);
             j["splits"].push_back(cr.parallel_split);
             j["cores"].push_back(cr.cores_used);
+        }
+        // Execution order (the fixed pebbling order) — emitted because the peak
+        // working set depends on it, so downstream must materialize this order.
+        {
+            const auto& order = step.subgraph.execution_order();
+            j["op_order"].push_back(std::vector<size_t>(order.begin(), order.end()));
+            // Per-op single-core k-tile, in execution order (cube-910B only). An
+            // op's seq_k = its full K means it ran the contraction in one pass.
+            const auto& prob = step.subgraph.problem();
+            if (step.subgraph.has_matmul() && prob.num_cube_cores > 1 &&
+                prob.l1_capacity > 0) {
+                std::vector<int64_t> pk;
+                step.subgraph.cube_peak_l1(cfg, &pk);  // L1-fit per-op (single core)
+                const int64_t sink = step.subgraph.sink_matmul_op();
+                auto cr = step.subgraph.compute_cost(cfg);
+                std::vector<int64_t> ks;
+                for (auto op : order)
+                    // Sink: the composed per-core k (L1-fit capped by the split-K
+                    // share, = granularities.k). Internals: the L1-fit single-core k.
+                    ks.push_back((int64_t)op == sink ? cr.config.k
+                                 : ((size_t)op < pk.size() ? pk[op] : 0));
+                j["seq_k"].push_back(ks);
+            } else {
+                j["seq_k"].push_back(nullptr);
+            }
         }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));

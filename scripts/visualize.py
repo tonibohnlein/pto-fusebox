@@ -274,8 +274,20 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             unit = "cube" if op_type == "MatMul" else "vector"
             cores_str = f"\\n{unit} cores: {cores}" if cores else ""
 
+            # Per-op single-core k-tile (cube-910B). Found by this op's slot in the
+            # step's execution order. Differs from the tile's K (gran[2], the sink's)
+            # for an INTERNAL matmul that slices its own contraction to fit L1.
+            seq_str = ""
+            seq_k_list = output_data.get('seq_k', [])
+            order_list = output_data.get('op_order', [])
+            if (op_type == "MatMul" and len(seq_k_list) > first_step
+                    and seq_k_list[first_step] is not None
+                    and len(order_list) > first_step and i in order_list[first_step]):
+                kk = seq_k_list[first_step][order_list[first_step].index(i)]
+                seq_str = f"\\nseq-k {kk}"
+
             step_str = ",".join(map(str, steps))
-            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}{split_str}{cores_str}\\nLat: {lat:.1f}\\n{snake_str}"
+            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}{split_str}{seq_str}{cores_str}\\nLat: {lat:.1f}\\n{snake_str}"
             lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
         else:
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"

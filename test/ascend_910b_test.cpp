@@ -747,7 +747,147 @@ static void test_fusion_decision_matrix() {
           wide.first > wide.second + 0.5);
 }
 
+// --- DFS execution order: post-order from sinks, producer before consumer -----
+// The fixed pebbling order the peak-working-set sweep walks (and that gets
+// emitted with the solution). For a chain C=(A@B)@D the producer matmul must
+// precede the sink; a singleton subgraph is just its own op.
+static void test_dfs_order() {
+    std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
+    auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
+    DAG dag = DAG::build(p);
+    auto fused = Subgraph::create(p, dag, {0, 1});
+    CHECK("ORDER: fused chain creates", (bool)fused);
+    const auto& ord = fused->execution_order();
+    CHECK("ORDER: order covers both chain ops", ord.size() == 2);
+    CHECK("ORDER: producer op0 emitted before sink op1",
+          ord.size() == 2 && ord[0] == 0 && ord[1] == 1);
+    auto single = Subgraph::create(p, dag, {1});
+    CHECK("ORDER: singleton order is the op itself",
+          single && single->execution_order().size() == 1 &&
+          single->execution_order()[0] == 1);
+}
+
+// --- derive_exec: intermediate bands + greedy per-op k + pebble peak ----------
+// The dynamic peak that replaces the old static operand-strip sum. For the chain
+// C=(A@B)@D the intermediate band T must be counted (the static input-sum
+// ignored it), and each matmul's single-core k is derived to fit the headroom.
+static void test_exec_enumeration() {
+    std::cout << "[EXEC] derive_exec: bands + greedy per-op k + peak\n";
+    auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // FP32; T=[256,256]
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    CHECK("EXEC: chain creates", (bool)sg);
+    TileConfig cfg{128, 256, 0};                          // full M-band, k derived
+    std::vector<int64_t> kk;
+    int64_t peak = sg->cube_peak_l1(cfg, &kk);
+    CHECK("EXEC: chain feasible at [128,256]", peak != INT64_MAX);
+    // T band = 256*256*4 = 262144; op0 strip at k=128 = 1536*128 = 196608.
+    CHECK_EQ("EXEC: peak L1 = T band + op0 strip", (double)peak, 458752.0, 0.5);
+    CHECK("EXEC: op0 internal seq-k sliced to 128", kk.size() > 1 && kk[0] == 128);
+    CHECK("EXEC: op1 sink seq-k = full output_K 256", kk.size() > 1 && kk[1] == 256);
+    CHECK("EXEC: peak counts the intermediate band (old sum ignored it)",
+          (double)peak > 262144.0);
+}
+
+// --- thread 1: single-core k-split is allowed on INTERNAL matmuls -------------
+// A chain whose internal matmul has a huge K: its full-K operand strip blows L1,
+// so the chain is feasible ONLY because the internal mm derives a SLICED k
+// (single-core accumulation, no cross-core merge). The sink keeps its small full K.
+static void test_seq_k_intermediate() {
+    std::cout << "[SEQK] internal matmul slices its own k to fit L1 (no merge)\n";
+    auto p = mk_chained(128, 8192, 64, 64, 1000, 1000);  // op0: K1=8192 internal
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    std::vector<int64_t> kk;
+    int64_t peak = sg->cube_peak_l1({64, 128, 0}, &kk);
+    CHECK("SEQK: chain feasible (internal mm sliced to fit)", peak != INT64_MAX);
+    CHECK("SEQK: internal mm0 k sliced below full K=8192", kk.size() > 1 && kk[0] < 8192);
+    CHECK("SEQK: internal mm0 k is a valid 16-fractal strip", kk.size() > 1 && kk[0] >= 16);
+    CHECK("SEQK: sink mm1 keeps its small full K=64", kk.size() > 1 && kk[1] == 64);
+    // Without slicing the internal full-K strip (768 bytes/k * 8192) would be ~6 MB
+    // >> 512 KB L1 — the static model had no way to express this.
+}
+
+// --- thread 2: the intermediate BAND gates feasibility (static sum ignored it) -
+// A chain with a very WIDE intermediate T: its [N1, h] band alone overflows L1 at
+// a full M-band, so the dynamic peak REJECTS h=128 (correctly) while feasible at
+// h=16. The old static sum counted only boundary INPUTS and never saw the band,
+// so it would have wrongly accepted the overflowing config.
+static void test_peak_band_feasibility() {
+    std::cout << "[BAND] intermediate band gates feasibility (peak vs static sum)\n";
+    auto p = mk_chained(128, 64, 4096, 64, 1000, 1000);  // T = [4096, 128], FP32
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    // h=128: band = 4096*128*4 = 2 MB > 512 KB L1 -> infeasible.
+    CHECK("BAND: full M-band infeasible (T band overflows L1)",
+          sg->cube_peak_l1({64, 128, 0}) == INT64_MAX);
+    // h=16: band = 4096*16*4 = 256 KB < 512 KB -> feasible.
+    CHECK("BAND: small M-band feasible (band fits, peak under L1)",
+          sg->cube_peak_l1({64, 16, 0}) != INT64_MAX);
+}
+
+// --- chained 2mm: the three k-split regimes, each a distinct optimal tiling ----
+// The fused chain C=(A@B)@D selects one of three contraction strategies for its
+// optimal tiling, isolated here by shape. Two orthogonal axes decide it:
+//
+//   AXIS 1 — sink output area [N2 x M].  Spatial tiles ~ (N2/16)(M/16). When this
+//     is >= the cube cores (~24) the sink fills the cores SPATIALLY -> split=1.
+//     When it is far below, the sink's contraction is split ACROSS cores to fill
+//     them -> PARALLEL split-K (BSP merge tail). Boundary ~ N2*M/256 ~ 24 cores,
+//     i.e. sink area ~ a few thousand 16-fractals (modulated by DDR-boundness:
+//     a memory-bound sink fills fewer cores).
+//
+//   AXIS 2 — a matmul's full-K operand strip vs L1.  Strip = K * (lhs_b*h +
+//     rhs_b*w_eff) bytes; when it exceeds the L1 headroom (L1 - live bands) the
+//     matmul SEQ-slices its own contraction on ONE core (no merge). Boundary
+//     K ~ headroom / (dtype_bytes * (h + w_eff)).  For the chains below
+//     (tile ~[*,32], FP32) onset is ~K1 = 2048.
+//
+// The regimes (all on the FUSED subgraph's best tiling):
+//   NO-K        sink fills spatially (split=1), every K fits L1  -> seq_k = K
+//   INTERNAL-K  sink fills spatially (split=1), internal K1 > L1 -> internal
+//               seq-slices on-core; sink unaffected
+//   PARALLEL-K  sink area too small to fill cores -> split>1; all K fit L1, so
+//               no on-core seq-slice (the split is core-fill, not an L1 limit)
+static void test_chain_ksplit_variants() {
+    std::cout << "[KVAR] chained 2mm: no-k / internal-k / parallel-k regimes\n";
+    struct R { int split; int64_t k0, k1, K1, N1; };
+    auto run = [](int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t cc) {
+        auto p = mk_chained(M, K1, N1, N2, 1000, 1000);
+        p.cube_compute_cost = cc;
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0, 1});
+        auto r = sg->best_cost();
+        std::vector<int64_t> pk; sg->cube_peak_l1(r.config, &pk);  // op0=internal, op1=sink
+        return R{r.parallel_split, pk[0], pk[1], K1, N1};
+    };
+    // (1) NO k-split: small contractions, sink large enough to fill cores.
+    auto nok = run(256, 256, 64, 512, 1000);
+    CHECK("KVAR/no-k: sink not parallel-split (spatial fill)", nok.split == 1);
+    CHECK("KVAR/no-k: internal runs full K1 (no seq-slice)", nok.k0 == nok.K1);
+    CHECK("KVAR/no-k: sink runs full K (no seq-slice)", nok.k1 == nok.N1);
+    // (2) INTERNAL single-core k-split: huge K1 forces the internal matmul to
+    // slice its contraction on one core; the sink still fills cores spatially.
+    auto ink = run(1024, 8192, 64, 1024, 4096);
+    CHECK("KVAR/internal-k: sink not parallel-split", ink.split == 1);
+    CHECK("KVAR/internal-k: internal seq-slices below K1 (no merge)",
+          ink.k0 < ink.K1 && ink.k0 >= 16);
+    CHECK("KVAR/internal-k: sink still runs full K", ink.k1 == ink.N1);
+    // (3) PARALLEL k-split: sink output too small to fill cores -> split across
+    // cores. Operands fit L1, so neither matmul seq-slices.
+    auto par = run(64, 128, 512, 64, 1000);
+    CHECK("KVAR/parallel-k: sink parallel-split across cores", par.split > 1);
+    CHECK("KVAR/parallel-k: internal full K1 (L1-fit, no slice)", par.k0 == par.K1);
+    CHECK("KVAR/parallel-k: sink L1-fit full K (split is core-fill, not L1)",
+          par.k1 == par.N1);
+}
+
 int main() {
+    test_dfs_order();
+    test_exec_enumeration();
+    test_seq_k_intermediate();
+    test_peak_band_feasibility();
+    test_chain_ksplit_variants();
     test_visualize();
     test_two_matmul();
     test_fusion_decision_matrix();

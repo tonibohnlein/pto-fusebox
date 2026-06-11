@@ -218,6 +218,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     for (auto s : sink_ops) {
       if (prob.ops[s].type == OpType::MatMul) {
         sg.output_K_ = sg.op_K(s);
+        sg.sink_mm_op_ = (int64_t)s;
         break;
       }
     }
@@ -612,14 +613,61 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   else
     sg.ks_cand_ = valid_candidates(sg.k_divides_);
 
-  // 910B cube tile: enumerate 16-aligned k candidates (the DDR->L1 k-tile — how
-  // much of the contraction's operand strips fit in L1). The output accumulates
-  // across k-passes in L0c, so k doesn't change compute/parallelism; the L1
-  // working-set bound picks the largest feasible k (fewest passes). This is a
-  // DIFFERENT level from AutoTileMatmulL0's 16-fractal k-loop. 910B-only;
-  // valid_candidates already produced 16-aligned divisors of max_K_ above.
+  // 910B cube: the single-core k-tile is DERIVED per-op (greedy L1-strip fit in
+  // derive_exec / cube_peak_l1), NOT searched — so the k search axis collapses
+  // to a single sentinel (cfg.k = output_K_). This is design B: per-op k costs
+  // no search (vs ~Dk^(m-1) for a searched per-op k). compute_cost overwrites
+  // result.config.k with the derived per-core k for display/emit.
   if (matmul_910b)
-    sg.ks_cand_ = valid_candidates(sg.k_divides_);
+    sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
+
+  // Depth-first topological execution order (the fixed pebbling order). Post-
+  // order DFS from each sink over in-subgraph producers: an op is emitted only
+  // after all its producers, and a branch is finished before its sibling
+  // starts — minimizing simultaneously-live intermediate bands. Deterministic:
+  // sinks and producers are visited in topological-position order so the same
+  // subgraph always yields the same order (required for the cost cache).
+  {
+    auto by_topo = [&](size_t a, size_t b) {
+      return dag.topo_position(a) < dag.topo_position(b);
+    };
+    auto sg_producers = [&](size_t op) {
+      std::vector<size_t> preds;
+      for (auto t : prob.ops[op].inputs) {
+        int p = dag.tensor_producer[t];
+        if (p >= 0 && is_in_sg[(size_t)p]) preds.push_back((size_t)p);
+      }
+      std::sort(preds.begin(), preds.end(), by_topo);
+      preds.erase(std::unique(preds.begin(), preds.end()), preds.end());
+      return preds;
+    };
+    std::vector<size_t> sinks;
+    for (auto i : sg.ops_)
+      if (sg.is_sink_op_vec_[i]) sinks.push_back(i);
+    std::sort(sinks.begin(), sinks.end(), by_topo);
+
+    std::vector<bool> visited(num_ops, false);
+    std::vector<std::pair<size_t, bool>> stack;  // (op, expanded?)
+    for (auto root : sinks) {
+      if (visited[root]) continue;
+      stack.push_back({root, false});
+      while (!stack.empty()) {
+        auto [op, expanded] = stack.back();
+        stack.pop_back();
+        if (expanded) {  // all producers already emitted
+          sg.dfs_order_.push_back(op);
+          continue;
+        }
+        if (visited[op]) continue;
+        visited[op] = true;
+        stack.push_back({op, true});  // emit after producers
+        auto preds = sg_producers(op);
+        // Push in reverse so the smallest-topo producer is processed first.
+        for (auto it = preds.rbegin(); it != preds.rend(); ++it)
+          if (!visited[*it]) stack.push_back({*it, false});
+      }
+    }
+  }
 
   return sg;
 }
@@ -833,6 +881,105 @@ int64_t Subgraph::working_set(const TileConfig &cfg,
   return working_set_unchecked(cfg, retained_from_prev, retain_these);
 }
 
+// Greedy per-op k + red-blue pebble peak over the fixed execution order.
+// See the header for the model. Intermediate bands are k-independent residents;
+// each matmul's boundary operand strip is sized by a per-op k derived to fit the
+// headroom the bands leave. Peak = max over steps of (live bands + this step's
+// operand strip). Strips count BOUNDARY operands only — an intermediate operand
+// is already a live band (the same boundary/ephemeral split the roofline uses).
+int64_t Subgraph::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
+                              const FlatSet<size_t> &retained_from_prev,
+                              const FlatSet<size_t> &retain_these,
+                              std::vector<int64_t> *perop_k_out) const {
+  const double f = prob_->double_buffer ? 0.5 : 1.0;
+  const double l1 = (double)prob_->l1_capacity * f;
+  const auto &order = dfs_order_;
+
+  // Position of each op in the execution order (-1 = not in this subgraph).
+  std::vector<int> pos(prob_->num_ops(), -1);
+  for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
+
+  // Live intermediate-band bytes per step. Each ephemeral tensor occupies a
+  // [full_width, M-band h] band in L1/Mat from its producer step through its
+  // last in-subgraph consumer (the pebble interval). k-INDEPENDENT — bands are
+  // the only cross-step residents; output accumulators live in L0c (unbounded
+  // at this DDR<->L1 level).
+  std::vector<int64_t> band_at(order.size(), 0);
+  for (size_t t : ephemeral_) {
+    int pr = dag_->tensor_producer[t];
+    int prod = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
+    int last = prod;
+    for (auto c : dag_->tensor_consumers[t])
+      if (pos[c] >= 0) last = std::max(last, pos[c]);
+    int64_t h = std::min(cfg.h, prob_->tensors[t].height);
+    int64_t bytes = prob_->tensors[t].width * h * dtype_bytes(prob_->tensors[t].dtype);
+    for (int s = prod; s <= last; ++s) band_at[s] += bytes;
+  }
+
+  // Retained (coupling-layer) tensors are full-resident across the subgraph.
+  // Disabled for 910B (cross-subgraph data routes DDR); handled defensively.
+  int64_t base = 0;
+  for (auto t : retained_from_prev) base += prob_->tensors[t].size_bytes();
+  for (auto t : retain_these)
+    if (!retained_from_prev.count(t)) base += prob_->tensors[t].size_bytes();
+
+  if (perop_k_out) perop_k_out->assign(prob_->num_ops(), 0);
+
+  int64_t peak = 0;
+  for (int s = 0; s < (int)order.size(); ++s) {
+    const size_t opi = order[s];
+    const Op &op = prob_->ops[opi];
+    const int64_t bands = base + band_at[s];
+    if (op.type != OpType::MatMul) {
+      // Non-matmul in a cube subgraph shouldn't occur (unit-homogeneity); count
+      // its boundary-input [w,h] tiles defensively so the sweep stays sound.
+      int64_t strip = 0;
+      for (auto in : op.inputs)
+        if (!ephemeral_.count(in))
+          strip += std::min(cfg.w, prob_->tensors[in].width) *
+                   std::min(cfg.h, prob_->tensors[in].height) *
+                   dtype_bytes(prob_->tensors[in].dtype);
+      peak = std::max(peak, bands + strip);
+      continue;
+    }
+    const size_t lhs = op.inputs[0], rhs = op.inputs[1];
+    const int64_t M_o = prob_->tensors[op.output()].height;
+    const int64_t N_o = prob_->tensors[op.output()].width;
+    const int64_t h = std::min(cfg.h, M_o);
+    const int64_t w = std::min(cfg.w, N_o);
+    const int64_t K_eff = is_sink_op_vec_[opi] ? sink_K_eff : op_K(opi);
+    // Per unit of k, the boundary operand strip costs lhs_bytes*h (LHS [k,h]) +
+    // rhs_bytes*w (RHS [w,k]); an intermediate operand contributes 0 here (it is
+    // a band). per_unit==0 => both operands are bands, no DDR strip to size.
+    const int64_t lhs_b = ephemeral_.count(lhs) ? 0 : dtype_bytes(prob_->tensors[lhs].dtype);
+    const int64_t rhs_b = ephemeral_.count(rhs) ? 0 : dtype_bytes(prob_->tensors[rhs].dtype);
+    const int64_t per_unit = lhs_b * h + rhs_b * w;
+    int64_t kk;
+    if (per_unit == 0) {
+      kk = K_eff;  // no boundary strip; full K in one accumulation
+    } else {
+      const double headroom = l1 - (double)bands;
+      if (headroom <= 0) return INT64_MAX;  // bands alone overflow L1
+      int64_t max_kk = (int64_t)(headroom / (double)per_unit);
+      max_kk = (max_kk / 16) * 16;          // 16-fractal aligned
+      if (max_kk < 16) return INT64_MAX;     // not even one fractal strip fits
+      if (max_kk > K_eff) max_kk = K_eff;
+      kk = 0;  // largest 16-aligned divisor of K_eff not exceeding max_kk
+      for (int64_t d = std::min(max_kk, K_eff); d >= 16; d -= 16)
+        if (K_eff % d == 0) { kk = d; break; }
+      if (kk == 0) return INT64_MAX;
+    }
+    if (perop_k_out) (*perop_k_out)[opi] = kk;
+    peak = std::max(peak, bands + per_unit * kk);
+  }
+  return peak;
+}
+
+int64_t Subgraph::cube_peak_l1(const TileConfig &cfg,
+                               std::vector<int64_t> *perop_k) const {
+  return derive_exec(cfg, output_K_, {}, {}, perop_k);
+}
+
 // 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
 // the per-tile slice footprint IS the per-core footprint. Fork on cube/vector.
 bool Subgraph::fits_on_chip(const TileConfig &cfg,
@@ -844,12 +991,22 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
     return working_set_unchecked(cfg, retained_from_prev, retain_these) <=
            prob_->fast_memory_capacity;
 
+  // Cube: dynamic peak L1 over the execution order (live intermediate bands +
+  // per-op-k-sized operand strips), NOT a static sum of all operand strips. The
+  // sum both over-counted co-resident inputs and under-counted intermediate
+  // bands that physically sit in L1/Mat between matmuls; derive_exec is the
+  // red-blue pebble peak that the cost model's ephemeral-on-chip assumption
+  // implies. Infeasible iff no per-op k assignment keeps the peak under L1.
+  if (cube)
+    return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) !=
+           INT64_MAX;
+
+  // Vector: tile + ephemerals resident in UB. Vector ephemerals are small [w,h]
+  // tiles, so the static slice sum is a tight bound here (kept as-is).
   const int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
   const int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   const int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
-
-  int64_t operand_bytes = 0;  // cube -> L1
-  int64_t ub_bytes = 0;       // vector -> UB (everything resident)
+  int64_t ub_bytes = 0;
   for (const auto &info : boundary_tensor_info_) {
     if (retained_from_prev.count(info.id) || retain_these.count(info.id)) continue;
     int64_t ht = info.eval_h_tiles(ntw, nk);
@@ -857,17 +1014,9 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
     const int64_t W = prob_->tensors[info.id].width, H = prob_->tensors[info.id].height;
     ht = std::max(std::min(ht, W), (int64_t)1);
     vt = std::max(std::min(vt, H), (int64_t)1);
-    const int64_t bytes = (W / ht) * (H / vt) * dtype_bytes(prob_->tensors[info.id].dtype);
-    ub_bytes += bytes;
-    if (!info.is_boundary_out) operand_bytes += bytes;  // inputs stream through L1
+    ub_bytes += (W / ht) * (H / vt) * dtype_bytes(prob_->tensors[info.id].dtype);
   }
-  // Double-buffering reserves half of each STREAMING pool (L1/UB) for prefetch.
-  const double f = prob_->double_buffer ? 0.5 : 1.0;
-  // Our level is DDR<->L1/UB. Cube: only the operand strips must fit L1 (the
-  // output accumulates in L0c — the LATER L1->L0 pass's concern, NOT bounded
-  // here). Vector: the whole tile fits UB.
-  if (cube)
-    return (double)operand_bytes <= (double)prob_->l1_capacity * f;
+  const double f = prob_->double_buffer ? 0.5 : 1.0;  // double-buffer reserves half UB
   return (double)ub_bytes <= (double)prob_->vec_capacity * f;
 }
 
@@ -1160,19 +1309,30 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         result.cores_used = (int)cores_used;
         result.compute_bound = (total_compute / effS) >= stream_ddrS;  // streaming phase
         result.ddr_traffic = stream_ddrS + merge_tail;
-        // Per-core contraction share = ceil(output_K_/16 / S) fractals (16-aligned);
-        // the L1 k-tile is the largest divisor of output_K_ not exceeding it.
+        // Displayed per-core k composes the two k-levers: the greedy single-core
+        // L1-fit k (derive_exec, a divisor of output_K_), capped by the per-core
+        // split-K fractal share ceil(output_K_/16 / S)*16. Largest divisor of
+        // output_K_ not exceeding both -> k cleanly divides the contraction.
+        std::vector<int64_t> pk;
+        derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
+        const int64_t l1_k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0)
+                                 ? pk[sink_mm_op_] : output_K_;
         const int64_t share_k = ((kfrac + S - 1) / S) * 16;
         int64_t per_core_k = 16;
-        for (int64_t d = std::min(share_k, output_K_); d >= 16; d -= 16)
+        for (int64_t d = std::min({l1_k, share_k, output_K_}); d >= 16; d -= 16)
           if (output_K_ % d == 0) { per_core_k = d; break; }
-        result.config.k = std::min(cfg.k, per_core_k);
+        result.config.k = per_core_k;
       } else {
         result.latency = lat1;
         result.parallel_split = 1;
         result.cores_used = (int)eff1;
         result.compute_bound = (total_compute / eff1) >= ddr1;
         result.ddr_traffic = ddr1;
+        // Spatial-only (S=1): displayed k = the greedy single-core L1-fit k.
+        std::vector<int64_t> pk;
+        derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
+        result.config.k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0)
+                              ? pk[sink_mm_op_] : cfg.k;
       }
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is

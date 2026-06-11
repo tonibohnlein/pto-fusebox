@@ -78,6 +78,20 @@ public:
   // For pure-PW subgraphs: 1 (no K dimension).
   int64_t output_K() const { return output_K_; }
 
+  // Fixed depth-first execution order over this subgraph's ops (post-order DFS
+  // from the sinks, each op after its in-subgraph producers). This is the
+  // pebbling order: peak working set is evaluated along it, and it is emitted
+  // with the solution because the peak depends on it. (Optimizing the order is
+  // black-pebbling = PSPACE-complete; one DFS post-order is the accepted
+  // heuristic — optimal for chains/trees, good for diamonds.) Empty until
+  // create() populates it.
+  const std::vector<size_t> &execution_order() const { return dfs_order_; }
+
+  // Op id of the boundary-output MatMul (the sink whose contraction may be
+  // parallel-split across cores), or -1 if the subgraph has none. Its emitted
+  // per-core k is the composed config.k (L1-fit capped by the split-K share).
+  int64_t sink_matmul_op() const { return sink_mm_op_; }
+
   // --- Tiling validity ---
 
   bool is_valid_tiling(const TileConfig &cfg) const;
@@ -87,6 +101,16 @@ public:
   int64_t working_set(const TileConfig &cfg,
                       const FlatSet<size_t> &retained_from_prev = {},
                       const FlatSet<size_t> &retain_these = {}) const;
+
+  // 910B cube peak L1 working set (bytes) along the fixed execution order: the
+  // red-blue pebble peak over the per-output-tile schedule, with each matmul's
+  // single-core k-tile derived greedily (largest 16-aligned divisor of its K
+  // whose boundary operand strip fits the headroom left by the live intermediate
+  // bands). Returns INT64_MAX if infeasible at cfg. Optionally returns the
+  // derived per-op k (indexed by op id; 0 for non-matmul / non-participating).
+  // This is the dynamic peak that replaces the old static operand-strip SUM.
+  int64_t cube_peak_l1(const TileConfig &cfg,
+                       std::vector<int64_t> *perop_k = nullptr) const;
 
   bool is_feasible(const TileConfig &cfg,
                    const FlatSet<size_t> &retained_from_prev = {},
@@ -123,6 +147,16 @@ private:
   bool fits_on_chip(const TileConfig &cfg,
                     const FlatSet<size_t> &retained_from_prev,
                     const FlatSet<size_t> &retain_these) const;
+
+  // Engine behind cube_peak_l1(): sweep the execution order, accumulate live
+  // intermediate-band bytes, derive each matmul's per-op k against the headroom,
+  // return the peak L1 bytes (INT64_MAX if infeasible). sink_K_eff is the sink
+  // matmul's per-core contraction share (= output_K_ for S=1 feasibility; =
+  // output_K_/S when emitting the schedule for a known parallel split).
+  int64_t derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
+                      const FlatSet<size_t> &retained_from_prev,
+                      const FlatSet<size_t> &retain_these,
+                      std::vector<int64_t> *perop_k_out) const;
 
   const Problem *prob_ = nullptr;
   const DAG *dag_ = nullptr;
@@ -165,6 +199,8 @@ private:
   bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
+  int64_t sink_mm_op_ = -1;  // op id of the boundary-output MatMul (-1 if none);
+                             // its derived per-op k is the displayed config.k
 
   // Prologue-PW geometric condition (issue #71 Rules 2/3):
   //   Pointwise feeding a matmul's LHS → require cfg.w ≥ matmul.K
@@ -183,6 +219,10 @@ private:
 
   std::vector<size_t> reverse_topo_ops_;
   std::vector<bool> is_sink_op_vec_;
+
+  // Depth-first topological execution order (see execution_order()). Fixed at
+  // construction; drives the peak-working-set sweep and the emitted schedule.
+  std::vector<size_t> dfs_order_;
 
   // Precomputed per-boundary-tensor tiling info for working_set/compute_cost.
   //
