@@ -59,5 +59,8 @@
  "num_vector_cores": 48,
  "cube_capacity": 131072,
  "l1_capacity": 524288,
- "vec_capacity": 196608
+ "vec_capacity": 196608,
+ "cube_compute_cost": 1000,
+ "vector_compute_cost": 1,
+ "vector_lanes": 256
 }

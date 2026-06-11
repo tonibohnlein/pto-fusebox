@@ -43,6 +43,13 @@ static void set_910b(Problem& p) {
     p.cube_capacity = 128 * 1024;   // L0c accumulator (output)
     p.l1_capacity = 512 * 1024;     // L1/Mat operand pool (cube)
     p.vec_capacity = 192 * 1024;    // UB (vector)
+    // Machine-cost compute model (replaces per-op base_cost): cube = #16x16x16
+    // fractals * cube_compute_cost; vector = ceil(#elements/vector_lanes) *
+    // vector_compute_cost. These are PLACEHOLDER values (relative units) until
+    // grounded from real 910B specs; the per-op base_cost is now ignored.
+    p.cube_compute_cost = 1000;      // per 16x16x16 cube fractal
+    p.vector_compute_cost = 1;      // per vector SIMD step
+    p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
 }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
@@ -80,12 +87,15 @@ static void test_B_thin_matmul_parallel() {
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("B: subgraph builds", (bool)sg);
-    double lat = sg->best_cost().latency;
-    std::cout << "    best latency = " << lat << " (910B); single-context (1 core) would be ~2.4M\n";
-    // Output == native → 1 spatial tile. Split-K across the 24 cube cores
-    // (config enumeration picks a small k => nk independent work units) divides
-    // the 2.4M compute by ~24 -> ~100000, vs 2.4M on a single core.
-    CHECK("B: split-K parallelizes across cube cores (lat <= 200000)", lat <= 200000.0);
+    auto r = sg->best_cost();
+    // Geometry compute = #16x16x16 fractals * cube_compute_cost; one core alone
+    // would take that whole serial time. Split-K across the 24 cube cores divides
+    // it ~24x. (Absolute value depends on the machine cost; assert the parallelism.)
+    const double serial = (128.0 / 16) * (128.0 / 16) * (2048.0 / 16) * 1000.0;  // #fractals * cube_cost
+    std::cout << "    best latency = " << r.latency << " cores=" << r.cores_used
+              << " split=" << r.parallel_split << " (1-core serial=" << serial << ")\n";
+    CHECK("B: split-K fills the 24 cube cores", r.cores_used == 24 && r.parallel_split > 1);
+    CHECK("B: split-K parallelizes (lat << 1-core serial)", r.latency < serial / 5.0);
 }
 
 // --- C: pointwise fusion — fused beats separate ------------------------------
@@ -218,8 +228,11 @@ static void test_E_matmul_2d_vs_1d() {
     CHECK("E: subgraph builds", (bool)sg);
     // k chosen to fit the L1 operand pool (reload is k-independent — it streams
     // the full K either way — so this still isolates the 2D-vs-1D tile shape).
-    double balanced = sg->compute_cost(TileConfig{256, 128, 128}).latency;  // w·h=32K, ratio 2:1
-    double skewed = sg->compute_cost(TileConfig{512, 64, 64}).latency;      // w·h=32K, ratio 8:1
+    // Compare the DDR traffic (reload) directly: a matmul is compute-bound under
+    // the geometry model, so the reload is hidden in the latency — but the tiebreak
+    // still uses it. Balanced (2D) tiles reload less than skewed (1D).
+    double balanced = sg->compute_cost(TileConfig{256, 128, 128}).ddr_traffic;  // ratio 2:1
+    double skewed = sg->compute_cost(TileConfig{512, 64, 64}).ddr_traffic;      // ratio 8:1
     std::cout << "    balanced[w256,h128]=" << balanced << "  skewed[w512,h64]=" << skewed << "\n";
     CHECK("E: balanced (2D) tile reloads less than skewed (1D)", balanced < skewed);
 }
