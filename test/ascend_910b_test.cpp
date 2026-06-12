@@ -943,24 +943,38 @@ static void test_reduction_sink_gating() {
 // the single-core streaming chunk (the reduction accumulated chunk-by-chunk, e
 // recomputed past it) shrinks the band so it fits. The model must REPRESENT this
 // optimum as feasible (regime 2 of the softmax taxonomy).
-static void test_vector_streaming_reduction() {
-    std::cout << "[STREAM] large-W reduction streams to fit UB (materialize can't)\n";
-    const int64_t W = 32768, H = 128;
+static Problem mk_softmax(int64_t W, int64_t H) {
     Problem p;
     p.tensors = {{W, H}, {1, H}, {W, H}, {1, H}, {W, H}};
     p.ops = {{OpType::Reduction, {0}, {1}, W * H / 4}, {OpType::Pointwise, {0, 1}, {2}, W * H},
              {OpType::Reduction, {2}, {3}, W * H / 4}, {OpType::Pointwise, {2, 3}, {4}, W * H}};
     p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128; set_910b(p);
+    return p;
+}
+static void test_vector_streaming_reduction() {
+    std::cout << "[STREAM] large-W reduction streams to fit UB (materialize can't)\n";
+    Problem p = mk_softmax(32768, 128);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0, 1, 2, 3});
     const int64_t UB = 192 * 1024;
-    TileConfig cfg{W, 1, 0};  // full reduced extent, minimal M-band
+    TileConfig cfg{32768, 1, 0};  // full reduced extent, minimal M-band
     CHECK("STREAM: materialize overflows UB even at h=1", sg->vector_peak_ub(cfg) > UB);
     CHECK("STREAM: a small W-chunk fits UB (single-core streaming)",
           sg->vector_peak_ub(cfg, {}, {}, 256) <= UB);
     CHECK("STREAM: fused large-W softmax feasible (escalates to streaming)",
           std::isfinite(sg->best_cost().latency));
+    // Step 2b — the streamed case pays the flash recompute. W=8192 materializes
+    // (1 pass); W=24576 (3x the data) streams and recomputes over N_passes=3 (the
+    // two reductions + final), so its cost jumps ~9x (3x data x 3x passes) — well
+    // beyond the 3x a pure data scaling would give.
+    Problem pm = mk_softmax(8192, 128);   // materializes
+    Problem ps = mk_softmax(24576, 128);  // streams (3x W)
+    DAG dm = DAG::build(pm), ds = DAG::build(ps);
+    double mat = Subgraph::create(pm, dm, {0, 1, 2, 3})->best_cost().latency;
+    double str = Subgraph::create(ps, ds, {0, 1, 2, 3})->best_cost().latency;
+    CHECK("STREAM: streamed cost includes the recompute (>4x the 3x-data scaling)",
+          str > 4.0 * mat);
 }
 
 int main() {

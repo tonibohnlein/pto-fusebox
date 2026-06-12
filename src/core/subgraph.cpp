@@ -1437,6 +1437,25 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         if (info.is_boundary_out && !retain_these.count(info.id))
           total_io += bytes * inv_B;
       }
+      // Step 2b — single-core streaming recompute (flash 2-pass). When this
+      // config cannot materialize the reduced band (UB overflow), the feasible
+      // schedule STREAMS the reduced axis and recomputes reused ephemerals past
+      // each reduction: the boundary inputs are re-read and the pointwise work
+      // repeated, once per pass. N_passes = #reductions + 1 (each reduction is a
+      // barrier that needs a fresh streamed pass — softmax: rowmax, then
+      // exp+rowsum, then exp+div = 3). Pessimistic upper bound (every op counted
+      // each pass); refine toward per-op recompute liveness later.
+      if (has_reduction_) {
+        const double budget = (double)prob_->vec_capacity * (prob_->double_buffer ? 0.5 : 1.0);
+        if (budget > 0.0 && (double)vector_peak_ub(cfg) > budget) {
+          int reductions = 0;
+          for (auto i : ops_)
+            if (prob_->ops[i].type == OpType::Reduction) reductions++;
+          const double n_passes = (double)(reductions + 1);
+          total_compute *= n_passes;
+          total_io *= n_passes;
+        }
+      }
       // Same DDR bandwidth-saturation factor as the cube: HBM needs many cores'
       // DMA engines to saturate, so a DDR-bound tile on too few vector cores pays.
       const double sat_v = std::max(1.0, (double)n_cores / eff);
