@@ -1,0 +1,56 @@
+{
+ "widths": [
+  8192,
+  64,
+  64,
+  1024,
+  1024
+ ],
+ "heights": [
+  1024,
+  8192,
+  1024,
+  64,
+  1024
+ ],
+ "op_types": [
+  "MatMul",
+  "MatMul"
+ ],
+ "inputs": [
+  [
+   0,
+   1
+  ],
+  [
+   2,
+   3
+  ]
+ ],
+ "outputs": [
+  [
+   2
+  ],
+  [
+   4
+  ]
+ ],
+ "base_costs": [
+  134217728,
+  1048576
+ ],
+ "cube_compute_cost": 4096,
+ "fast_memory_capacity": 1073741824,
+ "slow_memory_bandwidth": 10,
+ "native_granularity": [
+  128,
+  128
+ ],
+ "num_cube_cores": 24,
+ "num_vector_cores": 48,
+ "cube_capacity": 131072,
+ "l1_capacity": 524288,
+ "vec_capacity": 196608,
+ "vector_compute_cost": 1,
+ "vector_lanes": 256
+}
