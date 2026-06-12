@@ -938,6 +938,31 @@ static void test_reduction_sink_gating() {
           sg && sg->best_cost().parallel_split == 1);
 }
 
+// --- single-core W-streaming makes a large-W reduction feasible --------------
+// A softmax whose row [W,1] of A+e overflows UB even at h=1 cannot materialize;
+// the single-core streaming chunk (the reduction accumulated chunk-by-chunk, e
+// recomputed past it) shrinks the band so it fits. The model must REPRESENT this
+// optimum as feasible (regime 2 of the softmax taxonomy).
+static void test_vector_streaming_reduction() {
+    std::cout << "[STREAM] large-W reduction streams to fit UB (materialize can't)\n";
+    const int64_t W = 32768, H = 128;
+    Problem p;
+    p.tensors = {{W, H}, {1, H}, {W, H}, {1, H}, {W, H}};
+    p.ops = {{OpType::Reduction, {0}, {1}, W * H / 4}, {OpType::Pointwise, {0, 1}, {2}, W * H},
+             {OpType::Reduction, {2}, {3}, W * H / 4}, {OpType::Pointwise, {2, 3}, {4}, W * H}};
+    p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128; set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    const int64_t UB = 192 * 1024;
+    TileConfig cfg{W, 1, 0};  // full reduced extent, minimal M-band
+    CHECK("STREAM: materialize overflows UB even at h=1", sg->vector_peak_ub(cfg) > UB);
+    CHECK("STREAM: a small W-chunk fits UB (single-core streaming)",
+          sg->vector_peak_ub(cfg, {}, {}, 256) <= UB);
+    CHECK("STREAM: fused large-W softmax feasible (escalates to streaming)",
+          std::isfinite(sg->best_cost().latency));
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -946,6 +971,7 @@ int main() {
     test_chain_ksplit_variants();
     test_vector_band_ub();
     test_reduction_sink_gating();
+    test_vector_streaming_reduction();
     test_visualize();
     test_two_matmul();
     test_fusion_decision_matrix();

@@ -120,9 +120,15 @@ public:
   // boundary tiles are transient. Returns the peak UB bytes. (No W-axis streaming
   // yet — a reduction band spans its FULL reduced extent; the streaming
   // single-core reduction that would shrink it is the next increment.)
+  // reduce_chunk caps the reduced axis at a single-core STREAMING granularity:
+  // the reduction is accumulated chunk-by-chunk on one core, so a reused ephemeral
+  // (softmax's e) is held only a chunk at a time (recomputed past the reduction)
+  // rather than as a full [reduced_extent, h] band. INT64_MAX = no streaming
+  // (materialize the full band). Lets a large-W reduction fit UB.
   int64_t vector_peak_ub(const TileConfig &cfg,
                          const FlatSet<size_t> &retained_from_prev = {},
-                         const FlatSet<size_t> &retain_these = {}) const;
+                         const FlatSet<size_t> &retain_these = {},
+                         int64_t reduce_chunk = INT64_MAX) const;
 
   bool is_feasible(const TileConfig &cfg,
                    const FlatSet<size_t> &retained_from_prev = {},
