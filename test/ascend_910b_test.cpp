@@ -15,10 +15,13 @@
 #include "core/dag.h"
 #include "core/subgraph.h"
 #include "core/types.h"
+#include "pipeline/solver.h"
+#include "solution/solution.h"
 
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <vector>
 
 static int g_pass = 0, g_fail = 0, g_red = 0;
 
@@ -1113,6 +1116,86 @@ static void test_model_stages() {
     }
 }
 
+// --- larger instances: the full solver on 10+ op DAGs ------------------------
+// Drives the partitioner (solve) on realistic multi-op graphs and checks the
+// solution is structurally sound: valid, a true partition (every op covered
+// exactly once — no recompute on 910B), and every step UNIT-HOMOGENEOUS (a step
+// never mixes cube (MatMul) with vector (Pointwise/Reduction); Opaque is a
+// singleton). These hold for ANY valid solution, so the test is robust to the
+// evo search's non-determinism.
+static bool step_homogeneous(const Problem& p, const ScheduleStep& s) {
+    bool cube = false, vec = false, opaque = false;
+    for (auto i : s.subgraph.ops()) switch (p.ops[i].type) {
+        case OpType::MatMul: cube = true; break;
+        case OpType::Pointwise: case OpType::Reduction: vec = true; break;
+        case OpType::Opaque: opaque = true; break;
+    }
+    if (cube && vec) return false;
+    if (opaque && s.subgraph.num_ops() > 1) return false;
+    return true;
+}
+static void check_solution(const char* tag, const Problem& p) {
+    DAG dag = DAG::build(p);
+    auto sol = solve(p, dag);
+    char b[80];
+    auto C = [&](const char* w, bool ok) { snprintf(b, sizeof b, "BIG/%s: %s", tag, w); CHECK(b, ok); };
+    C("solution valid", sol.validate().valid);
+    C("total latency finite > 0", std::isfinite(sol.total_latency()) && sol.total_latency() > 0);
+    std::vector<int> cover(p.num_ops(), 0);
+    bool homo = true;
+    for (size_t i = 0; i < sol.num_steps(); i++) {
+        for (auto op : sol.step(i).subgraph.ops()) cover[op]++;
+        if (!step_homogeneous(p, sol.step(i))) homo = false;
+    }
+    bool once = true;
+    for (int c : cover) if (c != 1) once = false;
+    C("partition covers every op exactly once", once);
+    C("every step is unit-homogeneous (cube/vector never mixed)", homo);
+}
+static void test_large_instances() {
+    std::cout << "[BIG] full solver on 10+ op DAGs (partition + tiling)\n";
+    // (1) Transformer block: scores=Q@K^T -> softmax -> O=P@V -> O@Wo -> @W1 ->
+    // relu -> @W2 (10 ops; cube/vector interleaved). d=512, B=128, S=256, df=2048.
+    {
+        Problem p;
+        p.tensors = {{512, 128}, {256, 512}, {256, 128}, {1, 128}, {256, 128}, {1, 128},
+                     {256, 128}, {512, 256}, {512, 128}, {512, 512}, {512, 128}, {2048, 512},
+                     {2048, 128}, {2048, 128}, {512, 2048}, {512, 128}};
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 512},     // scores
+                 {OpType::Reduction, {2}, {3}, 256 * 128},        // colmax
+                 {OpType::Pointwise, {2, 3}, {4}, 256 * 128},     // exp
+                 {OpType::Reduction, {4}, {5}, 256 * 128},        // colsum
+                 {OpType::Pointwise, {4, 5}, {6}, 256 * 128},     // div -> P
+                 {OpType::MatMul, {6, 7}, {8}, 16384 * 256},      // O = P@V
+                 {OpType::MatMul, {8, 9}, {10}, 16384 * 512},     // O@Wo
+                 {OpType::MatMul, {10, 11}, {12}, 16384 * 512},   // @W1
+                 {OpType::Pointwise, {12}, {13}, 2048 * 128},     // relu
+                 {OpType::MatMul, {13, 14}, {15}, 16384 * 2048}}; // @W2
+        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.native_w = 128; p.native_h = 128; set_910b(p);
+        check_solution("transformer-block", p);
+    }
+    // (2) Deep matmul chain (8 cube ops): C0=A@B0, C1=C0@B1, ... all cube; tests
+    // partition + fusion on a long homogeneous chain.
+    {
+        Problem p;
+        int64_t M = 256, D = 256;
+        p.tensors.push_back({D, M});                 // 0: A [D,M]
+        size_t prev = 0;
+        for (int i = 0; i < 8; i++) {
+            p.tensors.push_back({D, D});             // weight Bi [D,D]
+            size_t w = p.tensors.size() - 1;
+            p.tensors.push_back({D, M});             // output Ci [D,M]
+            size_t out = p.tensors.size() - 1;
+            p.ops.push_back({OpType::MatMul, {prev, w}, {out}, 16384 * D});
+            prev = out;
+        }
+        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.native_w = 128; p.native_h = 128; set_910b(p);
+        check_solution("deep-chain-8mm", p);
+    }
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -1121,6 +1204,7 @@ int main() {
     test_chain_ksplit_variants();
     test_matmul_sensibility();
     test_model_stages();
+    test_large_instances();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();
