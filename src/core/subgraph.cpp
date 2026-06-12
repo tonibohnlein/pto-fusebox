@@ -41,6 +41,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   std::vector<bool> is_in_sg(num_ops, false);
   std::vector<bool> is_produced(num_tensors, false);
   std::vector<bool> is_consumed(num_tensors, false);
+  bool reduces_width = false, reduces_height = false;  // for reduced-axis homogeneity
 
   for (auto i : sg.ops_) {
     is_in_sg[i] = true;
@@ -60,9 +61,11 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       if (prob.tensors[out].width < prob.tensors[in0].width) {
         sg.reduced_axis_ = 1;  // width  (row reduction: [H,W] -> [H,1])
         sg.reduced_extent_ = std::max(sg.reduced_extent_, prob.tensors[in0].width);
+        reduces_width = true;
       } else if (prob.tensors[out].height < prob.tensors[in0].height) {
         sg.reduced_axis_ = 2;  // height (col reduction: [H,W] -> [1,W])
         sg.reduced_extent_ = std::max(sg.reduced_extent_, prob.tensors[in0].height);
+        reduces_height = true;
       }
     }
   }
@@ -86,6 +89,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
     if (has_cube && has_vector) return std::nullopt;            // no cube↔vector fusion
     if (has_opaque && sg.ops_.size() > 1) return std::nullopt;  // Opaque is a barrier
+    // Reduced-axis homogeneity: a subgraph may not fuse reductions on DIFFERENT
+    // axes (a width-reduction AND a height-reduction). A single unified tile is
+    // coupled to the FULL extent on each reduced axis, so fusing both would force
+    // the whole tensor into one tile on one core — no spatial parallelism, never
+    // beneficial. The single reduced_axis_ also can't represent both (last wins),
+    // so without this it would silently tile the un-forced reduced axis and break
+    // that reduction. Force the partitioner to cut between them instead.
+    if (reduces_width && reduces_height) return std::nullopt;
   }
 
   // Classify ephemerals

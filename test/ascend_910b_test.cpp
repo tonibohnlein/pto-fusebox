@@ -1196,6 +1196,28 @@ static void test_large_instances() {
     }
 }
 
+// --- reduced-axis homogeneity: reductions on different axes cannot fuse -------
+// A unified tile is coupled to the full extent on each reduced axis; fusing a
+// width-reduction with a height-reduction would force the whole tensor into one
+// tile (no parallelism) and the single reduced_axis_ can't represent both. The
+// partitioner must cut between them. (Softmax's reductions share an axis -> fine.)
+static void test_mixed_axis_reduction_rejected() {
+    std::cout << "[RAXIS] reductions on different axes cannot fuse\n";
+    Problem p;  // x[256,128]; m=rowmax(x)[1,128] (reduce width); c=colsum(x)[256,1] (reduce height)
+    p.tensors = {{256, 128}, {1, 128}, {256, 1}};
+    p.ops = {{OpType::Reduction, {0}, {1}, 256 * 128}, {OpType::Reduction, {0}, {2}, 256 * 128}};
+    p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128; set_910b(p);
+    DAG d = DAG::build(p);
+    CHECK("RAXIS: width-reduction + height-reduction NOT fusable", !Subgraph::create(p, d, {0, 1}));
+    CHECK("RAXIS: width-reduction alone creates", (bool)Subgraph::create(p, d, {0}));
+    CHECK("RAXIS: height-reduction alone creates", (bool)Subgraph::create(p, d, {1}));
+    Problem sm = mk_softmax(2048, 128);  // both reductions reduce the SAME axis (width)
+    DAG ds = DAG::build(sm);
+    CHECK("RAXIS: same-axis reductions (softmax) still fuse",
+          (bool)Subgraph::create(sm, ds, {0, 1, 2, 3}));
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -1205,6 +1227,7 @@ int main() {
     test_matmul_sensibility();
     test_model_stages();
     test_large_instances();
+    test_mixed_axis_reduction_rejected();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();
