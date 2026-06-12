@@ -254,19 +254,13 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             lat_list = output_data.get('subgraph_latencies', [])
             lat = lat_list[first_step] if len(lat_list) > first_step else 0.0
             
-            trav_order = output_data.get('traversal_orders', [])
-            snake_str = "None"
-            if len(trav_order) > first_step and trav_order[first_step] is not None and len(trav_order[first_step]) > 1:
-                t_ord = trav_order[first_step]
-                if abs(t_ord[1] - t_ord[0]) == 1:
-                    snake_str = "RowMajor"
-                else:
-                    snake_str = "ColMajor"
-            
+            # A matmul subgraph has TWO distinct contraction k's, shown separately:
+            #   seq-k  = single-core sequential k-tile (the DDR->L1 strip), per op
+            #   split-K = parallel cross-core split factor S (sink op only)
+            # The TILE is the SPATIAL output [w x h] only — k is not a spatial dim.
             split_list = output_data.get('splits', [])
             split = split_list[first_step] if len(split_list) > first_step else 1
-            # split>1 = parallel split-K (cube) / reduction split (vector) across cores
-            split_str = f"\\nsplit-K x{split}" if split and split > 1 else ""
+            split_str = f"\\nsplit-K x{split} (parallel)" if split and split > 1 else ""
 
             cores_list = output_data.get('cores', [])
             cores = cores_list[first_step] if len(cores_list) > first_step else None
@@ -274,9 +268,7 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             unit = "cube" if op_type == "MatMul" else "vector"
             cores_str = f"\\n{unit} cores: {cores}" if cores else ""
 
-            # Per-op single-core k-tile (cube-910B). Found by this op's slot in the
-            # step's execution order. Differs from the tile's K (gran[2], the sink's)
-            # for an INTERNAL matmul that slices its own contraction to fit L1.
+            # Single-core sequential k-tile, per matmul op (by its slot in op_order).
             seq_str = ""
             seq_k_list = output_data.get('seq_k', [])
             order_list = output_data.get('op_order', [])
@@ -284,10 +276,11 @@ def generate_solution_dot(input_data, output_data, out_filepath):
                     and seq_k_list[first_step] is not None
                     and len(order_list) > first_step and i in order_list[first_step]):
                 kk = seq_k_list[first_step][order_list[first_step].index(i)]
-                seq_str = f"\\nseq-k {kk}"
+                seq_str = f"\\nseq-k {kk} (1-core)"
 
             step_str = ",".join(map(str, steps))
-            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}\\nTile: {gran[0]}x{gran[1]}x{gran[2]}{split_str}{seq_str}{cores_str}\\nLat: {lat:.1f}\\n{snake_str}"
+            label = (f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}"
+                     f"\\ntile {gran[0]}x{gran[1]}{seq_str}{split_str}{cores_str}\\nLat: {lat:.1f}")
             lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
         else:
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"
