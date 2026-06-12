@@ -977,15 +977,89 @@ static void test_vector_streaming_reduction() {
           str > 4.0 * mat);
 }
 
+// --- matmul sensibility invariants across a shape grid -----------------------
+// Locks the "sensible solution" properties we eyeballed: every single-matmul
+// tiling fills the cube cores, keeps k a clean divisor of K, keeps the L1
+// operand strip within budget, and only split-Ks when the output is too small to
+// fill the cores spatially.
+static void test_matmul_sensibility() {
+    std::cout << "[MMSENS] single-matmul tilings are sensible across shapes\n";
+    struct Case { const char* tag; int64_t M, N, K; };
+    const Case cases[] = {
+        {"sq256", 256, 256, 256}, {"sq1024", 1024, 1024, 1024}, {"sq4096", 4096, 4096, 4096},
+        {"tall", 4096, 128, 2048}, {"fat", 128, 4096, 2048}, {"thinK", 64, 64, 8192},
+        {"tiny", 16, 16, 512}, {"deepK", 512, 512, 8192}, {"wideN", 256, 8192, 1024},
+        {"flatK", 2048, 2048, 256}};
+    for (const auto& c : cases) {
+        Problem p;
+        p.tensors = {{c.K, c.M}, {c.N, c.K}, {c.N, c.M}};  // A[K,M] B[N,K] -> C[N,M]
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * c.K}};
+        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.native_w = 128; p.native_h = 128; set_910b(p);
+        DAG d = DAG::build(p);
+        auto r = Subgraph::create(p, d, {0})->best_cost();
+        char b[80];
+        auto C = [&](const char* what, bool ok) {
+            snprintf(b, sizeof b, "MMSENS/%s: %s", c.tag, what); CHECK(b, ok);
+        };
+        // total atomic 16^3 fractals; <24 would justify fewer cores (none here).
+        const int64_t fractals = (c.M / 16) * (c.N / 16) * (c.K / 16);
+        C("feasible", std::isfinite(r.latency));
+        C("k divides K", r.config.k > 0 && c.K % r.config.k == 0);
+        C("L1 strip within 512KB",
+          (long long)r.config.k * (r.config.w + r.config.h) * 4 <= 512 * 1024);
+        C("fills 24 cube cores", fractals < 24 ? r.cores_used == fractals : r.cores_used == 24);
+        C("split-K only when spatial tiles < cores",
+          r.parallel_split == 1 || r.num_spatial_tiles < 24);
+    }
+}
+
+// --- vector/reduction sensibility invariants ---------------------------------
+// Pointwise and reduction subgraphs fill the vector cores (spatially, or via the
+// sink-reduced split for few-row reductions), stay UB-feasible, and stream only
+// when materialize overflows.
+static void test_vector_sensibility() {
+    std::cout << "[VECSENS] vector/reduction tilings fill cores and fit UB\n";
+    auto run = [](const char* tag, const Problem& p, std::vector<size_t> ops,
+                  bool expect_split) {
+        DAG d = DAG::build(p);
+        auto sg = Subgraph::create(p, d, ops);
+        char b[80];
+        auto C = [&](const char* what, bool ok) {
+            snprintf(b, sizeof b, "VECSENS/%s: %s", tag, what); CHECK(b, ok);
+        };
+        if (!sg) { C("builds", false); return; }
+        auto r = sg->best_cost();
+        C("feasible", std::isfinite(r.latency));
+        C("fills 48 vector cores", r.cores_used == 48);
+        if (expect_split) C("few-row reduction split-fills cores", r.parallel_split > 1);
+    };
+    auto base = [](Problem& p) { p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+                                 p.native_w = 128; p.native_h = 128; set_910b(p); };
+    Problem pw; pw.tensors = {{4096, 4096}, {4096, 4096}};
+    pw.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 4096}}; base(pw);
+    run("pointwise", pw, {0}, false);
+    Problem rm; rm.tensors = {{1024, 512}, {1, 512}};       // many rows -> spatial fill
+    rm.ops = {{OpType::Reduction, {0}, {1}, 1024 * 512}}; base(rm);
+    run("rowmax-manyrows", rm, {0}, false);
+    Problem rf; rf.tensors = {{4096, 4}, {1, 4}};           // few rows -> reduced split
+    rf.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}}; base(rf);
+    run("rowmax-fewrows", rf, {0}, true);
+    Problem ss = mk_softmax(2048, 128);   run("softmax-smallW", ss, {0, 1, 2, 3}, false);
+    Problem sl = mk_softmax(32768, 128);  run("softmax-largeW-stream", sl, {0, 1, 2, 3}, false);
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
     test_peak_band_feasibility();
     test_chain_ksplit_variants();
+    test_matmul_sensibility();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();
+    test_vector_sensibility();
     test_visualize();
     test_two_matmul();
     test_fusion_decision_matrix();
