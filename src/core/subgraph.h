@@ -112,6 +112,18 @@ public:
   int64_t cube_peak_l1(const TileConfig &cfg,
                        std::vector<int64_t> *perop_k = nullptr) const;
 
+  // Vector (UB) pebble peak — the dynamic on-chip working set of a vector
+  // subgraph, the analog of cube_peak_l1 for the cube. Each tensor's tile
+  // footprint is [min(cfg.w,W), min(cfg.h,H)]; the reduced axis is coupled to its
+  // full extent (cfg forces it), so a reduction input spans the whole row/col
+  // band. Ephemeral tensors are resident across [producer, last consumer];
+  // boundary tiles are transient. Returns the peak UB bytes. (No W-axis streaming
+  // yet — a reduction band spans its FULL reduced extent; the streaming
+  // single-core reduction that would shrink it is the next increment.)
+  int64_t vector_peak_ub(const TileConfig &cfg,
+                         const FlatSet<size_t> &retained_from_prev = {},
+                         const FlatSet<size_t> &retain_these = {}) const;
+
   bool is_feasible(const TileConfig &cfg,
                    const FlatSet<size_t> &retained_from_prev = {},
                    const FlatSet<size_t> &retain_these = {}) const;
@@ -196,6 +208,10 @@ private:
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).
   int64_t reduced_extent_ = 0;
   bool has_pw_sink_ = false;
+  bool reduction_is_sink_ = false;  // a sink op is a Reduction — the ONLY case
+                                    // where the reduced axis may be parallel-split
+                                    // across cores (cross-core merge = DDR, so an
+                                    // internal reduction split must be a subgraph cut)
   bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul

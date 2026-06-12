@@ -209,6 +209,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         break;
       }
     }
+    // A reduction sink is the only place a reduced-axis (cross-core) split may
+    // land — its partials reduce through DDR, which is fine for a boundary output
+    // but would break ephemerality for an internal reduction (that case must be a
+    // subgraph cut instead). Mirrors matmul's sink-only parallel split-K.
+    for (auto s : sink_ops)
+      if (prob.ops[s].type == OpType::Reduction) { sg.reduction_is_sink_ = true; break; }
 
     // Set output_K_ from the sink matmul (if any).
     //   MM-only sinks:  output_K_ = op_K(sink_mm) — standard temporal tiling.
@@ -980,6 +986,58 @@ int64_t Subgraph::cube_peak_l1(const TileConfig &cfg,
   return derive_exec(cfg, output_K_, {}, {}, perop_k);
 }
 
+// Vector (UB) pebble peak — see the header. Same interval-overlap sweep as the
+// cube, over the UB pool: live ephemeral bands + the transient boundary tiles of
+// the running op. The matmul band bug transposed to vector — softmax's e=[W,h]
+// row band is ephemeral and was uncounted by the old static boundary-only sum.
+int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
+                                 const FlatSet<size_t> &retained_from_prev,
+                                 const FlatSet<size_t> &retain_these) const {
+  const auto &order = dfs_order_;
+  std::vector<int> pos(prob_->num_ops(), -1);
+  for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
+
+  // Tile footprint: the reduced axis is coupled to its full extent (cfg forces
+  // ws_/hs_cand there), so min(cfg,dim) gives full-extent on the reduced axis and
+  // the spatial tile on the non-reduced one; a reduction output ([·,1]) collapses.
+  auto tile_bytes = [&](size_t t) -> int64_t {
+    const int64_t tw = std::min(cfg.w, prob_->tensors[t].width);
+    const int64_t th = std::min(cfg.h, prob_->tensors[t].height);
+    return tw * th * dtype_bytes(prob_->tensors[t].dtype);
+  };
+
+  // Ephemeral bands resident across [producer, last in-subgraph consumer].
+  std::vector<int64_t> band_at(order.size(), 0);
+  for (size_t t : ephemeral_) {
+    int pr = dag_->tensor_producer[t];
+    int prod = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
+    int last = prod;
+    for (auto c : dag_->tensor_consumers[t])
+      if (pos[c] >= 0) last = std::max(last, pos[c]);
+    const int64_t b = tile_bytes(t);
+    for (int s = prod; s <= last; ++s) band_at[s] += b;
+  }
+
+  // Retained (coupling) tensors resident across the subgraph (disabled on 910B).
+  int64_t base = 0;
+  for (auto t : retained_from_prev) base += prob_->tensors[t].size_bytes();
+  for (auto t : retain_these)
+    if (!retained_from_prev.count(t)) base += prob_->tensors[t].size_bytes();
+
+  int64_t peak = 0;
+  for (int s = 0; s < (int)order.size(); ++s) {
+    const Op &op = prob_->ops[order[s]];
+    int64_t transient = 0;
+    for (auto in : op.inputs)  // boundary input tiles (ephemerals are bands)
+      if (!ephemeral_.count(in) && !retained_from_prev.count(in) && !retain_these.count(in))
+        transient += tile_bytes(in);
+    const size_t o = op.output();  // boundary output tile (resident while written)
+    if (!ephemeral_.count(o) && !retain_these.count(o)) transient += tile_bytes(o);
+    peak = std::max(peak, base + band_at[s] + transient);
+  }
+  return peak;
+}
+
 // 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
 // the per-tile slice footprint IS the per-core footprint. Fork on cube/vector.
 bool Subgraph::fits_on_chip(const TileConfig &cfg,
@@ -1001,23 +1059,12 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
     return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) !=
            INT64_MAX;
 
-  // Vector: tile + ephemerals resident in UB. Vector ephemerals are small [w,h]
-  // tiles, so the static slice sum is a tight bound here (kept as-is).
-  const int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
-  const int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
-  const int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
-  int64_t ub_bytes = 0;
-  for (const auto &info : boundary_tensor_info_) {
-    if (retained_from_prev.count(info.id) || retain_these.count(info.id)) continue;
-    int64_t ht = info.eval_h_tiles(ntw, nk);
-    int64_t vt = info.eval_v_tiles(nth, nk);
-    const int64_t W = prob_->tensors[info.id].width, H = prob_->tensors[info.id].height;
-    ht = std::max(std::min(ht, W), (int64_t)1);
-    vt = std::max(std::min(vt, H), (int64_t)1);
-    ub_bytes += (W / ht) * (H / vt) * dtype_bytes(prob_->tensors[info.id].dtype);
-  }
-  const double f = prob_->double_buffer ? 0.5 : 1.0;  // double-buffer reserves half UB
-  return (double)ub_bytes <= (double)prob_->vec_capacity * f;
+  // Vector: dynamic peak UB over the execution order, counting ephemeral bands
+  // (the reduction subgraph's [reduced_extent, h] intermediates — e.g. softmax's
+  // e — which the old boundary-only sum ignored). Double-buffer reserves half UB.
+  const double f = prob_->double_buffer ? 0.5 : 1.0;
+  return (double)vector_peak_ub(cfg, retained_from_prev, retain_these) <=
+         (double)prob_->vec_capacity * f;
 }
 
 bool Subgraph::is_feasible(const TileConfig &cfg,
@@ -1377,24 +1424,28 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       result.cores_used = (int)eff;
       result.compute_bound = (total_compute / eff) >= total_io * sat_v;
       result.ddr_traffic = total_io;
-      // Reduction split: when the spatial (non-reduced) tiles can't fill the
-      // cores, split the REDUCED axis across cores — each core reduces its slice
-      // to a partial, then partials merge across cores via DDR. The partial is
-      // the thin reduced output (out_H_ for a width-reduction, out_W_ for a
-      // height-reduction), so the merge is cheap — the flash-attention insight.
-      // Taken only when it helps. Mirrors matmul split-K.
-      if (has_reduction_ && num_tiles < n_cores) {
+      // Reduced-axis (cross-core) split — the vector analog of matmul split-K.
+      // SINK-ONLY: the S per-core partials reduce across cores through DDR, which
+      // is fine for a boundary reduction output but would break ephemerality for
+      // an internal reduction (that case is expressed as a subgraph cut, not an
+      // in-subgraph split). The split propagates to the pointwise ops feeding the
+      // sink along the reduced axis; the single merge is an ADDITIVE BSP barrier.
+      if (has_reduction_ && reduction_is_sink_ && num_tiles < n_cores) {
         const int64_t S = (n_cores + num_tiles - 1) / num_tiles;  // cores per spatial tile
         const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
-        const double merge =
-            (double)(S - 1) * (double)(reduced_axis_ == 1 ? out_H_ : out_W_) * inv_B;
-        const double latS = std::max(total_compute / effS, total_io + merge);
+        const double sat_vS = std::max(1.0, (double)n_cores / effS);
+        const double streamS = std::max(total_compute / effS, total_io * sat_vS);
+        // Thin partial: the reduced output ([H,1] for a width-reduction, [1,W]
+        // for a height-reduction). (S-1) cross-core merges through DDR.
+        const double merge_tail =
+            (double)(S - 1) * (double)(reduced_axis_ == 1 ? out_H_ : out_W_) * inv_B * sat_vS;
+        const double latS = streamS + merge_tail;
         if (latS < lat) {
           lat = latS;
           result.parallel_split = (int)S;
           result.cores_used = (int)effS;
-          result.compute_bound = (total_compute / effS) >= (total_io + merge);
-          result.ddr_traffic = total_io + merge;
+          result.compute_bound = (total_compute / effS) >= (total_io * sat_vS);
+          result.ddr_traffic = total_io * sat_vS + merge_tail;
         }
       }
       result.latency = lat;

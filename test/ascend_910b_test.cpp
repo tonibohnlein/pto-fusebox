@@ -882,12 +882,70 @@ static void test_chain_ksplit_variants() {
           par.k1 == par.N1);
 }
 
+// --- vector pebble: the ephemeral row-band is counted in UB ------------------
+// Vector analog of test_peak_band_feasibility. A reduction subgraph x->exp->rowsum
+// has an ephemeral e=[W,h] row band (W coupled to full extent). The old static
+// sum counted only the boundary x/s; the pebble peak counts e, so a tile whose
+// boundary input alone fits UB can still overflow once e is on-chip.
+static void test_vector_band_ub() {
+    std::cout << "[VBAND] vector UB pebble counts the ephemeral row band\n";
+    Problem p;  // x[4096,H] -> e=exp(x)[4096,H] (ephemeral) -> s=rowsum(e)[1,H] (sink)
+    p.tensors = {{4096, 128}, {4096, 128}, {1, 128}};
+    p.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 128},
+             {OpType::Reduction, {1}, {2}, 4096 * 128}};
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10; p.native_w = 128; p.native_h = 128;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    const int64_t UB = 192 * 1024;
+    const int64_t xtile8 = 4096LL * 8 * 4;                 // boundary x tile at h=8 = 131072
+    int64_t peak8 = sg->vector_peak_ub({4096, 8, 0});
+    CHECK("VBAND: ephemeral e adds on top of the boundary input", peak8 > xtile8);
+    CHECK("VBAND: e band overflows UB where boundary-only would fit",
+          peak8 > UB && xtile8 < UB);
+    CHECK("VBAND: a small M-band fits UB once e is counted",
+          sg->vector_peak_ub({4096, 2, 0}) <= UB);
+}
+
+// --- reduction parallel split is SINK-ONLY -----------------------------------
+// A bare rowmax (reduction IS the sink) may split its reduced axis across cores.
+// A chain whose sink is a POINTWISE with an internal reduction may NOT — the
+// internal reduction's partials would round-trip DDR (breaking ephemerality), so
+// the model leaves it spatial-only (a cut would be the partitioner's job).
+static void test_reduction_sink_gating() {
+    std::cout << "[RGATE] reduced-axis split only when the reduction is the sink\n";
+    auto mk = []() { Problem p; p.slow_memory_bandwidth = 10;
+                     p.native_w = 128; p.native_h = 128; return p; };
+    // (a) bare rowmax, few rows -> sink reduction -> splits across cores.
+    Problem a = mk();
+    a.tensors = {{4096, 4}, {1, 4}};
+    a.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}};
+    a.fast_memory_capacity = 1 << 24; set_910b(a);
+    DAG da = DAG::build(a);
+    CHECK("RGATE: bare reduction sink splits the reduced axis",
+          Subgraph::create(a, da, {0})->best_cost().parallel_split > 1);
+    // (b) x -> m=rowmax(x) -> y=sub(x,m): pointwise SINK, internal reduction, few
+    // rows. Cannot fill cores (no split allowed) -> parallel_split stays 1.
+    Problem b = mk();
+    b.tensors = {{4096, 4}, {1, 4}, {4096, 4}};
+    b.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000},
+             {OpType::Pointwise, {0, 1}, {2}, 4096LL * 4}};
+    b.fast_memory_capacity = 1 << 24; set_910b(b);
+    DAG db = DAG::build(b);
+    auto sg = Subgraph::create(b, db, {0, 1});
+    CHECK("RGATE: internal-reduction chain (pw sink) does NOT split",
+          sg && sg->best_cost().parallel_split == 1);
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
     test_peak_band_feasibility();
     test_chain_ksplit_variants();
+    test_vector_band_ub();
+    test_reduction_sink_gating();
     test_visualize();
     test_two_matmul();
     test_fusion_decision_matrix();
