@@ -1049,6 +1049,70 @@ static void test_vector_sensibility() {
     Problem sl = mk_softmax(32768, 128);  run("softmax-largeW-stream", sl, {0, 1, 2, 3}, false);
 }
 
+// --- realistic model stages: FFN + attention across batch sizes --------------
+// FFN (X@W1 -> relu -> @W2) and attention (Q@K^T -> softmax -> @V) must each
+// partition into THREE homogeneous subgraphs (cube / vector / cube — the
+// cube<->vector handoff is DDR, never fused). Verifies core-filling and that a
+// sub-fractal (decode) batch pads to a 16-fractal row: same cube cost as B=16.
+static CostResult eval(const Problem& p, std::vector<size_t> ops) {
+    DAG d = DAG::build(p);  // kept alive across best_cost() (uses dag_)
+    auto sg = Subgraph::create(p, d, ops);
+    return sg ? sg->best_cost() : CostResult{};  // default latency = +inf
+}
+static bool creatable(const Problem& p, std::vector<size_t> ops) {
+    DAG d = DAG::build(p);
+    return (bool)Subgraph::create(p, d, ops);
+}
+static void test_model_stages() {
+    std::cout << "[MODEL] FFN / attention stages across batch sizes\n";
+    auto ffn = [](int64_t B) {
+        Problem p; int64_t dm = 512, df = 2048;
+        p.tensors = {{dm, B}, {df, dm}, {df, B}, {df, B}, {dm, df}, {dm, B}};
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * dm}, {OpType::Pointwise, {2}, {3}, df * B},
+                 {OpType::MatMul, {3, 4}, {5}, 16384 * df}};
+        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.native_w = 128; p.native_h = 128; set_910b(p); return p;
+    };
+    char b[80];
+    double mm1_decode = -1, mm1_b16 = -1;
+    for (int64_t B : {1, 8, 16, 128, 512}) {
+        Problem p = ffn(B);
+        auto C = [&](const char* w, bool ok) { snprintf(b, sizeof b, "FFN B%lld: %s",
+                                                         (long long)B, w); CHECK(b, ok); };
+        C("cube+vector not fusable (homogeneity)", !creatable(p, {0, 1}));
+        auto m1 = eval(p, {0}), rl = eval(p, {1}), m2 = eval(p, {2});
+        C("mm1 feasible + fills 24 cube cores", std::isfinite(m1.latency) && m1.cores_used == 24);
+        C("relu feasible + fills 48 vector cores", std::isfinite(rl.latency) && rl.cores_used == 48);
+        C("mm2 feasible + fills 24 cube cores", std::isfinite(m2.latency) && m2.cores_used == 24);
+        if (B == 1) mm1_decode = m1.latency;
+        if (B == 16) mm1_b16 = m1.latency;
+    }
+    CHECK("MODEL/FFN: decode (B=1) matmul cost == B=16 (fractal-quantized)",
+          mm1_decode == mm1_b16 && mm1_decode > 0);
+
+    // Attention: Q@K^T -> softmax(over keys) -> @V  (d=64, S_kv=2048).
+    auto attn = [](int64_t B) {
+        Problem p; int64_t d = 64, S = 2048;
+        p.tensors = {{d, B}, {S, d}, {S, B}, {1, B}, {S, B}, {1, B}, {S, B}, {d, S}, {d, B}};
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * d}, {OpType::Reduction, {2}, {3}, S * B},
+                 {OpType::Pointwise, {2, 3}, {4}, S * B}, {OpType::Reduction, {4}, {5}, S * B},
+                 {OpType::Pointwise, {4, 5}, {6}, S * B}, {OpType::MatMul, {6, 7}, {8}, 16384 * S}};
+        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.native_w = 128; p.native_h = 128; set_910b(p); return p;
+    };
+    for (int64_t B : {16, 128, 512}) {
+        Problem p = attn(B);
+        auto C = [&](const char* w, bool ok) { snprintf(b, sizeof b, "ATTN B%lld: %s",
+                                                         (long long)B, w); CHECK(b, ok); };
+        C("QK^T(cube)+softmax(vec) not fusable", !creatable(p, {0, 1}));
+        auto sc = eval(p, {0}), sm = eval(p, {1, 2, 3, 4}), pv = eval(p, {5});
+        C("scores feasible + fills 24 cube cores", std::isfinite(sc.latency) && sc.cores_used == 24);
+        C("softmax(over keys) feasible", std::isfinite(sm.latency));
+        C("PV feasible + fills 24 cube cores", std::isfinite(pv.latency) && pv.cores_used == 24);
+        if (B >= 128) C("softmax fills 48 vector cores (enough queries)", sm.cores_used == 48);
+    }
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -1056,6 +1120,7 @@ int main() {
     test_peak_band_feasibility();
     test_chain_ksplit_variants();
     test_matmul_sensibility();
+    test_model_stages();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();

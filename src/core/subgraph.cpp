@@ -594,7 +594,10 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       }
       if (ok) result.push_back(c);
     }
-    if (result.empty()) result.push_back(matmul_910b ? std::min(mx, (int64_t)16) : (int64_t)1);
+    // Cube: pad a sub-16 dim UP to one 16-fractal (the cube is atomic at 16, so
+    // a small-batch / GEMV output tiles to a single padded fractal — feasible,
+    // not stuck at a sub-16 tile that fails the alignment check). Competition: 1.
+    if (result.empty()) result.push_back(matmul_910b ? (int64_t)16 : (int64_t)1);
     return result;
   };
 
@@ -1295,11 +1298,15 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         // are produced once: factor 1.
         const double recompute = consumed.count(o) ? (double)num_tw : 1.0;
         if (prob_->cube_compute_cost > 0) {
-          // 910B machine model: count the 16x16x16 cube fractals the matmul
-          // implies = (out_W/16)(out_H/16)(K/16), times the per-fractal cube cost.
-          const double Km = (double)prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
-          const double fractals = ((double)prob_->tensors[o].width / 16.0) *
-                                  ((double)prob_->tensors[o].height / 16.0) * (Km / 16.0);
+          // 910B machine model: count the WHOLE 16x16x16 cube fractals the matmul
+          // implies = ceil(out_W/16)*ceil(out_H/16)*ceil(K/16), times the per-
+          // fractal cube cost. CEIL (not floor) so a sub-16 dim pads up to one
+          // fractal — a small-batch GEMV (M<16) still costs a full fractal row,
+          // matching the cube's atomic 16-granularity, instead of being dropped.
+          const int64_t Km = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
+          const double fractals = (double)((prob_->tensors[o].width + 15) / 16) *
+                                  (double)((prob_->tensors[o].height + 15) / 16) *
+                                  (double)((Km + 15) / 16);
           total_compute += fractals * (double)prob_->cube_compute_cost * recompute;
         } else {
           // Legacy: per-op base_cost interpreted as per-native-128-tile cost.
