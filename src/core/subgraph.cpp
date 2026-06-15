@@ -1012,7 +1012,7 @@ int64_t Subgraph::cube_peak_l1(const TileConfig &cfg,
 int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
                                  const FlatSet<size_t> &retained_from_prev,
                                  const FlatSet<size_t> &retain_these,
-                                 int64_t reduce_chunk) const {
+                                 int64_t reduce_chunk, int stream_axis) const {
   const auto &order = dfs_order_;
   std::vector<int> pos(prob_->num_ops(), -1);
   for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
@@ -1020,13 +1020,15 @@ int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
   // Tile footprint: the reduced axis is coupled to its full extent (cfg forces
   // ws_/hs_cand there), so min(cfg,dim) gives full-extent on the reduced axis and
   // the spatial tile on the non-reduced one; a reduction output ([·,1]) collapses.
-  // Single-core streaming caps the reduced axis at reduce_chunk (the band held on
-  // one core per chunk; reused ephemerals are recomputed past the reduction).
+  // Single-core streaming caps the stream axis at reduce_chunk (the band held on
+  // one core per chunk). stream_axis defaults to the reduced axis (reduction
+  // online accumulation); a pure pointwise passes an explicit axis to stream.
+  const int ax = stream_axis ? stream_axis : reduced_axis_;
   auto tile_bytes = [&](size_t t) -> int64_t {
     int64_t tw = std::min(cfg.w, prob_->tensors[t].width);
     int64_t th = std::min(cfg.h, prob_->tensors[t].height);
-    if (reduced_axis_ == 1) tw = std::min(tw, reduce_chunk);
-    else if (reduced_axis_ == 2) th = std::min(th, reduce_chunk);
+    if (ax == 1) tw = std::min(tw, reduce_chunk);
+    else if (ax == 2) th = std::min(th, reduce_chunk);
     return tw * th * dtype_bytes(prob_->tensors[t].dtype);
   };
 
@@ -1062,6 +1064,40 @@ int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
   return peak;
 }
 
+// Derive the single-core k-stream of a vector subgraph — the analog of the
+// matmul per-op seq-k. Materialize when the whole tile fits UB; else stream the
+// largest UB-fitting chunk along the coupled reduced axis (reduction) or the
+// larger tile axis (pointwise). Peak is monotone in the chunk, so binary-search.
+Subgraph::VecStream Subgraph::vector_stream(const TileConfig &cfg,
+                                            const FlatSet<size_t> &retained_from_prev,
+                                            const FlatSet<size_t> &retain_these) const {
+  const double f = prob_->double_buffer ? 0.5 : 1.0;
+  const int64_t budget = (int64_t)((double)prob_->vec_capacity * f);
+  if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget)
+    return {0, INT64_MAX};  // materialized — no sub-streaming
+
+  int stream_axis;
+  int64_t ext, min_chunk;
+  if (has_reduction_) {  // reduction: stream the coupled reduced axis, min 16-granule
+    stream_axis = reduced_axis_;
+    ext = (reduced_axis_ == 1) ? std::max(out_W_, reduced_extent_)
+                               : std::max(out_H_, reduced_extent_);
+    min_chunk = 16;
+  } else {  // pointwise: stream the larger tile axis (shrinks the footprint most)
+    stream_axis = (cfg.w >= cfg.h) ? 1 : 2;
+    ext = (stream_axis == 1) ? std::min(cfg.w, out_W_) : std::min(cfg.h, out_H_);
+    min_chunk = 1;
+  }
+  int64_t lo = min_chunk, hi = std::max(ext, min_chunk), best = 0;
+  while (lo <= hi) {
+    const int64_t mid = lo + (hi - lo) / 2;
+    if (vector_peak_ub(cfg, retained_from_prev, retain_these, mid, stream_axis) <= budget) {
+      best = mid; lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return {best >= min_chunk ? stream_axis : 0, best};  // chunk 0 => infeasible
+}
+
 // 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
 // the per-tile slice footprint IS the per-core footprint. Fork on cube/vector.
 bool Subgraph::fits_on_chip(const TileConfig &cfg,
@@ -1083,31 +1119,8 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
     return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) !=
            INT64_MAX;
 
-  // Vector: dynamic peak UB over the execution order, counting ephemeral bands
-  // (the reduction subgraph's [reduced_extent, h] intermediates — e.g. softmax's
-  // e — which the old boundary-only sum ignored). Double-buffer reserves half UB.
-  const double f = prob_->double_buffer ? 0.5 : 1.0;
-  const int64_t budget = (int64_t)((double)prob_->vec_capacity * f);
-  // Materialize first: hold the full reduced band on-chip (no streaming).
-  if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget) return true;
-  // Escalate to single-core STREAMING (the vector analog of matmul seq-k):
-  // materialize when it fits, stream only when forced.
-  //  - PURE POINTWISE: no coupling, so the tile streams freely in UB-chunks down
-  //    to 1 element — ALWAYS feasible. (The tile is a per-core kernel; the cost's
-  //    eff + kernel-fill terms, not feasibility, size it to ~one kernel per core.)
-  //  - REDUCTION: the reduced axis is coupled (online accumulation), so stream
-  //    that axis at the largest chunk whose streamed peak fits.
-  if (!has_reduction_) return true;
-  const int64_t ext = (reduced_axis_ == 1) ? std::max(out_W_, reduced_extent_)
-                                           : std::max(out_H_, reduced_extent_);
-  int64_t lo = 16, hi = ext, best = 0;
-  while (lo <= hi) {  // largest feasible chunk; peak is monotincreasing in chunk
-    const int64_t mid = lo + (hi - lo) / 2;
-    if (vector_peak_ub(cfg, retained_from_prev, retain_these, mid) <= budget) {
-      best = mid; lo = mid + 1;
-    } else hi = mid - 1;
-  }
-  return best >= 16;  // feasible iff even a minimal 16-wide chunk fits
+  // Vector: feasible iff the subgraph materializes OR streams to fit UB.
+  return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
 }
 
 bool Subgraph::is_feasible(const TileConfig &cfg,

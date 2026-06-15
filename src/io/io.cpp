@@ -267,6 +267,14 @@ void write_solution(const std::string& filename, const Solution& sol) {
                     ks.push_back((int64_t)op == sink ? cr.config.k
                                  : ((size_t)op < pk.size() ? pk[op] : 0));
                 j["seq_k"].push_back(ks);
+            } else if (!step.subgraph.has_matmul() && prob.num_vector_cores > 1 &&
+                       prob.vec_capacity > 0) {
+                // Vector single-core k-stream: one subgraph-wide chunk along the
+                // streamed axis (the matmul-seq-k analog). Emit it per op (same
+                // value); INT64_MAX (materialized) -> 0 = "no sub-streaming".
+                const auto vs = step.subgraph.vector_stream(cfg);
+                const int64_t chunk = vs.chunk == INT64_MAX ? 0 : vs.chunk;
+                j["seq_k"].push_back(std::vector<int64_t>(order.size(), chunk));
             } else {
                 j["seq_k"].push_back(nullptr);
             }

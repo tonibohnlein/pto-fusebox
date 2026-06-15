@@ -125,10 +125,25 @@ public:
   // (softmax's e) is held only a chunk at a time (recomputed past the reduction)
   // rather than as a full [reduced_extent, h] band. INT64_MAX = no streaming
   // (materialize the full band). Lets a large-W reduction fit UB.
+  // stream_axis selects which axis reduce_chunk caps: 0 => the reduced axis (a
+  // reduction's coupled online accumulation); 1/2 => width/height, used to stream
+  // a pure-pointwise tile (which has no coupled axis — the single-core k-stream).
   int64_t vector_peak_ub(const TileConfig &cfg,
                          const FlatSet<size_t> &retained_from_prev = {},
                          const FlatSet<size_t> &retain_these = {},
-                         int64_t reduce_chunk = INT64_MAX) const;
+                         int64_t reduce_chunk = INT64_MAX,
+                         int stream_axis = 0) const;
+
+  // The derived single-core k-stream of a vector subgraph at this tiling — the
+  // analog of the matmul per-op seq-k. axis: 0 = materialized (whole tile fits
+  // UB, no sub-streaming); 1/2 = the width/height axis streamed in UB-chunks.
+  // chunk: the streaming granularity along that axis (INT64_MAX when materialized,
+  // 0 when infeasible). For a reduction the axis is the coupled reduced one; for
+  // a pure pointwise it's the larger tile axis (shrinks the footprint most).
+  struct VecStream { int axis = 0; int64_t chunk = 0; };
+  VecStream vector_stream(const TileConfig &cfg,
+                          const FlatSet<size_t> &retained_from_prev = {},
+                          const FlatSet<size_t> &retain_these = {}) const;
 
   bool is_feasible(const TileConfig &cfg,
                    const FlatSet<size_t> &retained_from_prev = {},

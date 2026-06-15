@@ -1255,6 +1255,32 @@ static void test_kernel_fill_one_per_core() {
     CHECK("KFILL: kernel-fill adds to the cost", with_fill > no_fill);
 }
 
+// --- explicit single-core k-stream for pointwise (the matmul-seq-k analog) ----
+// A vector tile that overflows UB is not "always feasible" by fiat — it derives
+// an EXPLICIT chunk along the larger axis (like matmul seq-k / the reduction
+// chunk). A tile that fits is materialized (no sub-streaming).
+static void test_pointwise_stream_explicit() {
+    std::cout << "[PWSTREAM] pointwise derives an explicit single-core k-stream\n";
+    Problem p;
+    p.tensors = {{8192, 256}, {8192, 256}};
+    p.ops = {{OpType::Pointwise, {0}, {1}, 8192 * 256}};
+    p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128; set_910b(p);
+    DAG d = DAG::build(p);
+    auto sg = Subgraph::create(p, d, {0});
+    const int64_t UB = 192 * 1024;
+    TileConfig big{8192, 256, 0};   // whole tensor as one kernel -> overflows UB
+    CHECK("PWSTREAM: large tile overflows UB", sg->vector_peak_ub(big) > UB);
+    auto s = sg->vector_stream(big);
+    CHECK("PWSTREAM: an explicit chunk is derived (streams the wider axis)",
+          s.axis == 1 && s.chunk > 0 && s.chunk < 8192);
+    CHECK("PWSTREAM: the chunk actually fits UB",
+          sg->vector_peak_ub(big, {}, {}, s.chunk, s.axis) <= UB);
+    TileConfig small{128, 128, 0};  // fits UB -> materialized, no sub-stream
+    CHECK("PWSTREAM: a UB-fitting tile materializes (no stream)",
+          sg->vector_stream(small).axis == 0);
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -1266,6 +1292,7 @@ int main() {
     test_large_instances();
     test_mixed_axis_reduction_rejected();
     test_kernel_fill_one_per_core();
+    test_pointwise_stream_explicit();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();

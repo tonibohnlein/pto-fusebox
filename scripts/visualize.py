@@ -268,15 +268,18 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             unit = "cube" if op_type == "MatMul" else "vector"
             cores_str = f"\\n{unit} cores: {cores}" if cores else ""
 
-            # Single-core sequential k-tile, per matmul op (by its slot in op_order).
+            # Single-core k-stream per op (by its slot in op_order): the matmul
+            # contraction seq-k, or a vector tile's UB-chunk stream. 0 = no
+            # sub-streaming (materialized), not shown.
             seq_str = ""
             seq_k_list = output_data.get('seq_k', [])
             order_list = output_data.get('op_order', [])
-            if (op_type == "MatMul" and len(seq_k_list) > first_step
-                    and seq_k_list[first_step] is not None
+            if (len(seq_k_list) > first_step and seq_k_list[first_step] is not None
                     and len(order_list) > first_step and i in order_list[first_step]):
                 kk = seq_k_list[first_step][order_list[first_step].index(i)]
-                seq_str = f"\\nseq-k {kk} (1-core)"
+                if kk and kk > 0:
+                    tag = "seq-k" if op_type == "MatMul" else "stream"
+                    seq_str = f"\\n{tag} {kk} (1-core)"
 
             step_str = ",".join(map(str, steps))
             label = (f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}"
