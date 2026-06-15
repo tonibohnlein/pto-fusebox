@@ -1,5 +1,4 @@
 #include "io/io.h"
-#include "core/cost.h"
 #include "solution/solution.h"
 #include <fstream>
 #include <iostream>
@@ -230,7 +229,6 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
     j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
     j["tensors_to_retain"] = json::array();
-    j["traversal_orders"]  = json::array();
     j["subgraph_latencies"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
@@ -281,23 +279,6 @@ void write_solution(const std::string& filename, const Solution& sol) {
         }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
-
-        if (cfg.snake != SnakeDir::None) {
-            int ntw = (int)(step.subgraph.output_width()  / cfg.w);
-            int nth = (int)(step.subgraph.output_height() / cfg.h);
-            if (ntw * nth > 1) {
-                // Only emit an explicit traversal order when there is more than
-                // one tile. A single-tile grid has nothing to permute; null
-                // (raster default) is equivalent and cleaner in the output.
-                auto order = make_traversal(ntw, nth, cfg.snake);
-                j["traversal_orders"].push_back(
-                    std::vector<int64_t>(order.begin(), order.end()));
-            } else {
-                j["traversal_orders"].push_back(nullptr);
-            }
-        } else {
-            j["traversal_orders"].push_back(nullptr);
-        }
 
         j["subgraph_latencies"].push_back(sol.step_latency(i));
     }

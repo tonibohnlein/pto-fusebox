@@ -119,14 +119,11 @@ struct Problem {
 };
 
 // ============================================================================
-// Tile configuration & traversal direction
+// Tile configuration
 // ============================================================================
-
-enum class SnakeDir { None, RowMajor, ColMajor };
 
 struct TileConfig {
     int64_t w = 0, h = 0, k = 0;
-    SnakeDir snake = SnakeDir::None;
 };
 
 // ============================================================================

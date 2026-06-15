@@ -102,8 +102,6 @@ int main(int argc, char* argv[]) {
         }
         std::string type_tag = (step_mm && step_pw) ? "MM+PW" :
                                (step_mm ? "MM" : "PW");
-        std::string snake_str = cfg.snake == SnakeDir::RowMajor ? "RM" :
-                                cfg.snake == SnakeDir::ColMajor ? "CM" : "--";
 
         double lat = sol.step_latency(i);
         double pct = 100.0 * lat / total_lat;
@@ -114,7 +112,6 @@ int main(int argc, char* argv[]) {
                   << " [" << std::setw(4) << cfg.w
                   << "," << std::setw(4) << cfg.h
                   << "," << std::setw(4) << cfg.k << "]"
-                  << " " << snake_str
                   << " lat=" << std::setw(12) << std::fixed << std::setprecision(1) << lat
                   << " (" << std::setw(4) << std::setprecision(1) << pct << "%)";
         if (!s.retain_these.empty()) {

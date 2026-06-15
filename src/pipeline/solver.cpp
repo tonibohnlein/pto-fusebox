@@ -109,11 +109,11 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
         effective_dl = now + std::chrono::seconds(5);
     auto total_budget = effective_dl - now;
 
+    // 910B never retains tensors across kernels: cross-subgraph data routes
+    // through DDR (no shared L2), so the retain/coupling pipeline (Phase 3) is
+    // permanently disabled — the no-retention path always runs.
     auto feasibly_ret = compute_feasibly_retainable(prob, dag);
-    bool has_retain   = !feasibly_ret.empty();
-
-    std::cerr << "  Retainable tensors: " << feasibly_ret.size()
-              << " / " << prob.retainable_tensors.size() << "\n";
+    const bool has_retain = false;
 
     TimePoint phase1_dl, phase2_dl;
     if (has_retain) {
@@ -377,11 +377,10 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
     if (deadline == TimePoint::max())
         effective_dl = now + std::chrono::seconds(5);
 
+    // 910B never retains tensors across kernels (cross-subgraph data routes
+    // through DDR) — the retain/coupling pipeline is permanently disabled.
     auto feasibly_ret = compute_feasibly_retainable(prob, dag);
-    bool has_retain = !feasibly_ret.empty();
-
-    std::cerr << "  Retainable tensors: " << feasibly_ret.size()
-              << " / " << prob.retainable_tensors.size() << "\n";
+    const bool has_retain = false;
 
     CostCache shared_cache;
 

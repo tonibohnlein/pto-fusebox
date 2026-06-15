@@ -1315,7 +1315,7 @@ CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
   for (int64_t ww : ws_cand_) {
     for (int64_t hh : hs_cand_) {
       for (int64_t kk : ks_cand_) {
-        TileConfig cfg{ww, hh, kk, SnakeDir::None};
+        TileConfig cfg{ww, hh, kk};
         if (!is_valid_tiling(cfg)) continue;
         if (!fits_on_chip(cfg, retained_from_prev, retain_these)) continue;
         auto r = compute_cost(cfg, retained_from_prev, retain_these);
