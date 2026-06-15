@@ -187,21 +187,11 @@ private:
   FlatSet<size_t> boundary_inputs_;
   FlatSet<size_t> boundary_outputs_;
   FlatSet<size_t> ephemeral_;
-  // Ephemerals split by producer-op type. Used for the granule-fit check in
-  // is_valid_tiling:
-  //   PW producer: slice ≤ (cfg.w, cfg.h) — PW has no k-loop, one granule
-  //                per execution.
-  //   MM producer: slice ≤ native — MM's internal k-loop covers multiple
-  //                native-sized steps; the bound is the hardware limit.
-  // Defensive: mostly subsumed by cfg ≤ native + role propagation, but cheap
-  // and catches role-propagation surprises in long op chains.
+  // PW-produced ephemerals, for the granule-fit check in is_valid_tiling: a PW
+  // op has no k-loop, so its output slice must fit within one (cfg.w, cfg.h)
+  // granule. Defensive — mostly subsumed by cfg ≤ native + role propagation,
+  // but cheap and catches role-propagation surprises in long op chains.
   std::vector<size_t> pw_produced_ephemerals_;
-  std::vector<size_t> mm_produced_ephemerals_;
-
-  // Ephemeral MM outputs that serve as accumulators in MM→PW epilogue patterns.
-  // These are physically resident in fast memory across all k-steps (w×h each).
-  // Only populated when has_simple_epilogue_ is true.
-  std::vector<size_t> ephemeral_accumulators_;
 
   int64_t out_W_ = 0, out_H_ = 0;
   bool has_matmul_ = false;
@@ -250,7 +240,7 @@ private:
   // construction; drives the peak-working-set sweep and the emitted schedule.
   std::vector<size_t> dfs_order_;
 
-  // Precomputed per-boundary-tensor tiling info for working_set/compute_cost.
+  // Precomputed per-boundary-tensor tiling info for compute_cost.
   //
   // Each boundary tensor's slice dimensions are determined by backward
   // propagation through the chain, exactly matching the reference evaluator's

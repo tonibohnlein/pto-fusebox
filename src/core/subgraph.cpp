@@ -75,8 +75,8 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // through DDR (no free ephemeral) and the unified single grid can't express
   // cube/vector overlap — so they are never fused into one group. Opaque ops
   // (gather/scatter/sort/transpose) are barriers: singleton groups only.
-  // Gated on parallel-core mode; single-context (cores==1) keeps the
-  // competition behavior (mixed fusion allowed).
+  // Gated on parallel-core mode (cores>1); the legacy single-core path
+  // (cores<=1) does not enforce homogeneity (mixed fusion allowed).
   if (prob.num_cube_cores > 1 || prob.num_vector_cores > 1) {
     bool has_cube = false, has_vector = false, has_opaque = false;
     for (auto i : sg.ops_) {
@@ -122,16 +122,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
       sg.ephemeral_.insert(t);
   }
 
-  // Partition ephemerals by producer op-type for the granule-fit check.
-  // PW-produced ephemerals have a stricter bound (cfg) since PW has no
-  // k-loop; MM-produced ephemerals just need to fit native.
+  // Collect PW-produced ephemerals for the granule-fit check in is_valid_tiling
+  // (PW has no k-loop, so its output slice must fit one (cfg.w, cfg.h) granule).
   for (auto i : sg.ops_) {
     size_t out_t = prob.ops[i].output();
-    if (!is_ephemeral[out_t]) continue;
-    if (prob.ops[i].type == OpType::Pointwise)
+    if (is_ephemeral[out_t] && prob.ops[i].type == OpType::Pointwise)
       sg.pw_produced_ephemerals_.push_back(out_t);
-    else
-      sg.mm_produced_ephemerals_.push_back(out_t);
   }
 
   // Issue #71 Rules 2/3 (prologue-PW geometric condition):
@@ -280,10 +276,6 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
         sg.has_simple_epilogue_ = true;
         sg.output_K_ = sg.op_K(found_mm);
         sg.is_sink_op_vec_[found_mm] = true;
-        // Record the ephemeral accumulator tensor
-        size_t accum_t = prob.ops[found_mm].output();
-        if (is_ephemeral[accum_t])
-          sg.ephemeral_accumulators_.push_back(accum_t);
       }
     }
 
@@ -578,16 +570,11 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   for (size_t idx = 0; idx < sg.boundary_tensor_info_.size(); idx++)
     sg.tensor_id_to_infos_[sg.boundary_tensor_info_[idx].id].push_back((int)idx);
 
-  // Super-native granule forbidden on all three axes per issues #74 Q1, #78
-  // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
-  // we use native_w as the uniform cap (benchmarks always have native_w ==
-  // native_h, and native_k follows the same value).
-  // Candidate caps. No native cap (the competition super-native rule is retired):
-  // cube tiles align to the 16 fractal; vector tiles have no cap and no alignment
-  // (a large vector tile is a per-core kernel streamed in UB-chunks — the
-  // streaming fits memory, not a small tile).
+  // Tile-size candidates: divisors of the role-required dims. There is no
+  // super-native cap — cube tiles align to the 16-element fractal; vector tiles
+  // have no alignment and no cap (a large vector tile is a per-core kernel
+  // streamed in UB-chunks — the streaming fits memory, not a small tile).
   const bool matmul_910b = sg.has_matmul_;
-  const int64_t cand_cap = 0;
   const int64_t cand_align = matmul_910b ? 16 : 1;
   auto valid_candidates = [&](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
     if (dims.empty()) return {1};
@@ -596,8 +583,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     auto divs = all_divisors(mx);
     std::vector<int64_t> result;
     for (auto c : divs) {
-      if (cand_cap > 0 && c > cand_cap) continue;          // super-native (competition)
-      if (cand_align > 1 && c % cand_align != 0) continue;  // fractal-aligned (matmul)
+      if (cand_align > 1 && c % cand_align != 0) continue;  // fractal-aligned (cube)
       bool ok = true;
       for (auto v : dims) {
         if (c < v && v % c != 0) { ok = false; break; }
@@ -606,7 +592,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     }
     // Cube: pad a sub-16 dim UP to one 16-fractal (the cube is atomic at 16, so
     // a small-batch / GEMV output tiles to a single padded fractal — feasible,
-    // not stuck at a sub-16 tile that fails the alignment check). Competition: 1.
+    // not stuck at a sub-16 tile that fails the alignment check). Vector: 1.
     if (result.empty()) result.push_back(matmul_910b ? (int64_t)16 : (int64_t)1);
     return result;
   };
@@ -713,8 +699,8 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   for (int64_t v : h_divides_)
     if (cfg.h < v && v % cfg.h != 0) return false;
   // 910B cube tile spans the full contraction (k = max_K_, accumulated in L0c);
-  // the competition's per-op k-divisibility (temporal-tiling correctness) does
-  // not apply, and for a chained group max_K_ may exceed a smaller op's K.
+  // the per-op k-divisibility rule (temporal-tiling correctness) does not apply
+  // here, and for a chained group max_K_ may exceed a smaller op's K.
   if ((!has_pw_sink_ || has_simple_epilogue_) && !matmul_910b) {
     for (int64_t v : k_divides_) {
       // Per #75: cfg.k > op_K is physically undefined — there's nothing

@@ -133,10 +133,8 @@ struct TileConfig {
 struct CostResult {
     bool feasible = false;
     double latency = std::numeric_limits<double>::infinity();
-    int64_t working_set = 0;
     int num_spatial_tiles = 0;
     int num_k_passes = 0;
-    double compute_per_step = 0;
     TileConfig config;
 
     // 910B parallel-roofline introspection (set by the cores>1 override). Lets
