@@ -53,6 +53,8 @@ static void set_910b(Problem& p) {
     p.cube_compute_cost = 4096;     // per 16x16x16 cube fractal
     p.vector_compute_cost = 1;      // per vector SIMD step
     p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
+    p.kernel_fill_cost = 10000;     // per-kernel pipeline fill (placeholder; the dual
+                                    // of eff — drives the tiling to ~one kernel/core)
 }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
@@ -66,6 +68,7 @@ static void test_A_pointwise_memory_bound() {
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
+    p.kernel_fill_cost = 0;  // isolate the DDR floor (fill is a separate layer)
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("A: subgraph builds", (bool)sg);
@@ -396,7 +399,7 @@ static void test_two_matmul() {
         q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
         q.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * Kc}, {OpType::MatMul, {0, 3}, {4}, 16384 * Kc}};
         q.fast_memory_capacity = 1 << 26; q.slow_memory_bandwidth = 10;
-        q.native_w = 128; q.native_h = 128; set_910b(q);
+        q.native_w = 128; q.native_h = 128; set_910b(q); q.kernel_fill_cost = 0;
         DAG dq = DAG::build(q);
         double a = Subgraph::create(q, dq, {0})->best_cost().latency;
         double b = Subgraph::create(q, dq, {1})->best_cost().latency;
@@ -442,7 +445,8 @@ static void test_geometry_compute() {
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost IGNORED when cube_compute_cost set
     c.fast_memory_capacity = 1 << 26; c.slow_memory_bandwidth = 10; c.native_w = 128; c.native_h = 128;
     set_910b(c);
-    c.cube_compute_cost = 10000;  // per fractal (machine param)
+    c.cube_compute_cost = 10000;
+    c.kernel_fill_cost = 0;  // isolate the compute roofline  // per fractal (machine param)
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
     const double fractals = 128.0 / 16 * 128.0 / 16 * 2048.0 / 16;  // 8192
     const double exp_c = fractals * 10000.0 / rc.cores_used;
@@ -458,7 +462,8 @@ static void test_geometry_compute() {
         v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
         v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10; v.native_w = 128; v.native_h = 128;
         set_910b(v);
-        v.vector_compute_cost = 40000;  // per SIMD step
+        v.vector_compute_cost = 40000;
+        v.kernel_fill_cost = 0;  // isolate the compute roofline  // per SIMD step
         v.vector_lanes = lanes;
         return Subgraph::create(v, DAG::build(v), {0})->best_cost();
     };
@@ -1085,13 +1090,21 @@ static void test_model_stages() {
         C("cube+vector not fusable (homogeneity)", !creatable(p, {0, 1}));
         auto m1 = eval(p, {0}), rl = eval(p, {1}), m2 = eval(p, {2});
         C("mm1 feasible + fills 24 cube cores", std::isfinite(m1.latency) && m1.cores_used == 24);
-        C("relu feasible + fills 48 vector cores", std::isfinite(rl.latency) && rl.cores_used == 48);
+        // relu fills 48 once there are enough rows; a tiny decode batch (B<16,
+        // few thousand elements) legitimately uses fewer cores (the kernel-fill
+        // dual makes over-parallelizing a tiny op cost more than it saves).
+        C("relu feasible", std::isfinite(rl.latency));
+        if (B >= 16) C("relu fills 48 vector cores", rl.cores_used == 48);
         C("mm2 feasible + fills 24 cube cores", std::isfinite(m2.latency) && m2.cores_used == 24);
         if (B == 1) mm1_decode = m1.latency;
         if (B == 16) mm1_b16 = m1.latency;
     }
-    CHECK("MODEL/FFN: decode (B=1) matmul cost == B=16 (fractal-quantized)",
-          mm1_decode == mm1_b16 && mm1_decode > 0);
+    // Decode (B=1) and B=16 have the SAME cube compute (both pad to one fractal
+    // row); the small residual difference is the byte-based DDR (B=1 reads fewer
+    // real rows) + the per-kernel fill. So they're equal up to a few percent, not
+    // bit-identical.
+    CHECK("MODEL/FFN: decode (B=1) matmul cost ~= B=16 (fractal-quantized)",
+          mm1_decode > 0 && std::abs(mm1_decode - mm1_b16) < 0.05 * mm1_b16);
 
     // Attention: Q@K^T -> softmax(over keys) -> @V  (d=64, S_kv=2048).
     auto attn = [](int64_t B) {
@@ -1218,6 +1231,30 @@ static void test_mixed_axis_reduction_rejected() {
           (bool)Subgraph::create(sm, ds, {0, 1, 2, 3}));
 }
 
+// --- kernel-fill: the cost prefers ~one kernel per core ----------------------
+// With the native-128 vector cap removed and the per-kernel fill (the dual of
+// eff), a huge pointwise that used to shatter into 16384 tiles now collapses to
+// ~cores large kernels, each streamed in UB-chunks.
+static void test_kernel_fill_one_per_core() {
+    std::cout << "[KFILL] cost prefers ~one kernel per core (cap removed + fill)\n";
+    Problem p;
+    p.tensors = {{16384, 16384}, {16384, 16384}};
+    p.ops = {{OpType::Pointwise, {0}, {1}, 16384LL * 16384}};
+    p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128; set_910b(p);
+    DAG d = DAG::build(p);
+    auto r = Subgraph::create(p, d, {0})->best_cost();
+    CHECK("KFILL: huge pointwise uses ~one kernel per core (<= 2x cores)",
+          r.num_spatial_tiles <= 2 * 48 && r.cores_used == 48);
+    CHECK("KFILL: the per-core tile exceeds UB (streamed, not materialized)",
+          (long long)r.config.w * r.config.h * 4 * 2 > 192 * 1024);
+    // The fill genuinely enters the cost (same tiling search, fill on vs off).
+    Problem p0 = p; p0.kernel_fill_cost = 0;
+    double with_fill = r.latency;
+    double no_fill = Subgraph::create(p0, d, {0})->best_cost().latency;
+    CHECK("KFILL: kernel-fill adds to the cost", with_fill > no_fill);
+}
+
 int main() {
     test_dfs_order();
     test_exec_enumeration();
@@ -1228,6 +1265,7 @@ int main() {
     test_model_stages();
     test_large_instances();
     test_mixed_axis_reduction_rejected();
+    test_kernel_fill_one_per_core();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_vector_streaming_reduction();

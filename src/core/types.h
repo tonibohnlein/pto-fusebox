@@ -92,6 +92,13 @@ struct Problem {
     int64_t cube_compute_cost = 0;    // cost per 16x16x16 cube fractal step
     int64_t vector_compute_cost = 0;  // cost per vector SIMD step
     int64_t vector_lanes = 0;         // elements per vector SIMD step (0 => 1)
+    // Per-kernel pipeline fill/drain latency. A subgraph's tiling produces
+    // num_tiles "kernels"; each core runs ceil(num_tiles/cores) of them in
+    // sequence, paying one fill per pass. Charged as rounds*kernel_fill_cost,
+    // the DUAL of the eff core-fill incentive: eff penalizes under-tiling
+    // (fewer tiles than cores), this penalizes over-tiling (more) — so the
+    // optimum sits at ~one kernel per core. 0 => off (legacy/competition).
+    int64_t kernel_fill_cost = 0;
     // Ping-pong double-buffering: reserve half of each STREAMING pool (L1 / UB)
     // for prefetch of the next tile while the current one computes. Halves the
     // effective L1 and UB budgets. Off => single-buffer (full budget).

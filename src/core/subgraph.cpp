@@ -582,13 +582,14 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
   // we use native_w as the uniform cap (benchmarks always have native_w ==
   // native_h, and native_k follows the same value).
-  // Candidate caps. Competition / vector subgraphs: native cap, no alignment.
-  // 910B matmul (cube) subgraphs: NO native cap (the L0c bound is enforced in
-  // is_valid_tiling) and 16-fractal alignment — bigger DDR->L1 tiles are good
-  // (L1->L0 pipelining + amortization); the native granule belongs to the later
-  // AutoTileMatmulL0 pass. Gated so non-matmul / single-context is unchanged.
+  // Candidate caps. The native cap is a COMPETITION concept (super-native granule
+  // forbidden) — retired for the whole 910B path. Cube tiles align to the 16
+  // fractal; vector tiles have no cap and no alignment (a large vector tile is a
+  // per-core kernel streamed in UB-chunks; the streaming is what fits memory, not
+  // a small tile). Only single-context (cores==1) keeps the native cap.
   const bool matmul_910b = (prob.num_cube_cores > 1) && sg.has_matmul_ && (prob.l1_capacity > 0);
-  const int64_t cand_cap = matmul_910b ? 0 : prob.native_w;
+  const bool vector_910b = (prob.num_vector_cores > 1) && !sg.has_matmul_ && (prob.vec_capacity > 0);
+  const int64_t cand_cap = (matmul_910b || vector_910b) ? 0 : prob.native_w;
   const int64_t cand_align = matmul_910b ? 16 : 1;
   auto valid_candidates = [&](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
     if (dims.empty()) return {1};
@@ -709,8 +710,12 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   // it from growing without bound. Gated; else the competition native cap applies.
   const int64_t native_cap = prob_->native_w;
   const bool matmul_910b = (prob_->num_cube_cores > 1) && has_matmul_ && (prob_->l1_capacity > 0);
+  const bool vector_910b = (prob_->num_vector_cores > 1) && !has_matmul_ && (prob_->vec_capacity > 0);
   if (matmul_910b) {
     if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // fractal-aligned only
+  } else if (vector_910b) {
+    // No native cap for 910B vector — a large tile is a per-core kernel streamed
+    // in UB-chunks (fits_on_chip checks the chunk). No alignment requirement.
   } else if (native_cap > 0) {
     // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
     // Exception: a reduction's reduced axis spans the full extent (super-native
@@ -1085,11 +1090,14 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
   const int64_t budget = (int64_t)((double)prob_->vec_capacity * f);
   // Materialize first: hold the full reduced band on-chip (no streaming).
   if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget) return true;
-  // Escalate to single-core STREAMING: cap the reduced axis at the largest chunk
-  // whose streamed peak fits (mirrors matmul seq-k — materialize when it fits,
-  // stream only when forced). Only a reduction has a coupled axis to stream; a
-  // pointwise-only subgraph that overflows UB has no recourse here.
-  if (!has_reduction_) return false;
+  // Escalate to single-core STREAMING (the vector analog of matmul seq-k):
+  // materialize when it fits, stream only when forced.
+  //  - PURE POINTWISE: no coupling, so the tile streams freely in UB-chunks down
+  //    to 1 element — ALWAYS feasible. (The tile is a per-core kernel; the cost's
+  //    eff + kernel-fill terms, not feasibility, size it to ~one kernel per core.)
+  //  - REDUCTION: the reduced axis is coupled (online accumulation), so stream
+  //    that axis at the largest chunk whose streamed peak fits.
+  if (!has_reduction_) return true;
   const int64_t ext = (reduced_axis_ == 1) ? std::max(out_W_, reduced_extent_)
                                            : std::max(out_H_, reduced_extent_);
   int64_t lo = 16, hi = ext, best = 0;
@@ -1507,6 +1515,16 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         }
       }
       result.latency = lat;
+    }
+    // Per-kernel pipeline fill — the DUAL of the eff core-fill incentive. A
+    // tiling produces num_tiles "kernels"; each core runs ceil(num_tiles/n_cores)
+    // of them in sequence, paying one fill per pass. eff penalizes too FEW tiles
+    // (under-filled cores); this penalizes too MANY (over-tiling), so the optimum
+    // sits at ~one kernel per core. Split-K fills a tile WITHIN a pass, so it
+    // doesn't add rounds (it's spatial num_tiles that count). Gated; off => legacy.
+    if (prob_->kernel_fill_cost > 0) {
+      const int64_t rounds = (num_tiles + n_cores - 1) / n_cores;
+      result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
     }
   }
 
