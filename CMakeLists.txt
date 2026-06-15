@@ -57,9 +57,6 @@ target_link_libraries(solver_lib Threads::Threads)
 add_executable(mlsys src/pipeline/main.cpp)
 target_link_libraries(mlsys solver_lib Threads::Threads)
 
-add_executable(evaluate src/pipeline/evaluate.cpp)
-target_link_libraries(evaluate solver_lib Threads::Threads)
-
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 
@@ -68,55 +65,11 @@ target_link_libraries(symmetry_app solver_lib Threads::Threads)
 enable_testing()
 
 set(TEST_SOURCES
-    test/test_feasibility.cpp
-    test/cross_validate.cpp
-    test/symm_init_test.cpp
-    test/unit_tests.cpp
-    test/problem_examples_test.cpp
-    test/chained_matmul_test.cpp
-    test/fanin_matmul_test.cpp
-    test/local_search_test.cpp
-    test/init_strategies_test.cpp
-    test/fm_test.cpp
-    test/move_gain_test.cpp
-    test/gain_update_test.cpp
-    test/retain_snake_test.cpp
-    test/constructed_optima_test.cpp
+    # 910B cost-model suite (the only cost model after the competition removal).
     test/ascend_910b_test.cpp
-    test/cost_cache_test.cpp
-    test/evolution_test.cpp
-    test/sanity_test.cpp
-    test/partition_fm_test.cpp
-    test/more_unit_tests.cpp
-    test/io_test.cpp
+    # Cost-agnostic structural infra still used by the 910B solver.
     test/dag_test.cpp
-    test/subgraph_test.cpp
-    test/cost_model_test.cpp
-    test/ephemeral_retain_test.cpp
-    test/incremental_dag_test.cpp
-    test/fm_search_test.cpp
-    test/partition_test.cpp
-    test/parallel_search_test.cpp
-    test/ordering_test.cpp
-    test/solver_test.cpp
     test/pairing_heap_test.cpp
-    test/coupling_test.cpp
-    test/coupling_moves_test.cpp
-    test/coupled_fm_correctness_test.cpp
-    test/merge_correctness_test.cpp
-    test/split_correctness_test.cpp
-    test/steal_correctness_test.cpp
-    test/eject_correctness_test.cpp
-    test/recompute_correctness_test.cpp
-    test/de_recompute_correctness_test.cpp
-    test/tensor_merge_correctness_test.cpp
-    test/tensor_extract_correctness_test.cpp
-    test/regression_test.cpp
-    test/granule_bound_test.cpp
-    test/multi_role_test.cpp
-    test/large_subgraph_test.cpp
-    test/prologue_pw_test.cpp
-    test/epilogue_splitk_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

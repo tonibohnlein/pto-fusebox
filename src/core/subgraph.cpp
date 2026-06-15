@@ -582,14 +582,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   // Q3, #80 Q3, #81 Q1. Per #80 Q1 native is a single value across w/h/k;
   // we use native_w as the uniform cap (benchmarks always have native_w ==
   // native_h, and native_k follows the same value).
-  // Candidate caps. The native cap is a COMPETITION concept (super-native granule
-  // forbidden) — retired for the whole 910B path. Cube tiles align to the 16
-  // fractal; vector tiles have no cap and no alignment (a large vector tile is a
-  // per-core kernel streamed in UB-chunks; the streaming is what fits memory, not
-  // a small tile). Only single-context (cores==1) keeps the native cap.
-  const bool matmul_910b = (prob.num_cube_cores > 1) && sg.has_matmul_ && (prob.l1_capacity > 0);
-  const bool vector_910b = (prob.num_vector_cores > 1) && !sg.has_matmul_ && (prob.vec_capacity > 0);
-  const int64_t cand_cap = (matmul_910b || vector_910b) ? 0 : prob.native_w;
+  // Candidate caps. No native cap (the competition super-native rule is retired):
+  // cube tiles align to the 16 fractal; vector tiles have no cap and no alignment
+  // (a large vector tile is a per-core kernel streamed in UB-chunks — the
+  // streaming fits memory, not a small tile).
+  const bool matmul_910b = sg.has_matmul_;
+  const int64_t cand_cap = 0;
   const int64_t cand_align = matmul_910b ? 16 : 1;
   auto valid_candidates = [&](const std::vector<int64_t> &dims) -> std::vector<int64_t> {
     if (dims.empty()) return {1};
@@ -701,28 +699,13 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
-  // 910B matmul (cube) subgraphs: the tile is a DDR->L1 panel. Our LEVEL is
-  // DDR<->L1, so the only on-chip bound here is 16-fractal alignment + the L1
-  // operand-strip budget (checked in fits_on_chip). The output tile [w,h] is NOT
-  // bounded by L0c at this level — accumulating [w,h] within the 128KB L0c is the
-  // LATER L1->L0 pass's job (AutoTileMatmulL0 sub-tiles [w,h] into L0c [m,n]). So
-  // a >L0c output tile is legal here; the cost model's split-K merge term keeps
-  // it from growing without bound. Gated; else the competition native cap applies.
-  const int64_t native_cap = prob_->native_w;
-  const bool matmul_910b = (prob_->num_cube_cores > 1) && has_matmul_ && (prob_->l1_capacity > 0);
-  const bool vector_910b = (prob_->num_vector_cores > 1) && !has_matmul_ && (prob_->vec_capacity > 0);
+  // The tile is a DDR<->L1/UB panel. Cube tiles are 16-fractal aligned; vector
+  // tiles have no alignment or cap (a large vector tile is a per-core kernel
+  // streamed in UB-chunks — fits_on_chip checks the chunk). The output is NOT
+  // bounded by L0c here — that L1->L0 sub-tiling is AutoTileMatmulL0's job.
+  const bool matmul_910b = has_matmul_;
   if (matmul_910b) {
-    if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // fractal-aligned only
-  } else if (vector_910b) {
-    // No native cap for 910B vector — a large tile is a per-core kernel streamed
-    // in UB-chunks (fits_on_chip checks the chunk). No alignment requirement.
-  } else if (native_cap > 0) {
-    // Super-native granule forbidden (issues #74 Q1, #78 Q3, #80 Q3, #81 Q1).
-    // Exception: a reduction's reduced axis spans the full extent (super-native
-    // by necessity — the whole row/col is one reduction), so exempt that axis.
-    if (!(has_reduction_ && reduced_axis_ == 1) && cfg.w > native_cap) return false;
-    if (!(has_reduction_ && reduced_axis_ == 2) && cfg.h > native_cap) return false;
-    if (cfg.k > native_cap) return false;
+    if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // 16-fractal aligned
   }
 
   for (int64_t v : w_divides_)
@@ -820,11 +803,6 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
     slice_for(t, sw, sh);
     if (sw > cfg.w || sh > cfg.h) return false;
   }
-  for (size_t t : mm_produced_ephemerals_) {
-    int64_t sw, sh;
-    slice_for(t, sw, sh);
-    if (!matmul_910b && native_cap > 0 && (sw > native_cap || sh > native_cap)) return false;
-  }
 
   // Multi-role tensors are now modeled explicitly via multi-entry
   // boundary_tensor_info_ (per #70 + #73); divisibility checks above cover
@@ -835,76 +813,6 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   return true;
 }
 
-// ============================================================================
-// Working set
-// ============================================================================
-
-// Internal: compute working set assuming cfg is already validated.
-int64_t Subgraph::working_set_unchecked(const TileConfig &cfg,
-                              const FlatSet<size_t> &retained_from_prev,
-                              const FlatSet<size_t> &retain_these) const {
-  int64_t ntw = std::max(out_W_ / cfg.w, (int64_t)1);
-  int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
-  int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
-
-  int64_t ws = 0;
-
-  // Multi-role tensors have N entries in boundary_tensor_info_ for the same
-  // tensor id. A retained_from_prev tensor is physically one resident copy
-  // (full_size), not one per role — dedupe to avoid double-counting.
-  // retain_these is already handled once below, outside the per-entry loop.
-  FlatSet<size_t> retained_counted;
-
-  for (auto &info : boundary_tensor_info_) {
-    if (retained_from_prev.count(info.id)) {
-      if (retained_counted.insert(info.id).second)
-        ws += info.full_size;
-      continue;
-    }
-    if (retain_these.count(info.id)) {
-      continue;
-    }
-
-    int64_t ht = info.eval_h_tiles(ntw, nk);
-    int64_t vt = info.eval_v_tiles(nth, nk);
-    int64_t W = prob_->tensors[info.id].width;
-    int64_t H = prob_->tensors[info.id].height;
-    // Clamp: tile count cannot exceed tensor dimension (safety net;
-    // is_valid_tiling should already reject such configs).
-    ht = std::max(std::min(ht, W), (int64_t)1);
-    vt = std::max(std::min(vt, H), (int64_t)1);
-    int64_t slice = (W / ht) * (H / vt);
-    ws += slice;
-  }
-
-  for (auto t : retained_from_prev) {
-    if (t < tensor_id_to_infos_.size() && !tensor_id_to_infos_[t].empty())
-      continue;
-    ws += prob_->tensors[t].size();
-  }
-
-  for (auto t : retain_these)
-    if (!retained_from_prev.count(t))
-      ws += prob_->tensors[t].size();
-
-  // Ephemeral MM accumulators in MM→PW epilogue patterns (#82):
-  // The MM output is ephemeral but physically resident in fast memory as an
-  // accumulator across all k-steps. Costs w×h per spatial tile.
-  if (nk > 1) {
-    for (auto t : ephemeral_accumulators_)
-      ws += cfg.w * cfg.h;
-  }
-
-  return ws;
-}
-
-int64_t Subgraph::working_set(const TileConfig &cfg,
-                              const FlatSet<size_t> &retained_from_prev,
-                              const FlatSet<size_t> &retain_these) const {
-  if (!is_valid_tiling(cfg))
-    return INT64_MAX;
-  return working_set_unchecked(cfg, retained_from_prev, retain_these);
-}
 
 // Greedy per-op k + red-blue pebble peak over the fixed execution order.
 // See the header for the model. Intermediate bands are k-independent residents;
@@ -1103,12 +1011,7 @@ Subgraph::VecStream Subgraph::vector_stream(const TileConfig &cfg,
 bool Subgraph::fits_on_chip(const TileConfig &cfg,
                             const FlatSet<size_t> &retained_from_prev,
                             const FlatSet<size_t> &retain_these) const {
-  const bool cube = (prob_->num_cube_cores > 1) && has_matmul_ && prob_->l1_capacity > 0;
-  const bool vec = (prob_->num_vector_cores > 1) && !has_matmul_ && prob_->vec_capacity > 0;
-  if (!cube && !vec)  // legacy/competition: single element-count pool
-    return working_set_unchecked(cfg, retained_from_prev, retain_these) <=
-           prob_->fast_memory_capacity;
-
+  const bool cube = has_matmul_;
   // Cube: dynamic peak L1 over the execution order (live intermediate bands +
   // per-op-k-sized operand strips), NOT a static sum of all operand strips. The
   // sum both over-counted co-resident inputs and under-counted intermediate
@@ -1140,165 +1043,23 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
   CostResult result;
   result.config = cfg;
 
-  result.working_set = working_set(cfg, retained_from_prev, retain_these);
-
   if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
     return result;
   result.feasible = true;
 
   const double inv_B = 1.0 / (double)prob_->slow_memory_bandwidth;
-  int num_tw = std::max((int)(out_W_ / cfg.w), 1);
-  int num_th = std::max((int)(out_H_ / cfg.h), 1);
-  int num_tiles = num_tw * num_th;
+  const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
+  const int num_th = std::max((int)(out_H_ / cfg.h), 1);
+  const int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
   result.num_k_passes = has_matmul_ ? std::max((int)(output_K_ / cfg.k), 1) : 1;
-  const int nk = result.num_k_passes;
 
-  double comp_per_step = 0.0;
-  double native_w = (double)prob_->native_w;
-  double native_h = (double)prob_->native_h;
-
-  for (auto i : ops_) {
-    double c = (double)prob_->ops[i].base_cost;
-    size_t out_t = prob_->ops[i].output();
-
-    double op_scale = 1.0;
-    if (out_t < tensor_tiling_.size()) {
-      auto &tp = tensor_tiling_[out_t];
-      BoundaryTensorInfo tmpinfo;
-      tmpinfo.h_source = tp.h;
-      tmpinfo.v_source = tp.v;
-      int64_t ht = tmpinfo.eval_h_tiles(num_tw, nk);
-      int64_t vt = tmpinfo.eval_v_tiles(num_th, nk);
-      int64_t tW = prob_->tensors[out_t].width;
-      int64_t tH = prob_->tensors[out_t].height;
-      ht = std::max(std::min(ht, tW), (int64_t)1);
-      vt = std::max(std::min(vt, tH), (int64_t)1);
-      double slice_w = (double)tW / ht;
-      double slice_h = (double)tH / vt;
-      op_scale = std::max(slice_w / native_w, 1.0) *
-                 std::max(slice_h / native_h, 1.0);
-    }
-    // Per PROBLEM.md Example 5: when the unified execution grid has k<K,
-    // every op's compute is amortized across the nk k-steps (the whole
-    // subgraph co-pipelines partial k-slices — no op materializes its
-    // output before the sink). Divide by nk uniformly.
-    comp_per_step += c / (double)nk * op_scale;
-  }
-  result.compute_per_step = comp_per_step;
-
-  double once_load = 0, row_load = 0, col_load = 0;
-  double tile_load = 0, stream_load = 0, out_evict = 0;
-
-  for (auto &info : boundary_tensor_info_) {
-    bool retained_in = retained_from_prev.count(info.id);
-    bool retained_out = retain_these.count(info.id);
-
-    if (!retained_in && !info.is_internally_produced) {
-      int64_t ht = info.eval_h_tiles(num_tw, nk);
-      int64_t vt = info.eval_v_tiles(num_th, nk);
-      int64_t W = prob_->tensors[info.id].width;
-      int64_t H = prob_->tensors[info.id].height;
-      ht = std::max(std::min(ht, W), (int64_t)1);
-      vt = std::max(std::min(vt, H), (int64_t)1);
-      double slice_io = (double)((W / ht) * (H / vt)) * inv_B;
-
-      auto eff_h = info.h_source;
-      auto eff_v = info.v_source;
-      if (nk <= 1) {
-        if (eff_h == BoundaryTensorInfo::FROM_NK) eff_h = BoundaryTensorInfo::FIXED_1;
-        if (eff_v == BoundaryTensorInfo::FROM_NK) eff_v = BoundaryTensorInfo::FIXED_1;
-      }
-
-      bool k_dep = (eff_h == BoundaryTensorInfo::FROM_NK ||
-                    eff_v == BoundaryTensorInfo::FROM_NK);
-      bool h_fixed = (eff_h == BoundaryTensorInfo::FIXED_1);
-      bool v_fixed = (eff_v == BoundaryTensorInfo::FIXED_1);
-
-      if (k_dep)                    stream_load += slice_io;
-      else if (h_fixed && v_fixed)  once_load   += slice_io;
-      else if (h_fixed)             row_load    += slice_io; // FIX: Fixed horizontally (LHS). Paid on row change.
-      else if (v_fixed)             col_load    += slice_io; // FIX: Fixed vertically (RHS). Paid on col change.
-      else                          tile_load   += slice_io;
-    }
-
-    if (info.is_boundary_out && !retained_out) {
-      int64_t ht = info.eval_h_tiles(num_tw, nk);
-      int64_t vt = info.eval_v_tiles(num_th, nk);
-      int64_t W = prob_->tensors[info.id].width;
-      int64_t H = prob_->tensors[info.id].height;
-      ht = std::max(std::min(ht, W), (int64_t)1);
-      vt = std::max(std::min(vt, H), (int64_t)1);
-      out_evict += (double)((W / ht) * (H / vt)) * inv_B;
-    }
-  }
-
-  auto tile_cost = [&](bool once_fresh, bool row_fresh, bool col_fresh) -> double {
-    double per_tile_io = tile_load;
-    if (once_fresh) per_tile_io += once_load;
-    if (row_fresh)  per_tile_io += row_load;
-    if (col_fresh)  per_tile_io += col_load;
-
-    if (nk == 1) {
-      return std::max(comp_per_step, per_tile_io + stream_load + out_evict);
-    }
-
-    double step0 = std::max(comp_per_step, per_tile_io + stream_load);
-    double mid = (nk >= 3) ? (double)(nk - 2) * std::max(comp_per_step, stream_load) : 0.0;
-    double last = std::max(comp_per_step, stream_load + out_evict);
-
-    return step0 + mid + last;
-  };
-
-  if (cfg.snake == SnakeDir::None) {
-    if (has_matmul_ && num_tw > 1) {
-      // Row-major scan, no snake. Rows go left-to-right, then reset.
-      // Within row: h changes → RHS (col_load) reloads; LHS stays.
-      // Row start: both h resets and v changes → both reload.
-      double first_tile = tile_cost(true, true, true);
-      double row_start = tile_cost(false, true, true);
-      double within_row = tile_cost(false, false, true);
-      result.latency = first_tile +
-                       (double)(num_th - 1) * row_start +
-                       (double)(num_tw - 1) * num_th * within_row;
-    } else if (has_matmul_ && num_th > 1) {
-      // Single column of tiles (num_tw=1): only v changes between tiles.
-      // LHS (row_load) reloads every tile; RHS (col_load/once_load) loads once.
-      double first_tile = tile_cost(true, true, true);
-      double rest = tile_cost(false, true, false);
-      result.latency = first_tile + (double)(num_th - 1) * rest;
-    } else {
-      result.latency = (double)num_tiles * tile_cost(true, true, true);
-    }
-  } else if (cfg.snake == SnakeDir::RowMajor) {
-    // hsnake: sweep rows, alternate direction each row.
-    // Within row: h changes → RHS (col_load) reloads.
-    // Row transition: v changes, h stays (snake) → LHS (row_load) reloads.
-    double first = tile_cost(true, true, true);
-    double row_trans = tile_cost(false, true, false);
-    double within = tile_cost(false, false, true);
-    int n_row_trans = num_th - 1;
-    int n_within = (num_tw - 1) * num_th;
-    result.latency = first +
-                     (double)n_row_trans * row_trans +
-                     (double)n_within * within;
-  } else { // ColMajor
-    double first = tile_cost(true, true, true);
-    double col_trans = tile_cost(false, false, true);
-    double within = tile_cost(false, true, false);
-    int n_col_trans = num_tw - 1;
-    int n_within = (num_th - 1) * num_tw;
-    result.latency = first +
-                     (double)n_col_trans * col_trans +
-                     (double)n_within * within;
-  }
-
-  // 910B parallel-core roofline (gated on parallel mode; cores==1 leaves the
-  // single-context latency above untouched). Compute parallelizes across the
-  // unit's cores — spatial tiles AND split-K give num_tiles*nk independent work
-  // units — while DDR bandwidth is a SHARED floor (one HBM) that does not divide.
+  // 910B parallel-core roofline — the only cost model (the competition
+  // single-context model was removed). Compute parallelizes across the unit's
+  // cores (spatial tiles + split-K = independent work units); DDR is a SHARED
+  // floor (one HBM) that does not divide.
   const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
-  if (n_cores > 1) {
+  {
     if (has_matmul_) {
       // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
       // 16-aligned cube tiles have no padding (the op_scale native-128 padding
@@ -1550,75 +1311,48 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 
 CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
                                const FlatSet<size_t> &retain_these) const {
-  std::vector<SnakeDir> snakes;
-  if (has_matmul_) {
-    snakes = {SnakeDir::RowMajor, SnakeDir::ColMajor};
-  } else {
-    snakes = {SnakeDir::None};
-  }
-
   CostResult best;
-  // 910B: among equal-latency tiles prefer the one with LESS DDR traffic — a
-  // big balanced tile that fills the cores via a little split-K beats tiny
-  // spatial tiles that nominally fill them but reload far more (and have no
-  // L1->L0 reuse). Competition (cores==1) keeps the original strict-min so its
-  // chosen tiles, and the 49/49 evaluator results, are byte-identical.
-  const bool parallel =
-      (has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores) > 1;
-
   for (int64_t ww : ws_cand_) {
     for (int64_t hh : hs_cand_) {
       for (int64_t kk : ks_cand_) {
-        // is_valid_tiling depends on (w,h,k) only, not snake direction.
-        // Check once before iterating snakes to avoid redundant work inside
-        // compute_cost → working_set → is_valid_tiling.
-        TileConfig base_cfg{ww, hh, kk, SnakeDir::None};
-        if (!is_valid_tiling(base_cfg)) continue;
-        // Feasibility depends on (w,h,k) only, not snake direction.
-        // Check once here to skip all snake variants for infeasible tiles.
-        if (!fits_on_chip(base_cfg, retained_from_prev, retain_these)) continue;
-        for (auto sd : snakes) {
-          TileConfig cfg{ww, hh, kk, sd};
-          auto r = compute_cost(cfg, retained_from_prev, retain_these);
-          if (!r.feasible) continue;
-          bool take;
-          if (best.latency == std::numeric_limits<double>::infinity()) {
+        TileConfig cfg{ww, hh, kk, SnakeDir::None};
+        if (!is_valid_tiling(cfg)) continue;
+        if (!fits_on_chip(cfg, retained_from_prev, retain_these)) continue;
+        auto r = compute_cost(cfg, retained_from_prev, retain_these);
+        if (!r.feasible) continue;
+        bool take;
+        if (best.latency == std::numeric_limits<double>::infinity()) {
+          take = true;
+        } else {
+          // Lexicographic tiebreak among equal-latency tiles:
+          //   1. lower DDR traffic   — matmul reuse (less reload); flat for PW
+          //   2. more cores used     — fill the unit's cores (parallelism)
+          //   3. larger tile area    — best vectorization / least per-tile
+          //      overhead (avoids the degenerate 1xN / 16x16 picks)
+          //   4. larger k            — fewer L1 passes
+          const double tol = 1e-6 * std::max(1.0, best.latency);
+          const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
+          const long long ra = (long long)r.config.w * r.config.h;
+          const long long ba = (long long)best.config.w * best.config.h;
+          if (r.latency < best.latency - tol) {
             take = true;
-          } else if (!parallel) {
-            take = r.latency < best.latency;  // competition: strict-min, unchanged
+          } else if (r.latency > best.latency + tol) {
+            take = false;
+          } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
+            take = true;
+          } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
+            take = false;
+          } else if (r.cores_used != best.cores_used) {
+            take = r.cores_used > best.cores_used;
+          } else if (ra != ba) {
+            take = ra > ba;
           } else {
-            // 910B lexicographic tiebreak among equal-latency tiles:
-            //   1. lower DDR traffic   — matmul reuse (less reload); flat for PW
-            //   2. more cores used     — fill the unit's cores (parallelism)
-            //   3. larger tile area    — best vectorization / least per-tile
-            //      overhead (avoids the degenerate 1xN / 16x16 picks)
-            // Memory-bound PW has flat latency AND flat DDR, so keys 2-3 choose a
-            // sensible big core-filling tile instead of the smallest candidate.
-            const double tol = 1e-6 * std::max(1.0, best.latency);
-            const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
-            const long long ra = (long long)r.config.w * r.config.h;
-            const long long ba = (long long)best.config.w * best.config.h;
-            if (r.latency < best.latency - tol) {
-              take = true;
-            } else if (r.latency > best.latency + tol) {
-              take = false;
-            } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
-              take = true;
-            } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
-              take = false;
-            } else if (r.cores_used != best.cores_used) {
-              take = r.cores_used > best.cores_used;
-            } else if (ra != ba) {
-              take = ra > ba;
-            } else {
-              take = r.config.k > best.config.k;  // larger k => fewer L1 passes
-            }
+            take = r.config.k > best.config.k;
           }
-          if (take) best = r;
         }
+        if (take) best = r;
       }
     }
   }
-
   return best;
 }

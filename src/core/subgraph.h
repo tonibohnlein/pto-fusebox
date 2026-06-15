@@ -98,10 +98,6 @@ public:
 
   // --- Feasibility ---
 
-  int64_t working_set(const TileConfig &cfg,
-                      const FlatSet<size_t> &retained_from_prev = {},
-                      const FlatSet<size_t> &retain_these = {}) const;
-
   // 910B cube peak L1 working set (bytes) along the fixed execution order: the
   // red-blue pebble peak over the per-output-tile schedule, with each matmul's
   // single-core k-tile derived greedily (largest 16-aligned divisor of its K
@@ -164,13 +160,6 @@ public:
   Subgraph() = default;
 
 private:
-  // working_set without the is_valid_tiling() guard — caller must ensure
-  // validity before calling.  Used by compute_cost() and is_feasible() to
-  // avoid redundant validation when best_cost() already checked.
-  int64_t working_set_unchecked(const TileConfig &cfg,
-                                const FlatSet<size_t> &retained_from_prev,
-                                const FlatSet<size_t> &retain_these) const;
-
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
   //   vector: tile + ephemerals fit UB (vec_capacity)
