@@ -40,7 +40,13 @@ static void RED(const char* l, bool c) {
 }
 // Activate the 910B parallel model (one die): 24 cube + 48 vector cores,
 // L0c accumulator = 128 KB/core (the cube tile bound, replacing the native cap).
-static void set_910b(Problem& p) {
+// cube_cost defaults to a MEMORY-BOUND calibration (64): real 910B matmul is
+// memory-bound for typical shapes — with bandwidth=10 the roofline knee sits
+// around a few hundred of these units (the fp16 hardware estimate is ~5). Tests
+// that specifically exercise a COMPUTE-bound property (fractal quantization,
+// split-K compute speedup, the compute-bound "fused == sum") pass an explicit
+// compute-bound value, e.g. set_910b(p, 4096).
+static void set_910b(Problem& p, int64_t cube_cost = 64) {
     p.num_cube_cores = 24;
     p.num_vector_cores = 48;
     p.cube_capacity = 128 * 1024;   // L0c accumulator (output)
@@ -48,9 +54,9 @@ static void set_910b(Problem& p) {
     p.vec_capacity = 192 * 1024;    // UB (vector)
     // Machine-cost compute model (replaces per-op base_cost): cube = #16x16x16
     // fractals * cube_compute_cost; vector = ceil(#elements/vector_lanes) *
-    // vector_compute_cost. These are PLACEHOLDER values (relative units) until
-    // grounded from real 910B specs; the per-op base_cost is now ignored.
-    p.cube_compute_cost = 4096;     // per 16x16x16 cube fractal
+    // vector_compute_cost. PLACEHOLDER (relative) values until grounded from real
+    // 910B specs; the per-op base_cost is now ignored.
+    p.cube_compute_cost = cube_cost;  // per 16x16x16 cube fractal (memory-bound default)
     p.vector_compute_cost = 1;      // per vector SIMD step
     p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
     p.kernel_fill_cost = 10000;     // per-kernel pipeline fill (placeholder; the dual
@@ -92,7 +98,7 @@ static void test_B_thin_matmul_parallel() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
-    set_910b(p);
+    set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("B: subgraph builds", (bool)sg);
@@ -253,7 +259,7 @@ static void test_F_split_k() {
     p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
-    set_910b(p);
+    set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
     DAG dag = DAG::build(p);
     double par = Subgraph::create(p, dag, {0})->best_cost().latency;
     // Geometry serial = the whole fractal compute on one cube core. Split-K across
@@ -396,7 +402,7 @@ static void test_two_matmul() {
         q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
         q.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * Kc}, {OpType::MatMul, {0, 3}, {4}, 16384 * Kc}};
         q.fast_memory_capacity = 1 << 26; q.slow_memory_bandwidth = 10;
-        q.native_w = 128; q.native_h = 128; set_910b(q); q.kernel_fill_cost = 0;
+        q.native_w = 128; q.native_h = 128; set_910b(q, 4096); q.kernel_fill_cost = 0;  // compute-bound regime
         DAG dq = DAG::build(q);
         double a = Subgraph::create(q, dq, {0})->best_cost().latency;
         double b = Subgraph::create(q, dq, {1})->best_cost().latency;
@@ -427,6 +433,40 @@ static void test_two_matmul() {
         CHECK("2MM: accumulate add alone is a valid vector group",
               Subgraph::create(a, da, {2}).has_value());
     }
+}
+
+// --- shared-input reuse: a boundary operand feeding several fused ops is loaded
+// ONCE, not once per op (the reload dedup). Run MEMORY-BOUND (low cube_compute_
+// cost) so the reload — and the saving — actually drives the latency and flips
+// fuse-vs-separate. (The placeholder cube_compute_cost=4096 is compute-bound and
+// hides this; real 910B matmul sits below the roofline knee.)
+static void test_shared_input_reuse() {
+    std::cout << "[REUSE] shared-LHS reload counted once when fused (memory-bound)\n";
+    // Two independent matmuls sharing the SAME LHS t0: Q=t0@t1, K=t0@t3. Both
+    // tile the same M-band, so both want t0[K, m-band] — one L1 load serves both.
+    Problem p;  // t0[K,M] shared LHS; t1,t3 distinct RHS; t2,t4 outputs (same shape)
+    int64_t M = 1536, K = 512, N = 256;
+    p.tensors = {{K, M}, {N, K}, {N, M}, {N, K}, {N, M}};  // t0, t1, t2=out0, t3, t4=out1
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
+             {OpType::MatMul, {0, 3}, {4}, 1000}};
+    p.fast_memory_capacity = 1 << 26; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    set_910b(p);
+    p.cube_compute_cost = 16;   // memory-bound: HBM dominates (vs the 4096 placeholder)
+    p.kernel_fill_cost = 0;     // isolate the roofline
+    DAG dag = DAG::build(p);
+    double q = Subgraph::create(p, dag, {0})->best_cost().latency;       // Q alone
+    double k = Subgraph::create(p, dag, {1})->best_cost().latency;       // K alone
+    double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;  // fused, t0 shared
+    std::cout << "    Q=" << q << " K=" << k << " fused=" << fused << " (sum=" << q + k << ")\n";
+    // THE FLIP: with the shared-t0 dedup, fused loads t0 once instead of twice, so
+    // fusing strictly beats running them separately. Without the dedup, fused == sum
+    // (t0 double-counted) and there is no IO benefit to fusing.
+    CHECK("REUSE: shared-LHS fused < separate sum (t0 loaded once)", fused < q + k - 1.0);
+    CHECK("REUSE: identical matmuls cost the same alone", std::abs(q - k) < 1.0);
+    // The whole saving is ~one t0 reload through DDR (the other operands t1,t3 and
+    // both outputs are still counted in the fused case).
+    CHECK("REUSE: saving is a meaningful fraction of a single matmul", (q + k) - fused > 0.1 * q);
 }
 
 // --- machine-cost compute model: geometry x per-step cost (910B) --------------
@@ -1088,7 +1128,7 @@ static void test_model_stages() {
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * dm}, {OpType::Pointwise, {2}, {3}, df * B},
                  {OpType::MatMul, {3, 4}, {5}, 16384 * df}};
         p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
-        p.native_w = 128; p.native_h = 128; set_910b(p); return p;
+        p.native_w = 128; p.native_h = 128; set_910b(p, 4096); return p;  // compute-bound: decode fractal-quant
     };
     char b[80];
     double mm1_decode = -1, mm1_b16 = -1;
@@ -1308,6 +1348,7 @@ int main() {
     test_vector_sensibility();
     test_visualize();
     test_two_matmul();
+    test_shared_input_reuse();
     test_fusion_decision_matrix();
     test_two_pool_working_set();
     test_geometry_compute();

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <numeric>
 #include <cassert>
+#include <tuple>
 
 // ============================================================================
 // Utility
@@ -1164,7 +1165,19 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // aware MNK*(1/w + 1/h) splits into a left-operand (1/w) and right-operand
       // (1/h) term; a non-sink op tiles its intermediate FULL-width (w_i = N_i)
       // under the M-partition, so only its M-band height h is tiled.
+      //
+      // Shared-input reuse: a boundary operand used by SEVERAL ops in the SAME
+      // role needs the SAME per-tile slice — e.g. a shared LHS t0 in {t0@t1,
+      // t0@t3} both want t0[K, m-band] (independent of the N-column), so it is
+      // loaded ONCE into L1 (it fits, ≤ l1_capacity) and reused across the ops.
+      // Charge each (tensor, role) slice once — dedup across ops. Within a
+      // subgraph all outputs share (M,N), so the same (tensor, orientation,
+      // is_boundary_op) key ⇒ identical term ⇒ the same physical slice. A role
+      // SWITCH (LHS in one op, RHS in another) keys differently and IS counted
+      // twice (rows vs columns — genuinely different data, no reuse). Mirrors the
+      // vector path, which already dedups via per-tensor boundary_tensor_info_.
       double reload = 0.0;
+      std::set<std::tuple<size_t, int, bool>> counted;  // (tensor, 0=LHS/1=RHS, is_boundary_op)
       for (auto i : ops_) {
         if (prob_->ops[i].type != OpType::MatMul) continue;
         const size_t lhs = prob_->ops[i].inputs[0];
@@ -1176,9 +1189,9 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         const bool is_boundary_op = !consumed.count(o);
         const double w_i = is_boundary_op ? std::min((double)cfg.w, N_i) : N_i;
         const double h_i = std::min((double)cfg.h, M_i);            // shared M-band
-        if (!produced.count(lhs))   // left operand [K_i, M_i] streamed from DDR
+        if (!produced.count(lhs) && counted.emplace(lhs, 0, is_boundary_op).second)
           reload += M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
-        if (!produced.count(rhs))   // right operand [N_i, K_i] streamed from DDR
+        if (!produced.count(rhs) && counted.emplace(rhs, 1, is_boundary_op).second)
           reload += M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
       }
       // S=1 (spatial-only): no cross-core reduction, so the output store streams
