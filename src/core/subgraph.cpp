@@ -840,11 +840,31 @@ int64_t Subgraph::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
   std::vector<int> pos(prob_->num_ops(), -1);
   for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
 
-  // Live intermediate-band bytes per step. Each ephemeral tensor occupies a
-  // [full_width, M-band h] band in L1/Mat from its producer step through its
-  // last in-subgraph consumer (the pebble interval). k-INDEPENDENT — bands are
-  // the only cross-step residents; output accumulators live in L0c (unbounded
-  // at this DDR<->L1 level).
+  // Live intermediate-band bytes per step. The L1/Mat working set of a cube tile
+  // has two charged contributors; the peak below sums only these:
+  //
+  //   (1) EPHEMERAL intermediates ARE charged. A fused intermediate (T in
+  //       C=(A@B)@D) must become fully L1-resident for its consumer matmul to
+  //       read it as an operand, so it occupies a [full_width, M-band h] band. We
+  //       charge it across the whole interval [producer .. last consumer].
+  //       Charging it AT the producer step too is deliberate and conservative:
+  //         - T's band routinely EXCEEDS L0c (cube_capacity, 128KB) — e.g. a
+  //           [256,256] FP32 band is 256KB > 128KB — so it cannot sit wholly in
+  //           the L0c accumulator; it spills into L1 as it is produced.
+  //         - Even when it fits L0c, at the producer->consumer transition T has
+  //           materialised in L1 while the producer's operand strips may still be
+  //           resident, so the two coexist.
+  //       "Ephemeral" means no DDR round-trip — NOT zero memory.
+  //
+  //   (2) The boundary OUTPUT is NEVER charged to L1. On the 910B the L0c
+  //       accumulator drains DIRECTLY back to DDR (write-back from L0c, no L1
+  //       staging of the result), so a tile's own output never needs an L1 slot.
+  //       (An ephemeral output is the consumer's input, charged via (1); a
+  //       boundary output goes straight to DDR.) L0c sizing is the L0 sub-tiling
+  //       level's job (AutoTileMatmulL0), not this DDR<->L1 model.
+  //
+  // Bands are k-INDEPENDENT; the per-step boundary-operand strip (sized by the
+  // greedy k, below) is added on top of the live bands at each step.
   std::vector<int64_t> band_at(order.size(), 0);
   for (size_t t : ephemeral_) {
     int pr = dag_->tensor_producer[t];
