@@ -856,7 +856,7 @@ static void test_peak_band_feasibility() {
 //               no on-core seq-slice (the split is core-fill, not an L1 limit)
 static void test_chain_ksplit_variants() {
     std::cout << "[KVAR] chained 2mm: no-k / internal-k / parallel-k regimes\n";
-    struct R { int split; int64_t k0, k1, K1, N1; };
+    struct R { int split; int64_t k0, k1, K1, N1; int64_t w, h, outW, outH; };
     auto run = [](int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t cc) {
         auto p = mk_chained(M, K1, N1, N2, 1000, 1000);
         p.cube_compute_cost = cc;
@@ -864,16 +864,24 @@ static void test_chain_ksplit_variants() {
         auto sg = Subgraph::create(p, dag, {0, 1});
         auto r = sg->best_cost();
         std::vector<int64_t> pk; sg->cube_peak_l1(r.config, &pk);  // op0=internal, op1=sink
-        return R{r.parallel_split, pk[0], pk[1], K1, N1};
+        // sink C = [N2, M] -> the unified grid tiles this output (out_W=N2, out_H=M).
+        return R{r.parallel_split, pk[0], pk[1], K1, N1, r.config.w, r.config.h, N2, M};
     };
+    // Unified-grid invariant (all regimes): the emitted spatial tile tiles the
+    // SINK output, so it never exceeds the output dims. Regression for the bug
+    // where a chained intermediate matmul WIDER than the sink (N1 > N2) leaked
+    // its width N1 into the spatial-w candidates, emitting w = N1 > out_W.
+    auto grid_within_output = [](const R& r) { return r.w <= r.outW && r.h <= r.outH; };
     // (1) NO k-split: small contractions, sink large enough to fill cores.
     auto nok = run(256, 256, 64, 512, 1000);
+    CHECK("KVAR/no-k: spatial tile within sink output (unified grid)", grid_within_output(nok));
     CHECK("KVAR/no-k: sink not parallel-split (spatial fill)", nok.split == 1);
     CHECK("KVAR/no-k: internal runs full K1 (no seq-slice)", nok.k0 == nok.K1);
     CHECK("KVAR/no-k: sink runs full K (no seq-slice)", nok.k1 == nok.N1);
     // (2) INTERNAL single-core k-split: huge K1 forces the internal matmul to
     // slice its contraction on one core; the sink still fills cores spatially.
     auto ink = run(1024, 8192, 64, 1024, 4096);
+    CHECK("KVAR/internal-k: spatial tile within sink output (unified grid)", grid_within_output(ink));
     CHECK("KVAR/internal-k: sink not parallel-split", ink.split == 1);
     CHECK("KVAR/internal-k: internal seq-slices below K1 (no merge)",
           ink.k0 < ink.K1 && ink.k0 >= 16);
@@ -881,6 +889,10 @@ static void test_chain_ksplit_variants() {
     // (3) PARALLEL k-split: sink output too small to fill cores -> split across
     // cores. Operands fit L1, so neither matmul seq-slices.
     auto par = run(64, 128, 512, 64, 1000);
+    // THE bug trigger: intermediate T is [N1=512, M] — 8x wider than the sink
+    // C [N2=64, M]. The emitted w must tile the 64-wide sink, NOT the 512 intermediate.
+    CHECK("KVAR/parallel-k: spatial tile within sink output (NOT the wider intermediate)",
+          grid_within_output(par));
     CHECK("KVAR/parallel-k: sink parallel-split across cores", par.split > 1);
     CHECK("KVAR/parallel-k: internal full K1 (L1-fit, no slice)", par.k0 == par.K1);
     CHECK("KVAR/parallel-k: sink L1-fit full K (split is core-fill, not L1)",
