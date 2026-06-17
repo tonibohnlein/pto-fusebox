@@ -177,6 +177,7 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("vector_compute_cost")) p.vector_compute_cost = j["vector_compute_cost"].get<int64_t>();
     if (j.contains("vector_lanes"))        p.vector_lanes        = j["vector_lanes"].get<int64_t>();
     if (j.contains("kernel_fill_cost"))    p.kernel_fill_cost    = j["kernel_fill_cost"].get<int64_t>();
+    if (j.contains("ddr_atomic_add"))      p.ddr_atomic_add      = j["ddr_atomic_add"].get<bool>();
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.

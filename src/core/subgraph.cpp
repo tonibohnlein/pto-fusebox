@@ -1205,11 +1205,11 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       // compute — an ADDITIVE barrier S*out_store*inv_B (a BSP superstep).
       //
       // S is a FIRST-CLASS design axis (like w,h): streamS DECREASES with S (more
-      // cores) while the merge GROWS with S, so latS(S) trades parallelism against
-      // merge cost. ENUMERATE S and take the min — do NOT bake in a model-specific
-      // optimum. (Under the current sat-discounted merge the min happens to land
-      // at the max-fill S, because sat cancels S below full-fill; if the merge
-      // becomes HBM-bound the optimum is interior. The enumeration handles both.)
+      // cores) while the merge barrier may GROW with S (see below — the serial DDR
+      // reduction when the target has no SetAtomicAdd), so latS(S) trades
+      // parallelism against the merge cost. ENUMERATE S and take the min — the
+      // optimum is interior when the merge is serial, and max-fill when
+      // SetAtomicAdd folds the reduction into the write-back.
       // Useful range: S <= kfrac (>=1 fractal/partial) and S <= ceil(n_cores/
       // num_tiles) (beyond that effS caps at n_cores and a larger S only adds
       // merge). output_K_ is the sink matmul's contraction (NOT max_K_, a deeper
@@ -1224,7 +1224,21 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
         const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
         const double stream_ddrS = reload * inv_B * sat(effS);
         const double streamS = std::max(total_compute / effS, stream_ddrS);
-        const double merge = (double)S * out_store * inv_B * sat(effS);  // BSP barrier
+        // Merge barrier. Two regimes, selected by the target's ddr_atomic_add
+        // capability (see Problem::ddr_atomic_add):
+        //   (1) ALWAYS — write the S partials to DDR (parallel across effS cores).
+        //   (2) WITHOUT SetAtomicAdd — read the partials back and accumulate
+        //       serially per output tile: the S adds target ONE DDR accumulator
+        //       per tile, so they SERIALIZE per tile (parallelism is across the
+        //       num_tiles accumulators, NOT across S). It gets sat(num_tiles) and
+        //       grows ~linearly with S (no cancellation) — the real price of a
+        //       DDR reduction, which makes the optimum S interior.
+        //   WITH SetAtomicAdd — the partials accumulate in DDR during write-back,
+        //       so (2) vanishes; the merge is just (1) (sat-discounted → cancels
+        //       below full-fill), so split-K stays cheap and max-fill is optimal.
+        double merge = (double)S * out_store * inv_B * sat(effS);                     // (1) write partials
+        if (!prob_->ddr_atomic_add)
+          merge += (double)(S + 1) * out_store * inv_B * sat((double)num_tiles);      // (2) serial read-back + sum
         const double latS = streamS + merge;
         if (latS < best_latS) {
           best_latS = latS; best_S = S; best_effS = effS;

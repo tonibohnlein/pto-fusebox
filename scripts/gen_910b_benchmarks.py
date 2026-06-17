@@ -17,7 +17,8 @@ OUT = os.path.join(ROOT, "benchmarks")
 CFG = dict(
     fast_memory_capacity=1 << 30, slow_memory_bandwidth=10, native_granularity=[128, 128],
     num_cube_cores=24, num_vector_cores=48, cube_capacity=131072, l1_capacity=524288,
-    vec_capacity=196608, vector_compute_cost=1, vector_lanes=256, kernel_fill_cost=10000)
+    vec_capacity=196608, vector_compute_cost=1, vector_lanes=256, kernel_fill_cost=10000,
+    ddr_atomic_add=True)  # 910B SetAtomicAdd: split-K partials accumulate in DDR (cheap merge)
 
 MM, PW, RED = "MatMul", "Pointwise", "Reduction"
 

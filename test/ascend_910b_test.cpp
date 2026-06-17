@@ -61,6 +61,8 @@ static void set_910b(Problem& p, int64_t cube_cost = 64) {
     p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
     p.kernel_fill_cost = 10000;     // per-kernel pipeline fill (placeholder; the dual
                                     // of eff — drives the tiling to ~one kernel/core)
+    p.ddr_atomic_add = true;        // 910B SetAtomicAdd: split-K partials accumulate in
+                                    // DDR during write-back (cheap merge, no read-back)
 }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
@@ -467,6 +469,37 @@ static void test_shared_input_reuse() {
     // The whole saving is ~one t0 reload through DDR (the other operands t1,t3 and
     // both outputs are still counted in the fused case).
     CHECK("REUSE: saving is a meaningful fraction of a single matmul", (q + k) - fused > 0.1 * q);
+}
+
+// --- ddr_atomic_add toggles the parallel split-K merge cost ------------------
+// With SetAtomicAdd (910B) the S split-K partials accumulate in DDR during
+// write-back — cheap merge, split-K fills the cores (max-fill). Without it, the
+// partials are read back and summed serially per tile — the merge grows ~S, so
+// split-K is punished and the chosen S is smaller / the latency higher.
+static void test_atomic_add_flag() {
+    std::cout << "[ATOMIC] ddr_atomic_add toggles the split-K merge cost\n";
+    // Thin matmul C[64,128], K=2048 — few spatial tiles < cores, so split-K kicks
+    // in. Memory-bound (low cube_compute_cost) so the merge actually drives it.
+    Problem p;
+    int64_t M = 128, N = 64, K = 2048;
+    p.tensors = {{K, M}, {N, K}, {N, M}};  // A[K,M] B[N,K] -> C[N,M]
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}};
+    p.fast_memory_capacity = 1 << 26; p.slow_memory_bandwidth = 10;
+    p.native_w = 128; p.native_h = 128;
+    set_910b(p);                 // ddr_atomic_add = true (910B has SetAtomicAdd)
+    p.cube_compute_cost = 64;    // memory-bound so the merge matters
+    p.kernel_fill_cost = 0;
+    DAG dag = DAG::build(p);
+    auto r_atomic = Subgraph::create(p, dag, {0})->best_cost();   // (a) cheap merge
+    p.ddr_atomic_add = false;
+    auto r_serial = Subgraph::create(p, dag, {0})->best_cost();   // (b) serial DDR reduction (A)
+    std::cout << "    atomic-add: split=" << r_atomic.parallel_split << " cores=" << r_atomic.cores_used
+              << " lat=" << r_atomic.latency << "  |  serial(A): split=" << r_serial.parallel_split
+              << " cores=" << r_serial.cores_used << " lat=" << r_serial.latency << "\n";
+    CHECK("ATOMIC: split-K is used with SetAtomicAdd (fills cores)", r_atomic.parallel_split > 1);
+    CHECK("ATOMIC: serial merge (no SetAtomicAdd) costs more", r_serial.latency > r_atomic.latency + 1.0);
+    CHECK("ATOMIC: serial merge splits no more aggressively than atomic-add",
+          r_serial.parallel_split <= r_atomic.parallel_split);
 }
 
 // --- machine-cost compute model: geometry x per-step cost (910B) --------------
@@ -1349,6 +1382,7 @@ int main() {
     test_visualize();
     test_two_matmul();
     test_shared_input_reuse();
+    test_atomic_add_flag();
     test_fusion_decision_matrix();
     test_two_pool_working_set();
     test_geometry_compute();

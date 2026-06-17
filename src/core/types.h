@@ -103,6 +103,16 @@ struct Problem {
     // for prefetch of the next tile while the current one computes. Halves the
     // effective L1 and UB budgets. Off => single-buffer (full budget).
     bool double_buffer = false;
+    // Parallel split-K aggregation path (a target capability — the scheduler's
+    // analog of a compiler flag). When TRUE, the hardware can write back to DDR
+    // with SetAtomicAdd, so the S split-K partials are atomically accumulated
+    // into the DDR output DURING write-back — no separate read-back + sum. The
+    // merge barrier is then just the S partial writes (sat-discounted), so
+    // split-K stays cheap and max-fill is optimal. When FALSE (default), the
+    // partials are written, then read back and summed serially per output tile
+    // (one DDR accumulator/tile) — the merge grows ~linearly with S, punishing
+    // split-K. The Ascend 910B HAS SetAtomicAdd, so set_910b enables it.
+    bool ddr_atomic_add = false;
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
