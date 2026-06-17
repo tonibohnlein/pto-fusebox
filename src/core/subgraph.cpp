@@ -1,4 +1,5 @@
 #include "core/subgraph.h"
+#include "core/subgraph_structure.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -41,15 +42,12 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 
   std::vector<bool> is_in_sg(num_ops, false);
   std::vector<bool> is_produced(num_tensors, false);
-  std::vector<bool> is_consumed(num_tensors, false);
   bool reduces_width = false, reduces_height = false;  // for reduced-axis homogeneity
 
   for (auto i : sg.ops_) {
     is_in_sg[i] = true;
     { size_t t = prob.ops[i].output();
       is_produced[t] = true; }
-    for (auto t : prob.ops[i].inputs)
-      is_consumed[t] = true;
     if (prob.ops[i].type == OpType::MatMul) {
       sg.has_matmul_ = true;
       int64_t Ki = prob.tensors[prob.ops[i].inputs[0]].width;
@@ -100,28 +98,25 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
     if (reduces_width && reduces_height) return std::nullopt;
   }
 
-  // Classify ephemerals
+  // Structural classification — boundary inputs/outputs, ephemerals, and sinks
+  // — is computed ONCE by SubgraphStructure, the shared architecture-independent
+  // layer. The cost model composes those facts and adds tiling/feasibility/cost
+  // on top. (The execution-order DFS stays in the cost layer below: its roots
+  // are refined by the #82 epilogue detection, so it is not purely structural.)
   //
-  // Rule: a tensor produced AND consumed inside this subgraph is ephemeral.
-  // It passes directly between ops without consuming fast memory or slow
-  // memory bandwidth. Zero memory footprint, zero IO cost.
-  //
-  // Whether external consumers can access this tensor is NOT the subgraph's
-  // concern — that's validated at the partition/solution level by
-  // partition_has_gap() and Solution::validate().
+  // Rule recap: a tensor produced AND consumed inside is ephemeral (zero memory
+  // footprint, zero IO). Whether an external consumer can reach it is NOT the
+  // subgraph's concern — that is the partition/solution ephemeral-gap check.
+  SubgraphStructure structure(prob, dag, sg.ops_);
+  if (!structure.valid())
+    return std::nullopt;  // empty op set, or no boundary output
+  sg.boundary_inputs_  = structure.boundary_inputs();
+  sg.boundary_outputs_ = structure.boundary_outputs();
+  sg.ephemeral_        = structure.ephemeral();
+  // Local per-tensor ephemeral lookup the tiling code below indexes by tensor id.
   std::vector<bool> is_ephemeral(num_tensors, false);
-  for (size_t t = 0; t < num_tensors; t++) {
-    if (is_consumed[t] && !is_produced[t])
-      sg.boundary_inputs_.insert(t);
-    if (is_produced[t] && is_consumed[t])
-      is_ephemeral[t] = true;
-  }
-  for (size_t t = 0; t < num_tensors; t++) {
-    if (is_produced[t] && !is_ephemeral[t])
-      sg.boundary_outputs_.insert(t);
-    if (is_ephemeral[t])
-      sg.ephemeral_.insert(t);
-  }
+  for (auto t : structure.ephemeral())
+    is_ephemeral[t] = true;
 
   // Collect PW-produced ephemerals for the granule-fit check in is_valid_tiling
   // (PW has no k-loop, so its output slice must fit one (cfg.w, cfg.h) granule).
@@ -179,21 +174,15 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
   enum class SliceH : uint8_t { H_param, K_param };
 
   {
+    // Structural sinks come from SubgraphStructure (an op whose output has no
+    // in-subgraph consumer). The #82 epilogue detection below may additionally
+    // mark an internal MM as an effective sink — a cost-model refinement on top
+    // of this structural set.
     sg.is_sink_op_vec_.assign(num_ops, false);
-    std::vector<size_t> sink_ops;
-    for (auto i : sg.ops_) {
-      bool has_internal_succ = false;
-      { size_t t = prob.ops[i].output();
-        for (auto cop : dag.tensor_consumers[t])
-          if (is_in_sg[cop]) { has_internal_succ = true; break; } }
-      
-      if (!has_internal_succ) {
-        sink_ops.push_back(i);
-        sg.is_sink_op_vec_[i] = true;
-      }
-    }
-
-    if (sink_ops.empty()) return std::nullopt;
+    std::vector<size_t> sink_ops = structure.sinks();
+    for (auto s : sink_ops)
+      sg.is_sink_op_vec_[s] = true;
+    // sink_ops is non-empty: structure.valid() ⇒ ≥1 boundary output ⇒ ≥1 sink.
     size_t first_sink_out = prob.ops[sink_ops[0]].output();
     sg.out_W_ = prob.tensors[first_sink_out].width;
     sg.out_H_ = prob.tensors[first_sink_out].height;
