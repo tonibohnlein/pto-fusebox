@@ -32,10 +32,17 @@ Three-tier memory:
 
 ---
 
-## 2. Subgraph (`src/core/subgraph.h`, `src/core/subgraph.cpp`)
+## 2. Subgraph (`src/core/ascend910b_cost.{h,cpp}`)
 
 A subgraph is a set of op indices that will execute as a single fused
 kernel with a shared tiling grid.
+
+`Subgraph` is a compile-time alias (`src/core/subgraph.h`) for the active
+architecture's cost model — today `Ascend910BCost`, which models the
+`CostModel` concept (`src/core/cost_model.h`). Its architecture-independent
+structural classification (boundary/ephemeral tensors, sinks) is delegated to
+`SubgraphStructure` (`src/core/subgraph_structure.{h,cpp}`). All `Subgraph::…`
+references below resolve through that alias.
 
 ### 2.1 Construction — `Subgraph::create()`
 

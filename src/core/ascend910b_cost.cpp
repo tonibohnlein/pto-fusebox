@@ -1,4 +1,4 @@
-#include "core/subgraph.h"
+#include "core/ascend910b_cost.h"
 #include "core/subgraph_structure.h"
 #include <algorithm>
 #include <cmath>
@@ -27,12 +27,12 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // Factory
 // ============================================================================
 
-std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
+std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const DAG &dag,
                                          std::vector<size_t> op_indices) {
   if (op_indices.empty())
     return std::nullopt;
 
-  Subgraph sg;
+  Ascend910BCost sg;
   sg.prob_ = &prob;
   sg.dag_ = &dag;
   sg.ops_ = std::move(op_indices);
@@ -693,7 +693,7 @@ std::optional<Subgraph> Subgraph::create(const Problem &prob, const DAG &dag,
 // Tiling validity (Replicates `evaluator.cpp` SHAPES_MISALIGNED EXACTLY)
 // ============================================================================
 
-bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
+bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w <= 0 || cfg.h <= 0 || cfg.k <= 0)
     return false;
 
@@ -805,7 +805,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
   // Multi-role tensors are now modeled explicitly via multi-entry
   // boundary_tensor_info_ (per #70 + #73); divisibility checks above cover
   // shape constraints across all role orientations, and the 2-partial limit
-  // is enforced at Subgraph::create. No symbolic-propagation conflict check
+  // is enforced at Ascend910BCost::create. No symbolic-propagation conflict check
   // is needed — the former slow path rejected exactly the multi-role configs
   // #73 now accepts.
   return true;
@@ -818,7 +818,7 @@ bool Subgraph::is_valid_tiling(const TileConfig &cfg) const {
 // headroom the bands leave. Peak = max over steps of (live bands + this step's
 // operand strip). Strips count BOUNDARY operands only — an intermediate operand
 // is already a live band (the same boundary/ephemeral split the roofline uses).
-int64_t Subgraph::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
+int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
                               const FlatSet<size_t> &retained_from_prev,
                               const FlatSet<size_t> &retain_these,
                               std::vector<int64_t> *perop_k_out) const {
@@ -926,7 +926,7 @@ int64_t Subgraph::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
   return peak;
 }
 
-int64_t Subgraph::cube_peak_l1(const TileConfig &cfg,
+int64_t Ascend910BCost::cube_peak_l1(const TileConfig &cfg,
                                std::vector<int64_t> *perop_k) const {
   return derive_exec(cfg, output_K_, {}, {}, perop_k);
 }
@@ -935,7 +935,7 @@ int64_t Subgraph::cube_peak_l1(const TileConfig &cfg,
 // cube, over the UB pool: live ephemeral bands + the transient boundary tiles of
 // the running op. The matmul band bug transposed to vector — softmax's e=[W,h]
 // row band is ephemeral and was uncounted by the old static boundary-only sum.
-int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
+int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
                                  const FlatSet<size_t> &retained_from_prev,
                                  const FlatSet<size_t> &retain_these,
                                  int64_t reduce_chunk, int stream_axis) const {
@@ -994,7 +994,7 @@ int64_t Subgraph::vector_peak_ub(const TileConfig &cfg,
 // matmul per-op seq-k. Materialize when the whole tile fits UB; else stream the
 // largest UB-fitting chunk along the coupled reduced axis (reduction) or the
 // larger tile axis (pointwise). Peak is monotone in the chunk, so binary-search.
-Subgraph::VecStream Subgraph::vector_stream(const TileConfig &cfg,
+Ascend910BCost::VecStream Ascend910BCost::vector_stream(const TileConfig &cfg,
                                             const FlatSet<size_t> &retained_from_prev,
                                             const FlatSet<size_t> &retain_these) const {
   const double f = prob_->double_buffer ? 0.5 : 1.0;
@@ -1026,7 +1026,7 @@ Subgraph::VecStream Subgraph::vector_stream(const TileConfig &cfg,
 
 // 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
 // the per-tile slice footprint IS the per-core footprint. Fork on cube/vector.
-bool Subgraph::fits_on_chip(const TileConfig &cfg,
+bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
                             const FlatSet<size_t> &retained_from_prev,
                             const FlatSet<size_t> &retain_these) const {
   const bool cube = has_matmul_;
@@ -1044,7 +1044,7 @@ bool Subgraph::fits_on_chip(const TileConfig &cfg,
   return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
 }
 
-bool Subgraph::is_feasible(const TileConfig &cfg,
+bool Ascend910BCost::is_feasible(const TileConfig &cfg,
                            const FlatSet<size_t> &retained_from_prev,
                            const FlatSet<size_t> &retain_these) const {
   return is_valid_tiling(cfg) &&
@@ -1055,7 +1055,7 @@ bool Subgraph::is_feasible(const TileConfig &cfg,
 // Cost computation
 // ============================================================================
 
-CostResult Subgraph::compute_cost(const TileConfig &cfg,
+CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                   const FlatSet<size_t> &retained_from_prev,
                                   const FlatSet<size_t> &retain_these) const {
   CostResult result;
@@ -1379,7 +1379,7 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
 // Granularity enumeration
 // ============================================================================
 
-CostResult Subgraph::best_cost(const FlatSet<size_t> &retained_from_prev,
+CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
                                const FlatSet<size_t> &retain_these) const {
   CostResult best;
   for (int64_t ww : ws_cand_) {
