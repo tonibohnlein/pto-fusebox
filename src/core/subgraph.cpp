@@ -1199,34 +1199,53 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);
       const double ddr1 = (reload + out_store) * inv_B * sat(eff1);
       const double lat1 = std::max(total_compute / eff1, ddr1);
-      // Sink split-K: gang up to output_K_/16 partials per sink tile to fill the
-      // cores. Streaming phase (operand reload overlaps partial-compute) is a
-      // roofline; the S partials then reduce through DDR AFTER compute — an
-      // ADDITIVE barrier S*out_store*inv_B (the BSP superstep). output_K_ is the
-      // sink matmul's contraction (NOT max_K_, which may be a deeper stage's K).
+      // Sink split-K: split the sink contraction into S per-tile partials to
+      // recruit idle cores. The streaming phase (operand reload overlaps partial
+      // compute) is a roofline; the S partials then reduce through DDR AFTER
+      // compute — an ADDITIVE barrier S*out_store*inv_B (a BSP superstep).
+      //
+      // S is a FIRST-CLASS design axis (like w,h): streamS DECREASES with S (more
+      // cores) while the merge GROWS with S, so latS(S) trades parallelism against
+      // merge cost. ENUMERATE S and take the min — do NOT bake in a model-specific
+      // optimum. (Under the current sat-discounted merge the min happens to land
+      // at the max-fill S, because sat cancels S below full-fill; if the merge
+      // becomes HBM-bound the optimum is interior. The enumeration handles both.)
+      // Useful range: S <= kfrac (>=1 fractal/partial) and S <= ceil(n_cores/
+      // num_tiles) (beyond that effS caps at n_cores and a larger S only adds
+      // merge). output_K_ is the sink matmul's contraction (NOT max_K_, a deeper
+      // stage's K). Bounded by n_cores.
       const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
-      const int64_t cores_used = std::min<int64_t>(n_cores, (int64_t)num_tiles * kfrac);
-      const int64_t S = std::max<int64_t>(1, (cores_used + num_tiles - 1) / num_tiles);
-      const double effS = (double)cores_used;
-      const double stream_ddrS = reload * inv_B * sat(effS);
-      const double streamS = std::max(total_compute / effS, stream_ddrS);
-      const double merge_tail = (double)S * out_store * inv_B * sat(effS);  // BSP barrier
-      const double latS = streamS + merge_tail;
-      if (S > 1 && latS < lat1) {  // sink split-K only if it helps
-        result.latency = latS;
-        result.parallel_split = (int)S;
-        result.cores_used = (int)cores_used;
-        result.compute_bound = (total_compute / effS) >= stream_ddrS;  // streaming phase
-        result.ddr_traffic = stream_ddrS + merge_tail;
+      const int64_t S_max =
+          std::min<int64_t>(kfrac, (n_cores + num_tiles - 1) / num_tiles);
+      double best_latS = std::numeric_limits<double>::infinity();
+      int64_t best_S = 1;
+      double best_effS = eff1, best_stream_ddr = 0.0, best_merge = 0.0;
+      for (int64_t S = 2; S <= S_max; ++S) {
+        const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
+        const double stream_ddrS = reload * inv_B * sat(effS);
+        const double streamS = std::max(total_compute / effS, stream_ddrS);
+        const double merge = (double)S * out_store * inv_B * sat(effS);  // BSP barrier
+        const double latS = streamS + merge;
+        if (latS < best_latS) {
+          best_latS = latS; best_S = S; best_effS = effS;
+          best_stream_ddr = stream_ddrS; best_merge = merge;
+        }
+      }
+      if (best_S > 1 && best_latS < lat1) {  // sink split-K only if it helps
+        result.latency = best_latS;
+        result.parallel_split = (int)best_S;
+        result.cores_used = (int)best_effS;
+        result.compute_bound = (total_compute / best_effS) >= best_stream_ddr;  // streaming phase
+        result.ddr_traffic = best_stream_ddr + best_merge;
         // Displayed per-core k composes the two k-levers: the greedy single-core
         // L1-fit k (derive_exec, a divisor of output_K_), capped by the per-core
-        // split-K fractal share ceil(output_K_/16 / S)*16. Largest divisor of
-        // output_K_ not exceeding both -> k cleanly divides the contraction.
+        // split-K fractal share ceil(kfrac / S)*16. Largest divisor of output_K_
+        // not exceeding both -> k cleanly divides the contraction.
         std::vector<int64_t> pk;
         derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
         const int64_t l1_k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0)
                                  ? pk[sink_mm_op_] : output_K_;
-        const int64_t share_k = ((kfrac + S - 1) / S) * 16;
+        const int64_t share_k = ((kfrac + best_S - 1) / best_S) * 16;
         int64_t per_core_k = 16;
         for (int64_t d = std::min({l1_k, share_k, output_K_}); d >= 16; d -= 16)
           if (output_K_ % d == 0) { per_core_k = d; break; }
