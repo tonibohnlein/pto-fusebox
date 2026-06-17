@@ -23,14 +23,16 @@ The output tensor is **M×N** (M rows, N cols). One global decision:
 - **Temporal tiling** = the contraction `k`. Two variants:
   - **single-core sequential k** — one core accumulates the contraction in its
     L0c, no cross-core merge. Allowed on any matmul. **Cost-free** (§6).
-  - **parallel split-K** — the contraction is split across cores, partials merged
-    through DDR. **Sink-only**, and the merge is an additive barrier (§5.2).
+  - **parallel split-K** (factor `S`) — the contraction is split across `S` cores,
+    the partials reduced through DDR. **Sink-only**; the merge cost depends on the
+    target's atomic-add capability (§4.2).
 
-**Only `(w, h)` are searched** (`best_cost` loops `ws_cand_ × hs_cand_`). The
-contraction `k` is **not** searched — it is derived **greedily** per matmul
-(§3). The cube spatial candidates are bounded by the sink output dim (a tile
-never exceeds the output it tiles; an intermediate matmul's wider output width
-is a contraction, not a spatial axis).
+**`(w, h)` and the split-K factor `S` are searched**: `best_cost` loops
+`ws_cand_ × hs_cand_`, and for each tile `compute_cost` enumerates `S` over its
+useful range and keeps the best (§4.2). The single-core contraction `k` is **not**
+searched — it is derived **greedily** per matmul (§3). The cube spatial candidates
+are bounded by the sink output dim (a tile never exceeds the output it tiles; an
+intermediate matmul's wider output width is a contraction, not a spatial axis).
 
 ---
 
@@ -120,27 +122,46 @@ penalises over-tiling, so the optimum sits at ~one kernel per core. Compute
 parallelises over cores; **DDR is a shared floor** (`sat` penalises too few
 cores to saturate HBM).
 
-### 4.2 Parallel split-K (sink contraction split across cores)
+### 4.2 Parallel split-K (sink contraction split across `S` cores)
 
-Used when the spatial tiles can't fill the cores (`num_tiles < n_cores`):
+Used when the spatial tiles can't fill the cores (`num_tiles < n_cores`). The
+sink contraction is split into `S` per-tile partials. `S` is **enumerated** over
+its useful range and the best kept (the optimum is interior when the merge is
+serial — below):
 
 ```
-kfrac      = output_K / 16                            # 16-fractal slices of the sink contraction
-cores_used = min(n_cores, num_tiles · kfrac)
-S          = ⌈cores_used / num_tiles⌉                 # split factor per tile
-effS       = cores_used
-streamS    = max( total_compute / effS , reload · inv_B · sat(effS) )
-merge_tail = S · out_store · inv_B · sat(effS)        # the S partial-C writes, ADDITIVE
-latS       = streamS + merge_tail
+kfrac  = output_K / 16                          # 16-fractal contraction slices
+S_max  = min(kfrac, ⌈n_cores / num_tiles⌉)      # >=1 fractal/partial; beyond this effS caps at n_cores
+for S in 2 .. S_max:
+  effS    = min(num_tiles · S, n_cores)
+  streamS = max( total_compute / effS , reload · inv_B · sat(effS) )       # decreases with S
+  merge   = S · out_store · inv_B · sat(effS)                              # (1) write the S partials
+          + (ddr_atomic_add ? 0
+                            : (S+1) · out_store · inv_B · sat(num_tiles))  # (2) serial read-back + sum
+  latS    = streamS + merge
+# result = min( lat1 , best latS ) + kernel_fill
 ```
-Chosen iff `S > 1` and `latS < lat1`. `merge_tail` is the cost the single-core
-path avoids: each of the S cores writes a full `C[n,m]` partial to DDR and they
-are reduced there (no shared L2) — a BSP barrier, **not** hidden under the
-roofline. **Sink-only:** only a boundary-output matmul may split this way (its C
-goes to DDR anyway); an *internal* matmul splitting would round-trip the
-ephemeral through DDR — that is expressed as a **subgraph cut** at the partition
-level, not an in-subgraph split. The displayed per-core `k` composes the
-single-core L1-fit `k` with the split share `⌈kfrac/S⌉·16`.
+
+The merge is an **additive barrier** (the reduction can't start until all `S`
+partials exist). It has two regimes, set by the target capability
+`Problem::ddr_atomic_add` (§8):
+
+- **With `SetAtomicAdd`** (`ddr_atomic_add = true`; the 910B): the partials are
+  atomically accumulated into the DDR output **during write-back** — no read-back.
+  The merge is just (1), which is `sat`-discounted and **cancels below full-fill**
+  (`sat(effS) = n_cores/(num_tiles·S)` → the `S` cancels), so split-K is cheap and
+  the optimal `S` is max-fill.
+- **Without it** (`false`): add (2) — read the `S` partials back and sum them
+  **serially per output tile** (one DDR accumulator/tile, so the `S` adds
+  serialise; parallelism is across `num_tiles`, not `S` → `sat(num_tiles)`, grows
+  ∝ `S`). Split-K is punished and the optimal `S` is **interior** — which is why
+  `S` is enumerated rather than derived as a single max-fill value.
+
+**Sink-only:** only a boundary-output matmul may split this way (its output goes
+to DDR anyway); an *internal* matmul splitting would round-trip the ephemeral
+through DDR — expressed as a **subgraph cut** at the partition level, not an
+in-subgraph split. The displayed per-core `k` composes the single-core L1-fit `k`
+with the split share `⌈kfrac/S⌉·16`.
 
 ---
 
@@ -180,7 +201,7 @@ compute nor IO:
   the full T band instead — §3.)
 
 This is exactly what distinguishes single-core (free, L0c merge) from parallel
-split-K (the `merge_tail` through DDR — §4.2).
+split-K (the DDR merge — free with `SetAtomicAdd`, else a serial reduction; §4.2).
 
 ---
 
@@ -221,6 +242,10 @@ The machine params are **placeholders** (relative units) until grounded from rea
   specifically exercise a *compute-bound* property (split-K compute speedup,
   fractal-quant decode, the compute-bound `fused==sum`) pin a compute-bound value.
 - `vector_compute_cost`, `vector_lanes`, `kernel_fill_cost` — also placeholders.
+- `ddr_atomic_add` — **target capability** (true on the 910B). Selects the split-K
+  merge regime (§4.2): `true` = `SetAtomicAdd` write-back (cheap merge, max-fill
+  split-K); `false` = serial per-tile read-back + sum (split-K punished ∝ S,
+  interior optimum). The scheduler's analog of a compiler/target flag.
 - `slow_memory_bandwidth`, capacities (`l1`/`cube`/`vec`), `num_*_cores`,
   `double_buffer` — the per-die 910B layout (24 cube / 48 vector cores; L1 512 KB,
   L0c 128 KB, UB 192 KB).
