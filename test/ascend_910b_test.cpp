@@ -14,6 +14,7 @@
 
 #include "core/dag.h"
 #include "core/subgraph.h"
+#include "core/subgraph_structure.h"
 #include "core/types.h"
 #include "pipeline/solver.h"
 #include "solution/solution.h"
@@ -850,6 +851,69 @@ static void test_fusion_decision_matrix() {
 // The fixed pebbling order the peak-working-set sweep walks (and that gets
 // emitted with the solution). For a chain C=(A@B)@D the producer matmul must
 // precede the sink; a singleton subgraph is just its own op.
+// --- SubgraphStructure: the shared, arch-independent structural layer --------
+// SubgraphStructure classifies boundary/ephemeral tensors, sinks, and the DFS
+// execution order from (Problem, DAG, ops) ALONE — no machine params. The arch
+// cost model (today: Subgraph) composes it. This pins that the extracted
+// structure agrees with the live Subgraph on every accepted op set, and that
+// structural validity is INDEPENDENT of arch admissibility.
+static void test_subgraph_structure() {
+    std::cout << "[STRUCT] SubgraphStructure matches Subgraph; arch-independent\n";
+
+    // Chained C=(A@B)@D: op0 produces ephemeral T, op1 is the sink.
+    auto pc = mk_chained(256, 512, 256, 128, 1000, 1000);
+    DAG dc = DAG::build(pc);
+    for (const std::vector<size_t>& ops : {std::vector<size_t>{0, 1},
+                                           std::vector<size_t>{0},
+                                           std::vector<size_t>{1}}) {
+        auto sg = Subgraph::create(pc, dc, ops);
+        SubgraphStructure s(pc, dc, ops);
+        CHECK("STRUCT: chain subgraph accepted by both", (bool)sg && s.valid());
+        if (!sg) continue;
+        CHECK("STRUCT: boundary_inputs match", s.boundary_inputs() == sg->boundary_inputs());
+        CHECK("STRUCT: boundary_outputs match", s.boundary_outputs() == sg->boundary_outputs());
+        CHECK("STRUCT: ephemeral match", s.ephemeral() == sg->ephemeral());
+        CHECK("STRUCT: execution_order match", s.execution_order() == sg->execution_order());
+    }
+    // Hand-checked classification for the fused chain {0,1}:
+    //   inputs {0=A,1=B,3=D}, ephemeral {2=T}, output {4=C}, sink op1, order [0,1].
+    {
+        SubgraphStructure s(pc, dc, {0, 1});
+        CHECK("STRUCT: chain inputs = {0,1,3}", s.boundary_inputs() == FlatSet<size_t>{0, 1, 3});
+        CHECK("STRUCT: chain ephemeral = {2}", s.ephemeral() == FlatSet<size_t>{2});
+        CHECK("STRUCT: chain output = {4}", s.boundary_outputs() == FlatSet<size_t>{4});
+        CHECK("STRUCT: chain sinks = {1}", s.sinks().size() == 1 && s.sinks()[0] == 1);
+        CHECK("STRUCT: chain order = [0,1]",
+              s.execution_order().size() == 2 && s.execution_order()[0] == 0 &&
+              s.execution_order()[1] == 1);
+    }
+
+    // Empty op set → structurally invalid.
+    CHECK("STRUCT: empty ops invalid", !SubgraphStructure(pc, dc, {}).valid());
+
+    // Structural validity is INDEPENDENT of arch admissibility: a mixed
+    // cube+vector group is REJECTED by the 910B cost model (Subgraph), yet it is
+    // a perfectly well-formed structure (it has a boundary output).
+    {
+        Problem pm;
+        pm.tensors = {{64, 64}, {64, 64}, {64, 64}, {64, 64}};  // 0=A 1=B 2=T 3=out
+        pm.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},          // op0: cube
+                  {OpType::Pointwise, {2}, {3}, 100}};          // op1: vector
+        pm.fast_memory_capacity = 1 << 20;
+        pm.slow_memory_bandwidth = 10;
+        pm.native_w = 128;
+        pm.native_h = 128;
+        set_910b(pm);
+        DAG dm = DAG::build(pm);
+        auto sg = Subgraph::create(pm, dm, {0, 1});
+        SubgraphStructure s(pm, dm, {0, 1});
+        CHECK("STRUCT: mixed group rejected by arch cost model", !sg.has_value());
+        CHECK("STRUCT: mixed group is structurally valid", s.valid());
+        CHECK("STRUCT: mixed group ephemeral = {2}", s.ephemeral() == FlatSet<size_t>{2});
+        CHECK("STRUCT: mixed group output = {3}", s.boundary_outputs() == FlatSet<size_t>{3});
+    }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1385,6 +1449,7 @@ static void test_pointwise_stream_explicit() {
 }
 
 int main() {
+    test_subgraph_structure();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
