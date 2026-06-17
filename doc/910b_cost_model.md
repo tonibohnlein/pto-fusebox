@@ -14,21 +14,23 @@ fuse into one grid.
 
 ## 1. Parameterization
 
-The output tensor **C is M×N** (M rows, N cols). One global decision:
+The output tensor is **M×N** (M rows, N cols). One global decision:
 
 - **Spatial tiling** of the output: a tile `(w, h)` — `w` along N, `h` along M.
   → `num_tiles = (N/w)·(M/h)`. Each tile is an **independent kernel** on one
-  cube core; tiles share only the read-only weights, so there are **no
-  dependencies between tiles**.
+  core; tiles share only read-only inputs, so there are **no dependencies
+  between tiles**.
 - **Temporal tiling** = the contraction `k`. Two variants:
   - **single-core sequential k** — one core accumulates the contraction in its
-    L0c, no cross-core merge. Allowed on any matmul.
+    L0c, no cross-core merge. Allowed on any matmul. **Cost-free** (§6).
   - **parallel split-K** — the contraction is split across cores, partials merged
-    through DDR. **Sink-only** (the merge is a DDR barrier).
+    through DDR. **Sink-only**, and the merge is an additive barrier (§5.2).
 
 **Only `(w, h)` are searched** (`best_cost` loops `ws_cand_ × hs_cand_`). The
-contraction `k` is **not** searched — it is derived **greedily** per matmul (see
-§3). This document focuses on the single-core (S=1) path.
+contraction `k` is **not** searched — it is derived **greedily** per matmul
+(§3). The cube spatial candidates are bounded by the sink output dim (a tile
+never exceeds the output it tiles; an intermediate matmul's wider output width
+is a contraction, not a spatial axis).
 
 ---
 
@@ -76,33 +78,117 @@ largest 16-aligned divisor of that op's contraction that fits the headroom
 `L1 − live_bands`. If a huge K cannot fit in one pass it is sliced — the
 **internal single-core k-split**.
 
----
-
-## 4. Roofline cost — `compute_cost` (S=1)
-
-`num_tw = N/w`, `num_th = M/h`, `num_tiles = num_tw·num_th`.
-
-- **Compute** `= Σ_matmul fractals · cube_compute_cost · recompute`, with
-  `fractals = ⌈N/16⌉·⌈M/16⌉·⌈K/16⌉` (16³ cube fractals; CEIL pads sub-16 dims).
-  `recompute = num_tw` for an **intermediate** matmul (its band is recomputed per
-  sink N-column tile when the sink tiles over N), `1` for a boundary output.
-- **Reload (DDR)** `= Σ_matmul` over **boundary** operands only: LHS `M·N·K/w_i`,
-  RHS `M·N·K/h_i` (each operand re-streamed across the perpendicular output
-  tiling). **Ephemeral operands are skipped** — they stay on-chip. Plus
-  `out_store = Σ boundary-output bytes`.
-- **Latency** `= max(compute/eff, (reload + out_store)·inv_B·sat) + kernel_fill`,
-  where `eff = min(num_tiles, n_cores)`, `sat = max(1, n_cores/eff)` (HBM is a
-  **shared** floor; too few cores can't saturate it), and
-  `kernel_fill = ⌈num_tiles/n_cores⌉ · kernel_fill_cost` (the dual of `eff`:
-  penalizes over-tiling, so the optimum sits at ~one kernel per core).
+**Arbitrary DAGs (trees, diamonds).** The band loop is interval-overlap, so it
+generalises with no special-casing: every ephemeral is live `[producer .. last
+consumer]`, and each step sums *all* bands covering it. A **tree** join (e.g.
+`(A·B)·(E·F)`) therefore has **both** child bands co-resident at the root; the
+DFS post-order (one subtree fully, then the sibling, then the join) keeps the
+live-band count = the DFS frontier width. At a join the root op's `per_unit = 0`
+— both its operands are ephemeral bands already charged, so it adds no strip.
 
 ---
 
-## 5. Worked example (verified end-to-end)
+## 4. Roofline cost — `compute_cost`
+
+`num_tw = N/w`, `num_th = M/h`, `num_tiles = num_tw·num_th`,
+`eff1 = min(num_tiles, n_cores)`, `inv_B = 1/bandwidth`,
+`sat(c) = max(1, n_cores/c)`.
+
+**Compute** `= Σ_matmul fractals · cube_compute_cost · recompute`, with
+`fractals = ⌈N/16⌉·⌈M/16⌉·⌈K/16⌉` (16³ cube fractals; CEIL pads sub-16 dims).
+`recompute = num_tw` for an **intermediate** matmul (its band is recomputed per
+sink N-column tile when the sink tiles over N), `1` for a boundary output.
+
+**Reload (DDR)** `= Σ` over **boundary** operands: LHS `M·N·K/w_i`, RHS
+`M·N·K/h_i` (each operand re-streamed across the perpendicular output tiling;
+`w_i = min(w, N_i)` for a boundary op, else the full intermediate width `N_i`).
+Ephemeral operands are skipped (on-chip). **Shared-input dedup:** an operand used
+by several ops in the **same role** (`(tensor, orientation, is_boundary_op)`) is
+charged **once** — within a subgraph all outputs share `(M,N)`, so the same key
+is the same per-tile slice, loaded once into L1 and reused (§5.1). A role *switch*
+(LHS in one op, RHS in another) keys differently and is charged twice (rows vs
+columns — different data). `out_store = Σ boundary-output bytes`.
+
+### 4.1 Spatial-only (S=1)
+
+```
+lat1 = max( total_compute / eff1 , (reload + out_store) · inv_B · sat(eff1) )
+       + kernel_fill
+```
+`kernel_fill = ⌈num_tiles/n_cores⌉ · kernel_fill_cost` — the dual of `eff`:
+penalises over-tiling, so the optimum sits at ~one kernel per core. Compute
+parallelises over cores; **DDR is a shared floor** (`sat` penalises too few
+cores to saturate HBM).
+
+### 4.2 Parallel split-K (sink contraction split across cores)
+
+Used when the spatial tiles can't fill the cores (`num_tiles < n_cores`):
+
+```
+kfrac      = output_K / 16                            # 16-fractal slices of the sink contraction
+cores_used = min(n_cores, num_tiles · kfrac)
+S          = ⌈cores_used / num_tiles⌉                 # split factor per tile
+effS       = cores_used
+streamS    = max( total_compute / effS , reload · inv_B · sat(effS) )
+merge_tail = S · out_store · inv_B · sat(effS)        # the S partial-C writes, ADDITIVE
+latS       = streamS + merge_tail
+```
+Chosen iff `S > 1` and `latS < lat1`. `merge_tail` is the cost the single-core
+path avoids: each of the S cores writes a full `C[n,m]` partial to DDR and they
+are reduced there (no shared L2) — a BSP barrier, **not** hidden under the
+roofline. **Sink-only:** only a boundary-output matmul may split this way (its C
+goes to DDR anyway); an *internal* matmul splitting would round-trip the
+ephemeral through DDR — that is expressed as a **subgraph cut** at the partition
+level, not an in-subgraph split. The displayed per-core `k` composes the
+single-core L1-fit `k` with the split share `⌈kfrac/S⌉·16`.
+
+---
+
+## 5. Shared inputs & multiple outputs
+
+A subgraph may have **several boundary outputs** as long as they share the same
+`(W,H)` (`create()` rejects mismatched sinks). One unified grid tiles them all;
+per tile-position the kernel runs the DFS order over the ops, producing every
+output's tile in that kernel — they are computed **together**, not in separate
+passes.
+
+### 5.1 Shared-input reuse
+
+When a boundary input feeds several ops in the same role (e.g. a shared LHS `t0`
+in `{t0·t1, t0·t3}`), every op wants the *same* per-tile slice `t0[K, m-band]`
+(independent of the N-column), so it is loaded **once** into L1 and reused. The
+reload dedup (§4) credits this: `t0` is charged once, not once per op. **This is
+only visible when the subgraph is memory-bound** — see §8. A *role switch* needs
+different slices (rows vs columns) and is correctly charged twice.
+
+---
+
+## 6. Single-core k-split is cost-free
+
+Splitting one matmul's contraction into `nk` single-core passes changes neither
+compute nor IO:
+
+- The **L0c accumulator persists** across all `nk` passes (the output tile fits
+  L0c, or spills to L1 — §3). Each pass streams its k-chunk operands and
+  **accumulates in place**; the partials merge *in L0c*. So the cube fragment
+  count is the full `⌈N/16⌉⌈M/16⌉⌈K/16⌉` regardless of chunking, and each operand
+  is loaded once (in chunks). `nk · max(compute/nk, io/nk) = max(compute, io)`.
+- **No `k²` in a chain.** With both matmuls split, the per-op contractions just
+  walk independently; the op1-chunks *partition* N1, so op0 produces each T-slice
+  once — `Σ` over the partition is op0's full count, once. (The fused-pipeline
+  variant that *would* re-read A per chunk is not used; the model materialises
+  the full T band instead — §3.)
+
+This is exactly what distinguishes single-core (free, L0c merge) from parallel
+split-K (the `merge_tail` through DDR — §4.2).
+
+---
+
+## 7. Worked example (verified end-to-end)
 
 `A[256,3072]·B[256,256]→T[256,3072]` ; `T·D[128,256]→C[128,3072]`
 (M=3072, K1=256, N1=256, N2=128; FP32; L1=512 KB, L0c=128 KB, 24 cube cores,
-`cube_compute_cost`=1000, bandwidth=10, `kernel_fill_cost`=10000). Solver picks
+`cube_compute_cost=1000`, bandwidth=10, `kernel_fill_cost=10000`). Solver picks
 `(w=128, h=128)`, S=1, `seq_k=[256,256]`.
 
 **Memory** — order `[op0, op1]`, T band `= 256·128·4 = 128 KB`:
@@ -114,27 +200,60 @@ largest 16-aligned divisor of that op's contraction that fits the headroom
 
 `peak = 384 KB ≤ 512 KB` → feasible, both k full (256).
 
-**Roofline**: `num_tw=1, num_th=24, num_tiles=24`.
-compute `= 49152·1000·1 + 24576·1000·1 = 73.73M`; reload `= 9.44M + 3.15M =
-12.58M`, out_store `1.57M`; `eff=24`, `sat=1` →
-`lat = max(73.73M/24, 14.16M·0.1) + 1·10000 = max(3.072M, 1.42M) + 10000 =`
-**3,082,000**.
+**Roofline** (`num_tw=1, num_th=24, num_tiles=24`):
+compute `= 49152·1000 + 24576·1000 = 73.73M`; reload `= 9.44M + 3.15M = 12.58M`,
+out_store `1.57M`; `eff=24, sat=1` →
+`lat = max(73.73M/24, 14.16M·0.1) + 10000 = max(3.072M, 1.42M) + 10000 =`
+**3,082,000** (compute-bound at this `cube_compute_cost`).
 
 ---
 
-## 6. Key modeling choices
+## 8. Calibration
+
+The machine params are **placeholders** (relative units) until grounded from real
+910B specs; the per-op `base_cost` is ignored.
+
+- `cube_compute_cost` — time per 16³ cube fractal. **Default is memory-bound**
+  (64 in `set_910b`): real 910B matmul is memory-bound for typical shapes. With
+  `bandwidth=10` the roofline knee sits around a few hundred of these units (the
+  fp16 hardware estimate is ~5). The old 4096 placeholder was compute-bound and
+  hid every IO-side effect (the shared-input reuse, the DDR floor). Tests that
+  specifically exercise a *compute-bound* property (split-K compute speedup,
+  fractal-quant decode, the compute-bound `fused==sum`) pin a compute-bound value.
+- `vector_compute_cost`, `vector_lanes`, `kernel_fill_cost` — also placeholders.
+- `slow_memory_bandwidth`, capacities (`l1`/`cube`/`vec`), `num_*_cores`,
+  `double_buffer` — the per-die 910B layout (24 cube / 48 vector cores; L1 512 KB,
+  L0c 128 KB, UB 192 KB).
+
+---
+
+## 9. Key modeling choices
 
 1. **The intermediate is ephemeral, full-width (N1), tiled only over M.** It never
    round-trips DDR (on-chip), but it *is* **recomputed** once per sink N-column
-   tile (the `recompute = num_tw` factor). Fusion's win = "no DDR round-trip for
-   T," paid for by recompute when the sink tiles over N.
+   tile (`recompute = num_tw`). Fusion's win = "no DDR round-trip for T," paid for
+   by recompute when the sink tiles over N.
 2. **k is per-matmul greedy, not searched** — each matmul independently takes the
    largest 16-aligned divisor of its own contraction that fits the L1 headroom.
-3. **Compute parallelizes over `min(num_tiles, cores)`; DDR is a shared floor.**
+3. **Compute parallelises over `min(num_tiles·split, cores)`; DDR is a shared
+   floor.** Single-core k-split merges in L0c (free); parallel split-K merges
+   through DDR (additive barrier).
 
-## 7. Implementation note — two places
+---
 
-The **slicing** (which slice of each tensor a tile needs) lives in
-`create()`'s TileSource propagation; the **memory peak** is computed separately in
-`derive_exec` (it re-derives bands/strips from `cfg` + tensor dims). They are
-consistent but not shared code — a candidate for future unification.
+## 10. Known limitations
+
+- **Single roofline over a fused subgraph (`Σmax ≥ maxΣ`).** `compute_cost` takes
+  one roofline `max(Σcompute/eff, Σio·inv_B·sat)` over all ops rather than summing
+  per-op rooflines `Σ max(c_i, i_i)`. This is optimistic when fused stages differ
+  in bottleneck (one compute-bound, one IO-bound) — it assumes cross-tile
+  pipelining hides the per-stage sequential dependency. Invisible when uniformly
+  compute- or memory-bound.
+- **Conservative L0c-aware band.** An ephemeral is charged at its producer step
+  unconditionally (§3). A refinement would charge it there only when its band
+  exceeds L0c (else it sits in the accumulator, not L1).
+- **Two places.** The per-tensor *slicing* (TileSource in `create()`) and the
+  *memory peak* (`derive_exec`, which re-derives bands/strips from `cfg`) are
+  consistent but not shared code — a candidate for unification, along with
+  computing the cube reload from `boundary_tensor_info_` (as the vector path
+  does) instead of the per-op dedup loop.
