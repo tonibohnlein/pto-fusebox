@@ -500,6 +500,27 @@ static void test_atomic_add_flag() {
     CHECK("ATOMIC: serial merge (no SetAtomicAdd) costs more", r_serial.latency > r_atomic.latency + 1.0);
     CHECK("ATOMIC: serial merge splits no more aggressively than atomic-add",
           r_serial.parallel_split <= r_atomic.parallel_split);
+
+    // The VECTOR reduction sink-split obeys the same flag. Few-row reduction
+    // (W=4096 -> [1,H], H small) so it splits the reduced axis across cores.
+    {
+        Problem v;  // x[4096,32] -> rowsum [1,32] (width-reduction)
+        v.tensors = {{4096, 32}, {1, 32}};
+        v.ops = {{OpType::Reduction, {0}, {1}, 4096 * 32}};
+        v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10;
+        v.native_w = 128; v.native_h = 128;
+        set_910b(v);              // ddr_atomic_add = true
+        v.kernel_fill_cost = 0;
+        DAG dv = DAG::build(v);
+        int sp_atomic = Subgraph::create(v, dv, {0})->best_cost().parallel_split;
+        v.ddr_atomic_add = false;
+        int sp_serial = Subgraph::create(v, dv, {0})->best_cost().parallel_split;
+        std::cout << "    vec reduction: atomic split=" << sp_atomic
+                  << " serial split=" << sp_serial << "\n";
+        CHECK("ATOMIC/vec: reduction split-K uses the cores with SetAtomicAdd", sp_atomic > 1);
+        CHECK("ATOMIC/vec: serial reduction merge splits no more than atomic-add",
+              sp_serial <= sp_atomic);
+    }
 }
 
 // --- machine-cost compute model: geometry x per-step cost (910B) --------------

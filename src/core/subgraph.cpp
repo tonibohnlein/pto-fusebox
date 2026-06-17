@@ -1338,28 +1338,35 @@ CostResult Subgraph::compute_cost(const TileConfig &cfg,
       result.cores_used = (int)eff;
       result.compute_bound = (total_compute / eff) >= total_io * sat_v;
       result.ddr_traffic = total_io;
-      // Reduced-axis (cross-core) split — the vector analog of matmul split-K.
-      // SINK-ONLY: the S per-core partials reduce across cores through DDR, which
-      // is fine for a boundary reduction output but would break ephemerality for
-      // an internal reduction (that case is expressed as a subgraph cut, not an
-      // in-subgraph split). The split propagates to the pointwise ops feeding the
-      // sink along the reduced axis; the single merge is an ADDITIVE BSP barrier.
+      // Reduced-axis (cross-core) split — the vector analog of the cube split-K.
+      // SINK-ONLY: the S per-core partials reduce across cores through DDR (fine
+      // for a boundary reduction output; an internal reduction split is a subgraph
+      // cut, not an in-subgraph split). Mirrors the cube (§4.2): ENUMERATE S (the
+      // optimum is interior when the merge is serial), and the merge has the SAME
+      // two regimes via Problem::ddr_atomic_add. The reduced partial is thin
+      // ([H,1] for a width-reduction, [1,W] for a height-reduction) -> red_dim.
       if (has_reduction_ && reduction_is_sink_ && num_tiles < n_cores) {
-        const int64_t S = (n_cores + num_tiles - 1) / num_tiles;  // cores per spatial tile
-        const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
-        const double sat_vS = std::max(1.0, (double)n_cores / effS);
-        const double streamS = std::max(total_compute / effS, total_io * sat_vS);
-        // Thin partial: the reduced output ([H,1] for a width-reduction, [1,W]
-        // for a height-reduction). (S-1) cross-core merges through DDR.
-        const double merge_tail =
-            (double)(S - 1) * (double)(reduced_axis_ == 1 ? out_H_ : out_W_) * inv_B * sat_vS;
-        const double latS = streamS + merge_tail;
-        if (latS < lat) {
-          lat = latS;
-          result.parallel_split = (int)S;
-          result.cores_used = (int)effS;
-          result.compute_bound = (total_compute / effS) >= (total_io * sat_vS);
-          result.ddr_traffic = total_io * sat_vS + merge_tail;
+        const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
+        const double sat_acc = std::max(1.0, (double)n_cores / (double)num_tiles);
+        const int64_t S_max = (n_cores + num_tiles - 1) / num_tiles;
+        for (int64_t S = 2; S <= S_max; ++S) {
+          const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
+          const double sat_vS = std::max(1.0, (double)n_cores / effS);
+          const double streamS = std::max(total_compute / effS, total_io * sat_vS);
+          // (1) write/atomic-add the S thin partials (parallel; cancels below full-fill).
+          double merge = (double)(S - 1) * red_dim * inv_B * sat_vS;
+          // (2) WITHOUT SetAtomicAdd: read the partials back and sum serially per
+          //     tile (one accumulator/tile -> sat(num_tiles), grows ∝ S).
+          if (!prob_->ddr_atomic_add)
+            merge += (double)(S + 1) * red_dim * inv_B * sat_acc;
+          const double latS = streamS + merge;
+          if (latS < lat) {
+            lat = latS;
+            result.parallel_split = (int)S;
+            result.cores_used = (int)effS;
+            result.compute_bound = (total_compute / effS) >= (total_io * sat_vS);
+            result.ddr_traffic = total_io * sat_vS + merge;
+          }
         }
       }
       result.latency = lat;
