@@ -989,6 +989,64 @@ static void test_mixed_unit_tiling() {
           fr.cores_used == 3 * eff_units);
 }
 
+// --- MM->PW mixed kernel variants: the DDR-bound regime ----------------------
+// Most MM->PW kernels are memory-bound. DDR-domination shows up as
+// compute_bound=false and lat = rounds*fill + ddr_lat (the cube/vector stages
+// hidden under DDR). The DDR bytes = boundary inputs + boundary outputs +
+// 2x(cube->vector crossing intermediate) — the intermediate round-trips the GM
+// ring on 910B. We also print the separated MM+PW cost for comparison.
+static void test_mixed_mm_pw_variants() {
+    std::cout << "[MIXVAR] MM->PW mixed kernel — DDR-bound regime + variants\n";
+    auto mk = [](int64_t M, int64_t N, int64_t K, int64_t cc) {
+        Problem p;
+        p.tensors = {{K, M}, {N, K}, {N, M}, {N, M}};  // A[K,M] B[N,K] C[N,M] D[N,M]
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
+                 {OpType::Pointwise, {2}, {3}, 100}};
+        p.fast_memory_capacity = 1 << 26;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p, cc);
+        return p;
+    };
+
+    // (1) memory-bound matmul (cc=64): MM->PW should be DDR-dominated.
+    {
+        Problem p = mk(256, 256, 256, 64);
+        DAG dag = DAG::build(p);
+        auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        auto mm = Subgraph::create(p, dag, {0})->best_cost();
+        auto pw = Subgraph::create(p, dag, {1})->best_cost();
+        const int rounds = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
+        const double twoC = 2.0 * (256.0 * 256.0) * 4 / 10.0;  // intermediate roundtrip
+        std::cout << "  mem-bound : fused lat=" << fr.latency << " compute_bound=" << fr.compute_bound
+                  << " ddr=" << fr.ddr_traffic << " tiles=" << fr.num_spatial_tiles
+                  << "  | separated mm.ddr=" << mm.ddr_traffic << " pw.ddr=" << pw.ddr_traffic << "\n";
+        CHECK("MIXVAR: memory-bound MM->PW is DDR-bound", !fr.compute_bound);
+        CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
+              std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
+        CHECK("MIXVAR: ddr includes the 2x intermediate roundtrip", fr.ddr_traffic >= twoC - 1.0);
+    }
+    // (2) compute-bound matmul (cc=4096): the cube stage dominates.
+    {
+        Problem p = mk(256, 256, 256, 4096);
+        DAG dag = DAG::build(p);
+        auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        std::cout << "  compute   : fused lat=" << fr.latency
+                  << " compute_bound=" << fr.compute_bound << " ddr=" << fr.ddr_traffic << "\n";
+        CHECK("MIXVAR: heavy matmul MM->PW is compute-bound", fr.compute_bound);
+    }
+    // (3) wide intermediate (big C, cheap matmul): the 2x roundtrip dominates DDR.
+    {
+        Problem p = mk(64, 1024, 64, 64);
+        DAG dag = DAG::build(p);
+        auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        std::cout << "  wide-C    : fused lat=" << fr.latency
+                  << " compute_bound=" << fr.compute_bound << " ddr=" << fr.ddr_traffic << "\n";
+        CHECK("MIXVAR: wide-intermediate MM->PW is DDR-bound", !fr.compute_bound);
+    }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1527,6 +1585,7 @@ int main() {
     test_subgraph_structure();
     test_cube_vector_fusion();
     test_mixed_unit_tiling();
+    test_mixed_mm_pw_variants();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
