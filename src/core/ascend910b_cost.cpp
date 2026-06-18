@@ -1063,6 +1063,47 @@ bool Ascend910BCost::is_feasible(const TileConfig &cfg,
 }
 
 // ============================================================================
+// Matmul operand reload (BYTES) — shared by the cube cost and the mixed cost
+// ============================================================================
+
+double Ascend910BCost::cube_operand_reload(const TileConfig &cfg,
+                                           bool matmul_at_output_grid) const {
+  // Build the in-subgraph produced/consumed sets (produced ⇒ on-chip ephemeral
+  // operand, never reloaded from DDR; consumed ⇒ the op is an intermediate).
+  FlatSet<size_t> produced, consumed;
+  for (auto i : ops_) {
+    produced.insert(prob_->ops[i].output());
+    for (auto t : prob_->ops[i].inputs) consumed.insert(t);
+  }
+  // Distribution-aware reload: the left operand reloads with the N-tiling (1/w),
+  // the right operand with the M-tiling (1/h); deduped per (tensor, role,
+  // boundary?) so a shared operand in the same role is charged once. A consumed
+  // (chained-intermediate) matmul tiles its output full-width (w_i = N_i) UNLESS
+  // matmul_at_output_grid forces the output grid — the mixed feed-forward case,
+  // where the matmul output is consumed elementwise by the vector stage and so is
+  // tiled at cfg.w like a boundary output.
+  double reload = 0.0;
+  std::set<std::tuple<size_t, int, bool>> counted;  // (tensor, 0=LHS/1=RHS, is_boundary_op)
+  for (auto i : ops_) {
+    if (prob_->ops[i].type != OpType::MatMul) continue;
+    const size_t lhs = prob_->ops[i].inputs[0];
+    const size_t rhs = prob_->ops[i].inputs[1];
+    const size_t o   = prob_->ops[i].output();
+    const double N_i = (double)prob_->tensors[o].width;
+    const double M_i = (double)prob_->tensors[o].height;
+    const double K_i = (double)prob_->tensors[lhs].width;       // contraction
+    const bool is_boundary_op = matmul_at_output_grid || !consumed.count(o);
+    const double w_i = is_boundary_op ? std::min((double)cfg.w, N_i) : N_i;
+    const double h_i = std::min((double)cfg.h, M_i);            // shared M-band
+    if (!produced.count(lhs) && counted.emplace(lhs, 0, is_boundary_op).second)
+      reload += M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
+    if (!produced.count(rhs) && counted.emplace(rhs, 1, is_boundary_op).second)
+      reload += M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
+  }
+  return reload;
+}
+
+// ============================================================================
 // Cost computation
 // ============================================================================
 
@@ -1097,14 +1138,11 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // output (#native tiles) — for a CHAINED group the intermediate has a
       // different shape than the sink, so a single sink-scaled basis would
       // mis-count it. Single matmul: output == sink, identical to before.
-      // In-subgraph produced/consumed sets: an operand is ephemeral (on-chip) iff
-      // produced within the subgraph; an op is a boundary-output op iff its output
-      // is not consumed within the subgraph.
-      FlatSet<size_t> produced, consumed;
-      for (auto i : ops_) {
-        produced.insert(prob_->ops[i].output());
+      // In-subgraph consumed set: an op is a boundary-output op iff its output is
+      // not consumed within the subgraph (drives the recompute factor below).
+      FlatSet<size_t> consumed;
+      for (auto i : ops_)
         for (auto t : prob_->ops[i].inputs) consumed.insert(t);
-      }
       double total_compute = 0.0;
       for (auto i : ops_) {
         if (prob_->ops[i].type != OpType::MatMul) continue;
@@ -1161,39 +1199,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       for (const auto& info : boundary_tensor_info_)
         if (info.is_boundary_out)
           out_store += (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
-      // Operand reload: per matmul op, boundary operands only. The distribution-
-      // aware MNK*(1/w + 1/h) splits into a left-operand (1/w) and right-operand
-      // (1/h) term; a non-sink op tiles its intermediate FULL-width (w_i = N_i)
-      // under the M-partition, so only its M-band height h is tiled.
-      //
-      // Shared-input reuse: a boundary operand used by SEVERAL ops in the SAME
-      // role needs the SAME per-tile slice — e.g. a shared LHS t0 in {t0@t1,
-      // t0@t3} both want t0[K, m-band] (independent of the N-column), so it is
-      // loaded ONCE into L1 (it fits, ≤ l1_capacity) and reused across the ops.
-      // Charge each (tensor, role) slice once — dedup across ops. Within a
-      // subgraph all outputs share (M,N), so the same (tensor, orientation,
-      // is_boundary_op) key ⇒ identical term ⇒ the same physical slice. A role
-      // SWITCH (LHS in one op, RHS in another) keys differently and IS counted
-      // twice (rows vs columns — genuinely different data, no reuse). Mirrors the
-      // vector path, which already dedups via per-tensor boundary_tensor_info_.
-      double reload = 0.0;
-      std::set<std::tuple<size_t, int, bool>> counted;  // (tensor, 0=LHS/1=RHS, is_boundary_op)
-      for (auto i : ops_) {
-        if (prob_->ops[i].type != OpType::MatMul) continue;
-        const size_t lhs = prob_->ops[i].inputs[0];
-        const size_t rhs = prob_->ops[i].inputs[1];
-        const size_t o   = prob_->ops[i].output();
-        const double N_i = (double)prob_->tensors[o].width;
-        const double M_i = (double)prob_->tensors[o].height;
-        const double K_i = (double)prob_->tensors[lhs].width;       // contraction
-        const bool is_boundary_op = !consumed.count(o);
-        const double w_i = is_boundary_op ? std::min((double)cfg.w, N_i) : N_i;
-        const double h_i = std::min((double)cfg.h, M_i);            // shared M-band
-        if (!produced.count(lhs) && counted.emplace(lhs, 0, is_boundary_op).second)
-          reload += M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
-        if (!produced.count(rhs) && counted.emplace(rhs, 1, is_boundary_op).second)
-          reload += M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
-      }
+      // Matmul boundary-operand reload — distribution-aware MNK*(1/w + 1/h),
+      // deduped per (tensor, role). See cube_operand_reload(); the cube path
+      // treats a consumed (chained) intermediate matmul as a full-width band.
+      const double reload = cube_operand_reload(cfg);
       // S=1 (spatial-only): no cross-core reduction, so the output store streams
       // out as tiles complete (overlaps compute) — classic roofline, no barrier.
       const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);
@@ -1445,17 +1454,30 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     }
   }
 
-  // DDR traffic: boundary inputs (read) + boundary outputs (written) + every
-  // cube↔vector-crossing intermediate round-tripped (write + read = 2x). An
-  // ephemeral produced and consumed within the SAME unit stays on chip (free);
-  // only a unit-crossing one hits DDR (the off-chip GM ring buffer).
-  double ddr_bytes = 0.0;
-  for (const auto& info : boundary_tensor_info_) {
+  // DDR traffic. CRITICAL: fusion on 910B does NOT reduce DDR — the matmul still
+  // reloads its operands and the intermediate still round-trips DDR (only 950's
+  // direct pipe removes the roundtrip). So the mixed DDR is, exactly like the
+  // separated two kernels:
+  //   (a) matmul operand reload — the SAME term as the cube model (shared helper;
+  //       the matmul is the effective sink here, tiled at the output grid);
+  //   (b) every cube↔vector-crossing intermediate, round-tripped (write+read = 2x
+  //       through the off-chip GM ring);
+  //   (c) vector-only boundary inputs (read) + boundary outputs (written).
+  // A cube operand is already in (a), so it is excluded from (c) to avoid double
+  // counting; an ephemeral that stays within one unit is free (not crossing).
+  double ddr_bytes = cube_operand_reload(cfg, /*matmul_at_output_grid=*/true);  // (a)
+  FlatSet<size_t> cube_operands;
+  for (auto i : ops_)
+    if (prob_->ops[i].type == OpType::MatMul)
+      for (auto t : prob_->ops[i].inputs) cube_operands.insert(t);
+  for (const auto& info : boundary_tensor_info_) {                              // (c)
     const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
-    if (!info.is_internally_produced) ddr_bytes += bytes;  // boundary input (read)
-    if (info.is_boundary_out)         ddr_bytes += bytes;  // boundary output (write)
+    if (!info.is_internally_produced && !cube_operands.count(info.id))
+      ddr_bytes += bytes;  // vector-read boundary input (cube operands are in (a))
+    if (info.is_boundary_out)
+      ddr_bytes += bytes;  // boundary output store
   }
-  FlatSet<size_t> in_sg(ops_.begin(), ops_.end());
+  FlatSet<size_t> in_sg(ops_.begin(), ops_.end());                             // (b)
   for (auto t : ephemeral_) {
     const int prod = dag_->tensor_producer[t];
     const bool prod_cube = prod >= 0 && prob_->ops[(size_t)prod].type == OpType::MatMul;

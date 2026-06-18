@@ -197,6 +197,16 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                       const FlatSet<size_t> &retain_these,
                       std::vector<int64_t> *perop_k_out) const;
 
+  // Matmul boundary-operand reload (BYTES) at this tiling: the distribution-aware
+  // M*N*K*(1/w + 1/h) term, deduped per (tensor, role). Shared by the cube cost
+  // and the mixed cost so fusion does not silently drop the operand reload.
+  // matmul_at_output_grid=true treats every matmul as tiled at the output grid
+  // (w_i = min(cfg.w, N)) — correct for a feed-forward mixed kernel whose matmul
+  // output is consumed elementwise by the vector stage (it is the effective sink),
+  // vs the cube path's chained-intermediate default (full-width band, w_i = N).
+  double cube_operand_reload(const TileConfig &cfg,
+                             bool matmul_at_output_grid = false) const;
+
   const Problem *prob_ = nullptr;
   const DAG *dag_ = nullptr;
   std::vector<size_t> ops_;

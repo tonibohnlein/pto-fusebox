@@ -1026,6 +1026,16 @@ static void test_mixed_mm_pw_variants() {
         CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
               std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
         CHECK("MIXVAR: ddr includes the 2x intermediate roundtrip", fr.ddr_traffic >= twoC - 1.0);
+        // The mixed DDR now carries the matmul operand reload (it is NOT just the
+        // boundary tensors read once = (A+B+D+2C) = 131072 here) — fusion does not
+        // avoid the reload on 910B.
+        const double boundary_once = (double)(65536 * 3 + 2 * 65536) * 4 / 10.0;  // 131072
+        CHECK("MIXVAR: ddr carries operand reload (> boundary-read-once)",
+              fr.ddr_traffic > boundary_once + 1.0);
+        // Fusion still wins (saves a kernel fill + overlaps compute) but does NOT
+        // halve the DDR — the win is modest in the DDR-bound regime.
+        CHECK("MIXVAR: fused < separated (saves fill + overlap, not DDR)",
+              fr.latency < mm.latency + pw.latency);
     }
     // (2) compute-bound matmul (cc=4096): the cube stage dominates.
     {
