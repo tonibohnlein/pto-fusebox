@@ -23,8 +23,10 @@ CFG = dict(
 MM, PW, RED = "MatMul", "Pointwise", "Reduction"
 
 
-def emit(name, tensors, ops, cube_compute_cost=4096):
-    """tensors: [(w,h)]; ops: [(type, [inputs], [outputs])]."""
+def emit(name, tensors, ops, cube_compute_cost=4096, **overrides):
+    """tensors: [(w,h)]; ops: [(type, [inputs], [outputs])].
+    overrides: per-instance CFG overrides (e.g. vec_capacity=16384 for a tight-UB
+    architecture) applied on top of the shared CFG."""
     widths = [w for w, _ in tensors]
     heights = [h for _, h in tensors]
     base_costs = []
@@ -37,6 +39,7 @@ def emit(name, tensors, ops, cube_compute_cost=4096):
     j = dict(widths=widths, heights=heights, op_types=[t for t, _, _ in ops],
              inputs=[ins for _, ins, _ in ops], outputs=[outs for _, _, outs in ops],
              base_costs=base_costs, cube_compute_cost=cube_compute_cost, **CFG)
+    j.update(overrides)
     path = os.path.join(OUT, f"910b-{name}.json")
     with open(path, "w") as f:
         json.dump(j, f, indent=1)
@@ -104,3 +107,12 @@ emit("mixed-mm-mm-pw",
 emit("mixed-mm-pw-pw",
      [(256, 256), (256, 256), (256, 256), (256, 256), (256, 256)],
      [(MM, [0, 1], [2]), (PW, [2], [3]), (PW, [3], [4])], cube_compute_cost=64)
+# Compute-bound MM->PW (cube_compute_cost=4096): the cube dominates and the vector
+# stage is fully hidden under the overlap — still fused.
+mm_pw = ([(256, 256), (256, 256), (256, 256), (256, 256)],
+         [(MM, [0, 1], [2]), (PW, [2], [3])])
+emit("mixed-mm-pw-compute", *mm_pw, cube_compute_cost=4096)
+# Tight-UB architecture (UB 16KB): the shared tile is forced small, the matmul
+# reload blows up, so the mixed solver picks SEPARATE over fusion — the
+# fuse-vs-separate decision driven by the on-chip memory size.
+emit("mixed-mm-pw-tight-ub", *mm_pw, cube_compute_cost=64, vec_capacity=16384)
