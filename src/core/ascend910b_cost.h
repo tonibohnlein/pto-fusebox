@@ -401,6 +401,10 @@ class Ascend910BMixed : public Ascend910BCost {
     return Ascend910BMixed(std::move(*base));
   }
 
+  // Default-constructible like the base (ScheduleStep default-inits its subgraph
+  // member); the user-declared private ctor below otherwise suppresses it.
+  Ascend910BMixed() = default;
+
   // The third subgraph type: a fused cube+vector mixed kernel. Cube-only and
   // vector-only groups delegate to the (shared, unchanged) base cost.
   CostResult compute_cost(const TileConfig &cfg,

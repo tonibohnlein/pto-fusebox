@@ -57,6 +57,14 @@ target_link_libraries(solver_lib Threads::Threads)
 add_executable(mlsys src/pipeline/main.cpp)
 target_link_libraries(mlsys solver_lib Threads::Threads)
 
+# --- Mixed-model variant (cube+vector fusion) ---
+# Same solver, compiled with the compile-time arch switch flipped to
+# Ascend910BMixed (see src/core/subgraph.h). Used to solve/visualise fused mixed
+# kernels; the default `mlsys` stays the unit-homogeneous model.
+add_executable(mlsys_mixed ${LIB_SOURCES} src/pipeline/main.cpp)
+target_compile_definitions(mlsys_mixed PRIVATE PYPTO_FUSE_CUBE_VECTOR)
+target_link_libraries(mlsys_mixed Threads::Threads)
+
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 

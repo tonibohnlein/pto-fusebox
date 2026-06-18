@@ -16,4 +16,12 @@
 #include "core/ascend910b_cost.h"
 #include "core/cost_model.h"
 
+// Compile-time architecture switch. Default = the unit-homogeneous 910B model;
+// -DPYPTO_FUSE_CUBE_VECTOR selects the cube+vector-fusing model (used by the
+// `mlsys_mixed` build to solve/visualise fused mixed kernels). This is the single
+// switch point — every pipeline type that names `Subgraph` follows.
+#ifdef PYPTO_FUSE_CUBE_VECTOR
+using Subgraph = SubgraphT<Ascend910BMixed>;
+#else
 using Subgraph = SubgraphT<Ascend910BCost>;
+#endif

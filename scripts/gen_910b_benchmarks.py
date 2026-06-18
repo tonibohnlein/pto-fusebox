@@ -89,3 +89,18 @@ for _ in range(8):
     tns.append((256, 256)); out = len(tns) - 1
     ops.append((MM, [prev, w], [out])); prev = out
 emit("deep-chain-8mm", tns, ops)
+
+# (7) Mixed cube+vector kernels (rendered with mlsys_mixed = Ascend910BMixed).
+#     Memory-bound matmul (cube_compute_cost=64) — the realistic MM->PW regime.
+# MM -> PW:  C = A@B; D = relu(C).  The canonical fused mixed kernel.
+emit("mixed-mm-pw",
+     [(256, 256), (256, 256), (256, 256), (256, 256)],  # A[K,M] B[N,K] C[N,M] D
+     [(MM, [0, 1], [2]), (PW, [2], [3])], cube_compute_cost=64)
+# MM -> MM -> PW:  T1=A@B; C=T1@D; E=relu(C).  T1 is a held cube L1 operand band.
+emit("mixed-mm-mm-pw",
+     [(256, 256), (1024, 256), (1024, 256), (256, 1024), (256, 256), (256, 256)],
+     [(MM, [0, 1], [2]), (MM, [2, 3], [4]), (PW, [4], [5])], cube_compute_cost=64)
+# MM -> PW -> PW:  C=A@B; T=relu(C); D=gelu(T).  T is a held vector UB band.
+emit("mixed-mm-pw-pw",
+     [(256, 256), (256, 256), (256, 256), (256, 256), (256, 256)],
+     [(MM, [0, 1], [2]), (PW, [2], [3]), (PW, [3], [4])], cube_compute_cost=64)

@@ -15,7 +15,8 @@ set -euo pipefail
 
 INSTANCE="$1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOLVER="$ROOT/build/mlsys"
+# Override with e.g. SOLVER=$ROOT/build/mlsys_mixed to render fused mixed kernels.
+SOLVER="${SOLVER:-$ROOT/build/mlsys}"
 OUT="$ROOT/fusion_dag"
 NAME="$(basename "$INSTANCE" .json)"
 mkdir -p "$OUT"
