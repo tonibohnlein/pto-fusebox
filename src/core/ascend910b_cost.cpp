@@ -1097,8 +1097,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // DDR — written by the producing unit, read by the consuming unit (2x). That
       // traffic is unavoidable, but the two stages OVERLAP (the cube streams output
       // tiles into DDR while the vector cores consume already-written tiles), so
-      // the roundtrip LATENCY is hidden behind the slower stage:
-      //   lat = max(cube_compute/eff_cube, vector_compute/eff_vec, ddr·inv_B)
+      // the roundtrip LATENCY is hidden behind the slower stage. The kernel tiles
+      // for UNITS (1 cube + 2 vector; see below):
+      //   lat = fill + max(cube_compute/eff_units, vector_compute/(2·eff_units), ddr·inv_B)
       // plus ONE kernel fill (added by the shared block below). Compare the
       // SEPARATED cost (two kernels): [fill+max(cube,ddr_c)] + [fill+max(vec,ddr_v)]
       // — fusion saves the overlap (max vs sum) and one fill; the DDR total is the
@@ -1148,19 +1149,26 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           ddr_bytes += 2.0 * (double)(prob_->tensors[t].width * prob_->tensors[t].height) *
                        dtype_bytes(prob_->tensors[t].dtype);
       }
-      // Cube and vector pools run concurrently; each compute term divides by its
-      // OWN pool's filled cores. DDR is the shared floor (sat≈1: a mixed kernel
-      // issues DMA from both pools, so HBM saturates easily — refine later).
-      const double eff_cube = (double)std::min<int64_t>(num_tiles, prob_->num_cube_cores);
-      const double eff_vec  = (double)std::min<int64_t>(num_tiles, prob_->num_vector_cores);
-      const double cube_lat = cube_compute / eff_cube;
-      const double vec_lat  = vector_compute / eff_vec;
-      const double ddr_lat  = ddr_bytes * inv_B;
-      result.latency = std::max({cube_lat, vec_lat, ddr_lat});
+      // Tiling for UNITS. With the fixed 1:2 cube:vector ratio, a mixed kernel's
+      // atomic resource is a UNIT = 1 cube + 2 vector cores (the 950 mix-cluster;
+      // on 910B the same ratio + the GM ring). The output regions tile over
+      // n_units = num_cube_cores; WITHIN a unit the cube and its 2 vector cores are
+      // pipeline STAGES (not a finer output grid), so the two stage times divide by
+      // 1 and 2 cores per unit:
+      //   cube_stage   = cube_compute   / eff_units        (1 cube / unit)
+      //   vector_stage = vector_compute / (2 · eff_units)  (2 vectors / unit)
+      // DDR is the shared floor (sat≈1: a mixed kernel issues DMA from both stages,
+      // so HBM saturates easily — refine later).
+      const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
+      const double eff_units   = std::min((double)num_tiles, n_units);
+      const double cube_stage  = cube_compute   / eff_units;
+      const double vec_stage   = vector_compute / (2.0 * eff_units);
+      const double ddr_lat     = ddr_bytes * inv_B;
+      result.latency       = std::max({cube_stage, vec_stage, ddr_lat});
       result.parallel_split = 1;
-      result.cores_used = (int)(eff_cube + eff_vec);
-      result.compute_bound = std::max(cube_lat, vec_lat) >= ddr_lat;
-      result.ddr_traffic = ddr_lat;
+      result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit
+      result.compute_bound = std::max(cube_stage, vec_stage) >= ddr_lat;
+      result.ddr_traffic   = ddr_lat;
     } else if (has_matmul_) {
       // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
       // 16-aligned cube tiles have no padding (the op_scale native-128 padding

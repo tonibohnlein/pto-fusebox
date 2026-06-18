@@ -949,7 +949,44 @@ static void test_cube_vector_fusion() {
     std::cout << "    fused=" << f << "  separated=" << (mm + pw)
               << "  (mm=" << mm << " pw=" << pw << ")  cores=" << fr.cores_used << "\n";
     CHECK("FUSE: fused < separated (overlap + one fill)", f < mm + pw);
-    CHECK("FUSE: mixed kernel uses both core pools", fr.cores_used > 24);
+    // Tiling for units: cores_used = 3 per active unit (1 cube + 2 vector).
+    const int eff_units = (fr.num_spatial_tiles < p.num_cube_cores)
+                              ? fr.num_spatial_tiles : p.num_cube_cores;
+    CHECK("FUSE: cores_used = 3 per active unit", fr.cores_used == 3 * eff_units);
+}
+
+// --- mixed kernel tiles for UNITS (1 cube + 2 vector) ------------------------
+// Toni's 4-cube/8-vector example: 4 units of {1 cube + 2 vector}. The output is
+// tiled into regions over units; within a unit the cube streams its region to
+// the 2 vector cores (which split it). An active unit consumes 3 cores, and the
+// vector stage runs on 2 cores per unit (vector_compute / (2·eff_units)).
+static void test_mixed_unit_tiling() {
+    std::cout << "[UNIT] mixed kernel tiles for units (1 cube + 2 vector)\n";
+    Problem p;
+    // C[64,64] = A[K=128,M=64] @ B[N=64,K=128];  D = relu(C).
+    p.tensors = {{128, 64}, {64, 128}, {64, 64}, {64, 64}};  // A, B, C, D
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
+             {OpType::Pointwise, {2}, {3}, 100}};
+    p.fast_memory_capacity = 1 << 24;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p, 4096);
+    p.num_cube_cores = 4;
+    p.num_vector_cores = 8;  // 1:2 ratio -> 4 units of {1 cube + 2 vector}
+    DAG dag = DAG::build(p);
+
+    auto fused = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("UNIT: mixed group builds (4 cube + 8 vector)", (bool)fused);
+    if (!fused) return;
+    auto fr = fused->best_cost();
+    const int eff_units = (fr.num_spatial_tiles < p.num_cube_cores)
+                              ? fr.num_spatial_tiles : p.num_cube_cores;
+    std::cout << "    tiles=" << fr.num_spatial_tiles << " eff_units=" << eff_units
+              << " cores_used=" << fr.cores_used << " lat=" << fr.latency << "\n";
+    CHECK("UNIT: active units <= n_units (= num_cube_cores)", eff_units <= 4);
+    CHECK("UNIT: cores_used = 3 per active unit (1 cube + 2 vector)",
+          fr.cores_used == 3 * eff_units);
 }
 
 static void test_dfs_order() {
@@ -1489,6 +1526,7 @@ static void test_pointwise_stream_explicit() {
 int main() {
     test_subgraph_structure();
     test_cube_vector_fusion();
+    test_mixed_unit_tiling();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
