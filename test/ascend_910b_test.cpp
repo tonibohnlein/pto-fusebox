@@ -1057,14 +1057,14 @@ static void test_mixed_mm_pw_variants() {
     }
 }
 
-// --- mixed-kernel two-pool feasibility + the fuse-vs-separate flip -----------
-// A fused MM->PW needs BOTH on-chip pools at the SHARED tile: cube operand strips
-// + output in L1/L0c, AND the vector tile in UB. A large shared tile that
-// overflows UB is infeasible to fuse. With a tight UB the fused kernel is forced
-// to a small shared tile (high matmul reload) — so in a memory-bound regime
-// SEPARATE (each kernel tiling its own single pool) can beat fusion.
+// --- mixed feasibility: both pools STREAM to fit (cube seq-k, vector chunks) --
+// A fused MM->PW needs both pools, but each streams to fit like its homogeneous
+// counterpart: the cube seq-k-slices the contraction to fit L1, and the vector
+// streams its tile through UB. So a small UB does NOT wall fusion — the PW streams
+// (free, elementwise) — and MM->PW fuses across UB sizes. (The genuine hard
+// constraint is a held cube L1 operand band; see test_mixed_multistage_pebble.)
 static void test_mixed_two_pool_feasibility() {
-    std::cout << "[2POOL] mixed feasibility: L1/L0c AND UB; fuse-vs-separate flip\n";
+    std::cout << "[2POOL] mixed feasibility: vector streams UB, cube seq-k fits L1\n";
     auto mk = [](int64_t ub_bytes) {
         Problem p;
         p.tensors = {{256, 256}, {256, 256}, {256, 256}, {256, 256}};  // A B C D, FP32
@@ -1073,29 +1073,29 @@ static void test_mixed_two_pool_feasibility() {
         p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
-        set_910b(p, 64);  // memory-bound: a UB-forced small tile hurts via operand reload
+        set_910b(p, 64);
         p.l1_capacity = 512 * 1024;
         p.cube_capacity = 128 * 1024;
         p.vec_capacity = ub_bytes;
         return p;
     };
 
-    // --- the UB half of the two-pool check fires on a large shared tile --------
+    // Even a 16KB UB (a 128x128 PW tile is 8x too big to materialize) does NOT make
+    // fusion infeasible — the vector stage streams its tile through UB.
     {
-        Problem p = mk(64 * 1024);  // 64KB UB
+        Problem p = mk(16 * 1024);
         DAG dag = DAG::build(p);
         auto sg = Ascend910BMixed::create(p, dag, {0, 1});
         CHECK("2POOL: mixed group builds", (bool)sg);
         if (!sg) return;
-        // 128x128 vector tile = 2*128*128*4 = 128KB > 64KB UB -> infeasible to fuse.
-        CHECK("2POOL: large shared tile (128x128) overflows UB -> infeasible",
-              !sg->is_feasible(TileConfig{128, 128, 256}));
-        // 64x64 vector tile = 2*64*64*4 = 32KB <= 64KB; cube strips fit L1 -> feasible.
-        CHECK("2POOL: small shared tile (64x64) fits both pools -> feasible",
+        CHECK("2POOL: large shared tile feasible at tiny UB (PW streams)",
+              sg->is_feasible(TileConfig{128, 128, 256}));
+        CHECK("2POOL: small shared tile also feasible",
               sg->is_feasible(TileConfig{64, 64, 256}));
     }
 
-    // --- fuse-vs-separate: roomy UB fuses; tight UB forces separate ------------
+    // MM->PW fuses across UB sizes — the PW streams either way, so the tight UB
+    // costs nothing extra (free for a pointwise) and fuses identically to roomy.
     {
         Problem roomy = mk(256 * 1024), tight = mk(16 * 1024);
         DAG dr = DAG::build(roomy), dt = DAG::build(tight);
@@ -1107,10 +1107,9 @@ static void test_mixed_two_pool_feasibility() {
                   << "  tight-UB fused=" << ft.latency << " tile=" << ft.config.w << "x" << ft.config.h
                   << "  separated=" << (mm + pw) << "\n";
         CHECK("2POOL: roomy UB -> fusion wins", fr.latency < mm + pw);
-        CHECK("2POOL: tight UB forces a smaller shared tile",
-              ft.config.w * ft.config.h < fr.config.w * fr.config.h);
-        CHECK("2POOL: tight UB -> separate beats fusion (small tile, high reload)",
-              ft.latency > mm + pw);
+        CHECK("2POOL: tight UB still fuses (vector streams, no UB wall)", ft.latency < mm + pw);
+        CHECK("2POOL: tight UB fuses identically to roomy (PW stream is free)",
+              std::abs(ft.latency - fr.latency) < 1.0);
     }
 }
 
@@ -1172,13 +1171,15 @@ static void test_mixed_multistage_pebble() {
         auto sg = Ascend910BMixed::create(p, dag, {0, 1, 2});
         CHECK("MSWEEP: MM->PW1->PW2 mixed group builds", (bool)sg);
         if (sg) {
-            // UB at a vector step = T band [w,h] + a transient [w,h] tile = 2*[w,h]*4:
-            //   64x64  -> 2*64*64*4   = 32KB <= 48KB UB -> feasible
-            //   128x64 -> 2*128*64*4  = 64KB >  48KB UB -> infeasible
-            CHECK("MSWEEP: 64x64 fits UB (incl. held T band)",
+            // The held vector->vector T band + transient overflow UB at 128x64
+            // (2*128*64*4 = 64KB > 48KB) when materialized — but the vector stage
+            // STREAMS the tile through UB, so both tiles are feasible. (A held
+            // vector band is relieved by streaming; only a held CUBE L1 operand
+            // band — case (1) — is a hard, un-streamable constraint.)
+            CHECK("MSWEEP: 64x64 fits UB (held T band materializes)",
                   sg->is_feasible(TileConfig{64, 64, 256}));
-            CHECK("MSWEEP: 128x64 infeasible (held T UB band + tile overflow)",
-                  !sg->is_feasible(TileConfig{128, 64, 256}));
+            CHECK("MSWEEP: 128x64 feasible (held T band streams through UB)",
+                  sg->is_feasible(TileConfig{128, 64, 256}));
         }
     }
 }

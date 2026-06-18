@@ -870,12 +870,19 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
   for (size_t t : ephemeral_) {
     int pr = dag_->tensor_producer[t];
     int prod = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
-    int last = prod;
+    // An ephemeral is an L1 OPERAND band only while an in-subgraph MATMUL reads it
+    // (the consumer needs it L1-resident). One consumed only by a VECTOR op (a
+    // cube->vector crossing) is NOT an L1 band — it drains from L0c to the GM ring.
+    // Homogeneous cube: every ephemeral has a matmul consumer, so last_mm == last
+    // consumer and this is unchanged; it only differs inside a mixed group.
+    int last_mm = -1;
     for (auto c : dag_->tensor_consumers[t])
-      if (pos[c] >= 0) last = std::max(last, pos[c]);
+      if (pos[c] >= 0 && prob_->ops[c].type == OpType::MatMul)
+        last_mm = std::max(last_mm, pos[c]);
+    if (last_mm < 0) continue;  // no in-subgraph matmul consumer -> not an L1 band
     int64_t h = std::min(cfg.h, prob_->tensors[t].height);
     int64_t bytes = prob_->tensors[t].width * h * dtype_bytes(prob_->tensors[t].dtype);
-    for (int s = prod; s <= last; ++s) band_at[s] += bytes;
+    for (int s = prod; s <= last_mm; ++s) band_at[s] += bytes;
   }
 
   // Retained (coupling-layer) tensors are full-resident across the subgraph.
@@ -892,18 +899,11 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
     const size_t opi = order[s];
     const Op &op = prob_->ops[opi];
     const int64_t bands = base + band_at[s];
-    if (op.type != OpType::MatMul) {
-      // Non-matmul in a cube subgraph shouldn't occur (unit-homogeneity); count
-      // its boundary-input [w,h] tiles defensively so the sweep stays sound.
-      int64_t strip = 0;
-      for (auto in : op.inputs)
-        if (!ephemeral_.count(in))
-          strip += std::min(cfg.w, prob_->tensors[in].width) *
-                   std::min(cfg.h, prob_->tensors[in].height) *
-                   dtype_bytes(prob_->tensors[in].dtype);
-      peak = std::max(peak, bands + strip);
+    // A VECTOR op does not pressure L1 — it runs on the vector unit (UB). Skip it
+    // from the cube L1 sweep. (Homogeneous cube has no vector ops, so this is never
+    // taken there; it only matters inside a mixed group.)
+    if (op.type != OpType::MatMul)
       continue;
-    }
     const size_t lhs = op.inputs[0], rhs = op.inputs[1];
     const int64_t M_o = prob_->tensors[op.output()].height;
     const int64_t N_o = prob_->tensors[op.output()].width;
@@ -969,16 +969,26 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     return tw * th * dtype_bytes(prob_->tensors[t].dtype);
   };
 
-  // Ephemeral bands resident across [producer, last in-subgraph consumer].
+  // Ephemeral bands resident across [producer, last in-subgraph VECTOR consumer].
+  // A vector->vector ephemeral is a UB band; a CUBE-produced ephemeral (a
+  // cube->vector crossing) is NOT — it streams through the GM ring, so it is only
+  // a transient at the consuming step (below). Homogeneous vector: every ephemeral
+  // is vector-produced and vector-consumed, so is_ub_band == ephemeral and this is
+  // unchanged; it only differs inside a mixed group.
   std::vector<int64_t> band_at(order.size(), 0);
+  std::vector<bool> is_ub_band(prob_->num_tensors(), false);
   for (size_t t : ephemeral_) {
     int pr = dag_->tensor_producer[t];
+    if (pr >= 0 && prob_->ops[(size_t)pr].type == OpType::MatMul) continue;  // crossing
     int prod = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
-    int last = prod;
+    int last_vec = -1;
     for (auto c : dag_->tensor_consumers[t])
-      if (pos[c] >= 0) last = std::max(last, pos[c]);
+      if (pos[c] >= 0 && prob_->ops[c].type != OpType::MatMul)
+        last_vec = std::max(last_vec, pos[c]);
+    if (last_vec < 0) continue;  // no in-subgraph vector consumer -> not a UB band
     const int64_t b = tile_bytes(t);
-    for (int s = prod; s <= last; ++s) band_at[s] += b;
+    for (int s = prod; s <= last_vec; ++s) band_at[s] += b;
+    is_ub_band[t] = true;
   }
 
   // Retained (coupling) tensors resident across the subgraph (disabled on 910B).
@@ -990,12 +1000,15 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   int64_t peak = 0;
   for (int s = 0; s < (int)order.size(); ++s) {
     const Op &op = prob_->ops[order[s]];
+    if (op.type == OpType::MatMul) continue;  // cube op: not in the UB (vector) sweep
     int64_t transient = 0;
-    for (auto in : op.inputs)  // boundary input tiles (ephemerals are bands)
-      if (!ephemeral_.count(in) && !retained_from_prev.count(in) && !retain_these.count(in))
+    // UB-band inputs are already in band_at; a non-band input is a transient tile
+    // (a boundary read, or a crossing tile popped from the GM ring).
+    for (auto in : op.inputs)
+      if (!is_ub_band[in] && !retained_from_prev.count(in) && !retain_these.count(in))
         transient += tile_bytes(in);
-    const size_t o = op.output();  // boundary output tile (resident while written)
-    if (!ephemeral_.count(o) && !retain_these.count(o)) transient += tile_bytes(o);
+    const size_t o = op.output();  // boundary/crossing output tile (resident while written)
+    if (!is_ub_band[o] && !retain_these.count(o)) transient += tile_bytes(o);
     peak = std::max(peak, base + band_at[s] + transient);
   }
   return peak;
@@ -1062,96 +1075,24 @@ bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
 }
 
 bool Ascend910BCost::mixed_fits_on_chip(const TileConfig &cfg,
-                                  const FlatSet<size_t> & /*retained_from_prev*/,
-                                  const FlatSet<size_t> & /*retain_these*/) const {
-  // Unified two-pool pebble sweep over the execution order — the same interval-
-  // overlap as the homogeneous derive_exec (L1) / vector_peak_ub (UB), but the
-  // capacity BOUNDARY switches per op: a cube step is checked against L1, a vector
-  // step against UB. Intermediates stay RED resident bands in their OWN unit's
-  // pool:
-  //   * an ephemeral read by an in-subgraph matmul is an L1 operand band
-  //     ([full_width, h-band]) across its liveness — the binary-tree "keep the
-  //     sibling's red pebble while computing the other branch" case;
-  //   * a vector->vector ephemeral is a UB band ([w,h]).
-  // A CROSSING cube<->vector ephemeral is NOT a resident band: its full extent
-  // sits in the GM ring (DDR), so it only relieves the on-chip bound. Its per-tile
-  // streaming footprint is still charged as a transient at the consuming step (the
-  // popped [w,h] tile in UB; the producing matmul's output tile is charged via the
-  // strip below). L0c output sizing is deferred to the L0 sub-tiling level
-  // (AutoTileMatmulL0), exactly as in the homogeneous cube model — not bounded
-  // here. The DDR roundtrip of every crossing is paid in compute_cost, not here.
-  const double f = prob_->double_buffer ? 0.5 : 1.0;
-  const auto &order = dfs_order_;
-  const int n = (int)order.size();
-  std::vector<int> pos(prob_->num_ops(), -1);
-  for (int i = 0; i < n; ++i) pos[order[i]] = i;
-  auto is_cube = [&](size_t op) { return prob_->ops[op].type == OpType::MatMul; };
-
-  // Red bands by same-unit relationship, charged across their liveness interval.
-  std::vector<int64_t> l1_band(n, 0), ub_band(n, 0);
-  std::vector<bool> is_ub_band(prob_->num_tensors(), false);
-  for (size_t t : ephemeral_) {
-    const int pr = dag_->tensor_producer[t];
-    const int prodpos = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
-    const bool prod_cube = pr >= 0 && is_cube((size_t)pr);
-    int last_cube_use = -1, last_vec_use = -1;
-    for (auto c : dag_->tensor_consumers[t]) {
-      if (pos[c] < 0) continue;
-      if (is_cube(c)) last_cube_use = std::max(last_cube_use, pos[c]);
-      else            last_vec_use  = std::max(last_vec_use,  pos[c]);
-    }
-    if (last_cube_use >= 0) {  // L1 operand band (read by an in-subgraph matmul)
-      const int64_t b = prob_->tensors[t].width *
-                        std::min(cfg.h, prob_->tensors[t].height) *
-                        dtype_bytes(prob_->tensors[t].dtype);
-      for (int s = prodpos; s <= last_cube_use; ++s) l1_band[s] += b;
-    }
-    if (!prod_cube && last_vec_use >= 0) {  // vector->vector UB band
-      const int64_t b = std::min(cfg.w, prob_->tensors[t].width) *
-                        std::min(cfg.h, prob_->tensors[t].height) *
-                        dtype_bytes(prob_->tensors[t].dtype);
-      for (int s = prodpos; s <= last_vec_use; ++s) ub_band[s] += b;
-      is_ub_band[t] = true;
-    }
-  }
-
-  const double l1 = (double)prob_->l1_capacity  * f;
-  const double ub = (double)prob_->vec_capacity * f;
-  for (int s = 0; s < n; ++s) {
-    const size_t opi = order[s];
-    const Op &op = prob_->ops[opi];
-    if (is_cube(opi)) {
-      // L1: resident operand bands + this matmul's minimum 16-fractal operand
-      // strip. An ephemeral operand is itself a band (counted in l1_band, so its
-      // strip contribution is 0); larger k is a cost lever, not a feasibility one.
-      const size_t lhs = op.inputs[0], rhs = op.inputs[1];
-      const int64_t h = std::min(cfg.h, prob_->tensors[op.output()].height);
-      const int64_t w = std::min(cfg.w, prob_->tensors[op.output()].width);
-      const int64_t lhs_b = ephemeral_.count(lhs) ? 0 : dtype_bytes(prob_->tensors[lhs].dtype);
-      const int64_t rhs_b = ephemeral_.count(rhs) ? 0 : dtype_bytes(prob_->tensors[rhs].dtype);
-      const double strip16 = ((double)lhs_b * (double)h + (double)rhs_b * (double)w) * 16.0;
-      if (prob_->l1_capacity > 0 && (double)l1_band[s] + strip16 > l1)
-        return false;
-    } else {  // vector step
-      // UB: resident vector->vector bands + transient tiles. A boundary input, or
-      // a crossing tile popped from the ring, is a transient [w,h] tile; a
-      // vector->vector band is already in ub_band (skip to avoid double counting).
-      int64_t transient = 0;
-      for (auto in : op.inputs)
-        if (!is_ub_band[in])
-          transient += std::min(cfg.w, prob_->tensors[in].width) *
-                       std::min(cfg.h, prob_->tensors[in].height) *
-                       dtype_bytes(prob_->tensors[in].dtype);
-      const size_t o = op.output();
-      if (!is_ub_band[o])
-        transient += std::min(cfg.w, prob_->tensors[o].width) *
-                     std::min(cfg.h, prob_->tensors[o].height) *
-                     dtype_bytes(prob_->tensors[o].dtype);
-      if (prob_->vec_capacity > 0 && (double)ub_band[s] + (double)transient > ub)
-        return false;
-    }
-  }
-  return true;
+                                  const FlatSet<size_t> &retained_from_prev,
+                                  const FlatSet<size_t> &retain_these) const {
+  // Two-pool feasibility for a mixed cube+vector kernel — REUSE the homogeneous
+  // single-core streams, now that both are affinity-aware (each skips the other
+  // unit's ops, and treats a cube↔vector crossing as ring-streamed, not a resident
+  // band):
+  //   * CUBE stage — derive_exec sweeps the L1 operand bands and derives each
+  //     matmul's per-op SEQ-K (slicing the contraction to fit L1). A held
+  //     cube→cube intermediate is an L1 band; a crossing matmul output drains
+  //     L0c→ring (not an L1 band); vector ops are skipped. L0c output sizing is
+  //     deferred to AutoTileMatmulL0, as in the homogeneous cube.
+  //   * VECTOR stage — vector_stream streams the [w,h] tile through UB in chunks
+  //     (down to a min-chunk; free for a pointwise, recompute-costed only for a
+  //     reduction). A held vector→vector intermediate is a UB band; a crossing tile
+  //     popped from the ring is a transient; cube ops are skipped.
+  // The crossing's DDR roundtrip is paid in compute_cost, not in feasibility.
+  return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) != INT64_MAX &&
+         vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -1617,6 +1558,14 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     const int64_t rounds = (num_tiles + n_units_i - 1) / n_units_i;
     result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
   }
+
+  // Emitted per-core cube k: the single-core seq-k derived for the sink matmul
+  // (same derivation as the homogeneous cube), so the lowered kernel and the
+  // visualised tile carry the real contraction chunk, not the candidate cfg.k.
+  std::vector<int64_t> pk;
+  derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
+  if (sink_mm_op_ >= 0 && (size_t)sink_mm_op_ < pk.size() && pk[sink_mm_op_] > 0)
+    result.config.k = pk[sink_mm_op_];
   return result;
 }
 
