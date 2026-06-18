@@ -914,6 +914,44 @@ static void test_subgraph_structure() {
     }
 }
 
+// --- cube+vector fusion: the Ascend910BMixed model ---------------------------
+// MM -> PW (C=A@B, D=relu(C)). The homogeneous Ascend910BCost rejects the mixed
+// group (unit-homogeneity); Ascend910BMixed permits it and the fused cost beats
+// running the two kernels separately — the cube and vector pools overlap (the
+// DDR roundtrip latency is hidden) and only one kernel fill is paid. The two
+// models differ ONLY in admissibility; a pure cube or pure vector group costs
+// identically under both.
+static void test_cube_vector_fusion() {
+    std::cout << "[FUSE] cube+vector fusion — Ascend910BMixed model\n";
+    Problem p;
+    // C[N=256,M=256] = A[K=512,M=256] @ B[N=256,K=512];  D = relu(C).
+    p.tensors = {{512, 256}, {256, 512}, {256, 256}, {256, 256}};  // A, B, C, D
+    p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
+             {OpType::Pointwise, {2}, {3}, 100}};
+    p.fast_memory_capacity = 1 << 26;
+    p.slow_memory_bandwidth = 10;
+    p.native_w = 128;
+    p.native_h = 128;
+    set_910b(p, 4096);  // compute-bound matmul so the overlap is the lever
+    DAG dag = DAG::build(p);
+
+    // Homogeneous model rejects the mixed group; the mixed model builds it.
+    CHECK("FUSE: homogeneous model rejects mixed group",
+          !Subgraph::create(p, dag, {0, 1}).has_value());
+    auto fused = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("FUSE: Ascend910BMixed builds the mixed group", (bool)fused);
+    if (!fused) return;
+    auto fr = fused->best_cost();
+    double f = fr.latency;
+    // Pure groups: identical cost under either model (the mixed branch is unreached).
+    double mm = Subgraph::create(p, dag, {0})->best_cost().latency;
+    double pw = Subgraph::create(p, dag, {1})->best_cost().latency;
+    std::cout << "    fused=" << f << "  separated=" << (mm + pw)
+              << "  (mm=" << mm << " pw=" << pw << ")  cores=" << fr.cores_used << "\n";
+    CHECK("FUSE: fused < separated (overlap + one fill)", f < mm + pw);
+    CHECK("FUSE: mixed kernel uses both core pools", fr.cores_used > 24);
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1450,6 +1488,7 @@ static void test_pointwise_stream_explicit() {
 
 int main() {
     test_subgraph_structure();
+    test_cube_vector_fusion();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();

@@ -39,8 +39,14 @@
 class Ascend910BCost {
 public:
   // Factory: returns nullopt if ops don't form a valid subgraph.
+  //
+  // allow_mixed relaxes unit-homogeneity to permit a fused CUBE+VECTOR group.
+  // The base model leaves it false (homogeneous); Ascend910BMixed passes true.
+  // It is the ONLY behavioural difference between the two models — the cost of a
+  // mixed group, when one is built, is the shared compute_cost mixed branch.
   static std::optional<Ascend910BCost> create(const Problem &prob, const DAG &dag,
-                                              std::vector<size_t> op_indices);
+                                              std::vector<size_t> op_indices,
+                                              bool allow_mixed = false);
 
   // --- Accessors ---
 
@@ -199,7 +205,10 @@ private:
   std::vector<size_t> pw_produced_ephemerals_;
 
   int64_t out_W_ = 0, out_H_ = 0;
-  bool has_matmul_ = false;
+  bool has_matmul_ = false;   // group has ≥1 CUBE (matmul) op
+  bool has_vector_ = false;   // group has ≥1 VECTOR (pointwise/reduction) op.
+                              // has_matmul_ && has_vector_ ⇒ a MIXED kernel
+                              // (allowed only when Problem::fuse_cube_vector).
   // 910B reduction (vector): a Reduction couples its reduced axis (the whole
   // row/col must be present to reduce it), so the tile spans the FULL reduced
   // dim and only the non-reduced dim is tiled for spatial parallelism. The
@@ -341,3 +350,34 @@ private:
 // assertion is missing part of the contract.
 static_assert(CostModel<Ascend910BCost>,
               "Ascend910BCost must model the CostModel interface");
+
+// ============================================================================
+// Ascend910BMixed — the 910B cost model that ALSO permits fused cube+vector
+// kernels (mixed groups), streaming the cube↔vector handoff through DDR so the
+// roundtrip latency is hidden behind the cube∥vector overlap.
+//
+// It differs from the homogeneous Ascend910BCost in exactly ONE thing:
+// admissibility. create() allows a cube+vector group instead of rejecting it.
+// Everything else — tiling, feasibility, and the cost of any given group
+// (including the mixed branch of compute_cost) — is inherited unchanged. The
+// base model is therefore left exactly as it is; selecting this model (via the
+// `Subgraph` alias in subgraph.h) is the compile-time opt-in to fusion.
+// ============================================================================
+class Ascend910BMixed : public Ascend910BCost {
+ public:
+  static std::optional<Ascend910BMixed> create(const Problem &prob, const DAG &dag,
+                                               std::vector<size_t> op_indices) {
+    auto base = Ascend910BCost::create(prob, dag, std::move(op_indices),
+                                       /*allow_mixed=*/true);
+    if (!base) return std::nullopt;
+    return Ascend910BMixed(std::move(*base));
+  }
+
+ private:
+  // Adds no state of its own — it is an Ascend910BCost built with mixed groups
+  // admitted, so it slices up from a fully-built base.
+  explicit Ascend910BMixed(Ascend910BCost base) : Ascend910BCost(std::move(base)) {}
+};
+
+static_assert(CostModel<Ascend910BMixed>,
+              "Ascend910BMixed must model the CostModel interface");
