@@ -1089,87 +1089,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   // floor (one HBM) that does not divide.
   const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
   {
-    if (has_matmul_ && has_vector_) {
-      // ===== MIXED cube+vector kernel — 910B DDR-streamed, latency hidden =====
-      // Enabled by Problem::fuse_cube_vector. Cube ops run on the cube pool and
-      // vector ops on the vector pool CONCURRENTLY. A cube↔vector intermediate
-      // cannot stay on chip (910B has no direct Acc→Vec pipe), so it ROUND-TRIPS
-      // DDR — written by the producing unit, read by the consuming unit (2x). That
-      // traffic is unavoidable, but the two stages OVERLAP (the cube streams output
-      // tiles into DDR while the vector cores consume already-written tiles), so
-      // the roundtrip LATENCY is hidden behind the slower stage. The kernel tiles
-      // for UNITS (1 cube + 2 vector; see below):
-      //   lat = fill + max(cube_compute/eff_units, vector_compute/(2·eff_units), ddr·inv_B)
-      // plus ONE kernel fill (added by the shared block below). Compare the
-      // SEPARATED cost (two kernels): [fill+max(cube,ddr_c)] + [fill+max(vec,ddr_v)]
-      // — fusion saves the overlap (max vs sum) and one fill; the DDR total is the
-      // same on 910B (the intermediate round-trips either way). A future 950 makes
-      // the handoff direct (the crossing intermediate avoids DDR) — same formula,
-      // cheaper ddr term.
-      double cube_compute = 0.0, vector_compute = 0.0;
-      for (auto i : ops_) {
-        const auto& op = prob_->ops[i];
-        if (op.type == OpType::MatMul) {
-          const size_t o = op.output();
-          const int64_t Km = prob_->tensors[op.inputs[0]].width;  // contraction
-          const double fractals = (double)((prob_->tensors[o].width + 15) / 16) *
-                                  (double)((prob_->tensors[o].height + 15) / 16) *
-                                  (double)((Km + 15) / 16);
-          cube_compute += fractals * (double)std::max<int64_t>(prob_->cube_compute_cost, 1);
-        } else {  // Pointwise / Reduction — element work, lane-stepped, tile-invariant
-          int64_t elems = (int64_t)prob_->tensors[op.output()].width *
-                          prob_->tensors[op.output()].height;
-          for (auto t : op.inputs)
-            elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-          const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
-          vector_compute += (double)((elems + lanes - 1) / lanes) *
-                            (double)std::max<int64_t>(prob_->vector_compute_cost, 1);
-        }
-      }
-      // DDR traffic: boundary inputs (read) + boundary outputs (written) + every
-      // cube↔vector-crossing intermediate round-tripped (write + read = 2x). An
-      // ephemeral produced and consumed within the SAME unit stays on chip (free);
-      // only a unit-crossing one hits DDR.
-      double ddr_bytes = 0.0;
-      for (const auto& info : boundary_tensor_info_) {
-        const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
-        if (!info.is_internally_produced) ddr_bytes += bytes;  // boundary input (read)
-        if (info.is_boundary_out)         ddr_bytes += bytes;  // boundary output (write)
-      }
-      FlatSet<size_t> in_sg(ops_.begin(), ops_.end());
-      for (auto t : ephemeral_) {
-        const int prod = dag_->tensor_producer[t];
-        const bool prod_cube = prod >= 0 && prob_->ops[(size_t)prod].type == OpType::MatMul;
-        bool crosses = false;
-        for (auto c : dag_->tensor_consumers[t])
-          if (in_sg.count(c) && (prob_->ops[c].type == OpType::MatMul) != prod_cube) {
-            crosses = true; break;
-          }
-        if (crosses)
-          ddr_bytes += 2.0 * (double)(prob_->tensors[t].width * prob_->tensors[t].height) *
-                       dtype_bytes(prob_->tensors[t].dtype);
-      }
-      // Tiling for UNITS. With the fixed 1:2 cube:vector ratio, a mixed kernel's
-      // atomic resource is a UNIT = 1 cube + 2 vector cores (the 950 mix-cluster;
-      // on 910B the same ratio + the GM ring). The output regions tile over
-      // n_units = num_cube_cores; WITHIN a unit the cube and its 2 vector cores are
-      // pipeline STAGES (not a finer output grid), so the two stage times divide by
-      // 1 and 2 cores per unit:
-      //   cube_stage   = cube_compute   / eff_units        (1 cube / unit)
-      //   vector_stage = vector_compute / (2 · eff_units)  (2 vectors / unit)
-      // DDR is the shared floor (sat≈1: a mixed kernel issues DMA from both stages,
-      // so HBM saturates easily — refine later).
-      const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
-      const double eff_units   = std::min((double)num_tiles, n_units);
-      const double cube_stage  = cube_compute   / eff_units;
-      const double vec_stage   = vector_compute / (2.0 * eff_units);
-      const double ddr_lat     = ddr_bytes * inv_B;
-      result.latency       = std::max({cube_stage, vec_stage, ddr_lat});
-      result.parallel_split = 1;
-      result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit
-      result.compute_bound = std::max(cube_stage, vec_stage) >= ddr_lat;
-      result.ddr_traffic   = ddr_lat;
-    } else if (has_matmul_) {
+    if (has_matmul_) {
       // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
       // 16-aligned cube tiles have no padding (the op_scale native-128 padding
       // is a single-level competition artifact that belongs at the L0 fractal,
@@ -1463,6 +1383,115 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
     }
   }
 
+  return result;
+}
+
+// ============================================================================
+// Ascend910BMixed — the third subgraph type: a fused cube+vector mixed kernel.
+// Cube-only and vector-only groups delegate to the (unchanged) base cost; only
+// the mixed type is added here.
+// ============================================================================
+
+CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
+                                         const FlatSet<size_t> &retained_from_prev,
+                                         const FlatSet<size_t> &retain_these) const {
+  // The two homogeneous types are identical to the base model.
+  if (!(has_matmul_ && has_vector_))
+    return Ascend910BCost::compute_cost(cfg, retained_from_prev, retain_these);
+
+  // ===== MIXED cube+vector kernel — 910B DDR-streamed, latency hidden =====
+  // Cube ops run on the cube pool and vector ops on the vector pool CONCURRENTLY.
+  // A cube↔vector intermediate cannot stay on chip (910B has no direct Acc→Vec
+  // pipe), so it ROUND-TRIPS DDR — written by the producing unit, read by the
+  // consuming unit (2x). That traffic is unavoidable, but the two stages OVERLAP
+  // (the cube streams output tiles into DDR while the vector cores consume
+  // already-written tiles), so the roundtrip LATENCY is hidden behind the slower
+  // stage. The kernel tiles for UNITS (1 cube + 2 vector):
+  //   lat = fill + max(cube_compute/eff_units, vector_compute/(2·eff_units), ddr·inv_B)
+  // Compare the SEPARATED two-kernel cost (fusion saves the overlap + one fill;
+  // the DDR total is the same on 910B). A future 950 makes the handoff direct
+  // (the crossing intermediate avoids DDR) — same formula, cheaper ddr term.
+  CostResult result;
+  result.config = cfg;
+  if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
+    return result;
+  result.feasible = true;
+
+  const double inv_B = 1.0 / (double)prob_->slow_memory_bandwidth;
+  const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
+  const int num_th = std::max((int)(out_H_ / cfg.h), 1);
+  const int num_tiles = num_tw * num_th;
+  result.num_spatial_tiles = num_tiles;
+  result.num_k_passes = std::max((int)(output_K_ / cfg.k), 1);
+
+  double cube_compute = 0.0, vector_compute = 0.0;
+  for (auto i : ops_) {
+    const auto& op = prob_->ops[i];
+    if (op.type == OpType::MatMul) {
+      const size_t o = op.output();
+      const int64_t Km = prob_->tensors[op.inputs[0]].width;  // contraction
+      const double fractals = (double)((prob_->tensors[o].width + 15) / 16) *
+                              (double)((prob_->tensors[o].height + 15) / 16) *
+                              (double)((Km + 15) / 16);
+      cube_compute += fractals * (double)std::max<int64_t>(prob_->cube_compute_cost, 1);
+    } else {  // Pointwise / Reduction — element work, lane-stepped, tile-invariant
+      int64_t elems = (int64_t)prob_->tensors[op.output()].width *
+                      prob_->tensors[op.output()].height;
+      for (auto t : op.inputs)
+        elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
+      const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
+      vector_compute += (double)((elems + lanes - 1) / lanes) *
+                        (double)std::max<int64_t>(prob_->vector_compute_cost, 1);
+    }
+  }
+
+  // DDR traffic: boundary inputs (read) + boundary outputs (written) + every
+  // cube↔vector-crossing intermediate round-tripped (write + read = 2x). An
+  // ephemeral produced and consumed within the SAME unit stays on chip (free);
+  // only a unit-crossing one hits DDR (the off-chip GM ring buffer).
+  double ddr_bytes = 0.0;
+  for (const auto& info : boundary_tensor_info_) {
+    const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
+    if (!info.is_internally_produced) ddr_bytes += bytes;  // boundary input (read)
+    if (info.is_boundary_out)         ddr_bytes += bytes;  // boundary output (write)
+  }
+  FlatSet<size_t> in_sg(ops_.begin(), ops_.end());
+  for (auto t : ephemeral_) {
+    const int prod = dag_->tensor_producer[t];
+    const bool prod_cube = prod >= 0 && prob_->ops[(size_t)prod].type == OpType::MatMul;
+    bool crosses = false;
+    for (auto c : dag_->tensor_consumers[t])
+      if (in_sg.count(c) && (prob_->ops[c].type == OpType::MatMul) != prod_cube) {
+        crosses = true; break;
+      }
+    if (crosses)
+      ddr_bytes += 2.0 * (double)(prob_->tensors[t].width * prob_->tensors[t].height) *
+                   dtype_bytes(prob_->tensors[t].dtype);
+  }
+
+  // Tiling for UNITS. With the fixed 1:2 cube:vector ratio, the atomic resource
+  // is a UNIT = 1 cube + 2 vector cores (the 950 mix-cluster; on 910B the same
+  // ratio + the GM ring). Regions tile over n_units = num_cube_cores; WITHIN a
+  // unit the cube and its 2 vector cores are pipeline STAGES (not a finer output
+  // grid), so the stage times divide by 1 and 2 cores per unit. DDR is the shared
+  // floor (sat≈1: a mixed kernel issues DMA from both stages — refine later).
+  const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
+  const double eff_units  = std::min((double)num_tiles, n_units);
+  const double cube_stage = cube_compute   / eff_units;
+  const double vec_stage  = vector_compute / (2.0 * eff_units);
+  const double ddr_lat    = ddr_bytes * inv_B;
+  result.latency       = std::max({cube_stage, vec_stage, ddr_lat});
+  result.parallel_split = 1;
+  result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit
+  result.compute_bound = std::max(cube_stage, vec_stage) >= ddr_lat;
+  result.ddr_traffic   = ddr_lat;
+
+  // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)).
+  if (prob_->kernel_fill_cost > 0) {
+    const int64_t n_units_i = std::max<int64_t>(1, prob_->num_cube_cores);
+    const int64_t rounds = (num_tiles + n_units_i - 1) / n_units_i;
+    result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
+  }
   return result;
 }
 

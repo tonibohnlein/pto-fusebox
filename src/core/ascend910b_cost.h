@@ -158,9 +158,11 @@ public:
 
   // --- Cost evaluation ---
 
-  CostResult compute_cost(const TileConfig &cfg,
-                          const FlatSet<size_t> &retained_from_prev = {},
-                          const FlatSet<size_t> &retain_these = {}) const;
+  // Cost of one (cube-only or vector-only) subgraph. virtual so Ascend910BMixed
+  // can add the third (mixed cube+vector) type; best_cost dispatches through it.
+  virtual CostResult compute_cost(const TileConfig &cfg,
+                                  const FlatSet<size_t> &retained_from_prev = {},
+                                  const FlatSet<size_t> &retain_these = {}) const;
 
   // --- Parameter enumeration ---
 
@@ -170,7 +172,11 @@ public:
 
   Ascend910BCost() = default;
 
-private:
+  // Polymorphic base (Ascend910BMixed derives). Cost models are value types
+  // (stored by value in ScheduleStep, never deleted via a base pointer), so no
+  // virtual destructor is needed; the implicit copy/move carry the vptr.
+
+protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
   //   vector: tile + ephemerals fit UB (vec_capacity)
@@ -372,6 +378,12 @@ class Ascend910BMixed : public Ascend910BCost {
     if (!base) return std::nullopt;
     return Ascend910BMixed(std::move(*base));
   }
+
+  // The third subgraph type: a fused cube+vector mixed kernel. Cube-only and
+  // vector-only groups delegate to the (shared, unchanged) base cost.
+  CostResult compute_cost(const TileConfig &cfg,
+                          const FlatSet<size_t> &retained_from_prev = {},
+                          const FlatSet<size_t> &retain_these = {}) const override;
 
  private:
   // Adds no state of its own — it is an Ascend910BCost built with mixed groups
