@@ -1114,6 +1114,75 @@ static void test_mixed_two_pool_feasibility() {
     }
 }
 
+// --- mixed pebble SWEEP charges held same-unit bands (multi-stage) -----------
+// The per-op check saw each op alone; the interval-overlap sweep charges an
+// intermediate that stays resident across later ops. (1) MM1->MM2->PW: T1=A@B is
+// MM2's operand, so it is a held L1 band during MM2 (large h overflows L1).
+// (2) MM->PW1->PW2: T=relu(C) is a vector->vector UB band held into PW2.
+static void test_mixed_multistage_pebble() {
+    std::cout << "[MSWEEP] mixed pebble sweep charges held same-unit bands\n";
+
+    // (1) Cube L1 band: T1=A@B feeds MM2 as an operand -> L1-resident band.
+    {
+        Problem p;
+        // A[K1,M] B[N1,K1] -> T1[N1,M];  T1[N1,M] D[N2,N1] -> C[N2,M];  E=relu(C).
+        p.tensors = {{256, 256}, {1024, 256}, {1024, 256}, {256, 1024}, {256, 256}, {256, 256}};
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},   // T1 = A @ B
+                 {OpType::MatMul, {2, 3}, {4}, 1000},   // C  = T1 @ D
+                 {OpType::Pointwise, {4}, {5}, 100}};   // E  = relu(C)
+        p.fast_memory_capacity = 1 << 26;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p, 64);
+        p.l1_capacity = 512 * 1024;
+        p.cube_capacity = 128 * 1024;
+        p.vec_capacity = 192 * 1024;
+        DAG dag = DAG::build(p);
+        auto sg = Ascend910BMixed::create(p, dag, {0, 1, 2});
+        CHECK("MSWEEP: MM1->MM2->PW mixed group builds", (bool)sg);
+        if (sg) {
+            // T1 L1 band = T1.width(1024) * min(cfg.h,256) * 4:
+            //   h=16  -> 1024*16*4  = 64KB     (+ strips) <= 512KB L1 -> feasible
+            //   h=128 -> 1024*128*4 = 512KB    (+ strips) >  512KB L1 -> infeasible
+            CHECK("MSWEEP: small h fits (held T1 L1 band small)",
+                  sg->is_feasible(TileConfig{128, 16, 1024}));
+            CHECK("MSWEEP: large h infeasible (held T1 L1 band overflows L1)",
+                  !sg->is_feasible(TileConfig{128, 128, 1024}));
+        }
+    }
+
+    // (2) Vector->vector UB band: T=relu(C) feeds PW2 -> UB-resident band.
+    {
+        Problem p;
+        // A[K,M] B[N,K] -> C[N,M];  T=relu(C);  D=gelu(T).  N=M=K=256.
+        p.tensors = {{256, 256}, {256, 256}, {256, 256}, {256, 256}, {256, 256}};
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},   // C = A @ B
+                 {OpType::Pointwise, {2}, {3}, 100},    // T = relu(C)
+                 {OpType::Pointwise, {3}, {4}, 100}};   // D = gelu(T)
+        p.fast_memory_capacity = 1 << 26;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p, 64);
+        p.l1_capacity = 512 * 1024;
+        p.cube_capacity = 128 * 1024;
+        p.vec_capacity = 48 * 1024;  // tight UB
+        DAG dag = DAG::build(p);
+        auto sg = Ascend910BMixed::create(p, dag, {0, 1, 2});
+        CHECK("MSWEEP: MM->PW1->PW2 mixed group builds", (bool)sg);
+        if (sg) {
+            // UB at a vector step = T band [w,h] + a transient [w,h] tile = 2*[w,h]*4:
+            //   64x64  -> 2*64*64*4   = 32KB <= 48KB UB -> feasible
+            //   128x64 -> 2*128*64*4  = 64KB >  48KB UB -> infeasible
+            CHECK("MSWEEP: 64x64 fits UB (incl. held T band)",
+                  sg->is_feasible(TileConfig{64, 64, 256}));
+            CHECK("MSWEEP: 128x64 infeasible (held T UB band + tile overflow)",
+                  !sg->is_feasible(TileConfig{128, 64, 256}));
+        }
+    }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1654,6 +1723,7 @@ int main() {
     test_mixed_unit_tiling();
     test_mixed_mm_pw_variants();
     test_mixed_two_pool_feasibility();
+    test_mixed_multistage_pebble();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
