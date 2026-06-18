@@ -18,7 +18,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Override with e.g. SOLVER=$ROOT/build/mlsys_mixed to render fused mixed kernels.
 SOLVER="${SOLVER:-$ROOT/build/mlsys}"
 OUT="$ROOT/fusion_dag"
-NAME="$(basename "$INSTANCE" .json)"
+# Override the output basename with OUTNAME= to render the same instance under a
+# distinct name (e.g. OUTNAME=910b-ffn-b128-mixed with SOLVER=.../mlsys_mixed).
+NAME="${OUTNAME:-$(basename "$INSTANCE" .json)}"
 mkdir -p "$OUT"
 
 [[ -x "$SOLVER" ]] || { echo "ERROR: $SOLVER not built (cd build && cmake --build . -j)"; exit 1; }

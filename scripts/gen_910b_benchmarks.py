@@ -116,3 +116,12 @@ emit("mixed-mm-pw-compute", *mm_pw, cube_compute_cost=4096)
 # reload blows up, so the mixed solver picks SEPARATE over fusion — the
 # fuse-vs-separate decision driven by the on-chip memory size.
 emit("mixed-mm-pw-tight-ub", *mm_pw, cube_compute_cost=64, vec_capacity=16384)
+# 2-layer MLP: X@W1 -> relu -> @W2 -> relu -> @W3.  Each matmul fuses its relu
+# epilogue (mixed kernel); the final matmul has no epilogue.
+emit("mixed-mlp",
+     [(512, 128), (2048, 512), (2048, 128), (2048, 128),   # X W1 H1 A1=relu(H1)
+      (512, 2048), (512, 128), (512, 128),                 # W2 H2 A2=relu(H2)
+      (2048, 512), (2048, 128)],                           # W3 Y
+     [(MM, [0, 1], [2]), (PW, [2], [3]),
+      (MM, [3, 4], [5]), (PW, [5], [6]),
+      (MM, [6, 7], [8])], cube_compute_cost=64)
