@@ -187,6 +187,18 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                     const FlatSet<size_t> &retained_from_prev,
                     const FlatSet<size_t> &retain_these) const;
 
+  // Two-pool feasibility for a MIXED cube+vector kernel (used by
+  // Ascend910BMixed). A fused mixed kernel needs BOTH on-chip pools live at once:
+  // the cube stage's matmul operand strips fit L1 and its output tile fits L0c,
+  // AND the vector stage's tile working set fits UB. (The crossing intermediate
+  // lives in L0c on the cube side and UB on the vector side, joined by the
+  // off-chip GM ring — it is not an L1/UB resident band.) This is the constraint
+  // that can make a fusion infeasible at a large shared tile where the separate
+  // kernels — each tiling for its own single pool — both fit.
+  bool mixed_fits_on_chip(const TileConfig &cfg,
+                          const FlatSet<size_t> &retained_from_prev,
+                          const FlatSet<size_t> &retain_these) const;
+
   // Engine behind cube_peak_l1(): sweep the execution order, accumulate live
   // intermediate-band bytes, derive each matmul's per-op k against the headroom,
   // return the peak L1 bytes (INT64_MAX if infeasible). sink_K_eff is the sink

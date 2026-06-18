@@ -1040,6 +1040,12 @@ Ascend910BCost::VecStream Ascend910BCost::vector_stream(const TileConfig &cfg,
 bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
                             const FlatSet<size_t> &retained_from_prev,
                             const FlatSet<size_t> &retain_these) const {
+  // Mixed cube+vector group (only Ascend910BMixed builds one): needs BOTH pools.
+  // Shared here so is_feasible() and the mixed compute_cost agree. The base model
+  // never admits a mixed group, so it never reaches this branch.
+  if (has_matmul_ && has_vector_)
+    return mixed_fits_on_chip(cfg, retained_from_prev, retain_these);
+
   const bool cube = has_matmul_;
   // Cube: dynamic peak L1 over the execution order (live intermediate bands +
   // per-op-k-sized operand strips), NOT a static sum of all operand strips. The
@@ -1053,6 +1059,59 @@ bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
 
   // Vector: feasible iff the subgraph materializes OR streams to fit UB.
   return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
+}
+
+bool Ascend910BCost::mixed_fits_on_chip(const TileConfig &cfg,
+                                  const FlatSet<size_t> & /*retained_from_prev*/,
+                                  const FlatSet<size_t> & /*retain_these*/) const {
+  const double f = prob_->double_buffer ? 0.5 : 1.0;
+
+  // --- Cube pool: each matmul's output tile fits L0c, operand strips fit L1. ---
+  // The matmul output is the crossing intermediate: it accumulates in L0c then
+  // drains to the GM ring (it is NOT an L1 band here). L1 must hold at least one
+  // 16-fractal operand strip (A[16,h] + B[w,16]); larger k is a cost lever, not a
+  // feasibility one. (v0: per-matmul strips only — a chained mixed group's
+  // same-unit cube intermediate band is a later refinement.)
+  for (auto i : ops_) {
+    if (prob_->ops[i].type != OpType::MatMul) continue;
+    const size_t o = prob_->ops[i].output();
+    const int64_t w = std::min(cfg.w, prob_->tensors[o].width);
+    const int64_t h = std::min(cfg.h, prob_->tensors[o].height);
+    if (prob_->cube_capacity > 0 &&
+        (double)(w * h * dtype_bytes(prob_->tensors[o].dtype)) > (double)prob_->cube_capacity * f)
+      return false;  // output tile overflows L0c
+    const size_t lhs = prob_->ops[i].inputs[0], rhs = prob_->ops[i].inputs[1];
+    const double strip16 = ((double)dtype_bytes(prob_->tensors[lhs].dtype) * (double)h +
+                            (double)dtype_bytes(prob_->tensors[rhs].dtype) * (double)w) * 16.0;
+    if (prob_->l1_capacity > 0 && strip16 > (double)prob_->l1_capacity * f)
+      return false;  // not even one 16-fractal operand strip fits L1
+  }
+
+  // --- Vector pool: the PW stage's tile working set fits UB. ---
+  // Peak simultaneously-live vector tiles per op: its inputs (the crossing tile
+  // popped from the ring + any boundary inputs) + its output, all at [w,h].
+  // (v0: per-op peak — a vector→vector chain's resident band is a later
+  // refinement; no implicit cube→vector streaming modelled yet, so UB must hold
+  // the whole [w,h] vector tile.)
+  if (prob_->vec_capacity > 0) {
+    int64_t peak = 0;
+    for (auto i : ops_) {
+      if (prob_->ops[i].type == OpType::MatMul) continue;
+      int64_t live = 0;
+      for (auto in : prob_->ops[i].inputs)
+        live += std::min(cfg.w, prob_->tensors[in].width) *
+                std::min(cfg.h, prob_->tensors[in].height) *
+                dtype_bytes(prob_->tensors[in].dtype);
+      const size_t o = prob_->ops[i].output();
+      live += std::min(cfg.w, prob_->tensors[o].width) *
+              std::min(cfg.h, prob_->tensors[o].height) *
+              dtype_bytes(prob_->tensors[o].dtype);
+      peak = std::max(peak, live);
+    }
+    if ((double)peak > (double)prob_->vec_capacity * f)
+      return false;  // vector tile overflows UB
+  }
+  return true;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -1422,6 +1481,10 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // (the crossing intermediate avoids DDR) — same formula, cheaper ddr term.
   CostResult result;
   result.config = cfg;
+  // Mixed kernels need BOTH on-chip pools (L1/L0c for the cube stage, UB for the
+  // vector stage) — fits_on_chip dispatches to mixed_fits_on_chip here. A large
+  // shared tile that overflows UB is infeasible to fuse even when the separate
+  // kernels each fit their one pool.
   if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
     return result;
   result.feasible = true;

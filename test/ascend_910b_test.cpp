@@ -1057,6 +1057,63 @@ static void test_mixed_mm_pw_variants() {
     }
 }
 
+// --- mixed-kernel two-pool feasibility + the fuse-vs-separate flip -----------
+// A fused MM->PW needs BOTH on-chip pools at the SHARED tile: cube operand strips
+// + output in L1/L0c, AND the vector tile in UB. A large shared tile that
+// overflows UB is infeasible to fuse. With a tight UB the fused kernel is forced
+// to a small shared tile (high matmul reload) — so in a memory-bound regime
+// SEPARATE (each kernel tiling its own single pool) can beat fusion.
+static void test_mixed_two_pool_feasibility() {
+    std::cout << "[2POOL] mixed feasibility: L1/L0c AND UB; fuse-vs-separate flip\n";
+    auto mk = [](int64_t ub_bytes) {
+        Problem p;
+        p.tensors = {{256, 256}, {256, 256}, {256, 256}, {256, 256}};  // A B C D, FP32
+        p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}, {OpType::Pointwise, {2}, {3}, 100}};
+        p.fast_memory_capacity = 1 << 26;
+        p.slow_memory_bandwidth = 10;
+        p.native_w = 128;
+        p.native_h = 128;
+        set_910b(p, 64);  // memory-bound: a UB-forced small tile hurts via operand reload
+        p.l1_capacity = 512 * 1024;
+        p.cube_capacity = 128 * 1024;
+        p.vec_capacity = ub_bytes;
+        return p;
+    };
+
+    // --- the UB half of the two-pool check fires on a large shared tile --------
+    {
+        Problem p = mk(64 * 1024);  // 64KB UB
+        DAG dag = DAG::build(p);
+        auto sg = Ascend910BMixed::create(p, dag, {0, 1});
+        CHECK("2POOL: mixed group builds", (bool)sg);
+        if (!sg) return;
+        // 128x128 vector tile = 2*128*128*4 = 128KB > 64KB UB -> infeasible to fuse.
+        CHECK("2POOL: large shared tile (128x128) overflows UB -> infeasible",
+              !sg->is_feasible(TileConfig{128, 128, 256}));
+        // 64x64 vector tile = 2*64*64*4 = 32KB <= 64KB; cube strips fit L1 -> feasible.
+        CHECK("2POOL: small shared tile (64x64) fits both pools -> feasible",
+              sg->is_feasible(TileConfig{64, 64, 256}));
+    }
+
+    // --- fuse-vs-separate: roomy UB fuses; tight UB forces separate ------------
+    {
+        Problem roomy = mk(256 * 1024), tight = mk(16 * 1024);
+        DAG dr = DAG::build(roomy), dt = DAG::build(tight);
+        auto fr = Ascend910BMixed::create(roomy, dr, {0, 1})->best_cost();
+        auto ft = Ascend910BMixed::create(tight, dt, {0, 1})->best_cost();
+        double mm = Subgraph::create(roomy, dr, {0})->best_cost().latency;  // pure cube: UB-independent
+        double pw = Subgraph::create(roomy, dr, {1})->best_cost().latency;
+        std::cout << "  roomy-UB fused=" << fr.latency << " tile=" << fr.config.w << "x" << fr.config.h
+                  << "  tight-UB fused=" << ft.latency << " tile=" << ft.config.w << "x" << ft.config.h
+                  << "  separated=" << (mm + pw) << "\n";
+        CHECK("2POOL: roomy UB -> fusion wins", fr.latency < mm + pw);
+        CHECK("2POOL: tight UB forces a smaller shared tile",
+              ft.config.w * ft.config.h < fr.config.w * fr.config.h);
+        CHECK("2POOL: tight UB -> separate beats fusion (small tile, high reload)",
+              ft.latency > mm + pw);
+    }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1596,6 +1653,7 @@ int main() {
     test_cube_vector_fusion();
     test_mixed_unit_tiling();
     test_mixed_mm_pw_variants();
+    test_mixed_two_pool_feasibility();
     test_dfs_order();
     test_exec_enumeration();
     test_seq_k_intermediate();
