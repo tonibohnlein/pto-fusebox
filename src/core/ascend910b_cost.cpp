@@ -24,6 +24,97 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 }
 
 // ============================================================================
+// Grounded pto-isa machine model (Ascend 910B / A2A3)
+// ============================================================================
+// All grounded costs are in CORE CYCLES, matching pto-isa's EstimateLinearCycles
+// (cube) and EstimateBandwidthCycles (transfers). When the grounded fields are
+// unset (cube_freq_hz == 0) every helper falls back to the legacy placeholders
+// (cube_compute_cost per fractal, the single slow_memory_bandwidth), so
+// competition/legacy instances are byte-for-byte unchanged.
+namespace {
+
+constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+
+// Per-direction "cycles per byte" for a transfer. Grounded: a byte costs
+// (1/2^30)/bw_GiBps * freq_hz cycles (EstimateBandwidthCycles). Legacy: the
+// single 1/slow_memory_bandwidth, direction-agnostic.
+struct ByteCost {
+  double reload = 0.0;  // GM->L1   (cube operand reload)
+  double store = 0.0;   // L0C->GM  (cube output writeback)
+  double l0a = 0.0;     // L1->L0A  (lhs extract)
+  double l0b = 0.0;     // L1->L0B  (rhs extract)
+  double ub_in = 0.0;   // GM->UB   (vector load)
+  double ub_out = 0.0;  // UB->GM   (vector store)
+};
+
+ByteCost MakeByteCost(const Problem* p) {
+  const double inv_legacy = 1.0 / (double)p->slow_memory_bandwidth;
+  const bool grounded = p->cube_freq_hz > 0.0;
+  auto cpb = [&](double bw_gibps) {
+    return (grounded && bw_gibps > 0.0) ? p->cube_freq_hz / (kGiB * bw_gibps)
+                                        : inv_legacy;
+  };
+  return {cpb(p->bw_gm_l1), cpb(p->bw_l0c_gm), cpb(p->bw_l1_l0a),
+          cpb(p->bw_l1_l0b), cpb(p->bw_gm_ub), cpb(p->bw_ub_gm)};
+}
+
+// Cube MAC cost of one M x N x K matmul, in cycles. Grounded: the dtype-aware
+// fractal count x cycles-per-repeat (pto-isa cce_costmodel_cube.hpp `mad`):
+// kF = 32/dtype_bytes (fp32:8, fp16:16), cyc = 2 (fp32) else 1. cube_compute_cost
+// (default 1 in the grounded config) is a calibration multiplier. Legacy: the
+// fixed-16 K-fractal count x the flat per-fractal cube_compute_cost.
+double CubeMacCycles(const Problem* p, int64_t M, int64_t N, int64_t K, DType dt) {
+  if (p->cube_freq_hz > 0.0) {
+    const int64_t kF = std::max<int64_t>(1, 32 / dtype_bytes(dt));
+    const double repeats = (double)((M + 15) / 16) * (double)((N + 15) / 16) *
+                           (double)((K + kF - 1) / kF);
+    const double cyc = (dt == DType::FP32) ? 2.0 : 1.0;
+    const double mult = (p->cube_compute_cost > 0) ? (double)p->cube_compute_cost : 1.0;
+    return repeats * cyc * mult;
+  }
+  const double fractals = (double)((M + 15) / 16) * (double)((N + 15) / 16) *
+                          (double)((K + 15) / 16);
+  return fractals * (double)p->cube_compute_cost;
+}
+
+// L1->L0 operand extract for one M x N x K matmul, in cycles. The cube re-reads
+// the lhs once per L0 N-block (l0_tile_n) and the rhs once per L0 M-block
+// (l0_tile_m) — the same distribution-aware reuse as cube_operand_reload, one
+// hierarchy level down. Double-buffering overlaps this with the MACs, so the
+// caller takes max(MAC, extract). 0 when ungrounded or no L0 base tile.
+double CubeExtractCycles(const Problem* p, const ByteCost& bc, int64_t M,
+                         int64_t N, int64_t K, DType dt) {
+  if (p->cube_freq_hz <= 0.0 || p->l0_tile_m <= 0 || p->l0_tile_n <= 0)
+    return 0.0;
+  const double db = (double)dtype_bytes(dt);
+  const double MNK = (double)M * (double)N * (double)K;
+  const double lhs_bytes = MNK / (double)p->l0_tile_n * db;
+  const double rhs_bytes = MNK / (double)p->l0_tile_m * db;
+  return lhs_bytes * bc.l0a + rhs_bytes * bc.l0b;
+}
+
+// Wave-aware compute makespan. The independent work units (spatial tiles x
+// split-K partials) are EQUAL-cost under the current uniform-tile / equal-K-split
+// representation, so they run in ceil(U/C) "waves" and the makespan is set by the
+// fullest wave, NOT by an idealized total/C fractional division:
+//
+//   T_compute = ceil(U/C) * (W_total / U)
+//
+// vs the old W_total / min(U, C), which silently assumed work splits fractionally
+// and so under-charged any U > C that is not a multiple of C (e.g. 32 units on 24
+// cores: old = W/24, true = 2*(W/32) = W/16, a 33% miss). U = num_work_units; the
+// effective parallelism is U/ceil(U/C), NOT min(U,C).
+double WaveComputeCycles(double total_compute, int64_t num_work_units,
+                         int64_t num_cores) {
+  const int64_t units = std::max<int64_t>(1, num_work_units);
+  const int64_t cores = std::max<int64_t>(1, num_cores);
+  const int64_t waves = (units + cores - 1) / cores;
+  return total_compute * (double)waves / (double)units;
+}
+
+}  // namespace
+
+// ============================================================================
 // Factory
 // ============================================================================
 
@@ -1157,7 +1248,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
     return result;
   result.feasible = true;
 
-  const double inv_B = 1.0 / (double)prob_->slow_memory_bandwidth;
+  const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
   const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
   const int num_th = std::max((int)(out_H_ / cfg.h), 1);
   const int num_tiles = num_tw * num_th;
@@ -1183,7 +1274,15 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       FlatSet<size_t> consumed;
       for (auto i : ops_)
         for (auto t : prob_->ops[i].inputs) consumed.insert(t);
-      double total_compute = 0.0;
+      // Per-core cube work is HIERARCHICAL and double-buffered: producing a tile
+      // needs both the cube MACs (Matrix pipe) AND the L1->L0A/L0B operand
+      // extract (MTE1 pipe), which OVERLAP — so the work is max(MACs, extract),
+      // not their sum. Accumulate the two pipes separately, then take the max.
+      // (Validated against pto-isa's measured 7680^3 GEMM: with the L0 128x256
+      // base tile the extract lands at ~0.6x the MACs — i.e. cube-bound, extract
+      // hidden — matching its 63% vs 80.6% pipe-utilisation split.)
+      double total_cube = 0.0;     // Matrix-pipe cycles (cube MACs)
+      double total_extract = 0.0;  // MTE1-pipe cycles (L1->L0 operand extract)
       for (auto i : ops_) {
         if (prob_->ops[i].type != OpType::MatMul) continue;
         size_t o = prob_->ops[i].output();
@@ -1197,24 +1296,26 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         // separately; the partitioner picks the cheaper.) Boundary/sink outputs
         // are produced once: factor 1.
         const double recompute = consumed.count(o) ? (double)num_tw : 1.0;
-        if (prob_->cube_compute_cost > 0) {
-          // 910B machine model: count the WHOLE 16x16x16 cube fractals the matmul
-          // implies = ceil(out_W/16)*ceil(out_H/16)*ceil(K/16), times the per-
-          // fractal cube cost. CEIL (not floor) so a sub-16 dim pads up to one
-          // fractal — a small-batch GEMV (M<16) still costs a full fractal row,
-          // matching the cube's atomic 16-granularity, instead of being dropped.
-          const int64_t Km = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
-          const double fractals = (double)((prob_->tensors[o].width + 15) / 16) *
-                                  (double)((prob_->tensors[o].height + 15) / 16) *
-                                  (double)((Km + 15) / 16);
-          total_compute += fractals * (double)prob_->cube_compute_cost * recompute;
+        if (prob_->cube_compute_cost > 0 || prob_->cube_freq_hz > 0.0) {
+          // Grounded / machine model: dtype-aware fractal MACs + the hierarchical
+          // L1->L0 extract (CubeMacCycles / CubeExtractCycles). CEIL granularity
+          // so a sub-16 dim pads up to one fractal — a small-batch GEMV (M<16)
+          // still costs a full fractal row, matching the cube's 16-granularity.
+          const int64_t Mo = prob_->tensors[o].height;
+          const int64_t No = prob_->tensors[o].width;
+          const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
+          const DType dt = prob_->tensors[o].dtype;
+          total_cube += CubeMacCycles(prob_, Mo, No, Ko, dt) * recompute;
+          total_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt) * recompute;
         } else {
           // Legacy: per-op base_cost interpreted as per-native-128-tile cost.
-          total_compute += (double)prob_->ops[i].base_cost *
-                           ((double)prob_->tensors[o].width / prob_->native_w) *
-                           ((double)prob_->tensors[o].height / prob_->native_h);
+          total_cube += (double)prob_->ops[i].base_cost *
+                        ((double)prob_->tensors[o].width / prob_->native_w) *
+                        ((double)prob_->tensors[o].height / prob_->native_h);
         }
       }
+      // Double-buffered overlap of the two per-core cube pipes (MACs || extract).
+      const double total_compute = std::max(total_cube, total_extract);
       // --- BSP/superstep matmul roofline (910B; no shared L2) ----------------
       // Parallelize the (possibly fused-chain) subgraph over the SHARED output
       // dim M: each core owns a sink-output band and computes its own
@@ -1245,9 +1346,17 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       const double reload = cube_operand_reload(cfg);
       // S=1 (spatial-only): no cross-core reduction, so the output store streams
       // out as tiles complete (overlaps compute) — classic roofline, no barrier.
-      const double eff1 = (double)std::min<int64_t>(num_tiles, n_cores);
-      const double ddr1 = (reload + out_store) * inv_B * sat(eff1);
-      const double lat1 = std::max(total_compute / eff1, ddr1);
+      // DDR is the shared HBM floor; the operand reload (GM->L1) and the output
+      // store (L0C->GM) ride DIFFERENT directions (135 vs 70 GiB/s grounded), so
+      // charge them at their own bandwidths rather than one lumped figure.
+      // Wave-aware compute (ceil(U/C) waves); DDR is the shared total-volume floor
+      // discounted by active-core saturation — NOT wave-scaled (a K-split divides
+      // the operand slices, it does not inflate the total reload bytes).
+      const int64_t units1 = num_tiles;
+      const double compute1 = WaveComputeCycles(total_compute, units1, n_cores);
+      const double active1 = (double)std::min<int64_t>(units1, n_cores);
+      const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
+      const double lat1 = std::max(compute1, ddr1);
       // Sink split-K: split the sink contraction into S per-tile partials to
       // recruit idle cores. The streaming phase (operand reload overlaps partial
       // compute) is a roofline; the S partials then reduce through DDR AFTER
@@ -1259,20 +1368,31 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // parallelism against the merge cost. ENUMERATE S and take the min — the
       // optimum is interior when the merge is serial, and max-fill when
       // SetAtomicAdd folds the reduction into the write-back.
-      // Useful range: S <= kfrac (>=1 fractal/partial) and S <= ceil(n_cores/
-      // num_tiles) (beyond that effS caps at n_cores and a larger S only adds
-      // merge). output_K_ is the sink matmul's contraction (NOT max_K_, a deeper
-      // stage's K). Bounded by n_cores.
+      // Useful range: S <= kfrac (>=1 fractal/partial). The old ceil(n_cores/
+      // num_tiles) core-fill bound is REMOVED: under the wave model a split that
+      // overfills a wave (e.g. 16 tiles x S=3 = 48 units = 2 full waves -> W/24)
+      // can still cut compute below what S=2 reaches, so capping at the first
+      // S that hits n_cores would skip useful candidates. We enumerate the valid
+      // K-fractal divisors and let the merge cost (which grows with S) reject the
+      // excessive ones. output_K_ is the sink matmul's contraction (NOT max_K_).
       const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
-      const int64_t S_max =
-          std::min<int64_t>(kfrac, (n_cores + num_tiles - 1) / num_tiles);
       double best_latS = std::numeric_limits<double>::infinity();
       int64_t best_S = 1;
-      double best_effS = eff1, best_stream_ddr = 0.0, best_merge = 0.0;
-      for (int64_t S = 2; S <= S_max; ++S) {
-        const double effS = (double)std::min<int64_t>((int64_t)num_tiles * S, n_cores);
-        const double stream_ddrS = reload * inv_B * sat(effS);
-        const double streamS = std::max(total_compute / effS, stream_ddrS);
+      double best_activeS = active1, best_computeS = compute1, best_stream_ddr = 0.0,
+             best_merge = 0.0;
+      // Only S that evenly split the K-fractals are feasible: each of the S cores gets
+      // an equal, 16-aligned K-slice (output_K / S), so the emit can realize the split
+      // cleanly (one partial matmul per slice, atomic-added). Enumerate the divisors of
+      // kfrac (S >= 2); a non-divisor S would not be emittable. all_divisors() is
+      // ascending, so ties pick the smallest S.
+      for (int64_t S : all_divisors(kfrac)) {
+        if (S < 2) continue;
+        // Optional: a real emitter/runtime cap on the partial count would go here.
+        const int64_t unitsS = (int64_t)num_tiles * S;
+        const double computeS = WaveComputeCycles(total_compute, unitsS, n_cores);
+        const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
+        const double stream_ddrS = reload * bc.reload * sat(activeS);  // GM->L1 feed
+        const double streamS = std::max(computeS, stream_ddrS);
         // Merge barrier. Two regimes, selected by the target's ddr_atomic_add
         // capability (see Problem::ddr_atomic_add):
         //   (1) ALWAYS — write the S partials to DDR (parallel across effS cores).
@@ -1285,20 +1405,20 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         //   WITH SetAtomicAdd — the partials accumulate in DDR during write-back,
         //       so (2) vanishes; the merge is just (1) (sat-discounted → cancels
         //       below full-fill), so split-K stays cheap and max-fill is optimal.
-        double merge = (double)S * out_store * inv_B * sat(effS);                     // (1) write partials
+        double merge = (double)S * out_store * bc.store * sat(activeS);               // (1) write partials (L0C->GM)
         if (!prob_->ddr_atomic_add)
-          merge += (double)(S + 1) * out_store * inv_B * sat((double)num_tiles);      // (2) serial read-back + sum
+          merge += (double)(S + 1) * out_store * bc.store * sat((double)num_tiles);   // (2) serial read-back + sum
         const double latS = streamS + merge;
         if (latS < best_latS) {
-          best_latS = latS; best_S = S; best_effS = effS;
-          best_stream_ddr = stream_ddrS; best_merge = merge;
+          best_latS = latS; best_S = S; best_activeS = activeS;
+          best_computeS = computeS; best_stream_ddr = stream_ddrS; best_merge = merge;
         }
       }
       if (best_S > 1 && best_latS < lat1) {  // sink split-K only if it helps
         result.latency = best_latS;
         result.parallel_split = (int)best_S;
-        result.cores_used = (int)best_effS;
-        result.compute_bound = (total_compute / best_effS) >= best_stream_ddr;  // streaming phase
+        result.cores_used = (int)best_activeS;
+        result.compute_bound = best_computeS >= best_stream_ddr;  // streaming phase
         result.ddr_traffic = best_stream_ddr + best_merge;
         // Displayed per-core k composes the two k-levers: the greedy single-core
         // L1-fit k (derive_exec, a divisor of output_K_), capped by the per-core
@@ -1316,8 +1436,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       } else {
         result.latency = lat1;
         result.parallel_split = 1;
-        result.cores_used = (int)eff1;
-        result.compute_bound = (total_compute / eff1) >= ddr1;
+        result.cores_used = (int)active1;
+        result.compute_bound = compute1 >= ddr1;
         result.ddr_traffic = ddr1;
         // Spatial-only (S=1): displayed k = the greedy single-core L1-fit k.
         std::vector<int64_t> pk;
@@ -1356,9 +1476,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       for (const auto& info : boundary_tensor_info_) {
         const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
         if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
-          total_io += bytes * inv_B;
+          total_io += bytes * bc.ub_in;   // GM->UB boundary load
         if (info.is_boundary_out && !retain_these.count(info.id))
-          total_io += bytes * inv_B;
+          total_io += bytes * bc.ub_out;  // UB->GM boundary store
       }
       // Step 2b — single-core streaming recompute (flash 2-pass). When this
       // config cannot materialize the reduced band (UB overflow), the feasible
@@ -1403,11 +1523,11 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           const double sat_vS = std::max(1.0, (double)n_cores / effS);
           const double streamS = std::max(total_compute / effS, total_io * sat_vS);
           // (1) write/atomic-add the S thin partials (parallel; cancels below full-fill).
-          double merge = (double)(S - 1) * red_dim * inv_B * sat_vS;
+          double merge = (double)(S - 1) * red_dim * bc.ub_out * sat_vS;
           // (2) WITHOUT SetAtomicAdd: read the partials back and sum serially per
           //     tile (one accumulator/tile -> sat(num_tiles), grows ∝ S).
           if (!prob_->ddr_atomic_add)
-            merge += (double)(S + 1) * red_dim * inv_B * sat_acc;
+            merge += (double)(S + 1) * red_dim * bc.ub_out * sat_acc;
           const double latS = streamS + merge;
           if (latS < lat) {
             lat = latS;
@@ -1470,23 +1590,26 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     return result;
   result.feasible = true;
 
-  const double inv_B = 1.0 / (double)prob_->slow_memory_bandwidth;
+  const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
   const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
   const int num_th = std::max((int)(out_H_ / cfg.h), 1);
   const int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
   result.num_k_passes = std::max((int)(output_K_ / cfg.k), 1);
 
-  double cube_compute = 0.0, vector_compute = 0.0;
+  // cube_mac / cube_extract: the cube stage is hierarchical and double-buffered
+  // (same as the homogeneous cube path) — its time is max(MACs, L1->L0 extract).
+  double cube_mac = 0.0, cube_extract = 0.0, vector_compute = 0.0;
   for (auto i : ops_) {
     const auto& op = prob_->ops[i];
     if (op.type == OpType::MatMul) {
       const size_t o = op.output();
-      const int64_t Km = prob_->tensors[op.inputs[0]].width;  // contraction
-      const double fractals = (double)((prob_->tensors[o].width + 15) / 16) *
-                              (double)((prob_->tensors[o].height + 15) / 16) *
-                              (double)((Km + 15) / 16);
-      cube_compute += fractals * (double)std::max<int64_t>(prob_->cube_compute_cost, 1);
+      const int64_t Mo = prob_->tensors[o].height;
+      const int64_t No = prob_->tensors[o].width;
+      const int64_t Ko = prob_->tensors[op.inputs[0]].width;  // contraction
+      const DType dt = prob_->tensors[o].dtype;
+      cube_mac += CubeMacCycles(prob_, Mo, No, Ko, dt);
+      cube_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt);
     } else {  // Pointwise / Reduction — element work, lane-stepped, tile-invariant
       int64_t elems = (int64_t)prob_->tensors[op.output()].width *
                       prob_->tensors[op.output()].height;
@@ -1543,9 +1666,13 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // floor (sat≈1: a mixed kernel issues DMA from both stages — refine later).
   const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
   const double eff_units  = std::min((double)num_tiles, n_units);
-  const double cube_stage = cube_compute   / eff_units;
+  // Cube stage = max(MACs, L1->L0 extract) — the same double-buffered hierarchy
+  // as the homogeneous cube path. DDR (reload + roundtrips + vector IO) rides
+  // the shared GM ring; charge it at the GM->L1 feed bandwidth (the dominant
+  // operand-reload direction; legacy => the lumped slow_memory_bandwidth).
+  const double cube_stage = std::max(cube_mac, cube_extract) / eff_units;
   const double vec_stage  = vector_compute / (2.0 * eff_units);
-  const double ddr_lat    = ddr_bytes * inv_B;
+  const double ddr_lat    = ddr_bytes * bc.reload;
   result.latency       = std::max({cube_stage, vec_stage, ddr_lat});
   result.parallel_split = 1;
   result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit

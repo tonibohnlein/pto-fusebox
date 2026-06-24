@@ -114,6 +114,35 @@ struct Problem {
     // split-K. The Ascend 910B HAS SetAtomicAdd, so set_910b enables it.
     bool ddr_atomic_add = false;
 
+    // --- Grounded pto-isa machine model (Ascend 910B / A2A3) -----------------
+    // The cost terms above (cube_compute_cost per fractal, the single
+    // slow_memory_bandwidth) are coarse placeholders. These fields, when set,
+    // switch the cube path to pto-isa's measured coefficients
+    // (pto-isa include/pto/costmodel/arch_config.hpp + cce_costmodel_cube.hpp):
+    //
+    //   * WORK IS IN CYCLES. A matmul costs `repeats * cyc_per_repeat` cycles,
+    //     repeats = ceil(M/16)*ceil(N/16)*ceil(K/kF), kF = 32/dtype_bytes
+    //     (fp32:8, fp16/bf16:16), cyc_per_repeat = 2 (fp32) else 1.
+    //   * A byte transfer costs (bytes/2^30)/bw_GiBps * cube_freq_hz cycles
+    //     (EstimateBandwidthCycles): bandwidths below are GiB/s, PER DIRECTION.
+    //   * The cube core's WORK is hierarchical and double-buffered: producing a
+    //     tile needs both the cube MACs AND the L1->L0A/L0B operand extract,
+    //     which OVERLAP, so per-core work = max(cube_cycles, extract_cycles).
+    //     The L1->L0 reload reuses the L0 GEMM base tile (l0_tile_m/n) the same
+    //     way cube_operand_reload reuses the L1 tile (w/h) one level up.
+    //
+    // 0 / unset => fall back to slow_memory_bandwidth + cube_compute_cost (the
+    // competition / legacy instances are byte-for-byte unchanged).
+    double cube_freq_hz = 0.0;   // core clock (1.85e9). >0 activates the grounded path.
+    double bw_gm_l1   = 0.0;     // GM->L1 operand reload      (GiB/s; pto-isa 135.0)
+    double bw_l0c_gm  = 0.0;     // L0C->GM output store       (GiB/s; pto-isa 70.0)
+    double bw_l1_l0a  = 0.0;     // L1->L0A lhs extract        (GiB/s; pto-isa 441.0)
+    double bw_l1_l0b  = 0.0;     // L1->L0B rhs extract        (GiB/s; pto-isa 220.5)
+    double bw_gm_ub   = 0.0;     // GM->UB vector load         (GiB/s; pto-isa 100.9)
+    double bw_ub_gm   = 0.0;     // UB->GM vector store        (GiB/s; pto-isa 188.46)
+    int64_t l0_tile_m = 0;       // L0 GEMM base M (pto-isa oracle 128) — L1->L0 reuse
+    int64_t l0_tile_n = 0;       // L0 GEMM base N (pto-isa oracle 256) — L1->L0 reuse
+
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
 
