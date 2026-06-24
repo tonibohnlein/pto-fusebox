@@ -99,10 +99,11 @@ struct Problem {
     // (fewer tiles than cores), this penalizes over-tiling (more) — so the
     // optimum sits at ~one kernel per core. 0 => off (legacy/competition).
     int64_t kernel_fill_cost = 0;
-    // Ping-pong double-buffering: reserve half of each STREAMING pool (L1 / UB)
-    // for prefetch of the next tile while the current one computes. Halves the
-    // effective L1 and UB budgets. Off => single-buffer (full budget).
-    bool double_buffer = false;
+    // Double-buffering is ALWAYS assumed on 910B but does NOT reserve half the
+    // pool: the two ping-pong buffers together ARE the L1/UB, so feasibility uses
+    // the FULL l1_capacity / vec_capacity. The overlap is realized in the emit by
+    // streaming each seq-K strip (or tile) as >=2 sub-strips -- it halves the
+    // per-load k, not the resident operand. (Hence no double_buffer flag.)
     // Parallel split-K aggregation path (a target capability — the scheduler's
     // analog of a compiler flag). When TRUE, the hardware can write back to DDR
     // with SetAtomicAdd, so the S split-K partials are atomically accumulated

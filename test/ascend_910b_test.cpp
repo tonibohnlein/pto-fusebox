@@ -646,13 +646,9 @@ static void test_two_pool_working_set() {
               << "] k=" << rc.config.k << " split=" << rc.parallel_split
               << " operand=" << opnd << "B (L1=" << (512 * 1024) << ")\n";
     CHECK("POOL: cube k-tiled to fit L1 (k < full K=4096)", rc.config.k < 4096);
+    // Full L1/Mat pool: the operand strip uses all 512 KB (double-buffering
+    // streams it as ping-pong sub-strips in the emit -- it does not reserve half).
     CHECK("POOL: cube operand strips fit L1 (512KB)", opnd <= 512 * 1024);
-    // Double-buffering halves L1 -> a strictly smaller k-tile.
-    Problem cd = c;
-    cd.double_buffer = true;
-    auto rcd = Subgraph::create(cd, DAG::build(cd), {0})->best_cost();
-    std::cout << "    double-buffer on: k=" << rcd.config.k << " (single-buffer k=" << rc.config.k << ")\n";
-    CHECK("POOL: double-buffering shrinks the cube k-tile (half L1)", rcd.config.k < rc.config.k);
     // Vector: a pointwise tile (in + out resident) must fit the 192 KB UB.
     Problem v;
     v.tensors = {{512, 512}, {512, 512}};

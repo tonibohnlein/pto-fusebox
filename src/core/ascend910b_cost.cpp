@@ -1000,8 +1000,14 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
                               const FlatSet<size_t> &retained_from_prev,
                               const FlatSet<size_t> &retain_these,
                               std::vector<int64_t> *perop_k_out) const {
-  const double f = prob_->double_buffer ? 0.5 : 1.0;
-  const double l1 = (double)prob_->l1_capacity * f;
+  // Full L1/Mat budget -- double-buffering does NOT reserve half. The two
+  // ping-pong buffers are not "L1 + a spare half"; together they ARE the L1, so
+  // the operand strip that fits is the full pool. Double-buffering is realized in
+  // the emit by streaming each seq-K strip as >=2 sub-strips (load s+1 while
+  // computing s) -- it HALVES the per-load k, not the resident operand. Reserving
+  // half here would double-count the prefetch buffer and wrongly reject tiles
+  // whose operand genuinely fits.
+  const double l1 = (double)prob_->l1_capacity;
   const auto &order = dfs_order_;
 
   // Position of each op in the execution order (-1 = not in this subgraph).
@@ -1188,8 +1194,9 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
 Ascend910BCost::VecStream Ascend910BCost::vector_stream(const TileConfig &cfg,
                                             const FlatSet<size_t> &retained_from_prev,
                                             const FlatSet<size_t> &retain_these) const {
-  const double f = prob_->double_buffer ? 0.5 : 1.0;
-  const int64_t budget = (int64_t)((double)prob_->vec_capacity * f);
+  // Full UB budget -- double-buffering streams the tile in sub-chunks (the emit
+  // ping-pong), it does not reserve half the pool.
+  const int64_t budget = (int64_t)prob_->vec_capacity;
   if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget)
     return {0, INT64_MAX};  // materialized — no sub-streaming
 
@@ -1632,7 +1639,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // exp+rowsum, then exp+div = 3). Pessimistic upper bound (every op counted
       // each pass); refine toward per-op recompute liveness later.
       if (has_reduction_) {
-        const double budget = (double)prob_->vec_capacity * (prob_->double_buffer ? 0.5 : 1.0);
+        const double budget = (double)prob_->vec_capacity;  // full UB (see vector_stream)
         if (budget > 0.0 && (double)vector_peak_ub(cfg) > budget) {
           int reductions = 0;
           for (auto i : ops_)
