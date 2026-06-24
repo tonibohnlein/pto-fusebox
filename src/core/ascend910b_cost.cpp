@@ -1583,15 +1583,30 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // matmul path; applies to pointwise and reduction alike.)
       double total_compute = 0.0;
       for (auto i : ops_) {
-        if (prob_->vector_compute_cost > 0) {
-          // 910B machine model: the vector unit processes vector_lanes elements
-          // per SIMD step, so compute = ceil(#elements / lanes) * per-step cost.
-          // #elements = the op's largest tensor (the [H,W] grid). lanes is a
-          // machine parameter (SIMD width) to calibrate; default 1 (per-element).
-          int64_t elems = (int64_t)prob_->tensors[prob_->ops[i].output()].width *
-                          prob_->tensors[prob_->ops[i].output()].height;
-          for (auto t : prob_->ops[i].inputs)
-            elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
+        // #elements = the op's largest tensor (the [H,W] grid). A reduction
+        // [H,W]->[H,1] processes the W*H input, so the max over inputs/output is
+        // the right element count for both pointwise and reduction.
+        int64_t elems = (int64_t)prob_->tensors[prob_->ops[i].output()].width *
+                        prob_->tensors[prob_->ops[i].output()].height;
+        for (auto t : prob_->ops[i].inputs)
+          elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
+        if (prob_->cube_freq_hz > 0.0) {
+          // Grounded (pto-isa A2A3): per-op CYCLES = head + slope*repeat + tail,
+          // repeat = ceil(elems / (vec_reg_bytes/dtype_bytes)) -- the 256-byte
+          // vector register holds 64 fp32 / 128 fp16 elements. A Reduction takes
+          // the steep vreducev2 slope (~14x an elementwise add); the head/tail
+          // charges each op's pipeline fill, so a multi-op chain (softmax = exp +
+          // reduce + div) pays per op.
+          const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+          const DType dt = prob_->tensors[prob_->ops[i].output()].dtype;
+          const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dt));
+          const int64_t repeat = (elems + epr - 1) / epr;
+          const double slope = (prob_->ops[i].type == OpType::Reduction)
+                                   ? prob_->vec_slope_reduce
+                                   : prob_->vec_slope_pw;
+          total_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
+        } else if (prob_->vector_compute_cost > 0) {
+          // Legacy: vector_lanes elements per SIMD step, flat per-step cost.
           const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
           const int64_t steps = (elems + lanes - 1) / lanes;
           total_compute += (double)steps * (double)prob_->vector_compute_cost;
@@ -1738,14 +1753,23 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       const DType dt = prob_->tensors[o].dtype;
       cube_mac += CubeMacCycles(prob_, Mo, No, Ko, dt);
       cube_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt);
-    } else {  // Pointwise / Reduction — element work, lane-stepped, tile-invariant
+    } else {  // Pointwise / Reduction — element work, tile-invariant
       int64_t elems = (int64_t)prob_->tensors[op.output()].width *
                       prob_->tensors[op.output()].height;
       for (auto t : op.inputs)
         elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-      const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
-      vector_compute += (double)((elems + lanes - 1) / lanes) *
-                        (double)std::max<int64_t>(prob_->vector_compute_cost, 1);
+      if (prob_->cube_freq_hz > 0.0) {  // grounded: head + slope*repeat + tail (cycles)
+        const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+        const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(prob_->tensors[op.output()].dtype));
+        const int64_t repeat = (elems + epr - 1) / epr;
+        const double slope = (op.type == OpType::Reduction) ? prob_->vec_slope_reduce
+                                                            : prob_->vec_slope_pw;
+        vector_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
+      } else {
+        const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
+        vector_compute += (double)((elems + lanes - 1) / lanes) *
+                          (double)std::max<int64_t>(prob_->vector_compute_cost, 1);
+      }
     }
   }
 

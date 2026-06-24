@@ -143,6 +143,21 @@ struct Problem {
     int64_t l0_tile_m = 0;       // L0 GEMM base M (pto-isa oracle 128) — L1->L0 reuse
     int64_t l0_tile_n = 0;       // L0 GEMM base N (pto-isa oracle 256) — L1->L0 reuse
 
+    // Grounded vector (AIV) compute, in CYCLES (pto-isa A2A3
+    // cce_costmodel_vector_compute.hpp). Active in grounded mode (cube_freq_hz>0).
+    // Each vector op costs head + slope*repeat + tail, repeat = ceil(elems /
+    // (vec_reg_bytes / dtype_bytes)) -- the 256-byte vector register holds
+    // 64 fp32 / 128 fp16 elements (fp16 = 2x throughput). slope picks elementwise
+    // (vadd/vmul ~1-2) vs reduction (vreducev2 ~14), so a reduction is ~14x an add
+    // and the per-op head/tail charges the pipeline fill of a multi-op chain
+    // (e.g. softmax = exp + reduce + div). Replaces the flat vector_compute_cost /
+    // vector_lanes placeholder; 0 => legacy.
+    int64_t vec_reg_bytes = 0;        // vector register size in bytes (pto-isa 256)
+    double vec_op_head = 0.0;         // per-op pipeline startup cycles (~14)
+    double vec_op_tail = 0.0;         // per-op drain cycles (~18)
+    double vec_slope_pw = 0.0;        // cycles/repeat, elementwise (~2)
+    double vec_slope_reduce = 0.0;    // cycles/repeat, reduction (~14)
+
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
 

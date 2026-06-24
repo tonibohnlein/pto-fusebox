@@ -188,6 +188,11 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("bw_ub_gm"))     p.bw_ub_gm     = j["bw_ub_gm"].get<double>();
     if (j.contains("l0_tile_m"))    p.l0_tile_m    = j["l0_tile_m"].get<int64_t>();
     if (j.contains("l0_tile_n"))    p.l0_tile_n    = j["l0_tile_n"].get<int64_t>();
+    if (j.contains("vec_reg_bytes"))    p.vec_reg_bytes    = j["vec_reg_bytes"].get<int64_t>();
+    if (j.contains("vec_op_head"))      p.vec_op_head      = j["vec_op_head"].get<double>();
+    if (j.contains("vec_op_tail"))      p.vec_op_tail      = j["vec_op_tail"].get<double>();
+    if (j.contains("vec_slope_pw"))     p.vec_slope_pw     = j["vec_slope_pw"].get<double>();
+    if (j.contains("vec_slope_reduce")) p.vec_slope_reduce = j["vec_slope_reduce"].get<double>();
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
