@@ -120,9 +120,14 @@ double WaveComputeCycles(double total_compute, int64_t num_work_units,
 // captures the +-1-fractal imbalance and multi-wave grids. The per-region work is
 // supplied by the caller so a single-matmul sink and a chained group (sink region
 // + backpropagated intermediate row-bands) share this distribution logic.
+// `ksplit` > 1 applies split-K ON the grid: each region's K-contraction splits
+// into ksplit equal partials, so the P*Q regions become P*Q*ksplit work units of
+// work/ksplit each. This keeps split-K LPT-consistent with the grid (the equal-
+// unit wave would optimistically ignore the +-1-fractal region imbalance).
 template <typename RegionWork>
 double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
-                   RegionWork region_work) {
+                   RegionWork region_work, int64_t ksplit = 1) {
+  ksplit = std::max<int64_t>(1, ksplit);
   const int64_t m_sizes[2] = {pm.big, pm.small};
   const int64_t m_cnts[2] = {pm.num_big, pm.parts - pm.num_big};
   const int64_t n_sizes[2] = {pn.big, pn.small};
@@ -132,8 +137,8 @@ double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition
     for (int b = 0; b < 2; ++b) {
       const int64_t cnt = m_cnts[a] * n_cnts[b];
       if (cnt <= 0 || m_sizes[a] <= 0 || n_sizes[b] <= 0) continue;
-      const double work = region_work(m_sizes[a], n_sizes[b]);
-      for (int64_t i = 0; i < cnt; ++i) regions.push_back(work);
+      const double work = region_work(m_sizes[a], n_sizes[b]) / (double)ksplit;
+      for (int64_t i = 0; i < cnt * ksplit; ++i) regions.push_back(work);
     }
   std::sort(regions.begin(), regions.end(), [](double x, double y) { return x > y; });
   std::vector<double> load(std::max<int64_t>(1, n_cores), 0.0);
@@ -1434,29 +1439,44 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // -- the sink M-partition slices every intermediate's rows, while the
       // intermediate is consumed full-width (it is the next matmul's contraction),
       // so each N-region in an M-band recomputes the band (counted per region,
-      // reproducing the num_tw recompute factor of total_compute). Uniform mode:
-      // the wave makespan over equal work units.
+      // reproducing the num_tw recompute factor of total_compute). Hoisted so the
+      // split-K loop below reuses it (LPT-consistent split-K on the grid). Uniform
+      // mode: the wave makespan over equal work units.
+      const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m));
+      const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n));
+      // L0 base tile (pto-isa GEMM oracle); the K-step is baseK=64. Used for the
+      // Phase-D pipeline depth. Fall back to {1,1} when ungrounded (extract==0
+      // then, so the depth is immaterial).
+      const int64_t l0m = std::max<int64_t>(1, prob_->l0_tile_m);
+      const int64_t l0n = std::max<int64_t>(1, prob_->l0_tile_n);
+      auto grid_region_work = [&](int64_t m_ext, int64_t n_ext) {
+        double work = 0.0;
+        for (auto i : ops_) {
+          if (prob_->ops[i].type != OpType::MatMul) continue;
+          const size_t o = prob_->ops[i].output();
+          const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;
+          const DType dt = prob_->tensors[o].dtype;
+          const int64_t n = consumed.count(o) ? prob_->tensors[o].width  // full band
+                                              : n_ext;                    // sink region
+          const double mac = CubeMacCycles(prob_, m_ext, n, Ko, dt);
+          const double ext = CubeExtractCycles(prob_, bc, m_ext, n, Ko, dt);
+          // Phase D — double-buffer overlap over L L0-MAD steps:
+          //   T = (mac + ext + (L-1)*max(mac,ext)) / L
+          // L=1 (one L0 tile) => mac+ext (no steady state to overlap); L>>1 =>
+          // max(mac,ext) (full ping-pong). L = #L0 sub-tiles of this matmul's
+          // region: ceil(m/baseM)*ceil(n/baseN)*ceil(K/baseK), baseK=64.
+          const int64_t L = std::max<int64_t>(
+              1, ((m_ext + l0m - 1) / l0m) * ((n + l0n - 1) / l0n) *
+                     ((Ko + 63) / 64));
+          // Matmuls in a region run SEQUENTIALLY (the intermediate feeds the
+          // sink), so their pipeline times SUM (not max-of-sums).
+          work += (mac + ext + (double)(L - 1) * std::max(mac, ext)) / (double)L;
+        }
+        return work;
+      };
       const double compute1 =
-          (cfg.parts_m > 0)
-              ? LptMakespan(n_cores, partition_axis(out_H_, cfg.parts_m),
-                            partition_axis(out_W_, cfg.parts_n),
-                            [&](int64_t m_ext, int64_t n_ext) {
-                              double cube = 0.0, ext = 0.0;
-                              for (auto i : ops_) {
-                                if (prob_->ops[i].type != OpType::MatMul) continue;
-                                const size_t o = prob_->ops[i].output();
-                                const int64_t Ko =
-                                    prob_->tensors[prob_->ops[i].inputs[0]].width;
-                                const DType dt = prob_->tensors[o].dtype;
-                                const int64_t n = consumed.count(o)
-                                                      ? prob_->tensors[o].width  // full band
-                                                      : n_ext;                   // sink region
-                                cube += CubeMacCycles(prob_, m_ext, n, Ko, dt);
-                                ext += CubeExtractCycles(prob_, bc, m_ext, n, Ko, dt);
-                              }
-                              return std::max(cube, ext);
-                            })
-              : WaveComputeCycles(total_compute, units1, n_cores);
+          (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work)
+                            : WaveComputeCycles(total_compute, units1, n_cores);
       const double active1 = (double)std::min<int64_t>(units1, n_cores);
       const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
       const double lat1 = std::max(compute1, ddr1);
@@ -1492,7 +1512,12 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         if (S < 2) continue;
         // Optional: a real emitter/runtime cap on the partial count would go here.
         const int64_t unitsS = (int64_t)num_tiles * S;
-        const double computeS = WaveComputeCycles(total_compute, unitsS, n_cores);
+        // Grid: LPT the P*Q regions with the K split S ways (each region's work
+        // /S, P*Q*S units) -- honest about the +-1-fractal imbalance, unlike the
+        // equal-unit wave used for uniform tiles.
+        const double computeS =
+            (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work, S)
+                              : WaveComputeCycles(total_compute, unitsS, n_cores);
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
         const double stream_ddrS = reload * bc.reload * sat(activeS);  // GM->L1 feed
         const double streamS = std::max(computeS, stream_ddrS);
@@ -1816,11 +1841,15 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           take = true;
         } else {
           // Lexicographic tiebreak among equal-latency tiles:
-          //   1. lower DDR traffic   — matmul reuse (less reload); flat for PW
-          //   2. more cores used     — fill the unit's cores (parallelism)
-          //   3. larger tile area    — best vectorization / least per-tile
+          //   1. fewer split-K partials — a balanced spatial grid that fills the
+          //      cores at the same latency beats a K-split (less merge traffic,
+          //      no atomic-add serialization, simpler emit). split-K only wins
+          //      when it is STRICTLY faster (caught by the latency test above).
+          //   2. lower DDR traffic   — matmul reuse (less reload); flat for PW
+          //   3. more cores used     — fill the unit's cores (parallelism)
+          //   4. larger tile area    — best vectorization / least per-tile
           //      overhead (avoids the degenerate 1xN / 16x16 picks)
-          //   4. larger k            — fewer L1 passes
+          //   5. larger k            — fewer L1 passes
           const double tol = 1e-6 * std::max(1.0, best.latency);
           const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
           const long long ra = (long long)r.config.w * r.config.h;
@@ -1829,6 +1858,8 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
             take = true;
           } else if (r.latency > best.latency + tol) {
             take = false;
+          } else if (r.parallel_split != best.parallel_split) {
+            take = r.parallel_split < best.parallel_split;
           } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
             take = true;
           } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
