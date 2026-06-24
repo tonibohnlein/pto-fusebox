@@ -112,16 +112,17 @@ double WaveComputeCycles(double total_compute, int64_t num_work_units,
   return total_compute * (double)waves / (double)units;
 }
 
-// Wave makespan for a non-uniform parts_m x parts_n SpatialSchedule grid (single
-// matmul). The even split yields at most 4 distinct region shapes; each region's
-// work is the double-buffered max(cube MACs, L1->L0 extract). LPT-assign the P*Q
-// regions across n_cores and return the makespan (the busiest core's load). With
+// LPT makespan for a non-uniform parts_m x parts_n SpatialSchedule grid. The even
+// split yields at most 4 distinct region shapes (m_ext, n_ext);
+// `region_work(m_ext, n_ext)` gives one region's double-buffered cost. LPT-assign
+// the P*Q regions across n_cores and return the busiest core's load. With
 // parts == n_cores this is one wave -> the largest region's cost; the LPT also
-// captures the slight imbalance of the +-1-fractal extents and multi-wave grids.
-double LptCubeMakespan(const Problem* p, const ByteCost& bc, int64_t M, int64_t N,
-                       int64_t K, DType dt, int64_t parts_m, int64_t parts_n) {
-  const AxisPartition pm = partition_axis(M, parts_m);
-  const AxisPartition pn = partition_axis(N, parts_n);
+// captures the +-1-fractal imbalance and multi-wave grids. The per-region work is
+// supplied by the caller so a single-matmul sink and a chained group (sink region
+// + backpropagated intermediate row-bands) share this distribution logic.
+template <typename RegionWork>
+double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
+                   RegionWork region_work) {
   const int64_t m_sizes[2] = {pm.big, pm.small};
   const int64_t m_cnts[2] = {pm.num_big, pm.parts - pm.num_big};
   const int64_t n_sizes[2] = {pn.big, pn.small};
@@ -131,12 +132,11 @@ double LptCubeMakespan(const Problem* p, const ByteCost& bc, int64_t M, int64_t 
     for (int b = 0; b < 2; ++b) {
       const int64_t cnt = m_cnts[a] * n_cnts[b];
       if (cnt <= 0 || m_sizes[a] <= 0 || n_sizes[b] <= 0) continue;
-      const double work = std::max(CubeMacCycles(p, m_sizes[a], n_sizes[b], K, dt),
-                                   CubeExtractCycles(p, bc, m_sizes[a], n_sizes[b], K, dt));
+      const double work = region_work(m_sizes[a], n_sizes[b]);
       for (int64_t i = 0; i < cnt; ++i) regions.push_back(work);
     }
   std::sort(regions.begin(), regions.end(), [](double x, double y) { return x > y; });
-  std::vector<double> load(std::max<int64_t>(1, p->num_cube_cores), 0.0);
+  std::vector<double> load(std::max<int64_t>(1, n_cores), 0.0);
   for (double w : regions) {  // longest-processing-time-first onto the least-loaded core
     size_t mn = 0;
     for (size_t c = 1; c < load.size(); ++c)
@@ -776,17 +776,22 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   if (matmul_910b)
     sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
 
-  // SpatialSchedule grid candidates (Phase A): balanced ~24-region partitions the
-  // uniform exact-divisor tiles cannot express (powers of two only yield
-  // power-of-two tile counts, never a multiple of 24). Single-matmul cube sinks
-  // only -- the per-region cube cost is exact there; chained recompute is a
-  // follow-up. Enumerate factor pairs of n_cores and 2*n_cores (both
-  // orientations), bounded by each axis's 16-fractal count.
+  // SpatialSchedule grid candidates: balanced ~24-region partitions the uniform
+  // exact-divisor tiles cannot express (powers of two only yield power-of-two
+  // tile counts, never a multiple of 24). The grid tiles the SINK output; the
+  // chain backpropagates from it (an intermediate is a full-width [m_ext, N_int]
+  // row-band of the sink M-partition). This requires every matmul to share the
+  // sink's M dimension (tensors[o].height == out_H_) -- the standard (A@B)@D
+  // chain does; a DAG whose matmuls tile M differently falls back to uniform.
+  // Enumerate factor pairs of n_cores and 2*n_cores (both orientations), bounded
+  // by each axis's 16-fractal count.
   if (matmul_910b) {
-    int n_mm = 0;
+    bool shared_m = true;
     for (auto i : sg.ops_)
-      if (prob.ops[i].type == OpType::MatMul) ++n_mm;
-    if (n_mm == 1) {
+      if (prob.ops[i].type == OpType::MatMul &&
+          prob.tensors[prob.ops[i].output()].height != sg.out_H_)
+        shared_m = false;
+    if (shared_m) {
       const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
       const int64_t C = std::max<int64_t>(1, prob.num_cube_cores);
       for (int64_t R : {C, 2 * C})
@@ -1422,14 +1427,35 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // discounted by active-core saturation — NOT wave-scaled (a K-split divides
       // the operand slices, it does not inflate the total reload bytes).
       const int64_t units1 = num_tiles;
-      // Grid mode: LPT makespan over the non-uniform (+-1-fractal) regions —
-      // exact per-region cost (single-matmul cube sink). Uniform mode: the
-      // wave makespan over equal work units.
+      // Grid mode: LPT makespan over the non-uniform (+-1-fractal) regions. The
+      // per-region work is the SINK matmul at the region extent (m_ext, n_ext)
+      // PLUS each consumed INTERMEDIATE as a full-width [m_ext, N_int] row-band:
+      // the grid is the sink-output tiling, and the chain backpropagates from it
+      // -- the sink M-partition slices every intermediate's rows, while the
+      // intermediate is consumed full-width (it is the next matmul's contraction),
+      // so each N-region in an M-band recomputes the band (counted per region,
+      // reproducing the num_tw recompute factor of total_compute). Uniform mode:
+      // the wave makespan over equal work units.
       const double compute1 =
           (cfg.parts_m > 0)
-              ? LptCubeMakespan(prob_, bc, out_H_, out_W_, output_K_,
-                                prob_->tensors[prob_->ops[sink_mm_op_].output()].dtype,
-                                cfg.parts_m, cfg.parts_n)
+              ? LptMakespan(n_cores, partition_axis(out_H_, cfg.parts_m),
+                            partition_axis(out_W_, cfg.parts_n),
+                            [&](int64_t m_ext, int64_t n_ext) {
+                              double cube = 0.0, ext = 0.0;
+                              for (auto i : ops_) {
+                                if (prob_->ops[i].type != OpType::MatMul) continue;
+                                const size_t o = prob_->ops[i].output();
+                                const int64_t Ko =
+                                    prob_->tensors[prob_->ops[i].inputs[0]].width;
+                                const DType dt = prob_->tensors[o].dtype;
+                                const int64_t n = consumed.count(o)
+                                                      ? prob_->tensors[o].width  // full band
+                                                      : n_ext;                   // sink region
+                                cube += CubeMacCycles(prob_, m_ext, n, Ko, dt);
+                                ext += CubeExtractCycles(prob_, bc, m_ext, n, Ko, dt);
+                              }
+                              return std::max(cube, ext);
+                            })
               : WaveComputeCycles(total_compute, units1, n_cores);
       const double active1 = (double)std::min<int64_t>(units1, n_cores);
       const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
