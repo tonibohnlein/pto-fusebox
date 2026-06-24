@@ -363,6 +363,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;
+  // Non-uniform spatial-grid candidates (parts_m, parts_n) for the cube path —
+  // factor pairs of useful region counts (n_cores, 2*n_cores) that land a
+  // balanced ~24-region partition the uniform exact-divisor tiles can't express.
+  // Empty for vector / chained / legacy subgraphs (SpatialSchedule Phase A
+  // targets the single-matmul cube sink).
+  std::vector<std::pair<int64_t, int64_t>> grid_cand_;
 
   // Flat lookup: tensor index → list of indices into boundary_tensor_info_.
   // Empty list means the tensor isn't a boundary tensor of this subgraph.

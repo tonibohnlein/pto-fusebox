@@ -112,6 +112,42 @@ double WaveComputeCycles(double total_compute, int64_t num_work_units,
   return total_compute * (double)waves / (double)units;
 }
 
+// Wave makespan for a non-uniform parts_m x parts_n SpatialSchedule grid (single
+// matmul). The even split yields at most 4 distinct region shapes; each region's
+// work is the double-buffered max(cube MACs, L1->L0 extract). LPT-assign the P*Q
+// regions across n_cores and return the makespan (the busiest core's load). With
+// parts == n_cores this is one wave -> the largest region's cost; the LPT also
+// captures the slight imbalance of the +-1-fractal extents and multi-wave grids.
+double LptCubeMakespan(const Problem* p, const ByteCost& bc, int64_t M, int64_t N,
+                       int64_t K, DType dt, int64_t parts_m, int64_t parts_n) {
+  const AxisPartition pm = partition_axis(M, parts_m);
+  const AxisPartition pn = partition_axis(N, parts_n);
+  const int64_t m_sizes[2] = {pm.big, pm.small};
+  const int64_t m_cnts[2] = {pm.num_big, pm.parts - pm.num_big};
+  const int64_t n_sizes[2] = {pn.big, pn.small};
+  const int64_t n_cnts[2] = {pn.num_big, pn.parts - pn.num_big};
+  std::vector<double> regions;
+  for (int a = 0; a < 2; ++a)
+    for (int b = 0; b < 2; ++b) {
+      const int64_t cnt = m_cnts[a] * n_cnts[b];
+      if (cnt <= 0 || m_sizes[a] <= 0 || n_sizes[b] <= 0) continue;
+      const double work = std::max(CubeMacCycles(p, m_sizes[a], n_sizes[b], K, dt),
+                                   CubeExtractCycles(p, bc, m_sizes[a], n_sizes[b], K, dt));
+      for (int64_t i = 0; i < cnt; ++i) regions.push_back(work);
+    }
+  std::sort(regions.begin(), regions.end(), [](double x, double y) { return x > y; });
+  std::vector<double> load(std::max<int64_t>(1, p->num_cube_cores), 0.0);
+  for (double w : regions) {  // longest-processing-time-first onto the least-loaded core
+    size_t mn = 0;
+    for (size_t c = 1; c < load.size(); ++c)
+      if (load[c] < load[mn]) mn = c;
+    load[mn] += w;
+  }
+  double mk = 0.0;
+  for (double l : load) mk = std::max(mk, l);
+  return mk;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -740,6 +776,29 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   if (matmul_910b)
     sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
 
+  // SpatialSchedule grid candidates (Phase A): balanced ~24-region partitions the
+  // uniform exact-divisor tiles cannot express (powers of two only yield
+  // power-of-two tile counts, never a multiple of 24). Single-matmul cube sinks
+  // only -- the per-region cube cost is exact there; chained recompute is a
+  // follow-up. Enumerate factor pairs of n_cores and 2*n_cores (both
+  // orientations), bounded by each axis's 16-fractal count.
+  if (matmul_910b) {
+    int n_mm = 0;
+    for (auto i : sg.ops_)
+      if (prob.ops[i].type == OpType::MatMul) ++n_mm;
+    if (n_mm == 1) {
+      const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
+      const int64_t C = std::max<int64_t>(1, prob.num_cube_cores);
+      for (int64_t R : {C, 2 * C})
+        for (int64_t P = 1; P <= R; ++P) {
+          if (R % P != 0) continue;
+          const int64_t Q = R / P;
+          if (P > Fm || Q > Fn || P * Q < 2) continue;
+          sg.grid_cand_.emplace_back(P, Q);
+        }
+    }
+  }
+
   // Depth-first topological execution order (the fixed pebbling order). Post-
   // order DFS from each sink over in-subgraph producers: an op is emitted only
   // after all its producers, and a branch is finished before its sibling
@@ -808,10 +867,17 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
     if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // 16-fractal aligned
   }
 
-  for (int64_t v : w_divides_)
-    if (cfg.w < v && v % cfg.w != 0) return false;
-  for (int64_t v : h_divides_)
-    if (cfg.h < v && v % cfg.h != 0) return false;
+  // Grid (SpatialSchedule) mode: w,h carry the PHYSICAL (max) region extent of a
+  // non-uniform parts_m x parts_n partition, which need NOT evenly divide the
+  // output -- so skip the exact-divisor check (the 16-alignment above + the L1
+  // fit in fits_on_chip still apply). parts are clamped to the fractal count in
+  // partition_axis, so no region is empty.
+  if (cfg.parts_m == 0) {
+    for (int64_t v : w_divides_)
+      if (cfg.w < v && v % cfg.w != 0) return false;
+    for (int64_t v : h_divides_)
+      if (cfg.h < v && v % cfg.h != 0) return false;
+  }
   // 910B cube tile spans the full contraction (k = max_K_, accumulated in L0c);
   // the per-op k-divisibility rule (temporal-tiling correctness) does not apply
   // here, and for a chained group max_K_ may exceed a smaller op's K.
@@ -1249,8 +1315,11 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   result.feasible = true;
 
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
-  const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
-  const int num_th = std::max((int)(out_H_ / cfg.h), 1);
+  // Grid (SpatialSchedule) mode: the spatial region count is parts_m x parts_n
+  // exactly (a balanced non-uniform partition). Uniform mode: floor-divide the
+  // output by the tile. (w,h carry the physical region extent in both.)
+  const int num_tw = (cfg.parts_n > 0) ? (int)cfg.parts_n : std::max((int)(out_W_ / cfg.w), 1);
+  const int num_th = (cfg.parts_m > 0) ? (int)cfg.parts_m : std::max((int)(out_H_ / cfg.h), 1);
   const int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
   result.num_k_passes = has_matmul_ ? std::max((int)(output_K_ / cfg.k), 1) : 1;
@@ -1353,7 +1422,15 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // discounted by active-core saturation — NOT wave-scaled (a K-split divides
       // the operand slices, it does not inflate the total reload bytes).
       const int64_t units1 = num_tiles;
-      const double compute1 = WaveComputeCycles(total_compute, units1, n_cores);
+      // Grid mode: LPT makespan over the non-uniform (+-1-fractal) regions —
+      // exact per-region cost (single-matmul cube sink). Uniform mode: the
+      // wave makespan over equal work units.
+      const double compute1 =
+          (cfg.parts_m > 0)
+              ? LptCubeMakespan(prob_, bc, out_H_, out_W_, output_K_,
+                                prob_->tensors[prob_->ops[sink_mm_op_].output()].dtype,
+                                cfg.parts_m, cfg.parts_n)
+              : WaveComputeCycles(total_compute, units1, n_cores);
       const double active1 = (double)std::min<int64_t>(units1, n_cores);
       const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
       const double lat1 = std::max(compute1, ddr1);
@@ -1703,14 +1780,11 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
 CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
                                const FlatSet<size_t> &retain_these) const {
   CostResult best;
-  for (int64_t ww : ws_cand_) {
-    for (int64_t hh : hs_cand_) {
-      for (int64_t kk : ks_cand_) {
-        TileConfig cfg{ww, hh, kk};
-        if (!is_valid_tiling(cfg)) continue;
-        if (!fits_on_chip(cfg, retained_from_prev, retain_these)) continue;
+  auto consider = [&](const TileConfig &cfg) {
+        if (!is_valid_tiling(cfg)) return;
+        if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return;
         auto r = compute_cost(cfg, retained_from_prev, retain_these);
-        if (!r.feasible) continue;
+        if (!r.feasible) return;
         bool take;
         if (best.latency == std::numeric_limits<double>::infinity()) {
           take = true;
@@ -1742,8 +1816,22 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           }
         }
         if (take) best = r;
-      }
-    }
+  };
+
+  // Uniform exact-divisor tiles (the legacy spatial search).
+  for (int64_t ww : ws_cand_)
+    for (int64_t hh : hs_cand_)
+      for (int64_t kk : ks_cand_)
+        consider(TileConfig{ww, hh, kk});
+
+  // Non-uniform SpatialSchedule grids (Phase A): each (parts_m, parts_n) lands a
+  // balanced region count the uniform tiles can't (e.g. exactly n_cores). w,h
+  // carry the physical (max) region extent so fits_on_chip / reload are unchanged.
+  for (const auto &g : grid_cand_) {
+    const AxisPartition pm = partition_axis(out_H_, g.first);
+    const AxisPartition pn = partition_axis(out_W_, g.second);
+    for (int64_t kk : ks_cand_)
+      consider(TileConfig{pn.big, pm.big, kk, pm.parts, pn.parts});
   }
   return best;
 }

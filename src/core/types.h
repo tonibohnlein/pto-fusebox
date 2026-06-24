@@ -163,7 +163,45 @@ struct Problem {
 
 struct TileConfig {
     int64_t w = 0, h = 0, k = 0;
+    // Non-uniform spatial grid (SpatialSchedule). 0 => legacy uniform-divisor
+    // tile (w,h are an exact-divisor tile). >0 => the output is partitioned into
+    // parts_m x parts_n regions whose extents are an even split of the 16-fractal
+    // counts (regions differ by <=1 fractal per axis); w,h then carry the
+    // PHYSICAL (max) region extent so the L1-fit / reload machinery is unchanged.
+    // See partition_axis().
+    int64_t parts_m = 0, parts_n = 0;
 };
+
+// Even distribution of an axis of `dim` elements into `parts` regions, in units
+// of 16-element cube fractals. F = ceil(dim/16) fractals split as evenly as
+// possible: `num_big` regions get (base+1) fractals, the rest get `base`. Since
+// regions differ by at most one fractal, an axis has at most two distinct
+// extents -- so a P x Q grid has at most four distinct region shapes.
+struct AxisPartition {
+    int64_t big = 16, small = 16;  // element extents of the two region sizes
+    int64_t num_big = 0;           // first num_big of `parts` regions use `big`
+    int64_t parts = 1;
+    int64_t offset(int64_t i) const {
+        return i < num_big ? i * big : num_big * big + (i - num_big) * small;
+    }
+    int64_t extent(int64_t i, int64_t dim) const {  // valid extent (final region clamped)
+        const int64_t e = (i < num_big) ? big : small;
+        const int64_t off = offset(i);
+        return (off + e <= dim) ? e : (dim - off);
+    }
+};
+
+inline AxisPartition partition_axis(int64_t dim, int64_t parts) {
+    const int64_t F = (dim + 15) / 16;                       // 16-fractals on the axis
+    parts = (parts < 1) ? 1 : ((parts > F) ? F : parts);     // never more parts than fractals
+    const int64_t base = F / parts, rem = F % parts;
+    AxisPartition p;
+    p.parts = parts;
+    p.num_big = rem;
+    p.big = (base + (rem > 0 ? 1 : 0)) * 16;
+    p.small = base * 16;
+    return p;
+}
 
 // ============================================================================
 // Cost evaluation result
