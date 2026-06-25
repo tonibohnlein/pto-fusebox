@@ -56,7 +56,9 @@ calibration multiplier (grounded value: 1). → `CubeMacCycles()`.
 
 Producing an output tile needs both the **cube MACs** (Matrix pipe) and the
 **L1→L0 operand extract** (MTE1 pipe). They run concurrently (double buffering), so
-the per-region work is the steady-state pipeline, NOT just the MACs.
+the per-region work is the steady-state pipeline, NOT just the MACs. (This is the
+*inner* L1↔L0 double-buffer; the *outer* DDR↔L1 reload double-buffer — and its
+roofline floor — is in §3.)
 
 **Extract** (`CubeExtractCycles`): the L1→L0 operand reload, reusing the L0 base
 tile `(l0_tile_m, l0_tile_n) = (128, 256)` the same way `cube_operand_reload`
@@ -91,8 +93,24 @@ a square fp16 GEMM — matching pto-isa's measured 7680³ run (TEXTRACT 63% / Cu
 ## 3. The roofline — `compute_cost`
 
 ```
-lat = max( compute_makespan , ddr )
+lat = max( compute_makespan , ddr )    # when the reload can double-buffer
+    = compute_makespan + ddr           # otherwise (no overlap)
 ```
+
+**Double-buffer floor.** The `max()` overlap (reload hidden under compute) is only
+physical when the operand reload can **ping-pong** — i.e. the per-core contraction
+is halvable into ≥2 seq-K sub-strips (`per_core_K ≥ 32`, two K-fractals; the emit's
+implicit double-buffer halving needs that). A tiny contraction, or an
+over-aggressive split-K with `K/S < 32`, can't overlap → reload and compute
+**serialize** (`compute + ddr`). This caps split-K at `S ≤ K/32`. It is a cost, not
+a hard reject (a genuinely tiny-K matmul has no feasible alternative). Grounded
+only; legacy keeps `max`.
+
+**Double-buffering does NOT reserve L1/UB.** The two ping-pong buffers *together*
+are the pool, so `derive_exec` / `vector_stream` use the **full** `l1_capacity` /
+`vec_capacity`. The model keeps the full seq-K strip; the emit halves the
+*per-load* k (`kk → 2×kk/2`, both occupying the full L1). There is no
+`double_buffer` flag.
 
 **DDR** is the shared HBM floor, charged PER DIRECTION (reload and store ride
 different ports at different bandwidths), discounted by active-core saturation:
@@ -129,10 +147,23 @@ Operand and intermediate tiles are backpropagated from it (§5 of the base doc).
 can't. e.g. 1024² → `4×6` grid, N-extents `[176,176,176,176,160,160]` — 24
 non-empty 16-aligned regions covering 1024 columns with **no padding**.
 
-**Candidates** (`grid_cand_`, cube path): factor pairs of `n_cores` and `2*n_cores`
-(both orientations), bounded by each axis's fractal count, gated on all matmuls
-sharing the sink M (`tensors[o].height == out_H_`). A DAG that tiles M differently
-falls back to uniform.
+**Candidates** (`grid_cand_`, cube path): the fill target is `n_cores` (and
+`2*n_cores`) **WORK UNITS = `parts_m × parts_n × S`** (spatial regions × parallel
+split-K). Enumerate the spatial factor `P×Q` over the **divisors** of {24, 48}
+(both orientations), bounded by each axis's fractal count; compute_cost's split-K
+loop then supplies `S = target/(P·Q)`. So an output too small to form 24 spatial
+16-fractal regions still fills the cores via the k-split (64² = 4×4 fractals →
+`(4,3) grid × S=2`). Gated on all matmuls sharing the sink M
+(`tensors[o].height == out_H_`); a DAG that tiles M differently falls back to
+uniform.
+
+**16×16 is a fractal *granularity*, not a hard constraint** (pto-isa `mad`
+`CeilDiv`): a sub-16 dim pads to one fractal. The grid keeps regions ≥1 fractal
+(`parts ≤ F`) to avoid that padding — so 24 isn't forced via sub-fractal tiles;
+the k-split fills with real contraction work instead. Padding to force exactly-24
+*equal* regions never helps: the 1-wave makespan is the largest region
+`⌈Fm/P⌉·⌈Fn/Q⌉`, which padding can't shrink — it only inflates the smaller regions
+(wasted compute + DDR) for identical latency.
 
 **Chained backpropagation**: the sink M-partition slices every matmul's rows; a
 consumed intermediate is the next matmul's contraction, so it is a full-width
@@ -172,7 +203,14 @@ the ±1-fractal imbalance and multi-wave grids.
 Splits the sink contraction into `S` per-tile partials (atomic-add merge). On a grid
 it is LPT-consistent: `LptMakespan(..., ksplit=S)` splits each region's K into S
 partials (`P*Q*S` units of `work/S`) — honest about the region imbalance, where the
-equal-unit wave would be optimistic. `S` ranges over divisors of `K/16`.
+equal-unit wave would be optimistic. `S` ranges over divisors of `K/16`, capped by
+the **double-buffer floor** (§3): `K/S ≥ 32` (each partial keeps ≥2 K-fractals to
+ping-pong its reload), else that partial's streaming phase serializes.
+
+Split-K is **unified with the grid** (§4): the candidates target `P·Q·S = n_cores`
+work units, so the solver reaches the fill via the cheapest spatial×split combo —
+e.g. a reload-bound 2048² picks `3×4 grid × S=2` (bigger tiles, less reload) over
+`4×6` all-spatial, ~8% faster.
 
 Merge barrier (`ddr_atomic_add`): with SetAtomicAdd, just the S partial writes
 (sat-discounted); without, a serial DDR read-back + sum (∝ S).
@@ -186,15 +224,16 @@ K-split (less merge, no atomic serialization, simpler emit). Split-K only wins w
 
 ## 7. Worked examples (grounded; standalone `mlsys`)
 
-| shape (fp) | result | regions | waves | eff_par |
+| shape (fp16) | result | units (P·Q·S) | waves | eff_par |
 | --- | --- | --- | --- | --- |
-| 2048² | GRID 4×6, tile `512×352`, split=1 | 24 | 1 | ~24 |
-| 512²  | GRID 4×6, tile `128×96`, split=1  | 24 | 1 | ~24 |
-| 1536² | uniform 3×4 + split-2             | 24 | 1 | 24 |
-| 64²   | uniform 4×4 + split-2 (only 4×4 fractals exist) | 16 | 2 | 16 |
+| 256³ / 1024³ / 4096³ | `3×4` grid × split-2 | 24 | 1 | 24.0 |
+| 2048³ | `3×4` grid × split-2 (bigger tiles, ~8% < `4×6` spatial) | 24 | 1 | 24.0 |
+| 2048²×512 | `4×6` grid × split-1 | 24 | 1 | 24.0 |
+| 64² (K=64) | only 4×4 fractals; floor caps S≤2 → cost picks fewer (DDR-bound) | 16 | 1 | 16 |
 
-Before the grid, 2048²/512² were stuck at a power-of-two tile count (16) → eff_par
-16. The grid lands 24 balanced regions in one wave.
+Before the grid+split unification, power-of-two shapes were stuck at a power-of-two
+tile count (16/32) → eff_par 16. Now they land **24 work units in one wave** via the
+cheapest spatial×split combo, with no padding.
 
 ---
 
