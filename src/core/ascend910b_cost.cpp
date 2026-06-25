@@ -1502,7 +1502,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                             : WaveComputeCycles(total_compute, units1, n_cores);
       const double active1 = (double)std::min<int64_t>(units1, n_cores);
       const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
-      const double lat1 = std::max(compute1, ddr1);
+      // Double-buffer floor: the max(compute, ddr) overlap is only real when the
+      // operand reload can ping-pong, i.e. the per-core contraction is halvable
+      // into >=2 seq-K sub-strips (>= 32 = two K-fractals; the emit's implicit
+      // halving needs that). A tiny contraction can't overlap -> reload and
+      // compute SERIALIZE (compute + ddr). Grounded only; legacy keeps max.
+      auto db_roofline = [&](double comp, double dram, int64_t per_core_K) {
+        const bool overlap = !(prob_->cube_freq_hz > 0.0) || per_core_K >= 32;
+        return overlap ? std::max(comp, dram) : comp + dram;
+      };
+      const double lat1 = db_roofline(compute1, ddr1, output_K_);
       // Sink split-K: split the sink contraction into S per-tile partials to
       // recruit idle cores. The streaming phase (operand reload overlaps partial
       // compute) is a roofline; the S partials then reduce through DDR AFTER
@@ -1543,7 +1552,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                               : WaveComputeCycles(total_compute, unitsS, n_cores);
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
         const double stream_ddrS = reload * bc.reload * sat(activeS);  // GM->L1 feed
-        const double streamS = std::max(computeS, stream_ddrS);
+        // Double-buffer floor: a partial owns only output_K_/S of the contraction,
+        // so an over-aggressive split (K/S < 32, i.e. < 2 K-fractals) can no longer
+        // ping-pong its reload -> the streaming phase serializes (compute + ddr).
+        const double streamS = db_roofline(computeS, stream_ddrS, output_K_ / S);
         // Merge barrier. Two regimes, selected by the target's ddr_atomic_add
         // capability (see Problem::ddr_atomic_add):
         //   (1) ALWAYS — write the S partials to DDR (parallel across effS cores).
