@@ -180,9 +180,11 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
   //   vector: tile + ephemerals fit UB (vec_capacity)
-  // double_buffer halves the streaming pools (L1/UB). When the relevant 910B
-  // pool budgets are 0 (legacy/competition), falls back to the single
-  // fast_memory_capacity element-count check.
+  // Always double-buffered, but the pools are NOT halved: the two ping-pong
+  // buffers together ARE the L1/UB, so feasibility uses the full capacity and
+  // the emit halves the per-load k instead. When the relevant 910B pool budgets
+  // are 0 (legacy/competition), falls back to the single fast_memory_capacity
+  // element-count check.
   bool fits_on_chip(const TileConfig &cfg,
                     const FlatSet<size_t> &retained_from_prev,
                     const FlatSet<size_t> &retain_these) const;

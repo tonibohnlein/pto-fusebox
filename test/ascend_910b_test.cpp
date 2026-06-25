@@ -531,16 +531,19 @@ static void test_atomic_add_flag() {
 // base_cost (so the rest of the suite is unchanged).
 static void test_geometry_compute() {
     std::cout << "[GEOM] machine-cost compute: cube=#fractals*cost, vector=#steps*cost\n";
-    // Cube: out[128,128], K=2048 -> 128/16 * 128/16 * 2048/16 = 8192 fractals.
+    // Cube: out[64,96], K=2048 -> 64/16 * 96/16 * 2048/16 = 3072 fractals.
+    // 24-divisible shape: 4x6 = 24 EQUAL 1-fractal regions -> one wave, eff_par 24
+    // EXACTLY (a power-of-2 square like 128^2 caps at eff_par ~23.1 under the
+    // wave/grid model, so W/cores_used is unreachable there -- see doc section 7).
     Problem c;
-    c.tensors = {{2048, 128}, {128, 2048}, {128, 128}};
+    c.tensors = {{2048, 64}, {96, 2048}, {96, 64}};
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost IGNORED when cube_compute_cost set
     c.fast_memory_capacity = 1 << 26; c.slow_memory_bandwidth = 10; c.native_w = 128; c.native_h = 128;
     set_910b(c);
     c.cube_compute_cost = 10000;
     c.kernel_fill_cost = 0;  // isolate the compute roofline  // per fractal (machine param)
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
-    const double fractals = 128.0 / 16 * 128.0 / 16 * 2048.0 / 16;  // 8192
+    const double fractals = 64.0 / 16 * 96.0 / 16 * 2048.0 / 16;  // 3072
     const double exp_c = fractals * 10000.0 / rc.cores_used;
     std::cout << "    cube: fractals=" << (long long)fractals << " cores=" << rc.cores_used
               << " -> lat=" << rc.latency << " (expect " << exp_c << ")\n";
@@ -1304,7 +1307,11 @@ static void test_chain_ksplit_variants() {
     CHECK("KVAR/no-k: sink runs full K (no seq-slice)", nok.k1 == nok.N1);
     // (2) INTERNAL single-core k-split: huge K1 forces the internal matmul to
     // slice its contraction on one core; the sink still fills cores spatially.
-    auto ink = run(1024, 8192, 64, 1024, 4096);
+    // M=384 = 24 M-fractals -> the (24,1) grid fills the cores with eff_par 24
+    // EXACTLY, so the sink needs no parallel split. (At M=1024 = 64 M-fractals
+    // the (24,1) grid is coarse, eff_par 21.3, and the model correctly prefers a
+    // split-K core-fill instead -- see doc section 7 / the GEOM 24-divisibility note.)
+    auto ink = run(384, 8192, 64, 1024, 4096);
     CHECK("KVAR/internal-k: spatial tile within sink output (unified grid)", grid_within_output(ink));
     CHECK("KVAR/internal-k: sink not parallel-split", ink.split == 1);
     CHECK("KVAR/internal-k: internal seq-slices below K1 (no merge)",
