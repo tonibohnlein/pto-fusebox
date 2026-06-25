@@ -4,6 +4,7 @@
 #include <cmath>
 #include <numeric>
 #include <cassert>
+#include <set>
 #include <tuple>
 
 // ============================================================================
@@ -799,13 +800,28 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     if (shared_m) {
       const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
       const int64_t C = std::max<int64_t>(1, prob.num_cube_cores);
+      // The fill target is n_cores (and 2*n_cores) WORK UNITS = spatial regions
+      // (parts_m x parts_n) x the parallel split-K S. Enumerate the spatial factor
+      // P x Q over the DIVISORS of {C, 2C}; compute_cost's split-K loop then
+      // supplies S = target/(P*Q). So an output too small to form C spatial
+      // regions (16-fractal aligned) still fills the cores through the k-split --
+      // e.g. 64^2 = 4x4 fractals: no P*Q=24 fits, but (4,3) grid x S=2 = 24 units.
+      // The fewer-split-K-partials tiebreak prefers the all-spatial grid (S=1)
+      // whenever C regions fit outright, so 24 is a strong SOFT preference the
+      // cost drives, not a hard rule.
+      std::set<int64_t> region_counts;  // distinct P*Q to offer (divisors of C, 2C)
       for (int64_t R : {C, 2 * C})
-        for (int64_t P = 1; P <= R; ++P) {
-          if (R % P != 0) continue;
-          const int64_t Q = R / P;
-          if (P > Fm || Q > Fn || P * Q < 2) continue;
+        for (int64_t d = 1; d * d <= R; ++d)
+          if (R % d == 0) { region_counts.insert(d); region_counts.insert(R / d); }
+      for (int64_t PQ : region_counts) {
+        if (PQ < 2) continue;
+        for (int64_t P = 1; P <= PQ; ++P) {
+          if (PQ % P != 0) continue;
+          const int64_t Q = PQ / P;
+          if (P > Fm || Q > Fn) continue;
           sg.grid_cand_.emplace_back(P, Q);
         }
+      }
     }
   }
 
