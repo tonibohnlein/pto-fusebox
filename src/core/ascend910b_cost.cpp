@@ -782,47 +782,63 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   if (matmul_910b)
     sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
 
-  // SpatialSchedule grid candidates: balanced ~24-region partitions the uniform
-  // exact-divisor tiles cannot express (powers of two only yield power-of-two
-  // tile counts, never a multiple of 24). The grid tiles the SINK output; the
-  // chain backpropagates from it (an intermediate is a full-width [m_ext, N_int]
-  // row-band of the sink M-partition). This requires every matmul to share the
-  // sink's M dimension (tensors[o].height == out_H_) -- the standard (A@B)@D
-  // chain does; a DAG whose matmuls tile M differently falls back to uniform.
-  // Enumerate factor pairs of n_cores and 2*n_cores (both orientations), bounded
-  // by each axis's 16-fractal count.
+  // SpatialSchedule grid candidates: balanced ~C-region partitions the uniform
+  // exact-divisor tiles cannot express (powers of two only yield power-of-two tile
+  // counts, never a multiple of C). Used for BOTH the cube (C = cube cores) and the
+  // vector (C = vector cores) paths. Each candidate is a (parts_m, parts_n,
+  // split_k) TRIPLE: P*Q is a balanced 16-aligned spatial grid (a divisor of
+  // {C, 2C}), bounded by each axis's 16-fractal cap; split_k is the parallel
+  // contraction/reduction split. The WORK UNITS P*Q*S range freely -- filling all C
+  // cores is a strong SOFT preference, but the cost (merge barrier vs streaming
+  // gain) drives it (a small shape can be best at FEWER than C units when the split
+  // merge outweighs recruiting idle cores). compute_cost evaluates each fixed
+  // triple (no internal S sweep). PQ < 2 (whole-output) is covered by the uniform
+  // path, so skip it.
+  auto gen_grid = [&](int64_t C, int64_t maxP, int64_t maxQ,
+                      const std::vector<int64_t> &s_vals) {
+    std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C}
+    for (int64_t R : {C, 2 * C})
+      for (int64_t d = 1; d * d <= R; ++d)
+        if (R % d == 0) { region_counts.insert(d); region_counts.insert(R / d); }
+    for (int64_t PQ : region_counts) {
+      if (PQ < 2) continue;
+      for (int64_t P = 1; P <= PQ; ++P) {
+        if (PQ % P != 0) continue;
+        const int64_t Q = PQ / P;
+        if (P > maxP || Q > maxQ) continue;
+        for (int64_t S : s_vals) sg.grid_cand_.push_back({P, Q, S});
+      }
+    }
+  };
+  const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
   if (matmul_910b) {
+    // Cube: the grid tiles the SINK output; the chain backpropagates from it, so
+    // every matmul must share the sink's M (tensors[o].height == out_H_) -- the
+    // (A@B)@D chain does; a DAG tiling M differently falls back to uniform. split_k
+    // is the sink-K split S (S | kfrac, each partial a 16-aligned K-slice), so a
+    // power-of-two shape that can't form C spatial regions still fills the cores
+    // via split-K (64^2 = 4x4 fractals -> no P*Q=24, but (4,3) grid x S=2 = 24).
     bool shared_m = true;
     for (auto i : sg.ops_)
       if (prob.ops[i].type == OpType::MatMul &&
           prob.tensors[prob.ops[i].output()].height != sg.out_H_)
         shared_m = false;
     if (shared_m) {
-      const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
-      const int64_t C = std::max<int64_t>(1, prob.num_cube_cores);
-      // The fill target is n_cores (and 2*n_cores) WORK UNITS = spatial regions
-      // (parts_m x parts_n) x the parallel split-K S. Enumerate the spatial factor
-      // P x Q over the DIVISORS of {C, 2C}; compute_cost's split-K loop then
-      // supplies S = target/(P*Q). So an output too small to form C spatial
-      // regions (16-fractal aligned) still fills the cores through the k-split --
-      // e.g. 64^2 = 4x4 fractals: no P*Q=24 fits, but (4,3) grid x S=2 = 24 units.
-      // The fewer-split-K-partials tiebreak prefers the all-spatial grid (S=1)
-      // whenever C regions fit outright, so 24 is a strong SOFT preference the
-      // cost drives, not a hard rule.
-      std::set<int64_t> region_counts;  // distinct P*Q to offer (divisors of C, 2C)
-      for (int64_t R : {C, 2 * C})
-        for (int64_t d = 1; d * d <= R; ++d)
-          if (R % d == 0) { region_counts.insert(d); region_counts.insert(R / d); }
-      for (int64_t PQ : region_counts) {
-        if (PQ < 2) continue;
-        for (int64_t P = 1; P <= PQ; ++P) {
-          if (PQ % P != 0) continue;
-          const int64_t Q = PQ / P;
-          if (P > Fm || Q > Fn) continue;
-          sg.grid_cand_.emplace_back(P, Q);
-        }
-      }
+      const int64_t kfrac = std::max<int64_t>(1, sg.output_K_ / 16);
+      gen_grid(std::max<int64_t>(1, prob.num_cube_cores), Fm, Fn, all_divisors(kfrac));
     }
+  } else if (sg.has_vector_) {
+    // Vector: tile the output across the AIV cores. The PARALLEL split is the
+    // reduced-axis (cross-core accumulation) split, which is meaningful ONLY for a
+    // reduction SINK -- and the vector branch of compute_cost handles THAT
+    // internally -- so these grids are PURE SPATIAL (split_k = 1). A reduced axis
+    // cannot be spatially tiled (the whole row/col must be present to reduce), so
+    // its parts pin to 1: a width reduction ([H,W]->[H,1]) tiles only height
+    // (parts_n = 1), a height reduction only width (parts_m = 1); pointwise tiles
+    // both.
+    const int64_t maxP = (sg.reduced_axis_ == 2) ? 1 : Fm;  // height reduced -> no M-split
+    const int64_t maxQ = (sg.reduced_axis_ == 1) ? 1 : Fn;  // width  reduced -> no N-split
+    gen_grid(std::max<int64_t>(1, prob.num_vector_cores), maxP, maxQ, {1});
   }
 
   // Depth-first topological execution order (the fixed pebbling order). Post-
@@ -1531,82 +1547,72 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // K-fractal divisors and let the merge cost (which grows with S) reject the
       // excessive ones. output_K_ is the sink matmul's contraction (NOT max_K_).
       const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
-      double best_latS = std::numeric_limits<double>::infinity();
-      int64_t best_S = 1;
-      double best_activeS = active1, best_computeS = compute1, best_stream_ddr = 0.0,
-             best_merge = 0.0;
-      // Only S that evenly split the K-fractals are feasible: each of the S cores gets
-      // an equal, 16-aligned K-slice (output_K / S), so the emit can realize the split
-      // cleanly (one partial matmul per slice, atomic-added). Enumerate the divisors of
-      // kfrac (S >= 2); a non-divisor S would not be emittable. all_divisors() is
-      // ascending, so ties pick the smallest S.
-      for (int64_t S : all_divisors(kfrac)) {
-        if (S < 2) continue;
-        // Optional: a real emitter/runtime cap on the partial count would go here.
+      // Evaluate one split factor S (>=1) -> latency components. S=1 is the
+      // spatial-only roofline (lat1); S>=2 splits the sink contraction into S equal
+      // 16-aligned partials (each owns output_K_/S) -- a streaming roofline plus an
+      // ADDITIVE DDR merge barrier. Only S | kfrac is emittable (one partial matmul
+      // per equal 16-aligned K-slice, atomic-added).
+      struct SplitEval { double lat, compute, stream_ddr, merge, active; };
+      auto eval_S = [&](int64_t S) -> SplitEval {
+        if (S <= 1) return {lat1, compute1, ddr1, 0.0, active1};
         const int64_t unitsS = (int64_t)num_tiles * S;
-        // Grid: LPT the P*Q regions with the K split S ways (each region's work
-        // /S, P*Q*S units) -- honest about the +-1-fractal imbalance, unlike the
-        // equal-unit wave used for uniform tiles.
+        // Grid: LPT the P*Q regions with K split S ways (P*Q*S units) -- honest
+        // about the +-1-fractal imbalance; uniform: the equal-unit wave.
         const double computeS =
             (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work, S)
                               : WaveComputeCycles(total_compute, unitsS, n_cores);
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
         const double stream_ddrS = reload * bc.reload * sat(activeS);  // GM->L1 feed
-        // Double-buffer floor: a partial owns only output_K_/S of the contraction,
-        // so an over-aggressive split (K/S < 32, i.e. < 2 K-fractals) can no longer
-        // ping-pong its reload -> the streaming phase serializes (compute + ddr).
+        // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
         const double streamS = db_roofline(computeS, stream_ddrS, output_K_ / S);
-        // Merge barrier. Two regimes, selected by the target's ddr_atomic_add
-        // capability (see Problem::ddr_atomic_add):
-        //   (1) ALWAYS — write the S partials to DDR (parallel across effS cores).
-        //   (2) WITHOUT SetAtomicAdd — read the partials back and accumulate
-        //       serially per output tile: the S adds target ONE DDR accumulator
-        //       per tile, so they SERIALIZE per tile (parallelism is across the
-        //       num_tiles accumulators, NOT across S). It gets sat(num_tiles) and
-        //       grows ~linearly with S (no cancellation) — the real price of a
-        //       DDR reduction, which makes the optimum S interior.
-        //   WITH SetAtomicAdd — the partials accumulate in DDR during write-back,
-        //       so (2) vanishes; the merge is just (1) (sat-discounted → cancels
-        //       below full-fill), so split-K stays cheap and max-fill is optimal.
-        double merge = (double)S * out_store * bc.store * sat(activeS);               // (1) write partials (L0C->GM)
+        // Merge barrier: (1) write S partials (L0C->GM); WITHOUT SetAtomicAdd, also
+        // (2) a serial per-tile read-back + sum (~linear in S; the optimum S is then
+        // interior). WITH SetAtomicAdd the partials accumulate during write-back, so
+        // (2) vanishes and split-K stays cheap.
+        double merge = (double)S * out_store * bc.store * sat(activeS);
         if (!prob_->ddr_atomic_add)
-          merge += (double)(S + 1) * out_store * bc.store * sat((double)num_tiles);   // (2) serial read-back + sum
-        const double latS = streamS + merge;
-        if (latS < best_latS) {
-          best_latS = latS; best_S = S; best_activeS = activeS;
-          best_computeS = computeS; best_stream_ddr = stream_ddrS; best_merge = merge;
+          merge += (double)(S + 1) * out_store * bc.store * sat((double)num_tiles);
+        return {streamS + merge, computeS, stream_ddrS, merge, activeS};
+      };
+
+      // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
+      // enumeration) and is evaluated as-is; a uniform/legacy tile (split_k==0)
+      // sweeps S over the valid K-fractal divisors and adopts a split only if it
+      // STRICTLY beats the spatial-only S=1.
+      int64_t chosen_S = 1;
+      SplitEval chosen = {lat1, compute1, ddr1, 0.0, active1};
+      if (cfg.split_k >= 1) {
+        chosen_S = cfg.split_k;
+        chosen = eval_S(chosen_S);
+      } else {
+        for (int64_t S : all_divisors(kfrac)) {
+          if (S < 2) continue;
+          const SplitEval e = eval_S(S);
+          if (e.lat < chosen.lat) { chosen = e; chosen_S = S; }
         }
       }
-      if (best_S > 1 && best_latS < lat1) {  // sink split-K only if it helps
-        result.latency = best_latS;
-        result.parallel_split = (int)best_S;
-        result.cores_used = (int)best_activeS;
-        result.compute_bound = best_computeS >= best_stream_ddr;  // streaming phase
-        result.ddr_traffic = best_stream_ddr + best_merge;
-        // Displayed per-core k composes the two k-levers: the greedy single-core
-        // L1-fit k (derive_exec, a divisor of output_K_), capped by the per-core
-        // split-K fractal share ceil(kfrac / S)*16. Largest divisor of output_K_
-        // not exceeding both -> k cleanly divides the contraction.
-        std::vector<int64_t> pk;
-        derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
-        const int64_t l1_k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0)
-                                 ? pk[sink_mm_op_] : output_K_;
-        const int64_t share_k = ((kfrac + best_S - 1) / best_S) * 16;
+
+      result.latency = chosen.lat;
+      result.parallel_split = (int)chosen_S;
+      result.cores_used = (int)chosen.active;
+      result.compute_bound = chosen.compute >= chosen.stream_ddr;  // streaming phase
+      result.ddr_traffic = chosen.stream_ddr + chosen.merge;       // S=1: ddr1, no merge
+      // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
+      // divisor of output_K_), capped for a split by the per-core fractal share
+      // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
+      std::vector<int64_t> pk;
+      derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
+      const int64_t l1_k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0) ? pk[sink_mm_op_]
+                                                                     : output_K_;
+      if (chosen_S > 1) {
+        const int64_t share_k = ((kfrac + chosen_S - 1) / chosen_S) * 16;
         int64_t per_core_k = 16;
         for (int64_t d = std::min({l1_k, share_k, output_K_}); d >= 16; d -= 16)
           if (output_K_ % d == 0) { per_core_k = d; break; }
         result.config.k = per_core_k;
       } else {
-        result.latency = lat1;
-        result.parallel_split = 1;
-        result.cores_used = (int)active1;
-        result.compute_bound = compute1 >= ddr1;
-        result.ddr_traffic = ddr1;
-        // Spatial-only (S=1): displayed k = the greedy single-core L1-fit k.
-        std::vector<int64_t> pk;
-        derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
-        result.config.k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0)
-                              ? pk[sink_mm_op_] : cfg.k;
+        result.config.k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0) ? pk[sink_mm_op_]
+                                                                    : cfg.k;
       }
     } else {
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
@@ -1679,11 +1685,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       }
       // Same DDR bandwidth-saturation factor as the cube: HBM needs many cores'
       // DMA engines to saturate, so a DDR-bound tile on too few vector cores pays.
+      // Wave-aware compute makespan (ceil(num_tiles/cores) waves) -- the analog of
+      // the cube path, so a balanced num_tiles==cores grid (one wave) beats an
+      // over-tiled count (multiple waves) that the old total_compute/eff scored
+      // identically. eff stays the per-wave active-core count for the DDR sat.
+      const double compute_mk = WaveComputeCycles(total_compute, num_tiles, n_cores);
       const double sat_v = std::max(1.0, (double)n_cores / eff);
-      double lat = std::max(total_compute / eff, total_io * sat_v);
+      double lat = std::max(compute_mk, total_io * sat_v);
       result.parallel_split = 1;
       result.cores_used = (int)eff;
-      result.compute_bound = (total_compute / eff) >= total_io * sat_v;
+      result.compute_bound = compute_mk >= total_io * sat_v;
       result.ddr_traffic = total_io;
       // Reduced-axis (cross-core) split — the vector analog of the cube split-K.
       // SINK-ONLY: the S per-core partials reduce across cores through DDR (fine
@@ -1699,7 +1710,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         for (int64_t S = 2; S <= S_max; ++S) {
           const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
           const double sat_vS = std::max(1.0, (double)n_cores / effS);
-          const double streamS = std::max(total_compute / effS, total_io * sat_vS);
+          const double streamS = std::max(
+              WaveComputeCycles(total_compute, num_tiles * S, n_cores), total_io * sat_vS);
           // (1) write/atomic-add the S thin partials (parallel; cancels below full-fill).
           double merge = (double)(S - 1) * red_dim * bc.ub_out * sat_vS;
           // (2) WITHOUT SetAtomicAdd: read the partials back and sum serially per
@@ -1906,13 +1918,21 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           //      when it is STRICTLY faster (caught by the latency test above).
           //   2. lower DDR traffic   — matmul reuse (less reload); flat for PW
           //   3. more cores used     — fill the unit's cores (parallelism)
-          //   4. larger tile area    — best vectorization / least per-tile
+          //   4. UNIFORM over grid    — a non-uniform SpatialSchedule grid wins ONLY
+          //      when STRICTLY faster (caught above). At equal latency the uniform
+          //      exact-divisor tile is preferred: its even-divisor extents are
+          //      emit-friendly, whereas a grid's +-1-fractal extents (e.g. h=1376
+          //      on a 4096 axis) the tiling emit cannot realize cleanly. So a grid
+          //      is used only where it pays for itself (power-of-two fills).
+          //   5. larger tile area    — best vectorization / least per-tile
           //      overhead (avoids the degenerate 1xN / 16x16 picks)
-          //   5. larger k            — fewer L1 passes
+          //   6. larger k            — fewer L1 passes
           const double tol = 1e-6 * std::max(1.0, best.latency);
           const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
           const long long ra = (long long)r.config.w * r.config.h;
           const long long ba = (long long)best.config.w * best.config.h;
+          const bool r_uniform = r.config.parts_m == 0;
+          const bool b_uniform = best.config.parts_m == 0;
           if (r.latency < best.latency - tol) {
             take = true;
           } else if (r.latency > best.latency + tol) {
@@ -1925,6 +1945,8 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
             take = false;
           } else if (r.cores_used != best.cores_used) {
             take = r.cores_used > best.cores_used;
+          } else if (r_uniform != b_uniform) {
+            take = r_uniform;  // emit-friendly uniform tile beats a grid when equal
           } else if (ra != ba) {
             take = ra > ba;
           } else {
@@ -1943,11 +1965,18 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
   // Non-uniform SpatialSchedule grids (Phase A): each (parts_m, parts_n) lands a
   // balanced region count the uniform tiles can't (e.g. exactly n_cores). w,h
   // carry the physical (max) region extent so fits_on_chip / reload are unchanged.
+  // One config per (parts_m, parts_n, split_k) triple. The single-core seq-k is
+  // NOT enumerated: grid_k is just a structurally-valid placeholder (largest k
+  // divisor). fits_on_chip -> derive_exec then DERIVES the greedy L1-fitting
+  // per-op k and returns infeasible (INT64_MAX) iff NO such k exists -- so a
+  // triple is only accepted when a memory-fitting k EXISTS, and that derived k is
+  // what compute_cost writes back to result.config.k for the emit. The parallel
+  // split is the triple's split_k, evaluated by compute_cost as a fixed S.
+  const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
   for (const auto &g : grid_cand_) {
-    const AxisPartition pm = partition_axis(out_H_, g.first);
-    const AxisPartition pn = partition_axis(out_W_, g.second);
-    for (int64_t kk : ks_cand_)
-      consider(TileConfig{pn.big, pm.big, kk, pm.parts, pn.parts});
+    const AxisPartition pm = partition_axis(out_H_, g.parts_m);
+    const AxisPartition pn = partition_axis(out_W_, g.parts_n);
+    consider(TileConfig{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k});
   }
   return best;
 }

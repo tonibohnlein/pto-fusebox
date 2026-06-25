@@ -186,6 +186,12 @@ struct TileConfig {
     // PHYSICAL (max) region extent so the L1-fit / reload machinery is unchanged.
     // See partition_axis().
     int64_t parts_m = 0, parts_n = 0;
+    // Parallel split-K: the sink contraction is split into `split_k` equal
+    // 16-aligned partials across cores (atomic-add merge), so the work units are
+    // parts_m * parts_n * split_k. 0 => UNSET — compute_cost sweeps S internally
+    // (the uniform/legacy path). >=1 => a FIXED factor from the SpatialSchedule
+    // (P,Q,S) triple enumeration, evaluated as-is (no internal sweep).
+    int64_t split_k = 0;
 };
 
 // Even distribution of an axis of `dim` elements into `parts` regions, in units

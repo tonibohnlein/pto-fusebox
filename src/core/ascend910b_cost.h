@@ -365,12 +365,16 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<int64_t> ws_cand_;
   std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;
-  // Non-uniform spatial-grid candidates (parts_m, parts_n) for the cube path —
-  // factor pairs of useful region counts (n_cores, 2*n_cores) that land a
-  // balanced ~24-region partition the uniform exact-divisor tiles can't express.
-  // Empty for vector / chained / legacy subgraphs (SpatialSchedule Phase A
-  // targets the single-matmul cube sink).
-  std::vector<std::pair<int64_t, int64_t>> grid_cand_;
+  // SpatialSchedule (parts_m, parts_n, split_k) TRIPLES for the cube path. Each
+  // lands parts_m*parts_n*split_k WORK UNITS targeting the core count (n_cores) or
+  // 2*n_cores (a 2-wave grid): P*Q is the balanced 16-aligned spatial partition,
+  // S=split_k splits the sink K across cores to fill what the spatial grid alone
+  // can't (a power-of-two shape that can't form C spatial regions still fills the
+  // cores via split-K). One enumeration of all three core-fill levers; the
+  // single-core seq-k is NOT here (derive_exec sets it greedily). Empty for
+  // vector / legacy subgraphs (the uniform divisor tiles cover those).
+  struct SpatialTriple { int64_t parts_m, parts_n, split_k; };
+  std::vector<SpatialTriple> grid_cand_;
 
   // Flat lookup: tensor index → list of indices into boundary_tensor_info_.
   // Empty list means the tensor isn't a boundary tensor of this subgraph.
