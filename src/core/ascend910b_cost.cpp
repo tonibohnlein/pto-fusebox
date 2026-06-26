@@ -1716,6 +1716,18 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // more, so a larger tile gets no extra (and unreal) overlap credit.
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
       const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+      // DMA-shape penalty (grounded): GM<->UB moves a tile as `h` strided segments
+      // of `w` contiguous elements (one tile-row). The DMA reaches peak bandwidth
+      // only when that contiguous run spans >= one transfer burst; below it the
+      // per-descriptor setup dominates (a narrow rectangle issues many tiny strided
+      // transfers). Charge io a max(1, burst / (w*dtype)) factor, burst =
+      // vec_reg_bytes -- so a wide / full-width (row-strip) tile is unpenalized
+      // (factor 1) and the dividing tiebreak still picks among efficient tiles,
+      // while only sub-burst widths pay. Makes a row/column-friendly layout
+      // cost-FAVORED, not just tiebreak-favored. (pto-isa BLOCK_BYTE_SIZE=32 is the
+      // DMA block; contiguity below the burst is descriptor-bound.)
+      if (prob_->cube_freq_hz > 0.0)
+        total_io *= std::max(1.0, (double)vreg / std::max(1.0, (double)cfg.w * (double)dtb));
       const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
       const bool db = !(prob_->cube_freq_hz > 0.0) || tile_bytes >= 2.0 * (double)vreg;
       auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };

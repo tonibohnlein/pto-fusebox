@@ -246,6 +246,18 @@ load of chunk s+1 overlaps the compute of chunk s. A smaller tile can't ping-pon
 threshold grants `max` and nothing more — a larger tile gets no extra (unreal)
 overlap credit. The vector analog of the cube's `K ≥ 32`.
 
+**DMA-shape penalty.** GM↔UB moves a tile as `h` **strided segments** of `w`
+contiguous elements (one tile-row). The DMA reaches peak bandwidth only when that
+contiguous run spans ≥ one transfer burst; below it the per-descriptor setup
+dominates (a narrow rectangle issues many tiny strided transfers). So `io` carries
+a `max(1, vec_reg_bytes / (w·dtype_bytes))` factor: a **wide / full-width row-strip**
+tile is unpenalized (factor 1), only sub-burst widths pay. This makes a
+row/column-friendly layout **cost-favored** (not just tiebreak-favored) — e.g. a
+256² pointwise lands on a full-width `[256, 6]` row-strip instead of a `[32, 64]`
+rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below the
+burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
+emit-friendly tile among efficient ones.
+
 **Reduction recompute.** When a reduction's coupled band overflows UB
 (`vector_peak_ub > vec_capacity`), the feasible schedule STREAMS the reduced axis
 and recomputes the reused ephemerals once per pass: `compute *= n_passes`,
@@ -310,12 +322,14 @@ Among equal-latency configs, lexicographic:
 
 ## 11. Known limitations / open calibration
 
-- **Vector double-buffer threshold** (`2·vec_reg_bytes`) and the reduction
-  **`n_passes` recompute** are the least-calibrated terms — both are reasoned
-  bounds, not measured.
-- **Per-tile overhead.** The vector compute is tiling-invariant (full-op cost); it
-  does not charge a per-tile SIMD pipeline-fill, so "favor larger tiles" is a
-  *tiebreak* (§9.5), not cost-driven. Fine once tiles can be arbitrarily fine.
+- **Calibration constants** — the vector double-buffer threshold (`2·vec_reg_bytes`),
+  the DMA-shape burst (`vec_reg_bytes`), and the reduction **`n_passes` recompute**
+  are reasoned bounds, not measured. The DMA-shape burst especially is a knob: it
+  sets the contiguous width above which a tile is DMA-efficient.
+- **Per-tile compute overhead.** The vector *compute* is still tiling-invariant
+  (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
+  tiles, "favor larger tiles" is a *tiebreak* (§9.5), not cost-driven. (The DMA
+  shape *is* now cost-driven, via §7.)
 - **Emit gap (downstream).** The solver chooses grids and split-K; the AutoFuse
   cube **emit** does not yet realize split-K for a lone matmul. Solver-side
   complete; this is Phase-C codegen work, independent of the cost model.

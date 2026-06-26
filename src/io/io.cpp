@@ -239,6 +239,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
     json j;
     j["subgraphs"]         = json::array();
     j["granularities"]     = json::array();
+    j["parts"]             = json::array();  // 910B spatial grid (parts_m, parts_n) per step
     j["splits"]            = json::array();  // 910B parallel split-K / reduction split per step
     j["cores"]             = json::array();  // 910B cube/vector cores used per step
     j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
@@ -252,6 +253,11 @@ void write_solution(const std::string& filename, const Solution& sol) {
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
+        // Spatial grid shape: parts_m x parts_n regions (0,0 = a uniform tile,
+        // region count = floor(out_W/w)*floor(out_H/h)). w,h above are the MAX
+        // region extent (regions differ by <=1 block), NOT a uniform tile -- read
+        // the region count from here, do not infer it from the tile size.
+        j["parts"].push_back({cfg.parts_m, cfg.parts_n});
         // Parallel split + cores used for this tile (cube split-K / vector
         // reduction split; 1 = pure spatial). Computed for the chosen config.
         {

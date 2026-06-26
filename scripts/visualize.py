@@ -15,13 +15,20 @@ def hw_legend(d):
     bw = d.get('slow_memory_bandwidth', '?')
     if d.get('num_cube_cores', 1) > 1 or d.get('num_vector_cores', 1) > 1:
         kb = lambda x: f"{d.get(x, 0) // 1024}KB"
+        grounded = (d.get('cube_freq_hz', 0) or 0) > 0
+        if grounded:
+            bw_line = (f"grounded (pto-isa cycles, {d['cube_freq_hz']/1e9:.2f}GHz): "
+                       f"GM->L1 {d.get('bw_gm_l1')}  L0c->GM {d.get('bw_l0c_gm')}  "
+                       f"GM<->UB {d.get('bw_gm_ub')}/{d.get('bw_ub_gm')} GiB/s")
+        else:
+            bw_line = f"legacy single-pool: HBM bandwidth {bw}"
         lines = [
             "Ascend 910B (1 die)",
             f"Cube/AIC: {d.get('num_cube_cores')} cores   Vector/AIV: {d.get('num_vector_cores')} cores",
-            f"L1/Mat (operands): {kb('l1_capacity')}   L0c/Acc (output): {kb('cube_capacity')}",
-            f"UB (vector): {kb('vec_capacity')}",
-            f"HBM bandwidth: {bw}   double-buffer: {'on' if d.get('double_buffer') else 'off'}",
-            f"Cube fractal: 16x16x16   tile align: 16",
+            f"L1/Mat: {kb('l1_capacity')}   L0c/Acc: {kb('cube_capacity')}   UB: {kb('vec_capacity')}",
+            bw_line,
+            "Tile: cube 16x16 fractal  |  vector sub-16 rows + 32B DMA-block width",
+            "Grid-only (P x Q x split-K); double-buffered (implicit, full pool)",
         ]
     else:
         lines = [f"Fast Mem: {d.get('fast_memory_capacity', 0) / 1000.0:.1f} K",
@@ -268,6 +275,20 @@ def generate_solution_dot(input_data, output_data, out_filepath):
             unit = "cube" if op_type == "MatMul" else "vector"
             cores_str = f"\\n{unit} cores: {cores}" if cores else ""
 
+            # Spatial grid shape: parts_m x parts_n REGIONS. The tile (w x h) below
+            # is the MAX region of a (possibly non-uniform, +-1-block) grid, NOT a
+            # uniform tile -- so show the region count explicitly; a viewer can't
+            # infer it from w x h (e.g. a 4x12=48-region grid has a 32x64 max tile,
+            # not 8x4=32 tiles). Work units = regions x split-K = `cores`.
+            parts_list = output_data.get('parts', [])
+            parts = parts_list[first_step] if len(parts_list) > first_step else [0, 0]
+            if parts and parts[0] > 0:
+                grid_str = f"\\n{parts[0]}x{parts[1]} grid = {parts[0] * parts[1]} regions"
+                tile_word = "max region"
+            else:
+                grid_str = ""
+                tile_word = "tile"
+
             # Single-core k-stream per op (by its slot in op_order): the matmul
             # contraction seq-k, or a vector tile's UB-chunk stream. 0 = no
             # sub-streaming (materialized), not shown.
@@ -283,7 +304,7 @@ def generate_solution_dot(input_data, output_data, out_filepath):
 
             step_str = ",".join(map(str, steps))
             label = (f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}"
-                     f"\\ntile {gran[0]}x{gran[1]}{seq_str}{split_str}{cores_str}\\nLat: {lat:.1f}")
+                     f"\\n{tile_word} {gran[0]}x{gran[1]}{grid_str}{seq_str}{split_str}{cores_str}\\nLat: {lat:.1f}")
             lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
         else:
             label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"
