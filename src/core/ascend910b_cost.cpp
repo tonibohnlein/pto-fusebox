@@ -27,18 +27,15 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // ============================================================================
 // Grounded pto-isa machine model (Ascend 910B / A2A3)
 // ============================================================================
-// All grounded costs are in CORE CYCLES, matching pto-isa's EstimateLinearCycles
-// (cube) and EstimateBandwidthCycles (transfers). When the grounded fields are
-// unset (cube_freq_hz == 0) every helper falls back to the legacy placeholders
-// (cube_compute_cost per fractal, the single slow_memory_bandwidth), so
-// competition/legacy instances are byte-for-byte unchanged.
+// All costs are in CORE CYCLES, matching pto-isa's EstimateLinearCycles (cube)
+// and EstimateBandwidthCycles (transfers), using the grounded A2/A3 coefficients
+// (per-direction bandwidths, core clock, L0/vector-register sizes).
 namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
-// Per-direction "cycles per byte" for a transfer. Grounded: a byte costs
-// (1/2^30)/bw_GiBps * freq_hz cycles (EstimateBandwidthCycles). Legacy: the
-// single 1/slow_memory_bandwidth, direction-agnostic.
+// Per-direction "cycles per byte" for a transfer: a byte costs
+// (1/2^30)/bw_GiBps * freq_hz cycles (pto-isa EstimateBandwidthCycles).
 struct ByteCost {
   double reload = 0.0;  // GM->L1   (cube operand reload)
   double store = 0.0;   // L0C->GM  (cube output writeback)
@@ -49,12 +46,9 @@ struct ByteCost {
 };
 
 ByteCost MakeByteCost(const Problem* p) {
-  const double inv_legacy = 1.0 / (double)p->slow_memory_bandwidth;
-  const bool grounded = p->cube_freq_hz > 0.0;
-  auto cpb = [&](double bw_gibps) {
-    return (grounded && bw_gibps > 0.0) ? p->cube_freq_hz / (kGiB * bw_gibps)
-                                        : inv_legacy;
-  };
+  // Per-direction cycles/byte: a byte costs freq / (2^30 * bw_GiBps) cycles
+  // (pto-isa EstimateBandwidthCycles); bandwidths are GiB/s, per direction.
+  auto cpb = [&](double bw_gibps) { return p->cube_freq_hz / (kGiB * bw_gibps); };
   return {cpb(p->bw_gm_l1), cpb(p->bw_l0c_gm), cpb(p->bw_l1_l0a),
           cpb(p->bw_l1_l0b), cpb(p->bw_gm_ub), cpb(p->bw_ub_gm)};
 }
@@ -62,30 +56,24 @@ ByteCost MakeByteCost(const Problem* p) {
 // Cube MAC cost of one M x N x K matmul, in cycles. Grounded: the dtype-aware
 // fractal count x cycles-per-repeat (pto-isa cce_costmodel_cube.hpp `mad`):
 // kF = 32/dtype_bytes (fp32:8, fp16:16), cyc = 2 (fp32) else 1. cube_compute_cost
-// (default 1 in the grounded config) is a calibration multiplier. Legacy: the
-// fixed-16 K-fractal count x the flat per-fractal cube_compute_cost.
+// (default 1) is a calibration multiplier.
 double CubeMacCycles(const Problem* p, int64_t M, int64_t N, int64_t K, DType dt) {
-  if (p->cube_freq_hz > 0.0) {
-    const int64_t kF = std::max<int64_t>(1, 32 / dtype_bytes(dt));
-    const double repeats = (double)((M + 15) / 16) * (double)((N + 15) / 16) *
-                           (double)((K + kF - 1) / kF);
-    const double cyc = (dt == DType::FP32) ? 2.0 : 1.0;
-    const double mult = (p->cube_compute_cost > 0) ? (double)p->cube_compute_cost : 1.0;
-    return repeats * cyc * mult;
-  }
-  const double fractals = (double)((M + 15) / 16) * (double)((N + 15) / 16) *
-                          (double)((K + 15) / 16);
-  return fractals * (double)p->cube_compute_cost;
+  const int64_t kF = std::max<int64_t>(1, 32 / dtype_bytes(dt));
+  const double repeats = (double)((M + 15) / 16) * (double)((N + 15) / 16) *
+                         (double)((K + kF - 1) / kF);
+  const double cyc = (dt == DType::FP32) ? 2.0 : 1.0;
+  const double mult = (p->cube_compute_cost > 0) ? (double)p->cube_compute_cost : 1.0;
+  return repeats * cyc * mult;
 }
 
 // L1->L0 operand extract for one M x N x K matmul, in cycles. The cube re-reads
 // the lhs once per L0 N-block (l0_tile_n) and the rhs once per L0 M-block
 // (l0_tile_m) — the same distribution-aware reuse as cube_operand_reload, one
 // hierarchy level down. Double-buffering overlaps this with the MACs, so the
-// caller takes max(MAC, extract). 0 when ungrounded or no L0 base tile.
+// caller takes max(MAC, extract). 0 when no L0 base tile.
 double CubeExtractCycles(const Problem* p, const ByteCost& bc, int64_t M,
                          int64_t N, int64_t K, DType dt) {
-  if (p->cube_freq_hz <= 0.0 || p->l0_tile_m <= 0 || p->l0_tile_n <= 0)
+  if (p->l0_tile_m <= 0 || p->l0_tile_n <= 0)
     return 0.0;
   const double db = (double)dtype_bytes(dt);
   const double MNK = (double)M * (double)N * (double)K;
@@ -1431,23 +1419,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         // separately; the partitioner picks the cheaper.) Boundary/sink outputs
         // are produced once: factor 1.
         const double recompute = consumed.count(o) ? (double)num_tw : 1.0;
-        if (prob_->cube_compute_cost > 0 || prob_->cube_freq_hz > 0.0) {
-          // Grounded / machine model: dtype-aware fractal MACs + the hierarchical
-          // L1->L0 extract (CubeMacCycles / CubeExtractCycles). CEIL granularity
-          // so a sub-16 dim pads up to one fractal — a small-batch GEMV (M<16)
-          // still costs a full fractal row, matching the cube's 16-granularity.
-          const int64_t Mo = prob_->tensors[o].height;
-          const int64_t No = prob_->tensors[o].width;
-          const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
-          const DType dt = prob_->tensors[o].dtype;
-          total_cube += CubeMacCycles(prob_, Mo, No, Ko, dt) * recompute;
-          total_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt) * recompute;
-        } else {
-          // Legacy: per-op base_cost interpreted as per-native-128-tile cost.
-          total_cube += (double)prob_->ops[i].base_cost *
-                        ((double)prob_->tensors[o].width / prob_->native_w) *
-                        ((double)prob_->tensors[o].height / prob_->native_h);
-        }
+        // Grounded machine model: dtype-aware fractal MACs + the hierarchical
+        // L1->L0 extract (CubeMacCycles / CubeExtractCycles). CEIL granularity
+        // so a sub-16 dim pads up to one fractal — a small-batch GEMV (M<16)
+        // still costs a full fractal row, matching the cube's 16-granularity.
+        const int64_t Mo = prob_->tensors[o].height;
+        const int64_t No = prob_->tensors[o].width;
+        const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
+        const DType dt = prob_->tensors[o].dtype;
+        total_cube += CubeMacCycles(prob_, Mo, No, Ko, dt) * recompute;
+        total_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt) * recompute;
       }
       // Double-buffered overlap of the two per-core cube pipes (MACs || extract).
       const double total_compute = std::max(total_cube, total_extract);
@@ -1539,9 +1520,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // operand reload can ping-pong, i.e. the per-core contraction is halvable
       // into >=2 seq-K sub-strips (>= 32 = two K-fractals; the emit's implicit
       // halving needs that). A tiny contraction can't overlap -> reload and
-      // compute SERIALIZE (compute + ddr). Grounded only; legacy keeps max.
+      // compute SERIALIZE (compute + ddr).
       auto db_roofline = [&](double comp, double dram, int64_t per_core_K) {
-        const bool overlap = !(prob_->cube_freq_hz > 0.0) || per_core_K >= 32;
+        const bool overlap = per_core_K >= 32;
         return overlap ? std::max(comp, dram) : comp + dram;
       };
       const double lat1 = db_roofline(compute1, ddr1, output_K_);
@@ -1648,29 +1629,20 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                         prob_->tensors[prob_->ops[i].output()].height;
         for (auto t : prob_->ops[i].inputs)
           elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-        if (prob_->cube_freq_hz > 0.0) {
-          // Grounded (pto-isa A2A3): per-op CYCLES = head + slope*repeat + tail,
-          // repeat = ceil(elems / (vec_reg_bytes/dtype_bytes)) -- the 256-byte
-          // vector register holds 64 fp32 / 128 fp16 elements. A Reduction takes
-          // the steep vreducev2 slope (~14x an elementwise add); the head/tail
-          // charges each op's pipeline fill, so a multi-op chain (softmax = exp +
-          // reduce + div) pays per op.
-          const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-          const DType dt = prob_->tensors[prob_->ops[i].output()].dtype;
-          const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dt));
-          const int64_t repeat = (elems + epr - 1) / epr;
-          const double slope = (prob_->ops[i].type == OpType::Reduction)
-                                   ? prob_->vec_slope_reduce
-                                   : prob_->vec_slope_pw;
-          total_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
-        } else if (prob_->vector_compute_cost > 0) {
-          // Legacy: vector_lanes elements per SIMD step, flat per-step cost.
-          const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
-          const int64_t steps = (elems + lanes - 1) / lanes;
-          total_compute += (double)steps * (double)prob_->vector_compute_cost;
-        } else {
-          total_compute += (double)prob_->ops[i].base_cost;  // legacy
-        }
+        // Grounded (pto-isa A2A3): per-op CYCLES = head + slope*repeat + tail,
+        // repeat = ceil(elems / (vec_reg_bytes/dtype_bytes)) -- the 256-byte
+        // vector register holds 64 fp32 / 128 fp16 elements. A Reduction takes
+        // the steep vreducev2 slope (~14x an elementwise add); the head/tail
+        // charges each op's pipeline fill, so a multi-op chain (softmax = exp +
+        // reduce + div) pays per op.
+        const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+        const DType dt = prob_->tensors[prob_->ops[i].output()].dtype;
+        const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dt));
+        const int64_t repeat = (elems + epr - 1) / epr;
+        const double slope = (prob_->ops[i].type == OpType::Reduction)
+                                 ? prob_->vec_slope_reduce
+                                 : prob_->vec_slope_pw;
+        total_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
       }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       double total_io = 0.0;  // byte-based: each boundary tensor in its own dtype
@@ -1726,10 +1698,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // while only sub-burst widths pay. Makes a row/column-friendly layout
       // cost-FAVORED, not just tiebreak-favored. (pto-isa BLOCK_BYTE_SIZE=32 is the
       // DMA block; contiguity below the burst is descriptor-bound.)
-      if (prob_->cube_freq_hz > 0.0)
-        total_io *= std::max(1.0, (double)vreg / std::max(1.0, (double)cfg.w * (double)dtb));
+      total_io *= std::max(1.0, (double)vreg / std::max(1.0, (double)cfg.w * (double)dtb));
       const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
-      const bool db = !(prob_->cube_freq_hz > 0.0) || tile_bytes >= 2.0 * (double)vreg;
+      const bool db = tile_bytes >= 2.0 * (double)vreg;
       auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };
       double lat = rfl(compute_mk, total_io * sat_v);
       result.parallel_split = 1;
@@ -1857,18 +1828,14 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
                       prob_->tensors[op.output()].height;
       for (auto t : op.inputs)
         elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-      if (prob_->cube_freq_hz > 0.0) {  // grounded: head + slope*repeat + tail (cycles)
-        const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-        const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(prob_->tensors[op.output()].dtype));
-        const int64_t repeat = (elems + epr - 1) / epr;
-        const double slope = (op.type == OpType::Reduction) ? prob_->vec_slope_reduce
-                                                            : prob_->vec_slope_pw;
-        vector_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
-      } else {
-        const int64_t lanes = std::max<int64_t>(1, prob_->vector_lanes);
-        vector_compute += (double)((elems + lanes - 1) / lanes) *
-                          (double)std::max<int64_t>(prob_->vector_compute_cost, 1);
-      }
+      // Grounded: head + slope*repeat + tail (cycles); repeat = ceil(elems /
+      // (vec_reg_bytes/dtype_bytes)). Reduction takes the steep vreducev2 slope.
+      const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+      const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(prob_->tensors[op.output()].dtype));
+      const int64_t repeat = (elems + epr - 1) / epr;
+      const double slope = (op.type == OpType::Reduction) ? prob_->vec_slope_reduce
+                                                          : prob_->vec_slope_pw;
+      vector_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
     }
   }
 
@@ -1920,7 +1887,7 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // Cube stage = max(MACs, L1->L0 extract) — the same double-buffered hierarchy
   // as the homogeneous cube path. DDR (reload + roundtrips + vector IO) rides
   // the shared GM ring; charge it at the GM->L1 feed bandwidth (the dominant
-  // operand-reload direction; legacy => the lumped slow_memory_bandwidth).
+  // operand-reload direction).
   const double cube_stage = std::max(cube_mac, cube_extract) / eff_units;
   const double vec_stage  = vector_compute / (2.0 * eff_units);
   const double ddr_lat    = ddr_bytes * bc.reload;
@@ -2016,24 +1983,10 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
         if (take) best = r;
   };
 
-  // Uniform exact-divisor tiles. The PURE-CUBE 910B path (has_matmul_, no vector,
-  // n_cores > 1) is GRID-ONLY: feasibility is via derive_exec (the cube seq-k fits
-  // L1 regardless of the spatial tile), so uniform tiles are redundant and the grid
-  // -- now including the (1,1) whole-output region -- covers every fill. The vector
-  // and mixed paths KEEP uniform: a vector reduction (esp. an internal one like
-  // softmax, where reduced_axis_ is set but the output is full [W,H]) tiles and
-  // streams in a way the pure-spatial grid does not yet capture. Single-context
-  // (n_units == 1) also keeps it (no grid). pypto never builds a single-context
-  // Problem; this is the legacy fallback.
-  const int64_t n_units = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
-  auto consider_uniform = [&] {
-    for (int64_t ww : ws_cand_)
-      for (int64_t hh : hs_cand_)
-        for (int64_t kk : ks_cand_)
-          consider(TileConfig{ww, hh, kk});
-  };
-  if (n_units <= 1) consider_uniform();  // grid-only on the 910B path (cube AND vector)
-
+  // GRID-ONLY (910B, cube AND vector). Feasibility is via derive_exec /
+  // vector_stream (the cube seq-k fits L1, the vector streams UB, regardless of the
+  // spatial tile), so the SpatialSchedule grid -- including the (1,1) whole-output
+  // region -- covers every fill; uniform exact-divisor tiles are redundant.
   // SpatialSchedule grids: each (parts_m, parts_n) lands a balanced region count
   // the uniform tiles can't (e.g. exactly n_cores). w,h carry the physical (max)
   // region extent so fits_on_chip / reload are unchanged.

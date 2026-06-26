@@ -24,7 +24,7 @@ Problem read_problem(const std::string& filename) {
     // Validate required top-level keys exist before accessing them.
     for (const char* key : {"widths", "heights", "inputs", "outputs",
                              "base_costs", "op_types",
-                             "fast_memory_capacity", "slow_memory_bandwidth",
+                             "fast_memory_capacity", "cube_freq_hz",
                              "native_granularity"}) {
         if (!j.contains(key)) {
             std::cerr << "Error: missing required field '" << key
@@ -148,7 +148,6 @@ Problem read_problem(const std::string& filename) {
 
     // --- Hardware parameters ---
     p.fast_memory_capacity  = j["fast_memory_capacity"].get<int64_t>();
-    p.slow_memory_bandwidth = j["slow_memory_bandwidth"].get<int64_t>();
 
     auto& ng = j["native_granularity"];
     if (!ng.is_array() || ng.size() < 2) {
@@ -158,8 +157,7 @@ Problem read_problem(const std::string& filename) {
     p.native_w = ng[0].get<int64_t>();
     p.native_h = ng[1].get<int64_t>();
 
-    if (p.fast_memory_capacity <= 0 || p.slow_memory_bandwidth <= 0 ||
-        p.native_w <= 0 || p.native_h <= 0) {
+    if (p.fast_memory_capacity <= 0 || p.native_w <= 0 || p.native_h <= 0) {
         std::cerr << "Error: hardware parameters must be positive\n";
         std::exit(1);
     }
@@ -173,8 +171,6 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("vec_capacity"))     p.vec_capacity     = j["vec_capacity"].get<int64_t>();
     if (j.contains("l1_capacity"))      p.l1_capacity      = j["l1_capacity"].get<int64_t>();
     if (j.contains("cube_compute_cost"))   p.cube_compute_cost   = j["cube_compute_cost"].get<int64_t>();
-    if (j.contains("vector_compute_cost")) p.vector_compute_cost = j["vector_compute_cost"].get<int64_t>();
-    if (j.contains("vector_lanes"))        p.vector_lanes        = j["vector_lanes"].get<int64_t>();
     if (j.contains("kernel_fill_cost"))    p.kernel_fill_cost    = j["kernel_fill_cost"].get<int64_t>();
     if (j.contains("ddr_atomic_add"))      p.ddr_atomic_add      = j["ddr_atomic_add"].get<bool>();
     // Grounded pto-isa machine model (optional; absent => legacy placeholders).

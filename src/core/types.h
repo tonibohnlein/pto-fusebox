@@ -63,16 +63,13 @@ struct Problem {
     std::vector<Tensor> tensors;
     std::vector<Op> ops;
     int64_t fast_memory_capacity;
-    int64_t slow_memory_bandwidth;
     int64_t native_w, native_h;
 
-    // --- Ascend 910B extensions ----------------------------------------------
+    // --- Ascend 910B machine model -------------------------------------------
     // Compute parallelizes across these cores; DDR bandwidth is shared (one HBM).
-    // Default 1 = SINGLE-CONTEXT: the parallel roofline + unit-homogeneity
-    // constraint are inert, so legacy/competition instances are unchanged. The
-    // 910B path (adapter / tests) sets the real counts (cube 24, vector 48).
-    int num_cube_cores = 1;      // AIC cores — matmul
-    int num_vector_cores = 1;    // AIV cores — pointwise / reduction
+    // The 910B path (adapter / tests) sets the real counts (cube 24, vector 48).
+    int num_cube_cores = 24;     // AIC cores — matmul
+    int num_vector_cores = 48;   // AIV cores — pointwise / reduction
     // Per-core local-memory budgets in BYTES. 0 = fall back to the single
     // fast_memory_capacity pool (so legacy element-count instances are
     // unchanged). The 910B feasibility check forks on cube-vs-vector:
@@ -81,17 +78,11 @@ struct Problem {
     int64_t vec_capacity = 0;    // per-vector-core UB (910B: 192*1024)
     int64_t cube_capacity = 0;   // per-cube-core L0c accumulator (910B: 128*1024)
     int64_t l1_capacity = 0;     // per-cube-core L1/Mat operand pool (910B: 512*1024)
-    // 910B compute is derived from TILE GEOMETRY x a machine cost, NOT a per-op
-    // padded-native-tile base_cost (the competition model). cube_compute_cost is
-    // the time for one 16x16x16 cube fractal; vector_compute_cost is the time per
-    // vector element. 0 => fall back to the per-op base_cost (legacy/competition).
-    // cube does one 16x16x16 fractal per step; vector processes vector_lanes
-    // elements per SIMD step. compute = (#steps) x (per-step cost). vector_lanes
-    // is a machine parameter (SIMD width) to be calibrated later; 0 => treat as 1
-    // (per-element). The cube step is fixed at the 16x16x16 fractal (hardware).
-    int64_t cube_compute_cost = 0;    // cost per 16x16x16 cube fractal step
-    int64_t vector_compute_cost = 0;  // cost per vector SIMD step
-    int64_t vector_lanes = 0;         // elements per vector SIMD step (0 => 1)
+    // Grounded cube-compute CALIBRATION MULTIPLIER on the pto-isa fractal-cycle
+    // model (CubeMacCycles = repeats * cyc * cube_compute_cost). The pto-isa model
+    // is already in real cycles, so the realistic value is 1; tests dial it up to
+    // force a compute-bound regime. 0 => treated as 1.
+    int64_t cube_compute_cost = 1;
     // Per-kernel pipeline fill/drain latency. A subgraph's tiling produces
     // num_tiles "kernels"; each core runs ceil(num_tiles/cores) of them in
     // sequence, paying one fill per pass. Charged as rounds*kernel_fill_cost,
@@ -116,9 +107,7 @@ struct Problem {
     bool ddr_atomic_add = false;
 
     // --- Grounded pto-isa machine model (Ascend 910B / A2A3) -----------------
-    // The cost terms above (cube_compute_cost per fractal, the single
-    // slow_memory_bandwidth) are coarse placeholders. These fields, when set,
-    // switch the cube path to pto-isa's measured coefficients
+    // The cube/vector costs use pto-isa's measured coefficients
     // (pto-isa include/pto/costmodel/arch_config.hpp + cce_costmodel_cube.hpp):
     //
     //   * WORK IS IN CYCLES. A matmul costs `repeats * cyc_per_repeat` cycles,
@@ -131,10 +120,7 @@ struct Problem {
     //     which OVERLAP, so per-core work = max(cube_cycles, extract_cycles).
     //     The L1->L0 reload reuses the L0 GEMM base tile (l0_tile_m/n) the same
     //     way cube_operand_reload reuses the L1 tile (w/h) one level up.
-    //
-    // 0 / unset => fall back to slow_memory_bandwidth + cube_compute_cost (the
-    // competition / legacy instances are byte-for-byte unchanged).
-    double cube_freq_hz = 0.0;   // core clock (1.85e9). >0 activates the grounded path.
+    double cube_freq_hz = 1.85e9;  // core clock (A2A3 1.85e9)
     double bw_gm_l1   = 0.0;     // GM->L1 operand reload      (GiB/s; pto-isa 135.0)
     double bw_l0c_gm  = 0.0;     // L0C->GM output store       (GiB/s; pto-isa 70.0)
     double bw_l1_l0a  = 0.0;     // L1->L0A lhs extract        (GiB/s; pto-isa 441.0)
@@ -151,9 +137,8 @@ struct Problem {
     // 64 fp32 / 128 fp16 elements (fp16 = 2x throughput). slope picks elementwise
     // (vadd/vmul ~1-2) vs reduction (vreducev2 ~14), so a reduction is ~14x an add
     // and the per-op head/tail charges the pipeline fill of a multi-op chain
-    // (e.g. softmax = exp + reduce + div). Replaces the flat vector_compute_cost /
-    // vector_lanes placeholder; 0 => legacy.
-    int64_t vec_reg_bytes = 0;        // vector register size in bytes (pto-isa 256)
+    // (e.g. softmax = exp + reduce + div).
+    int64_t vec_reg_bytes = 256;      // vector register size in bytes (pto-isa 256)
     double vec_op_head = 0.0;         // per-op pipeline startup cycles (~14)
     double vec_op_tail = 0.0;         // per-op drain cycles (~18)
     double vec_slope_pw = 0.0;        // cycles/repeat, elementwise (~2)

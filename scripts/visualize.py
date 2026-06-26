@@ -7,33 +7,19 @@ def load_json(filepath):
         return json.load(f)
 
 def hw_legend(d):
-    """Instance-legend label. Lists the Ascend 910B per-die specs when the 910B
-    fields are present, else the single-pool competition info."""
-    gran = d.get('native_granularity', 'Unknown')
-    if isinstance(gran, list):
-        gran = "x".join(map(str, gran))
-    bw = d.get('slow_memory_bandwidth', '?')
-    if d.get('num_cube_cores', 1) > 1 or d.get('num_vector_cores', 1) > 1:
-        kb = lambda x: f"{d.get(x, 0) // 1024}KB"
-        grounded = (d.get('cube_freq_hz', 0) or 0) > 0
-        if grounded:
-            bw_line = (f"grounded (pto-isa cycles, {d['cube_freq_hz']/1e9:.2f}GHz): "
-                       f"GM->L1 {d.get('bw_gm_l1')}  L0c->GM {d.get('bw_l0c_gm')}  "
-                       f"GM<->UB {d.get('bw_gm_ub')}/{d.get('bw_ub_gm')} GiB/s")
-        else:
-            bw_line = f"legacy single-pool: HBM bandwidth {bw}"
-        lines = [
-            "Ascend 910B (1 die)",
-            f"Cube/AIC: {d.get('num_cube_cores')} cores   Vector/AIV: {d.get('num_vector_cores')} cores",
-            f"L1/Mat: {kb('l1_capacity')}   L0c/Acc: {kb('cube_capacity')}   UB: {kb('vec_capacity')}",
-            bw_line,
-            "Tile: cube 16x16 fractal  |  vector sub-16 rows + 32B DMA-block width",
-            "Grid-only (P x Q x split-K); double-buffered (implicit, full pool)",
-        ]
-    else:
-        lines = [f"Fast Mem: {d.get('fast_memory_capacity', 0) / 1000.0:.1f} K",
-                 f"Slow Mem BW: {bw}",
-                 f"Native Granularity: {gran}"]
+    """Instance-legend label: the Ascend 910B per-die grounded pto-isa specs."""
+    kb = lambda x: f"{d.get(x, 0) // 1024}KB"
+    bw_line = (f"grounded (pto-isa cycles, {(d.get('cube_freq_hz', 0) or 0)/1e9:.2f}GHz): "
+               f"GM->L1 {d.get('bw_gm_l1')}  L0c->GM {d.get('bw_l0c_gm')}  "
+               f"GM<->UB {d.get('bw_gm_ub')}/{d.get('bw_ub_gm')} GiB/s")
+    lines = [
+        "Ascend 910B (1 die)",
+        f"Cube/AIC: {d.get('num_cube_cores')} cores   Vector/AIV: {d.get('num_vector_cores')} cores",
+        f"L1/Mat: {kb('l1_capacity')}   L0c/Acc: {kb('cube_capacity')}   UB: {kb('vec_capacity')}",
+        bw_line,
+        "Tile: cube 16x16 fractal  |  vector sub-16 rows + 32B DMA-block width",
+        "Grid-only (P x Q x split-K); double-buffered (implicit, full pool)",
+    ]
     return "Instance Info\\n" + "\\n".join(lines)
 
 def generate_instance_dot(input_data, out_filepath):

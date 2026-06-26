@@ -29,7 +29,6 @@ static Problem make_chain(int n) {
     for (int i = 0; i < n; i++)
         p.ops.push_back({OpType::Pointwise,{(size_t)i},{(size_t)(i+1)},100});
     p.fast_memory_capacity = 500000;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128; p.native_h = 128;
     return p;
 }
@@ -75,7 +74,7 @@ void test_can_reach_diamond() {
     p.ops = {{OpType::Pointwise,{0},{1},100},
              {OpType::Pointwise,{0},{2},100},
              {OpType::Pointwise,{1,2},{3},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     CHECK("Op0→Op2", d.can_reach(0,2));
@@ -94,7 +93,7 @@ void test_op_neighbors_co_consumer() {
     p.tensors = {{128,128},{128,128},{128,128}};
     p.ops = {{OpType::Pointwise,{0},{1},100},
              {OpType::Pointwise,{0},{2},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto& n0 = d.op_neighbors[0];
@@ -143,7 +142,7 @@ void test_tensor_multi_consumer() {
     p.tensors = {{128,128},{128,128},{128,128}};
     p.ops = {{OpType::Pointwise,{0},{1},100},
              {OpType::Pointwise,{0},{2},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     CHECK_EQ_S("T0 has 2 consumers", d.tensor_consumers[0].size(), 2);
@@ -159,7 +158,7 @@ void test_tensor_matmul() {
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128}};
     p.ops = {{OpType::MatMul,{0,1},{2},2000}};
-    p.fast_memory_capacity = 100000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 100000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     CHECK_EQ_S("2 graph inputs", d.graph_inputs.size(), 2);
@@ -182,7 +181,7 @@ void test_topo_sort_disconnected() {
              {OpType::Pointwise,{1},{2},100},
              {OpType::Pointwise,{3},{4},100},
              {OpType::Pointwise,{4},{5},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto order = d.topo_sort();
@@ -204,7 +203,7 @@ void test_topo_sort_valid_order() {
              {OpType::Pointwise,{1},{2},100},
              {OpType::Pointwise,{1},{3},100},
              {OpType::Pointwise,{2,3},{4},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     auto order = d.topo_sort();
@@ -243,7 +242,7 @@ void test_topo_position_diamond() {
              {OpType::Pointwise,{1},{2},100},
              {OpType::Pointwise,{1},{3},100},
              {OpType::Pointwise,{2,3},{4},100}};
-    p.fast_memory_capacity = 500000; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 500000;
     p.native_w = 128; p.native_h = 128;
     DAG d = DAG::build(p);
     CHECK("Op0 before Op1", d.topo_position(0)<d.topo_position(1));

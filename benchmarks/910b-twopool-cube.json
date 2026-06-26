@@ -27,7 +27,6 @@
   67108864
  ],
  "fast_memory_capacity": 67108864,
- "slow_memory_bandwidth": 10,
  "native_granularity": [
   128,
   128
@@ -37,9 +36,21 @@
  "cube_capacity": 131072,
  "l1_capacity": 524288,
  "vec_capacity": 196608,
- "cube_compute_cost": 1000,
- "vector_compute_cost": 1,
- "vector_lanes": 256,
+ "cube_compute_cost": 1,
  "kernel_fill_cost": 10000,
- "ddr_atomic_add": true
+ "ddr_atomic_add": true,
+ "cube_freq_hz": 1850000000.0,
+ "bw_gm_l1": 135.0,
+ "bw_l0c_gm": 70.0,
+ "bw_l1_l0a": 441.0,
+ "bw_l1_l0b": 220.5,
+ "bw_gm_ub": 100.9,
+ "bw_ub_gm": 188.46,
+ "l0_tile_m": 128,
+ "l0_tile_n": 256,
+ "vec_reg_bytes": 256,
+ "vec_op_head": 14.0,
+ "vec_op_tail": 18.0,
+ "vec_slope_pw": 2.0,
+ "vec_slope_reduce": 14.0
 }

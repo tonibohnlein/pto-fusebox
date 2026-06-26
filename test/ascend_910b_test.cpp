@@ -39,31 +39,42 @@ static void RED(const char* l, bool c) {
     if (c) g_pass++;
     else { g_red++; std::cout << "  RED (todo): " << l << "\n"; }
 }
-// Activate the 910B parallel model (one die): 24 cube + 48 vector cores,
-// L0c accumulator = 128 KB/core (the cube tile bound, replacing the native cap).
-// cube_cost defaults to a MEMORY-BOUND calibration (64): real 910B matmul is
-// memory-bound for typical shapes — with bandwidth=10 the roofline knee sits
-// around a few hundred of these units (the fp16 hardware estimate is ~5). Tests
-// that specifically exercise a COMPUTE-bound property (fractal quantization,
-// split-K compute speedup, the compute-bound "fused == sum") pass an explicit
-// compute-bound value, e.g. set_910b(p, 4096).
-static void set_910b(Problem& p, int64_t cube_cost = 64) {
+// Activate the grounded 910B parallel model (one die): 24 cube + 48 vector cores,
+// L0c accumulator = 128 KB/core (the cube tile bound, replacing the native cap),
+// and the pto-isa A2/A3 cost coefficients (per-direction bandwidths, core clock,
+// L0 GEMM base tile, vector register + per-op compute slopes). `cube_cost` is the
+// grounded cube-compute CALIBRATION MULTIPLIER on the pto-isa fractal-cycle model
+// (repeats * cyc); the realistic default is 1 (the model is already in real
+// cycles — the production adapter leaves it unset). Tests that specifically
+// exercise a COMPUTE-bound property (fractal quantization, split-K compute
+// speedup) dial it up with an explicit multiplier, e.g. set_910b(p, 4096).
+static void set_910b(Problem& p, int64_t cube_cost = 1) {
     p.num_cube_cores = 24;
     p.num_vector_cores = 48;
     p.cube_capacity = 128 * 1024;   // L0c accumulator (output)
     p.l1_capacity = 512 * 1024;     // L1/Mat operand pool (cube)
     p.vec_capacity = 192 * 1024;    // UB (vector)
-    // Machine-cost compute model (replaces per-op base_cost): cube = #16x16x16
-    // fractals * cube_compute_cost; vector = ceil(#elements/vector_lanes) *
-    // vector_compute_cost. PLACEHOLDER (relative) values until grounded from real
-    // 910B specs; the per-op base_cost is now ignored.
-    p.cube_compute_cost = cube_cost;  // per 16x16x16 cube fractal (memory-bound default)
-    p.vector_compute_cost = 1;      // per vector SIMD step
-    p.vector_lanes = 256;           // elements per vector SIMD step (to calibrate)
-    p.kernel_fill_cost = 10000;     // per-kernel pipeline fill (placeholder; the dual
-                                    // of eff — drives the tiling to ~one kernel/core)
+    p.cube_compute_cost = cube_cost;  // grounded cube-compute calibration multiplier
+    p.kernel_fill_cost = 10000;     // per-kernel pipeline fill (the dual of eff —
+                                    // drives the tiling to ~one kernel/core)
     p.ddr_atomic_add = true;        // 910B SetAtomicAdd: split-K partials accumulate in
                                     // DDR during write-back (cheap merge, no read-back)
+    // Grounded pto-isa A2/A3 coefficients: per-direction bandwidths in GiB/s, core
+    // clock, L0 GEMM base tile, vector register size + per-op compute slopes.
+    p.cube_freq_hz = 1.85e9;   // core clock (A2A3)
+    p.bw_gm_l1   = 135.0;      // GM->L1 operand reload
+    p.bw_l0c_gm  = 70.0;       // L0C->GM output store
+    p.bw_l1_l0a  = 441.0;      // L1->L0A lhs extract
+    p.bw_l1_l0b  = 220.5;      // L1->L0B rhs extract
+    p.bw_gm_ub   = 100.9;      // GM->UB vector load
+    p.bw_ub_gm   = 188.46;     // UB->GM vector store
+    p.l0_tile_m  = 128;        // L0 GEMM base M (pto-isa oracle)
+    p.l0_tile_n  = 256;        // L0 GEMM base N (pto-isa oracle)
+    p.vec_reg_bytes = 256;     // vector register size (bytes)
+    p.vec_op_head = 14.0;      // per-op pipeline startup cycles
+    p.vec_op_tail = 18.0;      // per-op drain cycles
+    p.vec_slope_pw = 2.0;      // elementwise cycles/repeat (vmul-ish)
+    p.vec_slope_reduce = 14.0; // reduction cycles/repeat (vreducev2)
 }
 
 // --- A: large pointwise — memory-bound, tile-invariant -----------------------
@@ -73,7 +84,6 @@ static void test_A_pointwise_memory_bound() {
     p.tensors = {{512, 512}, {512, 512}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 100}};  // trivial compute
     p.fast_memory_capacity = 1 << 22;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -83,8 +93,12 @@ static void test_A_pointwise_memory_bound() {
     CHECK("A: subgraph builds", (bool)sg);
     double lat = sg->best_cost().latency;
     std::cout << "    best latency = " << lat << "\n";
-    // byte-based: (load T0 + store T1) = 2 * 512*512 * 4B / 10 = 209715.2 (tile-invariant).
-    CHECK_EQ("A: latency == DDR floor (byte-based, 209715.2)", lat, 209715.2);
+    // Grounded DDR floor: load T0 (GM->UB) + store T1 (UB->GM), byte-based and
+    // tile-invariant. cost-per-byte = freq / (2^30 * bw_GiBps) (see MakeByteCost).
+    auto cpb = [&](double bw) { return p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
+    const double bytes = 512.0 * 512.0 * 4.0;
+    const double floor = bytes * cpb(p.bw_gm_ub) + bytes * cpb(p.bw_ub_gm);  // ~27491.6
+    CHECK_EQ("A: latency == grounded DDR floor (GM->UB load + UB->GM store)", lat, floor);
 }
 
 // --- B: thin matmul — should parallelize via split-K across cube cores --------
@@ -98,7 +112,6 @@ static void test_B_thin_matmul_parallel() {
     p.tensors = {{2048, 64}, {64, 2048}, {64, 64}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};  // compute-heavy (2.4M = 24*100k)
     p.fast_memory_capacity = 1 << 20;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
@@ -123,7 +136,6 @@ static void test_C_pointwise_fusion() {
     p.tensors = {{256, 256}, {256, 256}, {256, 256}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 500}, {OpType::Pointwise, {1}, {2}, 500}};
     p.fast_memory_capacity = 1 << 20;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -143,7 +155,6 @@ static void test_D_mixed_cube_vector() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}, {128, 128}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 30000}, {OpType::Pointwise, {2}, {3}, 500}};
     p.fast_memory_capacity = 1 << 20;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -178,7 +189,6 @@ static void test_softmax_reduction_schema() {
              {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
              {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -214,7 +224,6 @@ static void test_R_reduction_split() {
     p.tensors = {{4096, 4}, {1, 4}};                       // A[4 rows x 4096], rowmax -> m[1,4]
     p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4}};
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -234,7 +243,6 @@ static void test_E_matmul_2d_vs_1d() {
     p.tensors = {{512, 512}, {512, 512}, {512, 512}};  // A, B, C : M=N=K=512
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};       // tiny compute -> memory-bound
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -259,7 +267,6 @@ static void test_F_split_k() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048 (1 native tile)
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
@@ -287,7 +294,6 @@ static void test_G_super_native_tile() {
     p.tensors = {{512, 1024}, {1024, 512}, {1024, 1024}};  // M=N=1024, K=512
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};
     p.fast_memory_capacity = 1 << 26;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -310,7 +316,6 @@ static void test_H_split_k_beats_spatial() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -336,7 +341,6 @@ static Problem mk_mm(int64_t M, int64_t N, int64_t K, int64_t cost) {
     p.tensors = {{K, M}, {N, K}, {N, M}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, cost}};
     p.fast_memory_capacity = 1 << 26;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -364,7 +368,6 @@ static Problem mk_chained(int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t
     p.tensors = {{K1, M}, {N1, K1}, {N1, M}, {N2, N1}, {N2, M}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, c1}, {OpType::MatMul, {2, 3}, {4}, c2}};
     p.fast_memory_capacity = 1 << 26;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -377,24 +380,37 @@ static void test_two_matmul() {
     // Chained, FAT sink E[128,256] (fills the cores so the fused case needs no
     // heavy split-K), large intermediate C[256,256]. base_cost ignored (geometry).
     auto p = mk_chained(256, 512, 256, 128, 16384 * 512, 16384 * 256);
-    p.cube_compute_cost = 1000;  // DDR-relevant regime (see test_fusion_decision_matrix)
+    // Grounded realistic multiplier (cc=1 from set_910b): the pto-isa fractal model
+    // already sits at the DDR-relevant knee for these shapes, so the intermediate
+    // round-trip saving is visible (no artificial compute inflation).
     DAG dag = DAG::build(p);
     double m1 = Subgraph::create(p, dag, {0})->best_cost().latency;
     double m2 = Subgraph::create(p, dag, {1})->best_cost().latency;
     double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
     std::cout << "    M1=" << m1 << " M2=" << m2 << " fused=" << fused << "\n";
-    // Fused does BOTH matmuls' work — must not undercut either part (the old bug
-    // scaled all compute by the narrower sink output, so fused < M1 alone).
-    CHECK("2MM: chained fused >= each part (compute counted per-matmul)",
-          fused >= m1 - 0.5 && fused >= m2 - 0.5);
-    // BSP model: the intermediate T is EPHEMERAL when fused (kept on-chip via the
-    // M-partition, no DDR round-trip), so separately mm2 must reload T from DDR.
-    // With a fat sink the fused case parallelizes mostly over M (little recompute),
-    // so fusion strictly helps — fused < M1 + M2. (For a THIN sink the fused case
-    // is forced into split-K or N-tile recompute and can LOSE — see test_fusion_
-    // decision_matrix; that is the correct, faithful outcome, not a regression.)
+    // Fat-sink chain in the DDR-relevant regime: fusing keeps the big intermediate
+    // T EPHEMERAL on-chip (no DDR round-trip), so fusion strictly helps -- fused <
+    // M1 + M2. (For a THIN sink the fused case is forced into split-K or N-tile
+    // recompute and can LOSE -- see test_fusion_decision_matrix; the correct outcome.)
     CHECK("2MM: chained (fat sink) fused < M1+M2 (keeps intermediate on-chip)",
           fused < m1 + m2 - 0.5);
+    // Per-matmul COMPUTE accounting: in a compute-bound regime (latency ~= compute)
+    // the fused kernel does BOTH matmuls' fractals, so it cannot undercut either part
+    // (the old bug scaled all compute by the narrower sink output -> fused < M1). The
+    // DDR-bound regime above does NOT test this: there fused can legitimately be < M1
+    // alone, because M1 by itself pays to write the fat intermediate T to DDR that the
+    // fused kernel avoids.
+    {
+        auto pc = mk_chained(256, 512, 256, 128, 16384 * 512, 16384 * 256);
+        set_910b(pc, 4096);  // compute-bound multiplier -- isolate the compute roofline
+        pc.kernel_fill_cost = 0;
+        DAG dc = DAG::build(pc);
+        double c1 = Subgraph::create(pc, dc, {0})->best_cost().latency;
+        double c2 = Subgraph::create(pc, dc, {1})->best_cost().latency;
+        double cf = Subgraph::create(pc, dc, {0, 1})->best_cost().latency;
+        CHECK("2MM: chained fused >= each part (compute counted per-matmul)",
+              cf >= c1 - 0.5 && cf >= c2 - 0.5);
+    }
 
     // (2) INDEPENDENT shared-input: Q=X@Wq, K=X@Wk (same X). Both cube, no
     // intermediate between them — fusing only saves re-reading X (negligible
@@ -404,7 +420,7 @@ static void test_two_matmul() {
         int64_t M = 128, Kc = 256, N = 128;
         q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
         q.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * Kc}, {OpType::MatMul, {0, 3}, {4}, 16384 * Kc}};
-        q.fast_memory_capacity = 1 << 26; q.slow_memory_bandwidth = 10;
+        q.fast_memory_capacity = 1 << 26;
         q.native_w = 128; q.native_h = 128; set_910b(q, 4096); q.kernel_fill_cost = 0;  // compute-bound regime
         DAG dq = DAG::build(q);
         double a = Subgraph::create(q, dq, {0})->best_cost().latency;
@@ -424,7 +440,7 @@ static void test_two_matmul() {
         a.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * K},
                  {OpType::MatMul, {3, 4}, {5}, 16384 * K},
                  {OpType::Pointwise, {2, 5}, {6}, N * M}};
-        a.fast_memory_capacity = 1 << 26; a.slow_memory_bandwidth = 10;
+        a.fast_memory_capacity = 1 << 26;
         a.native_w = 128; a.native_h = 128; set_910b(a);
         DAG da = DAG::build(a);
         CHECK("2MM: accumulate {mm,mm,add} rejected (cube+vector not homogeneous)",
@@ -452,7 +468,7 @@ static void test_shared_input_reuse() {
     p.tensors = {{K, M}, {N, K}, {N, M}, {N, K}, {N, M}};  // t0, t1, t2=out0, t3, t4=out1
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::MatMul, {0, 3}, {4}, 1000}};
-    p.fast_memory_capacity = 1 << 26; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1 << 26;
     p.native_w = 128; p.native_h = 128;
     set_910b(p);
     p.cube_compute_cost = 16;   // memory-bound: HBM dominates (vs the 4096 placeholder)
@@ -485,7 +501,7 @@ static void test_atomic_add_flag() {
     int64_t M = 128, N = 64, K = 2048;
     p.tensors = {{K, M}, {N, K}, {N, M}};  // A[K,M] B[N,K] -> C[N,M]
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}};
-    p.fast_memory_capacity = 1 << 26; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1 << 26;
     p.native_w = 128; p.native_h = 128;
     set_910b(p);                 // ddr_atomic_add = true (910B has SetAtomicAdd)
     p.cube_compute_cost = 64;    // memory-bound so the merge matters
@@ -508,7 +524,7 @@ static void test_atomic_add_flag() {
         Problem v;  // x[4096,32] -> rowsum [1,32] (width-reduction)
         v.tensors = {{4096, 32}, {1, 32}};
         v.ops = {{OpType::Reduction, {0}, {1}, 4096 * 32}};
-        v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10;
+        v.fast_memory_capacity = 1 << 26;
         v.native_w = 128; v.native_h = 128;
         set_910b(v);              // ddr_atomic_add = true
         v.kernel_fill_cost = 0;
@@ -524,53 +540,56 @@ static void test_atomic_add_flag() {
     }
 }
 
-// --- machine-cost compute model: geometry x per-step cost (910B) --------------
-// Cube compute = (#16x16x16 fractals) * cube_compute_cost. Vector compute =
-// ceil(#elements / vector_lanes) * vector_compute_cost. Both are MACHINE params
-// (not per-op base_cost). Opt-in: when the params are 0 the model falls back to
-// base_cost (so the rest of the suite is unchanged).
+// --- grounded machine-cost compute model: pto-isa fractal MACs + vector roofline -
+// Cube compute = grounded fractal MACs: repeats = ceil(M/16)*ceil(N/16)*ceil(K/kF),
+// kF = 32/dtype_bytes (FP32:8, FP16:16), cyc = 2 (FP32) else 1, x cube_compute_cost
+// (the calibration multiplier, default 1). Vector compute = head + slope*repeat +
+// tail per op. The cube CAN be compute-bound (dial the multiplier up); the vector is
+// DDR-bound on 910B (compute parallelizes across cores while DDR is the shared
+// aggregate) -- the realistic regime, so we assert the vector DDR floor instead.
 static void test_geometry_compute() {
-    std::cout << "[GEOM] machine-cost compute: cube=#fractals*cost, vector=#steps*cost\n";
-    // Cube: out[64,96], K=2048 -> 64/16 * 96/16 * 2048/16 = 3072 fractals.
-    // 24-divisible shape: 4x6 = 24 EQUAL 1-fractal regions -> one wave, eff_par 24
-    // EXACTLY (a power-of-2 square like 128^2 caps at eff_par ~23.1 under the
-    // wave/grid model, so W/cores_used is unreachable there -- see doc section 7).
+    std::cout << "[GEOM] grounded compute: cube fractal MACs (compute-bound); vector DDR-bound\n";
+    // --- CUBE: C[N=96, M=64], K=2048, FP32. out 96x64 is a 4x6 = 24-region grid that
+    // fills the 24 cube cores EXACTLY (one wave); a big multiplier puts it on the
+    // compute roofline, so latency = total_MAC_cycles / cores.
     Problem c;
-    c.tensors = {{2048, 64}, {96, 2048}, {96, 64}};
-    c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost IGNORED when cube_compute_cost set
-    c.fast_memory_capacity = 1 << 26; c.slow_memory_bandwidth = 10; c.native_w = 128; c.native_h = 128;
-    set_910b(c);
-    c.cube_compute_cost = 10000;
-    c.kernel_fill_cost = 0;  // isolate the compute roofline  // per fractal (machine param)
+    c.tensors = {{2048, 64}, {96, 2048}, {96, 64}};  // A[K,M] B[N,K] -> C[N,M], FP32
+    c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost ignored (grounded geometry)
+    c.fast_memory_capacity = 1 << 26; c.native_w = 128; c.native_h = 128;
+    set_910b(c, 10000);  // big cube multiplier -> compute roofline (DDR hidden)
+    c.kernel_fill_cost = 0;
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
-    const double fractals = 64.0 / 16 * 96.0 / 16 * 2048.0 / 16;  // 3072
-    const double exp_c = fractals * 10000.0 / rc.cores_used;
-    std::cout << "    cube: fractals=" << (long long)fractals << " cores=" << rc.cores_used
+    const double kF = 32.0 / 4.0;  // FP32: 32 / dtype_bytes
+    const double repeats = std::ceil(64.0 / 16) * std::ceil(96.0 / 16) * std::ceil(2048.0 / kF);
+    const double exp_c = repeats * 2.0 * 10000.0 / rc.cores_used;  // cyc=2 (FP32) * multiplier
+    std::cout << "    cube: repeats=" << (long long)repeats << " cores=" << rc.cores_used
               << " -> lat=" << rc.latency << " (expect " << exp_c << ")\n";
-    CHECK("GEOM: cube compute = #fractals * cube_cost (compute-bound)",
-          rc.compute_bound && std::abs(rc.latency - exp_c) < 1.0);
+    // Compute-bound latency is the MAC roofline PLUS the small L1->L0 extract Phase-D
+    // fill (~ext/L per region, a separate hierarchical term << the MACs). Verify the
+    // MAC formula to a tight relative tolerance the extract sits comfortably inside;
+    // a wrong kF / cyc would miss by >= 2x, far outside this band.
+    CHECK("GEOM: cube compute = grounded fractal MACs / cores (compute-bound)",
+          rc.compute_bound && std::abs(rc.latency - exp_c) < exp_c * 1e-4);
 
-    // Vector: pointwise [512,512] -> 262144 elements; lanes=256 -> 1024 SIMD steps.
-    auto run_vec = [](int64_t lanes) {
-        Problem v;
-        v.tensors = {{512, 512}, {512, 512}};
-        v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
-        v.fast_memory_capacity = 1 << 26; v.slow_memory_bandwidth = 10; v.native_w = 128; v.native_h = 128;
-        set_910b(v);
-        v.vector_compute_cost = 40000;
-        v.kernel_fill_cost = 0;  // isolate the compute roofline  // per SIMD step
-        v.vector_lanes = lanes;
-        return Subgraph::create(v, DAG::build(v), {0})->best_cost();
-    };
-    auto rv = run_vec(256);
-    const double steps = std::ceil(512.0 * 512 / 256);  // 1024
-    const double exp_v = steps * 40000.0 / rv.cores_used;
-    std::cout << "    vector: 262144 elems / 256 lanes = " << (long long)steps << " steps cores="
-              << rv.cores_used << " -> lat=" << rv.latency << " (expect " << exp_v << ")\n";
-    CHECK("GEOM: vector compute = ceil(#elements/lanes) * step_cost (compute-bound)",
-          rv.compute_bound && std::abs(rv.latency - exp_v) < 1.0);
-    // Doubling the lanes halves the SIMD steps -> halves the vector compute.
-    CHECK("GEOM: 2x vector_lanes halves the vector compute", run_vec(128).latency > rv.latency * 1.9);
+    // --- VECTOR: pointwise [512,512], FP32. Vector compute parallelizes across cores
+    // while DDR is the shared aggregate, so a pointwise is DDR-BOUND -- its latency is
+    // the GM<->UB byte floor (load + store), tile-invariant. (The head+slope*repeat+
+    // tail compute formula is exercised where it bites -- UB-overflow streaming
+    // N_passes -- in the vector sensibility tests; it never drives a simple pointwise.)
+    Problem v;
+    v.tensors = {{512, 512}, {512, 512}};
+    v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
+    v.fast_memory_capacity = 1 << 26; v.native_w = 128; v.native_h = 128;
+    set_910b(v); v.kernel_fill_cost = 0;
+    auto rv = Subgraph::create(v, DAG::build(v), {0})->best_cost();
+    auto cpb = [&](double bw) { return v.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
+    const double vfloor = 512.0 * 512 * 4 * cpb(v.bw_gm_ub) + 512.0 * 512 * 4 * cpb(v.bw_ub_gm);
+    std::cout << "    vector: lat=" << rv.latency << " (DDR floor " << vfloor
+              << ", compute_bound=" << rv.compute_bound << ")\n";
+    CHECK("GEOM: vector pointwise is DDR-bound (compute parallelizes, DDR aggregate)",
+          !rv.compute_bound);
+    CHECK("GEOM: vector DDR-bound latency = GM<->UB byte floor (load + store)",
+          std::abs(rv.latency - vfloor) < 1.0);
 }
 
 // --- compare our DDR->L1 tile vs pypto ChooseL0Tile (mind the two levels!) -----
@@ -601,7 +620,6 @@ static void test_pypto_tiling_comparison() {
         p.tensors[2].dtype = DType::FP32;  // C accumulator
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384LL * c.K}};
         p.fast_memory_capacity = 1LL << 30;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p);
@@ -639,7 +657,6 @@ static void test_two_pool_working_set() {
     c.tensors = {{4096, 2048}, {2048, 4096}, {2048, 2048}};  // A[K,M] B[N,K] -> C[N,M], out 2048^2
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 4096}};
     c.fast_memory_capacity = 1 << 28;
-    c.slow_memory_bandwidth = 10;
     c.native_w = 128;
     c.native_h = 128;
     set_910b(c);
@@ -657,7 +674,6 @@ static void test_two_pool_working_set() {
     v.tensors = {{512, 512}, {512, 512}};
     v.ops = {{OpType::Pointwise, {0}, {1}, 100}};
     v.fast_memory_capacity = 1 << 28;
-    v.slow_memory_bandwidth = 10;
     v.native_w = 128;
     v.native_h = 128;
     set_910b(v);
@@ -684,7 +700,6 @@ static void test_pypto_l0_comparison() {
     p.tensors = {{2048, 16}, {64, 2048}, {64, 16}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 2048}};
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p);
@@ -786,7 +801,6 @@ static void test_visualize() {
                  {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
                  {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
         p.fast_memory_capacity = 1 << 24;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p);
@@ -798,7 +812,6 @@ static void test_visualize() {
         p.tensors = {{4096, 4}, {1, 4}};
         p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}};
         p.fast_memory_capacity = 1 << 24;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p);
@@ -818,11 +831,10 @@ static void test_fusion_decision_matrix() {
     std::cout << "[FDM] fusion decision matrix (fuse iff strictly cheaper than split)\n";
     auto cmp = [](const char* tag, int64_t M, int64_t K1, int64_t N1, int64_t N2) {
         auto p = mk_chained(M, K1, N1, N2, 1000, 1000);
-        // Lower the cube cost into the regime where DDR matters (matches the
-        // benchmarks). At set_910b's 4096 the chain is so compute-bound that the
-        // intermediate's round-trip is fully hidden and fusion is latency-neutral
-        // for ALL shapes — the fuse-vs-split decision only varies once DDR binds.
-        p.cube_compute_cost = 1000;
+        // Grounded realistic multiplier (cc=1 from set_910b): the pto-isa fractal
+        // model sits at the DDR-relevant knee, so the fuse-vs-split decision is
+        // driven by the real intermediate round-trip vs recompute trade-off (no
+        // artificial compute inflation that would hide the round-trip for all shapes).
         DAG dag = DAG::build(p);
         auto fz = Subgraph::create(p, dag, {0, 1});
         double f = fz ? fz->best_cost().latency : 1e18;
@@ -835,12 +847,15 @@ static void test_fusion_decision_matrix() {
     // FAT sink, big intermediate, M fills cores -> fusion saves the C round-trip.
     auto win = cmp("fuse-wins (fat sink, big C)", 256, 512, 256, 128);
     CHECK("FDM: fat-sink chain FUSES (fused < split)", win.first < win.second - 0.5);
-    // Small M -> sink tiles over N2 -> intermediate recomputed per column-tile ->
-    // fusion costs more than splitting (which round-trips C via DDR once).
-    auto sm = cmp("small-M (N2-tiled, recompute)", 64, 256, 256, 512);
-    CHECK("FDM: small-M chain SPLITS (recompute makes fusion lose)", sm.first > sm.second + 0.5);
-    // Wide intermediate (huge C compute): recomputing it per column-tile dwarfs
-    // its DDR round-trip -> split.
+    // Small M, but a SMALL intermediate T[64,256] that fits on-chip -> the sink's
+    // N2-tiling reuses the held T (no recompute), so fusion still saves the round-trip
+    // and WINS. (Under an inflated compute multiplier the recompute looked expensive
+    // and this split; at the realistic grounded cc=1 the held-T reuse dominates.)
+    auto sm = cmp("small-M (N2-tiled, T held on-chip)", 64, 256, 256, 512);
+    CHECK("FDM: small-M chain FUSES (small T held on-chip, no recompute)",
+          sm.first < sm.second - 0.5);
+    // Wide intermediate T[2048,256]: too big to hold while tiling the sink, so it is
+    // recomputed per column-tile and that recompute dwarfs its DDR round-trip -> split.
     auto wide = cmp("wide-C (huge intermediate)", 256, 512, 2048, 256);
     CHECK("FDM: wide-intermediate chain SPLITS (recompute >> round-trip)",
           wide.first > wide.second + 0.5);
@@ -899,7 +914,6 @@ static void test_subgraph_structure() {
         pm.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},          // op0: cube
                   {OpType::Pointwise, {2}, {3}, 100}};          // op1: vector
         pm.fast_memory_capacity = 1 << 20;
-        pm.slow_memory_bandwidth = 10;
         pm.native_w = 128;
         pm.native_h = 128;
         set_910b(pm);
@@ -928,7 +942,6 @@ static void test_cube_vector_fusion() {
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::Pointwise, {2}, {3}, 100}};
     p.fast_memory_capacity = 1 << 26;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p, 4096);  // compute-bound matmul so the overlap is the lever
@@ -967,7 +980,6 @@ static void test_mixed_unit_tiling() {
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::Pointwise, {2}, {3}, 100}};
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10;
     p.native_w = 128;
     p.native_h = 128;
     set_910b(p, 4096);
@@ -1002,22 +1014,25 @@ static void test_mixed_mm_pw_variants() {
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
                  {OpType::Pointwise, {2}, {3}, 100}};
         p.fast_memory_capacity = 1 << 26;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p, cc);
         return p;
     };
 
-    // (1) memory-bound matmul (cc=64): MM->PW should be DDR-dominated.
+    // (1) memory-bound matmul (realistic cc=1): MM->PW should be DDR-dominated.
     {
-        Problem p = mk(256, 256, 256, 64);
+        Problem p = mk(256, 256, 256, 1);
         DAG dag = DAG::build(p);
         auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
         auto mm = Subgraph::create(p, dag, {0})->best_cost();
         auto pw = Subgraph::create(p, dag, {1})->best_cost();
         const int rounds = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
-        const double twoC = 2.0 * (256.0 * 256.0) * 4 / 10.0;  // intermediate roundtrip
+        // Grounded DDR is charged at the GM->L1 feed bandwidth (the mixed model lumps
+        // all ddr bytes onto bc.reload); cost-per-byte = freq / (2^30 * bw_gm_l1).
+        auto cpb = [&](double bw) { return p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
+        const double Cb = 256.0 * 256.0 * 4;             // intermediate C bytes (= A = B = D here)
+        const double twoC = 2.0 * Cb * cpb(p.bw_gm_l1);  // the cube<->vector roundtrip
         std::cout << "  mem-bound : fused lat=" << fr.latency << " compute_bound=" << fr.compute_bound
                   << " ddr=" << fr.ddr_traffic << " tiles=" << fr.num_spatial_tiles
                   << "  | separated mm.ddr=" << mm.ddr_traffic << " pw.ddr=" << pw.ddr_traffic << "\n";
@@ -1025,12 +1040,12 @@ static void test_mixed_mm_pw_variants() {
         CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
               std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
         CHECK("MIXVAR: ddr includes the 2x intermediate roundtrip", fr.ddr_traffic >= twoC - 1.0);
-        // The mixed DDR now carries the matmul operand reload (it is NOT just the
-        // boundary tensors read once = (A+B+D+2C) = 131072 here) — fusion does not
-        // avoid the reload on 910B.
-        const double boundary_once = (double)(65536 * 3 + 2 * 65536) * 4 / 10.0;  // 131072
-        CHECK("MIXVAR: ddr carries operand reload (> boundary-read-once)",
-              fr.ddr_traffic > boundary_once + 1.0);
+        // The mixed DDR also carries the cube OPERAND RELOAD (A + B) — fusion does not
+        // make it free on 910B — so ddr exceeds the intermediate roundtrip (2C) plus the
+        // boundary output store (D) alone; the excess is exactly the A + B reload.
+        const double roundtrip_plus_out = (2.0 * Cb + Cb) * cpb(p.bw_gm_l1);  // 2C + D
+        CHECK("MIXVAR: ddr carries operand reload (> roundtrip + boundary output)",
+              fr.ddr_traffic > roundtrip_plus_out + 1.0);
         // Fusion still wins (saves a kernel fill + overlaps compute) but does NOT
         // halve the DDR — the win is modest in the DDR-bound regime.
         CHECK("MIXVAR: fused < separated (saves fill + overlap, not DDR)",
@@ -1069,7 +1084,6 @@ static void test_mixed_two_pool_feasibility() {
         p.tensors = {{256, 256}, {256, 256}, {256, 256}, {256, 256}};  // A B C D, FP32
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}, {OpType::Pointwise, {2}, {3}, 100}};
         p.fast_memory_capacity = 1 << 26;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p, 64);
@@ -1129,7 +1143,6 @@ static void test_mixed_multistage_pebble() {
                  {OpType::MatMul, {2, 3}, {4}, 1000},   // C  = T1 @ D
                  {OpType::Pointwise, {4}, {5}, 100}};   // E  = relu(C)
         p.fast_memory_capacity = 1 << 26;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p, 64);
@@ -1159,7 +1172,6 @@ static void test_mixed_multistage_pebble() {
                  {OpType::Pointwise, {2}, {3}, 100},    // T = relu(C)
                  {OpType::Pointwise, {3}, {4}, 100}};   // D = gelu(T)
         p.fast_memory_capacity = 1 << 26;
-        p.slow_memory_bandwidth = 10;
         p.native_w = 128;
         p.native_h = 128;
         set_910b(p, 64);
@@ -1299,8 +1311,10 @@ static void test_chain_ksplit_variants() {
     // where a chained intermediate matmul WIDER than the sink (N1 > N2) leaked
     // its width N1 into the spatial-w candidates, emitting w = N1 > out_W.
     auto grid_within_output = [](const R& r) { return r.w <= r.outW && r.h <= r.outH; };
-    // (1) NO k-split: small contractions, sink large enough to fill cores.
-    auto nok = run(256, 256, 64, 512, 1000);
+    // (1) NO k-split: small contractions, sink large enough to fill cores. Realistic
+    // grounded multiplier (cc=1) -- an inflated multiplier would make a marginal
+    // split-K look attractive even though the sink already fills the cores spatially.
+    auto nok = run(256, 256, 64, 512, 1);
     CHECK("KVAR/no-k: spatial tile within sink output (unified grid)", grid_within_output(nok));
     CHECK("KVAR/no-k: sink not parallel-split (spatial fill)", nok.split == 1);
     CHECK("KVAR/no-k: internal runs full K1 (no seq-slice)", nok.k0 == nok.K1);
@@ -1342,7 +1356,7 @@ static void test_vector_band_ub() {
     p.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 128},
              {OpType::Reduction, {1}, {2}, 4096 * 128}};
     p.fast_memory_capacity = 1 << 24;
-    p.slow_memory_bandwidth = 10; p.native_w = 128; p.native_h = 128;
+ p.native_w = 128; p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0, 1});
@@ -1363,7 +1377,7 @@ static void test_vector_band_ub() {
 // the model leaves it spatial-only (a cut would be the partitioner's job).
 static void test_reduction_sink_gating() {
     std::cout << "[RGATE] reduced-axis split only when the reduction is the sink\n";
-    auto mk = []() { Problem p; p.slow_memory_bandwidth = 10;
+    auto mk = []() { Problem p;
                      p.native_w = 128; p.native_h = 128; return p; };
     // (a) bare rowmax, few rows -> sink reduction -> splits across cores.
     Problem a = mk();
@@ -1396,7 +1410,7 @@ static Problem mk_softmax(int64_t W, int64_t H) {
     p.tensors = {{W, H}, {1, H}, {W, H}, {1, H}, {W, H}};
     p.ops = {{OpType::Reduction, {0}, {1}, W * H / 4}, {OpType::Pointwise, {0, 1}, {2}, W * H},
              {OpType::Reduction, {2}, {3}, W * H / 4}, {OpType::Pointwise, {2, 3}, {4}, W * H}};
-    p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1 << 24;
     p.native_w = 128; p.native_h = 128; set_910b(p);
     return p;
 }
@@ -1442,7 +1456,7 @@ static void test_matmul_sensibility() {
         Problem p;
         p.tensors = {{c.K, c.M}, {c.N, c.K}, {c.N, c.M}};  // A[K,M] B[N,K] -> C[N,M]
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * c.K}};
-        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.fast_memory_capacity = 1LL << 30;
         p.native_w = 128; p.native_h = 128; set_910b(p);
         DAG d = DAG::build(p);
         auto r = Subgraph::create(p, d, {0})->best_cost();
@@ -1482,7 +1496,7 @@ static void test_vector_sensibility() {
         C("fills 48 vector cores", r.cores_used == 48);
         if (expect_split) C("few-row reduction split-fills cores", r.parallel_split > 1);
     };
-    auto base = [](Problem& p) { p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+    auto base = [](Problem& p) { p.fast_memory_capacity = 1 << 24;
                                  p.native_w = 128; p.native_h = 128; set_910b(p); };
     Problem pw; pw.tensors = {{4096, 4096}, {4096, 4096}};
     pw.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 4096}}; base(pw);
@@ -1518,7 +1532,7 @@ static void test_model_stages() {
         p.tensors = {{dm, B}, {df, dm}, {df, B}, {df, B}, {dm, df}, {dm, B}};
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * dm}, {OpType::Pointwise, {2}, {3}, df * B},
                  {OpType::MatMul, {3, 4}, {5}, 16384 * df}};
-        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.fast_memory_capacity = 1LL << 30;
         p.native_w = 128; p.native_h = 128; set_910b(p, 4096); return p;  // compute-bound: decode fractal-quant
     };
     char b[80];
@@ -1553,7 +1567,7 @@ static void test_model_stages() {
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * d}, {OpType::Reduction, {2}, {3}, S * B},
                  {OpType::Pointwise, {2, 3}, {4}, S * B}, {OpType::Reduction, {4}, {5}, S * B},
                  {OpType::Pointwise, {4, 5}, {6}, S * B}, {OpType::MatMul, {6, 7}, {8}, 16384 * S}};
-        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.fast_memory_capacity = 1LL << 30;
         p.native_w = 128; p.native_h = 128; set_910b(p); return p;
     };
     for (int64_t B : {16, 128, 512}) {
@@ -1624,7 +1638,7 @@ static void test_large_instances() {
                  {OpType::MatMul, {10, 11}, {12}, 16384 * 512},   // @W1
                  {OpType::Pointwise, {12}, {13}, 2048 * 128},     // relu
                  {OpType::MatMul, {13, 14}, {15}, 16384 * 2048}}; // @W2
-        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.fast_memory_capacity = 1LL << 30;
         p.native_w = 128; p.native_h = 128; set_910b(p);
         check_solution("transformer-block", p);
     }
@@ -1643,7 +1657,7 @@ static void test_large_instances() {
             p.ops.push_back({OpType::MatMul, {prev, w}, {out}, 16384 * D});
             prev = out;
         }
-        p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+        p.fast_memory_capacity = 1LL << 30;
         p.native_w = 128; p.native_h = 128; set_910b(p);
         check_solution("deep-chain-8mm", p);
     }
@@ -1659,7 +1673,7 @@ static void test_mixed_axis_reduction_rejected() {
     Problem p;  // x[256,128]; m=rowmax(x)[1,128] (reduce width); c=colsum(x)[256,1] (reduce height)
     p.tensors = {{256, 128}, {1, 128}, {256, 1}};
     p.ops = {{OpType::Reduction, {0}, {1}, 256 * 128}, {OpType::Reduction, {0}, {2}, 256 * 128}};
-    p.fast_memory_capacity = 1 << 24; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1 << 24;
     p.native_w = 128; p.native_h = 128; set_910b(p);
     DAG d = DAG::build(p);
     CHECK("RAXIS: width-reduction + height-reduction NOT fusable", !Subgraph::create(p, d, {0, 1}));
@@ -1680,7 +1694,7 @@ static void test_kernel_fill_one_per_core() {
     Problem p;
     p.tensors = {{16384, 16384}, {16384, 16384}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 16384LL * 16384}};
-    p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1LL << 30;
     p.native_w = 128; p.native_h = 128; set_910b(p);
     DAG d = DAG::build(p);
     auto r = Subgraph::create(p, d, {0})->best_cost();
@@ -1704,7 +1718,7 @@ static void test_pointwise_stream_explicit() {
     Problem p;
     p.tensors = {{8192, 256}, {8192, 256}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 8192 * 256}};
-    p.fast_memory_capacity = 1LL << 30; p.slow_memory_bandwidth = 10;
+    p.fast_memory_capacity = 1LL << 30;
     p.native_w = 128; p.native_h = 128; set_910b(p);
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});

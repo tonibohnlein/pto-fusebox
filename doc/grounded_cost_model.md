@@ -6,15 +6,15 @@ drives **both** the cube and the vector path. It extends `doc/910b_cost_model.md
 (backpropagation, memory feasibility, shared-input reuse) and supersedes its §4
 roofline and §8 calibration.
 
-Everything grounded is gated on `cube_freq_hz > 0`. When unset, every term
-collapses to the legacy behavior (single `slow_memory_bandwidth`, flat
-`cube_compute_cost`, no extract, double-buffer floors inert), so
-competition / single-context instances are byte-for-byte unchanged.
+The 910B is the **only** cost model: every term uses the grounded pto-isa
+coefficients (per-direction bandwidths, fractal-cycle compute, L1↔L0 extract,
+double-buffer floors). `cube_freq_hz` is the core clock; `cube_compute_cost` is a
+calibration multiplier (default 1). The earlier single-`slow_memory_bandwidth` /
+flat-`cube_compute_cost` competition path has been removed.
 
-**One enumeration.** On the 910B path (`num_cores > 1`) the model enumerates only
-`(parts_m, parts_n, split_k)` **triples** over the SpatialSchedule grid — for the
-cube *and* the vector. Uniform exact-divisor tiles survive only as the
-single-context (`num_cores ≤ 1`) legacy fallback.
+**One enumeration.** The model enumerates only `(parts_m, parts_n, split_k)`
+**triples** over the SpatialSchedule grid — for the cube *and* the vector —
+including the `(1,1)` whole-output region.
 
 ---
 
@@ -43,7 +43,7 @@ transfer_cycles = (bytes / 2^30) / bw_GiBps * cube_freq_hz
 ```
 
 i.e. `MakeByteCost()` precomputes `cycles_per_byte = cube_freq_hz / (2^30 *
-bw_GiBps)`. Legacy fallback: `1 / slow_memory_bandwidth` for every direction.
+bw_GiBps)`, per direction.
 
 **Cube fractals** (pto-isa `mad`): a matmul of an `M×N` output with contraction `K`:
 
@@ -109,7 +109,7 @@ reload can **ping-pong** — the per-core contraction halvable into ≥2 seq-K
 sub-strips (`per_core_K ≥ 32`; the emit's implicit halving needs that). A tiny
 contraction, or an over-aggressive split-K with `K/S < 32`, can't overlap →
 reload and compute **serialize** (`compute + ddr`). This caps split-K at `S ≤
-K/32`. It is a cost, not a hard reject. Grounded only; legacy keeps `max`.
+K/32`. It is a cost, not a hard reject.
 
 **Double-buffering does NOT reserve L1/UB.** The two ping-pong buffers *together*
 are the pool, so `derive_exec` / `vector_stream` use the **full** `l1_capacity` /
