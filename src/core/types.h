@@ -63,7 +63,6 @@ struct Problem {
     std::vector<Tensor> tensors;
     std::vector<Op> ops;
     int64_t fast_memory_capacity;
-    int64_t native_w, native_h;
 
     // --- Ascend 910B machine model -------------------------------------------
     // Compute parallelizes across these cores; DDR bandwidth is shared (one HBM).

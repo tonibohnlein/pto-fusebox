@@ -40,10 +40,6 @@
   8388608
  ],
  "fast_memory_capacity": 67108864,
- "native_granularity": [
-  128,
-  128
- ],
  "num_cube_cores": 24,
  "num_vector_cores": 48,
  "cube_capacity": 131072,

@@ -1909,12 +1909,11 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           //      when it is STRICTLY faster (caught by the latency test above).
           //   2. lower DDR traffic   — matmul reuse (less reload); flat for PW
           //   3. more cores used     — fill the unit's cores (parallelism)
-          //   4. UNIFORM over grid    — a non-uniform SpatialSchedule grid wins ONLY
-          //      when STRICTLY faster (caught above). At equal latency the uniform
-          //      exact-divisor tile is preferred: its even-divisor extents are
-          //      emit-friendly, whereas a grid's +-1-fractal extents (e.g. h=1376
-          //      on a 4096 axis) the tiling emit cannot realize cleanly. So a grid
-          //      is used only where it pays for itself (power-of-two fills).
+          //   4. EVENLY-DIVIDING tile — a grid whose +-1-fractal region extents do
+          //      NOT evenly divide the output (e.g. h=1376 on a 4096 axis) the tiling
+          //      emit cannot realize cleanly; at equal latency prefer a tile whose
+          //      extents evenly divide the output. An imbalanced grid is used only
+          //      where it is strictly faster (power-of-two / few-row fills).
           //   5. larger tile area    — best vectorization / least per-tile
           //      overhead (avoids the degenerate 1xN / 16x16 picks)
           //   6. larger k            — fewer L1 passes

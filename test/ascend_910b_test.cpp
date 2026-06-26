@@ -24,7 +24,7 @@
 #include <iostream>
 #include <vector>
 
-static int g_pass = 0, g_fail = 0, g_red = 0;
+static int g_pass = 0, g_fail = 0;
 
 static void CHECK(const char* l, bool c) {
     if (c) g_pass++;
@@ -33,11 +33,6 @@ static void CHECK(const char* l, bool c) {
 static void CHECK_EQ(const char* l, double g, double e, double t = 0.5) {
     if (std::abs(g - e) < t) g_pass++;
     else { g_fail++; std::cout << "  FAIL: " << l << " got=" << g << " exp=" << e << "\n"; }
-}
-// Expected to fail until the 910B model lands — does not break the build.
-static void RED(const char* l, bool c) {
-    if (c) g_pass++;
-    else { g_red++; std::cout << "  RED (todo): " << l << "\n"; }
 }
 // Activate the grounded 910B parallel model (one die): 24 cube + 48 vector cores,
 // L0c accumulator = 128 KB/core (the cube tile bound, replacing the native cap),
@@ -84,8 +79,6 @@ static void test_A_pointwise_memory_bound() {
     p.tensors = {{512, 512}, {512, 512}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 100}};  // trivial compute
     p.fast_memory_capacity = 1 << 22;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     p.kernel_fill_cost = 0;  // isolate the DDR floor (fill is a separate layer)
     DAG dag = DAG::build(p);
@@ -112,8 +105,6 @@ static void test_B_thin_matmul_parallel() {
     p.tensors = {{2048, 64}, {64, 2048}, {64, 64}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};  // compute-heavy (2.4M = 24*100k)
     p.fast_memory_capacity = 1 << 20;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
@@ -136,8 +127,6 @@ static void test_C_pointwise_fusion() {
     p.tensors = {{256, 256}, {256, 256}, {256, 256}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 500}, {OpType::Pointwise, {1}, {2}, 500}};
     p.fast_memory_capacity = 1 << 20;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;
@@ -155,8 +144,6 @@ static void test_D_mixed_cube_vector() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}, {128, 128}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 30000}, {OpType::Pointwise, {2}, {3}, 500}};
     p.fast_memory_capacity = 1 << 20;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     // 910B: matmul (cube) + relu (vector) can't share a subgraph — the unit-
@@ -189,8 +176,6 @@ static void test_softmax_reduction_schema() {
              {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
              {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     CHECK("softmax: rowmax reduces width to 1", p.tensors[1].width == 1);
     CHECK("softmax: m broadcast back to W in exp", p.tensors[2].width == 4096);
@@ -224,8 +209,6 @@ static void test_R_reduction_split() {
     p.tensors = {{4096, 4}, {1, 4}};                       // A[4 rows x 4096], rowmax -> m[1,4]
     p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     auto r = Subgraph::create(p, dag, {0})->best_cost();
@@ -243,8 +226,6 @@ static void test_E_matmul_2d_vs_1d() {
     p.tensors = {{512, 512}, {512, 512}, {512, 512}};  // A, B, C : M=N=K=512
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};       // tiny compute -> memory-bound
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
@@ -267,8 +248,6 @@ static void test_F_split_k() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048 (1 native tile)
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p, 4096);  // compute-bound: split-K's win is its COMPUTE parallelization
     DAG dag = DAG::build(p);
     double par = Subgraph::create(p, dag, {0})->best_cost().latency;
@@ -294,8 +273,6 @@ static void test_G_super_native_tile() {
     p.tensors = {{512, 1024}, {1024, 512}, {1024, 1024}};  // M=N=1024, K=512
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 100}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     auto best = Subgraph::create(p, dag, {0})->best_cost();
@@ -316,8 +293,6 @@ static void test_H_split_k_beats_spatial() {
     p.tensors = {{2048, 128}, {128, 2048}, {128, 128}};  // C[128,128], K=2048
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 2400000}};     // compute-heavy
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
@@ -341,8 +316,6 @@ static Problem mk_mm(int64_t M, int64_t N, int64_t K, int64_t cost) {
     p.tensors = {{K, M}, {N, K}, {N, M}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, cost}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     return p;
 }
@@ -368,8 +341,6 @@ static Problem mk_chained(int64_t M, int64_t K1, int64_t N1, int64_t N2, int64_t
     p.tensors = {{K1, M}, {N1, K1}, {N1, M}, {N2, N1}, {N2, M}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, c1}, {OpType::MatMul, {2, 3}, {4}, c2}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     return p;
 }
@@ -421,7 +392,7 @@ static void test_two_matmul() {
         q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
         q.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * Kc}, {OpType::MatMul, {0, 3}, {4}, 16384 * Kc}};
         q.fast_memory_capacity = 1 << 26;
-        q.native_w = 128; q.native_h = 128; set_910b(q, 4096); q.kernel_fill_cost = 0;  // compute-bound regime
+ set_910b(q, 4096); q.kernel_fill_cost = 0;  // compute-bound regime
         DAG dq = DAG::build(q);
         double a = Subgraph::create(q, dq, {0})->best_cost().latency;
         double b = Subgraph::create(q, dq, {1})->best_cost().latency;
@@ -441,7 +412,7 @@ static void test_two_matmul() {
                  {OpType::MatMul, {3, 4}, {5}, 16384 * K},
                  {OpType::Pointwise, {2, 5}, {6}, N * M}};
         a.fast_memory_capacity = 1 << 26;
-        a.native_w = 128; a.native_h = 128; set_910b(a);
+ set_910b(a);
         DAG da = DAG::build(a);
         CHECK("2MM: accumulate {mm,mm,add} rejected (cube+vector not homogeneous)",
               !Subgraph::create(a, da, {0, 1, 2}).has_value());
@@ -469,7 +440,7 @@ static void test_shared_input_reuse() {
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::MatMul, {0, 3}, {4}, 1000}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128; p.native_h = 128;
+
     set_910b(p);
     p.cube_compute_cost = 16;   // memory-bound: HBM dominates (vs the 4096 placeholder)
     p.kernel_fill_cost = 0;     // isolate the roofline
@@ -502,7 +473,7 @@ static void test_atomic_add_flag() {
     p.tensors = {{K, M}, {N, K}, {N, M}};  // A[K,M] B[N,K] -> C[N,M]
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128; p.native_h = 128;
+
     set_910b(p);                 // ddr_atomic_add = true (910B has SetAtomicAdd)
     p.cube_compute_cost = 64;    // memory-bound so the merge matters
     p.kernel_fill_cost = 0;
@@ -525,7 +496,7 @@ static void test_atomic_add_flag() {
         v.tensors = {{4096, 32}, {1, 32}};
         v.ops = {{OpType::Reduction, {0}, {1}, 4096 * 32}};
         v.fast_memory_capacity = 1 << 26;
-        v.native_w = 128; v.native_h = 128;
+
         set_910b(v);              // ddr_atomic_add = true
         v.kernel_fill_cost = 0;
         DAG dv = DAG::build(v);
@@ -555,7 +526,7 @@ static void test_geometry_compute() {
     Problem c;
     c.tensors = {{2048, 64}, {96, 2048}, {96, 64}};  // A[K,M] B[N,K] -> C[N,M], FP32
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 999}};  // base_cost ignored (grounded geometry)
-    c.fast_memory_capacity = 1 << 26; c.native_w = 128; c.native_h = 128;
+    c.fast_memory_capacity = 1 << 26;
     set_910b(c, 10000);  // big cube multiplier -> compute roofline (DDR hidden)
     c.kernel_fill_cost = 0;
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
@@ -579,7 +550,7 @@ static void test_geometry_compute() {
     Problem v;
     v.tensors = {{512, 512}, {512, 512}};
     v.ops = {{OpType::Pointwise, {0}, {1}, 999}};
-    v.fast_memory_capacity = 1 << 26; v.native_w = 128; v.native_h = 128;
+    v.fast_memory_capacity = 1 << 26;
     set_910b(v); v.kernel_fill_cost = 0;
     auto rv = Subgraph::create(v, DAG::build(v), {0})->best_cost();
     auto cpb = [&](double bw) { return v.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
@@ -620,8 +591,6 @@ static void test_pypto_tiling_comparison() {
         p.tensors[2].dtype = DType::FP32;  // C accumulator
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384LL * c.K}};
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p);
         auto r = Subgraph::create(p, DAG::build(p), {0})->best_cost();
         printf("  %-22s ours[N=%lld M=%lld k=%lld] split=%d | pypto L0[m=%d n=%d k=%d]\n",
@@ -657,8 +626,6 @@ static void test_two_pool_working_set() {
     c.tensors = {{4096, 2048}, {2048, 4096}, {2048, 2048}};  // A[K,M] B[N,K] -> C[N,M], out 2048^2
     c.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 4096}};
     c.fast_memory_capacity = 1 << 28;
-    c.native_w = 128;
-    c.native_h = 128;
     set_910b(c);
     auto rc = Subgraph::create(c, DAG::build(c), {0})->best_cost();
     long long opnd = (long long)rc.config.k * (rc.config.w + rc.config.h) * 4;  // FP32 operand bytes
@@ -674,8 +641,6 @@ static void test_two_pool_working_set() {
     v.tensors = {{512, 512}, {512, 512}};
     v.ops = {{OpType::Pointwise, {0}, {1}, 100}};
     v.fast_memory_capacity = 1 << 28;
-    v.native_w = 128;
-    v.native_h = 128;
     set_910b(v);
     auto rv = Subgraph::create(v, DAG::build(v), {0})->best_cost();
     long long ub = (long long)rv.config.w * rv.config.h * 2 * 4;  // in + out, FP32
@@ -700,8 +665,6 @@ static void test_pypto_l0_comparison() {
     p.tensors = {{2048, 16}, {64, 2048}, {64, 16}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * 2048}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p);
     auto r = Subgraph::create(p, DAG::build(p), {0})->best_cost();
     std::cout << "    pypto L0 (hand-crafted): out tile[16,64] Acc, k=256 (ChooseL0Tile), 1 core sequential\n";
@@ -801,8 +764,6 @@ static void test_visualize() {
                  {OpType::Reduction, {2}, {3}, 4096 * 128 / 4},
                  {OpType::Pointwise, {2, 3}, {4}, 4096 * 128}};
         p.fast_memory_capacity = 1 << 24;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p);
         viz_row("softmax fused", p, {0, 1, 2, 3});
         viz_row("rowmax alone", p, {0});
@@ -812,8 +773,6 @@ static void test_visualize() {
         p.tensors = {{4096, 4}, {1, 4}};
         p.ops = {{OpType::Reduction, {0}, {1}, 4096LL * 4 * 1000}};
         p.fast_memory_capacity = 1 << 24;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p);
         viz_row("few-row reduction", p, {0});
     }
@@ -914,8 +873,6 @@ static void test_subgraph_structure() {
         pm.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},          // op0: cube
                   {OpType::Pointwise, {2}, {3}, 100}};          // op1: vector
         pm.fast_memory_capacity = 1 << 20;
-        pm.native_w = 128;
-        pm.native_h = 128;
         set_910b(pm);
         DAG dm = DAG::build(pm);
         auto sg = Subgraph::create(pm, dm, {0, 1});
@@ -942,8 +899,6 @@ static void test_cube_vector_fusion() {
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::Pointwise, {2}, {3}, 100}};
     p.fast_memory_capacity = 1 << 26;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p, 4096);  // compute-bound matmul so the overlap is the lever
     DAG dag = DAG::build(p);
 
@@ -980,8 +935,6 @@ static void test_mixed_unit_tiling() {
     p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
              {OpType::Pointwise, {2}, {3}, 100}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128;
-    p.native_h = 128;
     set_910b(p, 4096);
     p.num_cube_cores = 4;
     p.num_vector_cores = 8;  // 1:2 ratio -> 4 units of {1 cube + 2 vector}
@@ -1014,8 +967,6 @@ static void test_mixed_mm_pw_variants() {
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000},
                  {OpType::Pointwise, {2}, {3}, 100}};
         p.fast_memory_capacity = 1 << 26;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p, cc);
         return p;
     };
@@ -1084,8 +1035,6 @@ static void test_mixed_two_pool_feasibility() {
         p.tensors = {{256, 256}, {256, 256}, {256, 256}, {256, 256}};  // A B C D, FP32
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 1000}, {OpType::Pointwise, {2}, {3}, 100}};
         p.fast_memory_capacity = 1 << 26;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p, 64);
         p.l1_capacity = 512 * 1024;
         p.cube_capacity = 128 * 1024;
@@ -1143,8 +1092,6 @@ static void test_mixed_multistage_pebble() {
                  {OpType::MatMul, {2, 3}, {4}, 1000},   // C  = T1 @ D
                  {OpType::Pointwise, {4}, {5}, 100}};   // E  = relu(C)
         p.fast_memory_capacity = 1 << 26;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p, 64);
         p.l1_capacity = 512 * 1024;
         p.cube_capacity = 128 * 1024;
@@ -1172,8 +1119,6 @@ static void test_mixed_multistage_pebble() {
                  {OpType::Pointwise, {2}, {3}, 100},    // T = relu(C)
                  {OpType::Pointwise, {3}, {4}, 100}};   // D = gelu(T)
         p.fast_memory_capacity = 1 << 26;
-        p.native_w = 128;
-        p.native_h = 128;
         set_910b(p, 64);
         p.l1_capacity = 512 * 1024;
         p.cube_capacity = 128 * 1024;
@@ -1356,7 +1301,7 @@ static void test_vector_band_ub() {
     p.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 128},
              {OpType::Reduction, {1}, {2}, 4096 * 128}};
     p.fast_memory_capacity = 1 << 24;
- p.native_w = 128; p.native_h = 128;
+
     set_910b(p);
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0, 1});
@@ -1378,7 +1323,7 @@ static void test_vector_band_ub() {
 static void test_reduction_sink_gating() {
     std::cout << "[RGATE] reduced-axis split only when the reduction is the sink\n";
     auto mk = []() { Problem p;
-                     p.native_w = 128; p.native_h = 128; return p; };
+ return p; };
     // (a) bare rowmax, few rows -> sink reduction -> splits across cores.
     Problem a = mk();
     a.tensors = {{4096, 4}, {1, 4}};
@@ -1411,7 +1356,7 @@ static Problem mk_softmax(int64_t W, int64_t H) {
     p.ops = {{OpType::Reduction, {0}, {1}, W * H / 4}, {OpType::Pointwise, {0, 1}, {2}, W * H},
              {OpType::Reduction, {2}, {3}, W * H / 4}, {OpType::Pointwise, {2, 3}, {4}, W * H}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
     return p;
 }
 static void test_vector_streaming_reduction() {
@@ -1457,7 +1402,7 @@ static void test_matmul_sensibility() {
         p.tensors = {{c.K, c.M}, {c.N, c.K}, {c.N, c.M}};  // A[K,M] B[N,K] -> C[N,M]
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * c.K}};
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
         DAG d = DAG::build(p);
         auto r = Subgraph::create(p, d, {0})->best_cost();
         char b[80];
@@ -1497,7 +1442,7 @@ static void test_vector_sensibility() {
         if (expect_split) C("few-row reduction split-fills cores", r.parallel_split > 1);
     };
     auto base = [](Problem& p) { p.fast_memory_capacity = 1 << 24;
-                                 p.native_w = 128; p.native_h = 128; set_910b(p); };
+ set_910b(p); };
     Problem pw; pw.tensors = {{4096, 4096}, {4096, 4096}};
     pw.ops = {{OpType::Pointwise, {0}, {1}, 4096 * 4096}}; base(pw);
     run("pointwise", pw, {0}, false);
@@ -1533,7 +1478,7 @@ static void test_model_stages() {
         p.ops = {{OpType::MatMul, {0, 1}, {2}, 16384 * dm}, {OpType::Pointwise, {2}, {3}, df * B},
                  {OpType::MatMul, {3, 4}, {5}, 16384 * df}};
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128; p.native_h = 128; set_910b(p, 4096); return p;  // compute-bound: decode fractal-quant
+ set_910b(p, 4096); return p;  // compute-bound: decode fractal-quant
     };
     char b[80];
     double mm1_decode = -1, mm1_b16 = -1;
@@ -1568,7 +1513,7 @@ static void test_model_stages() {
                  {OpType::Pointwise, {2, 3}, {4}, S * B}, {OpType::Reduction, {4}, {5}, S * B},
                  {OpType::Pointwise, {4, 5}, {6}, S * B}, {OpType::MatMul, {6, 7}, {8}, 16384 * S}};
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128; p.native_h = 128; set_910b(p); return p;
+ set_910b(p); return p;
     };
     for (int64_t B : {16, 128, 512}) {
         Problem p = attn(B);
@@ -1639,7 +1584,7 @@ static void test_large_instances() {
                  {OpType::Pointwise, {12}, {13}, 2048 * 128},     // relu
                  {OpType::MatMul, {13, 14}, {15}, 16384 * 2048}}; // @W2
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
         check_solution("transformer-block", p);
     }
     // (2) Deep matmul chain (8 cube ops): C0=A@B0, C1=C0@B1, ... all cube; tests
@@ -1658,7 +1603,7 @@ static void test_large_instances() {
             prev = out;
         }
         p.fast_memory_capacity = 1LL << 30;
-        p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
         check_solution("deep-chain-8mm", p);
     }
 }
@@ -1674,7 +1619,7 @@ static void test_mixed_axis_reduction_rejected() {
     p.tensors = {{256, 128}, {1, 128}, {256, 1}};
     p.ops = {{OpType::Reduction, {0}, {1}, 256 * 128}, {OpType::Reduction, {0}, {2}, 256 * 128}};
     p.fast_memory_capacity = 1 << 24;
-    p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
     DAG d = DAG::build(p);
     CHECK("RAXIS: width-reduction + height-reduction NOT fusable", !Subgraph::create(p, d, {0, 1}));
     CHECK("RAXIS: width-reduction alone creates", (bool)Subgraph::create(p, d, {0}));
@@ -1695,7 +1640,7 @@ static void test_kernel_fill_one_per_core() {
     p.tensors = {{16384, 16384}, {16384, 16384}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 16384LL * 16384}};
     p.fast_memory_capacity = 1LL << 30;
-    p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
     DAG d = DAG::build(p);
     auto r = Subgraph::create(p, d, {0})->best_cost();
     CHECK("KFILL: huge pointwise uses ~one kernel per core (<= 2x cores)",
@@ -1719,7 +1664,7 @@ static void test_pointwise_stream_explicit() {
     p.tensors = {{8192, 256}, {8192, 256}};
     p.ops = {{OpType::Pointwise, {0}, {1}, 8192 * 256}};
     p.fast_memory_capacity = 1LL << 30;
-    p.native_w = 128; p.native_h = 128; set_910b(p);
+ set_910b(p);
     DAG d = DAG::build(p);
     auto sg = Subgraph::create(p, d, {0});
     const int64_t UB = 192 * 1024;
@@ -1777,6 +1722,6 @@ int main() {
     test_F_split_k();
     test_G_super_native_tile();
     test_H_split_k_beats_spatial();
-    std::cout << "\n=== pass=" << g_pass << " fail=" << g_fail << " red(todo)=" << g_red << " ===\n";
+    std::cout << "\n=== pass=" << g_pass << " fail=" << g_fail << " ===\n";
     return g_fail;  // RED items are the spec; only hard CHECK failures break the build
 }

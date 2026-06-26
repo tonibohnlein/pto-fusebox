@@ -68,7 +68,6 @@ int main(int argc, char* argv[]) {
               << prob.num_ops() << " ops (" << n_mm << " MM + " << n_pw << " PW)"
               << ", fast_mem=" << prob.fast_memory_capacity
               << " freq=" << prob.cube_freq_hz
-              << " native=[" << prob.native_w << "," << prob.native_h << "]"
               << "\n         retainable=" << prob.retainable_tensors.size()
               << "/" << prob.num_tensors()
               << " max_tensor=" << max_tensor

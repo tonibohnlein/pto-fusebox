@@ -24,8 +24,7 @@ Problem read_problem(const std::string& filename) {
     // Validate required top-level keys exist before accessing them.
     for (const char* key : {"widths", "heights", "inputs", "outputs",
                              "base_costs", "op_types",
-                             "fast_memory_capacity", "cube_freq_hz",
-                             "native_granularity"}) {
+                             "fast_memory_capacity", "cube_freq_hz"}) {
         if (!j.contains(key)) {
             std::cerr << "Error: missing required field '" << key
                       << "' in '" << filename << "'\n";
@@ -149,15 +148,7 @@ Problem read_problem(const std::string& filename) {
     // --- Hardware parameters ---
     p.fast_memory_capacity  = j["fast_memory_capacity"].get<int64_t>();
 
-    auto& ng = j["native_granularity"];
-    if (!ng.is_array() || ng.size() < 2) {
-        std::cerr << "Error: native_granularity must be a 2-element array [w, h]\n";
-        std::exit(1);
-    }
-    p.native_w = ng[0].get<int64_t>();
-    p.native_h = ng[1].get<int64_t>();
-
-    if (p.fast_memory_capacity <= 0 || p.native_w <= 0 || p.native_h <= 0) {
+    if (p.fast_memory_capacity <= 0) {
         std::cerr << "Error: hardware parameters must be positive\n";
         std::exit(1);
     }
@@ -209,24 +200,13 @@ Problem read_problem(const std::string& filename) {
     // actually beneficial for a given schedule; this set is the permissive
     // upper bound of candidates.
     // -------------------------------------------------------------------------
-    // 910B: NO cross-subgraph retention. Each subgraph runs across the cores;
-    // data crossing a subgraph boundary (incl. the cube<->vector handoff) routes
-    // through DDR/GM, and there is no single shared fast memory that persists a
-    // tensor across subgraph executions (L1/L0c and UB are per-core, transient).
-    // So retainable_tensors stays empty — the per-core working set never pins a
-    // cross-subgraph tensor. (Competition single-core keeps the original logic.)
-    if (p.num_cube_cores <= 1 && p.num_vector_cores <= 1) {
-        std::vector<size_t> consumer_count(num_tensors, 0);
-        for (auto& op : p.ops)
-            for (auto t : op.inputs)
-                consumer_count[t]++;
-
-        for (size_t i = 0; i < num_tensors; i++) {
-            if (p.tensors[i].size() > p.fast_memory_capacity) continue; // rule 1
-            if (consumer_count[i] == 0)                        continue; // rule 2
-            p.retainable_tensors.insert(i);
-        }
-    }
+    // 910B: NO cross-subgraph retention. Each subgraph runs across the cores; data
+    // crossing a subgraph boundary (incl. the cube<->vector handoff) routes through
+    // DDR/GM, and there is no shared fast memory that persists a tensor across
+    // subgraph executions (L1/L0c and UB are per-core, transient). So
+    // retainable_tensors stays empty — the per-core working set never pins a
+    // cross-subgraph tensor.
+    // -------------------------------------------------------------------------
 
     return p;
 }
