@@ -92,6 +92,12 @@ live-band count = the DFS frontier width. At a join the root op's `per_unit = 0`
 
 ## 4. Roofline cost — `compute_cost`
 
+> **Superseded by `grounded_cost_model.md`** (§3 cube roofline, §5 wave/LPT
+> makespan, §6 the split taxonomy, §7 the vector roofline). The grounded model
+> uses per-direction bandwidths, a wave/LPT makespan over the SpatialSchedule
+> grid, and double-buffer floors. The single-bandwidth `min(num_tiles, cores)`
+> form below is the legacy path (`cube_freq_hz == 0`) only.
+
 `num_tw = N/w`, `num_th = M/h`, `num_tiles = num_tw·num_th`,
 `eff1 = min(num_tiles, n_cores)`, `inv_B = 1/bandwidth`,
 `sat(c) = max(1, n_cores/c)`.
