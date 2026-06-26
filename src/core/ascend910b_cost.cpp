@@ -792,16 +792,16 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // cores is a strong SOFT preference, but the cost (merge barrier vs streaming
   // gain) drives it (a small shape can be best at FEWER than C units when the split
   // merge outweighs recruiting idle cores). compute_cost evaluates each fixed
-  // triple (no internal S sweep). PQ < 2 (whole-output) is covered by the uniform
-  // path, so skip it.
+  // triple (no internal S sweep). PQ == 1 (the whole-output region) IS included
+  // so the grid is self-sufficient on the 910B path: (1,1,S) is the pure
+  // split-K / single-region fill the uniform whole-output tile used to provide.
   auto gen_grid = [&](int64_t C, int64_t maxP, int64_t maxQ,
                       const std::vector<int64_t> &s_vals) {
-    std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C}
+    std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C} (incl. 1)
     for (int64_t R : {C, 2 * C})
       for (int64_t d = 1; d * d <= R; ++d)
         if (R % d == 0) { region_counts.insert(d); region_counts.insert(R / d); }
     for (int64_t PQ : region_counts) {
-      if (PQ < 2) continue;
       for (int64_t P = 1; P <= PQ; ++P) {
         if (PQ % P != 0) continue;
         const int64_t Q = PQ / P;
@@ -810,7 +810,14 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       }
     }
   };
-  const int64_t Fm = (sg.out_H_ + 15) / 16, Fn = (sg.out_W_ + 15) / 16;
+  // Tile granularity: cube is 16x16-fractal aligned on both axes; vector has no
+  // fractal constraint, so its free (row/height) axis tiles at 1 element and its
+  // contiguous (width) axis at the 16-element DMA block. The finer row granule is
+  // what lets a few-row reduction (softmax) tile enough regions to fill C.
+  sg.grid_gran_h_ = matmul_910b ? 16 : 1;
+  sg.grid_gran_w_ = 16;
+  const int64_t Fm = (sg.out_H_ + sg.grid_gran_h_ - 1) / sg.grid_gran_h_;
+  const int64_t Fn = (sg.out_W_ + sg.grid_gran_w_ - 1) / sg.grid_gran_w_;
   if (matmul_910b) {
     // Cube: the grid tiles the SINK output; the chain backpropagates from it, so
     // every matmul must share the sink's M (tensors[o].height == out_H_) -- the
@@ -828,17 +835,27 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       gen_grid(std::max<int64_t>(1, prob.num_cube_cores), Fm, Fn, all_divisors(kfrac));
     }
   } else if (sg.has_vector_) {
-    // Vector: tile the output across the AIV cores. The PARALLEL split is the
-    // reduced-axis (cross-core accumulation) split, which is meaningful ONLY for a
-    // reduction SINK -- and the vector branch of compute_cost handles THAT
-    // internally -- so these grids are PURE SPATIAL (split_k = 1). A reduced axis
-    // cannot be spatially tiled (the whole row/col must be present to reduce), so
-    // its parts pin to 1: a width reduction ([H,W]->[H,1]) tiles only height
-    // (parts_n = 1), a height reduction only width (parts_m = 1); pointwise tiles
-    // both.
+    // Vector: tile the output across the AIV cores. A reduced axis cannot be
+    // spatially tiled (the whole row/col must be present to reduce), so its parts
+    // pin to 1: a width reduction ([H,W]->[H,1]) tiles only height (parts_n = 1), a
+    // height reduction only width (parts_m = 1); pointwise tiles both.
+    const int64_t C = std::max<int64_t>(1, prob.num_vector_cores);
     const int64_t maxP = (sg.reduced_axis_ == 2) ? 1 : Fm;  // height reduced -> no M-split
     const int64_t maxQ = (sg.reduced_axis_ == 1) ? 1 : Fn;  // width  reduced -> no N-split
-    gen_grid(std::max<int64_t>(1, prob.num_vector_cores), maxP, maxQ, {1});
+    // The triple's split_k is the REDUCED-AXIS (cross-core accumulation) split --
+    // the vector analog of cube split-K, meaningful ONLY for a reduction SINK. It
+    // lets P_spatial * S fill the cores when the non-reduced axis alone can't (a
+    // softmax whose query rows are few). S over the divisors of 2C, capped by the
+    // reduced fractal count (S <= the splittable extent). Pure pointwise has no
+    // axis to split -> S = 1.
+    std::vector<int64_t> s_vals = {1};
+    if (sg.reduced_axis_ != 0 && sg.reduction_is_sink_) {
+      const int64_t rcap = std::max<int64_t>(1, sg.reduced_extent_ / 16);
+      s_vals.clear();
+      for (int64_t s : all_divisors(2 * C))
+        if (s <= rcap) s_vals.push_back(s);
+    }
+    gen_grid(C, maxP, maxQ, s_vals);
   }
 
   // Depth-first topological execution order (the fixed pebbling order). Post-
@@ -1481,8 +1498,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // reproducing the num_tw recompute factor of total_compute). Hoisted so the
       // split-K loop below reuses it (LPT-consistent split-K on the grid). Uniform
       // mode: the wave makespan over equal work units.
-      const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m));
-      const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n));
+      const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m), grid_gran_h_);
+      const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n), grid_gran_w_);
       // L0 base tile (pto-isa GEMM oracle); the K-step is baseK=64. Used for the
       // Phase-D pipeline depth. Fall back to {1,1} when ungrounded (extract==0
       // then, so the depth is immaterial).
@@ -1691,7 +1708,18 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // identically. eff stays the per-wave active-core count for the DDR sat.
       const double compute_mk = WaveComputeCycles(total_compute, num_tiles, n_cores);
       const double sat_v = std::max(1.0, (double)n_cores / eff);
-      double lat = std::max(compute_mk, total_io * sat_v);
+      // Double-buffer floor (grounded): the max(compute, DDR) roofline holds only
+      // when the per-core tile streams in >= 2 SIMD-repeat chunks (>= 2*vec_reg_
+      // bytes), so the load of chunk s+1 overlaps the compute of chunk s. A tile
+      // too small to ping-pong can't overlap -> load and compute SERIALIZE
+      // (compute + DDR). BINARY: crossing the threshold grants max and nothing
+      // more, so a larger tile gets no extra (and unreal) overlap credit.
+      const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+      const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+      const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
+      const bool db = !(prob_->cube_freq_hz > 0.0) || tile_bytes >= 2.0 * (double)vreg;
+      auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };
+      double lat = rfl(compute_mk, total_io * sat_v);
       result.parallel_split = 1;
       result.cores_used = (int)eff;
       result.compute_bound = compute_mk >= total_io * sat_v;
@@ -1703,29 +1731,41 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // optimum is interior when the merge is serial), and the merge has the SAME
       // two regimes via Problem::ddr_atomic_add. The reduced partial is thin
       // ([H,1] for a width-reduction, [1,W] for a height-reduction) -> red_dim.
-      if (has_reduction_ && reduction_is_sink_ && num_tiles < n_cores) {
+      if (has_reduction_ && reduction_is_sink_) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         const double sat_acc = std::max(1.0, (double)n_cores / (double)num_tiles);
-        const int64_t S_max = (n_cores + num_tiles - 1) / num_tiles;
-        for (int64_t S = 2; S <= S_max; ++S) {
+        struct RS { double lat, eff, sat, merge, compute; };
+        auto eval_reduce_S = [&](int64_t S) -> RS {
           const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
           const double sat_vS = std::max(1.0, (double)n_cores / effS);
-          const double streamS = std::max(
-              WaveComputeCycles(total_compute, num_tiles * S, n_cores), total_io * sat_vS);
+          const double compS = WaveComputeCycles(total_compute, num_tiles * S, n_cores);
+          const double streamS = rfl(compS, total_io * sat_vS);  // same double-buffer floor
           // (1) write/atomic-add the S thin partials (parallel; cancels below full-fill).
           double merge = (double)(S - 1) * red_dim * bc.ub_out * sat_vS;
           // (2) WITHOUT SetAtomicAdd: read the partials back and sum serially per
           //     tile (one accumulator/tile -> sat(num_tiles), grows ∝ S).
           if (!prob_->ddr_atomic_add)
             merge += (double)(S + 1) * red_dim * bc.ub_out * sat_acc;
-          const double latS = streamS + merge;
-          if (latS < lat) {
-            lat = latS;
+          return {streamS + merge, effS, sat_vS, merge, compS};
+        };
+        auto take_S = [&](int64_t S) {
+          const RS e = eval_reduce_S(S);
+          if (e.lat < lat) {
+            lat = e.lat;
             result.parallel_split = (int)S;
-            result.cores_used = (int)effS;
-            result.compute_bound = (total_compute / effS) >= (total_io * sat_vS);
-            result.ddr_traffic = total_io * sat_vS + merge;
+            result.cores_used = (int)e.eff;
+            result.compute_bound = e.compute >= (total_io * e.sat);
+            result.ddr_traffic = total_io * e.sat + e.merge;
           }
+        };
+        // The triple's split_k IS the reduced-axis split (lets P_spatial * S fill
+        // the cores). A uniform/legacy tile (split_k==0, not on the 910B path)
+        // sweeps S to fill instead. S=1 means no split (the spatial base above).
+        if (cfg.split_k > 1) {
+          take_S(cfg.split_k);
+        } else if (cfg.split_k == 0 && num_tiles < n_cores) {
+          const int64_t S_max = (n_cores + num_tiles - 1) / num_tiles;
+          for (int64_t S = 2; S <= S_max; ++S) take_S(S);
         }
       }
       result.latency = lat;
@@ -1931,8 +1971,16 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
           const long long ra = (long long)r.config.w * r.config.h;
           const long long ba = (long long)best.config.w * best.config.h;
-          const bool r_uniform = r.config.parts_m == 0;
-          const bool b_uniform = best.config.parts_m == 0;
+          // Emit-friendliness: a tile whose extents EVENLY DIVIDE the output (every
+          // region identical) lowers cleanly; a grid's +-1-block extents (e.g.
+          // h=1366 on a 4096 axis) the tiling emit can't realize. So at equal
+          // latency prefer a dividing tile -- the imbalanced grid is used only when
+          // it is strictly faster (the power-of-two / few-row fills that have no
+          // dividing C-tiling). Uniform tiles always divide; a grid sometimes does.
+          const bool r_div = (out_W_ % std::max<int64_t>(1, r.config.w) == 0) &&
+                             (out_H_ % std::max<int64_t>(1, r.config.h) == 0);
+          const bool b_div = (out_W_ % std::max<int64_t>(1, best.config.w) == 0) &&
+                             (out_H_ % std::max<int64_t>(1, best.config.h) == 0);
           if (r.latency < best.latency - tol) {
             take = true;
           } else if (r.latency > best.latency + tol) {
@@ -1945,8 +1993,8 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
             take = false;
           } else if (r.cores_used != best.cores_used) {
             take = r.cores_used > best.cores_used;
-          } else if (r_uniform != b_uniform) {
-            take = r_uniform;  // emit-friendly uniform tile beats a grid when equal
+          } else if (r_div != b_div) {
+            take = r_div;  // emit-friendly evenly-dividing tile beats an imbalanced grid
           } else if (ra != ba) {
             take = ra > ba;
           } else {
@@ -1956,15 +2004,27 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
         if (take) best = r;
   };
 
-  // Uniform exact-divisor tiles (the legacy spatial search).
-  for (int64_t ww : ws_cand_)
-    for (int64_t hh : hs_cand_)
-      for (int64_t kk : ks_cand_)
-        consider(TileConfig{ww, hh, kk});
+  // Uniform exact-divisor tiles. The PURE-CUBE 910B path (has_matmul_, no vector,
+  // n_cores > 1) is GRID-ONLY: feasibility is via derive_exec (the cube seq-k fits
+  // L1 regardless of the spatial tile), so uniform tiles are redundant and the grid
+  // -- now including the (1,1) whole-output region -- covers every fill. The vector
+  // and mixed paths KEEP uniform: a vector reduction (esp. an internal one like
+  // softmax, where reduced_axis_ is set but the output is full [W,H]) tiles and
+  // streams in a way the pure-spatial grid does not yet capture. Single-context
+  // (n_units == 1) also keeps it (no grid). pypto never builds a single-context
+  // Problem; this is the legacy fallback.
+  const int64_t n_units = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
+  auto consider_uniform = [&] {
+    for (int64_t ww : ws_cand_)
+      for (int64_t hh : hs_cand_)
+        for (int64_t kk : ks_cand_)
+          consider(TileConfig{ww, hh, kk});
+  };
+  if (n_units <= 1) consider_uniform();  // grid-only on the 910B path (cube AND vector)
 
-  // Non-uniform SpatialSchedule grids (Phase A): each (parts_m, parts_n) lands a
-  // balanced region count the uniform tiles can't (e.g. exactly n_cores). w,h
-  // carry the physical (max) region extent so fits_on_chip / reload are unchanged.
+  // SpatialSchedule grids: each (parts_m, parts_n) lands a balanced region count
+  // the uniform tiles can't (e.g. exactly n_cores). w,h carry the physical (max)
+  // region extent so fits_on_chip / reload are unchanged.
   // One config per (parts_m, parts_n, split_k) triple. The single-core seq-k is
   // NOT enumerated: grid_k is just a structurally-valid placeholder (largest k
   // divisor). fits_on_chip -> derive_exec then DERIVES the greedy L1-fitting
@@ -1974,8 +2034,8 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
   // split is the triple's split_k, evaluated by compute_cost as a fixed S.
   const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
   for (const auto &g : grid_cand_) {
-    const AxisPartition pm = partition_axis(out_H_, g.parts_m);
-    const AxisPartition pn = partition_axis(out_W_, g.parts_n);
+    const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
+    const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
     consider(TileConfig{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k});
   }
   return best;

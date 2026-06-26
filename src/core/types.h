@@ -195,10 +195,10 @@ struct TileConfig {
 };
 
 // Even distribution of an axis of `dim` elements into `parts` regions, in units
-// of 16-element cube fractals. F = ceil(dim/16) fractals split as evenly as
-// possible: `num_big` regions get (base+1) fractals, the rest get `base`. Since
-// regions differ by at most one fractal, an axis has at most two distinct
-// extents -- so a P x Q grid has at most four distinct region shapes.
+// of `granule`-element blocks. F = ceil(dim/granule) blocks split as evenly as
+// possible: `num_big` regions get (base+1) blocks, the rest get `base`. Since
+// regions differ by at most one block, an axis has at most two distinct extents
+// -- so a P x Q grid has at most four distinct region shapes.
 struct AxisPartition {
     int64_t big = 16, small = 16;  // element extents of the two region sizes
     int64_t num_big = 0;           // first num_big of `parts` regions use `big`
@@ -213,15 +213,19 @@ struct AxisPartition {
     }
 };
 
-inline AxisPartition partition_axis(int64_t dim, int64_t parts) {
-    const int64_t F = (dim + 15) / 16;                       // 16-fractals on the axis
-    parts = (parts < 1) ? 1 : ((parts > F) ? F : parts);     // never more parts than fractals
+// `granule` is the alignment of each region extent: 16 for the cube (the 16x16
+// MAC fractal); finer for the vector (1 along free rows, the 32-byte DMA block
+// along the contiguous axis), which has no fractal constraint.
+inline AxisPartition partition_axis(int64_t dim, int64_t parts, int64_t granule = 16) {
+    const int64_t g = (granule < 1) ? 1 : granule;
+    const int64_t F = (dim + g - 1) / g;                     // granules on the axis
+    parts = (parts < 1) ? 1 : ((parts > F) ? F : parts);     // never more parts than granules
     const int64_t base = F / parts, rem = F % parts;
     AxisPartition p;
     p.parts = parts;
     p.num_big = rem;
-    p.big = (base + (rem > 0 ? 1 : 0)) * 16;
-    p.small = base * 16;
+    p.big = (base + (rem > 0 ? 1 : 0)) * g;
+    p.small = base * g;
     return p;
 }
 

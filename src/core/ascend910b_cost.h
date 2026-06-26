@@ -375,6 +375,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // vector / legacy subgraphs (the uniform divisor tiles cover those).
   struct SpatialTriple { int64_t parts_m, parts_n, split_k; };
   std::vector<SpatialTriple> grid_cand_;
+  // Per-axis region-extent granularity for the grid (partition_axis). Cube: 16 on
+  // both (the 16x16 MAC fractal). Vector: 1 along the free (row/height) axis and
+  // 16 (the 32-byte DMA block) along the contiguous (width) axis -- no fractal
+  // constraint, so a few-row reduction can still tile finely enough to fill C.
+  int64_t grid_gran_h_ = 16;
+  int64_t grid_gran_w_ = 16;
 
   // Flat lookup: tensor index → list of indices into boundary_tensor_info_.
   // Empty list means the tensor isn't a boundary tensor of this subgraph.
