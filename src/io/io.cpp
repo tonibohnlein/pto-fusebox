@@ -23,7 +23,7 @@ Problem read_problem(const std::string& filename) {
 
     // Validate required top-level keys exist before accessing them.
     for (const char* key : {"widths", "heights", "inputs", "outputs",
-                             "base_costs", "op_types",
+                             "op_types",
                              "fast_memory_capacity", "cube_freq_hz"}) {
         if (!j.contains(key)) {
             std::cerr << "Error: missing required field '" << key
@@ -66,13 +66,11 @@ Problem read_problem(const std::string& filename) {
     // --- Ops ---
     auto& inputs     = j["inputs"];
     auto& outputs    = j["outputs"];
-    auto& base_costs = j["base_costs"];
     auto& op_types   = j["op_types"];
 
     const size_t num_ops = op_types.size();
-    if (inputs.size() != num_ops || outputs.size() != num_ops ||
-        base_costs.size() != num_ops) {
-        std::cerr << "Error: inputs/outputs/base_costs/op_types arrays have "
+    if (inputs.size() != num_ops || outputs.size() != num_ops) {
+        std::cerr << "Error: inputs/outputs/op_types arrays have "
                      "inconsistent lengths\n";
         std::exit(1);
     }
@@ -112,7 +110,6 @@ Problem read_problem(const std::string& filename) {
             }
             op.outputs.push_back(idx);
         }
-        op.base_cost = base_costs[i].get<int64_t>();
         p.ops.push_back(std::move(op));
     }
 

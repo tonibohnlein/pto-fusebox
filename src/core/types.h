@@ -48,8 +48,7 @@ enum class OpType { MatMul, Pointwise, Reduction, Opaque };
 struct Op {
     OpType type;
     std::vector<size_t> inputs;   // tensor indices
-    std::vector<size_t> outputs;  // tensor indices (always exactly one per competition rules)
-    int64_t base_cost;
+    std::vector<size_t> outputs;  // tensor indices (always exactly one)
 
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }

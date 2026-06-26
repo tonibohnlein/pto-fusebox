@@ -284,12 +284,12 @@ public:
         auto component_hash = [&](const FlatSet<size_t>& comp) -> size_t {
             if (comp.empty()) return 0;
 
-            // Build local init hash per op (type + cost + shapes)
+            // Build local init hash per op (type + shapes; grounded cost is fully
+            // determined by type + shapes, so they are the complete op identity)
             std::map<size_t, size_t> init_h;
             for (auto op : comp) {
                 size_t h = (prob.ops[op].type == OpType::MatMul)
                            ? 0xAA55AA55ULL : 0x55AA55AAULL;
-                h = hash_combine(h, (size_t)prob.ops[op].base_cost);
                 std::vector<std::pair<int64_t,int64_t>> in_shapes;
                 for (auto t : prob.ops[op].inputs)
                     in_shapes.push_back({prob.tensors[t].width,

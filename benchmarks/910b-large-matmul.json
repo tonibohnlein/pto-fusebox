@@ -23,9 +23,6 @@
    2
   ]
  ],
- "base_costs": [
-  33554432
- ],
  "fast_memory_capacity": 67108864,
  "num_cube_cores": 24,
  "num_vector_cores": 48,

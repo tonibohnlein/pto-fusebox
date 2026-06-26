@@ -169,8 +169,17 @@ Partition init_seed_and_grow(const Problem& prob, const DAG& dag, CostCache* cac
 
     std::vector<size_t> order(prob.num_ops());
     std::iota(order.begin(), order.end(), 0);
+    // Seed from the most expensive ops first. Grounded cost proxy: matmul work ~
+    // M*N*K (the cube fractal count), vector work ~ the output element count.
+    auto cost_proxy = [&](size_t i) -> int64_t {
+        const Op& op = prob.ops[i];
+        int64_t work = prob.tensors[op.output()].width * prob.tensors[op.output()].height;
+        if (op.type == OpType::MatMul && !op.inputs.empty())
+            work *= prob.tensors[op.inputs[0]].width;  // * K (contraction)
+        return work;
+    };
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return prob.ops[a].base_cost > prob.ops[b].base_cost;
+        return cost_proxy(a) > cost_proxy(b);
     });
 
     std::vector<bool> assigned(prob.num_ops(), false);

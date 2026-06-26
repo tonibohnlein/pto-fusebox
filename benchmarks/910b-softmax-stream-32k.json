@@ -49,12 +49,6 @@
    4
   ]
  ],
- "base_costs": [
-  128,
-  4194304,
-  128,
-  4194304
- ],
  "cube_compute_cost": 1,
  "fast_memory_capacity": 1073741824,
  "num_cube_cores": 24,

@@ -70,10 +70,11 @@ struct MerkleHashes {
             return seed ^ (v * 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
         };
 
-        // Initial hash per op: type + input/output tensor shapes
+        // Initial hash per op: type + input/output tensor shapes. The grounded cost
+        // is fully determined by type + shapes, so they ARE the complete op identity
+        // (no separate cost field to fold in).
         for (size_t i = 0; i < n; i++) {
             size_t h = (prob.ops[i].type == OpType::MatMul) ? 0xAA55AA55ULL : 0x55AA55AAULL;
-            h = hash_combine(h, (size_t)prob.ops[i].base_cost);
 
             // Hash input tensor shapes.
             // For MatMul, input order matters (inputs[0]=LHS, inputs[1]=RHS,

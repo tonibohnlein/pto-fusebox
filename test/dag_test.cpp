@@ -27,7 +27,7 @@ static Problem make_chain(int n) {
     Problem p;
     for (int i = 0; i <= n; i++) p.tensors.push_back({128,128});
     for (int i = 0; i < n; i++)
-        p.ops.push_back({OpType::Pointwise,{(size_t)i},{(size_t)(i+1)},100});
+        p.ops.push_back({OpType::Pointwise,{(size_t)i},{(size_t)(i+1)}});
     p.fast_memory_capacity = 500000;
 
     return p;
@@ -71,9 +71,9 @@ void test_can_reach_diamond() {
     std::cout << "--- test_can_reach_diamond ---\n";
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{0},{2},100},
-             {OpType::Pointwise,{1,2},{3},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{0},{2}},
+             {OpType::Pointwise,{1,2},{3}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
@@ -91,8 +91,8 @@ void test_op_neighbors_co_consumer() {
     std::cout << "--- test_op_neighbors_co_consumer ---\n";
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{0},{2},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{0},{2}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
@@ -140,8 +140,8 @@ void test_tensor_multi_consumer() {
     std::cout << "--- test_tensor_multi_consumer ---\n";
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{0},{2},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{0},{2}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
@@ -157,7 +157,7 @@ void test_tensor_matmul() {
     std::cout << "--- test_tensor_matmul ---\n";
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::MatMul,{0,1},{2},2000}};
+    p.ops = {{OpType::MatMul,{0,1},{2}}};
     p.fast_memory_capacity = 100000;
 
     DAG d = DAG::build(p);
@@ -177,10 +177,10 @@ void test_topo_sort_disconnected() {
     // Two independent chains Op0→Op1 and Op2→Op3.
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{1},{2},100},
-             {OpType::Pointwise,{3},{4},100},
-             {OpType::Pointwise,{4},{5},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{1},{2}},
+             {OpType::Pointwise,{3},{4}},
+             {OpType::Pointwise,{4},{5}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
@@ -199,10 +199,10 @@ void test_topo_sort_valid_order() {
     // Fan-in: T1→Op1→T2, T1→Op2→T3, T2+T3→Op3→T4
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{1},{2},100},
-             {OpType::Pointwise,{1},{3},100},
-             {OpType::Pointwise,{2,3},{4},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{1},{2}},
+             {OpType::Pointwise,{1},{3}},
+             {OpType::Pointwise,{2,3},{4}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
@@ -238,10 +238,10 @@ void test_topo_position_diamond() {
     std::cout << "--- test_topo_position_diamond ---\n";
     Problem p;
     p.tensors = {{128,128},{128,128},{128,128},{128,128},{128,128}};
-    p.ops = {{OpType::Pointwise,{0},{1},100},
-             {OpType::Pointwise,{1},{2},100},
-             {OpType::Pointwise,{1},{3},100},
-             {OpType::Pointwise,{2,3},{4},100}};
+    p.ops = {{OpType::Pointwise,{0},{1}},
+             {OpType::Pointwise,{1},{2}},
+             {OpType::Pointwise,{1},{3}},
+             {OpType::Pointwise,{2,3},{4}}};
     p.fast_memory_capacity = 500000;
 
     DAG d = DAG::build(p);
