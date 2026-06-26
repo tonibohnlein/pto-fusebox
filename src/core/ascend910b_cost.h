@@ -362,8 +362,6 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   };
   std::vector<TilePair> tensor_tiling_;
 
-  std::vector<int64_t> ws_cand_;
-  std::vector<int64_t> hs_cand_;
   std::vector<int64_t> ks_cand_;
   // SpatialSchedule (parts_m, parts_n, split_k) TRIPLES for the cube path. Each
   // lands parts_m*parts_n*split_k WORK UNITS targeting the core count (n_cores) or

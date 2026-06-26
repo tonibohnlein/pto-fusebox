@@ -122,37 +122,6 @@ add_custom_command(TARGET run_all POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "Solutions written to build directory"
 )
 
-# --- Regression target ---
-# Runs all benchmarks and compares against benchmarks/baseline.json.
-# Usage:
-#   make regression           -- run and compare (default = v2 pipeline)
-#   make regression_v1        -- run with v1 pipeline
-#   make regression_update    -- run and promote improvements to baseline
-find_package(Python3 QUIET)
-if(Python3_FOUND OR EXISTS "/usr/bin/python3")
-    set(PYTHON_CMD ${Python3_EXECUTABLE})
-    if(NOT Python3_FOUND)
-        set(PYTHON_CMD python3)
-    endif()
-    add_custom_target(regression
-        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
-                --build ${CMAKE_BINARY_DIR}
-        DEPENDS mlsys
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Running benchmark regression (v2 pipeline, default)"
-    )
-    add_custom_target(regression_v1
-        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
-                --build ${CMAKE_BINARY_DIR} --solver-args "--v1"
-        DEPENDS mlsys
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Running benchmark regression with v1 pipeline"
-    )
-    add_custom_target(regression_update
-        COMMAND ${PYTHON_CMD} ${CMAKE_SOURCE_DIR}/scripts/regression.py
-                --build ${CMAKE_BINARY_DIR} --update
-        DEPENDS mlsys
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Running benchmark regression and updating baseline"
-    )
-endif()
+# Per-case 910B fusion-DAG visualizations are rendered via
+# scripts/render_fusion_dag.sh; the cost-model regression lives in the C++ test
+# suite (test/ascend_910b_test.cpp).

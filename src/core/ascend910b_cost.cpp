@@ -719,38 +719,10 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     return result;
   };
 
-  sg.ws_cand_ = valid_candidates(sg.w_divides_);
-  sg.hs_cand_ = valid_candidates(sg.h_divides_);
-  // The unified grid tiles the SINK output, so a spatial tile never needs to
-  // exceed the output dim (a wider/taller tile is just "one full tile"). For a
-  // CHAINED cube subgraph an intermediate matmul's output width is the NEXT
-  // matmul's contraction (a reduction axis, on-chip full-width), but the generic
-  // MM-RHS rule adds it to w_set as a spatial W_param — so e.g. C=(A@B)@D with
-  // N1 > N2 leaks w = N1 > out_W into ws_cand_. It is cost-neutral (it collapses
-  // to num_tw=1 and clamps via min(cfg.w, N_i) in the roofline) but violates the
-  // unified-grid contract in the emitted schedule. Bound the cube spatial
-  // candidates to the output dim, allowing the 16-fractal pad for sub-16 outputs.
-  // Reductions override ws_/hs_cand below to the full reduced extent and are
-  // intentionally exempt (the reduced axis spans its whole extent).
-  if (sg.has_matmul_) {
-    auto clamp_to_output = [](std::vector<int64_t> &cand, int64_t out_dim) {
-      const int64_t cap = std::max(out_dim, (int64_t)16);
-      std::vector<int64_t> kept;
-      for (auto c : cand)
-        if (c <= cap) kept.push_back(c);
-      if (!kept.empty()) cand.swap(kept);  // keep ≥1 candidate (sink dim always fits)
-    };
-    clamp_to_output(sg.ws_cand_, sg.out_W_);
-    clamp_to_output(sg.hs_cand_, sg.out_H_);
-  }
-  // Reduction: the reduced axis cannot be spatially split — the whole row/col
-  // is needed to reduce it — so the tile spans the FULL reduced extent (lifting
-  // the native cap on that axis, like a cube tile). Only the non-reduced axis
-  // is tiled, giving the spatial (per-core) parallelism. 910B-only.
-  if (sg.has_reduction_ && sg.reduced_axis_ == 1)
-    sg.ws_cand_ = std::vector<int64_t>{std::max(sg.out_W_, sg.reduced_extent_)};
-  else if (sg.has_reduction_ && sg.reduced_axis_ == 2)
-    sg.hs_cand_ = std::vector<int64_t>{std::max(sg.out_H_, sg.reduced_extent_)};
+  // The spatial w/h candidates feed the grid via w_divides_ / h_divides_ directly
+  // (gen_grid partitions the SINK output over divisors of the core count); the grid
+  // handles the reduction's full-reduced-extent axis itself. Only the k candidates
+  // are still materialized here.
   // PW-sink subgraphs: force k = output_K_ so nk == 1 (no temporal tiling).
   //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
   //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
