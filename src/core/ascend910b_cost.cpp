@@ -199,9 +199,11 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // through DDR (no free ephemeral) and the unified single grid can't express
   // cube/vector overlap — so they are never fused into one group. Opaque ops
   // (gather/scatter/sort/transpose) are barriers: singleton groups only.
-  // Gated on parallel-core mode (cores>1); the legacy single-core path
-  // (cores<=1) does not enforce homogeneity (mixed fusion allowed).
-  if (prob.num_cube_cores > 1 || prob.num_vector_cores > 1) {
+  // Unit-homogeneity admissibility (always enforced on the 910B): cube↔vector
+  // fusion is allowed only when the cost model opts in (allow_mixed, set by
+  // Ascend910BMixed); Opaque ops are singleton barriers; reductions on different
+  // axes may not fuse. (A bare scope so the has_* locals stay local.)
+  {
     bool has_cube = false, has_vector = false, has_opaque = false;
     for (auto i : sg.ops_) {
       switch (prob.ops[i].type) {
@@ -1546,9 +1548,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       };
 
       // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
-      // enumeration) and is evaluated as-is; a uniform/legacy tile (split_k==0)
-      // sweeps S over the valid K-fractal divisors and adopts a split only if it
-      // STRICTLY beats the spatial-only S=1.
+      // enumeration) and is evaluated as-is; an ad-hoc non-grid tile (split_k==0,
+      // e.g. a directly-constructed TileConfig) sweeps S over the valid K-fractal
+      // divisors and adopts a split only if it STRICTLY beats the spatial-only S=1.
       int64_t chosen_S = 1;
       SplitEval chosen = {lat1, compute1, ddr1, 0.0, active1};
       if (cfg.split_k >= 1) {
@@ -1588,10 +1590,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Vector (PW/Reduction): compute parallelizes over spatial tiles; DDR is
       // the shared full-tensor floor (no cross-core reload to model here). The
       // element-wise work is INVARIANT to tiling (each element is touched once),
-      // so use the summed base_cost — NOT num_tiles*op_scale, whose native-128
-      // padding would inflate compute for the small sub-128 tiles we need to fill
-      // the cores, wrongly favouring fewer tiles / fewer cores. (Same fix as the
-      // matmul path; applies to pointwise and reduction alike.)
+      // so SUM the per-op grounded compute over the FULL element count -- a
+      // per-tile charge would inflate compute for the small sub-16 tiles we need
+      // to fill the cores, wrongly favouring fewer tiles / fewer cores. (Same
+      // tiling-invariance as the matmul fractal count.)
       double total_compute = 0.0;
       for (auto i : ops_) {
         // #elements = the op's largest tensor (the [H,W] grid). A reduction
@@ -1714,8 +1716,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           }
         };
         // The triple's split_k IS the reduced-axis split (lets P_spatial * S fill
-        // the cores). A uniform/legacy tile (split_k==0, not on the 910B path)
-        // sweeps S to fill instead. S=1 means no split (the spatial base above).
+        // the cores). An ad-hoc non-grid tile (split_k==0, e.g. a directly-
+        // constructed TileConfig) sweeps S to fill instead. S=1 means no split.
         if (cfg.split_k > 1) {
           take_S(cfg.split_k);
         } else if (cfg.split_k == 0 && num_tiles < n_cores) {
@@ -1730,7 +1732,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
     // of them in sequence, paying one fill per pass. eff penalizes too FEW tiles
     // (under-filled cores); this penalizes too MANY (over-tiling), so the optimum
     // sits at ~one kernel per core. Split-K fills a tile WITHIN a pass, so it
-    // doesn't add rounds (it's spatial num_tiles that count). Gated; off => legacy.
+    // doesn't add rounds (it's spatial num_tiles that count). kernel_fill_cost==0
+    // => no fill term.
     if (prob_->kernel_fill_cost > 0) {
       const int64_t rounds = (num_tiles + n_cores - 1) / n_cores;
       result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
