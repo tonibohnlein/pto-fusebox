@@ -81,7 +81,6 @@
  "l1_capacity": 524288,
  "vec_capacity": 196608,
  "kernel_fill_cost": 10000,
- "ddr_atomic_add": true,
  "cube_freq_hz": 1850000000.0,
  "bw_gm_l1": 135.0,
  "bw_l0c_gm": 70.0,

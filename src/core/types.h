@@ -93,16 +93,11 @@ struct Problem {
     // the FULL l1_capacity / vec_capacity. The overlap is realized in the emit by
     // streaming each seq-K strip (or tile) as >=2 sub-strips -- it halves the
     // per-load k, not the resident operand. (Hence no double_buffer flag.)
-    // Parallel split-K aggregation path (a target capability — the scheduler's
-    // analog of a compiler flag). When TRUE, the hardware can write back to DDR
-    // with SetAtomicAdd, so the S split-K partials are atomically accumulated
-    // into the DDR output DURING write-back — no separate read-back + sum. The
-    // merge barrier is then just the S partial writes (sat-discounted), so
-    // split-K stays cheap and max-fill is optimal. When FALSE (default), the
-    // partials are written, then read back and summed serially per output tile
-    // (one DDR accumulator/tile) — the merge grows ~linearly with S, punishing
-    // split-K. The Ascend 910B HAS SetAtomicAdd, so set_910b enables it.
-    bool ddr_atomic_add = false;
+    // Split-K partials accumulate into the DDR output via SetAtomicAdd during
+    // write-back (the Ascend 910B always has it), so the merge is just the S
+    // full-tile atomic writes — no read-back + serial re-sum. This is now an
+    // unconditional 910B capability; the old `ddr_atomic_add` toggle (and the
+    // no-atomic-add serial-reduction cost) was removed with the legacy strip.
 
     // --- Grounded pto-isa machine model (Ascend 910B / A2A3) -----------------
     // The cube/vector costs use pto-isa's measured coefficients
@@ -125,6 +120,19 @@ struct Problem {
     double bw_l1_l0b  = 0.0;     // L1->L0B rhs extract        (GiB/s; pto-isa 220.5)
     double bw_gm_ub   = 0.0;     // GM->UB vector load         (GiB/s; pto-isa 100.9)
     double bw_ub_gm   = 0.0;     // UB->GM vector store        (GiB/s; pto-isa 188.46)
+    // Aggregate HBM bandwidth (GiB/s) shared by ALL cores: the cap on the SUM of
+    // the per-core GM pipes. Each core has its own MTE2 (GM->L1/UB) + FixPipe
+    // (L0C/UB->GM), so DDR traffic divides across active cores up to this ceiling:
+    //   effective aggregate bw = min(active * per_core_peak, hbm_aggregate_gibps)
+    // (exactly pto-isa BwEff). Source: pto-isa docs/coding/performance-best-
+    // practices.md — A3 (24-core) hardware bandwidth ~900 GB/s (theoretical;
+    // achievable ~70-80%); treated as GiB/s to match the per-core peaks above.
+    // 0 => uncapped (pure per-core divide). The live 910B config sets this to the
+    // realistic A3 aggregate ~900, so par() binds at ~900/135 = 6.7 cores: beyond
+    // the knee, reload-bound matmuls saturate HBM instead of scaling linearly to 24.
+    // Perf-sim VALIDATED in the saturation regime (pto-isa gml1_multicore: per-core
+    // bw = min(135, 900/B) to <=0.4%). The exact aggregate is DEVICE-EVAL-PENDING.
+    double hbm_aggregate_gibps = 0.0;
     int64_t l0_tile_m = 0;       // L0 GEMM base M (pto-isa oracle 128) — L1->L0 reuse
     int64_t l0_tile_n = 0;       // L0 GEMM base N (pto-isa oracle 256) — L1->L0 reuse
 
@@ -232,4 +240,9 @@ struct CostResult {
     double ddr_traffic = 0.0;    // DDR bytes/BW for this tile (reload + merge). Secondary
                                  // objective: among equal-latency tiles prefer less DDR
                                  // (=> larger, balanced tiles with better L1/L0 reuse).
+    double l1l0_extract = 0.0;   // L1->L0 extract cycles (MTE1): lhs via L0A, rhs via L0B.
+                                 // TIEBREAKER ONLY (feed dominates the wall): the L0A/L0B
+                                 // ports are asymmetric (441 vs 220.5), so among reload-equal
+                                 // transposed tiles the lower-extract (TALL) tile wins.
+                                 // Perf-sim-driven (pto-isa gml1_decision); device eval pending.
 };

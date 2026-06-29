@@ -893,6 +893,13 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   // output -- so skip the exact-divisor check (the 16-alignment above + the L1
   // fit in fits_on_chip still apply). parts are clamped to the fractal count in
   // partition_axis, so no region is empty.
+  //
+  // NOTE (uniform tile, not on the live solver path): best_cost is GRID-ONLY on
+  // the 910B -- the SpatialSchedule grid, including the (1,1) whole-output region,
+  // covers every fill, so the solver never emits a parts_m == 0 cube/vector config.
+  // The cfg.parts_m == 0 exact-divisor branch below is reached ONLY by a
+  // directly-constructed TileConfig{w,h,k} (unit tests / ad-hoc API calls). Kept
+  // for that path; not exercised by the partition/search/solution pipeline.
   if (cfg.parts_m == 0) {
     for (int64_t v : w_divides_)
       if (cfg.w < v && v % cfg.w != 0) return false;
@@ -1292,7 +1299,9 @@ bool Ascend910BCost::is_feasible(const TileConfig &cfg,
 // ============================================================================
 
 double Ascend910BCost::cube_operand_reload(const TileConfig &cfg,
-                                           bool matmul_at_output_grid) const {
+                                           bool matmul_at_output_grid,
+                                           double *lhs_bytes_out,
+                                           double *rhs_bytes_out) const {
   // Build the in-subgraph produced/consumed sets (produced ⇒ on-chip ephemeral
   // operand, never reloaded from DDR; consumed ⇒ the op is an intermediate).
   FlatSet<size_t> produced, consumed;
@@ -1307,7 +1316,7 @@ double Ascend910BCost::cube_operand_reload(const TileConfig &cfg,
   // matmul_at_output_grid forces the output grid — the mixed feed-forward case,
   // where the matmul output is consumed elementwise by the vector stage and so is
   // tiled at cfg.w like a boundary output.
-  double reload = 0.0;
+  double reload = 0.0, lhs_bytes = 0.0, rhs_bytes = 0.0;  // lhs->L0A, rhs->L0B (MTE1 split)
   std::set<std::tuple<size_t, int, bool>> counted;  // (tensor, 0=LHS/1=RHS, is_boundary_op)
   for (auto i : ops_) {
     if (prob_->ops[i].type != OpType::MatMul) continue;
@@ -1320,11 +1329,17 @@ double Ascend910BCost::cube_operand_reload(const TileConfig &cfg,
     const bool is_boundary_op = matmul_at_output_grid || !consumed.count(o);
     const double w_i = is_boundary_op ? std::min((double)cfg.w, N_i) : N_i;
     const double h_i = std::min((double)cfg.h, M_i);            // shared M-band
-    if (!produced.count(lhs) && counted.emplace(lhs, 0, is_boundary_op).second)
-      reload += M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
-    if (!produced.count(rhs) && counted.emplace(rhs, 1, is_boundary_op).second)
-      reload += M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
+    if (!produced.count(lhs) && counted.emplace(lhs, 0, is_boundary_op).second) {
+      const double b = M_i * N_i * K_i / w_i * dtype_bytes(prob_->tensors[lhs].dtype);
+      reload += b; lhs_bytes += b;
+    }
+    if (!produced.count(rhs) && counted.emplace(rhs, 1, is_boundary_op).second) {
+      const double b = M_i * N_i * K_i / h_i * dtype_bytes(prob_->tensors[rhs].dtype);
+      reload += b; rhs_bytes += b;
+    }
   }
+  if (lhs_bytes_out) *lhs_bytes_out = lhs_bytes;
+  if (rhs_bytes_out) *rhs_bytes_out = rhs_bytes;
   return reload;
 }
 
@@ -1354,10 +1369,23 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
 
   // 910B parallel-core roofline — the only cost model (the competition
   // single-context model was removed). Compute parallelizes across the unit's
-  // cores (spatial tiles + split-K = independent work units); DDR is a SHARED
-  // floor (one HBM) that does not divide.
+  // cores (spatial tiles + split-K = independent work units); DDR traffic divides
+  // across each core's own GM pipe (MTE2/FixPipe) up to the aggregate HBM ceiling.
   const int n_cores = has_matmul_ ? prob_->num_cube_cores : prob_->num_vector_cores;
   {
+    // Per-direction realized parallel GM-pipe count. Each core has its own MTE2
+    // (GM->L1/UB) and FixPipe (L0C/UB->GM), so a direction's DDR traffic divides
+    // across `active` cores' pipes up to the aggregate HBM ceiling:
+    //   par(active, peak) = min(active, hbm_aggregate_gibps / per_core_peak)
+    // and that direction's cycles = bytes * cyc_per_byte / par. Exactly pto-isa
+    // BwEff (effective bw = min(active*peak, hbm)). hbm<=0 => uncapped (pure
+    // per-core divide; the cores never saturate a finite HBM).
+    const double hbm = prob_->hbm_aggregate_gibps;
+    auto par = [&](double active, double peak_gibps) {
+      const double cap = (hbm > 0.0 && peak_gibps > 0.0)
+                             ? hbm / peak_gibps : std::numeric_limits<double>::infinity();
+      return std::max(1.0, std::min(active, cap));
+    };
     if (has_matmul_) {
       // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
       // 16-aligned cube tiles have no padding (the op_scale native-128 padding
@@ -1414,15 +1442,12 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       //     output store. Intermediate tensors are EPHEMERAL (zero DDR) — a
       //     deeper matmul's partials are computed independently per output tile,
       //     never crossing cores, so they need no barrier.
-      //   * The ONLY barrier is a sink split-K merge. With no shared L2, the S
-      //     partials reduce through DDR strictly AFTER compute, so it is charged
-      //     ADDITIVELY (a BSP superstep), never hidden under the streaming
-      //     roofline. Intermediate k-split is disallowed: it would round-trip the
-      //     intermediate through DDR, i.e. be no better than splitting the
-      //     subgraph there (which also frees independent tiling) — so any k-split
-      //     lands on the subgraph output only.
-      const double M = (double)out_H_, N = (double)out_W_;
-      auto sat = [&](double cores) { return std::max(1.0, (double)n_cores / cores); };
+      //   * A sink split-K writes the output S times (S atomic-add partials via
+      //     SetAtomicAdd). That is extra DDR write traffic riding the roofline with
+      //     compute — NOT an additive barrier (each core writes independently).
+      //     Intermediate k-split is disallowed: it would round-trip the intermediate
+      //     through DDR, i.e. be no better than splitting the subgraph there (which
+      //     also frees independent tiling) — so any k-split lands on the output only.
       // (produced/consumed sets built above for the recompute factor are reused.)
       // Sink output store = sum over boundary outputs, byte-based (intermediates
       // are is_internally_produced and excluded).
@@ -1433,16 +1458,22 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Matmul boundary-operand reload — distribution-aware MNK*(1/w + 1/h),
       // deduped per (tensor, role). See cube_operand_reload(); the cube path
       // treats a consumed (chained) intermediate matmul as a full-width band.
-      const double reload = cube_operand_reload(cfg);
-      // S=1 (spatial-only): no cross-core reduction, so the output store streams
-      // out as tiles complete (overlaps compute) — classic roofline, no barrier.
-      // DDR is the shared HBM floor; the operand reload (GM->L1) and the output
-      // store (L0C->GM) ride DIFFERENT directions (135 vs 70 GiB/s grounded), so
-      // charge them at their own bandwidths rather than one lumped figure.
-      // Wave-aware compute (ceil(U/C) waves); DDR is the shared total-volume floor
-      // discounted by active-core saturation — NOT wave-scaled (a K-split divides
-      // the operand slices, it does not inflate the total reload bytes).
-      const int64_t units1 = num_tiles;
+      double reload_lhs_b = 0.0, reload_rhs_b = 0.0;
+      const double reload = cube_operand_reload(cfg, /*matmul_at_output_grid=*/false,
+                                                &reload_lhs_b, &reload_rhs_b);
+      // L1->L0 extract cycles (MTE1), a TIEBREAKER only: lhs via L0A (fast 441),
+      // rhs via L0B (slow 220.5). Same per-port byte split as the GM reload, charged
+      // at the L0 ports — so among reload-equal transposed tiles the TALL one (large h,
+      // less slow-L0B traffic) wins. Perf-sim-driven (gml1_decision); device eval pending.
+      const double l1l0_extract = reload_lhs_b * bc.l0a + reload_rhs_b * bc.l0b;
+      // DDR is two SEPARATE concurrent pipes: the operand reload (MTE2, GM->L1,
+      // 135 GiB/s) and the output store (FixPipe, L0C->GM, 70 GiB/s). They are
+      // distinct hardware (pto-isa scores GM reads/writes as independent groups),
+      // so the DDR term is their MAX, not their sum. Each pipe's traffic DIVIDES
+      // across active cores up to the aggregate HBM ceiling (see par()): cycles =
+      // bytes*cyc_per_byte / par(active, peak). Compute is wave-aware (ceil(U/C)
+      // waves); the DDR bytes are NOT wave-scaled (a K-split divides the operand
+      // slices, it does not inflate the total reload bytes).
       // Grid mode: LPT makespan over the non-uniform (+-1-fractal) regions. The
       // per-region work is the SINK matmul at the region extent (m_ext, n_ext)
       // PLUS each consumed INTERMEDIATE as a full-width [m_ext, N_int] row-band:
@@ -1485,11 +1516,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         }
         return work;
       };
-      const double compute1 =
-          (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work)
-                            : WaveComputeCycles(total_compute, units1, n_cores);
-      const double active1 = (double)std::min<int64_t>(units1, n_cores);
-      const double ddr1 = (reload * bc.reload + out_store * bc.store) * sat(active1);
+      // parts_m > 0 (grid + LPT makespan) is the ONLY mode best_cost emits on the
+      // 910B. The WaveComputeCycles arm is the uniform parts_m == 0 tile, reached
+      // only by a directly-constructed TileConfig (tests / ad-hoc) -- see the
+      // matching note in is_valid_tiling. Not produced by the live solver.
       // Double-buffer floor: the max(compute, ddr) overlap is only real when the
       // operand reload can ping-pong, i.e. the per-core contraction is halvable
       // into >=2 seq-K sub-strips (>= 32 = two K-fractals; the emit's implicit
@@ -1499,34 +1529,26 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         const bool overlap = per_core_K >= 32;
         return overlap ? std::max(comp, dram) : comp + dram;
       };
-      const double lat1 = db_roofline(compute1, ddr1, output_K_);
       // Sink split-K: split the sink contraction into S per-tile partials to
-      // recruit idle cores. The streaming phase (operand reload overlaps partial
-      // compute) is a roofline; the S partials then reduce through DDR AFTER
-      // compute — an ADDITIVE barrier S*out_store*inv_B (a BSP superstep).
+      // recruit idle cores. The output write-back grows to S partials (L0C->GM via
+      // FixPipe, SetAtomicAdd — each core writes independently, no merge barrier),
+      // but that store pipe OVERLAPS the operand feed, so split-K only pays for the
+      // writes once S*store exceeds the feed (max, not sum).
       //
-      // S is a FIRST-CLASS design axis (like w,h): streamS DECREASES with S (more
-      // cores) while the merge barrier may GROW with S (see below — the serial DDR
-      // reduction when the target has no SetAtomicAdd), so latS(S) trades
-      // parallelism against the merge cost. ENUMERATE S and take the min — the
-      // optimum is interior when the merge is serial, and max-fill when
-      // SetAtomicAdd folds the reduction into the write-back.
-      // Useful range: S <= kfrac (>=1 fractal/partial). The old ceil(n_cores/
-      // num_tiles) core-fill bound is REMOVED: under the wave model a split that
-      // overfills a wave (e.g. 16 tiles x S=3 = 48 units = 2 full waves -> W/24)
-      // can still cut compute below what S=2 reaches, so capping at the first
-      // S that hits n_cores would skip useful candidates. We enumerate the valid
-      // K-fractal divisors and let the merge cost (which grows with S) reject the
-      // excessive ones. output_K_ is the sink matmul's contraction (NOT max_K_).
+      // S is a FIRST-CLASS design axis (like w,h): more cores cut compute (and,
+      // until HBM saturates, the per-core-divided operand feed) while the S output
+      // writes grow the store pipe. ENUMERATE S and take the min. Useful range:
+      // S <= kfrac (>=1 fractal/partial); the wave model + the growing store pipe
+      // reject the excessive splits (the old ceil(n_cores/num_tiles) core-fill bound
+      // is gone — a split that overfills a wave can still cut compute). output_K_ is
+      // the sink matmul's contraction (NOT max_K_); only S | kfrac is emittable.
       const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
-      // Evaluate one split factor S (>=1) -> latency components. S=1 is the
-      // spatial-only roofline (lat1); S>=2 splits the sink contraction into S equal
-      // 16-aligned partials (each owns output_K_/S) -- a streaming roofline plus an
-      // ADDITIVE DDR merge barrier. Only S | kfrac is emittable (one partial matmul
-      // per equal 16-aligned K-slice, atomic-added).
-      struct SplitEval { double lat, compute, stream_ddr, merge, active; };
+      // Evaluate one split factor S (>=1). S=1 is the spatial-only roofline; S>=2
+      // splits the sink contraction into S equal 16-aligned partials (each owns
+      // output_K_/S), writing the output S times (S atomic-add partials).
+      struct SplitEval { double lat, compute, ddr, active; };
       auto eval_S = [&](int64_t S) -> SplitEval {
-        if (S <= 1) return {lat1, compute1, ddr1, 0.0, active1};
+        S = std::max<int64_t>(1, S);
         const int64_t unitsS = (int64_t)num_tiles * S;
         // Grid: LPT the P*Q regions with K split S ways (P*Q*S units) -- honest
         // about the +-1-fractal imbalance; uniform: the equal-unit wave.
@@ -1534,17 +1556,18 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
             (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work, S)
                               : WaveComputeCycles(total_compute, unitsS, n_cores);
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
-        const double stream_ddrS = reload * bc.reload * sat(activeS);  // GM->L1 feed
+        // DDR is two SEPARATE, concurrent pipes: the operand feed (MTE2, GM->L1)
+        // and the output write-back (FixPipe, L0C->GM; S atomic-add partials for a
+        // split). They are distinct hardware, and pto-isa scores GM reads and GM
+        // writes as independent aggregate groups, so they OVERLAP -- the cube DDR
+        // term is max(feed, writes), NOT their sum. Each is per-core-divided +
+        // HBM-capped at its own peak (S=1 => a single output store).
+        const double feed   = reload * bc.reload / par(activeS, prob_->bw_gm_l1);
+        const double writes = (double)S * out_store * bc.store / par(activeS, prob_->bw_l0c_gm);
+        const double ddrS = std::max(feed, writes);
         // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
-        const double streamS = db_roofline(computeS, stream_ddrS, output_K_ / S);
-        // Merge barrier: (1) write S partials (L0C->GM); WITHOUT SetAtomicAdd, also
-        // (2) a serial per-tile read-back + sum (~linear in S; the optimum S is then
-        // interior). WITH SetAtomicAdd the partials accumulate during write-back, so
-        // (2) vanishes and split-K stays cheap.
-        double merge = (double)S * out_store * bc.store * sat(activeS);
-        if (!prob_->ddr_atomic_add)
-          merge += (double)(S + 1) * out_store * bc.store * sat((double)num_tiles);
-        return {streamS + merge, computeS, stream_ddrS, merge, activeS};
+        const double latS = db_roofline(computeS, ddrS, output_K_ / S);
+        return {latS, computeS, ddrS, activeS};
       };
 
       // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
@@ -1552,7 +1575,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // e.g. a directly-constructed TileConfig) sweeps S over the valid K-fractal
       // divisors and adopts a split only if it STRICTLY beats the spatial-only S=1.
       int64_t chosen_S = 1;
-      SplitEval chosen = {lat1, compute1, ddr1, 0.0, active1};
+      SplitEval chosen = eval_S(1);
       if (cfg.split_k >= 1) {
         chosen_S = cfg.split_k;
         chosen = eval_S(chosen_S);
@@ -1567,8 +1590,9 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       result.latency = chosen.lat;
       result.parallel_split = (int)chosen_S;
       result.cores_used = (int)chosen.active;
-      result.compute_bound = chosen.compute >= chosen.stream_ddr;  // streaming phase
-      result.ddr_traffic = chosen.stream_ddr + chosen.merge;       // S=1: ddr1, no merge
+      result.compute_bound = chosen.compute >= chosen.ddr;
+      result.ddr_traffic = chosen.ddr;
+      result.l1l0_extract = l1l0_extract;  // MTE1 tiebreaker (tall tiles win the slow L0B port)
       // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
       // divisor of output_K_), capped for a split by the per-core fractal share
       // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
@@ -1619,22 +1643,23 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         total_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
       }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
-      double total_io = 0.0;  // byte-based: each boundary tensor in its own dtype
+      // DDR per direction (byte-based cycles): GM->UB boundary loads and UB->GM
+      // boundary stores, kept SEPARATE so each divides across active cores at ITS
+      // OWN per-core peak (par), capped by the aggregate HBM ceiling.
+      double io_in = 0.0, io_out = 0.0;
       for (const auto& info : boundary_tensor_info_) {
         const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
         if (!retained_from_prev.count(info.id) && !info.is_internally_produced)
-          total_io += bytes * bc.ub_in;   // GM->UB boundary load
+          io_in += bytes * bc.ub_in;   // GM->UB boundary load
         if (info.is_boundary_out && !retain_these.count(info.id))
-          total_io += bytes * bc.ub_out;  // UB->GM boundary store
+          io_out += bytes * bc.ub_out; // UB->GM boundary store
       }
-      // Step 2b — single-core streaming recompute (flash 2-pass). When this
-      // config cannot materialize the reduced band (UB overflow), the feasible
-      // schedule STREAMS the reduced axis and recomputes reused ephemerals past
-      // each reduction: the boundary inputs are re-read and the pointwise work
-      // repeated, once per pass. N_passes = #reductions + 1 (each reduction is a
-      // barrier that needs a fresh streamed pass — softmax: rowmax, then
-      // exp+rowsum, then exp+div = 3). Pessimistic upper bound (every op counted
-      // each pass); refine toward per-op recompute liveness later.
+      // Step 2b — single-core streaming recompute (flash 2-pass). When this config
+      // cannot materialize the reduced band (UB overflow), the feasible schedule
+      // STREAMS the reduced axis and recomputes reused ephemerals past each
+      // reduction: boundary inputs are re-read and the pointwise work repeated, once
+      // per pass. N_passes = #reductions + 1 (softmax: rowmax, then exp+rowsum, then
+      // exp+div = 3). Pessimistic upper bound; refine toward per-op liveness later.
       if (has_reduction_) {
         const double budget = (double)prob_->vec_capacity;  // full UB (see vector_stream)
         if (budget > 0.0 && (double)vector_peak_ub(cfg) > budget) {
@@ -1643,67 +1668,64 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
             if (prob_->ops[i].type == OpType::Reduction) reductions++;
           const double n_passes = (double)(reductions + 1);
           total_compute *= n_passes;
-          total_io *= n_passes;
+          io_in  *= n_passes;
+          io_out *= n_passes;
         }
       }
-      // Same DDR bandwidth-saturation factor as the cube: HBM needs many cores'
-      // DMA engines to saturate, so a DDR-bound tile on too few vector cores pays.
-      // Wave-aware compute makespan (ceil(num_tiles/cores) waves) -- the analog of
-      // the cube path, so a balanced num_tiles==cores grid (one wave) beats an
-      // over-tiled count (multiple waves) that the old total_compute/eff scored
-      // identically. eff stays the per-wave active-core count for the DDR sat.
-      const double compute_mk = WaveComputeCycles(total_compute, num_tiles, n_cores);
-      const double sat_v = std::max(1.0, (double)n_cores / eff);
-      // Double-buffer floor (grounded): the max(compute, DDR) roofline holds only
-      // when the per-core tile streams in >= 2 SIMD-repeat chunks (>= 2*vec_reg_
-      // bytes), so the load of chunk s+1 overlaps the compute of chunk s. A tile
-      // too small to ping-pong can't overlap -> load and compute SERIALIZE
-      // (compute + DDR). BINARY: crossing the threshold grants max and nothing
-      // more, so a larger tile gets no extra (and unreal) overlap credit.
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
       const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
       // DMA-shape penalty (grounded): GM<->UB moves a tile as `h` strided segments
-      // of `w` contiguous elements (one tile-row). The DMA reaches peak bandwidth
-      // only when that contiguous run spans >= one transfer burst; below it the
-      // per-descriptor setup dominates (a narrow rectangle issues many tiny strided
-      // transfers). Charge io a max(1, burst / (w*dtype)) factor, burst =
-      // vec_reg_bytes -- so a wide / full-width (row-strip) tile is unpenalized
-      // (factor 1) and the dividing tiebreak still picks among efficient tiles,
-      // while only sub-burst widths pay. Makes a row/column-friendly layout
-      // cost-FAVORED, not just tiebreak-favored. (pto-isa BLOCK_BYTE_SIZE=32 is the
-      // DMA block; contiguity below the burst is descriptor-bound.)
-      total_io *= std::max(1.0, (double)vreg / std::max(1.0, (double)cfg.w * (double)dtb));
+      // of `w` contiguous elements. The DMA reaches peak bandwidth only when that
+      // contiguous run spans >= one transfer burst (vec_reg_bytes); below it the
+      // per-descriptor setup dominates. Charge a max(1, burst/(w*dtype)) factor to
+      // BOTH directions -- a wide / full-width tile is unpenalized (factor 1), only
+      // sub-burst widths pay. (pto-isa BLOCK_BYTE_SIZE=32 is the DMA block.)
+      const double dma_pen = std::max(1.0, (double)vreg / std::max(1.0, (double)cfg.w * (double)dtb));
+      io_in  *= dma_pen;
+      io_out *= dma_pen;
+      // Per-direction DDR cycles: each direction divides across `active` cores' UB
+      // DMA pipes up to the aggregate HBM ceiling (par), at its OWN per-core peak
+      // (GM->UB load vs UB->GM store). io_out_eff lets the reduction split below
+      // pass the S-times-written store without re-deriving the load term.
+      auto ddr_io = [&](double active, double io_out_eff) {
+        return io_in / par(active, prob_->bw_gm_ub) + io_out_eff / par(active, prob_->bw_ub_gm);
+      };
+      // Wave-aware compute makespan (ceil(num_tiles/cores) waves) -- a balanced
+      // num_tiles==cores grid (one wave) beats an over-tiled count.
+      const double compute_mk = WaveComputeCycles(total_compute, num_tiles, n_cores);
+      // Double-buffer floor (grounded): the max(compute, DDR) roofline holds only
+      // when the per-core tile streams in >= 2 SIMD-repeat chunks (>= 2*vec_reg_
+      // bytes), so chunk s+1's load overlaps chunk s's compute. Too small to
+      // ping-pong -> SERIALIZE (compute + DDR). BINARY: crossing grants max, no more.
       const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
       const bool db = tile_bytes >= 2.0 * (double)vreg;
       auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };
-      double lat = rfl(compute_mk, total_io * sat_v);
+      double lat = rfl(compute_mk, ddr_io(eff, io_out));
       result.parallel_split = 1;
       result.cores_used = (int)eff;
-      result.compute_bound = compute_mk >= total_io * sat_v;
-      result.ddr_traffic = total_io;
+      result.compute_bound = compute_mk >= ddr_io(eff, io_out);
+      result.ddr_traffic = ddr_io(eff, io_out);
       // Reduced-axis (cross-core) split — the vector analog of the cube split-K.
       // SINK-ONLY: the S per-core partials reduce across cores through DDR (fine
       // for a boundary reduction output; an internal reduction split is a subgraph
-      // cut, not an in-subgraph split). Mirrors the cube (§4.2): ENUMERATE S (the
-      // optimum is interior when the merge is serial), and the merge has the SAME
-      // two regimes via Problem::ddr_atomic_add. The reduced partial is thin
-      // ([H,1] for a width-reduction, [1,W] for a height-reduction) -> red_dim.
+      // cut, not an in-subgraph split). Mirrors the cube (§4.2): ENUMERATE S and
+      // take the min. The partials accumulate via SetAtomicAdd (910B always has it).
+      // The reduced partial is thin ([H,1] for a width-reduction, [1,W] for a
+      // height-reduction) -> red_dim.
       if (has_reduction_ && reduction_is_sink_) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
-        const double sat_acc = std::max(1.0, (double)n_cores / (double)num_tiles);
-        struct RS { double lat, eff, sat, merge, compute; };
+        struct RS { double lat, eff, ddr, compute; };
         auto eval_reduce_S = [&](int64_t S) -> RS {
           const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
-          const double sat_vS = std::max(1.0, (double)n_cores / effS);
           const double compS = WaveComputeCycles(total_compute, num_tiles * S, n_cores);
-          const double streamS = rfl(compS, total_io * sat_vS);  // same double-buffer floor
-          // (1) write/atomic-add the S thin partials (parallel; cancels below full-fill).
-          double merge = (double)(S - 1) * red_dim * bc.ub_out * sat_vS;
-          // (2) WITHOUT SetAtomicAdd: read the partials back and sum serially per
-          //     tile (one accumulator/tile -> sat(num_tiles), grows ∝ S).
-          if (!prob_->ddr_atomic_add)
-            merge += (double)(S + 1) * red_dim * bc.ub_out * sat_acc;
-          return {streamS + merge, effS, sat_vS, merge, compS};
+          // The thin reduced output is written S times (S atomic-add partials):
+          // extra UB->GM store traffic FOLDED into the roofline, NOT an additive
+          // merge. red_dim is the thin partial ([H,1] / [1,W]); charge it the same
+          // DMA-shape penalty as the base store.
+          const double io_out_S = io_out + (double)(S - 1) * red_dim * bc.ub_out * dma_pen;
+          const double ddrS = ddr_io(effS, io_out_S);
+          const double streamS = rfl(compS, ddrS);
+          return {streamS, effS, ddrS, compS};
         };
         auto take_S = [&](int64_t S) {
           const RS e = eval_reduce_S(S);
@@ -1711,8 +1733,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
             lat = e.lat;
             result.parallel_split = (int)S;
             result.cores_used = (int)e.eff;
-            result.compute_bound = e.compute >= (total_io * e.sat);
-            result.ddr_traffic = total_io * e.sat + e.merge;
+            result.compute_bound = e.compute >= e.ddr;
+            result.ddr_traffic = e.ddr;
           }
         };
         // The triple's split_k IS the reduced-axis split (lets P_spatial * S fill
@@ -1922,6 +1944,7 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
           //   6. larger k            — fewer L1 passes
           const double tol = 1e-6 * std::max(1.0, best.latency);
           const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
+          const double etol = 1e-9 * std::max(1.0, best.l1l0_extract);
           const long long ra = (long long)r.config.w * r.config.h;
           const long long ba = (long long)best.config.w * best.config.h;
           // Emit-friendliness: a tile whose extents EVENLY DIVIDE the output (every
@@ -1944,6 +1967,12 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
             take = true;
           } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
             take = false;
+          } else if (std::abs(r.l1l0_extract - best.l1l0_extract) > etol) {
+            // Lower L1->L0 extract (MTE1) wins: the GM reload is port-symmetric and
+            // ties transposes, but the L0A/L0B ports are not, so the TALL tile (large
+            // h, less slow-L0B traffic) is faster. Perf-sim-driven (pto-isa
+            // gml1_decision: removes a ~4% aspect regret); device eval pending.
+            take = r.l1l0_extract < best.l1l0_extract;
           } else if (r.cores_used != best.cores_used) {
             take = r.cores_used > best.cores_used;
           } else if (r_div != b_div) {

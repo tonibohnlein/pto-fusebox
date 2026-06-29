@@ -218,8 +218,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // (w_i = min(cfg.w, N)) — correct for a feed-forward mixed kernel whose matmul
   // output is consumed elementwise by the vector stage (it is the effective sink),
   // vs the cube path's chained-intermediate default (full-width band, w_i = N).
+  // Optionally splits the reload BYTES per port (lhs via L0A, rhs via L0B) into the
+  // out-params — used to derive the L1->L0 extract (MTE1) tiebreaker in best_cost.
   double cube_operand_reload(const TileConfig &cfg,
-                             bool matmul_at_output_grid = false) const;
+                             bool matmul_at_output_grid = false,
+                             double *lhs_bytes_out = nullptr,
+                             double *rhs_bytes_out = nullptr) const;
 
   const Problem *prob_ = nullptr;
   const DAG *dag_ = nullptr;

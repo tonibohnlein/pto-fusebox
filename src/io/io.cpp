@@ -160,7 +160,6 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("l1_capacity"))      p.l1_capacity      = j["l1_capacity"].get<int64_t>();
     if (j.contains("cube_compute_cost"))   p.cube_compute_cost   = j["cube_compute_cost"].get<int64_t>();
     if (j.contains("kernel_fill_cost"))    p.kernel_fill_cost    = j["kernel_fill_cost"].get<int64_t>();
-    if (j.contains("ddr_atomic_add"))      p.ddr_atomic_add      = j["ddr_atomic_add"].get<bool>();
     // Grounded pto-isa machine model (optional; absent => legacy placeholders).
     if (j.contains("cube_freq_hz")) p.cube_freq_hz = j["cube_freq_hz"].get<double>();
     if (j.contains("bw_gm_l1"))     p.bw_gm_l1     = j["bw_gm_l1"].get<double>();
@@ -169,6 +168,7 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("bw_l1_l0b"))    p.bw_l1_l0b    = j["bw_l1_l0b"].get<double>();
     if (j.contains("bw_gm_ub"))     p.bw_gm_ub     = j["bw_gm_ub"].get<double>();
     if (j.contains("bw_ub_gm"))     p.bw_ub_gm     = j["bw_ub_gm"].get<double>();
+    if (j.contains("hbm_aggregate_gibps")) p.hbm_aggregate_gibps = j["hbm_aggregate_gibps"].get<double>();
     if (j.contains("l0_tile_m"))    p.l0_tile_m    = j["l0_tile_m"].get<int64_t>();
     if (j.contains("l0_tile_n"))    p.l0_tile_n    = j["l0_tile_n"].get<int64_t>();
     if (j.contains("vec_reg_bytes"))    p.vec_reg_bytes    = j["vec_reg_bytes"].get<int64_t>();
