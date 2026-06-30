@@ -230,7 +230,7 @@ The single-core seq-k is **derived** (`derive_exec`), never enumerated.
 ## 7. The vector roofline — `compute_cost` (vector branch)
 
 ```
-compute_mk = WaveComputeCycles( Σ_op (head + slope·ceil(elems/epr) + tail), num_tiles, C )
+compute_mk = WaveComputeCycles( Σ_op VecOpCompute(op), num_tiles, C )
 lat        = max( compute_mk , io * sat(eff) )    # when the tile can double-buffer
            = compute_mk + io * sat(eff)           # otherwise
 io = Σ boundary tensors * cyc_per_byte(GM↔UB)
@@ -238,6 +238,18 @@ io = Σ boundary tensors * cyc_per_byte(GM↔UB)
 
 **Wave-aware** like the cube (a balanced `num_tiles == C` grid, one wave, beats an
 over-tiled count). `compute_mk` is the full-op work distributed over the tiles.
+
+**Per-op compute — `VecOpCompute` (grounded, pto-isa `vec_tile_study`).**
+
+- *Pointwise:* `slope·ceil(elems/epr)` + `head+tail` **once per back-to-back stream** (Fix 3:
+  the perf-sim pays startup only when the VEC queue is empty, so a fused elementwise chain
+  overlaps its startup — reductions / matmuls break the stream). `elems` = the op's largest
+  tensor, tiling-invariant; `epr = vec_reg_bytes/dtype_bytes`.
+- *Reduction (Fix 1):* a reduction is **not** a single `slope_reduce·repeat` op — it lowers
+  to a barrier-separated **tree** of count-mode passes, so its cost tracks the **reduced
+  axis**, not `ROWS·COLS`. Reduce-W (row reduction): `45·(K−1)+51`, `K=W/epr` — **ROWS-
+  independent**. Reduce-H (col reduction, binary): `16·(H−1)+30·log₂H`. The old
+  `slope_reduce·(ROWS·COLS/epr)` overcounted a tall row-reduce **up to 19×** (`vec_reduce`).
 
 **Double-buffer floor (vector).** The `max()` overlap holds only when the per-core
 tile streams in **≥2 SIMD-repeat chunks** (`tile_bytes ≥ 2·vec_reg_bytes`), so the
@@ -258,11 +270,14 @@ rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below th
 burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
 emit-friendly tile among efficient ones.
 
-**Reduction recompute.** When a reduction's coupled band overflows UB
-(`vector_peak_ub > vec_capacity`), the feasible schedule STREAMS the reduced axis
-and recomputes the reused ephemerals once per pass: `compute *= n_passes`,
-`io *= n_passes`, `n_passes = #reductions + 1` (softmax = 3). Pessimistic upper
-bound.
+**UB-overflow streaming (Fix 2, `vec_stream`).** When a reduction's coupled band overflows
+UB (`vector_peak_ub > vec_capacity`), the schedule streams the reduced axis in chunks. The
+real emit is **online / flash** (`pto_macro_fa_softmax`): each chunk's pointwise runs **once
+per element** and each band is read once, so `compute` and `io` are **not** multiplied by
+`#reductions + 1` (that ~3× recompute was 3–4× pessimistic — it masked every streamed
+softmax, the large-context-attention regime). The only surcharge is a thin per-chunk
+correction (re-paid vector startup + an `O(ROWS·1)` running max/sum rescale):
+`compute += nchunks · #reductions · (head+tail)`, `io` unchanged.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction
@@ -322,10 +337,16 @@ Among equal-latency configs, lexicographic:
 
 ## 11. Known limitations / open calibration
 
-- **Calibration constants** — the vector double-buffer threshold (`2·vec_reg_bytes`),
-  the DMA-shape burst (`vec_reg_bytes`), and the reduction **`n_passes` recompute**
-  are reasoned bounds, not measured. The DMA-shape burst especially is a knob: it
-  sets the contiguous width above which a tile is DMA-efficient.
+- **Calibration constants** — the reduction tree (`45/51/16/30`, §7 Fix 1) and the
+  streaming surcharge (§7 Fix 2) are now **perf-sim-grounded** (`pto-isa vec_tile_study`,
+  R²≈1.0) but **device-eval-pending** (the perf-sim's count-mode flat-per-pass is itself
+  coarse vs real HW). The vector double-buffer threshold (`2·vec_reg_bytes`) and the
+  DMA-shape burst (`vec_reg_bytes`) remain reasoned bounds, not measured.
+- **Vector double-buffer / DMA-shape thresholds** remain reasoned bounds (above). All three
+  per-op pessimisms — reduction cost (Fix 1), streaming recompute (Fix 2), and per-op startup
+  (Fix 3, now once-per-stream via `pw_stream_start`) — are perf-sim-grounded and device-eval-
+  pending. The stream-break heuristic (reductions/matmuls reset the chain) is an approximation
+  of the true VEC-queue-empty condition; exact only when the op order matches the emit.
 - **Per-tile compute overhead.** The vector *compute* is still tiling-invariant
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
   tiles, "favor larger tiles" is a *tiebreak* (§9.5), not cost-driven. (The DMA

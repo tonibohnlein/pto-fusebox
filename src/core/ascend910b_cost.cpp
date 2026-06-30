@@ -34,6 +34,45 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
+// Vector REDUCTION tree coefficients (pto-isa perf-sim, vec_tile_study/vec_reduce, R^2~1.0,
+// device-eval-pending). A reduction is NOT a single slope*repeat op: it lowers to a
+// barrier-separated tree of count-mode passes, so the cost tracks the REDUCED-AXIS tree,
+// not ROWS*COLS. The old slope_reduce*(ROWS*COLS/epr) overcounted a tall row-reduce up to 19x.
+//   Row reduction (reduce W): 45*(K-1)+51 cycles, K=W/epr -- ROWS-INDEPENDENT, linear in W.
+//   Col reduction (reduce H): 16*(H-1)+30*log2(H) cycles -- pairwise vadd tree across rows.
+constexpr double kVecRowReducePass = 45.0;   // per barrier-isolated count-mode vadd pass
+constexpr double kVecRowReduceFinal = 51.0;  // K=1 base (the final cross-lane vcadd block)
+constexpr double kVecColReduceSlope = 16.0;  // streamed count-mode vadd per row-pair
+constexpr double kVecColReduceLevel = 30.0;  // per-level startup (log2(H) barriers)
+
+// Grounded per-op VECTOR compute cycles (pto-isa perf-sim, vec_tile_study). Shared by the
+// vector-only and the mixed cube+vector paths so a reduction costs the same in both.
+//   Pointwise: slope*repeat + (head+tail IF this op starts a vector stream). Fix 3: the
+//     perf-sim pays head+tail only when the VEC queue is empty (a back-to-back chain overlaps
+//     its startup), so the caller passes pw_stream_start=true only for the first pointwise op
+//     of a stream (chain start, or after a reduction/matmul barrier) -- not per op.
+//   Reduction (Fix 1): the REDUCED-AXIS tree -- ROWS-independent for reduce-W, log-depth for
+//     reduce-H -- NOT slope_reduce*(ROWS*COLS/epr) (overcounted a tall row-reduce up to 19x).
+//     Its barrier-isolated per-pass startups are already baked into the tree constants.
+inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, bool pw_stream_start) {
+  const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
+  const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(p->tensors[op.output()].dtype));
+  if (op.type == OpType::Reduction) {
+    const int64_t W = (int64_t)p->tensors[op.inputs[0]].width;
+    const int64_t H = (int64_t)p->tensors[op.inputs[0]].height;
+    if (reduced_axis == 2)  // reduce height: pairwise vadd tree across rows
+      return kVecColReduceSlope * (double)std::max<int64_t>(0, H - 1) +
+             kVecColReduceLevel * (H > 1 ? std::log2((double)H) : 0.0);
+    const int64_t K = std::max<int64_t>(1, W / epr);  // reduce width: ROWS-independent
+    return kVecRowReducePass * (double)(K - 1) + kVecRowReduceFinal;
+  }
+  int64_t elems = (int64_t)p->tensors[op.output()].width * p->tensors[op.output()].height;
+  for (auto t : op.inputs)
+    elems = std::max(elems, (int64_t)p->tensors[t].width * p->tensors[t].height);
+  const int64_t repeat = (elems + epr - 1) / epr;
+  return p->vec_slope_pw * (double)repeat + (pw_stream_start ? p->vec_op_head + p->vec_op_tail : 0.0);
+}
+
 // Per-direction "cycles per byte" for a transfer: a byte costs
 // (1/2^30)/bw_GiBps * freq_hz cycles (pto-isa EstimateBandwidthCycles).
 struct ByteCost {
@@ -1618,29 +1657,18 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // per-tile charge would inflate compute for the small sub-16 tiles we need
       // to fill the cores, wrongly favouring fewer tiles / fewer cores. (Same
       // tiling-invariance as the matmul fractal count.)
+      // Per-op grounded compute, SUMMED over the full element count (tiling-invariant:
+      // each element is touched once). Reductions use the axis-aware tree (Fix 1); see
+      // VecOpCompute. Fix 3: head+tail is paid once per back-to-back pointwise stream, so a
+      // pointwise op pays startup only when it STARTS a stream (first op, or after a
+      // reduction barrier). A per-tile charge would inflate compute for small sub-16 tiles.
       double total_compute = 0.0;
+      bool prev_pw = false;  // was the previous op a stream-continuing pointwise op?
       for (auto i : ops_) {
-        // #elements = the op's largest tensor (the [H,W] grid). A reduction
-        // [H,W]->[H,1] processes the W*H input, so the max over inputs/output is
-        // the right element count for both pointwise and reduction.
-        int64_t elems = (int64_t)prob_->tensors[prob_->ops[i].output()].width *
-                        prob_->tensors[prob_->ops[i].output()].height;
-        for (auto t : prob_->ops[i].inputs)
-          elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-        // Grounded (pto-isa A2A3): per-op CYCLES = head + slope*repeat + tail,
-        // repeat = ceil(elems / (vec_reg_bytes/dtype_bytes)) -- the 256-byte
-        // vector register holds 64 fp32 / 128 fp16 elements. A Reduction takes
-        // the steep vreducev2 slope (~14x an elementwise add); the head/tail
-        // charges each op's pipeline fill, so a multi-op chain (softmax = exp +
-        // reduce + div) pays per op.
-        const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-        const DType dt = prob_->tensors[prob_->ops[i].output()].dtype;
-        const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dt));
-        const int64_t repeat = (elems + epr - 1) / epr;
-        const double slope = (prob_->ops[i].type == OpType::Reduction)
-                                 ? prob_->vec_slope_reduce
-                                 : prob_->vec_slope_pw;
-        total_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
+        const Op &op = prob_->ops[i];
+        const bool pw = op.type != OpType::Reduction;
+        total_compute += VecOpCompute(prob_, op, reduced_axis_, /*pw_stream_start=*/pw && !prev_pw);
+        prev_pw = pw;
       }
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
       // DDR per direction (byte-based cycles): GM->UB boundary loads and UB->GM
@@ -1654,22 +1682,23 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         if (info.is_boundary_out && !retain_these.count(info.id))
           io_out += bytes * bc.ub_out; // UB->GM boundary store
       }
-      // Step 2b — single-core streaming recompute (flash 2-pass). When this config
-      // cannot materialize the reduced band (UB overflow), the feasible schedule
-      // STREAMS the reduced axis and recomputes reused ephemerals past each
-      // reduction: boundary inputs are re-read and the pointwise work repeated, once
-      // per pass. N_passes = #reductions + 1 (softmax: rowmax, then exp+rowsum, then
-      // exp+div = 3). Pessimistic upper bound; refine toward per-op liveness later.
+      // Step 2b — UB-overflow streaming (Fix 2, vec_stream). When the reduced band can't
+      // materialize, the feasible schedule streams the reduced axis in chunks. The real
+      // emit is ONLINE / flash (pto_macro_fa_softmax): each chunk's pointwise runs ONCE per
+      // element and each band is read once, so compute and IO are NOT multiplied by
+      // #reductions+1 (that was 3-4x pessimistic, masking every streamed softmax). The only
+      // surcharge is a thin per-chunk correction -- the re-paid vector startup + an
+      // O(ROWS*1) running max/sum rescale -- O(nchunks * #reductions) cheap work.
       if (has_reduction_) {
         const double budget = (double)prob_->vec_capacity;  // full UB (see vector_stream)
-        if (budget > 0.0 && (double)vector_peak_ub(cfg) > budget) {
+        const double peak = (double)vector_peak_ub(cfg);
+        if (budget > 0.0 && peak > budget) {
           int reductions = 0;
           for (auto i : ops_)
             if (prob_->ops[i].type == OpType::Reduction) reductions++;
-          const double n_passes = (double)(reductions + 1);
-          total_compute *= n_passes;
-          io_in  *= n_passes;
-          io_out *= n_passes;
+          const double nchunks = std::ceil(peak / budget);
+          total_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
+          // io_in / io_out unchanged: online streaming reads each band once (== materialized).
         }
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
@@ -1810,9 +1839,11 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // cube_mac / cube_extract: the cube stage is hierarchical and double-buffered
   // (same as the homogeneous cube path) — its time is max(MACs, L1->L0 extract).
   double cube_mac = 0.0, cube_extract = 0.0, vector_compute = 0.0;
+  bool prev_pw = false;  // Fix 3: pointwise startup once per stream (matmul/reduction break it)
   for (auto i : ops_) {
     const auto& op = prob_->ops[i];
     if (op.type == OpType::MatMul) {
+      prev_pw = false;  // a cube->vector crossing syncs -> next vector op restarts its stream
       const size_t o = op.output();
       const int64_t Mo = prob_->tensors[o].height;
       const int64_t No = prob_->tensors[o].width;
@@ -1820,19 +1851,12 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       const DType dt = prob_->tensors[o].dtype;
       cube_mac += CubeMacCycles(prob_, Mo, No, Ko, dt);
       cube_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt);
-    } else {  // Pointwise / Reduction — element work, tile-invariant
-      int64_t elems = (int64_t)prob_->tensors[op.output()].width *
-                      prob_->tensors[op.output()].height;
-      for (auto t : op.inputs)
-        elems = std::max(elems, (int64_t)prob_->tensors[t].width * prob_->tensors[t].height);
-      // Grounded: head + slope*repeat + tail (cycles); repeat = ceil(elems /
-      // (vec_reg_bytes/dtype_bytes)). Reduction takes the steep vreducev2 slope.
-      const int64_t reg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-      const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(prob_->tensors[op.output()].dtype));
-      const int64_t repeat = (elems + epr - 1) / epr;
-      const double slope = (op.type == OpType::Reduction) ? prob_->vec_slope_reduce
-                                                          : prob_->vec_slope_pw;
-      vector_compute += prob_->vec_op_head + slope * (double)repeat + prob_->vec_op_tail;
+    } else {  // Pointwise / Reduction — grounded per-op compute (reductions: axis-aware
+      // tree, Fix 1; pointwise startup once per stream, Fix 3). Shared with the vector-only
+      // path via VecOpCompute for one consistent cost.
+      const bool pw = op.type != OpType::Reduction;
+      vector_compute += VecOpCompute(prob_, op, reduced_axis_, /*pw_stream_start=*/pw && !prev_pw);
+      prev_pw = pw;
     }
   }
 

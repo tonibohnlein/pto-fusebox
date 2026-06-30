@@ -148,7 +148,9 @@ struct Problem {
     double vec_op_head = 0.0;         // per-op pipeline startup cycles (~14)
     double vec_op_tail = 0.0;         // per-op drain cycles (~18)
     double vec_slope_pw = 0.0;        // cycles/repeat, elementwise (~2)
-    double vec_slope_reduce = 0.0;    // cycles/repeat, reduction (~14)
+    double vec_slope_reduce = 0.0;    // DEPRECATED by Fix 1 (VecOpCompute reduction tree):
+                                      // a reduction is no longer one slope*repeat op. Field
+                                      // kept for ABI/serialization; unused by the cost path.
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }

@@ -1343,17 +1343,20 @@ static void test_vector_streaming_reduction() {
           sg->vector_peak_ub(cfg, {}, {}, 256) <= UB);
     CHECK("STREAM: fused large-W softmax feasible (escalates to streaming)",
           std::isfinite(sg->best_cost().latency));
-    // Step 2b — the streamed case pays the flash recompute. W=8192 materializes
-    // (1 pass); W=24576 (3x the data) streams and recomputes over N_passes=3 (the
-    // two reductions + final), so its cost jumps ~9x (3x data x 3x passes) — well
-    // beyond the 3x a pure data scaling would give.
+    // Step 2b (Fix 2, vec_stream) — the streamed emit is ONLINE (flash): the wide body runs
+    // once per element, so the cost scales ~LINEARLY with the data, NOT super-linearly.
+    // W=8192 materializes (1 pass); W=24576 (3x the data) streams but does NOT recompute over
+    // N_passes=3. The old model multiplied by #reductions+1 (a ~9x blowup, >4x mat); the
+    // perf-sim refuted that -- there is no recompute multiplier, only a thin per-chunk
+    // surcharge. Measured ratio ~2.4x (sub-linear: the materialized case carries more fixed
+    // per-element overhead). So assert it scales (>2x) WITHOUT a recompute blowup (<3.5x).
     Problem pm = mk_softmax(8192, 128);   // materializes
     Problem ps = mk_softmax(24576, 128);  // streams (3x W)
     DAG dm = DAG::build(pm), ds = DAG::build(ps);
     double mat = Subgraph::create(pm, dm, {0, 1, 2, 3})->best_cost().latency;
     double str = Subgraph::create(ps, ds, {0, 1, 2, 3})->best_cost().latency;
-    CHECK("STREAM: streamed cost includes the recompute (>4x the 3x-data scaling)",
-          str > 4.0 * mat);
+    CHECK("STREAM: streamed cost scales ~linearly (online, no #reductions+1 recompute blowup)",
+          str > 2.0 * mat && str < 3.5 * mat);
 }
 
 // --- matmul sensibility invariants across a shape grid -----------------------
