@@ -275,7 +275,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // — is computed ONCE by SubgraphStructure, the shared architecture-independent
   // layer. The cost model composes those facts and adds tiling/feasibility/cost
   // on top. (The execution-order DFS stays in the cost layer below: its roots
-  // are refined by the #82 epilogue detection, so it is not purely structural.)
+  // are refined by the epilogue detection, so it is not purely structural.)
   //
   // Rule recap: a tensor produced AND consumed inside is ephemeral (zero memory
   // footprint, zero IO). Whether an external consumer can reach it is NOT the
@@ -299,7 +299,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       sg.pw_produced_ephemerals_.push_back(out_t);
   }
 
-  // Issue #71 Rules 2/3 (prologue-PW geometric condition):
+  // Rules 2/3 (prologue-PW geometric condition):
   //   PW feeds a downstream MM's LHS (directly or through PW chain) →
   //     require cfg.w ≥ matmul.K
   //   PW feeds a downstream MM's RHS → require cfg.h ≥ matmul.K
@@ -348,7 +348,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
 
   {
     // Structural sinks come from SubgraphStructure (an op whose output has no
-    // in-subgraph consumer). The #82 epilogue detection below may additionally
+    // in-subgraph consumer). The epilogue detection below may additionally
     // mark an internal MM as an effective sink — a cost-model refinement on top
     // of this structural set.
     sg.is_sink_op_vec_.assign(num_ops, false);
@@ -399,11 +399,11 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       }
     }
 
-    // Detect simple MM→PW epilogue pattern (issue #82):
+    // Detect simple MM→PW epilogue pattern:
     //   All sinks are PW, and walking backward from PW sinks through PW-only
     //   chains reaches exactly one MM. That MM is the "effective sink" —
     //   its k-loop runs, accumulates into its ephemeral output, then the PW
-    //   chain fires once on the completed tile. Per #82 this is always valid.
+    //   chain fires once on the completed tile. This is always valid.
     //
     //   When detected: output_K_ = effective sink MM's K, and we mark it in
     //   is_sink_op_vec_ so tiling propagation gives it FROM_NK inputs.
@@ -542,11 +542,11 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     std::vector<TilePair> tsrc(num_tensors);
 
     // Per-tensor set of distinct role signatures. Powers the multi-entry
-    // boundary_tensor_info_ materialization per issues #70 + #73:
+    // boundary_tensor_info_ materialization:
     //   FULL signature (FIXED_1, FIXED_1) dominates — collapse to one full
-    //     entry, drop partials (#70).
+    //     entry, drop partials.
     //   Multiple distinct partial signatures → one entry each, working set
-    //     sums them (#73). Capped at 2 partials per the row/col simplification.
+    //     sums them. Capped at 2 partials per the row/col simplification.
     struct RoleSig { TS h; TS v; };
     std::vector<std::vector<RoleSig>> roles_per_tensor(num_tensors);
     auto push_role = [&](size_t t, TS h, TS v) {
@@ -575,7 +575,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         // Merge for the tsrc-based tensor_tiling_ (used by op_scale in
         // compute_cost). Multi-role is tracked separately in
         // roles_per_tensor and materialized as distinct entries in
-        // boundary_tensor_info_ per #70 + #73.
+        // boundary_tensor_info_.
         tsrc[t].h = merge_source(tsrc[t].h, new_h);
         tsrc[t].v = merge_source(tsrc[t].v, new_v);
       }
@@ -640,7 +640,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
 
     // Materialize boundary_tensor_info_ entries, one per distinct retained
     // role signature per tensor. Rules:
-    //   #70 collapse: if any signature is FULL (FIXED_1, FIXED_1), it
+    //   full-role collapse: if any signature is FULL (FIXED_1, FIXED_1), it
     //     subsumes all partials — keep only the full entry. Full move covers
     //     any partial access.
     //   2-partial limit: if no full and >2 distinct partial signatures
@@ -657,7 +657,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
 
       auto &roles = roles_per_tensor[t];
 
-      // #70 collapse: full role subsumes all others.
+      // full-role collapse: full role subsumes all others.
       bool has_full = false;
       for (auto &r : roles)
         if (r.h == TS::FIXED_1 && r.v == TS::FIXED_1) { has_full = true; break; }
@@ -768,7 +768,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   //   PW-only sinks:  output_K_ == 1 → k == 1 in solution.
   //   Mixed MM+PW sinks: output_K_ == op_K(mm) → k == K in solution
   //     (full reduction in one pass).
-  // Exception: simple MM→PW epilogue (#82) — enumerate k candidates
+  // Exception: simple MM→PW epilogue — enumerate k candidates
   //   since the MM's k-loop completes before PW fires.
   if (sg.has_pw_sink_ && !sg.has_simple_epilogue_)
     sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
@@ -950,7 +950,7 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   // here, and for a chained group max_K_ may exceed a smaller op's K.
   if ((!has_pw_sink_ || has_simple_epilogue_) && !matmul_910b) {
     for (int64_t v : k_divides_) {
-      // Per #75: cfg.k > op_K is physically undefined — there's nothing
+      // cfg.k > op_K is physically undefined — there's nothing
       // to stream into the back half of the k-granule, and whatever gets
       // summed in would corrupt the accumulator.
       if (cfg.k > v) return false;
@@ -967,10 +967,10 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   int64_t nth = std::max(out_H_ / cfg.h, (int64_t)1);
   int64_t nk = has_matmul_ ? std::max(output_K_ / cfg.k, (int64_t)1) : 1;
 
-  // PW-sink: no temporal tiling allowed, UNLESS simple MM→PW epilogue (#82).
+  // PW-sink: no temporal tiling allowed, UNLESS simple MM→PW epilogue.
   if (has_pw_sink_ && !has_simple_epilogue_ && nk > 1) return false;
 
-  // Issue #71 Rules 2/3: prologue-PW geometric condition. A PW that feeds
+  // Rules 2/3: prologue-PW geometric condition. A PW that feeds
   // an MM's LHS (via PW-only chain) requires cfg.w ≥ matmul.K so a single
   // PW tile spans the full LHS K-axis; feeding RHS requires cfg.h ≥ matmul.K.
   // Applies at all nk — the constraint is geometric (PW tile shape vs
@@ -979,7 +979,7 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   if (cfg.w < prologue_cfg_w_min_) return false;
   if (cfg.h < prologue_cfg_h_min_) return false;
 
-  // Per-entry tensor-dim bounds (per #70 + #73 multi-role). For each
+  // Per-entry tensor-dim bounds (multi-role). For each
   // distinct role signature of each boundary tensor, ensure the derived
   // tile count doesn't exceed the tensor's dim in that direction (otherwise
   // slice < 1). Replaces the old min_*_dim_ bounds which were computed from
@@ -997,7 +997,7 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   }
   // Ephemerals aren't in boundary_tensor_info_; use tensor_tiling_ (single
   // merged role — ephemerals aren't materialized per-role since they're
-  // zero-cost per #77 and don't affect WS/IO accounting).
+  // zero-cost and don't affect WS/IO accounting).
   for (size_t t : ephemeral_) {
     const auto &tp = tensor_tiling_[t];
     BoundaryTensorInfo tmp;
@@ -1038,11 +1038,11 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   }
 
   // Multi-role tensors are now modeled explicitly via multi-entry
-  // boundary_tensor_info_ (per #70 + #73); divisibility checks above cover
+  // boundary_tensor_info_; divisibility checks above cover
   // shape constraints across all role orientations, and the 2-partial limit
   // is enforced at Ascend910BCost::create. No symbolic-propagation conflict check
   // is needed — the former slow path rejected exactly the multi-role configs
-  // #73 now accepts.
+  // the multi-role accounting now accepts.
   return true;
 }
 

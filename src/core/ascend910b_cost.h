@@ -66,7 +66,7 @@ public:
   bool has_matmul() const { return has_matmul_; }
 
   // Number of distinct role-signature entries for a tensor in this subgraph.
-  // Returns 0 for non-boundary tensors. Multi-role tensors (per #70 + #73)
+  // Returns 0 for non-boundary tensors. Multi-role tensors
   // return >1. Mainly for tests and diagnostics.
   size_t boundary_entries_for(size_t tensor_id) const {
     if (tensor_id >= tensor_id_to_infos_.size()) return 0;
@@ -266,7 +266,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int64_t sink_mm_op_ = -1;  // op id of the boundary-output MatMul (-1 if none);
                              // its derived per-op k is the displayed config.k
 
-  // Prologue-PW geometric condition (issue #71 Rules 2/3):
+  // Prologue-PW geometric condition (Rules 2/3):
   //   Pointwise feeding a matmul's LHS → require cfg.w ≥ matmul.K
   //   Pointwise feeding a matmul's RHS → require cfg.h ≥ matmul.K
   // Without this, the matmul's k-loop would ask for LHS/RHS data a single
@@ -387,7 +387,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // Flat lookup: tensor index → list of indices into boundary_tensor_info_.
   // Empty list means the tensor isn't a boundary tensor of this subgraph.
   // A tensor can have multiple entries when it's used under multiple distinct
-  // role signatures (per issues #70 + #73 — working set sums distinct slices).
+  // role signatures (working set sums distinct slices).
   // Currently populated 1:1 per tensor; multi-entry materialization is
   // introduced in a follow-up step.
   std::vector<std::vector<int>> tensor_id_to_infos_;
