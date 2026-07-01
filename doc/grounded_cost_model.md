@@ -287,7 +287,81 @@ fills the cores by the fine sub-16 row tiling of §4.
 
 ---
 
-## 8. Feasibility (recap; full detail in base doc §3)
+## 8. The mixed roofline — `Ascend910BMixed::compute_cost`
+
+A **mixed** subgraph fuses cube (matmul) and vector (pointwise/reduction) ops into one
+kernel. On the 910B there is **no direct Acc→Vec pipe** — the cube↔vector handoff
+round-trips **GM** (`ExpandMixedKernel` splits the kernel into AIC + AIV functions joined
+by a GM-backed `tpush`/`tpop` FIFO; `SkewCrossCorePipeline` software-pipelines them). So the
+two units run **concurrently**, overlapping compute with each other and with the GM traffic.
+Admissible only when the model opts in (`allow_mixed` = `Ascend910BMixed`); the base model
+routes a cube↔vector group as two separate kernels.
+
+```
+cube_stage = max(cube_mac, cube_extract) / eff_units      # AIC per-unit wall (§2)
+vec_stage  = Σ_op VecOpCompute(op) / (2·eff_units)         # AIV per-unit wall — ALL vector ops (§7)
+ddr_lat    = max over the 4 GM ports (each par()-capped)   # cross-unit HBM contention
+one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpCompute /(2·num_tiles)
+
+2-stage: lat = max( cube_stage + one_vec_tile,            # producer-bound → + one consumer drain
+                    vec_stage  + one_cube_tile,            # consumer-bound → + one producer fill
+                    ddr_lat )
+3-stage: lat = max( cube_stage, vec_stage, ddr_lat )      # fill absorbed (output unit busy from t=0)
+       + rounds · kernel_fill_cost                        # per-LAUNCH fill (separate concern)
+eff_units = min(num_tiles, num_cube_cores)                # atomic resource = 1 cube : 2 vector unit
+```
+
+Grounded by pto-isa **`mixed_tile_study`** (7 experiments; the study is the *evidence*, this
+section the *model*).
+
+**Overlap `max` — real and near-universal.** The cube and vector stages overlap (the
+producer skew), so the wall is a `max`, not a sum. **Every single-round-trip shape overlaps**:
+`c→v` (epilogue), `v→c` (prologue), `v→c→v`, `c→v→c` (flash-decode — #1900's depth-2 per-stage
+buffers let its two cube matmuls pipeline). A `max` is wrong only for a genuine cross-tile
+**carry** or a **multi**-round-trip loop (the skew demotes those to Sequential = the sum, and
+worse) — shapes the partitioner does not form, so the model keeps the `max`. `vec_stage` pools
+**all** Pointwise/Reduction ops (a `v→c→v`'s prologue *and* epilogue run on the same AIV pool).
+
+**The symmetric fill (grounded: shape sweep `mixed_vcv`/`vc`/`cvc`).** A 2-stage wall is the
+**symmetric cross-term** `max(cube_stage + one_vec_tile, vec_stage + one_cube_tile)`: the
+bottleneck unit runs its full stage plus **one tile of the other** — the un-overlapped fill
+(the output unit's first-tile wait) or drain (the last tile after the producer). Matches the
+sim to ~1 cycle (`v→c`) / ~2.7% (`c→v`). Because it lives *inside* the `max`, the fill is
+**absorbed** when DDR-bound or when the other unit dominates — so an imbalanced fusion (matmul
++ tiny epilogue) pays only one **tiny** non-bottleneck tile, never a full cube tile. A
+**3-stage** kernel (`v→c→v`, `c→v→c`) has the output unit already running an earlier stage —
+busy from `t=0` — so the fill is **0** (plain `max`). Detection: the sink op's unit
+(`is_mm_out`) runs only the output op iff it has exactly one op in the group.
+
+**Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
+pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed
+`ddr_bytes · bc.reload` of the old flat model:
+
+| port | traffic | cyc/byte · peak |
+| ---- | ------- | --------------- |
+| `GM→L1` (cube reads) | operand reload (§3) + vec→cube crossing reads | `bc.reload` · `bw_gm_l1` |
+| `GM→UB` (vector reads) | vector boundary inputs + cube→vec crossing reads | `bc.ub_in` · `bw_gm_ub` |
+| `L0C→GM` (cube writes) | cube→vec crossing writes + a MatMul-sink output | `bc.store` · `bw_l0c_gm` |
+| `UB→GM` (vector writes) | vec→cube crossing writes + a vector-sink output | `bc.ub_out` · `bw_ub_gm` |
+
+A cube↔vector crossing intermediate round-trips **write + read on two SEPARATE overlapping
+ports** (not `2×` summed onto one). Fusion does **not** make it free — it still round-trips GM
+— but write and read ride distinct pipes. Each port divides across the active units and caps at
+the HBM ceiling: `port_lat = bytes · cyc_per_byte / par(eff_units, peak)` — the **same `par()`**
+the cube/vector paths use (§3, §7). Grounded by **`mixed_ddr_bound`** (single-core GM subsumed
+into the per-unit stages — `max(cube,vec,ddr) == max(cube,vec)` across a K-sweep) and
+**`mixed_contention`** (multi-core: cube `GM→L1` + vector `GM→UB` reads share one 900 GiB/s
+pool, both collapsing to `900/B`, matching `par()` to **0%**).
+
+**Fusion economics (910B).** Fusion saves the **overlap** (`max` vs the separated `cube + vec`)
+and one kernel launch — **not** the DDR (the intermediate round-trips GM either way). So it
+wins when the vector work is substantial or the kernel is memory-bound, and is neutral-to-losing
+for a compute-bound matmul with a trivial epilogue (small overlap saving; the separated cube can
+split-K, the mixed does not — `parallel_split = 1`).
+
+---
+
+## 9. Feasibility (recap; full detail in base doc §3)
 
 Feasibility **never depends on the spatial tile** — which is *why* the grid can
 replace uniform on the 910B path.
@@ -304,7 +378,7 @@ replace uniform on the 910B path.
 
 ---
 
-## 9. Enumeration tiebreak — `best_cost`
+## 10. Enumeration tiebreak — `best_cost`
 
 Among equal-latency configs, lexicographic:
 
@@ -321,7 +395,7 @@ Among equal-latency configs, lexicographic:
 
 ---
 
-## 10. Worked examples (grounded; standalone `mlsys`)
+## 11. Worked examples (grounded; standalone `mlsys`)
 
 | shape (fp16) | path | result |
 | --- | --- | --- |
@@ -335,7 +409,7 @@ Among equal-latency configs, lexicographic:
 
 ---
 
-## 11. Known limitations / open calibration
+## 12. Known limitations / open calibration
 
 - **Calibration constants** — the reduction tree (`45/51/16/30`, §7 Fix 1) and the
   streaming surcharge (§7 Fix 2) are now **perf-sim-grounded** (`pto-isa vec_tile_study`,
@@ -349,7 +423,7 @@ Among equal-latency configs, lexicographic:
   of the true VEC-queue-empty condition; exact only when the op order matches the emit.
 - **Per-tile compute overhead.** The vector *compute* is still tiling-invariant
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
-  tiles, "favor larger tiles" is a *tiebreak* (§9.5), not cost-driven. (The DMA
+  tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
   shape *is* now cost-driven, via §7.)
 - **Emit gap (downstream).** The solver chooses grids and split-K; the AutoFuse
   cube **emit** does not yet realize split-K for a lone matmul. Solver-side
@@ -357,7 +431,7 @@ Among equal-latency configs, lexicographic:
 
 ---
 
-## 12. Source map (`src/core/`)
+## 13. Source map (`src/core/`)
 
 | concept | location |
 | --- | --- |
@@ -370,5 +444,6 @@ Among equal-latency configs, lexicographic:
 | grid candidates (triples, granularity) | `Ascend910BCost::create` (`gen_grid`, `grid_gran_*`) |
 | cube roofline + split-K + Phase D | `Ascend910BCost::compute_cost` (matmul branch) |
 | vector roofline + double-buffer floor + reduced split | `compute_cost` (vector branch) |
-| feasibility | `derive_exec` / `cube_peak_l1` / `vector_stream` |
+| mixed roofline (overlap max + symmetric fill + 4-port par ddr) | `Ascend910BMixed::compute_cost` |
+| feasibility | `derive_exec` / `cube_peak_l1` / `vector_stream` (mixed: both) |
 | enumeration + tiebreak | `Ascend910BCost::best_cost` |
