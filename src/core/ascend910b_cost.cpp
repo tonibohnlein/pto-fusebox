@@ -1860,18 +1860,31 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     }
   }
 
+  // Tiling for UNITS. With the fixed 1:2 cube:vector ratio, the atomic resource
+  // is a UNIT = 1 cube + 2 vector cores (the 950 mix-cluster; on 910B the same
+  // ratio + the GM ring). Regions tile over n_units = num_cube_cores; WITHIN a
+  // unit the cube and its 2 vector cores are pipeline STAGES (not a finer output
+  // grid), so the stage times divide by 1 and 2 cores per unit.
+  const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
+  const double eff_units  = std::min((double)num_tiles, n_units);
+
   // DDR traffic. CRITICAL: fusion on 910B does NOT reduce DDR — the matmul still
   // reloads its operands and the intermediate still round-trips DDR (only 950's
-  // direct pipe removes the roundtrip). So the mixed DDR is, exactly like the
-  // separated two kernels:
-  //   (a) matmul operand reload — the SAME term as the cube model (shared helper;
-  //       the matmul is the effective sink here, tiled at the output grid);
-  //   (b) every cube↔vector-crossing intermediate, round-tripped (write+read = 2x
-  //       through the off-chip GM ring);
-  //   (c) vector-only boundary inputs (read) + boundary outputs (written).
-  // A cube operand is already in (a), so it is excluded from (c) to avoid double
-  // counting; an ephemeral that stays within one unit is free (not crossing).
-  double ddr_bytes = cube_operand_reload(cfg, /*matmul_at_output_grid=*/true);  // (a)
+  // direct pipe removes the roundtrip). The GM ring is FOUR independent, per-unit
+  // HBM ports that OVERLAP, so we accumulate bytes PER PORT and take the MAX over
+  // ports (grounded by mixed_contention: each read port caps at par() = hbm/peak,
+  // matching the sim to 0%; mixed_ddr_bound: the single-core GM is subsumed into
+  // the per-unit critical path). The four ports:
+  //   gm_l1  : GM->L1 cube reads    — matmul operand reload (a) + vec->cube crossing reads
+  //   gm_ub  : GM->UB vector reads  — vector boundary inputs (c) + cube->vec crossing reads
+  //   l0c_gm : L0C->GM cube writes  — cube->vec crossing writes + boundary out iff sink is MatMul
+  //   ub_gm  : UB->GM vector writes — vec->cube crossing writes + boundary out iff sink is vector
+  // A cube operand is already in (a)/gm_l1, so it is excluded from the vector
+  // boundary-input reads to avoid double counting; a same-unit ephemeral is free
+  // (not crossing). A crossing ephemeral splits into one WRITE (by the producer's
+  // unit) + one READ (by the consuming unit) — the 2x roundtrip, per-port.
+  double gm_l1_bytes  = cube_operand_reload(cfg, /*matmul_at_output_grid=*/true);  // (a)
+  double gm_ub_bytes  = 0.0, l0c_gm_bytes = 0.0, ub_gm_bytes = 0.0;
   FlatSet<size_t> cube_operands;
   for (auto i : ops_)
     if (prob_->ops[i].type == OpType::MatMul)
@@ -1879,9 +1892,9 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   for (const auto& info : boundary_tensor_info_) {                              // (c)
     const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
     if (!info.is_internally_produced && !cube_operands.count(info.id))
-      ddr_bytes += bytes;  // vector-read boundary input (cube operands are in (a))
-    if (info.is_boundary_out)
-      ddr_bytes += bytes;  // boundary output store
+      gm_ub_bytes += bytes;  // vector-read boundary input (cube operands are in gm_l1)
+    if (info.is_boundary_out)  // store direction is the sink unit: MatMul -> L0C->GM, vector -> UB->GM
+      (info.is_mm_out ? l0c_gm_bytes : ub_gm_bytes) += bytes;
   }
   FlatSet<size_t> in_sg(ops_.begin(), ops_.end());                             // (b)
   for (auto t : ephemeral_) {
@@ -1892,33 +1905,71 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       if (in_sg.count(c) && (prob_->ops[c].type == OpType::MatMul) != prod_cube) {
         crosses = true; break;
       }
-    if (crosses)
-      ddr_bytes += 2.0 * (double)(prob_->tensors[t].width * prob_->tensors[t].height) *
-                   dtype_bytes(prob_->tensors[t].dtype);
+    if (crosses) {
+      const double bytes = (double)(prob_->tensors[t].width * prob_->tensors[t].height) *
+                           dtype_bytes(prob_->tensors[t].dtype);
+      // Roundtrip = one WRITE by the producer's unit + one READ by the consumer's.
+      if (prod_cube) { l0c_gm_bytes += bytes; gm_ub_bytes += bytes; }  // cube writes L0C->GM, vector reads GM->UB
+      else           { ub_gm_bytes  += bytes; gm_l1_bytes += bytes; }  // vector writes UB->GM, cube reads GM->L1
+    }
   }
 
-  // Tiling for UNITS. With the fixed 1:2 cube:vector ratio, the atomic resource
-  // is a UNIT = 1 cube + 2 vector cores (the 950 mix-cluster; on 910B the same
-  // ratio + the GM ring). Regions tile over n_units = num_cube_cores; WITHIN a
-  // unit the cube and its 2 vector cores are pipeline STAGES (not a finer output
-  // grid), so the stage times divide by 1 and 2 cores per unit. DDR is the shared
-  // floor (sat≈1: a mixed kernel issues DMA from both stages — refine later).
-  const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
-  const double eff_units  = std::min((double)num_tiles, n_units);
+  // Per-port HBM cap: each port's traffic DIVIDES across active units up to the
+  // aggregate HBM ceiling (par = max(1, min(active, hbm/peak))). Duplicated from
+  // the base model (see Ascend910BCost::compute_cost) — the mixed branch has no
+  // access to the base's local lambda. hbm<=0 => uncapped per-unit divide.
+  const double hbm = prob_->hbm_aggregate_gibps;
+  auto par = [&](double active, double peak_gibps) {
+    const double cap = (hbm > 0.0 && peak_gibps > 0.0)
+                           ? hbm / peak_gibps : std::numeric_limits<double>::infinity();
+    return std::max(1.0, std::min(active, cap));
+  };
+  // Each port -> cycles at its own cyc/byte (GM->L1 reload, GM->UB ub_in, L0C->GM
+  // store, UB->GM ub_out — the same per-direction fields the base cube/vector paths
+  // use) and its own per-unit peak, divided by par(). The four ports are independent
+  // pipes that OVERLAP, so ddr_lat = MAX over them (grounded: mixed_contention par
+  // matches sim 0% / mixed_ddr_bound).
+  const double gm_l1_lat  = gm_l1_bytes  * bc.reload / par(eff_units, prob_->bw_gm_l1);
+  const double gm_ub_lat  = gm_ub_bytes  * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
+  const double l0c_gm_lat = l0c_gm_bytes * bc.store  / par(eff_units, prob_->bw_l0c_gm);
+  const double ub_gm_lat  = ub_gm_bytes  * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
+  const double ddr_lat = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
+
   // Cube stage = max(MACs, L1->L0 extract) — the same double-buffered hierarchy
-  // as the homogeneous cube path. DDR (reload + roundtrips + vector IO) rides
-  // the shared GM ring; charge it at the GM->L1 feed bandwidth (the dominant
-  // operand-reload direction).
+  // as the homogeneous cube path. The vector stage runs on 2 cores per unit.
   const double cube_stage = std::max(cube_mac, cube_extract) / eff_units;
   const double vec_stage  = vector_compute / (2.0 * eff_units);
-  const double ddr_lat    = ddr_bytes * bc.reload;
-  result.latency       = std::max({cube_stage, vec_stage, ddr_lat});
+  const double one_cube_tile = std::max(cube_mac, cube_extract) / (double)num_tiles;
+  const double one_vec_tile  = vector_compute / (2.0 * (double)num_tiles);
+
+  // Pipeline wall (grounded EXACTLY by mixed_tile_study, the shape sweep). The cube and
+  // vector units OVERLAP. In a 2-stage kernel (c->v or v->c) the output unit runs ONLY the
+  // output op, so the wall is the SYMMETRIC cross-term: each unit's full stage plus ONE tile
+  // of the OTHER (the un-overlapped fill/drain end) — max(cube_stage+one_vec_tile,
+  // vec_stage+one_cube_tile, ddr_lat). This matches the sim to the decimal (c->v, v->c), folds
+  // the fill INTO the max (so it is absorbed when DDR- or compute-bound by the other unit), and
+  // charges an imbalanced fusion only one TINY non-bottleneck tile (a matmul + small epilogue is
+  // NOT over-charged a full cube tile). A 3-stage kernel (v->c->v, c->v->c) has the output unit
+  // busy from t=0 (it runs an earlier stage), so there is no idle end — plain max.
+  // Detection: the sink op = producer of the single boundary output; output_is_cube = it is a
+  // MatMul; the output unit runs only the output op iff it has exactly one op in ops_.
+  bool output_is_cube = false;
+  for (const auto& info : boundary_tensor_info_)
+    if (info.is_boundary_out) { output_is_cube = info.is_mm_out; break; }
+  int output_unit_op_count = 0;
+  for (auto i : ops_)
+    if ((prob_->ops[i].type == OpType::MatMul) == output_is_cube) output_unit_op_count++;
+  const bool two_stage = (output_unit_op_count == 1);
+  result.latency = two_stage
+      ? std::max({cube_stage + one_vec_tile, vec_stage + one_cube_tile, ddr_lat})
+      : std::max({cube_stage, vec_stage, ddr_lat});
   result.parallel_split = 1;
   result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit
   result.compute_bound = std::max(cube_stage, vec_stage) >= ddr_lat;
   result.ddr_traffic   = ddr_lat;
 
-  // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)).
+  // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)) — the per-LAUNCH
+  // fill, a separate concern from the pipeline term above.
   if (prob_->kernel_fill_cost > 0) {
     const int64_t n_units_i = std::max<int64_t>(1, prob_->num_cube_cores);
     const int64_t rounds = (num_tiles + n_units_i - 1) / n_units_i;

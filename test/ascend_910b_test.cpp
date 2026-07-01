@@ -962,13 +962,17 @@ static void test_mixed_mm_pw_variants() {
         CHECK("MIXVAR: memory-bound MM->PW is DDR-bound", !fr.compute_bound);
         CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
               std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
-        CHECK("MIXVAR: ddr includes the 2x intermediate roundtrip", fr.ddr_traffic >= twoC - 1.0);
-        // The mixed DDR also carries the cube OPERAND RELOAD (A + B) — fusion does not
-        // make it free on 910B — so ddr exceeds the intermediate roundtrip (2C) plus the
-        // boundary output store (D) alone; the excess is exactly the A + B reload.
-        const double roundtrip_plus_out = (2.0 * Cb + Cb) * cpb(p.bw_gm_l1);  // 2C + D
-        CHECK("MIXVAR: ddr carries operand reload (> roundtrip + boundary output)",
-              fr.ddr_traffic > roundtrip_plus_out + 1.0);
+        // Under the grounded port-split the crossing roundtrip does NOT sum onto the ddr:
+        // the C write (L0C->GM) and C read (GM->UB) ride SEPARATE overlapping pipes, and
+        // ddr_traffic is the MAX over the four ports. In this mem-bound regime the A+B operand
+        // reload (GM->L1) is the dominant port, so ddr_traffic is that reload alone — BELOW both
+        // the old flat 2C roundtrip and the (2C + D) sum. Fusion still charges the reload +
+        // roundtrip + output (not free on 910B), just on independent overlapping pipes.
+        // (grounded: mixed_ddr_bound — ports overlap so max not sum; mixed_contention par cap.)
+        const double roundtrip_plus_out = (2.0 * Cb + Cb) * cpb(p.bw_gm_l1);  // 2C + D (old flat sum)
+        CHECK("MIXVAR: crossing roundtrip splits across overlapping ports (ddr = max, not sum)",
+              fr.ddr_traffic > 0.0 && fr.ddr_traffic < twoC - 1.0 &&
+                  fr.ddr_traffic < roundtrip_plus_out - 1.0);
         // Fusion still wins (saves a kernel fill + overlaps compute) but does NOT
         // halve the DDR — the win is modest in the DDR-bound regime.
         CHECK("MIXVAR: fused < separated (saves fill + overlap, not DDR)",
@@ -983,14 +987,20 @@ static void test_mixed_mm_pw_variants() {
                   << " compute_bound=" << fr.compute_bound << " ddr=" << fr.ddr_traffic << "\n";
         CHECK("MIXVAR: heavy matmul MM->PW is compute-bound", fr.compute_bound);
     }
-    // (3) wide intermediate (big C, cheap matmul): the 2x roundtrip dominates DDR.
+    // (3) wide intermediate (big C, cheap matmul): the 2x roundtrip SPLITS onto separate
+    // overlapping pipes (L0C->GM write + GM->UB read), so it does NOT dominate ddr — each half
+    // caps at its own port (~502 cyc) while the cheap matmul's cube stage (~12.5k) dominates.
+    // So under the grounded port-split a wide-C MM->PW is COMPUTE-bound (it was DDR-bound only
+    // under the old flat single-port ddr that piled the whole 2C roundtrip onto GM->L1).
+    // (grounded: mixed_ddr_bound — the crossing write and read overlap on distinct ports.)
     {
         Problem p = mk(64, 1024, 64, 64);
         DAG dag = DAG::build(p);
         auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
         std::cout << "  wide-C    : fused lat=" << fr.latency
                   << " compute_bound=" << fr.compute_bound << " ddr=" << fr.ddr_traffic << "\n";
-        CHECK("MIXVAR: wide-intermediate MM->PW is DDR-bound", !fr.compute_bound);
+        CHECK("MIXVAR: wide-intermediate MM->PW is compute-bound (roundtrip splits across ports)",
+              fr.compute_bound);
     }
 }
 
