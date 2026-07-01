@@ -303,11 +303,13 @@ vec_stage  = Σ_op VecOpCompute(op) / (2·eff_units)         # AIV per-unit wall
 ddr_lat    = max over the 4 GM ports (each par()-capped)   # cross-unit HBM contention
 one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpCompute /(2·num_tiles)
 
-2-stage: lat = max( cube_stage + one_vec_tile,            # producer-bound → + one consumer drain
-                    vec_stage  + one_cube_tile,            # consumer-bound → + one producer fill
-                    ddr_lat )
-3-stage: lat = max( cube_stage, vec_stage, ddr_lat )      # fill absorbed (output unit busy from t=0)
-       + rounds · kernel_fill_cost                        # per-LAUNCH fill (separate concern)
+2-stage: wall = max( cube_stage + one_vec_tile,           # producer-bound → + one consumer drain
+                     vec_stage  + one_cube_tile,           # consumer-bound → + one producer fill
+                     ddr_lat )
+3-stage: wall = max( cube_stage, vec_stage, ddr_lat )     # fill absorbed (output unit busy from t=0)
+
+lat       = wall + rounds · kernel_fill_cost              # per-LAUNCH fill — added to BOTH shapes
+rounds    = ceil(num_tiles / num_cube_cores)              # unit-rounds over the grid
 eff_units = min(num_tiles, num_cube_cores)                # atomic resource = 1 cube : 2 vector unit
 ```
 
@@ -330,8 +332,11 @@ sim to ~1 cycle (`v→c`) / ~2.7% (`c→v`). Because it lives *inside* the `max`
 **absorbed** when DDR-bound or when the other unit dominates — so an imbalanced fusion (matmul
 + tiny epilogue) pays only one **tiny** non-bottleneck tile, never a full cube tile. A
 **3-stage** kernel (`v→c→v`, `c→v→c`) has the output unit already running an earlier stage —
-busy from `t=0` — so the fill is **0** (plain `max`). Detection: the sink op's unit
-(`is_mm_out`) runs only the output op iff it has exactly one op in the group.
+busy from `t=0` — so the fill is **0** (plain `max`). Detection is **structural**, not a count:
+the fill is absorbed iff the sink unit (the boundary output's producing unit, `is_mm_out`) has
+an *early-stage* op whose input cone is same-unit + boundary — independent of the opposite unit
+(a `v→c→v` prologue, a `c→v→c` first matmul). Counting sink-unit ops is wrong: a same-unit tail
+(`c→v→v`) has >1 sink op yet still idles at `t=0`, so it pays the 2-stage fill.
 
 **Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
 pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed

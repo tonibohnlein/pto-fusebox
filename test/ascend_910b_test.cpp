@@ -943,9 +943,13 @@ static void test_mixed_mm_pw_variants() {
         return p;
     };
 
-    // (1) memory-bound matmul (realistic cc=1): MM->PW should be DDR-dominated.
+    // (1) memory-bound matmul (cc=1, K=128 below the compute knee): MM->PW should be
+    // DDR-dominated. K sits well below the compute-bound flip (this shape stays DDR-bound
+    // up to ~cc=3, a comfortable 3x margin at the realistic cc=1) so the regime is robust,
+    // not a knee case. Under the grid-accurate tile count (num_tiles = parts_m*parts_n) a
+    // square 256^3 landed right on the knee and tipped compute-bound; K=128 clears it.
     {
-        Problem p = mk(256, 256, 256, 1);
+        Problem p = mk(256, 256, 128, 1);
         DAG dag = DAG::build(p);
         auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
         auto mm = Subgraph::create(p, dag, {0})->best_cost();
@@ -954,7 +958,7 @@ static void test_mixed_mm_pw_variants() {
         // Grounded DDR is charged at the GM->L1 feed bandwidth (the mixed model lumps
         // all ddr bytes onto bc.reload); cost-per-byte = freq / (2^30 * bw_gm_l1).
         auto cpb = [&](double bw) { return p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
-        const double Cb = 256.0 * 256.0 * 4;             // intermediate C bytes (= A = B = D here)
+        const double Cb = 256.0 * 256.0 * 4;             // intermediate C/D bytes (N*M*4; A,B are half at K=128)
         const double twoC = 2.0 * Cb * cpb(p.bw_gm_l1);  // the cube<->vector roundtrip
         std::cout << "  mem-bound : fused lat=" << fr.latency << " compute_bound=" << fr.compute_bound
                   << " ddr=" << fr.ddr_traffic << " tiles=" << fr.num_spatial_tiles
@@ -962,12 +966,11 @@ static void test_mixed_mm_pw_variants() {
         CHECK("MIXVAR: memory-bound MM->PW is DDR-bound", !fr.compute_bound);
         CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
               std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
-        // Under the grounded port-split the crossing roundtrip does NOT sum onto the ddr:
-        // the C write (L0C->GM) and C read (GM->UB) ride SEPARATE overlapping pipes, and
-        // ddr_traffic is the MAX over the four ports. In this mem-bound regime the A+B operand
-        // reload (GM->L1) is the dominant port, so ddr_traffic is that reload alone — BELOW both
-        // the old flat 2C roundtrip and the (2C + D) sum. Fusion still charges the reload +
-        // roundtrip + output (not free on 910B), just on independent overlapping pipes.
+        // Under the grounded port-split the crossing roundtrip does NOT sum onto one ddr
+        // port: the C write (L0C->GM) and C read (GM->UB) ride SEPARATE overlapping pipes,
+        // and ddr_traffic is the MAX over the four ports — so it stays BELOW both the old
+        // flat 2C roundtrip and the (2C + D) sum. Fusion still charges the reload + roundtrip
+        // + output (not free on 910B), just on independent overlapping pipes.
         // (grounded: mixed_ddr_bound — ports overlap so max not sum; mixed_contention par cap.)
         const double roundtrip_plus_out = (2.0 * Cb + Cb) * cpb(p.bw_gm_l1);  // 2C + D (old flat sum)
         CHECK("MIXVAR: crossing roundtrip splits across overlapping ports (ddr = max, not sum)",
@@ -1001,6 +1004,74 @@ static void test_mixed_mm_pw_variants() {
                   << " compute_bound=" << fr.compute_bound << " ddr=" << fr.ddr_traffic << "\n";
         CHECK("MIXVAR: wide-intermediate MM->PW is compute-bound (roundtrip splits across ports)",
               fr.compute_bound);
+    }
+}
+
+// The mixed cube||vector pipeline pays a fill/drain tile ONLY when the sink unit is
+// idle at t=0 (every sink-unit op transitively waits on the opposite unit). If the
+// sink unit has an "early stage" op whose cone is same-unit + boundary (runs from
+// t=0), the fill is ABSORBED into the max. This is a STRUCTURAL property of the op
+// graph — independent of tile dims — so we probe the 4 canonical shapes with uniform
+// square tiles. Grounded by mixed_tile_study's shape sweep (v->c->v / c->v->c absorb;
+// c->v / v->c add). Guards against the old output_unit_op_count==1 heuristic, which
+// mis-classified same-unit tails (c->v->v has 2 vector ops yet still idles at t=0).
+static void test_mixed_pipeline_stages() {
+    std::cout << "[MIXSTAGE] fill absorption across the 4 canonical mixed shapes\n";
+    const Tensor sq{128, 128};  // uniform square tile — dims don't affect the (structural)
+                                // stage classification; small + equal so every op is feasible.
+    using OT = OpType;
+    auto absorbed = [&](std::vector<Tensor> tensors, std::vector<Op> ops,
+                        std::vector<size_t> group) {
+        Problem p;
+        p.tensors = std::move(tensors);
+        p.ops = std::move(ops);
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p, /*cc=*/1);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, std::move(group));
+        return mixed ? mixed->best_cost() : CostResult{};  // nullopt -> feasible stays false
+    };
+
+    // c->v->v : MatMul -> PW -> PW. Sink = vector; BOTH vector ops transitively depend
+    // on the cube, so the vector unit is idle at t=0 -> fill ADDS (2-stage).
+    {
+        auto fr = absorbed({sq, sq, sq, sq, sq},
+                           {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}, {OT::Pointwise, {3}, {4}}},
+                           {0, 1, 2});
+        CHECK("MIXSTAGE: c->v->v feasible", fr.feasible);
+        CHECK("MIXSTAGE: c->v->v pays 2-stage fill (same-unit tail still idles at t=0)",
+              !fr.pipeline_fill_absorbed);
+    }
+    // v->v->c : PW -> PW -> MatMul. Sink = cube; the matmul waits on the vector prologue
+    // chain -> cube idle at t=0 -> fill ADDS (2-stage). t3 = boundary matmul operand.
+    {
+        auto fr = absorbed({sq, sq, sq, sq, sq},
+                           {{OT::Pointwise, {0}, {1}}, {OT::Pointwise, {1}, {2}}, {OT::MatMul, {2, 3}, {4}}},
+                           {0, 1, 2});
+        CHECK("MIXSTAGE: v->v->c feasible", fr.feasible);
+        CHECK("MIXSTAGE: v->v->c pays 2-stage fill (not absorbed)", !fr.pipeline_fill_absorbed);
+    }
+    // v->c->v : PW -> MatMul -> PW. Sink = vector; the PROLOGUE pw reads boundary inputs
+    // and runs at t=0 (an earlier vector stage) -> fill ABSORBED (3-stage). t2 = boundary
+    // matmul operand.
+    {
+        auto fr = absorbed({sq, sq, sq, sq, sq},
+                           {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}, {OT::Pointwise, {3}, {4}}},
+                           {0, 1, 2});
+        CHECK("MIXSTAGE: v->c->v feasible", fr.feasible);
+        CHECK("MIXSTAGE: v->c->v absorbs fill (prologue vector runs at t=0)",
+              fr.pipeline_fill_absorbed);
+    }
+    // c->v->c : MatMul -> PW -> MatMul. Sink = cube; the FIRST matmul reads boundary
+    // inputs and runs at t=0 (an earlier cube stage) -> fill ABSORBED (3-stage). t4 =
+    // boundary second-matmul operand.
+    {
+        auto fr = absorbed({sq, sq, sq, sq, sq, sq},
+                           {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}, {OT::MatMul, {3, 4}, {5}}},
+                           {0, 1, 2});
+        CHECK("MIXSTAGE: c->v->c feasible", fr.feasible);
+        CHECK("MIXSTAGE: c->v->c absorbs fill (first matmul runs at t=0)",
+              fr.pipeline_fill_absorbed);
     }
 }
 
@@ -1689,6 +1760,7 @@ int main() {
     test_cube_vector_fusion();
     test_mixed_unit_tiling();
     test_mixed_mm_pw_variants();
+    test_mixed_pipeline_stages();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
     test_dfs_order();

@@ -1830,8 +1830,12 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   result.feasible = true;
 
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
-  const int num_tw = std::max((int)(out_W_ / cfg.w), 1);
-  const int num_th = std::max((int)(out_H_ / cfg.h), 1);
+  // Grid mode (parts_m/parts_n > 0) fixes the tile count directly: cfg.w/cfg.h are
+  // the big-region EXTENTS, not exact divisors, so out_W_/cfg.w would mis-floor the
+  // count. Mirrors the base cube path (Ascend910BCost::compute_cost); uniform/ad-hoc
+  // tiles (parts_* == 0, a directly-built TileConfig) fall back to the divide.
+  const int num_tw = (cfg.parts_n > 0) ? (int)cfg.parts_n : std::max((int)(out_W_ / cfg.w), 1);
+  const int num_th = (cfg.parts_m > 0) ? (int)cfg.parts_m : std::max((int)(out_H_ / cfg.h), 1);
   const int num_tiles = num_tw * num_th;
   result.num_spatial_tiles = num_tiles;
   result.num_k_passes = std::max((int)(output_K_ / cfg.k), 1);
@@ -1951,15 +1955,37 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // charges an imbalanced fusion only one TINY non-bottleneck tile (a matmul + small epilogue is
   // NOT over-charged a full cube tile). A 3-stage kernel (v->c->v, c->v->c) has the output unit
   // busy from t=0 (it runs an earlier stage), so there is no idle end — plain max.
-  // Detection: the sink op = producer of the single boundary output; output_is_cube = it is a
-  // MatMul; the output unit runs only the output op iff it has exactly one op in ops_.
+  // Detection: the sink unit is the producing unit of the boundary output (output_is_cube =
+  // it is a MatMul). The fill is ABSORBED (3-stage, plain max) iff the sink unit can run at
+  // t=0 — i.e. it has an "early stage" op whose whole input cone is same-unit + boundary,
+  // independent of the opposite unit (the v-prologue of v->c->v, the first matmul of c->v->c).
+  // Otherwise EVERY sink-unit op transitively waits on the opposite unit, so the sink idles
+  // one opposite tile before starting and the fill ADDS (2-stage). Counting sink-unit ops is
+  // NOT sufficient: a same-unit tail (c->v->v) has >1 sink op yet still idles at t=0. We flag
+  // each op whose input cone touches the opposite unit (single forward-topo pass, producers
+  // before consumers via reverse_topo_ops_), then look for a sink-unit op that does not.
   bool output_is_cube = false;
   for (const auto& info : boundary_tensor_info_)
     if (info.is_boundary_out) { output_is_cube = info.is_mm_out; break; }
-  int output_unit_op_count = 0;
+  auto is_sink_unit = [&](size_t i) {
+    return (prob_->ops[i].type == OpType::MatMul) == output_is_cube;
+  };
+  FlatSet<size_t> reaches_opp;  // ops whose input cone (incl. self) touches the opposite unit
+  for (auto it = reverse_topo_ops_.rbegin(); it != reverse_topo_ops_.rend(); ++it) {
+    const size_t i = *it;
+    bool touches = !is_sink_unit(i);  // op i itself runs on the opposite unit
+    if (!touches)
+      for (auto t : prob_->ops[i].inputs) {
+        const int prod = dag_->tensor_producer[t];
+        if (prod >= 0 && reaches_opp.count((size_t)prod)) { touches = true; break; }
+      }
+    if (touches) reaches_opp.insert(i);
+  }
+  bool sink_runs_early_stage = false;
   for (auto i : ops_)
-    if ((prob_->ops[i].type == OpType::MatMul) == output_is_cube) output_unit_op_count++;
-  const bool two_stage = (output_unit_op_count == 1);
+    if (is_sink_unit(i) && !reaches_opp.count(i)) { sink_runs_early_stage = true; break; }
+  const bool two_stage = !sink_runs_early_stage;
+  result.pipeline_fill_absorbed = !two_stage;  // 3-stage folds the fill into the max
   result.latency = two_stage
       ? std::max({cube_stage + one_vec_tile, vec_stage + one_cube_tile, ddr_lat})
       : std::max({cube_stage, vec_stage, ddr_lat});

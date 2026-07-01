@@ -247,4 +247,10 @@ struct CostResult {
                                  // ports are asymmetric (441 vs 220.5), so among reload-equal
                                  // transposed tiles the lower-extract (TALL) tile wins.
                                  // Perf-sim-driven (pto-isa gml1_decision); device eval pending.
+    bool pipeline_fill_absorbed = false;  // MIXED kernels only: the cube||vector pipeline
+                                 // fill/drain. false = 2-stage (the sink unit is idle at t=0,
+                                 // so the wall adds one non-bottleneck tile: c->v, v->c, c->v->v,
+                                 // v->v->c). true = 3-stage (the sink unit runs an earlier stage
+                                 // from t=0, so the fill is absorbed into the max: v->c->v,
+                                 // c->v->c). Grounded by mixed_tile_study's shape sweep.
 };
