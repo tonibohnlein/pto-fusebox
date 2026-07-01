@@ -355,8 +355,18 @@ ports** (not `2×` summed onto one). Fusion does **not** make it free — it sti
 the HBM ceiling: `port_lat = bytes · cyc_per_byte / par(eff_units, peak)` — the **same `par()`**
 the cube/vector paths use (§3, §7). Grounded by **`mixed_ddr_bound`** (single-core GM subsumed
 into the per-unit stages — `max(cube,vec,ddr) == max(cube,vec)` across a K-sweep) and
-**`mixed_contention`** (multi-core: cube `GM→L1` + vector `GM→UB` reads share one 900 GiB/s
-pool, both collapsing to `900/B`, matching `par()` to **0%**).
+**`mixed_contention`** (multi-core: the cube `GM→L1` and vector `GM→UB` **read** ports are each
+throttled to `min(peak, 900/B)` by the shared HBM read ceiling — a per-port **rate** cap, not a
+summed byte budget — both collapsing to `900/B` past the knee, matching `par()` to **0%**).
+
+**Scope of the four-port `max` (two untested corners).** (i) `mixed_contention` validates
+**read↔read** pooling only (`GM→L1` + `GM→UB`); the write ports (`L0C→GM`, `UB→GM`) and
+read↔write overlap follow the *same* per-port `par()` model but are **untested** — if real HBM
+shares R/W bandwidth, a write-heavy *and* read-heavy mixed kernel could under-count. (ii) mixed
+`GM↔UB` traffic assumes **wide** vector tiles: unlike §7 it does **not** apply the DMA-shape
+penalty (`max(1, vec_reg_bytes / (w·dtype_bytes))`), so a narrow-tile mixed epilogue is
+under-charged on those two ports. Both are second-order for the balanced tiles the partitioner
+emits; revisit with a write-contention experiment / a narrow-tile mixed sweep.
 
 **Fusion economics (910B).** Fusion saves the **overlap** (`max` vs the separated `cube + vec`)
 and one kernel launch — **not** the DDR (the intermediate round-trips GM either way). So it
