@@ -243,6 +243,13 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   bool has_vector_ = false;   // group has ≥1 VECTOR (pointwise/reduction) op.
                               // has_matmul_ && has_vector_ ⇒ a MIXED kernel
                               // (allowed only when Problem::fuse_cube_vector).
+  // Max cube↔vector unit ALTERNATIONS along any dependency path in the group.
+  // The mixed model's `max` overlap is the SKEWED cost, valid only for a single
+  // round-trip: depth ≤ 2 (the 4 canonical shapes c→v / v→c / v→c→v / c→v→c;
+  // #1900's depth-2 buffers cap the validated skew). Deeper multi-round-trips
+  // demote to Sequential, so create() REJECTS them (depth > 2) and compute_cost
+  // asserts the survivor is ≤ 2. 0 for a homogeneous group.
+  int mixed_round_trip_depth_ = 0;
   // 910B reduction (vector): a Reduction couples its reduced axis (the whole
   // row/col must be present to reduce it), so the tile spans the FULL reduced
   // dim and only the non-reduced dim is tiled for spatial parallelism. The

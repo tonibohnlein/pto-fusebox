@@ -1073,6 +1073,63 @@ static void test_mixed_pipeline_stages() {
         CHECK("MIXSTAGE: c->v->c absorbs fill (first matmul runs at t=0)",
               fr.pipeline_fill_absorbed);
     }
+    // c->v->c->v : a depth-3 multi-round-trip. The `max` overlap is the SKEWED cost,
+    // valid only for a single round-trip (depth <= 2); a depth-3 chain demotes to
+    // sequential, so the admission gate REJECTS it (create -> nullopt -> infeasible)
+    // and the partitioner cuts it into separate kernels. Guards the skewability gate.
+    {
+        auto fr = absorbed({sq, sq, sq, sq, sq, sq, sq},
+                           {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}},
+                            {OT::MatMul, {3, 4}, {5}}, {OT::Pointwise, {5}, {6}}},
+                           {0, 1, 2, 3});
+        CHECK("MIXSTAGE: c->v->c->v (depth 3) rejected as non-skewable", !fr.feasible);
+    }
+}
+
+// Sink split-K in a mixed kernel. The sink matmul splits its contraction across idle
+// CUBE cores — atomic-add partials with no merge barrier, so the cores stay independent
+// (exactly the base cube split-K; the vector overlaps orthogonally). ONLY the sink is
+// ever split, and only when it is the SOLE matmul: a vector-sink (c->v) does not split,
+// nor does a multi-matmul cube sink (c->v->c). A small output (few tiles) leaves idle
+// cube cores for a large-K sink to recruit.
+static void test_mixed_sink_split_k() {
+    std::cout << "[MIXSPLIT] cube-sink mixed kernel split-Ks the sole sink matmul\n";
+    auto run = [&](std::vector<Tensor> ts, std::vector<Op> ops, std::vector<size_t> grp, int64_t cc) {
+        Problem p; p.tensors = std::move(ts); p.ops = std::move(ops);
+        p.fast_memory_capacity = 1 << 26; set_910b(p, cc);
+        DAG dag = DAG::build(p);
+        auto m = Ascend910BMixed::create(p, dag, std::move(grp));
+        return m ? m->best_cost() : CostResult{};
+    };
+    using OT = OpType;
+    // v->c: PW prologue on the matmul LHS -> matmul SINK. Output [N=256, M=64] is few
+    // tiles, so idle cube cores; the sole sink matmul split-Ks across them.
+    {
+        auto fr = run({{128, 64}, {128, 64}, {256, 128}, {256, 64}},  // A0 A1 B[N,K] C[N,M], K=128
+                      {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}}, {0, 1}, /*cc=*/256);
+        CHECK("MIXSPLIT: v->c feasible", fr.feasible);
+        CHECK("MIXSPLIT: v->c cube-sink split-Ks the idle cores", fr.parallel_split > 1);
+        CHECK("MIXSPLIT: v->c split recruits cube cores beyond spatial tiling",
+              fr.cores_used > 3 * fr.num_spatial_tiles);
+    }
+    // c->v: same matmul but a vector EPILOGUE (vector sink). The sink is not the matmul,
+    // so split-K is sink-only -> no split.
+    {
+        auto fr = run({{128, 64}, {256, 128}, {256, 64}, {256, 64}},  // A[K,M] B[N,K] C[N,M] D
+                      {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}}, {0, 1}, /*cc=*/256);
+        CHECK("MIXSPLIT: c->v feasible", fr.feasible);
+        CHECK("MIXSPLIT: c->v vector-sink does NOT split (sink-only)", fr.parallel_split == 1);
+    }
+    // c->v->c: cube sink but TWO matmuls. Only the sink may split, and the rule is
+    // single-matmul-only (splitting a mid-kernel matmul is never allowed) -> no split.
+    {
+        const Tensor sq{128, 128};
+        auto fr = run({sq, sq, sq, sq, sq, sq},
+                      {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}, {OT::MatMul, {3, 4}, {5}}},
+                      {0, 1, 2}, /*cc=*/256);
+        CHECK("MIXSPLIT: c->v->c feasible", fr.feasible);
+        CHECK("MIXSPLIT: c->v->c multi-matmul cube sink does NOT split", fr.parallel_split == 1);
+    }
 }
 
 // --- mixed feasibility: both pools STREAM to fit (cube seq-k, vector chunks) --
@@ -1761,6 +1818,7 @@ int main() {
     test_mixed_unit_tiling();
     test_mixed_mm_pw_variants();
     test_mixed_pipeline_stages();
+    test_mixed_sink_split_k();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
     test_dfs_order();

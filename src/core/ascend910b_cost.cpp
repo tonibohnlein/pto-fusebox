@@ -260,6 +260,33 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // shared compute_cost mixed branch, reached only when one is actually built.
     if (has_cube && has_vector && !allow_mixed)
       return std::nullopt;                                      // no cube↔vector fusion
+    // Skewability gate (mixed only): the mixed cost credits the cube∥vector OVERLAP
+    // (`max`), which is the SKEWED cost. Only single-round-trip shapes skew — the 4
+    // canonical c→v / v→c / v→c→v / c→v→c, i.e. ≤ 2 unit alternations along any
+    // dependency path (#1900's depth-2 per-stage buffers cap the validated skew). A
+    // deeper multi-round-trip (c→v→c→v, …) demotes to Sequential (up to 2.26× the max,
+    // grounded by mixed_serial), so `max` would OVER-credit it — the solver could pick a
+    // fusion far slower than the separated config it rejects. Reject here so the
+    // partitioner cuts it into separate kernels rather than one over-credited mixed group.
+    if (has_cube && has_vector) {  // allow_mixed is true here (else returned above)
+      std::vector<int> alt_depth(num_ops, 0);
+      int max_alt = 0;
+      for (size_t i : dag.topological_order()) {
+        if (!is_in_sg[i]) continue;
+        const bool i_cube = prob.ops[i].type == OpType::MatMul;
+        int d = 0;
+        for (auto t : prob.ops[i].inputs) {
+          const int prod = dag.tensor_producer[t];
+          if (prod < 0 || !is_in_sg[(size_t)prod]) continue;  // boundary input — no crossing
+          const bool p_cube = prob.ops[(size_t)prod].type == OpType::MatMul;
+          d = std::max(d, alt_depth[(size_t)prod] + (p_cube != i_cube ? 1 : 0));
+        }
+        alt_depth[i] = d;
+        max_alt = std::max(max_alt, d);
+      }
+      sg.mixed_round_trip_depth_ = max_alt;
+      if (max_alt > 2) return std::nullopt;  // multi-round-trip → not skewable, force a cut
+    }
     if (has_opaque && sg.ops_.size() > 1) return std::nullopt;  // Opaque is a barrier
     // Reduced-axis homogeneity: a subgraph may not fuse reductions on DIFFERENT
     // axes (a width-reduction AND a height-reduction). A single unified tile is
@@ -1828,6 +1855,11 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
     return result;
   result.feasible = true;
+  // The `max` overlap below is the SKEWED cost — valid only for a single round-trip.
+  // create() rejects deeper multi-round-trips (mixed_round_trip_depth_ > 2); fail loud
+  // if one slips through, rather than silently over-crediting a non-skewable group.
+  assert(mixed_round_trip_depth_ <= 2 &&
+         "mixed cost requires a skewable (<=2 round-trip) group");
 
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
   // Grid mode (parts_m/parts_n > 0) fixes the tile count directly: cfg.w/cfg.h are
@@ -1928,23 +1960,18 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
                            ? hbm / peak_gibps : std::numeric_limits<double>::infinity();
     return std::max(1.0, std::min(active, cap));
   };
-  // Each port -> cycles at its own cyc/byte (GM->L1 reload, GM->UB ub_in, L0C->GM
-  // store, UB->GM ub_out — the same per-direction fields the base cube/vector paths
-  // use) and its own per-unit peak, divided by par(). The four ports are independent
-  // pipes that OVERLAP, so ddr_lat = MAX over them (grounded: mixed_contention par
-  // matches sim 0% / mixed_ddr_bound).
-  const double gm_l1_lat  = gm_l1_bytes  * bc.reload / par(eff_units, prob_->bw_gm_l1);
-  const double gm_ub_lat  = gm_ub_bytes  * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
-  const double l0c_gm_lat = l0c_gm_bytes * bc.store  / par(eff_units, prob_->bw_l0c_gm);
-  const double ub_gm_lat  = ub_gm_bytes  * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
-  const double ddr_lat = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
-
-  // Cube stage = max(MACs, L1->L0 extract) — the same double-buffered hierarchy
-  // as the homogeneous cube path. The vector stage runs on 2 cores per unit.
-  const double cube_stage = std::max(cube_mac, cube_extract) / eff_units;
-  const double vec_stage  = vector_compute / (2.0 * eff_units);
-  const double one_cube_tile = std::max(cube_mac, cube_extract) / (double)num_tiles;
-  const double one_vec_tile  = vector_compute / (2.0 * (double)num_tiles);
+  // Each port -> cycles at its own cyc/byte (GM->L1 reload, GM->UB ub_in, L0C->GM store,
+  // UB->GM ub_out) and its own per-unit peak, divided by par(). The four ports OVERLAP,
+  // so ddr_lat = MAX over them (grounded: mixed_contention / mixed_ddr_bound). The VECTOR
+  // ports + stage are split-K-INVARIANT (a sink split-K recruits CUBE cores only); the
+  // cube ports, cube_stage, and ddr are recomputed per split factor S in eval_S below.
+  const double gm_ub_lat = gm_ub_bytes * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
+  const double ub_gm_lat = ub_gm_bytes * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
+  // Vector stage runs on 2 cores per unit. Cube work = max(MACs, L1->L0 extract) — the
+  // same double-buffered hierarchy as the homogeneous cube path.
+  const double vec_stage      = vector_compute / (2.0 * eff_units);
+  const double one_vec_tile   = vector_compute / (2.0 * (double)num_tiles);
+  const double base_cube_work = std::max(cube_mac, cube_extract);
 
   // Pipeline wall (grounded EXACTLY by mixed_tile_study, the shape sweep). The cube and
   // vector units OVERLAP. In a 2-stage kernel (c->v or v->c) the output unit runs ONLY the
@@ -1986,13 +2013,48 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     if (is_sink_unit(i) && !reaches_opp.count(i)) { sink_runs_early_stage = true; break; }
   const bool two_stage = !sink_runs_early_stage;
   result.pipeline_fill_absorbed = !two_stage;  // 3-stage folds the fill into the max
-  result.latency = two_stage
-      ? std::max({cube_stage + one_vec_tile, vec_stage + one_cube_tile, ddr_lat})
-      : std::max({cube_stage, vec_stage, ddr_lat});
-  result.parallel_split = 1;
-  result.cores_used    = (int)(3.0 * eff_units);  // 1 cube + 2 vector per unit
-  result.compute_bound = std::max(cube_stage, vec_stage) >= ddr_lat;
-  result.ddr_traffic   = ddr_lat;
+
+  // Sink split-K (cube-sink, SINGLE matmul only). The sink matmul may split its
+  // contraction across idle CUBE cores — atomic-add partials with NO merge barrier, so
+  // the cores stay independent (exactly the base cube split-K; the vector prologue
+  // overlaps orthogonally). Restricted to a single-matmul cube sink (v->c, v->v->c) so
+  // ONLY the sink is ever split — never a mid-kernel matmul. split-K recruits cube cores
+  // (eff_cube = min(num_tiles*S, n_units)) and grows the output write-back to S atomic
+  // partials on L0C->GM; the vector stage/ports are untouched. S=1 == the spatial-only
+  // cost, so a non-splittable kernel is unchanged and a split is taken only when it wins.
+  int num_matmuls = 0;
+  for (auto i : ops_) if (prob_->ops[i].type == OpType::MatMul) num_matmuls++;
+  const bool can_split = output_is_cube && num_matmuls == 1;
+  const double sink_store_bytes = l0c_gm_bytes;  // single-matmul cube sink: L0C->GM == the sink store
+  struct MixEval { double wall, ddr, max_stage, eff_cube; };
+  auto eval_S = [&](int64_t S) -> MixEval {
+    const double eff_cube = std::min((double)num_tiles * (double)S, n_units);
+    const double cube_stage = base_cube_work / eff_cube;
+    const double one_cube_tile = (base_cube_work / (double)num_tiles) / std::min((double)S, n_units);
+    const double gm_l1_lat  = gm_l1_bytes * bc.reload / par(eff_cube, prob_->bw_gm_l1);
+    const double l0c_gm_lat = (l0c_gm_bytes + (double)(S - 1) * sink_store_bytes) * bc.store
+                              / par(eff_cube, prob_->bw_l0c_gm);
+    const double ddr = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
+    const double wall = two_stage
+        ? std::max({cube_stage + one_vec_tile, vec_stage + one_cube_tile, ddr})
+        : std::max({cube_stage, vec_stage, ddr});
+    return {wall, ddr, std::max(cube_stage, vec_stage), eff_cube};
+  };
+  MixEval best = eval_S(1);
+  int64_t best_S = 1;
+  if (can_split) {
+    const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
+    for (int64_t S : all_divisors(kfrac)) {
+      if (S < 2 || output_K_ / S < 32) continue;  // need >=2 K-fractals/partial to ping-pong
+      const MixEval e = eval_S(S);
+      if (e.wall < best.wall - 1e-9) { best = e; best_S = S; }
+    }
+  }
+  result.latency        = best.wall;
+  result.ddr_traffic    = best.ddr;
+  result.compute_bound  = best.max_stage >= best.ddr;
+  result.parallel_split = (int)best_S;
+  result.cores_used     = (int)(best.eff_cube + 2.0 * eff_units);  // cube (split) + 2 vector/tile
 
   // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)) — the per-LAUNCH
   // fill, a separate concern from the pipeline term above.

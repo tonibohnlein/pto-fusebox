@@ -371,8 +371,16 @@ emits; revisit with a write-contention experiment / a narrow-tile mixed sweep.
 **Fusion economics (910B).** Fusion saves the **overlap** (`max` vs the separated `cube + vec`)
 and one kernel launch — **not** the DDR (the intermediate round-trips GM either way). So it
 wins when the vector work is substantial or the kernel is memory-bound, and is neutral-to-losing
-for a compute-bound matmul with a trivial epilogue (small overlap saving; the separated cube can
-split-K, the mixed does not — `parallel_split = 1`).
+for a compute-bound matmul with a trivial epilogue (small overlap saving).
+
+**Sink split-K (cube sink, single matmul).** When the sink IS the matmul (`v→c`, `v→v→c`) it may
+split-K exactly like the separated cube: split the contraction across idle cube cores, atomic-add
+`S` partials (no merge barrier — the cores stay independent), the vector prologue overlapping
+orthogonally. So `parallel_split ≥ 1` for a single-matmul cube sink; the sweep recruits
+`eff_cube = min(num_tiles·S, num_cube_cores)` cores and grows the L0C→GM write-back to `S`
+partials, `S=1` reproducing the spatial-only cost. Split-K stays **off** (`= 1`) for a **vector
+sink** (`c→v` — the epilogue needs the fully-reduced C, so the matmul is never the sink) and for a
+**multi-matmul** cube sink (`c→v→c` — only the sink may split, never a mid-kernel matmul).
 
 ---
 
@@ -459,6 +467,6 @@ Among equal-latency configs, lexicographic:
 | grid candidates (triples, granularity) | `Ascend910BCost::create` (`gen_grid`, `grid_gran_*`) |
 | cube roofline + split-K + Phase D | `Ascend910BCost::compute_cost` (matmul branch) |
 | vector roofline + double-buffer floor + reduced split | `compute_cost` (vector branch) |
-| mixed roofline (overlap max + symmetric fill + 4-port par ddr) | `Ascend910BMixed::compute_cost` |
+| mixed roofline (overlap max + symmetric fill + 4-port par ddr + cube-sink split-K) | `Ascend910BMixed::compute_cost` |
 | feasibility | `derive_exec` / `cube_peak_l1` / `vector_stream` (mixed: both) |
 | enumeration + tiebreak | `Ascend910BCost::best_cost` |
