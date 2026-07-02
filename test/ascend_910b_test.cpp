@@ -1132,6 +1132,45 @@ static void test_mixed_sink_split_k() {
     }
 }
 
+// A single-tile kernel has no second tile to skew against, so even a 3-stage shape
+// (whose fill is normally ABSORBED) pays the un-overlapped SUM at one tile -- the
+// mixed_tile_study NT=1 row measured overlap_factor 0.00. This guards the num_tiles>=2
+// fill gate: without it, a single-tile 3-stage kernel is credited full overlap (the plain
+// max), which the sim contradicts and which biases the solver toward the low-batch
+// flash-decode corner. We compare a balanced compute-bound c->v->c (MM -> PW*16 -> MM) at
+// one tile vs two tiles: the WALL (latency minus the per-launch fill) ratio is ~3.3 (the
+// single tile is the sum), whereas the old plain-max gave exactly 2.0 (pure tiling).
+static void test_mixed_single_tile_no_skew() {
+    std::cout << "[MIXNT1] single-tile 3-stage kernel pays the un-overlapped sum\n";
+    const Tensor sq{128, 128};
+    const int P = 16;  // pointwise chain length: balances vec_stage against the two matmuls
+    Problem p;
+    p.tensors.assign(P + 5, sq);  // MM1{0,1}->2 ; PW chain 2->..->(2+P) ; sink MM2{(2+P),(3+P)}->(4+P)
+    p.ops.push_back({OpType::MatMul, {0, 1}, {2}});
+    for (int i = 0; i < P; ++i) p.ops.push_back({OpType::Pointwise, {(size_t)(2 + i)}, {(size_t)(3 + i)}});
+    p.ops.push_back({OpType::MatMul, {(size_t)(2 + P), (size_t)(3 + P)}, {(size_t)(4 + P)}});
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p, /*cc=*/1);  // low compute multiplier so the matmuls don't dwarf the vector
+    DAG dag = DAG::build(p);
+    std::vector<size_t> grp;
+    for (size_t i = 0; i < p.ops.size(); ++i) grp.push_back(i);
+    auto m = Ascend910BMixed::create(p, dag, grp);
+    auto wall = [&](TileConfig cfg) {
+        auto fr = m->compute_cost(cfg, {}, {});
+        const int r = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
+        return std::make_pair(fr, fr.latency - (double)r * (double)p.kernel_fill_cost);  // pipeline wall
+    };
+    auto [f1, w1] = wall(TileConfig{128, 128, 128});  // one output tile
+    auto [f2, w2] = wall(TileConfig{128, 64, 128});   // two output tiles
+    CHECK("MIXNT1: single tile is feasible, 3-stage, compute-bound",
+          f1.feasible && f1.pipeline_fill_absorbed && f1.compute_bound && f1.num_spatial_tiles == 1);
+    CHECK("MIXNT1: two-tile config is feasible with 2 tiles", f2.feasible && f2.num_spatial_tiles == 2);
+    // The single tile is charged the un-overlapped sum (cube+vec), so wall1/wall2 > 2.0 (the
+    // plain-max pure-tiling ratio the old code gave); ~3.3 here. Threshold 2.3 leaves margin.
+    CHECK("MIXNT1: single-tile wall is the un-overlapped sum (ratio > 2.3, not the 2.0 plain-max)",
+          w1 > 2.3 * w2);
+}
+
 // --- mixed feasibility: both pools STREAM to fit (cube seq-k, vector chunks) --
 // A fused MM->PW needs both pools, but each streams to fit like its homogeneous
 // counterpart: the cube seq-k-slices the contraction to fit L1, and the vector
@@ -1819,6 +1858,7 @@ int main() {
     test_mixed_mm_pw_variants();
     test_mixed_pipeline_stages();
     test_mixed_sink_split_k();
+    test_mixed_single_tile_no_skew();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
     test_dfs_order();

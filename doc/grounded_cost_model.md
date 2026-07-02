@@ -321,7 +321,12 @@ producer skew), so the wall is a `max`, not a sum. **Every single-round-trip sha
 `c→v` (epilogue), `v→c` (prologue), `v→c→v`, `c→v→c` (flash-decode — #1900's depth-2 per-stage
 buffers let its two cube matmuls pipeline). A `max` is wrong only for a genuine cross-tile
 **carry** or a **multi**-round-trip loop (the skew demotes those to Sequential = the sum, and
-worse) — shapes the partitioner does not form, so the model keeps the `max`. `vec_stage` pools
+worse). The **multi-round-trip** case is excluded at admission — `create()` rejects a group
+whose cube↔vector alternation depth exceeds 2 (the exact dual of the emit's `num_tpush!=1`
+demote), so it never reaches this cost. The **tile-carry** case needs no separate guard: a
+cross-tile reduction carry is prevented by the reduced-axis pinning in the tiling (§6) and, for
+a split-K merge, priced as atomic-add traffic — so the `max` is only ever applied to genuinely
+skewable groups. `vec_stage` pools
 **all** Pointwise/Reduction ops (a `v→c→v`'s prologue *and* epilogue run on the same AIV pool).
 
 **The symmetric fill (grounded: shape sweep `mixed_vcv`/`vc`/`cvc`).** A 2-stage wall is the
@@ -337,6 +342,15 @@ the fill is absorbed iff the sink unit (the boundary output's producing unit, `i
 an *early-stage* op whose input cone is same-unit + boundary — independent of the opposite unit
 (a `v→c→v` prologue, a `c→v→c` first matmul). Counting sink-unit ops is wrong: a same-unit tail
 (`c→v→v`) has >1 sink op yet still idles at `t=0`, so it pays the 2-stage fill.
+
+Absorption additionally requires **`num_tiles >= 2`**: a single tile has no second tile to skew
+against (the sweep's `NTILES=1` row measures `overlap_factor 0.00`), so a 3-stage kernel there
+takes the cross-term too — which at one tile collapses to the sequential sum `cube_stage +
+vec_stage`. This matters for the low-batch flash-decode corner (whole output as one tile), which
+the plain `max` would otherwise credit full overlap the hardware runs serially. *Mid-band
+caveat:* `one_*_tile` does not shrink while `rounds == 1`, so partial overlap between 2 and
+`num_cube_cores` tiles is slightly over-credited when compute-bound — a bounded level-1
+imprecision; only the unambiguous, sim-contradicted `NTILES=1` case is corrected.
 
 **Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
 pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed
@@ -448,9 +462,19 @@ Among equal-latency configs, lexicographic:
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
   tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
   shape *is* now cost-driven, via §7.)
-- **Emit gap (downstream).** The solver chooses grids and split-K; the AutoFuse
-  cube **emit** does not yet realize split-K for a lone matmul. Solver-side
-  complete; this is Phase-C codegen work, independent of the cost model.
+- **Split-K is model-ahead of the emit (base *and* mixed).** The solver credits
+  `parallel_split > 1` for a lone matmul and a single-matmul cube sink (`v→c`), but the
+  AutoFuse auto-emit realizes neither yet (mixed cube-sink split-K = net-new emit work:
+  fuse a vector prologue with a split-K matmul). Kept model-ahead deliberately; since the
+  model does not drive live lowering today it is a shared emit-TODO, not a bug — one
+  Problem-level buildable flag (default `S=1`) would gate base+mixed together when Phase-C lands.
+- **Mixed cube stage — makespan & floors.** (a) The double-buffer floor is now ported from
+  §3: a thin-K cube (`output_K/S < 32`) serializes compute with its GM reload. (b) A
+  non-uniform grid still divides by the average `eff_units`, not the base `LptMakespan`
+  (busiest core), so an imbalanced grid under-predicts by up to one block (~2× only at one
+  region/core) — routing `cube_stage` through the LPT/wave machinery is the fix. (c) A
+  matmul→reduction sink gets neither cube split-K (matmul-sink-gated) nor the §6 reduced-axis
+  split, so few-row reductions under-fill. Documented scope.
 
 ---
 

@@ -2035,9 +2035,20 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     const double l0c_gm_lat = (l0c_gm_bytes + (double)(S - 1) * sink_store_bytes) * bc.store
                               / par(eff_cube, prob_->bw_l0c_gm);
     const double ddr = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
-    const double wall = two_stage
-        ? std::max({cube_stage + one_vec_tile, vec_stage + one_cube_tile, ddr})
-        : std::max({cube_stage, vec_stage, ddr});
+    // Double-buffer floor (ported from the base cube path's db_roofline): the cube compute
+    // hides its GM reload only with >=2 K-fractals per core (per_core_K = output_K_/S >= 32).
+    // A thin-K matmul can't ping-pong, so compute SERIALIZES with the cube's GM ports
+    // max(feed, write) -- matching the base and the emit's implicit halving. K>=32 => no-op.
+    const double cube_dram = std::max(gm_l1_lat, l0c_gm_lat);
+    const bool cube_db = output_K_ <= 1 || (output_K_ / std::max<int64_t>(1, S)) >= 32;
+    const double cube_wall = cube_db ? cube_stage : cube_stage + cube_dram;
+    // A single-tile kernel has nothing to skew against (mixed_tile_study NT=1: overlap_factor
+    // 0.00), so a 3-stage fill is NOT absorbed there -- take the symmetric cross-term, which at
+    // num_tiles==1 collapses to the sequential sum (cube+vec). Absorb (plain max) only NT>=2.
+    const bool overlap_ok = !two_stage && num_tiles >= 2;
+    const double wall = overlap_ok
+        ? std::max({cube_wall, vec_stage, ddr})
+        : std::max({cube_wall + one_vec_tile, vec_stage + one_cube_tile, ddr});
     return {wall, ddr, std::max(cube_stage, vec_stage), eff_cube};
   };
   MixEval best = eval_S(1);
