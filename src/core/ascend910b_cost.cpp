@@ -1973,21 +1973,34 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   const double gm_ub_lat = gm_ub_bytes * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
   const double ub_gm_lat = ub_gm_bytes * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
   // Compute distribution: the LPT makespan over the non-uniform grid regions (the BUSIEST
-  // core), mirroring the base cube path — NOT the flat total/eff_units average, which
-  // under-predicts an imbalanced grid's biggest region (up to ~2x at one region/core, the
-  // few-tile decode corner). Region work ~ the region's output-area fraction (cube MAC/extract
-  // and vector cost both scale with the tiled M*N). Uniform tiles (parts==0; ad-hoc/test) use
-  // the wave-aware makespan. eff_units/eff_cube (active cores) still set the HBM par() + count.
-  const double base_cube_work = std::max(cube_mac, cube_extract);  // MACs vs L1->L0 extract
+  // unit), NOT the flat total/eff_units average, which under-predicts an imbalanced grid's
+  // biggest region (up to ~2x at one region/unit, the few-tile decode corner). The CUBE region
+  // work is recomputed PER REGION — max(Σ MAC, Σ extract) at the region extent — so it captures
+  // the fractal/extract padding non-linearity (the per-region ceil) and lets extract vs MAC
+  // dominate region-to-region, matching the mixed cube stage's own max(mac,extract) model. The
+  // VECTOR region work is an output-area fraction (a documented vector-region approximation;
+  // VecOpCompute is op-tensor-coupled, so a region-aware helper is a separate follow-up).
+  // Uniform tiles (parts==0; ad-hoc/test) use the wave-aware total; eff_units/eff_cube (active
+  // cores) still set the HBM par() + count.
+  const double base_cube_work = std::max(cube_mac, cube_extract);  // MACs vs extract (total)
   const bool grid_mode = cfg.parts_m > 0;
   const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m), grid_gran_h_);
   const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n), grid_gran_w_);
   const double out_area = (double)std::max<int64_t>(1, out_H_ * out_W_);
   auto cube_region_work = [&](int64_t m_ext, int64_t n_ext) {
-    return base_cube_work * ((double)(m_ext * n_ext) / out_area);
+    double rmac = 0.0, rext = 0.0;  // per-region recompute: fractal padding + local extract/MAC max
+    for (auto i : ops_) {
+      const auto& op = prob_->ops[i];
+      if (op.type != OpType::MatMul) continue;
+      const int64_t Ko = prob_->tensors[op.inputs[0]].width;
+      const DType dt = prob_->tensors[op.output()].dtype;
+      rmac += CubeMacCycles(prob_, m_ext, n_ext, Ko, dt);
+      rext += CubeExtractCycles(prob_, bc, m_ext, n_ext, Ko, dt);
+    }
+    return std::max(rmac, rext);
   };
   auto vec_region_work = [&](int64_t m_ext, int64_t n_ext) {
-    return vector_compute * ((double)(m_ext * n_ext) / out_area);
+    return vector_compute * ((double)(m_ext * n_ext) / out_area);  // area-fraction (approximation)
   };
   // Vector stage runs on 2 cores per unit (split-K-invariant: a sink split-K recruits CUBE
   // cores only). Makespan over the grid, then halved across the unit's 2 AIV cores.

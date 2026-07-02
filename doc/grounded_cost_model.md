@@ -467,15 +467,16 @@ Among equal-latency configs, lexicographic:
   AutoFuse auto-emit does not realize yet. `Problem::allow_model_ahead_split_k` gates it: `true`
   (default) credits the split; `false` forces `S=1` for **both** base and mixed, so `best_cost`
   never picks an unemittable split (`CostResult::uses_model_ahead_split_k` flags one). Flip when Phase-C lands.
-- **Mixed cube stage — now makespan + floors.** The cube/vector stages route through the base
-  `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-core makespan, not the flat
+- **Mixed cube stage — makespan + floors.** The cube/vector stages route through the base
+  `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-unit makespan, not the flat
   `eff_units` average — so an imbalanced grid no longer under-predicts its biggest region, and the
   double-buffer floor is ported (a thin-K cube `output_K/S < 32` serializes compute with its GM
-  reload). *Precision follow-up:* the per-region work is an output-**area fraction**
-  (`base_cube_work · area/total`) — exact for a single matmul (MAC/extract ~ M·N·K) but an
-  approximation for multi-matmul groups (`c→v→c`) and extract/fractal-padding tails; factoring
-  the base path's per-region Phase-D `grid_region_work` into a shared helper would make it exact.
-  *Scope:* a matmul→reduction sink gets neither cube split-K (matmul-sink-gated) nor the §6
+  reload). The **cube** region work is recomputed per region — `max(Σ MAC, Σ extract)` at the
+  region extent — so it captures fractal/extract padding (the per-region `ceil`) and per-region
+  MAC-vs-extract; the **vector** region work stays an output-area fraction (a documented
+  approximation — a region-aware `VecOpCompute` is the follow-up). A multi-matmul group (`c→v→c`)
+  uses the sink region extent for every matmul — a bounded approximation. *Scope:* a
+  matmul→reduction sink gets neither cube split-K (matmul-sink-gated) nor the §6
   reduced-axis split, so few-row reductions under-fill.
 
 ---

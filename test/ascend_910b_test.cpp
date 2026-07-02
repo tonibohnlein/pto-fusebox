@@ -1201,6 +1201,36 @@ static void test_mixed_grid_makespan() {
           grid > 1.2 * (total / 2.0) && grid < total);
 }
 
+// The MULTI-MATMUL case (reviewer concern (b)): a c->v->c on a non-uniform grid exercises the
+// PER-REGION recompute of the cube stage. The region work is max(Σ MAC, Σ extract) recomputed at
+// each region extent, NOT base_cube_work * area_fraction, so the makespan is not just proportional
+// to output area: with two matmuls + fractal padding, the big [32]-region of a W=48->[32,16] grid
+// costs ~0.80 T (above the 0.67 T an area fraction would give), while a flat average charges T/2.
+static void test_mixed_grid_makespan_multimatmul() {
+    std::cout << "[MIXGRID2] non-uniform grid on a c->v->c uses the per-region cube recompute\n";
+    Problem p;
+    p.tensors = {{32, 32}, {32, 32}, {32, 32}, {32, 32}, {48, 32}, {48, 32}};
+    // MM1{0,1}->2 (C1[32,32]) ; PW{2}->3 ; MM2{3,4}->5 (C2[48,32], contraction N1=32) — out W=48
+    p.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::Pointwise, {2}, {3}}, {OpType::MatMul, {3, 4}, {5}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p, /*cc=*/256);  // compute-bound: the cube makespan drives the wall
+    DAG dag = DAG::build(p);
+    auto m = Ascend910BMixed::create(p, dag, {0, 1, 2});
+    auto wall = [&](TileConfig cfg) {
+        auto fr = m->compute_cost(cfg, {}, {});
+        const int r = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
+        return std::make_pair(fr, fr.latency - (double)r * (double)p.kernel_fill_cost);
+    };
+    auto [f1, total] = wall(TileConfig{48, 32, 32});          // whole output -> total cube work T
+    auto [fg, grid] = wall(TileConfig{32, 32, 32, 1, 2, 0});  // grid parts_n=2 -> [32,16] regions
+    CHECK("MIXGRID2: c->v->c single-tile + grid feasible, grid 2 tiles compute-bound",
+          f1.feasible && fg.feasible && fg.compute_bound && fg.num_spatial_tiles == 2);
+    // The per-region makespan exceeds BOTH the flat average (T/2) and the area fraction (2/3 T),
+    // and stays below the sequential total T.
+    CHECK("MIXGRID2: per-region makespan > area-fraction (imbalance not just proportional to area)",
+          grid > 0.72 * total && grid < total);
+}
+
 // Split-K (base lone matmul and mixed cube-sink) is MODEL-AHEAD of the AutoFuse emit. The
 // buildable flag Problem::allow_model_ahead_split_k gates it: default true (analytic) credits
 // parallel_split > 1; false (buildable) forces S=1 so best_cost never selects an unemittable
@@ -1934,6 +1964,7 @@ int main() {
     test_mixed_sink_split_k();
     test_mixed_single_tile_no_skew();
     test_mixed_grid_makespan();
+    test_mixed_grid_makespan_multimatmul();
     test_model_ahead_split_k_flag();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
