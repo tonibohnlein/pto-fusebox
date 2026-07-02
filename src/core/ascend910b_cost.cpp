@@ -860,7 +860,14 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         shared_m = false;
     if (shared_m) {
       const int64_t kfrac = std::max<int64_t>(1, sg.output_K_ / 16);
-      gen_grid(std::max<int64_t>(1, prob.num_cube_cores), Fm, Fn, all_divisors(kfrac));
+      // A mixed subgraph with a REDUCTION (fused flash-attention style: matmul -> softmax)
+      // must PIN the reduction's reduced axis spatially — the reduction consumes the full
+      // axis online, and splitting it across cores would need a cross-core merge with no
+      // mid-kernel sync. The matmul's OWN contraction rides seq-k / split-K, a separate axis
+      // (the tiling chooses it). Pure cube (reduced_axis_ == 0) is unchanged: pm=Fm, pn=Fn.
+      const int64_t pm = (sg.reduced_axis_ == 2) ? 1 : Fm;  // height reduced -> pin M (parts_m=1)
+      const int64_t pn = (sg.reduced_axis_ == 1) ? 1 : Fn;  // width  reduced -> pin N (parts_n=1)
+      gen_grid(std::max<int64_t>(1, prob.num_cube_cores), pm, pn, all_divisors(kfrac));
     }
   } else if (sg.has_vector_) {
     // Vector: tile the output across the AIV cores. A reduced axis cannot be
@@ -1898,6 +1905,23 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       const bool pw = op.type != OpType::Reduction;
       vector_compute += VecOpCompute(prob_, op, reduced_axis_, /*pw_stream_start=*/pw && !prev_pw);
       prev_pw = pw;
+    }
+  }
+  // Fix 2 (UB-overflow streaming surcharge — mirror the homogeneous vector path). A fused
+  // flash-attention kernel (matmul -> softmax) keeps the reduced (keys) axis resident and
+  // PINNED, but it usually overflows UB, so the schedule streams that axis in chunks ONLINE
+  // (pto_macro_fa_softmax): each element is touched once, so compute is NOT multiplied by
+  // #reductions+1 — the only surcharge is a thin per-chunk correction (re-paid vector startup +
+  // an O(ROWS) running max/sum rescale). Same formula as the vector-only branch.
+  if (has_reduction_) {
+    const double budget = (double)prob_->vec_capacity;
+    const double peak = (double)vector_peak_ub(cfg, retained_from_prev, retain_these);
+    if (budget > 0.0 && peak > budget) {
+      int reductions = 0;
+      for (auto i : ops_)
+        if (prob_->ops[i].type == OpType::Reduction) reductions++;
+      const double nchunks = std::ceil(peak / budget);
+      vector_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
     }
   }
 

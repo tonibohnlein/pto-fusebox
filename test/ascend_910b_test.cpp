@@ -1231,6 +1231,37 @@ static void test_mixed_grid_makespan_multimatmul() {
           grid > 0.72 * total && grid < total);
 }
 
+// Fused FLASH ATTENTION: a mixed QK->softmax kernel keeps the reduced (keys) axis RESIDENT and
+// PINNED (parts_n=1), tiling only the query axis. The [query_tile x keys] scores overflow UB, so
+// feasibility comes from ONLINE streaming of the keys axis (flash), not materialization -- a
+// reduction can be mid-kernel iff its reduced axis is not split across cores. The matmul's own
+// contraction rides seq-k, a separate axis. Guards the grid pinning (step 1) + the streaming
+// surcharge (step 3) that make this feasible AND correctly costed.
+static void test_mixed_flash_attention() {
+    std::cout << "[MIXFA] fused QK->softmax pins the reduced axis + streams online (flash attention)\n";
+    Problem p; int64_t d = 64, S = 2048, B = 128;   // Q@K^T -> softmax(over keys) ; d=64, S_kv=2048
+    p.tensors = {{d, B}, {S, d}, {S, B}, {1, B}, {S, B}, {1, B}, {S, B}, {d, S}, {d, B}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::Reduction, {2}, {3}},
+             {OpType::Pointwise, {2, 3}, {4}}, {OpType::Reduction, {4}, {5}},
+             {OpType::Pointwise, {4, 5}, {6}}, {OpType::MatMul, {6, 7}, {8}}};
+    p.fast_memory_capacity = 1LL << 30;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4});  // QK -> softmax (fused mixed)
+    CHECK("MIXFA: fused QK->softmax is admissible (mixed cube+vector)", (bool)sg);
+    auto fr = sg->best_cost();
+    CHECK("MIXFA: fused QK->softmax is feasible", fr.feasible && std::isfinite(fr.latency));
+    // keys = the reduced axis = width (S->1); the grid must PIN it (parts_n == 1) and tile only
+    // the query axis (parts_m > 1). Without step 1's pinning it split keys -> infeasible.
+    CHECK("MIXFA: reduced (keys) axis pinned (parts_n==1), queries tiled (parts_m>1)",
+          fr.config.parts_n == 1 && fr.config.parts_m > 1);
+    // Feasibility is via STREAMING: the materialized scores overflow UB, so keys is streamed
+    // online (flash), not resident whole.
+    CHECK("MIXFA: feasibility comes from online streaming (scores overflow UB)",
+          sg->vector_peak_ub(fr.config, {}, {}) > p.vec_capacity
+              && sg->vector_stream(fr.config, {}, {}).chunk > 0);
+}
+
 // Split-K (base lone matmul and mixed cube-sink) is MODEL-AHEAD of the AutoFuse emit. The
 // buildable flag Problem::allow_model_ahead_split_k gates it: default true (analytic) credits
 // parallel_split > 1; false (buildable) forces S=1 so best_cost never selects an unemittable
@@ -1965,6 +1996,7 @@ int main() {
     test_mixed_single_tile_no_skew();
     test_mixed_grid_makespan();
     test_mixed_grid_makespan_multimatmul();
+    test_mixed_flash_attention();
     test_model_ahead_split_k_flag();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();

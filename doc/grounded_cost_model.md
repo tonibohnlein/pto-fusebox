@@ -324,9 +324,13 @@ buffers let its two cube matmuls pipeline). A `max` is wrong only for a genuine 
 worse). The **multi-round-trip** case is excluded at admission — `create()` rejects a group
 whose cube↔vector alternation depth exceeds 2 (the exact dual of the emit's `num_tpush!=1`
 demote), so it never reaches this cost. The **tile-carry** case needs no separate guard: a
-cross-tile reduction carry is prevented by the reduced-axis pinning in the tiling (§6) and, for
-a split-K merge, priced as atomic-add traffic — so the `max` is only ever applied to genuinely
-skewable groups. `vec_stage` pools
+cross-tile reduction carry is prevented by the reduced-axis **pinning** in the tiling (§6) — the
+mixed grid pins it (`parts_n=1`/`parts_m=1`) in **both** its cube- and vector-led branches, so a
+**mid-kernel** reduction stays resident on one unit and, when its coupled band overflows UB,
+**streams online** (fused flash attention `QK→softmax`; priced by §7's Fix-2 surcharge on the
+pooled `vec_stage`) — a matmul's own contraction rides a *separate* axis, chosen by the tiling. A
+split-K merge is instead priced as atomic-add traffic, so the `max` is only ever applied to
+genuinely skewable groups. `vec_stage` pools
 **all** Pointwise/Reduction ops (a `v→c→v`'s prologue *and* epilogue run on the same AIV pool).
 
 **The symmetric fill (grounded: shape sweep `mixed_vcv`/`vc`/`cvc`).** A 2-stage wall is the
@@ -448,16 +452,13 @@ Among equal-latency configs, lexicographic:
 
 ## 12. Known limitations / open calibration
 
-- **Calibration constants** — the reduction tree (`45/51/16/30`, §7 Fix 1) and the
-  streaming surcharge (§7 Fix 2) are now **perf-sim-grounded** (`pto-isa vec_tile_study`,
-  R²≈1.0) but **device-eval-pending** (the perf-sim's count-mode flat-per-pass is itself
-  coarse vs real HW). The vector double-buffer threshold (`2·vec_reg_bytes`) and the
-  DMA-shape burst (`vec_reg_bytes`) remain reasoned bounds, not measured.
-- **Vector double-buffer / DMA-shape thresholds** remain reasoned bounds (above). All three
-  per-op pessimisms — reduction cost (Fix 1), streaming recompute (Fix 2), and per-op startup
-  (Fix 3, now once-per-stream via `pw_stream_start`) — are perf-sim-grounded and device-eval-
-  pending. The stream-break heuristic (reductions/matmuls reset the chain) is an approximation
-  of the true VEC-queue-empty condition; exact only when the op order matches the emit.
+- **Calibration constants (perf-sim-grounded, device-eval-pending).** The reduction tree
+  (`45/51/16/30`, §7 Fix 1), streaming surcharge (Fix 2), and per-op startup (Fix 3, once-per-
+  stream via `pw_stream_start`) are perf-sim-grounded (`pto-isa vec_tile_study`, R²≈1.0) but
+  device-eval-pending (count-mode flat-per-pass is itself coarse vs real HW). The vector
+  double-buffer threshold (`2·vec_reg_bytes`) and DMA-shape burst (`vec_reg_bytes`) remain
+  reasoned bounds, not measured. The stream-break heuristic (reductions/matmuls reset the chain)
+  approximates the true VEC-queue-empty condition; exact only when the op order matches the emit.
 - **Per-tile compute overhead.** The vector *compute* is still tiling-invariant
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
   tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
