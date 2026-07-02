@@ -1,6 +1,5 @@
 import json
 import sys
-import os
 
 def load_json(filepath):
     with open(filepath, 'r') as f:
@@ -32,14 +31,7 @@ def generate_instance_dot(input_data, out_filepath):
         ""
     ]
 
-    cap_kb = input_data.get('fast_memory_capacity', 0) / 1000.0
-    bw = input_data.get('slow_memory_bandwidth', 'Unknown')
-    gran = input_data.get('native_granularity', 'Unknown')
-    if isinstance(gran, list):
-        gran = "x".join(map(str, gran))
-    
-    info_label = hw_legend(input_data)
-    lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
+    lines.append(f'    InstanceInfo [label="{hw_legend(input_data)}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 
     # 1. Define Tensors (Data)
@@ -53,9 +45,7 @@ def generate_instance_dot(input_data, out_filepath):
     lines.append("\n    // --- Operations ---")
     for i in range(len(input_data['op_types'])):
         op_type = input_data['op_types'][i]
-        cost = input_data['base_costs'][i]
-        label = f"Op {i}\\n{op_type}\\nCost: {cost}"
-        lines.append(f"    Op{i} [label=\"{label}\", shape=ellipse, style=filled, fillcolor=lightgreen];")
+        lines.append(f"    Op{i} [label=\"Op {i}\\n{op_type}\", shape=ellipse, style=filled, fillcolor=lightgreen];")
 
     # 3. Define Edges
     lines.append("\n    // --- Edges ---")
@@ -87,14 +77,7 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         ""
     ]
 
-    cap_kb = input_data.get('fast_memory_capacity', 0) / 1000.0
-    bw = input_data.get('slow_memory_bandwidth', 'Unknown')
-    gran = input_data.get('native_granularity', 'Unknown')
-    if isinstance(gran, list):
-        gran = "x".join(map(str, gran))
-    
-    info_label = hw_legend(input_data)
-    lines.append(f'    InstanceInfo [label="{info_label}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
+    lines.append(f'    InstanceInfo [label="{hw_legend(input_data)}", shape=note, style=filled, fillcolor=lightyellow, margin=0.2];')
     lines.append('')
 
     # Pre-calculate solution metadata
@@ -228,74 +211,75 @@ def generate_solution_dot(input_data, output_data, out_filepath):
         # Add to graph
         lines.append(f"    T{i} [label=\"{label}\", shape=box, style=\"{style_str}\", fillcolor=\"{fillcolor_str}\", color=\"{border_color}\", penwidth={penwidth}];")
 
-    # 2. Define Ops
-    lines.append("\n    // --- Operations ---")
-    for i in range(len(input_data['op_types'])):
-        op_type = input_data['op_types'][i]
-        cost = input_data['base_costs'][i]
-        
+    # 2. Ops, grouped into a rounded CLUSTER BOX per fused kernel (subgraph/step). The box carries
+    #    the KERNEL-level decision — kind (cube / vector / MIXED), max region, P x Q grid, split-K,
+    #    cores, latency — so a fused MIXED kernel (cube + vector ops in one box) is visually obvious.
+    #    Each op node inside shows only its per-op role: the single-core seq-k / UB stream. A MIXED
+    #    kernel runs on the 1 AIC : 2 AIV mix-cluster, so its cores span BOTH pools.
+    lines.append("\n    // --- Fused kernels (clusters) + ops ---")
+    op_types = input_data['op_types']
+
+    def first_step(i):
+        st = op_steps.get(i, [])
+        return st[0] if st else None
+
+    def op_node(i, indent="    "):
         steps = op_steps.get(i, [])
-        if steps:
-            # Use wedged multi-colors to vividly indicate sharing/multiple instances of recomputations
-            style = "filled,wedged" if len(steps) > 1 else "filled"
-            color_list = ":".join(colors[s % len(colors)] for s in steps)
-            
-            first_step = steps[0]
-            gran_list = output_data.get('granularities', [])
-            gran = gran_list[first_step] if len(gran_list) > first_step else ['?','?','?']
-            
-            lat_list = output_data.get('subgraph_latencies', [])
-            lat = lat_list[first_step] if len(lat_list) > first_step else 0.0
-            
-            # A matmul subgraph has TWO distinct contraction k's, shown separately:
-            #   seq-k  = single-core sequential k-tile (the DDR->L1 strip), per op
-            #   split-K = parallel cross-core split factor S (sink op only)
-            # The TILE is the SPATIAL output [w x h] only — k is not a spatial dim.
-            split_list = output_data.get('splits', [])
-            split = split_list[first_step] if len(split_list) > first_step else 1
-            split_str = f"\\nsplit-K x{split} (parallel)" if split and split > 1 else ""
+        if not steps:
+            return f'{indent}Op{i} [label="Op {i}\\n{op_types[i]}\\n(unscheduled)", shape=ellipse, style=filled, fillcolor="lightgrey"];'
+        # single-core k-stream (matmul seq-k / vector UB chunk), by op_order slot
+        extra = ""
+        s0 = steps[0]
+        seq_k_list, order_list = output_data.get('seq_k', []), output_data.get('op_order', [])
+        if (len(seq_k_list) > s0 and seq_k_list[s0] is not None
+                and len(order_list) > s0 and i in order_list[s0]):
+            kk = seq_k_list[s0][order_list[s0].index(i)]
+            if kk and kk > 0:
+                extra += f"\\n{'seq-k' if op_types[i] == 'MatMul' else 'stream'} {kk} (1-core)"
+        if len(steps) > 1:  # recomputed across steps — wedged colors + note
+            extra += f"\\n(recomputed: steps {','.join(map(str, steps))})"
+        style = "filled,wedged" if len(steps) > 1 else "filled"
+        color_list = ":".join(colors[s % len(colors)] for s in steps)
+        return f'{indent}Op{i} [label="Op {i}\\n{op_types[i]}{extra}", shape=ellipse, style="{style}", fillcolor="{color_list}"];'
 
-            cores_list = output_data.get('cores', [])
-            cores = cores_list[first_step] if len(cores_list) > first_step else None
-            # cube ops run on the AIC pool, vector (PW/Reduction) on the AIV pool
-            unit = "cube" if op_type == "MatMul" else "vector"
-            cores_str = f"\\n{unit} cores: {cores}" if cores else ""
+    for s, sub_ops in enumerate(output_data['subgraphs']):
+        members = [o for o in sub_ops if first_step(o) == s]
+        if not members:
+            continue
+        has_mm = any(op_types[o] == "MatMul" for o in sub_ops)
+        has_vec = any(op_types[o] in ("Pointwise", "Reduction") for o in sub_ops)
+        kind = "MIXED (cube+vector)" if (has_mm and has_vec) else ("cube (AIC)" if has_mm else "vector (AIV)")
 
-            # Spatial grid shape: parts_m x parts_n REGIONS. The tile (w x h) below
-            # is the MAX region of a (possibly non-uniform, +-1-block) grid, NOT a
-            # uniform tile -- so show the region count explicitly; a viewer can't
-            # infer it from w x h (e.g. a 4x12=48-region grid has a 32x64 max tile,
-            # not 8x4=32 tiles). Work units = regions x split-K = `cores`.
-            parts_list = output_data.get('parts', [])
-            parts = parts_list[first_step] if len(parts_list) > first_step else [0, 0]
-            if parts and parts[0] > 0:
-                grid_str = f"\\n{parts[0]}x{parts[1]} grid = {parts[0] * parts[1]} regions"
-                tile_word = "max region"
-            else:
-                grid_str = ""
-                tile_word = "tile"
-
-            # Single-core k-stream per op (by its slot in op_order): the matmul
-            # contraction seq-k, or a vector tile's UB-chunk stream. 0 = no
-            # sub-streaming (materialized), not shown.
-            seq_str = ""
-            seq_k_list = output_data.get('seq_k', [])
-            order_list = output_data.get('op_order', [])
-            if (len(seq_k_list) > first_step and seq_k_list[first_step] is not None
-                    and len(order_list) > first_step and i in order_list[first_step]):
-                kk = seq_k_list[first_step][order_list[first_step].index(i)]
-                if kk and kk > 0:
-                    tag = "seq-k" if op_type == "MatMul" else "stream"
-                    seq_str = f"\\n{tag} {kk} (1-core)"
-
-            step_str = ",".join(map(str, steps))
-            label = (f"Op {i}\\n{op_type}\\nCost: {cost}\\n---\\nSteps {{ {step_str} }}"
-                     f"\\n{tile_word} {gran[0]}x{gran[1]}{grid_str}{seq_str}{split_str}{cores_str}\\nLat: {lat:.1f}")
-            lines.append(f'    Op{i} [label="{label}", shape=ellipse, style="{style}", fillcolor="{color_list}"];')
+        def at(lst, default):
+            v = output_data.get(lst, [])
+            return v[s] if len(v) > s else default
+        gran = at('granularities', ['?', '?', '?'])
+        parts = at('parts', [0, 0])
+        if parts and parts[0] > 0:  # non-uniform P x Q grid; the tile is the MAX region
+            grid, tile_word = f"{parts[0]}x{parts[1]} grid = {parts[0] * parts[1]} regions", "max region"
         else:
-            label = f"Op {i}\\n{op_type}\\nCost: {cost}\\n(Unscheduled)"
-            color = "lightgrey"
-            lines.append(f"    Op{i} [label=\"{label}\", shape=ellipse, style=filled, fillcolor=\"{color}\"];")
+            grid, tile_word = "1 tile", "tile"
+        split = at('splits', 1)
+        split_str = f"  split-K x{split} (parallel)" if split and split > 1 else ""
+        cores = at('cores', None)
+        if cores:
+            cores_str = (f"{cores} cores (AIC + 2xAIV mix-cluster)" if (has_mm and has_vec)
+                         else f"{cores} {'cube (AIC)' if has_mm else 'vector (AIV)'} cores")
+        else:
+            cores_str = ""
+        lat = at('subgraph_latencies', 0.0)
+        klabel = (f"Kernel {s} — {kind}\\n{tile_word} {gran[0]}x{gran[1]}  |  {grid}{split_str}"
+                  f"\\n{cores_str}\\nLat {lat:.1f}")
+        bg = "#e6f0ff" if (has_mm and has_vec) else ("#fff0f0" if has_mm else "#eefbe6")
+        lines.append(f'    subgraph cluster_k{s} {{')
+        lines.append(f'      label="{klabel}"; labelloc="t"; fontsize=11; style="rounded,filled"; '
+                     f'fillcolor="{bg}"; color="gray40"; penwidth=1.5;')
+        for o in members:
+            lines.append(op_node(o, indent="      "))
+        lines.append("    }")
+    for i in range(len(op_types)):  # unscheduled ops sit outside every cluster
+        if first_step(i) is None:
+            lines.append(op_node(i))
 
     # 3. Define Edges
     lines.append("\n    // --- Data Edges ---")

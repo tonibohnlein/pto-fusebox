@@ -29,16 +29,9 @@ def emit(name, tensors, ops, cube_compute_cost=4096, **overrides):
     architecture) applied on top of the shared CFG."""
     widths = [w for w, _ in tensors]
     heights = [h for _, h in tensors]
-    base_costs = []
-    for t, ins, outs in ops:
-        if t == MM:
-            base_costs.append(16384 * tensors[ins[0]][0])  # 16384 * K
-        else:
-            ow, oh = tensors[outs[0]]
-            base_costs.append(ow * oh)
     j = dict(widths=widths, heights=heights, op_types=[t for t, _, _ in ops],
              inputs=[ins for _, ins, _ in ops], outputs=[outs for _, _, outs in ops],
-             base_costs=base_costs, cube_compute_cost=cube_compute_cost, **CFG)
+             cube_compute_cost=cube_compute_cost, **CFG)
     j.update(overrides)
     path = os.path.join(OUT, f"910b-{name}.json")
     with open(path, "w") as f:
