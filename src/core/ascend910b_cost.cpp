@@ -1967,11 +1967,29 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // cube ports, cube_stage, and ddr are recomputed per split factor S in eval_S below.
   const double gm_ub_lat = gm_ub_bytes * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
   const double ub_gm_lat = ub_gm_bytes * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
-  // Vector stage runs on 2 cores per unit. Cube work = max(MACs, L1->L0 extract) — the
-  // same double-buffered hierarchy as the homogeneous cube path.
-  const double vec_stage      = vector_compute / (2.0 * eff_units);
-  const double one_vec_tile   = vector_compute / (2.0 * (double)num_tiles);
-  const double base_cube_work = std::max(cube_mac, cube_extract);
+  // Compute distribution: the LPT makespan over the non-uniform grid regions (the BUSIEST
+  // core), mirroring the base cube path — NOT the flat total/eff_units average, which
+  // under-predicts an imbalanced grid's biggest region (up to ~2x at one region/core, the
+  // few-tile decode corner). Region work ~ the region's output-area fraction (cube MAC/extract
+  // and vector cost both scale with the tiled M*N). Uniform tiles (parts==0; ad-hoc/test) use
+  // the wave-aware makespan. eff_units/eff_cube (active cores) still set the HBM par() + count.
+  const double base_cube_work = std::max(cube_mac, cube_extract);  // MACs vs L1->L0 extract
+  const bool grid_mode = cfg.parts_m > 0;
+  const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m), grid_gran_h_);
+  const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n), grid_gran_w_);
+  const double out_area = (double)std::max<int64_t>(1, out_H_ * out_W_);
+  auto cube_region_work = [&](int64_t m_ext, int64_t n_ext) {
+    return base_cube_work * ((double)(m_ext * n_ext) / out_area);
+  };
+  auto vec_region_work = [&](int64_t m_ext, int64_t n_ext) {
+    return vector_compute * ((double)(m_ext * n_ext) / out_area);
+  };
+  // Vector stage runs on 2 cores per unit (split-K-invariant: a sink split-K recruits CUBE
+  // cores only). Makespan over the grid, then halved across the unit's 2 AIV cores.
+  const double vec_stage = (grid_mode
+      ? LptMakespan((int64_t)n_units, g_pm, g_pn, vec_region_work)
+      : WaveComputeCycles(vector_compute, num_tiles, (int64_t)n_units)) / 2.0;
+  const double one_vec_tile = vector_compute / (2.0 * (double)num_tiles);
 
   // Pipeline wall (grounded EXACTLY by mixed_tile_study, the shape sweep). The cube and
   // vector units OVERLAP. In a 2-stage kernel (c->v or v->c) the output unit runs ONLY the
@@ -2029,7 +2047,11 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   struct MixEval { double wall, ddr, max_stage, eff_cube; };
   auto eval_S = [&](int64_t S) -> MixEval {
     const double eff_cube = std::min((double)num_tiles * (double)S, n_units);
-    const double cube_stage = base_cube_work / eff_cube;
+    // Cube compute makespan (busiest core), split-K aware (LptMakespan ksplit = S; the wave arm
+    // divides num_tiles*S units). Uniform-grid LptMakespan reduces exactly to WaveComputeCycles.
+    const double cube_stage = grid_mode
+        ? LptMakespan((int64_t)n_units, g_pm, g_pn, cube_region_work, S)
+        : WaveComputeCycles(base_cube_work, num_tiles * S, (int64_t)n_units);
     const double one_cube_tile = (base_cube_work / (double)num_tiles) / std::min((double)S, n_units);
     const double gm_l1_lat  = gm_l1_bytes * bc.reload / par(eff_cube, prob_->bw_gm_l1);
     const double l0c_gm_lat = (l0c_gm_bytes + (double)(S - 1) * sink_store_bytes) * bc.store

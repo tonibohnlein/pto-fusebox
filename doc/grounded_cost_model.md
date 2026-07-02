@@ -298,8 +298,8 @@ Admissible only when the model opts in (`allow_mixed` = `Ascend910BMixed`); the 
 routes a cube↔vector group as two separate kernels.
 
 ```
-cube_stage = max(cube_mac, cube_extract) / eff_units      # AIC per-unit wall (§2)
-vec_stage  = Σ_op VecOpCompute(op) / (2·eff_units)         # AIV per-unit wall — ALL vector ops (§7)
+cube_stage = makespan( max(cube_mac,cube_extract) )       # AIC busiest-core wall — LPT grid / wave uniform (§5)
+vec_stage  = makespan( Σ_op VecOpCompute(op) ) / 2         # AIV busiest-core wall — 2 cores/unit, ALL vec ops (§7)
 ddr_lat    = max over the 4 GM ports (each par()-capped)   # cross-unit HBM contention
 one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpCompute /(2·num_tiles)
 
@@ -468,13 +468,13 @@ Among equal-latency configs, lexicographic:
   fuse a vector prologue with a split-K matmul). Kept model-ahead deliberately; since the
   model does not drive live lowering today it is a shared emit-TODO, not a bug — one
   Problem-level buildable flag (default `S=1`) would gate base+mixed together when Phase-C lands.
-- **Mixed cube stage — makespan & floors.** (a) The double-buffer floor is now ported from
-  §3: a thin-K cube (`output_K/S < 32`) serializes compute with its GM reload. (b) A
-  non-uniform grid still divides by the average `eff_units`, not the base `LptMakespan`
-  (busiest core), so an imbalanced grid under-predicts by up to one block (~2× only at one
-  region/core) — routing `cube_stage` through the LPT/wave machinery is the fix. (c) A
-  matmul→reduction sink gets neither cube split-K (matmul-sink-gated) nor the §6 reduced-axis
-  split, so few-row reductions under-fill. Documented scope.
+- **Mixed cube stage — now makespan + floors.** The cube/vector stages route through the base
+  `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-core makespan, not the flat
+  `eff_units` average (region work ~ output-area fraction) — so an imbalanced grid no longer
+  under-predicts its biggest region, and the double-buffer floor is ported (a thin-K cube
+  `output_K/S < 32` serializes compute with its GM reload). *Remaining scope:* a matmul→reduction
+  sink gets neither cube split-K (matmul-sink-gated) nor the §6 reduced-axis split, so few-row
+  reductions under-fill.
 
 ---
 

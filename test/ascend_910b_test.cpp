@@ -1171,6 +1171,35 @@ static void test_mixed_single_tile_no_skew() {
           w1 > 2.3 * w2);
 }
 
+// A non-uniform grid's cube_stage is the LPT makespan (busiest core = biggest region), not the
+// flat total/eff_units average -- which under-predicts an imbalanced grid (up to ~2x at one
+// region/core). We tile a W=48 output (3 fractals) two ways: whole (1 tile = total cube work T)
+// and a parts_n=2 grid, which partition_axis splits [32,16] (big=2 fractals, small=1). The two
+// regions land one-per-core, so the makespan is the BIG [32]-region = 2/3 T -- ABOVE the flat
+// average T/2 the old code charged, and below T. Compute-bound so cube_stage drives the wall.
+static void test_mixed_grid_makespan() {
+    std::cout << "[MIXGRID] non-uniform grid cube_stage is the busiest-region makespan, not the average\n";
+    Problem p;
+    p.tensors = {{32, 32}, {48, 32}, {48, 32}, {48, 32}};  // A[K,M] B[N,K] C[N,M] D[N,M], out W=48
+    p.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::Pointwise, {2}, {3}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p, /*cc=*/256);  // compute-bound: cube_stage drives the wall
+    DAG dag = DAG::build(p);
+    auto m = Ascend910BMixed::create(p, dag, {0, 1});
+    auto wall = [&](TileConfig cfg) {
+        auto fr = m->compute_cost(cfg, {}, {});
+        const int r = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
+        return std::make_pair(fr, fr.latency - (double)r * (double)p.kernel_fill_cost);
+    };
+    auto [f1, total] = wall(TileConfig{48, 32, 32});          // whole output: 1 tile -> total work T
+    auto [fg, grid] = wall(TileConfig{32, 32, 32, 1, 2, 0});  // grid parts_n=2 -> [32,16] regions
+    CHECK("MIXGRID: single-tile and grid configs feasible, grid is 2 tiles compute-bound",
+          f1.feasible && fg.feasible && fg.compute_bound && fg.num_spatial_tiles == 2);
+    // Makespan = the big [32]-region (2/3 T), above the flat average T/2, below the total T.
+    CHECK("MIXGRID: non-uniform grid pays the busiest-region makespan, not the flat average",
+          grid > 1.2 * (total / 2.0) && grid < total);
+}
+
 // --- mixed feasibility: both pools STREAM to fit (cube seq-k, vector chunks) --
 // A fused MM->PW needs both pools, but each streams to fit like its homogeneous
 // counterpart: the cube seq-k-slices the contraction to fit L1, and the vector
@@ -1859,6 +1888,7 @@ int main() {
     test_mixed_pipeline_stages();
     test_mixed_sink_split_k();
     test_mixed_single_tile_no_skew();
+    test_mixed_grid_makespan();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
     test_dfs_order();
