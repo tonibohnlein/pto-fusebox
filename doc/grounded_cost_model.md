@@ -462,19 +462,21 @@ Among equal-latency configs, lexicographic:
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
   tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
   shape *is* now cost-driven, via §7.)
-- **Split-K is model-ahead of the emit (base *and* mixed).** The solver credits
-  `parallel_split > 1` for a lone matmul and a single-matmul cube sink (`v→c`), but the
-  AutoFuse auto-emit realizes neither yet (mixed cube-sink split-K = net-new emit work:
-  fuse a vector prologue with a split-K matmul). Kept model-ahead deliberately; since the
-  model does not drive live lowering today it is a shared emit-TODO, not a bug — one
-  Problem-level buildable flag (default `S=1`) would gate base+mixed together when Phase-C lands.
+- **Split-K is model-ahead of the emit (base *and* mixed) — behind a buildable flag.** The solver
+  credits `parallel_split > 1` for a lone matmul and a single-matmul cube sink (`v→c`), which the
+  AutoFuse auto-emit does not realize yet. `Problem::allow_model_ahead_split_k` gates it: `true`
+  (default) credits the split; `false` forces `S=1` for **both** base and mixed, so `best_cost`
+  never picks an unemittable split (`CostResult::uses_model_ahead_split_k` flags one). Flip when Phase-C lands.
 - **Mixed cube stage — now makespan + floors.** The cube/vector stages route through the base
   `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-core makespan, not the flat
-  `eff_units` average (region work ~ output-area fraction) — so an imbalanced grid no longer
-  under-predicts its biggest region, and the double-buffer floor is ported (a thin-K cube
-  `output_K/S < 32` serializes compute with its GM reload). *Remaining scope:* a matmul→reduction
-  sink gets neither cube split-K (matmul-sink-gated) nor the §6 reduced-axis split, so few-row
-  reductions under-fill.
+  `eff_units` average — so an imbalanced grid no longer under-predicts its biggest region, and the
+  double-buffer floor is ported (a thin-K cube `output_K/S < 32` serializes compute with its GM
+  reload). *Precision follow-up:* the per-region work is an output-**area fraction**
+  (`base_cube_work · area/total`) — exact for a single matmul (MAC/extract ~ M·N·K) but an
+  approximation for multi-matmul groups (`c→v→c`) and extract/fractal-padding tails; factoring
+  the base path's per-region Phase-D `grid_region_work` into a shared helper would make it exact.
+  *Scope:* a matmul→reduction sink gets neither cube split-K (matmul-sink-gated) nor the §6
+  reduced-axis split, so few-row reductions under-fill.
 
 ---
 

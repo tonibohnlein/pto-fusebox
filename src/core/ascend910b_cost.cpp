@@ -1640,18 +1640,23 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // enumeration) and is evaluated as-is; an ad-hoc non-grid tile (split_k==0,
       // e.g. a directly-constructed TileConfig) sweeps S over the valid K-fractal
       // divisors and adopts a split only if it STRICTLY beats the spatial-only S=1.
+      // Split-K is MODEL-AHEAD of the AutoFuse emit: gate on the buildable flag so a
+      // buildable-mode harness never selects an unemittable split (default true = analytic).
       int64_t chosen_S = 1;
       SplitEval chosen = eval_S(1);
-      if (cfg.split_k >= 1) {
-        chosen_S = cfg.split_k;
-        chosen = eval_S(chosen_S);
-      } else {
-        for (int64_t S : all_divisors(kfrac)) {
-          if (S < 2) continue;
-          const SplitEval e = eval_S(S);
-          if (e.lat < chosen.lat) { chosen = e; chosen_S = S; }
+      if (prob_->allow_model_ahead_split_k) {
+        if (cfg.split_k >= 1) {
+          chosen_S = cfg.split_k;
+          chosen = eval_S(chosen_S);
+        } else {
+          for (int64_t S : all_divisors(kfrac)) {
+            if (S < 2) continue;
+            const SplitEval e = eval_S(S);
+            if (e.lat < chosen.lat) { chosen = e; chosen_S = S; }
+          }
         }
       }
+      result.uses_model_ahead_split_k = (chosen_S > 1);
 
       result.latency = chosen.lat;
       result.parallel_split = (int)chosen_S;
@@ -2030,7 +2035,10 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   for (auto i : ops_)
     if (is_sink_unit(i) && !reaches_opp.count(i)) { sink_runs_early_stage = true; break; }
   const bool two_stage = !sink_runs_early_stage;
-  result.pipeline_fill_absorbed = !two_stage;  // 3-stage folds the fill into the max
+  // Fill is absorbed only when the shape is 3-stage AND there is a successor tile to skew
+  // against (num_tiles >= 2). A single-tile 3-stage kernel pays the cross-term (A2), so the
+  // diagnostic flag must reflect the ACTUAL wall, not just the structural shape.
+  result.pipeline_fill_absorbed = !two_stage && num_tiles >= 2;
 
   // Sink split-K (cube-sink, SINGLE matmul only). The sink matmul may split its
   // contraction across idle CUBE cores — atomic-add partials with NO merge barrier, so
@@ -2042,7 +2050,9 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   // cost, so a non-splittable kernel is unchanged and a split is taken only when it wins.
   int num_matmuls = 0;
   for (auto i : ops_) if (prob_->ops[i].type == OpType::MatMul) num_matmuls++;
-  const bool can_split = output_is_cube && num_matmuls == 1;
+  // Cube-sink split-K is MODEL-AHEAD of the emit (§12): gate on the buildable flag so a
+  // buildable-mode harness never selects an unemittable mixed split (default true = analytic).
+  const bool can_split = output_is_cube && num_matmuls == 1 && prob_->allow_model_ahead_split_k;
   const double sink_store_bytes = l0c_gm_bytes;  // single-matmul cube sink: L0C->GM == the sink store
   struct MixEval { double wall, ddr, max_stage, eff_cube; };
   auto eval_S = [&](int64_t S) -> MixEval {
@@ -2087,6 +2097,7 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
   result.ddr_traffic    = best.ddr;
   result.compute_bound  = best.max_stage >= best.ddr;
   result.parallel_split = (int)best_S;
+  result.uses_model_ahead_split_k = (best_S > 1);
   result.cores_used     = (int)(best.eff_cube + 2.0 * eff_units);  // cube (split) + 2 vector/tile
 
   // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)) — the per-LAUNCH

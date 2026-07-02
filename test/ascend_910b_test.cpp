@@ -1162,9 +1162,10 @@ static void test_mixed_single_tile_no_skew() {
     };
     auto [f1, w1] = wall(TileConfig{128, 128, 128});  // one output tile
     auto [f2, w2] = wall(TileConfig{128, 64, 128});   // two output tiles
-    CHECK("MIXNT1: single tile is feasible, 3-stage, compute-bound",
-          f1.feasible && f1.pipeline_fill_absorbed && f1.compute_bound && f1.num_spatial_tiles == 1);
-    CHECK("MIXNT1: two-tile config is feasible with 2 tiles", f2.feasible && f2.num_spatial_tiles == 2);
+    CHECK("MIXNT1: single tile does NOT absorb fill (no successor to skew against), compute-bound",
+          f1.feasible && !f1.pipeline_fill_absorbed && f1.compute_bound && f1.num_spatial_tiles == 1);
+    CHECK("MIXNT1: the SAME shape at 2 tiles DOES absorb (confirms it is a 3-stage shape)",
+          f2.feasible && f2.pipeline_fill_absorbed && f2.num_spatial_tiles == 2);
     // The single tile is charged the un-overlapped sum (cube+vec), so wall1/wall2 > 2.0 (the
     // plain-max pure-tiling ratio the old code gave); ~3.3 here. Threshold 2.3 leaves margin.
     CHECK("MIXNT1: single-tile wall is the un-overlapped sum (ratio > 2.3, not the 2.0 plain-max)",
@@ -1198,6 +1199,50 @@ static void test_mixed_grid_makespan() {
     // Makespan = the big [32]-region (2/3 T), above the flat average T/2, below the total T.
     CHECK("MIXGRID: non-uniform grid pays the busiest-region makespan, not the flat average",
           grid > 1.2 * (total / 2.0) && grid < total);
+}
+
+// Split-K (base lone matmul and mixed cube-sink) is MODEL-AHEAD of the AutoFuse emit. The
+// buildable flag Problem::allow_model_ahead_split_k gates it: default true (analytic) credits
+// parallel_split > 1; false (buildable) forces S=1 so best_cost never selects an unemittable
+// split. CostResult::uses_model_ahead_split_k flags a chosen split. This proves the flag
+// disables the split path for BOTH base and mixed while leaving the analytic result intact.
+static void test_model_ahead_split_k_flag() {
+    std::cout << "[MIXBUILD] buildable flag gates model-ahead split-K (base + mixed)\n";
+    // (1) base lone matmul, a FIXED split_k=2 config (the (P,Q,S) schedule path) through
+    // compute_cost directly -- best_cost prefers spatial tiling for these shapes, so we
+    // exercise the split path explicitly. C[16,16] K=2048: 1 tile, split the contraction 2 ways.
+    {
+        Problem p;
+        p.tensors = {{2048, 16}, {16, 2048}, {16, 16}};  // A[K,M] B[N,K] C[N,M], K=2048
+        p.ops = {{OpType::MatMul, {0, 1}, {2}}};
+        p.fast_memory_capacity = 1 << 24; set_910b(p, 4096);
+        DAG dag = DAG::build(p);
+        const TileConfig split_cfg{16, 16, 2048, 1, 1, 2};  // grid 1x1, fixed split_k=2
+        auto analytic = Subgraph::create(p, dag, {0})->compute_cost(split_cfg, {}, {});
+        p.allow_model_ahead_split_k = false;  // buildable mode
+        auto buildable = Subgraph::create(p, dag, {0})->compute_cost(split_cfg, {}, {});
+        CHECK("MIXBUILD: base analytic honors the fixed split_k=2 (flagged model-ahead)",
+              analytic.feasible && analytic.parallel_split == 2 && analytic.uses_model_ahead_split_k);
+        CHECK("MIXBUILD: base buildable forces S=1 despite cfg.split_k=2 (flag respected)",
+              buildable.feasible && buildable.parallel_split == 1 && !buildable.uses_model_ahead_split_k);
+        CHECK("MIXBUILD: base analytic <= buildable (the gated split only helps)",
+              analytic.latency <= buildable.latency);
+    }
+    // (2) mixed cube-sink v->c (the MIXSPLIT shape): split-Ks the sole sink matmul.
+    {
+        Problem p;
+        p.tensors = {{128, 64}, {128, 64}, {256, 128}, {256, 64}};  // A0 A1 B[N,K] C[N,M]
+        p.ops = {{OpType::Pointwise, {0}, {1}}, {OpType::MatMul, {1, 2}, {3}}};
+        p.fast_memory_capacity = 1 << 26; set_910b(p, 256);
+        DAG dag = DAG::build(p);
+        auto analytic = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        p.allow_model_ahead_split_k = false;  // buildable mode
+        auto buildable = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        CHECK("MIXBUILD: mixed analytic cube-sink split-Ks (S>1, flagged model-ahead)",
+              analytic.parallel_split > 1 && analytic.uses_model_ahead_split_k);
+        CHECK("MIXBUILD: mixed buildable forces S=1 (no model-ahead split)",
+              buildable.parallel_split == 1 && !buildable.uses_model_ahead_split_k);
+    }
 }
 
 // --- mixed feasibility: both pools STREAM to fit (cube seq-k, vector chunks) --
@@ -1889,6 +1934,7 @@ int main() {
     test_mixed_sink_split_k();
     test_mixed_single_tile_no_skew();
     test_mixed_grid_makespan();
+    test_model_ahead_split_k_flag();
     test_mixed_two_pool_feasibility();
     test_mixed_multistage_pebble();
     test_dfs_order();

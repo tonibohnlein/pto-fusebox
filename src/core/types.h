@@ -151,6 +151,13 @@ struct Problem {
     double vec_slope_reduce = 0.0;    // DEPRECATED by Fix 1 (VecOpCompute reduction tree):
                                       // a reduction is no longer one slope*repeat op. Field
                                       // kept for ABI/serialization; unused by the cost path.
+    // Split-K is MODEL-AHEAD of the AutoFuse emit (both the base lone-matmul and the mixed
+    // cube-sink path — see grounded_cost_model.md §12). This flag gates it: true (default) =
+    // analytic/research mode, the cost model may credit parallel_split > 1; false = BUILDABLE
+    // mode, split-K is forced to S=1 so best_cost never selects a config the emit can't yet
+    // lower. Flip to false in any harness that treats the winning config as emittable;
+    // CostResult::uses_model_ahead_split_k flags when a chosen config used a split.
+    bool allow_model_ahead_split_k = true;
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
@@ -247,10 +254,13 @@ struct CostResult {
                                  // ports are asymmetric (441 vs 220.5), so among reload-equal
                                  // transposed tiles the lower-extract (TALL) tile wins.
                                  // Perf-sim-driven (pto-isa gml1_decision); device eval pending.
-    bool pipeline_fill_absorbed = false;  // MIXED kernels only: the cube||vector pipeline
-                                 // fill/drain. false = 2-stage (the sink unit is idle at t=0,
-                                 // so the wall adds one non-bottleneck tile: c->v, v->c, c->v->v,
-                                 // v->v->c). true = 3-stage (the sink unit runs an earlier stage
-                                 // from t=0, so the fill is absorbed into the max: v->c->v,
-                                 // c->v->c). Grounded by mixed_tile_study's shape sweep.
+    bool pipeline_fill_absorbed = false;  // MIXED kernels only: is the cube||vector fill/drain
+                                 // ACTUALLY absorbed into the max for THIS config. true iff the
+                                 // shape is 3-stage (sink unit runs an earlier stage from t=0:
+                                 // v->c->v, c->v->c) AND num_tiles >= 2 (a single tile has no
+                                 // successor to skew against, so it pays the cross-term even for
+                                 // a 3-stage shape). Grounded by mixed_tile_study's shape sweep.
+    bool uses_model_ahead_split_k = false;  // this config's parallel_split > 1 came from the
+                                 // model-ahead split-K path (Problem::allow_model_ahead_split_k;
+                                 // base lone-matmul or mixed cube-sink) — NOT yet emittable.
 };
