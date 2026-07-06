@@ -880,15 +880,25 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // The triple's split_k is the REDUCED-AXIS (cross-core accumulation) split --
     // the vector analog of cube split-K, meaningful ONLY for a reduction SINK. It
     // lets P_spatial * S fill the cores when the non-reduced axis alone can't (a
-    // softmax whose query rows are few). S over the divisors of 2C, capped by the
-    // reduced fractal count (S <= the splittable extent). Pure pointwise has no
-    // axis to split -> S = 1.
+    // softmax whose query rows are few). Pure pointwise has no axis to split -> S = 1.
+    //
+    // S ranges over the divisors of the reduced FRACTAL count (reduced_extent/16), capped by
+    // the core budget -- MIRRORING the matmul split-K gate all_divisors(kfrac) at :870. This is
+    // a FIDELITY constraint, not just a cap: it guarantees each core's reduced slice
+    // IM/S = 16*(rcap/S) is 16-aligned, so the vector emit can realize the split EXACTLY
+    // (disjoint reduced slices; padding the ragged tail slice would otherwise overlap the prior
+    // slice -> atomic-add double-count, or read past the source tensor -> OOB DMA). Drawing S
+    // from divisors of the CORE count (2*C) instead -- the previous behavior -- let the solver
+    // cost splits S that do NOT divide the reduced extent (e.g. col_sum[128,256] costed S=6,
+    // 6 ∤ 128); the emit cannot realize those and declines to a serial reduction, so the costed
+    // parallelism was fictional. A non-16-aligned reduced axis is not cleanly splittable at all
+    // (S=1): the emit runs it serial, which the cost model now prices honestly.
     std::vector<int64_t> s_vals = {1};
-    if (sg.reduced_axis_ != 0 && sg.reduction_is_sink_) {
+    if (sg.reduced_axis_ != 0 && sg.reduction_is_sink_ && sg.reduced_extent_ % 16 == 0) {
       const int64_t rcap = std::max<int64_t>(1, sg.reduced_extent_ / 16);
       s_vals.clear();
-      for (int64_t s : all_divisors(2 * C))
-        if (s <= rcap) s_vals.push_back(s);
+      for (int64_t s : all_divisors(rcap))
+        if (s <= 2 * C) s_vals.push_back(s);
     }
     gen_grid(C, maxP, maxQ, s_vals);
   }
