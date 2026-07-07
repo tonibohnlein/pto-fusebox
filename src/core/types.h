@@ -50,6 +50,13 @@ struct Op {
     std::vector<size_t> inputs;   // tensor indices
     std::vector<size_t> outputs;  // tensor indices (always exactly one)
 
+    // Per-op VECTOR compute slope (cycles per SIMD repeat) for a Pointwise op, when it differs
+    // from the group default `vec_slope_pw` (~2). pto-isa vec_tile_study: most pointwise ops are
+    // slope 2, but `vdiv` is 4 and the scalar/activation ops (`vrsqrt`/`vrelu`/`vmuls`) are 1.
+    // 0.0 => use the problem default. Set by the PyPTO adapter from the op name; JSON instances
+    // that omit it fall back to the default (so the benchmark suite is unaffected).
+    double vec_slope = 0.0;
+
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }
 };

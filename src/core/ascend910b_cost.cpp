@@ -45,6 +45,12 @@ constexpr double kVecRowReduceFinal = 51.0;  // K=1 base (the final cross-lane v
 constexpr double kVecColReduceSlope = 16.0;  // streamed count-mode vadd per row-pair
 constexpr double kVecColReduceLevel = 30.0;  // per-level startup (log2(H) barriers)
 
+// Count-mode dispatch floor: a binary-ALU vector op whose contiguous width is NOT repeat-aligned
+// (cols % epr != 0) enters count-mask dispatch, paying a one-time ~16-cycle floor independent of
+// the op/repeat (pto-isa cce_costmodel_core.hpp kCountModeFloorCycles; medians 12-18, std<3). This
+// is the +16 unaligned-width penalty the vec_tile_study flagged as previously unmodeled.
+constexpr double kVecCountModeFloor = 16.0;
+
 // Grounded per-op VECTOR compute cycles (pto-isa perf-sim, vec_tile_study). Shared by the
 // vector-only and the mixed cube+vector paths so a reduction costs the same in both.
 //   Pointwise: slope*repeat + (head+tail IF this op starts a vector stream). Fix 3: the
@@ -67,10 +73,18 @@ inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, boo
     return kVecRowReducePass * (double)(K - 1) + kVecRowReduceFinal;
   }
   int64_t elems = (int64_t)p->tensors[op.output()].width * p->tensors[op.output()].height;
-  for (auto t : op.inputs)
+  int64_t width = (int64_t)p->tensors[op.output()].width;  // contiguous extent (count-mode axis)
+  for (auto t : op.inputs) {
     elems = std::max(elems, (int64_t)p->tensors[t].width * p->tensors[t].height);
+    width = std::max(width, (int64_t)p->tensors[t].width);
+  }
   const int64_t repeat = (elems + epr - 1) / epr;
-  return p->vec_slope_pw * (double)repeat + (pw_stream_start ? p->vec_op_head + p->vec_op_tail : 0.0);
+  // Per-op slope (vdiv=4, vrsqrt/vrelu=1) overrides the group default (~2) when the adapter set it.
+  const double slope = op.vec_slope > 0.0 ? op.vec_slope : p->vec_slope_pw;
+  double cycles = slope * (double)repeat + (pw_stream_start ? p->vec_op_head + p->vec_op_tail : 0.0);
+  // A width not aligned to one SIMD repeat (cols % epr != 0) pays the count-mask dispatch floor.
+  if (width % epr != 0) cycles += kVecCountModeFloor;
+  return cycles;
 }
 
 // Per-direction "cycles per byte" for a transfer: a byte costs
