@@ -57,6 +57,11 @@ struct Op {
     // that omit it fall back to the default (so the benchmark suite is unaffected).
     double vec_slope = 0.0;
 
+    // Per-op VECTOR fixed cost (head+tail cycles), charged ONCE per fused chain (the stream-start
+    // op). pto-isa device-calibrated per-op: vadd/vsub/vmax/vmin 24, vmul 25, vexp 31, vdiv 30,
+    // vrsqrt/vrelu/vmuls ~24. 0.0 => use the problem default `vec_op_head+vec_op_tail` (~32).
+    double vec_fixed = 0.0;
+
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }
 };

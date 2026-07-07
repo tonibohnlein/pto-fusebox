@@ -81,7 +81,11 @@ inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, boo
   const int64_t repeat = (elems + epr - 1) / epr;
   // Per-op slope (vdiv=4, vrsqrt/vrelu=1) overrides the group default (~2) when the adapter set it.
   const double slope = op.vec_slope > 0.0 ? op.vec_slope : p->vec_slope_pw;
-  double cycles = slope * (double)repeat + (pw_stream_start ? p->vec_op_head + p->vec_op_tail : 0.0);
+  // Per-op fixed (head+tail) — vadd 24 / vmul 25 / vexp 31 / vdiv 30 — overrides the group default
+  // (~32) when the adapter set it. Charged ONCE per chain (the stream-start op), so it is the
+  // stream-start op's own fixed. Exact-match to pto-isa's calibrated per-op fixed.
+  const double fixed = op.vec_fixed > 0.0 ? op.vec_fixed : (p->vec_op_head + p->vec_op_tail);
+  double cycles = slope * (double)repeat + (pw_stream_start ? fixed : 0.0);
   // A width not aligned to one SIMD repeat (cols % epr != 0) pays the count-mask dispatch floor.
   if (width % epr != 0) cycles += kVecCountModeFloor;
   return cycles;
@@ -2275,4 +2279,23 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
     consider(TileConfig{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k});
   }
   return best;
+}
+
+// Same grid as best_cost, but COLLECT every feasible (config, cost) instead of the argmin — the
+// candidate set the solver chose from. For the cost-vs-wall-time validation (dump modeled costs;
+// force one for the device emit). Not on the hot path.
+std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans() const {
+  std::vector<std::pair<TileConfig, CostResult>> out;
+  const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
+  for (const auto &g : grid_cand_) {
+    const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
+    const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
+    const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
+    if (!is_valid_tiling(cfg)) continue;
+    if (!fits_on_chip(cfg, {}, {})) continue;
+    const CostResult r = compute_cost(cfg, {}, {});
+    if (!r.feasible) continue;
+    out.emplace_back(cfg, r);
+  }
+  return out;
 }

@@ -169,6 +169,12 @@ public:
   CostResult best_cost(const FlatSet<size_t> &retained_from_prev = {},
                        const FlatSet<size_t> &retain_these = {}) const;
 
+  // Enumerate every FEASIBLE (config, cost) candidate for this subgraph (the same grid the
+  // argmin best_cost picks from). Used by the cost-vs-wall-time validation: dump the plans + their
+  // modeled costs, then force one for the device emit and measure its latency. Not on the solver
+  // hot path.
+  std::vector<std::pair<TileConfig, CostResult>> enumerate_plans() const;
+
 
   Ascend910BCost() = default;
 
