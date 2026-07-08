@@ -1665,6 +1665,34 @@ static void test_streamed_reduction_sink_no_split() {
           r.cores_used <= 8);
 }
 
+// --- R0: vector_peak_ub couples the reduced axis to its FULL extent ----------
+// On the live grid path a bare reduction sink's cfg collapses the reduced axis to the thin
+// output extent (col_sum output [1,W] -> cfg.h derived from out_H_ = 1). vector_peak_ub must
+// STILL size the reduced-axis read from the TENSOR's own extent (the FIXED_1 role) — else a
+// streamed reduction looks "materialized, fits UB" at the FEASIBILITY and COMPUTE sites and the
+// streaming cost/decision logic never fires. Before R0 the coupling lived only inside the split
+// gate; feasibility (vector_stream) and the compute surcharge used the raw collapsed cfg.
+static void test_streaming_detected_via_coupled_peak() {
+    std::cout << "[R0] vector_peak_ub couples the reduced axis full even when cfg collapses it\n";
+    const int64_t UB = 192 * 1024;
+    auto peak_at_grid_cfg = [&](int64_t H) -> int64_t {
+        Problem p; p.tensors = {{128, H}, {128, 1}};   // col_sum m[1,128] over height H
+        p.ops = {{OpType::Reduction, {0}, {1}}};
+        p.fast_memory_capacity = 1 << 24; set_910b(p);
+        DAG d = DAG::build(p);
+        // Grid cfg for a col reduction: height collapses to the output (h=1); width tiled.
+        return Subgraph::create(p, d, {0})->vector_peak_ub(TileConfig{16, 1, 0});
+    };
+    // Large reduced extent -> the full-axis read (H=16384) overflows UB -> DETECTED as streaming,
+    // even though cfg.h = 1. (Before R0 the reduced axis was sized from cfg.h=1 -> looked tiny.)
+    CHECK("R0: large bare reduction detected as streaming (reduced axis coupled full at h=1 cfg)",
+          peak_at_grid_cfg(16384) > UB);
+    // Small reduced extent -> genuinely materializes; confirms the peak scales with the TRUE
+    // reduced extent, not a constant (guards against dropping the coupling AND over-coupling).
+    CHECK("R0: small bare reduction materializes (peak scales with the true reduced extent)",
+          peak_at_grid_cfg(64) <= UB);
+}
+
 // --- single-core W-streaming makes a large-W reduction feasible --------------
 // A softmax whose row [W,1] of A+e overflows UB even at h=1 cannot materialize;
 // the single-core streaming chunk (the reduction accumulated chunk-by-chunk, e
@@ -2050,6 +2078,7 @@ int main() {
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_streamed_reduction_sink_no_split();
+    test_streaming_detected_via_coupled_peak();
     test_vector_streaming_reduction();
     test_vector_sensibility();
     test_visualize();

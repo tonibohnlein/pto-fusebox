@@ -1246,17 +1246,25 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   std::vector<int> pos(prob_->num_ops(), -1);
   for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
 
-  // Tile footprint: the reduced axis is coupled to its full extent (cfg forces
-  // ws_/hs_cand there), so min(cfg,dim) gives full-extent on the reduced axis and
-  // the spatial tile on the non-reduced one; a reduction output ([·,1]) collapses.
-  // Single-core streaming caps the stream axis at reduce_chunk (the band held on
-  // one core per chunk). stream_axis defaults to the reduced axis (reduction
-  // online accumulation); a pure pointwise passes an explicit axis to stream.
+  // Tile footprint. The reduced axis of a reduction is READ FULL (FIXED_1 role), so
+  // size it from the TENSOR's own extent — NOT the thin output-derived cfg on that
+  // axis. On the live grid path cfg carries the collapsed OUTPUT extent
+  // (out_H_/out_W_ = 1 for a bare reduction sink), so `min(cfg,dim)` would
+  // under-count the full-axis read by the whole reduced extent (R0 — this is what
+  // made a streamed bare reduction look "materialized"). A post-reduction tensor
+  // ([·,1]) has extent 1 on that axis, so it stays thin either way; the NON-reduced
+  // (free) axis stays cfg-tiled. reduce_chunk caps the reduced axis when streaming.
+  // A pure-pointwise stream axis (no reduction) is a TILED axis, so it keeps the cfg
+  // bound. This is the coupling the header contract promises, now honored on every path.
   const int ax = stream_axis ? stream_axis : reduced_axis_;
   auto tile_bytes = [&](size_t t) -> int64_t {
     int64_t tw = std::min(cfg.w, prob_->tensors[t].width);
     int64_t th = std::min(cfg.h, prob_->tensors[t].height);
-    if (ax == 1) tw = std::min(tw, reduce_chunk);
+    if (has_reduction_ && ax == 1)       // reduced axis = width: read full, chunk-capped
+      tw = std::min(prob_->tensors[t].width, reduce_chunk);
+    else if (has_reduction_ && ax == 2)  // reduced axis = height: read full, chunk-capped
+      th = std::min(prob_->tensors[t].height, reduce_chunk);
+    else if (ax == 1) tw = std::min(tw, reduce_chunk);   // pure-pointwise stream axis (cfg-tiled)
     else if (ax == 2) th = std::min(th, reduce_chunk);
     return tw * th * dtype_bytes(prob_->tensors[t].dtype);
   };
@@ -1810,27 +1818,20 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // height-reduction) -> red_dim.
       //
       // C2 (device-grounded): the split is emittable ONLY when the reduction
-      // MATERIALIZES its reduced band in UB. The grid cfg carries the THIN output
-      // extent on the reduced axis (a bare reduction sink collapses it to 1 —
-      // out_H_/out_W_ = 1), which UNDER-counts the full-axis read, so couple the
-      // reduced axis to reduced_extent_ before the UB-fit test. A STREAMED
-      // reduction (reduced band >> UB) lowers to a single-core chunk-accumulation
-      // loop parallelized over the FREE axis (parts_n) alone — the emit's stream
-      // path returns BEFORE the S2 atomic-add split (auto_fuse_pass.cpp:1553), so
-      // the cross-core split never fires. Costing S there is fictional and INVERTS
-      // the argmin (device probe: split-heavy/occ=1 costed cheapest but ran
-      // slowest; device-best fills cores via parts_n). Gate the split on
-      // materialization so the model rewards free-axis occupancy for streamed
-      // reductions. (Non-streamed max/row-reduction splits the emit also declines
-      // are a separate, unmeasured fidelity gap — left as-is.)
-      auto reduction_materializes = [&]() -> bool {
-        if (vbudget <= 0.0) return true;  // no UB model -> legacy (always split-eligible)
-        TileConfig coupled = cfg;         // couple the reduced axis to its full read extent
-        if (reduced_axis_ == 2) coupled.h = std::max<int64_t>(cfg.h, reduced_extent_);
-        else if (reduced_axis_ == 1) coupled.w = std::max<int64_t>(cfg.w, reduced_extent_);
-        return (double)vector_peak_ub(coupled) <= vbudget;
-      };
-      if (has_reduction_ && reduction_is_sink_ && reduction_materializes()) {
+      // MATERIALIZES its reduced band in UB. A STREAMED reduction (reduced band >>
+      // UB) lowers to a single-core chunk-accumulation loop parallelized over the
+      // FREE axis (parts_n) alone — the emit's stream path returns BEFORE the S2
+      // atomic-add split (auto_fuse_pass.cpp:1553), so the cross-core split never
+      // fires. Costing S there is fictional and INVERTS the argmin (device probe:
+      // split-heavy/occ=1 costed cheapest but ran slowest; device-best fills cores
+      // via parts_n). `vector_peak_ub` now couples the reduced axis to its full
+      // extent internally (R0), so the raw-cfg call detects streaming correctly here
+      // AND at the feasibility/compute sites — no manual coupling needed. (Non-
+      // streamed max/row-reduction splits the emit also declines are a separate,
+      // unmeasured fidelity gap — left as-is.)
+      const bool reduction_materializes = vbudget <= 0.0 /* no UB model -> legacy */
+                                          || (double)vector_peak_ub(cfg) <= vbudget;
+      if (has_reduction_ && reduction_is_sink_ && reduction_materializes) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         struct RS { double lat, eff, ddr, compute; };
         auto eval_reduce_S = [&](int64_t S) -> RS {
