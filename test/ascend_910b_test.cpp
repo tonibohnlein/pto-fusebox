@@ -1629,6 +1629,42 @@ static void test_reduction_sink_gating() {
           sg && sg->best_cost().parallel_split == 1);
 }
 
+// --- C2: a STREAMED reduction sink fills via the free axis, not a split -------
+// A reduction whose reduced axis overflows UB lowers (in the AutoFuse emit) to a
+// single-core chunk-accumulation loop parallelized over the FREE axis ALONE — the
+// emit's stream path returns before the S2 atomic-add split, so no cross-core
+// reduced-axis split is ever realized. The model must price it at
+// parallel_split == 1 and fill cores via the free-axis grid (parts_n), NOT via a
+// fictional reduced-axis split. Device probe C2: costing the split for a streamed
+// reduction inverted the argmin (split-heavy/occ=1 costed cheapest but ran the
+// SLOWEST; device-best fills cores over parts_n). Discriminating shape: a col_sum
+// with a FEW-tile free axis (W=128 -> 8 tiles < 48 cores) over a huge streamed
+// reduced axis (H=16384). Without the gate the model split the reduced axis to
+// "fill" 48 cores (fictional); with it, it fills the 8 free tiles honestly.
+static void test_streamed_reduction_sink_no_split() {
+    std::cout << "[STREAMSPLIT] streamed reduction sink fills via free axis, not a fictional split\n";
+    Problem p;
+    p.tensors = {{128, 16384}, {128, 1}};   // A[H=16384, W=128] -> col_sum m[1,128]
+    p.ops = {{OpType::Reduction, {0}, {1}}};
+    p.fast_memory_capacity = 1 << 24; set_910b(p);
+    DAG d = DAG::build(p);
+    auto sg = Subgraph::create(p, d, {0});
+    const int64_t UB = 192 * 1024;
+    // Even the NARROWEST free tile (w=16) over the full reduced axis overflows UB,
+    // so EVERY cfg for this shape streams (pure streamed reduction).
+    CHECK("STREAMSPLIT: reduced band streams (materialize overflows UB even at w=16)",
+          sg->vector_peak_ub(TileConfig{16, 16384, 0}) > UB);
+    auto r = sg->best_cost();
+    std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
+              << " lat=" << r.latency << "\n";
+    // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
+    CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
+          r.parallel_split == 1);
+    // Cores filled by the free axis (W=128 -> 8 tiles), never a fictional 48-way reduced split.
+    CHECK("STREAMSPLIT: fills via the free-axis grid (parts_n), capped by the 8 free tiles",
+          r.cores_used <= 8);
+}
+
 // --- single-core W-streaming makes a large-W reduction feasible --------------
 // A softmax whose row [W,1] of A+e overflows UB even at h=1 cannot materialize;
 // the single-core streaming chunk (the reduction accumulated chunk-by-chunk, e
@@ -2013,6 +2049,7 @@ int main() {
     test_pointwise_stream_explicit();
     test_vector_band_ub();
     test_reduction_sink_gating();
+    test_streamed_reduction_sink_no_split();
     test_vector_streaming_reduction();
     test_vector_sensibility();
     test_visualize();

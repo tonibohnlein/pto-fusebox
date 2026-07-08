@@ -1756,14 +1756,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // #reductions+1 (that was 3-4x pessimistic, masking every streamed softmax). The only
       // surcharge is a thin per-chunk correction -- the re-paid vector startup + an
       // O(ROWS*1) running max/sum rescale -- O(nchunks * #reductions) cheap work.
-      if (has_reduction_) {
-        const double budget = (double)prob_->vec_capacity;  // full UB (see vector_stream)
+      const double vbudget = (double)prob_->vec_capacity;  // full UB; reused by the split gate (C2) below
+      if (has_reduction_ && vbudget > 0.0) {
         const double peak = (double)vector_peak_ub(cfg);
-        if (budget > 0.0 && peak > budget) {
+        if (peak > vbudget) {
           int reductions = 0;
           for (auto i : ops_)
             if (prob_->ops[i].type == OpType::Reduction) reductions++;
-          const double nchunks = std::ceil(peak / budget);
+          const double nchunks = std::ceil(peak / vbudget);
           total_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
           // io_in / io_out unchanged: online streaming reads each band once (== materialized).
         }
@@ -1808,7 +1808,29 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // take the min. The partials accumulate via SetAtomicAdd (910B always has it).
       // The reduced partial is thin ([H,1] for a width-reduction, [1,W] for a
       // height-reduction) -> red_dim.
-      if (has_reduction_ && reduction_is_sink_) {
+      //
+      // C2 (device-grounded): the split is emittable ONLY when the reduction
+      // MATERIALIZES its reduced band in UB. The grid cfg carries the THIN output
+      // extent on the reduced axis (a bare reduction sink collapses it to 1 —
+      // out_H_/out_W_ = 1), which UNDER-counts the full-axis read, so couple the
+      // reduced axis to reduced_extent_ before the UB-fit test. A STREAMED
+      // reduction (reduced band >> UB) lowers to a single-core chunk-accumulation
+      // loop parallelized over the FREE axis (parts_n) alone — the emit's stream
+      // path returns BEFORE the S2 atomic-add split (auto_fuse_pass.cpp:1553), so
+      // the cross-core split never fires. Costing S there is fictional and INVERTS
+      // the argmin (device probe: split-heavy/occ=1 costed cheapest but ran
+      // slowest; device-best fills cores via parts_n). Gate the split on
+      // materialization so the model rewards free-axis occupancy for streamed
+      // reductions. (Non-streamed max/row-reduction splits the emit also declines
+      // are a separate, unmeasured fidelity gap — left as-is.)
+      auto reduction_materializes = [&]() -> bool {
+        if (vbudget <= 0.0) return true;  // no UB model -> legacy (always split-eligible)
+        TileConfig coupled = cfg;         // couple the reduced axis to its full read extent
+        if (reduced_axis_ == 2) coupled.h = std::max<int64_t>(cfg.h, reduced_extent_);
+        else if (reduced_axis_ == 1) coupled.w = std::max<int64_t>(cfg.w, reduced_extent_);
+        return (double)vector_peak_ub(coupled) <= vbudget;
+      };
+      if (has_reduction_ && reduction_is_sink_ && reduction_materializes()) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         struct RS { double lat, eff, ddr, compute; };
         auto eval_reduce_S = [&](int64_t S) -> RS {
