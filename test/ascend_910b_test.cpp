@@ -1595,8 +1595,11 @@ static void test_vector_band_ub() {
     CHECK("VBAND: ephemeral e adds on top of the boundary input", peak8 > xtile8);
     CHECK("VBAND: e band overflows UB where boundary-only would fit",
           peak8 > UB && xtile8 < UB);
-    CHECK("VBAND: a small M-band fits UB once e is counted",
-          sg->vector_peak_ub({4096, 2, 0}) <= UB);
+    // A sub-granule free tile does NOT escape the overflow: the emit allocates DMA-block-padded
+    // tiles, so h=2 pads to the same granule floor as h=8 (which assertion 2 shows overflows UB).
+    // A large reduced axis fits UB only by STREAMING it (chunked), not by shrinking the free tile.
+    CHECK("VBAND: streaming the reduced axis fits UB",
+          sg->vector_peak_ub({4096, 8, 0}, {}, {}, /*reduce_chunk=*/64, /*stream_axis=*/1) <= UB);
 }
 
 // --- reduction parallel split is SINK-ONLY -----------------------------------

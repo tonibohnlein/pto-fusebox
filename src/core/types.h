@@ -157,6 +157,12 @@ struct Problem {
     // and the per-op head/tail charges the pipeline fill of a multi-op chain
     // (e.g. softmax = exp + reduce + div).
     int64_t vec_reg_bytes = 256;      // vector register size in bytes (pto-isa 256)
+    // DMA-block granule in BYTES (Ascend 910B: 32). A vector tile's contiguous-axis byte extent
+    // must be a multiple of this, so the emit allocates AlignUp(extent, dma_block/dtype_bytes)
+    // tiles. vector_peak_ub() pads its band footprint to match — a thin free axis (e.g. an M-tile
+    // of 3 -> 8 for fp32) is otherwise under-counted ~2.7x, making a group look UB-feasible that
+    // the emit overflows. Set by the AutoFuse adapter from BackendHandler::GetVectorDmaAlignment.
+    int64_t vec_dma_align_bytes = 32;
     double vec_op_head = 0.0;         // per-op pipeline startup cycles (~14)
     double vec_op_tail = 0.0;         // per-op drain cycles (~18)
     double vec_slope_pw = 0.0;        // cycles/repeat, elementwise (~2)

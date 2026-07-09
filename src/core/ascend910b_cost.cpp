@@ -1257,6 +1257,24 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   // A pure-pointwise stream axis (no reduction) is a TILED axis, so it keeps the cfg
   // bound. This is the coupling the header contract promises, now honored on every path.
   const int ax = stream_axis ? stream_axis : reduced_axis_;
+
+  // Emit granule (elements). The AutoFuse emit allocates DMA-block-aligned tiles: the CONTIGUOUS
+  // (width) axis is always padded to `emit_gran`, and the ROW (height) axis is padded too for a
+  // REDUCTION (its tile is col-major) — see auto_fuse_pass.cpp emit_strip. Feasibility must count
+  // that padded footprint, else a thin free axis (e.g. an M-tile of 3 -> 8 for fp32, ~2.7x) is
+  // under-counted and an over-UB group looks materializable (it then overflows AllocateMemoryAddr).
+  // The whole tile chain shares the padded extent, so the emit uses the group's SMALLEST dtype
+  // (largest element granule); match it by scanning the subgraph's dtypes.
+  int64_t min_dtype_b = INT64_MAX;
+  for (int oi : dfs_order_) {
+    const Op &gop = prob_->ops[(size_t)oi];
+    for (auto in : gop.inputs) min_dtype_b = std::min(min_dtype_b, (int64_t)dtype_bytes(prob_->tensors[in].dtype));
+    min_dtype_b = std::min(min_dtype_b, (int64_t)dtype_bytes(prob_->tensors[gop.output()].dtype));
+  }
+  if (min_dtype_b == INT64_MAX) min_dtype_b = 4;  // fp32 fallback (empty subgraph shouldn't occur)
+  const int64_t emit_gran = std::max<int64_t>(1, prob_->vec_dma_align_bytes / min_dtype_b);
+  auto align_up = [](int64_t x, int64_t g) -> int64_t { return g <= 1 ? x : ((x + g - 1) / g) * g; };
+
   auto tile_bytes = [&](size_t t) -> int64_t {
     int64_t tw = std::min(cfg.w, prob_->tensors[t].width);
     int64_t th = std::min(cfg.h, prob_->tensors[t].height);
@@ -1266,7 +1284,10 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
       th = std::min(prob_->tensors[t].height, reduce_chunk);
     else if (ax == 1) tw = std::min(tw, reduce_chunk);   // pure-pointwise stream axis (cfg-tiled)
     else if (ax == 2) th = std::min(th, reduce_chunk);
-    return tw * th * dtype_bytes(prob_->tensors[t].dtype);
+    // Pad to the emit's ALLOCATED shape: width always; height only for a reduction (col-major).
+    const int64_t tw_al = align_up(tw, emit_gran);
+    const int64_t th_al = has_reduction_ ? align_up(th, emit_gran) : th;
+    return tw_al * th_al * dtype_bytes(prob_->tensors[t].dtype);
   };
 
   // Ephemeral bands resident across [producer, last in-subgraph VECTOR consumer].
