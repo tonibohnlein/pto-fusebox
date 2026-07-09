@@ -1755,6 +1755,38 @@ static void test_g1_multi_reduction_stream_decline() {
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
 }
 
+// --- G3: a spanning-output streamed reduction reads its input TWICE (A7) -------
+// A streamed reduction whose live-out SPANS the reduced axis (rowmax then sub(x,m) -> [W,H]) needs
+// the FINALIZED whole-axis stat per element, so the emit re-streams the input in an APPLY pass —
+// the input is read twice. Streamed reductions are DDR-bound, so the model must price io_in x2 for
+// the spanning case (else it under-prices the streamed group and over-fuses). Control: a pointwise
+// twin relu(x) with the SAME [W,H] input and store, which reads the input ONCE. Both stream the
+// wide W across 48 cores. With the io_in x2 the spanning/twin DDR ratio is ~2.5; WITHOUT it (the
+// spanning input read once) it is ~1.5 (a pure config difference — the reduction pins the reduced
+// axis so it tiles differently). So `spanning > 2x twin` holds iff the second input read is priced.
+static void test_g3_spanning_reduction_rereads_input() {
+    std::cout << "[G3] spanning-output streamed reduction prices a second input read (io_in x2)\n";
+    const int64_t W = 32768, H = 128;  // huge reduced W -> both stream
+    auto ddr = [&](bool spanning) -> double {
+        Problem p;
+        if (spanning) {
+            p.tensors = {{W, H}, {1, H}, {W, H}};  // x -> m=rowmax[1,H] -> s=sub(x,m)[W,H] (spans W, 2 reads)
+            p.ops = {{OpType::Reduction, {0}, {1}}, {OpType::Pointwise, {0, 1}, {2}}};
+        } else {
+            p.tensors = {{W, H}, {W, H}};  // x -> relu(x)[W,H] (pointwise twin: same store, 1 read)
+            p.ops = {{OpType::Pointwise, {0}, {1}}};
+        }
+        p.fast_memory_capacity = 1 << 24;
+        set_910b(p);
+        DAG d = DAG::build(p);
+        const std::vector<size_t> ops = spanning ? std::vector<size_t>{0, 1} : std::vector<size_t>{0};
+        return Subgraph::create(p, d, ops)->best_cost().ddr_traffic;  // both stream over the wide W
+    };
+    const double twin = ddr(false), spanning = ddr(true);
+    CHECK("G3: spanning streamed reduction reads its input twice (DDR > 2x the 1-read twin)",
+          spanning > 2.0 * twin);
+}
+
 // --- matmul sensibility invariants across a shape grid -----------------------
 // Locks the "sensible solution" properties we eyeballed: every single-matmul
 // tiling fills the cube cores, keeps k a clean divisor of K, keeps the L1
@@ -2101,6 +2133,7 @@ int main() {
     test_streaming_detected_via_coupled_peak();
     test_vector_streaming_reduction();
     test_g1_multi_reduction_stream_decline();
+    test_g3_spanning_reduction_rereads_input();
     test_vector_sensibility();
     test_visualize();
     test_two_matmul();

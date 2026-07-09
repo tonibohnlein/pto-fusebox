@@ -1804,7 +1804,37 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           }
           const double nchunks = std::ceil(peak / vbudget);
           total_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
-          // io_in / io_out unchanged: online streaming reads each band once (== materialized).
+          // G3 (A7) — scale the input read by `stream_passes`. A streamed reduction reads each input
+          // band once per pass. If EVERY live-out folds into the reduction (its extent along the
+          // reduced axis == 1: a bare col/row reduction, P1), the reduction result IS the output and
+          // ONE streamed pass suffices. If any live-out SPANS the reduced axis (extent > 1: P2 /
+          // softmax / layernorm), each output element needs the FINALIZED whole-axis statistic, so
+          // the emit re-streams the input in a second APPLY pass — the input is read TWICE. Streamed
+          // reductions are DDR-bound, so pricing that second read (io_in x2) is what keeps the model
+          // from under-costing a spanning streamed group and over-fusing. The output write stays x1.
+          // General form is `1 + depth` (chained spanning reductions); our op set has depth <= 1, so
+          // stream_passes in {1, 2}. Only io scales here: for the CUT P2 emit the stats-cone and
+          // apply-cone are DISJOINT ops (each counted once in total_compute), so compute is already
+          // right; a FUSED online path (P4) that recomputes a shared op — e.g. exp — in both cones
+          // would additionally need the apply-cone compute scaled (deferred with P4).
+          bool spans = false;
+          for (auto t : boundary_outputs_) {
+            const int64_t ext_R =
+                (reduced_axis_ == 1) ? prob_->tensors[t].width : prob_->tensors[t].height;
+            if (ext_R > 1) { spans = true; break; }
+          }
+          // MODEL-AHEAD gate (couples to allow_model_ahead_multi_reduction_stream, whose flip P4
+          // performs). The 2x-read pricing is physically correct, but the more accurate optimum for
+          // a spanning streamed reduction often routes a reduced-axis stat as a CROSS-GROUP [.,1]
+          // broadcast input, which the emit still DECLINES (the G4 broadcast gap) -> over-UB
+          // materialization. So in BUILDABLE mode (adapter sets the flag false) keep io_in x1 to
+          // avoid steering the partitioner toward a cut the emit can't yet build (e.g. a softmax cut
+          // whose 2nd group takes m=[M,1] externally). In ANALYTIC mode (default true) apply it —
+          // the honest pricing P4 needs — so it auto-activates when P4 lands and the flag flips
+          // (contract §5.2 / A7; "G3 must accompany P4"). Until G4 (cross-group broadcast emit)
+          // lands, buildable stays x1.
+          if (spans && prob_->allow_model_ahead_multi_reduction_stream)
+            io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
         }
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
