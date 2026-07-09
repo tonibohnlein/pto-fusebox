@@ -1823,18 +1823,13 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                 (reduced_axis_ == 1) ? prob_->tensors[t].width : prob_->tensors[t].height;
             if (ext_R > 1) { spans = true; break; }
           }
-          // MODEL-AHEAD gate (couples to allow_model_ahead_multi_reduction_stream, whose flip P4
-          // performs). The 2x-read pricing is physically correct, but the more accurate optimum for
-          // a spanning streamed reduction often routes a reduced-axis stat as a CROSS-GROUP [.,1]
-          // broadcast input, which the emit still DECLINES (the G4 broadcast gap) -> over-UB
-          // materialization. So in BUILDABLE mode (adapter sets the flag false) keep io_in x1 to
-          // avoid steering the partitioner toward a cut the emit can't yet build (e.g. a softmax cut
-          // whose 2nd group takes m=[M,1] externally). In ANALYTIC mode (default true) apply it —
-          // the honest pricing P4 needs — so it auto-activates when P4 lands and the flag flips
-          // (contract §5.2 / A7; "G3 must accompany P4"). Until G4 (cross-group broadcast emit)
-          // lands, buildable stays x1.
-          if (spans && prob_->allow_model_ahead_multi_reduction_stream)
-            io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
+          // Applied unconditionally now. The accurate 2×-read pricing steers the partitioner toward
+          // cuts that route a reduced-axis stat as a CROSS-GROUP [.,1] broadcast input; the emit now
+          // BUILDS those (the G4 broadcast-operand fix — auto_fuse_pass.cpp emit_strip), so the more
+          // accurate optimum is realizable in buildable mode (softmax/layernorm G1-cut pieces still
+          // build + run exactly, verified 4096/8192/16384). Was briefly gated on
+          // allow_model_ahead_multi_reduction_stream until G4 landed. (contract §5.2 / A7.)
+          if (spans) io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
         }
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
