@@ -1735,6 +1735,23 @@ static void test_vector_streaming_reduction() {
           str > 2.0 * mat && str < 3.5 * mat);
 }
 
+// --- G1: a streamed MULTI-reduction group is infeasible in BUILDABLE mode -----
+// softmax/layernorm have >1 reduction over the streamed axis. The AutoFuse emit streams only a
+// SINGLE reduction (P1/P2); the online multi-reduction path (P4) is not built. So in buildable
+// mode a streamed >1-reduction group must be INFEASIBLE (best_cost = inf) — forcing the
+// partitioner to cut it into single-reduction (streamable) + pointwise pieces (an unfused softmax
+// IS buildable) — while analytic mode (default) keeps it feasible (model-ahead, assumes P4).
+static void test_g1_multi_reduction_stream_decline() {
+    std::cout << "[G1] streamed multi-reduction (softmax) infeasible in BUILDABLE mode\n";
+    Problem p = mk_softmax(32768, 128);   // 2 reductions (max, sum), streams (huge reduced W)
+    DAG dag = DAG::build(p);
+    CHECK("G1: analytic mode prices streamed softmax feasible (model-ahead, assumes P4)",
+          std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+    p.allow_model_ahead_multi_reduction_stream = false;  // buildable: no P4 emit yet
+    CHECK("G1: buildable mode marks streamed softmax INfeasible (partitioner must cut it)",
+          !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+}
+
 // --- matmul sensibility invariants across a shape grid -----------------------
 // Locks the "sensible solution" properties we eyeballed: every single-matmul
 // tiling fills the cube cores, keeps k a clean divisor of K, keeps the L1
@@ -2080,6 +2097,7 @@ int main() {
     test_streamed_reduction_sink_no_split();
     test_streaming_detected_via_coupled_peak();
     test_vector_streaming_reduction();
+    test_g1_multi_reduction_stream_decline();
     test_vector_sensibility();
     test_visualize();
     test_two_matmul();

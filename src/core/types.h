@@ -171,6 +171,16 @@ struct Problem {
     // CostResult::uses_model_ahead_split_k flags when a chosen config used a split.
     bool allow_model_ahead_split_k = true;
 
+    // Streamed MULTI-reduction (softmax/layernorm: >1 reduction over the streamed axis) is
+    // MODEL-AHEAD of the AutoFuse emit. The emit streams only a SINGLE reduction (P1/P2); the
+    // online multi-reduction / flash path (P4) is not built. This flag gates it: true (default)
+    // = analytic mode, the cost model prices a streamed multi-reduction group as feasible
+    // (assuming P4); false = BUILDABLE mode, such a group is INFEASIBLE so best_cost/solve cut it
+    // into single-reduction (streamable) + pointwise pieces instead of a group the emit can only
+    // lower to an over-UB tile (fails at AllocateMemoryAddr — G1). Flip to false in the AutoFuse
+    // adapter (and any harness treating the winning partition as emittable).
+    bool allow_model_ahead_multi_reduction_stream = true;
+
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
 

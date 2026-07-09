@@ -1771,6 +1771,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           int reductions = 0;
           for (auto i : ops_)
             if (prob_->ops[i].type == OpType::Reduction) reductions++;
+          // G1: the AutoFuse emit streams only a SINGLE reduction (P1/P2). A group that must
+          // stream (peak > UB) with >1 reduction (softmax/layernorm) has no emittable schedule
+          // yet — the online multi-reduction path (P4) is not built. In BUILDABLE mode mark it
+          // INFEASIBLE so the partitioner cuts it into single-reduction (streamable) + pointwise
+          // pieces (an UNFUSED softmax IS buildable) instead of fusing a group the emit can only
+          // lower to an over-UB tile. Analytic mode (default) keeps it feasible (assumes P4).
+          if (reductions > 1 && !prob_->allow_model_ahead_multi_reduction_stream) {
+            result.feasible = false;
+            return result;
+          }
           const double nchunks = std::ceil(peak / vbudget);
           total_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
           // io_in / io_out unchanged: online streaming reads each band once (== materialized).
