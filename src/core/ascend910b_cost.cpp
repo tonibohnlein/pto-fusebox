@@ -1922,7 +1922,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           for (int64_t S = 2; S <= S_max; ++S) take_S(S);
         }
       }
-      result.latency = lat;
+      // C3 — per-task host launch overhead. The kernel_fill term below is per-WAVE
+      // (rounds = ceil(num_tiles/cores)), so it is FLAT for num_tiles <= cores and the model ties
+      // plans the device ranks by task count (argmin lands on the most-tasks / device-slowest plan).
+      // Charge each launched work unit (num_tiles spatial x the reduced-axis split) a small grounded
+      // overhead so best_cost separates them toward fewer tasks. Self-gates: negligible vs a big
+      // kernel's compute, comparable-to-compute for small ones. Vector-only (device-grounded here).
+      result.latency = lat + (double)num_tiles * (double)std::max(1, result.parallel_split) *
+                                 (double)prob_->per_task_overhead_cycles;
     }
     // Per-kernel pipeline fill — the DUAL of the eff core-fill incentive. A
     // tiling produces num_tiles "kernels"; each core runs ceil(num_tiles/n_cores)

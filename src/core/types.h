@@ -100,6 +100,17 @@ struct Problem {
     // (fewer tiles than cores), this penalizes over-tiling (more) — so the
     // optimum sits at ~one kernel per core. 0 => off (legacy/competition).
     int64_t kernel_fill_cost = 0;
+    // Per-TASK host launch overhead (cycles), added as num_tiles*split*per_task to the vector
+    // latency (C3). The kernel_fill term above is per-WAVE (rounds = ceil(num_tiles/cores)), so it
+    // is FLAT for num_tiles<=cores — a device probe found the model then ties plans the silicon
+    // ranks differently (the argmin lands on the most-tasks plan = device-slowest of the block).
+    // A per-task term breaks that tie toward fewer tasks, and self-gates: negligible against a big
+    // kernel's compute, comparable-to-compute for small ones (device-confirmed). Value is in the
+    // MODEL's cost-cycle scale, NOT wall us: the device's ~0.2 us/task divides by the ~6.5x
+    // model<->wall calibration (model cost under-represents wall) -> ~57 cycles; the adapter sets 64
+    // (verified to rank the three device-swept sizes correctly). Wants a tighter op-sim-vs-wall
+    // clock-anchored calibration. 0 => off. Vector-only for now.
+    int64_t per_task_overhead_cycles = 0;
     // Double-buffering is ALWAYS assumed on 910B but does NOT reserve half the
     // pool: the two ping-pong buffers together ARE the L1/UB, so feasibility uses
     // the FULL l1_capacity / vec_capacity. The overlap is realized in the emit by
