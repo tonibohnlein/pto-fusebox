@@ -1738,14 +1738,12 @@ static void test_vector_streaming_reduction() {
           str > 2.0 * mat && str < 3.5 * mat);
 }
 
-// --- G1: a streamed MULTI-reduction group is infeasible in BUILDABLE mode -----
-// softmax/layernorm have >1 reduction over the streamed axis. The AutoFuse emit streams only a
-// SINGLE reduction (P1/P2); the online multi-reduction path (P4) is not built. So in buildable
-// mode a streamed >1-reduction group must be INFEASIBLE (best_cost = inf) — forcing the
-// partitioner to cut it into single-reduction (streamable) + pointwise pieces (an unfused softmax
-// IS buildable) — while analytic mode (default) keeps it feasible (model-ahead, assumes P4).
+// --- G1/P4: streamed MULTI-reduction buildability is candidate-local ----------
+// In buildable mode a streamed >1-reduction group is infeasible unless its COMPLETE op set is an
+// exact P4 pattern supplied by the IR adapter. The analytic override retains the historical
+// model-ahead behaviour for standalone research instances.
 static void test_g1_multi_reduction_stream_decline() {
-    std::cout << "[G1] streamed multi-reduction (softmax) infeasible in BUILDABLE mode\n";
+    std::cout << "[G1/P4] streamed multi-reduction requires an exact candidate pattern\n";
     Problem p = mk_softmax(32768, 128);   // 2 reductions (max, sum), streams (huge reduced W)
     DAG dag = DAG::build(p);
     CHECK("G1: analytic mode prices streamed softmax feasible (model-ahead, assumes P4)",
@@ -1753,6 +1751,11 @@ static void test_g1_multi_reduction_stream_decline() {
     p.allow_model_ahead_multi_reduction_stream = false;  // buildable: no P4 emit yet
     CHECK("G1: buildable mode marks streamed softmax INfeasible (partitioner must cut it)",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+    p.p4_patterns.push_back({P4PatternKind::SoftmaxFlash, FlatSet<size_t>{0, 1, 2, 3}});
+    CHECK("P4: exact complete softmax pattern is buildable",
+          std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+    CHECK("P4: a different subgroup does not inherit function-level permission",
+          !std::isfinite(Subgraph::create(p, dag, {0, 1, 2})->best_cost().latency));
 }
 
 // --- G3: a spanning-output streamed reduction reads its input TWICE (A7) -------

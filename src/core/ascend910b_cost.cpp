@@ -216,6 +216,16 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   sg.dag_ = &dag;
   sg.ops_ = std::move(op_indices);
 
+  // P4 buildability is candidate-local. A subset, superset, or different group must not inherit
+  // permission merely because the surrounding function contains a P4 pattern.
+  const FlatSet<size_t> candidate_ops(sg.ops_.begin(), sg.ops_.end());
+  for (const P4Pattern &pattern : prob.p4_patterns) {
+    if (pattern.kind != P4PatternKind::None && pattern.ops == candidate_ops) {
+      sg.p4_pattern_kind_ = pattern.kind;
+      break;
+    }
+  }
+
   const size_t num_tensors = prob.num_tensors();
   const size_t num_ops = prob.num_ops();
 
@@ -1798,7 +1808,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           // INFEASIBLE so the partitioner cuts it into single-reduction (streamable) + pointwise
           // pieces (an UNFUSED softmax IS buildable) instead of fusing a group the emit can only
           // lower to an over-UB tile. Analytic mode (default) keeps it feasible (assumes P4).
-          if (reductions > 1 && !prob_->allow_model_ahead_multi_reduction_stream) {
+          const bool exact_p4 = p4_pattern_kind_ != P4PatternKind::None;
+          if (reductions > 1 && !prob_->allow_model_ahead_multi_reduction_stream && !exact_p4) {
             result.feasible = false;
             return result;
           }

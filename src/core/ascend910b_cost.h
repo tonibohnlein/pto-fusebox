@@ -264,6 +264,9 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // never emits Reduction, so these stay default on the single-context path.
   bool has_reduction_ = false;
   int reduced_axis_ = 0;
+  // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
+  // multi-reduction is buildable only under the analytic model-ahead override.
+  P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).

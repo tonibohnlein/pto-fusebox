@@ -45,6 +45,16 @@ struct Tensor {
 // concat) ops the unified-grid tiling can't fuse through — a barrier in the DAG.
 enum class OpType { MatMul, Pointwise, Reduction, Opaque };
 
+// Exact streamed multi-reduction algorithms implemented by the AutoFuse emit.
+// A P4 pattern identifies the complete op set whose semantics were proven to
+// match the emitted online algorithm, not merely a reduction family.
+enum class P4PatternKind { None, SoftmaxFlash, LayerNormWelford };
+
+struct P4Pattern {
+    P4PatternKind kind = P4PatternKind::None;
+    FlatSet<size_t> ops;
+};
+
 struct Op {
     OpType type;
     std::vector<size_t> inputs;   // tensor indices
@@ -188,15 +198,15 @@ struct Problem {
     // CostResult::uses_model_ahead_split_k flags when a chosen config used a split.
     bool allow_model_ahead_split_k = true;
 
-    // Streamed MULTI-reduction (softmax/layernorm: >1 reduction over the streamed axis) is
-    // MODEL-AHEAD of the AutoFuse emit. The emit streams only a SINGLE reduction (P1/P2); the
-    // online multi-reduction / flash path (P4) is not built. This flag gates it: true (default)
-    // = analytic mode, the cost model prices a streamed multi-reduction group as feasible
-    // (assuming P4); false = BUILDABLE mode, such a group is INFEASIBLE so best_cost/solve cut it
-    // into single-reduction (streamable) + pointwise pieces instead of a group the emit can only
-    // lower to an over-UB tile (fails at AllocateMemoryAddr — G1). Flip to false in the AutoFuse
-    // adapter (and any harness treating the winning partition as emittable).
+    // Analytic override for streamed MULTI-reduction groups. AutoFuse sets this FALSE and instead
+    // populates p4_patterns with exact candidate op sets whose semantics match a real emitted
+    // algorithm. A different candidate is infeasible and is cut into P1/P2-buildable groups.
     bool allow_model_ahead_multi_reduction_stream = true;
+
+    // Exact buildable P4 candidates found once by the IR adapter. The cost model compares the
+    // candidate subgraph's complete op set against these entries; the emitter consumes the same
+    // analysis result.
+    std::vector<P4Pattern> p4_patterns;
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }
