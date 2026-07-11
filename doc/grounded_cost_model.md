@@ -270,14 +270,14 @@ rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below th
 burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
 emit-friendly tile among efficient ones.
 
-**UB-overflow streaming (Fix 2, `vec_stream`).** When a reduction's coupled band overflows
-UB (`vector_peak_ub > vec_capacity`), the schedule streams the reduced axis in chunks. The
-real emit is **online / flash** (`pto_macro_fa_softmax`): each chunk's pointwise runs **once
-per element** and each band is read once, so `compute` and `io` are **not** multiplied by
-`#reductions + 1` (that ~3× recompute was 3–4× pessimistic — it masked every streamed
-softmax, the large-context-attention regime). The only surcharge is a thin per-chunk
-correction (re-paid vector startup + an `O(ROWS·1)` running max/sum rescale):
-`compute += nchunks · #reductions · (head+tail)`, `io` unchanged.
+**UB-overflow streaming (Fix 2, `vector_stream_plan`).** When a tile's live bands exceed UB,
+the solver derives the largest fitting chunk and records its axis, full chunks, tail, stream
+kind, and body/stats/apply loop stages in `CostResult::vector_stream`. The solution JSON emits
+this descriptor alongside `TileConfig`; the legacy `vector_stream()` API remains an axis/chunk
+view. A reduction uses online/flash statistics, so there is no naive `#reductions+1` compute
+multiplier. A folded output reads each boundary input once; a spanning output reads it again for
+the apply pass. The thin correction remains `nchunks · #reductions · (head+tail)`. Phase fields
+are descriptive in this increment; phase-aware roofline costing is the next fidelity step.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction

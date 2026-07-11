@@ -6,6 +6,25 @@
 
 using json = nlohmann::json;
 
+static const char* vector_stream_kind_name(VectorStreamKind kind) {
+    switch (kind) {
+        case VectorStreamKind::Materialized: return "materialized";
+        case VectorStreamKind::Pointwise: return "pointwise";
+        case VectorStreamKind::ReductionFolded: return "reduction_folded";
+        case VectorStreamKind::ReductionSpanning: return "reduction_spanning";
+        case VectorStreamKind::SoftmaxFlash: return "softmax_flash";
+        case VectorStreamKind::LayerNormWelford: return "layernorm_welford";
+        case VectorStreamKind::ModelAheadMultiReduction: return "model_ahead_multi_reduction";
+    }
+    return "unknown";
+}
+
+static json vector_loop_json(const VectorLoopPlan& loop) {
+    return {{"first_chunk", loop.first_chunk},
+            {"trip_count", loop.trip_count},
+            {"pipeline_stages", loop.pipeline_stages}};
+}
+
 Problem read_problem(const std::string& filename) {
     std::ifstream f(filename);
     if (!f.is_open()) {
@@ -217,12 +236,14 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["cores"]             = json::array();  // 910B cube/vector cores used per step
     j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
     j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
+    j["vector_stream"]     = json::array();  // solver-owned vector UB sub-stream plan per step
     j["tensors_to_retain"] = json::array();
     j["subgraph_latencies"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         const auto& cfg  = step.config;
+        const auto& cost = sol.step_cost(i);
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
@@ -233,11 +254,8 @@ void write_solution(const std::string& filename, const Solution& sol) {
         j["parts"].push_back({cfg.parts_m, cfg.parts_n});
         // Parallel split + cores used for this tile (cube split-K / vector
         // reduction split; 1 = pure spatial). Computed for the chosen config.
-        {
-            auto cr = step.subgraph.compute_cost(cfg);
-            j["splits"].push_back(cr.parallel_split);
-            j["cores"].push_back(cr.cores_used);
-        }
+        j["splits"].push_back(cost.parallel_split);
+        j["cores"].push_back(cost.cores_used);
         // Execution order (the fixed pebbling order) — emitted because the peak
         // working set depends on it, so downstream must materialize this order.
         {
@@ -251,25 +269,38 @@ void write_solution(const std::string& filename, const Solution& sol) {
                 std::vector<int64_t> pk;
                 step.subgraph.cube_peak_l1(cfg, &pk);  // L1-fit per-op (single core)
                 const int64_t sink = step.subgraph.sink_matmul_op();
-                auto cr = step.subgraph.compute_cost(cfg);
                 std::vector<int64_t> ks;
                 for (auto op : order)
                     // Sink: the composed per-core k (L1-fit capped by the split-K
                     // share, = granularities.k). Internals: the L1-fit single-core k.
-                    ks.push_back((int64_t)op == sink ? cr.config.k
+                    ks.push_back((int64_t)op == sink ? cost.config.k
                                  : ((size_t)op < pk.size() ? pk[op] : 0));
                 j["seq_k"].push_back(ks);
             } else if (!step.subgraph.has_matmul() && prob.num_vector_cores > 1 &&
                        prob.vec_capacity > 0) {
                 // Vector single-core k-stream: one subgraph-wide chunk along the
-                // streamed axis (the matmul-seq-k analog). Emit it per op (same
-                // value); INT64_MAX (materialized) -> 0 = "no sub-streaming".
-                const auto vs = step.subgraph.vector_stream(cfg);
-                const int64_t chunk = vs.chunk == INT64_MAX ? 0 : vs.chunk;
+                // streamed axis (the matmul-seq-k analog). Emit it per op (same value).
+                const int64_t chunk = cost.vector_stream.streamed() ? cost.vector_stream.chunk : 0;
                 j["seq_k"].push_back(std::vector<int64_t>(order.size(), chunk));
             } else {
                 j["seq_k"].push_back(nullptr);
             }
+        }
+        if (cost.vector_stream.feasible) {
+            const VectorStreamPlan& plan = cost.vector_stream;
+            j["vector_stream"].push_back(
+                {{"kind", vector_stream_kind_name(plan.kind)},
+                 {"axis", plan.axis},
+                 {"extent", plan.extent},
+                 {"chunk", plan.chunk},
+                 {"full_chunks", plan.full_chunks},
+                 {"tail", plan.tail},
+                 {"stream_passes", plan.stream_passes},
+                 {"body", vector_loop_json(plan.body)},
+                 {"stats", vector_loop_json(plan.stats)},
+                 {"apply", vector_loop_json(plan.apply)}});
+        } else {
+            j["vector_stream"].push_back(nullptr);
         }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));

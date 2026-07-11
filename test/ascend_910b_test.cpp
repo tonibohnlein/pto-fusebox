@@ -1752,10 +1752,32 @@ static void test_g1_multi_reduction_stream_decline() {
     CHECK("G1: buildable mode marks streamed softmax INfeasible (partitioner must cut it)",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
     p.p4_patterns.push_back({P4PatternKind::SoftmaxFlash, FlatSet<size_t>{0, 1, 2, 3}});
+    auto exact_softmax = Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost();
     CHECK("P4: exact complete softmax pattern is buildable",
-          std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+          std::isfinite(exact_softmax.latency));
+    const auto& stream = exact_softmax.vector_stream;
+    CHECK("P4PLAN: selected CostResult carries a feasible softmax stream plan",
+          stream.feasible && stream.kind == VectorStreamKind::SoftmaxFlash &&
+              stream.axis == 1 && stream.extent == 32768 && stream.stream_passes == 2);
+    CHECK("P4PLAN: chunk geometry exactly covers full chunks plus a serial tail",
+          stream.chunk > 0 && stream.full_chunks >= 1 &&
+              stream.full_chunks * stream.chunk + stream.tail == stream.extent);
+    CHECK("P4PLAN: stats peel chunk zero while apply rolls every full chunk",
+          stream.stats.first_chunk == 1 &&
+              stream.stats.trip_count == std::max<int64_t>(0, stream.full_chunks - 1) &&
+              stream.apply.first_chunk == 0 && stream.apply.trip_count == stream.full_chunks);
+    CHECK("P4PLAN: long softmax stats and apply phases are stage-2 pipelines",
+          stream.stats.pipeline_stages == 2 && stream.apply.pipeline_stages == 2);
     CHECK("P4: a different subgroup does not inherit function-level permission",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2})->best_cost().latency));
+
+    Problem ln = p;
+    ln.p4_patterns.clear();
+    ln.p4_patterns.push_back({P4PatternKind::LayerNormWelford, FlatSet<size_t>{0, 1, 2, 3}});
+    DAG ln_dag = DAG::build(ln);
+    auto exact_layernorm = Subgraph::create(ln, ln_dag, {0, 1, 2, 3})->best_cost();
+    CHECK("P4PLAN: adapter-supplied Welford kind survives into the selected stream plan",
+          exact_layernorm.vector_stream.kind == VectorStreamKind::LayerNormWelford);
 }
 
 // --- G3: a spanning-output streamed reduction reads its input TWICE (A7) -------
@@ -2096,13 +2118,30 @@ static void test_pointwise_stream_explicit() {
     TileConfig big{8192, 256, 0};   // whole tensor as one kernel -> overflows UB
     CHECK("PWSTREAM: large tile overflows UB", sg->vector_peak_ub(big) > UB);
     auto s = sg->vector_stream(big);
+    auto plan = sg->vector_stream_plan(big);
     CHECK("PWSTREAM: an explicit chunk is derived (streams the wider axis)",
           s.axis == 1 && s.chunk > 0 && s.chunk < 8192);
+    CHECK("PWPLAN: public stream plan preserves the compatibility axis/chunk view",
+          plan.feasible && plan.kind == VectorStreamKind::Pointwise &&
+              plan.axis == s.axis && plan.chunk == s.chunk && plan.extent == 8192);
+    CHECK("PWPLAN: geometry and body loop describe every full chunk plus the tail",
+          plan.full_chunks * plan.chunk + plan.tail == plan.extent &&
+              plan.body.first_chunk == 0 && plan.body.trip_count == plan.full_chunks);
     CHECK("PWSTREAM: the chunk actually fits UB",
           sg->vector_peak_ub(big, {}, {}, s.chunk, s.axis) <= UB);
+    TileConfig valid_big{8192, 256, 1};
+    auto cost = sg->compute_cost(valid_big);
+    CHECK("PWPLAN: compute_cost carries the derived plan without changing feasibility",
+          cost.feasible && cost.vector_stream.feasible &&
+              cost.vector_stream.chunk == plan.chunk);
     TileConfig small{128, 128, 0};  // fits UB -> materialized, no sub-stream
     CHECK("PWSTREAM: a UB-fitting tile materializes (no stream)",
           sg->vector_stream(small).axis == 0);
+    auto materialized = sg->vector_stream_plan(small);
+    CHECK("PWPLAN: materialized plan is explicit and has no loop geometry",
+          materialized.feasible && !materialized.streamed() &&
+              materialized.kind == VectorStreamKind::Materialized &&
+              materialized.chunk == 0 && materialized.body.trip_count == 0);
 }
 
 int main() {

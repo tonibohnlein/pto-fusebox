@@ -243,6 +243,46 @@ struct TileConfig {
     int64_t split_k = 0;
 };
 
+// ============================================================================
+// Derived vector streaming plan
+// ============================================================================
+
+// The algorithm realized when a vector tile does not materialize in UB. This is
+// derived from (subgraph, TileConfig, retention context) by Ascend910BCost and is
+// carried by CostResult so a downstream emitter can consume the same plan that
+// was priced. Materialized means no UB sub-stream is required.
+enum class VectorStreamKind {
+    Materialized,
+    Pointwise,
+    ReductionFolded,          // P1: the reduction result is the output
+    ReductionSpanning,        // P2: stats pass + spanning apply pass
+    SoftmaxFlash,             // P4: online (m,l) + apply
+    LayerNormWelford,         // P4: online (mean,M2,count) + apply
+    ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
+};
+
+struct VectorLoopPlan {
+    int64_t first_chunk = 0;
+    int64_t trip_count = 0;
+    int pipeline_stages = 1;  // 1 = sequential/absent, 2 = stage-2 ping-pong
+};
+
+struct VectorStreamPlan {
+    bool feasible = false;
+    VectorStreamKind kind = VectorStreamKind::Materialized;
+    int axis = 0;  // 0 = materialized, 1 = width, 2 = height
+    int64_t extent = 0;
+    int64_t chunk = 0;
+    int64_t full_chunks = 0;
+    int64_t tail = 0;
+    int stream_passes = 0;
+    VectorLoopPlan body;   // pointwise stream
+    VectorLoopPlan stats;  // P1/P2/P4 online statistics
+    VectorLoopPlan apply;  // P2/P4 spanning output
+
+    bool streamed() const { return feasible && axis != 0; }
+};
+
 // Even distribution of an axis of `dim` elements into `parts` regions, in units
 // of `granule`-element blocks. F = ceil(dim/granule) blocks split as evenly as
 // possible: `num_big` regions get (base+1) blocks, the rest get `base`. Since
@@ -288,6 +328,9 @@ struct CostResult {
     int num_spatial_tiles = 0;
     int num_k_passes = 0;
     TileConfig config;
+    // Solver-owned UB sub-stream specification for vector-only candidates. The
+    // default is infeasible/empty for cube and mixed candidates.
+    VectorStreamPlan vector_stream;
 
     // 910B parallel-roofline introspection (set by the cores>1 override). Lets
     // tests visualize the chosen strategy and the eventual emit act on it.

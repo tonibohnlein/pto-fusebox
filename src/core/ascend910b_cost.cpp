@@ -247,6 +247,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     }
     if (prob.ops[i].type == OpType::Reduction) {
       sg.has_reduction_ = true;
+      sg.reduction_count_++;
       // Reduced axis = the dim that collapses (input extent -> 1 in the output).
       size_t in0 = prob.ops[i].inputs[0], out = prob.ops[i].output();
       if (prob.tensors[out].width < prob.tensors[in0].width) {
@@ -341,6 +342,16 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   sg.boundary_inputs_  = structure.boundary_inputs();
   sg.boundary_outputs_ = structure.boundary_outputs();
   sg.ephemeral_        = structure.ephemeral();
+  if (sg.has_reduction_) {
+    for (size_t t : sg.boundary_outputs_) {
+      const int64_t ext_r = sg.reduced_axis_ == 1 ? prob.tensors[t].width
+                                                   : prob.tensors[t].height;
+      if (ext_r > 1) {
+        sg.reduction_spans_output_ = true;
+        break;
+      }
+    }
+  }
   // Local per-tensor ephemeral lookup the tiling code below indexes by tensor id.
   std::vector<bool> is_ephemeral(num_tensors, false);
   for (auto t : structure.ephemeral())
@@ -1345,18 +1356,23 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   return peak;
 }
 
-// Derive the single-core k-stream of a vector subgraph — the analog of the
-// matmul per-op seq-k. Materialize when the whole tile fits UB; else stream the
-// largest UB-fitting chunk along the coupled reduced axis (reduction) or the
-// larger tile axis (pointwise). Peak is monotone in the chunk, so binary-search.
-Ascend910BCost::VecStream Ascend910BCost::vector_stream(const TileConfig &cfg,
-                                            const FlatSet<size_t> &retained_from_prev,
-                                            const FlatSet<size_t> &retain_these) const {
+// Derive the single-core UB stream — the analog of the matmul per-op seq-k.
+// Materialize when the whole tile fits UB; otherwise stream the largest
+// UB-fitting chunk. Besides geometry, record the loop trips/stages required by
+// the emitted P1/P2/P4 algorithm. Costing does not consume those phase fields
+// yet; carrying them in CostResult is the behavior-preserving first step toward
+// one model/emit schedule contract.
+VectorStreamPlan Ascend910BCost::vector_stream_plan(
+    const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these) const {
+  VectorStreamPlan plan;
   // Full UB budget -- double-buffering streams the tile in sub-chunks (the emit
   // ping-pong), it does not reserve half the pool.
   const int64_t budget = (int64_t)prob_->vec_capacity;
-  if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget)
-    return {0, INT64_MAX};  // materialized — no sub-streaming
+  if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget) {
+    plan.feasible = true;
+    return plan;  // materialized — no sub-streaming
+  }
 
   int stream_axis;
   int64_t ext, min_chunk;
@@ -1377,7 +1393,56 @@ Ascend910BCost::VecStream Ascend910BCost::vector_stream(const TileConfig &cfg,
       best = mid; lo = mid + 1;
     } else hi = mid - 1;
   }
-  return {best >= min_chunk ? stream_axis : 0, best};  // chunk 0 => infeasible
+  if (best < min_chunk) return plan;
+
+  plan.feasible = true;
+  plan.axis = stream_axis;
+  plan.extent = ext;
+  plan.chunk = best;
+  plan.full_chunks = ext / best;
+  plan.tail = ext - plan.full_chunks * best;
+
+  const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+  const int64_t dtb = boundary_outputs_.empty()
+                          ? 4
+                          : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+  const bool double_buffer =
+      (double)cfg.w * (double)cfg.h * (double)dtb >= 2.0 * (double)vreg;
+  auto stages_for = [&](int64_t trips) { return double_buffer && trips >= 2 ? 2 : 1; };
+
+  if (!has_reduction_) {
+    plan.kind = VectorStreamKind::Pointwise;
+    plan.stream_passes = 1;
+    plan.body = {0, plan.full_chunks, stages_for(plan.full_chunks)};
+    return plan;
+  }
+
+  if (p4_pattern_kind_ == P4PatternKind::SoftmaxFlash)
+    plan.kind = VectorStreamKind::SoftmaxFlash;
+  else if (p4_pattern_kind_ == P4PatternKind::LayerNormWelford)
+    plan.kind = VectorStreamKind::LayerNormWelford;
+  else if (reduction_count_ > 1)
+    plan.kind = VectorStreamKind::ModelAheadMultiReduction;
+  else
+    plan.kind = reduction_spans_output_ ? VectorStreamKind::ReductionSpanning
+                                        : VectorStreamKind::ReductionFolded;
+
+  plan.stream_passes = reduction_spans_output_ ? 2 : 1;
+  const int64_t stats_trips = std::max<int64_t>(0, plan.full_chunks - 1);
+  plan.stats = {1, stats_trips, stages_for(stats_trips)};
+  if (reduction_spans_output_)
+    plan.apply = {0, plan.full_chunks, stages_for(plan.full_chunks)};
+  return plan;
+}
+
+Ascend910BCost::VecStream Ascend910BCost::vector_stream(
+    const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these) const {
+  const VectorStreamPlan plan =
+      vector_stream_plan(cfg, retained_from_prev, retain_these);
+  if (!plan.feasible) return {0, 0};
+  if (!plan.streamed()) return {0, INT64_MAX};
+  return {plan.axis, plan.chunk};
 }
 
 // 910B per-core two-pool feasibility (byte-based). Each core runs one tile, so
@@ -1493,8 +1558,13 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   CostResult result;
   result.config = cfg;
 
-  if (!is_valid_tiling(cfg) || !fits_on_chip(cfg, retained_from_prev, retain_these))
-    return result;
+  if (!is_valid_tiling(cfg)) return result;
+  if (has_matmul_) {
+    if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
+  } else {
+    result.vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
+    if (!result.vector_stream.feasible) return result;
+  }
   result.feasible = true;
 
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
@@ -1799,9 +1869,6 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       if (has_reduction_ && vbudget > 0.0) {
         const double peak = (double)vector_peak_ub(cfg);
         if (peak > vbudget) {
-          int reductions = 0;
-          for (auto i : ops_)
-            if (prob_->ops[i].type == OpType::Reduction) reductions++;
           // G1: the AutoFuse emit streams only a SINGLE reduction (P1/P2). A group that must
           // stream (peak > UB) with >1 reduction (softmax/layernorm) has no emittable schedule
           // yet — the online multi-reduction path (P4) is not built. In BUILDABLE mode mark it
@@ -1809,12 +1876,12 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           // pieces (an UNFUSED softmax IS buildable) instead of fusing a group the emit can only
           // lower to an over-UB tile. Analytic mode (default) keeps it feasible (assumes P4).
           const bool exact_p4 = p4_pattern_kind_ != P4PatternKind::None;
-          if (reductions > 1 && !prob_->allow_model_ahead_multi_reduction_stream && !exact_p4) {
+          if (reduction_count_ > 1 && !prob_->allow_model_ahead_multi_reduction_stream && !exact_p4) {
             result.feasible = false;
             return result;
           }
           const double nchunks = std::ceil(peak / vbudget);
-          total_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
+          total_compute += nchunks * (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
           // G3 (A7) — scale the input read by `stream_passes`. A streamed reduction reads each input
           // band once per pass. If EVERY live-out folds into the reduction (its extent along the
           // reduced axis == 1: a bare col/row reduction, P1), the reduction result IS the output and
@@ -1828,19 +1895,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           // apply-cone are DISJOINT ops (each counted once in total_compute), so compute is already
           // right; a FUSED online path (P4) that recomputes a shared op — e.g. exp — in both cones
           // would additionally need the apply-cone compute scaled (deferred with P4).
-          bool spans = false;
-          for (auto t : boundary_outputs_) {
-            const int64_t ext_R =
-                (reduced_axis_ == 1) ? prob_->tensors[t].width : prob_->tensors[t].height;
-            if (ext_R > 1) { spans = true; break; }
-          }
           // Applied unconditionally now. The accurate 2×-read pricing steers the partitioner toward
           // cuts that route a reduced-axis stat as a CROSS-GROUP [.,1] broadcast input; the emit now
           // BUILDS those (the G4 broadcast-operand fix — auto_fuse_pass.cpp emit_strip), so the more
           // accurate optimum is realizable in buildable mode (softmax/layernorm G1-cut pieces still
           // build + run exactly, verified 4096/8192/16384). Was briefly gated on
           // allow_model_ahead_multi_reduction_stream until G4 landed. (contract §5.2 / A7.)
-          if (spans) io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
+          if (reduction_spans_output_)
+            io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
         }
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
@@ -2042,11 +2104,8 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
     const double budget = (double)prob_->vec_capacity;
     const double peak = (double)vector_peak_ub(cfg, retained_from_prev, retain_these);
     if (budget > 0.0 && peak > budget) {
-      int reductions = 0;
-      for (auto i : ops_)
-        if (prob_->ops[i].type == OpType::Reduction) reductions++;
       const double nchunks = std::ceil(peak / budget);
-      vector_compute += nchunks * (double)reductions * (prob_->vec_op_head + prob_->vec_op_tail);
+      vector_compute += nchunks * (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
     }
   }
 
@@ -2289,7 +2348,6 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
   CostResult best;
   auto consider = [&](const TileConfig &cfg) {
         if (!is_valid_tiling(cfg)) return;
-        if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return;
         auto r = compute_cost(cfg, retained_from_prev, retain_these);
         if (!r.feasible) return;
         bool take;
@@ -2389,7 +2447,6 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
     const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
     const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
     if (!is_valid_tiling(cfg)) continue;
-    if (!fits_on_chip(cfg, {}, {})) continue;
     const CostResult r = compute_cost(cfg, {}, {});
     if (!r.feasible) continue;
     out.emplace_back(cfg, r);

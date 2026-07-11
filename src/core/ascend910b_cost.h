@@ -141,12 +141,15 @@ public:
                          int64_t reduce_chunk = INT64_MAX,
                          int stream_axis = 0) const;
 
-  // The derived single-core k-stream of a vector subgraph at this tiling — the
-  // analog of the matmul per-op seq-k. axis: 0 = materialized (whole tile fits
-  // UB, no sub-streaming); 1/2 = the width/height axis streamed in UB-chunks.
-  // chunk: the streaming granularity along that axis (INT64_MAX when materialized,
-  // 0 when infeasible). For a reduction the axis is the coupled reduced one; for
-  // a pure pointwise it's the larger tile axis (shrinks the footprint most).
+  // Solver-owned vector sub-stream specification. This promotes the previous
+  // axis/chunk-only VecStream calculation into the CostResult contract while
+  // retaining vector_stream() as a compatibility view for existing callers.
+  VectorStreamPlan vector_stream_plan(const TileConfig &cfg,
+                                      const FlatSet<size_t> &retained_from_prev = {},
+                                      const FlatSet<size_t> &retain_these = {}) const;
+
+  // Compatibility view: axis 0 + chunk INT64_MAX means materialized; chunk 0
+  // means infeasible, matching the historical API.
   struct VecStream { int axis = 0; int64_t chunk = 0; };
   VecStream vector_stream(const TileConfig &cfg,
                           const FlatSet<size_t> &retained_from_prev = {},
@@ -264,6 +267,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // never emits Reduction, so these stay default on the single-context path.
   bool has_reduction_ = false;
   int reduced_axis_ = 0;
+  int reduction_count_ = 0;
+  bool reduction_spans_output_ = false;
   // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
