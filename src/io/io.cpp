@@ -244,6 +244,13 @@ void write_solution(const std::string& filename, const Solution& sol) {
         const auto& step = sol.step(i);
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
+        // Emit descriptors are reconstructed only for final solution steps. The
+        // hot local-search CostResult cache intentionally stores no stream plan.
+        const VectorStreamPlan vector_plan =
+            !step.subgraph.has_matmul()
+                ? step.subgraph.vector_stream_plan(
+                      cfg, sol.retained_entering(i), step.retain_these)
+                : VectorStreamPlan{};
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
@@ -280,14 +287,14 @@ void write_solution(const std::string& filename, const Solution& sol) {
                        prob.vec_capacity > 0) {
                 // Vector single-core k-stream: one subgraph-wide chunk along the
                 // streamed axis (the matmul-seq-k analog). Emit it per op (same value).
-                const int64_t chunk = cost.vector_stream.streamed() ? cost.vector_stream.chunk : 0;
+                const int64_t chunk = vector_plan.streamed() ? vector_plan.chunk : 0;
                 j["seq_k"].push_back(std::vector<int64_t>(order.size(), chunk));
             } else {
                 j["seq_k"].push_back(nullptr);
             }
         }
-        if (cost.vector_stream.feasible) {
-            const VectorStreamPlan& plan = cost.vector_stream;
+        if (vector_plan.feasible) {
+            const VectorStreamPlan& plan = vector_plan;
             j["vector_stream"].push_back(
                 {{"kind", vector_stream_kind_name(plan.kind)},
                  {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
@@ -300,7 +307,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"full_chunks", plan.full_chunks},
                  {"tail", plan.tail},
                  {"stream_passes", plan.stream_passes},
-                 {"overlap_granted", cost.vector_overlap_granted},
+                 {"overlap_granted", plan.overlap_granted},
                  {"body", vector_loop_json(plan.body)},
                  {"stats", vector_loop_json(plan.stats)},
                  {"apply", vector_loop_json(plan.apply)}});

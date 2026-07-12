@@ -248,13 +248,14 @@ struct TileConfig {
 // ============================================================================
 
 // The algorithm realized when a vector tile does not materialize in UB. This is
-// derived from (subgraph, TileConfig, retention context) by Ascend910BCost and is
-// carried by CostResult so a downstream emitter can consume the same plan that
-// was priced. Materialized means no UB sub-stream is required.
+// derived from (subgraph, TileConfig, retention context) by Ascend910BCost. Candidate
+// pricing uses it as a stack-local value; downstream consumers re-derive it only
+// for a final or explicitly forced configuration. Materialized means no UB
+// sub-stream is required.
 enum class VectorStreamKind {
     Materialized,
     Pointwise,
-    ReductionFolded,          // P1: the reduction result is the output
+    ReductionFolded,          // P1: bare reduction or thin folded finalize
     ReductionSpanning,        // P2: stats pass + spanning apply pass
     SoftmaxFlash,             // P4: online (m,l) + apply
     LayerNormWelford,         // P4: online (mean,M2,count) + apply
@@ -286,6 +287,9 @@ struct VectorStreamPlan {
     VectorLoopPlan body;   // pointwise stream
     VectorLoopPlan stats;  // P1/P2/P4 online statistics
     VectorLoopPlan apply;  // P2/P4 spanning output
+    // True when this exact loop structure can realize max(compute, DDR).
+    // False means candidate pricing must serialize compute + DDR.
+    bool overlap_granted = false;
 
     bool streamed() const { return feasible && axis != 0; }
 };
@@ -335,13 +339,6 @@ struct CostResult {
     int num_spatial_tiles = 0;
     int num_k_passes = 0;
     TileConfig config;
-    // Solver-owned UB sub-stream specification for vector-only candidates. The
-    // default is infeasible/empty for cube and mixed candidates.
-    VectorStreamPlan vector_stream;
-    // Whether the vector roofline used max(compute, DDR). False means the
-    // emitted loop structure requires serialized compute + DDR.
-    bool vector_overlap_granted = false;
-
     // 910B parallel-roofline introspection (set by the cores>1 override). Lets
     // tests visualize the chosen strategy and the eventual emit act on it.
     int parallel_split = 1;      // cores ganged per spatial tile: matmul split-K S /

@@ -270,14 +270,14 @@ rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below th
 burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
 emit-friendly tile among efficient ones.
 
-**UB-overflow streaming (Fix 2, `vector_stream_plan`).** One derivation per candidate records the
-full pebble peak, materialize/stream choice, emitted scratch-band peak, chunk/tail, algorithm kind,
-and body/stats/apply loop stages in `CostResult::vector_stream`. Reduction chunks include the P1/P2/
-P4 accumulator, assemble, online-stat, and prefetch bands; the winning plan is consumed directly by
-AutoFuse instead of being re-derived there. A folded reduction reads each input once; a spanning one
-reads it twice. `max(compute,DDR)` is granted to a streamed reduction only when every data-moving
-phase is stage-2; otherwise it uses `compute+DDR`. Remaining fidelity work is per-phase roofline
-summing (rather than one global max) and solver-owned materialized/pointwise strip scheduling.
+**UB-overflow streaming (Fix 2, `vector_stream_plan`).** A stack-local derivation per candidate records
+the full pebble peak, materialize/stream choice, emitted scratch-band peak, chunk/tail, algorithm kind,
+and body/stats/apply loop stages. Reduction chunks include the P1/P2/P4 accumulator, assemble,
+online-stat, and prefetch bands. The local-search `CostResult` deliberately retains only cost/config
+metadata; AutoFuse re-runs the same derivation for the final or explicitly forced config. A folded
+reduction reads each input once; a spanning one reads it twice. `max(compute,DDR)` is granted only
+when every streamed data-moving phase is stage-2; otherwise it uses `compute+DDR`. Remaining fidelity
+work is per-phase roofline summing and solver-owned materialized/pointwise strip scheduling.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction

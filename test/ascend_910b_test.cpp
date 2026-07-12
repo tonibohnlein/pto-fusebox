@@ -154,6 +154,8 @@ static void test_C_pointwise_fusion() {
     double s1 = Subgraph::create(p, dag, {1})->best_cost().latency;
     std::cout << "    fused = " << fused << "  separate = " << (s0 + s1) << "\n";
     CHECK("C: fused < separate", fused < s0 + s1);
+    CHECK_EQ("C: refactor preserves fused pointwise cost", fused, 11003.7, 0.5);
+    CHECK_EQ("C: refactor preserves separate pointwise cost", s0 + s1, 22007.4, 0.5);
 }
 
 // --- D: matmul->relu (mixed) — cube->vector handoff is a DDR round-trip --------
@@ -216,6 +218,8 @@ static void test_softmax_reduction_schema() {
     std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
+    CHECK_EQ("softmax: refactor preserves fused vector cost", fused, 30073.8, 0.5);
+    CHECK_EQ("softmax: refactor preserves cut vector cost", separate, 88186.9, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -237,6 +241,7 @@ static void test_R_reduction_split() {
     // so the sink reduction splits its reduced axis ACROSS cores to fill them.
     CHECK("R: few-row reduction split-fills the vector cores",
           r.cores_used == 48 && r.parallel_split > 1);
+    CHECK_EQ("R: refactor preserves few-row reduction cost", r.latency, 10563.0, 1.0);
 }
 
 // --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
@@ -1661,6 +1666,8 @@ static void test_streamed_reduction_sink_no_split() {
     auto r = sg->best_cost();
     std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
               << " lat=" << r.latency << "\n";
+    CHECK_EQ("STREAMSPLIT: shared-plan refactor preserves calibrated latency",
+             r.latency, 101566.0, 1.0);
     // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
     CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
           r.parallel_split == 1);
@@ -1753,11 +1760,12 @@ static void test_g1_multi_reduction_stream_decline() {
     CHECK("G1: buildable mode marks streamed softmax INfeasible (partitioner must cut it)",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
     p.p4_patterns.push_back({P4PatternKind::SoftmaxFlash, FlatSet<size_t>{0, 1, 2, 3}});
-    auto exact_softmax = Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost();
+    auto exact_softmax_sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    auto exact_softmax = exact_softmax_sg->best_cost();
     CHECK("P4: exact complete softmax pattern is buildable",
           std::isfinite(exact_softmax.latency));
-    const auto& stream = exact_softmax.vector_stream;
-    CHECK("P4PLAN: selected CostResult carries a feasible softmax stream plan",
+    const auto stream = exact_softmax_sg->vector_stream_plan(exact_softmax.config);
+    CHECK("P4PLAN: winning config re-derives a feasible softmax stream plan",
           stream.feasible && stream.kind == VectorStreamKind::SoftmaxFlash &&
               stream.axis == 1 && stream.extent == 32768 && stream.stream_passes == 2);
     CHECK("P4PLAN: selected chunk peak fits UB while the materialized peak does not",
@@ -1779,9 +1787,11 @@ static void test_g1_multi_reduction_stream_decline() {
     ln.p4_patterns.clear();
     ln.p4_patterns.push_back({P4PatternKind::LayerNormWelford, FlatSet<size_t>{0, 1, 2, 3}});
     DAG ln_dag = DAG::build(ln);
-    auto exact_layernorm = Subgraph::create(ln, ln_dag, {0, 1, 2, 3})->best_cost();
+    auto exact_layernorm_sg = Subgraph::create(ln, ln_dag, {0, 1, 2, 3});
+    auto exact_layernorm = exact_layernorm_sg->best_cost();
     CHECK("P4PLAN: adapter-supplied Welford kind survives into the selected stream plan",
-          exact_layernorm.vector_stream.kind == VectorStreamKind::LayerNormWelford);
+          exact_layernorm_sg->vector_stream_plan(exact_layernorm.config).kind ==
+              VectorStreamKind::LayerNormWelford);
 }
 
 // --- G3: a spanning-output streamed reduction reads its input TWICE (A7) -------
@@ -2137,9 +2147,9 @@ static void test_pointwise_stream_explicit() {
           sg->vector_peak_ub(big, {}, {}, s.chunk, s.axis) <= UB);
     TileConfig valid_big{8192, 256, 1};
     auto cost = sg->compute_cost(valid_big);
-    CHECK("PWPLAN: compute_cost carries the derived plan without changing feasibility",
-          cost.feasible && cost.vector_stream.feasible &&
-              cost.vector_stream.chunk == plan.chunk);
+    auto rediscovered = sg->vector_stream_plan(valid_big);
+    CHECK("PWPLAN: winning config re-derives the same plan without changing feasibility",
+          cost.feasible && rediscovered.feasible && rediscovered.chunk == plan.chunk);
     TileConfig small{128, 128, 0};  // fits UB -> materialized, no sub-stream
     CHECK("PWSTREAM: a UB-fitting tile materializes (no stream)",
           sg->vector_stream(small).axis == 0);
@@ -2187,30 +2197,41 @@ static void test_vector_stream_short_loop_serializes() {
     const int64_t full_peak = sg->vector_peak_ub(cfg);
     p.vec_capacity = full_peak - 1;
     auto short_cost = sg->compute_cost(cfg);
+    auto short_plan = sg->vector_stream_plan(cfg);
     CHECK("A5PLAN: near-peak UB produces a feasible streamed P2 plan",
-          short_cost.feasible && short_cost.vector_stream.streamed() &&
-              short_cost.vector_stream.kind == VectorStreamKind::ReductionSpanning);
+          short_cost.feasible && short_plan.streamed() &&
+              short_plan.kind == VectorStreamKind::ReductionSpanning);
     CHECK("A5PLAN: at least one data-moving phase is serial",
-          short_cost.vector_stream.stats.pipeline_stages == 1 ||
-              short_cost.vector_stream.apply.pipeline_stages == 1);
+          short_plan.stats.pipeline_stages == 1 || short_plan.apply.pipeline_stages == 1);
     CHECK("A5PLAN: serial phase withholds max(compute,DDR) overlap",
-          !short_cost.vector_overlap_granted);
+          !short_plan.overlap_granted);
 
     CostResult long_cost;
+    VectorStreamPlan long_plan;
     for (int divisor = 2; divisor <= 32; divisor *= 2) {
         p.vec_capacity = full_peak / divisor;
         auto candidate = sg->compute_cost(cfg);
-        if (candidate.feasible && candidate.vector_stream.stats.pipeline_stages == 2 &&
-            candidate.vector_stream.apply.pipeline_stages == 2) {
+        auto candidate_plan = sg->vector_stream_plan(cfg);
+        if (candidate.feasible && candidate_plan.stats.pipeline_stages == 2 &&
+            candidate_plan.apply.pipeline_stages == 2) {
             long_cost = candidate;
+            long_plan = candidate_plan;
             break;
         }
     }
     CHECK("A5PLAN: smaller chunks produce stage-2 stats and apply loops",
-          long_cost.feasible && long_cost.vector_stream.stats.pipeline_stages == 2 &&
-              long_cost.vector_stream.apply.pipeline_stages == 2);
+          long_cost.feasible && long_plan.stats.pipeline_stages == 2 &&
+              long_plan.apply.pipeline_stages == 2);
     CHECK("A5PLAN: fully pipelined phases retain roofline overlap",
-          long_cost.vector_overlap_granted);
+          long_plan.overlap_granted);
+}
+
+// CostResult is the value in both million-slot local-search cache tables. Keep
+// emit-only schedule descriptors out of it; they are reconstructed for winners.
+static void test_cost_result_cache_footprint() {
+    std::cout << "[CACHESIZE] local-search CostResult stays compact\n";
+    CHECK("CACHESIZE: CostResult does not embed VectorStreamPlan",
+          sizeof(CostResult) <= 128);
 }
 
 int main() {
@@ -2239,6 +2260,7 @@ int main() {
     test_kernel_fill_one_per_core();
     test_pointwise_stream_explicit();
     test_vector_stream_short_loop_serializes();
+    test_cost_result_cache_footprint();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_streamed_reduction_sink_no_split();

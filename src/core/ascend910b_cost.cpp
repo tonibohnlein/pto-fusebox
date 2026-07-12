@@ -1365,9 +1365,10 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
 // Derive the single-core UB stream — the analog of the matmul per-op seq-k.
 // Materialize when the whole tile fits UB; otherwise stream the largest
 // UB-fitting chunk. Besides geometry, record the loop trips/stages required by
-// the emitted P1/P2/P4 algorithm. The cost consumes the same chunk/pass/stage
-// fields the emitter receives. Peak values stay in the plan so compute_cost does
-// not repeat the O(|ops|+|edges|) pebbling sweep.
+// the emitted P1/P2/P4 algorithm. Candidate costing consumes this derived value
+// immediately; final-solution consumers re-derive it from the winning config.
+// Peak values stay in the local plan so compute_cost does not repeat the
+// O(|ops|+|edges|) pebbling sweep.
 VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these) const {
@@ -1375,10 +1376,17 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   // Full UB budget -- double-buffering streams the tile in sub-chunks (the emit
   // ping-pong), it does not reserve half the pool.
   const int64_t budget = (int64_t)prob_->vec_capacity;
+  const int64_t output_dtb = boundary_outputs_.empty()
+                                 ? vector_min_dtype_bytes_
+                                 : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+  const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
+  const bool tile_double_bufferable =
+      (double)cfg.w * (double)cfg.h * (double)output_dtb >= 2.0 * (double)vreg;
   plan.full_peak_ub_bytes = vector_peak_ub(cfg, retained_from_prev, retain_these);
   if (plan.full_peak_ub_bytes <= budget) {
     plan.feasible = true;
     plan.chunk_peak_ub_bytes = plan.full_peak_ub_bytes;
+    plan.overlap_granted = tile_double_bufferable;
     return plan;  // materialized — no sub-streaming
   }
 
@@ -1417,17 +1425,14 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       return g <= 1 ? x : ((x + g - 1) / g) * g;
     };
     plan.free_tile = std::min(align_up(raw_free_tile, vector_emit_granule_), free_extent);
-    const int64_t dtb = boundary_outputs_.empty()
-                            ? vector_min_dtype_bytes_
-                            : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
     const int64_t bytes_per_element =
-        std::max<int64_t>(1, plan.stream_band_count * plan.free_tile * dtb);
+        std::max<int64_t>(1, plan.stream_band_count * plan.free_tile * output_dtb);
     const int64_t cap = budget / bytes_per_element;
     best = std::max<int64_t>(vector_emit_granule_,
                              (cap / vector_emit_granule_) * vector_emit_granule_);
     best = std::min(best, ext);
     best_peak = plan.stream_band_count * plan.free_tile *
-                align_up(best, vector_emit_granule_) * dtb;
+                align_up(best, vector_emit_granule_) * output_dtb;
     if (best <= 0 || best_peak > budget) return plan;
   } else {
     // Pointwise: stream the larger tile axis (shrinks the exact pebble footprint most).
@@ -1464,6 +1469,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   if (!has_reduction_) {
     plan.stream_passes = 1;
     plan.body = {0, plan.full_chunks, stages_for(plan.full_chunks)};
+    // Preserve the established pointwise roofline gate. Making pointwise strip
+    // stages solver-owned is a separate fidelity increment.
+    plan.overlap_granted = tile_double_bufferable;
     return plan;
   }
 
@@ -1472,6 +1480,10 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   plan.stats = {1, stats_trips, stages_for(stats_trips)};
   if (reduction_spans_output_)
     plan.apply = {0, plan.full_chunks, stages_for(plan.full_chunks)};
+  const bool stats_pipeline = plan.stats.pipeline_stages >= 2;
+  const bool apply_pipeline =
+      plan.stream_passes == 1 || plan.apply.pipeline_stages >= 2;
+  plan.overlap_granted = tile_double_bufferable && stats_pipeline && apply_pipeline;
   return plan;
 }
 
@@ -1597,13 +1609,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                   const FlatSet<size_t> &retain_these) const {
   CostResult result;
   result.config = cfg;
+  VectorStreamPlan vector_stream;
 
   if (!is_valid_tiling(cfg)) return result;
   if (has_matmul_) {
     if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
   } else {
-    result.vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
-    if (!result.vector_stream.feasible) return result;
+    vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
+    if (!vector_stream.feasible) return result;
   }
   result.feasible = true;
 
@@ -1906,7 +1919,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // surcharge is a thin per-chunk correction -- the re-paid vector startup + an
       // O(ROWS*1) running max/sum rescale -- O(nchunks * #reductions) cheap work.
       const double vbudget = (double)prob_->vec_capacity;  // full UB; reused by the split gate (C2) below
-      if (has_reduction_ && vbudget > 0.0 && result.vector_stream.streamed()) {
+      if (has_reduction_ && vbudget > 0.0 && vector_stream.streamed()) {
         // G1: a streamed multi-reduction requires either the analytic model-ahead override or an
         // exact P4 descriptor for the complete candidate. Buildable mode cuts every other shape.
         const bool exact_p4 = p4_pattern_kind_ != P4PatternKind::None;
@@ -1914,8 +1927,12 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           result.feasible = false;
           return result;
         }
-        const double nchunks = (double)result.vector_stream.full_chunks +
-                               (result.vector_stream.tail > 0 ? 1.0 : 0.0);
+        // Preserve the established cost calibration: this thin startup
+        // correction is based on full-peak/UB bands. Switching it to the exact
+        // emitted chunk count is a separate model change, not part of making
+        // the schedule derivation shared or winner-only.
+        const double nchunks =
+            std::ceil((double)vector_stream.full_peak_ub_bytes / vbudget);
         total_compute +=
             nchunks * (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
         // G3 (A7) — scale the input read by `stream_passes`. A streamed reduction reads each input
@@ -1936,7 +1953,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         // emit_strip), so the more accurate optimum is realizable in buildable mode (softmax/
         // layernorm G1-cut pieces still build + run exactly, verified 4096/8192/16384). Was briefly
         // gated on allow_model_ahead_multi_reduction_stream until G4 landed. (contract §5.2 / A7.)
-        io_in *= (double)result.vector_stream.stream_passes;
+        io_in *= (double)vector_stream.stream_passes;
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
       const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
@@ -1963,19 +1980,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // when the per-core tile streams in >= 2 SIMD-repeat chunks (>= 2*vec_reg_
       // bytes), so chunk s+1's load overlaps chunk s's compute. Too small to
       // ping-pong -> SERIALIZE (compute + DDR). BINARY: crossing grants max, no more.
-      const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
-      bool db = tile_bytes >= 2.0 * (double)vreg;
-      if (has_reduction_ && result.vector_stream.streamed()) {
-        // A5: an over-UB reduction is a sequence of emitted phases, not an abstract large tile.
-        // The stats loop peels chunk zero; the apply loop (when present) rolls all full chunks.
-        // If either data-moving loop is serial, the emitted kernel cannot realize the global
-        // compute/DDR overlap, even though the unchunked tile is larger than 2*vreg.
-        const bool stats_pipeline = result.vector_stream.stats.pipeline_stages >= 2;
-        const bool apply_pipeline = result.vector_stream.stream_passes == 1 ||
-                                    result.vector_stream.apply.pipeline_stages >= 2;
-        db = db && stats_pipeline && apply_pipeline;
-      }
-      result.vector_overlap_granted = db;
+      // The same local schedule derivation that selected chunk/pass geometry
+      // owns the A5 decision. It is deliberately not retained in CostResult:
+      // the local-search cache does not need an emit descriptor.
+      const bool db = vector_stream.overlap_granted;
       auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };
       double lat = rfl(compute_mk, ddr_io(eff, io_out));
       result.parallel_split = 1;
@@ -2003,7 +2011,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // streamed max/row-reduction splits the emit also declines are a separate,
       // unmeasured fidelity gap — left as-is.)
       const bool reduction_materializes =
-          vbudget <= 0.0 /* no UB model -> legacy */ || !result.vector_stream.streamed();
+          vbudget <= 0.0 /* no UB model -> legacy */ || !vector_stream.streamed();
       if (has_reduction_ && reduction_is_sink_ && reduction_materializes) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         struct RS { double lat, eff, ddr, compute; };

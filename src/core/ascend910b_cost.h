@@ -141,9 +141,11 @@ public:
                          int64_t reduce_chunk = INT64_MAX,
                          int stream_axis = 0) const;
 
-  // Solver-owned vector sub-stream specification. This promotes the previous
-  // axis/chunk-only VecStream calculation into the CostResult contract while
-  // retaining vector_stream() as a compatibility view for existing callers.
+  // Solver-owned vector sub-stream specification. Candidate costing derives it
+  // as a stack-local value; final-solution/forced-plan consumers call this again
+  // for the winning config. It is intentionally absent from CostResult so the
+  // local-search cache stays compact. vector_stream() remains a compatibility
+  // axis/chunk view for existing callers.
   VectorStreamPlan vector_stream_plan(const TileConfig &cfg,
                                       const FlatSet<size_t> &retained_from_prev = {},
                                       const FlatSet<size_t> &retain_these = {}) const;
