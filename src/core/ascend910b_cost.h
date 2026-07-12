@@ -119,6 +119,17 @@ public:
   int64_t cube_peak_l1(const TileConfig &cfg,
                        std::vector<int64_t> *perop_k = nullptr) const;
 
+  // Solver-owned cube algorithm for one fixed candidate and parallel split.
+  // The hot candidate path uses derive_exec() directly for the peak/per-op
+  // windows it needs to price; final/forced-solution consumers re-run the same
+  // derivation once to obtain this full emit descriptor. `parallel_split` is the
+  // CostResult::parallel_split selected for the candidate (1 = spatial only).
+  CubeSchedulePlan cube_schedule_plan(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev = {},
+      const FlatSet<size_t> &retain_these = {},
+      int64_t parallel_split = 1) const;
+
   // Vector (UB) pebble peak — the dynamic on-chip working set of a vector
   // subgraph, the analog of cube_peak_l1 for the cube. Each tensor's tile
   // footprint is [min(cfg.w,W), min(cfg.h,H)]; the reduced axis is coupled to its

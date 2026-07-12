@@ -1,7 +1,9 @@
 #include "io/io.h"
+#include "core/types.h"
 #include "solution/solution.h"
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -22,6 +24,33 @@ static const char* vector_stream_kind_name(VectorStreamKind kind) {
 static json vector_loop_json(const VectorLoopPlan& loop) {
     return {{"first_chunk", loop.first_chunk},
             {"trip_count", loop.trip_count},
+            {"pipeline_stages", loop.pipeline_stages}};
+}
+
+static const char* cube_axis_binding_name(CubeAxisBinding binding) {
+    switch (binding) {
+        case CubeAxisBinding::Full: return "full";
+        case CubeAxisBinding::SpatialM: return "spatial_m";
+        case CubeAxisBinding::SpatialN: return "spatial_n";
+        case CubeAxisBinding::ParallelK: return "parallel_k";
+        case CubeAxisBinding::SequentialK: return "sequential_k";
+    }
+    return "unknown";
+}
+
+static json cube_region_json(const CubeTensorRegionPlan& region) {
+    return {{"tensor", region.tensor},
+            {"height_binding", cube_axis_binding_name(region.height_binding)},
+            {"width_binding", cube_axis_binding_name(region.width_binding)},
+            {"height", region.height},
+            {"width", region.width}};
+}
+
+static json cube_k_loop_json(const CubeKLoopPlan& loop) {
+    return {{"l1_window_k", loop.l1_window_k},
+            {"chunk", loop.chunk},
+            {"full_chunks", loop.full_chunks},
+            {"tail", loop.tail},
             {"pipeline_stages", loop.pipeline_stages}};
 }
 
@@ -237,6 +266,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
     j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
     j["vector_stream"]     = json::array();  // solver-owned vector UB sub-stream plan per step
+    j["cube_schedule"]     = json::array();  // solver-owned cube grid/band/K-loop plan per step
     j["tensors_to_retain"] = json::array();
     j["subgraph_latencies"] = json::array();
 
@@ -251,6 +281,12 @@ void write_solution(const std::string& filename, const Solution& sol) {
                 ? step.subgraph.vector_stream_plan(
                       cfg, sol.retained_entering(i), step.retain_these)
                 : VectorStreamPlan{};
+        const CubeSchedulePlan cube_plan =
+            step.subgraph.has_matmul()
+                ? step.subgraph.cube_schedule_plan(
+                      cfg, sol.retained_entering(i), step.retain_these,
+                      cost.parallel_split)
+                : CubeSchedulePlan{};
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
@@ -313,6 +349,35 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"apply", vector_loop_json(plan.apply)}});
         } else {
             j["vector_stream"].push_back(nullptr);
+        }
+        if (cube_plan.feasible) {
+            json matmuls = json::array();
+            for (const auto& mm : cube_plan.matmuls) {
+                matmuls.push_back(
+                    {{"op", mm.op},
+                     {"is_sink", mm.is_sink},
+                     {"lhs_ephemeral", mm.lhs_ephemeral},
+                     {"rhs_ephemeral", mm.rhs_ephemeral},
+                     {"output_ephemeral", mm.output_ephemeral},
+                     {"contraction", mm.contraction},
+                     {"effective_contraction", mm.effective_contraction},
+                     {"lhs", cube_region_json(mm.lhs)},
+                     {"rhs", cube_region_json(mm.rhs)},
+                     {"output", cube_region_json(mm.output)},
+                     {"k_loop", cube_k_loop_json(mm.k_loop)}});
+            }
+            j["cube_schedule"].push_back(
+                {{"emit_compatible", cube_plan.emit_compatible},
+                 {"spatial_tiles", cube_plan.spatial_tiles},
+                 {"split_k", cube_plan.split_k},
+                 {"work_units", cube_plan.work_units},
+                 {"peak_l1_bytes", cube_plan.peak_l1_bytes},
+                 {"seed_required", cube_plan.seed_required},
+                 {"model_overlap_granted", cube_plan.model_overlap_granted},
+                 {"overlap_implementable", cube_plan.overlap_implementable},
+                 {"matmuls", matmuls}});
+        } else {
+            j["cube_schedule"].push_back(nullptr);
         }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));

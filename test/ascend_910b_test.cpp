@@ -1471,6 +1471,119 @@ static void test_exec_enumeration() {
           (double)peak > 262144.0);
 }
 
+// --- CubeSchedulePlan: one source of truth for final cube emission -----------
+// Candidate costing keeps only CostResult plus the lightweight peak/per-op-k
+// derivation. A winning/forced configuration is re-derived into this descriptor,
+// which must reproduce the same grid, L1 windows, execution order, and split.
+static void test_cube_schedule_plan() {
+    std::cout << "[CUBEPLAN] winning cube configs re-derive their emit schedule\n";
+
+    // Lone matmul: the L1 window is split into two actual load chunks. This is
+    // the implementation of the historical "implicit halving" comment and the
+    // prerequisite for the model's max(compute, DDR) roofline.
+    {
+        auto p = mk_mm(256, 256, 512, 1000);
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0});
+        CHECK("CUBEPLAN/lone: subgraph is structurally accepted", static_cast<bool>(sg));
+        if (!sg) return;
+        TileConfig cfg;
+        cfg.w = 64;
+        cfg.h = 128;
+        cfg.k = 512;
+        cfg.parts_m = 2;
+        cfg.parts_n = 4;
+        cfg.split_k = 1;
+        auto cost = sg->compute_cost(cfg);
+        auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+        std::vector<int64_t> windows;
+        const int64_t peak = sg->cube_peak_l1(cfg, &windows);
+        CHECK("CUBEPLAN/lone: fixed candidate and plan are feasible",
+              cost.feasible && plan.feasible && plan.emit_compatible);
+        CHECK("CUBEPLAN/lone: exact grid and split are retained",
+              plan.m_partition.parts == 2 && plan.n_partition.parts == 4 &&
+                  plan.spatial_tiles == 8 && plan.split_k == cost.parallel_split &&
+                  plan.work_units == plan.spatial_tiles * plan.split_k);
+        CHECK("CUBEPLAN/lone: peak and per-op L1 window come from derive_exec",
+              plan.peak_l1_bytes == peak && plan.matmuls.size() == 1 &&
+                  plan.matmuls[0].k_loop.l1_window_k == windows[0]);
+        CHECK("CUBEPLAN/lone: actual stage-2 chunks fit two-at-a-time in the window",
+              plan.matmuls[0].k_loop.pipeline_stages == 2 &&
+                  2 * plan.matmuls[0].k_loop.chunk <= plan.matmuls[0].k_loop.l1_window_k &&
+                  plan.matmuls[0].k_loop.full_chunks >= 3 && plan.overlap_implementable &&
+                  plan.model_overlap_granted);
+    }
+
+    // Left-deep chain: producer-before-consumer order, an internal per-op K
+    // window, and the shared-M/full-N ephemeral band are all explicit.
+    {
+        auto p = mk_chained(128, 8192, 64, 64, 1000, 1000);
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0, 1});
+        CHECK("CUBEPLAN/chain: subgraph is structurally accepted", static_cast<bool>(sg));
+        if (!sg) return;
+        auto cost = sg->best_cost();
+        auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+        CHECK("CUBEPLAN/chain: plan follows the solver pebbling order",
+              plan.feasible && plan.execution_order.size() == 2 &&
+                  plan.execution_order[0] == 0 && plan.execution_order[1] == 1 &&
+                  plan.matmuls.size() == 2 && plan.matmuls[0].op == 0 &&
+                  plan.matmuls[1].op == 1);
+        CHECK("CUBEPLAN/chain: internal output is a spatial-M/full-N L1 band",
+              plan.matmuls[0].output_ephemeral &&
+                  plan.matmuls[0].output.height_binding == CubeAxisBinding::SpatialM &&
+                  plan.matmuls[0].output.width_binding == CubeAxisBinding::Full);
+        CHECK("CUBEPLAN/chain: internal matmul owns its derived sequential K loop",
+              plan.matmuls[0].k_loop.l1_window_k < 8192 &&
+                  plan.matmuls[0].k_loop.chunk > 0);
+    }
+
+    // Cost-preserving extraction deliberately does not change the historical
+    // K/S>=32 roofline yet. Characterize the exact gap the follow-up phase
+    // roofline must close: one 32-wide per-core contraction has no rolled
+    // stage-2 loop even though the old scalar gate grants overlap.
+    {
+        auto p = mk_mm(64, 64, 64, 1000);
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0});
+        CHECK("CUBEPLAN/roofline-gap: subgraph is structurally accepted", static_cast<bool>(sg));
+        if (!sg) return;
+        auto cost = sg->best_cost();
+        auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+        CHECK("CUBEPLAN/roofline-gap: old K/S gate can grant overlap to a serial loop",
+              plan.feasible && plan.model_overlap_granted && !plan.overlap_implementable &&
+                  plan.matmuls.size() == 1 &&
+                  plan.matmuls[0].k_loop.pipeline_stages == 1);
+    }
+
+    // The graph layer historically accepts a matmul-produced RHS, but the old
+    // pebble/cost formula still describes every ephemeral as an M-band. The plan
+    // must expose that unsupported role instead of letting a left-chain emitter
+    // silently lower it with fictional memory/traffic.
+    {
+        Problem p;
+        p.tensors = {{64, 64}, {64, 64}, {64, 64},   // A, B, L=A@B
+                     {64, 64}, {64, 64}, {64, 64},   // C, D, R=C@D
+                     {64, 64}};                       // O=L@R
+        p.ops = {{OpType::MatMul, {0, 1}, {2}},
+                 {OpType::MatMul, {3, 4}, {5}},
+                 {OpType::MatMul, {2, 5}, {6}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0, 1, 2});
+        CHECK("CUBEPLAN/rhs: both-input-produced matmul DAG is structurally accepted",
+              static_cast<bool>(sg));
+        if (sg) {
+            auto cost = sg->best_cost();
+            auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+            CHECK("CUBEPLAN/rhs: historical M-band model is marked non-emittable for RHS producer",
+                  plan.feasible && !plan.emit_compatible && plan.matmuls.size() == 3 &&
+                      plan.matmuls.back().rhs_ephemeral);
+        }
+    }
+}
+
 // --- thread 1: single-core k-split is allowed on INTERNAL matmuls -------------
 // A chain whose internal matmul has a huge K: its full-K operand strip blows L1,
 // so the chain is feasible ONLY because the internal mm derives a SLICED k
@@ -2263,7 +2376,7 @@ static void test_vector_stream_short_loop_serializes() {
 // emit-only schedule descriptors out of it; they are reconstructed for winners.
 static void test_cost_result_cache_footprint() {
     std::cout << "[CACHESIZE] local-search CostResult stays compact\n";
-    CHECK("CACHESIZE: CostResult does not embed VectorStreamPlan",
+    CHECK("CACHESIZE: CostResult embeds neither VectorStreamPlan nor CubeSchedulePlan",
           sizeof(CostResult) <= 128);
 }
 
@@ -2283,6 +2396,7 @@ int main() {
     test_mixed_multistage_pebble();
     test_dfs_order();
     test_exec_enumeration();
+    test_cube_schedule_plan();
     test_seq_k_intermediate();
     test_peak_band_feasibility();
     test_chain_ksplit_variants();

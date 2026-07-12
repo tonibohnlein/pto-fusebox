@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include "core/subgraph_structure.h"
+#include "core/types.h"
 
 // ============================================================================
 // Utility
@@ -116,6 +117,28 @@ ByteCost MakeByteCost(const Problem* p) {
   auto cpb = [&](double bw_gibps) { return p->cube_freq_hz / (kGiB * bw_gibps); };
   return {cpb(p->bw_gm_l1), cpb(p->bw_l0c_gm), cpb(p->bw_l1_l0a),
           cpb(p->bw_l1_l0b), cpb(p->bw_gm_ub), cpb(p->bw_ub_gm)};
+}
+
+// Largest per-load K chunk that fits two ping-pong buffers in the L1 window and
+// leaves at least two rolled iterations after a serial first accumulation
+// initializes the carry. Returning 0 means the concrete emitter has no stage-2
+// steady state and must serialize. This describes emission only; the first
+// CubeSchedulePlan increment intentionally preserves the historical cost gate.
+int64_t CubePipelinedChunk(int64_t extent, int64_t window) {
+  if (extent < 48 || window < 32) return 0;
+  const int64_t limit = (std::min(window / 2, extent / 3) / 16) * 16;
+  return limit >= 16 ? limit : 0;
+}
+
+int64_t CappedSinkWindow(int64_t output_k, int64_t l1_window, int64_t split) {
+  split = std::max<int64_t>(1, split);
+  const int64_t kfrac = std::max<int64_t>(1, output_k / 16);
+  const int64_t share_k = ((kfrac + split - 1) / split) * 16;
+  const int64_t cap = std::min({l1_window, share_k, output_k});
+  for (int64_t d = (cap / 16) * 16; d >= 16; d -= 16) {
+    if (output_k % d == 0) return d;
+  }
+  return 0;
 }
 
 // Cube MAC cost of one M x N x K matmul, in cycles. Grounded: the dtype-aware
@@ -1360,6 +1383,123 @@ int64_t Ascend910BCost::cube_peak_l1(const TileConfig &cfg,
   return derive_exec(cfg, output_K_, {}, {}, perop_k);
 }
 
+CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
+    const TileConfig &cfg,
+    const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these,
+    int64_t parallel_split) const {
+  CubeSchedulePlan plan;
+  plan.config = cfg;
+  if (!has_matmul_ || has_vector_ || !is_valid_tiling(cfg)) return plan;
+
+  std::vector<int64_t> perop_window_k;
+  const int64_t peak =
+      derive_exec(cfg, output_K_, retained_from_prev, retain_these, &perop_window_k);
+  if (peak == INT64_MAX) return plan;
+
+  const int64_t parts_m = cfg.parts_m > 0
+                              ? cfg.parts_m
+                              : std::max<int64_t>(1, out_H_ / std::max<int64_t>(1, cfg.h));
+  const int64_t parts_n = cfg.parts_n > 0
+                              ? cfg.parts_n
+                              : std::max<int64_t>(1, out_W_ / std::max<int64_t>(1, cfg.w));
+  const int64_t split = std::max<int64_t>(1, parallel_split);
+  plan.feasible = true;
+  plan.emit_compatible = true;
+  plan.m_partition = partition_axis(out_H_, parts_m, grid_gran_h_);
+  plan.n_partition = partition_axis(out_W_, parts_n, grid_gran_w_);
+  plan.spatial_tiles = parts_m * parts_n;
+  plan.split_k = split;
+  plan.work_units = plan.spatial_tiles * split;
+  plan.peak_l1_bytes = peak;
+  plan.seed_required = split > 1;
+  plan.model_overlap_granted = output_K_ / split >= 32;
+  plan.overlap_implementable = true;
+  plan.execution_order = dfs_order_;
+
+  for (size_t op_idx : dfs_order_) {
+    const Op &op = prob_->ops[op_idx];
+    if (op.type != OpType::MatMul) continue;
+
+    CubeMatmulSchedule mm;
+    mm.op = op_idx;
+    mm.is_sink = is_sink_op_vec_[op_idx];
+    mm.lhs_ephemeral = ephemeral_.count(op.inputs[0]);
+    mm.rhs_ephemeral = ephemeral_.count(op.inputs[1]);
+    mm.output_ephemeral = ephemeral_.count(op.output());
+    // The historical cube pebble/reload model is a shared-M/full-N algorithm.
+    // An internally produced RHS needs a K-row/N-column band instead; record the
+    // mismatch now so the emitter cannot silently treat this as a left chain.
+    if (mm.rhs_ephemeral) plan.emit_compatible = false;
+
+    const Tensor &out = prob_->tensors[op.output()];
+    mm.contraction = op_K(op_idx);
+    mm.effective_contraction = mm.is_sink ? mm.contraction / split : mm.contraction;
+    const int64_t out_h = std::min(cfg.h, out.height);
+    const int64_t out_w = mm.output_ephemeral ? out.width : std::min(cfg.w, out.width);
+
+    mm.output.tensor = op.output();
+    mm.output.height_binding = CubeAxisBinding::SpatialM;
+    mm.output.width_binding =
+        mm.output_ephemeral ? CubeAxisBinding::Full : CubeAxisBinding::SpatialN;
+    mm.output.height = out_h;
+    mm.output.width = out_w;
+    mm.lhs.tensor = op.inputs[0];
+    mm.lhs.height_binding = CubeAxisBinding::SpatialM;
+    mm.lhs.width_binding =
+        mm.is_sink && split > 1 ? CubeAxisBinding::ParallelK
+                                : CubeAxisBinding::SequentialK;
+    mm.lhs.height = out_h;
+    mm.lhs.width = mm.effective_contraction;
+    mm.rhs.tensor = op.inputs[1];
+    mm.rhs.height_binding =
+        mm.is_sink && split > 1 ? CubeAxisBinding::ParallelK
+                                : CubeAxisBinding::SequentialK;
+    mm.rhs.width_binding =
+        mm.output_ephemeral ? CubeAxisBinding::Full : CubeAxisBinding::SpatialN;
+    mm.rhs.height = mm.effective_contraction;
+    mm.rhs.width = out_w;
+
+    int64_t window = op_idx < perop_window_k.size() && perop_window_k[op_idx] > 0
+                         ? perop_window_k[op_idx]
+                         : mm.effective_contraction;
+    if (mm.is_sink && split > 1) {
+      window = CappedSinkWindow(output_K_, window, split);
+    }
+    window = std::min(window, mm.effective_contraction);
+    mm.k_loop.l1_window_k = window;
+
+    const bool loads_boundary = !mm.lhs_ephemeral || !mm.rhs_ephemeral;
+    const int64_t db_chunk = loads_boundary
+                                 ? CubePipelinedChunk(mm.effective_contraction, window)
+                                 : 0;
+    if (db_chunk > 0) {
+      mm.k_loop.chunk = db_chunk;
+      mm.k_loop.pipeline_stages = 2;
+    } else {
+      mm.k_loop.chunk = std::max<int64_t>(16, std::min(window, mm.effective_contraction));
+      mm.k_loop.pipeline_stages = 1;
+    }
+    mm.k_loop.full_chunks = mm.effective_contraction / mm.k_loop.chunk;
+    mm.k_loop.tail = mm.effective_contraction -
+                     mm.k_loop.full_chunks * mm.k_loop.chunk;
+    if (loads_boundary && mm.k_loop.pipeline_stages != 2) {
+      plan.overlap_implementable = false;
+    }
+    plan.matmuls.push_back(mm);
+  }
+
+  if (sink_mm_op_ >= 0) {
+    for (const auto &mm : plan.matmuls) {
+      if (mm.op == static_cast<size_t>(sink_mm_op_)) {
+        plan.config.k = mm.k_loop.l1_window_k;
+        break;
+      }
+    }
+  }
+  return plan;
+}
+
 // Vector (UB) pebble peak — see the header. Same interval-overlap sweep as the
 // cube, over the UB pool: live ephemeral bands + the transient boundary tiles of
 // the running op. The matmul band bug transposed to vector — softmax's e=[W,h]
@@ -1763,10 +1903,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   CostResult result;
   result.config = cfg;
   VectorStreamPlan vector_stream;
+  std::vector<int64_t> cube_window_k;
 
   if (!is_valid_tiling(cfg)) return result;
   if (has_matmul_) {
-    if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
+    if (has_vector_) {
+      if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
+    } else if (derive_exec(cfg, output_K_, retained_from_prev, retain_these,
+                           &cube_window_k) == INT64_MAX) {
+      return result;
+    }
   } else {
     vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
     if (!vector_stream.feasible) return result;
@@ -2017,19 +2163,24 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
       // divisor of output_K_), capped for a split by the per-core fractal share
       // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
-      std::vector<int64_t> pk;
-      derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
-      const int64_t l1_k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0) ? pk[sink_mm_op_]
-                                                                     : output_K_;
+      const int64_t l1_k =
+          (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < cube_window_k.size() &&
+           cube_window_k[sink_mm_op_] > 0)
+              ? cube_window_k[sink_mm_op_]
+              : output_K_;
       if (chosen_S > 1) {
         const int64_t share_k = ((kfrac + chosen_S - 1) / chosen_S) * 16;
         int64_t per_core_k = 16;
-        for (int64_t d = std::min({l1_k, share_k, output_K_}); d >= 16; d -= 16)
+        for (int64_t d = std::min({l1_k, share_k, output_K_}); d >= 16; d -= 16) {
           if (output_K_ % d == 0) { per_core_k = d; break; }
+        }
         result.config.k = per_core_k;
       } else {
-        result.config.k = (sink_mm_op_ >= 0 && pk[sink_mm_op_] > 0) ? pk[sink_mm_op_]
-                                                                    : cfg.k;
+        result.config.k =
+            (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < cube_window_k.size() &&
+             cube_window_k[sink_mm_op_] > 0)
+                ? cube_window_k[sink_mm_op_]
+                : cfg.k;
       }
     } else {
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);

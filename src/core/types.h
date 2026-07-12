@@ -360,6 +360,85 @@ inline AxisPartition partition_axis(int64_t dim, int64_t parts, int64_t granule 
 }
 
 // ============================================================================
+// Derived cube schedule plan
+// ============================================================================
+
+// Symbolic source of one axis of a fixed tensor region. The first cube-plan
+// increment records the current model's shared-M/full-N band algorithm; keeping
+// the binding explicit makes a future role-aware general DAG implementation
+// able to distinguish an intermediate used as a left operand from one used as a
+// right operand without rediscovering that choice in the emitter.
+enum class CubeAxisBinding {
+    Full,
+    SpatialM,
+    SpatialN,
+    ParallelK,
+    SequentialK
+};
+
+struct CubeTensorRegionPlan {
+    size_t tensor = std::numeric_limits<size_t>::max();
+    CubeAxisBinding height_binding = CubeAxisBinding::Full;
+    CubeAxisBinding width_binding = CubeAxisBinding::Full;
+    int64_t height = 0;
+    int64_t width = 0;
+};
+
+struct CubeKLoopPlan {
+    // `l1_window_k` is the total contraction extent whose two ping-pong buffers
+    // fit in the L1 headroom derived by the pebble sweep. `chunk` is the actual
+    // per-iteration slice the emitter must load. They intentionally differ:
+    // the historical cost comments assume the emitter halves the resident
+    // window when overlap is granted.
+    int64_t l1_window_k = 0;
+    int64_t chunk = 0;
+    int64_t full_chunks = 0;
+    int64_t tail = 0;
+    int pipeline_stages = 1;
+};
+
+struct CubeMatmulSchedule {
+    size_t op = std::numeric_limits<size_t>::max();
+    bool is_sink = false;
+    bool lhs_ephemeral = false;
+    bool rhs_ephemeral = false;
+    bool output_ephemeral = false;
+    int64_t contraction = 0;
+    int64_t effective_contraction = 0;  // sink K/split; full K for internal ops
+    CubeTensorRegionPlan lhs;
+    CubeTensorRegionPlan rhs;
+    CubeTensorRegionPlan output;
+    CubeKLoopPlan k_loop;
+};
+
+// The solver-owned algorithm descriptor for a homogeneous cube subgraph at one
+// fixed TileConfig and split-K factor. Like VectorStreamPlan, this is rebuilt
+// only for a winning/forced solution; it is deliberately absent from
+// CostResult, the million-entry local-search cache value.
+struct CubeSchedulePlan {
+    bool feasible = false;
+    // True when every internal matmul value follows the current model's
+    // shared-M/full-N band orientation. A right-operand producer is accepted by
+    // the historical graph model but needs the role-aware increment before it
+    // can be emitted faithfully, so the first plan marks it explicitly.
+    bool emit_compatible = false;
+    TileConfig config;
+    AxisPartition m_partition;
+    AxisPartition n_partition;
+    int64_t spatial_tiles = 0;
+    int64_t split_k = 1;
+    int64_t work_units = 0;
+    int64_t peak_l1_bytes = 0;
+    bool seed_required = false;
+    // The cost-preserving descriptor records both the historical scalar
+    // roofline gate and whether the concrete emitted loops can realize it.
+    bool model_overlap_granted = false;
+    bool overlap_implementable = false;
+    std::vector<size_t> execution_order;
+    std::vector<CubeMatmulSchedule> matmuls;
+};
+
+// ============================================================================
 // Cost evaluation result
 // ============================================================================
 
