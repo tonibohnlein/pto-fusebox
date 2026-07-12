@@ -270,14 +270,14 @@ rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below th
 burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
 emit-friendly tile among efficient ones.
 
-**UB-overflow streaming (Fix 2, `vector_stream_plan`).** When a tile's live bands exceed UB,
-the solver derives the largest fitting chunk and records its axis, full chunks, tail, stream
-kind, and body/stats/apply loop stages in `CostResult::vector_stream`. The solution JSON emits
-this descriptor alongside `TileConfig`; the legacy `vector_stream()` API remains an axis/chunk
-view. A reduction uses online/flash statistics, so there is no naive `#reductions+1` compute
-multiplier. A folded output reads each boundary input once; a spanning output reads it again for
-the apply pass. The thin correction remains `nchunks · #reductions · (head+tail)`. Phase fields
-are descriptive in this increment; phase-aware roofline costing is the next fidelity step.
+**UB-overflow streaming (Fix 2, `vector_stream_plan`).** One derivation per candidate records the
+full pebble peak, materialize/stream choice, emitted scratch-band peak, chunk/tail, algorithm kind,
+and body/stats/apply loop stages in `CostResult::vector_stream`. Reduction chunks include the P1/P2/
+P4 accumulator, assemble, online-stat, and prefetch bands; the winning plan is consumed directly by
+AutoFuse instead of being re-derived there. A folded reduction reads each input once; a spanning one
+reads it twice. `max(compute,DDR)` is granted to a streamed reduction only when every data-moving
+phase is stage-2; otherwise it uses `compute+DDR`. Remaining fidelity work is per-phase roofline
+summing (rather than one global max) and solver-owned materialized/pointwise strip scheduling.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction

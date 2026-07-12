@@ -270,7 +270,14 @@ struct VectorLoopPlan {
 struct VectorStreamPlan {
     bool feasible = false;
     VectorStreamKind kind = VectorStreamKind::Materialized;
+    // Peak UB footprint before streaming and at the selected chunk. Keeping
+    // both in the derived plan lets compute_cost reuse the feasibility work
+    // instead of rescanning the pebbling order for every cost term.
+    int64_t full_peak_ub_bytes = 0;
+    int64_t chunk_peak_ub_bytes = 0;
+    int64_t stream_band_count = 0;
     int axis = 0;  // 0 = materialized, 1 = width, 2 = height
+    int64_t free_tile = 0;
     int64_t extent = 0;
     int64_t chunk = 0;
     int64_t full_chunks = 0;
@@ -331,6 +338,9 @@ struct CostResult {
     // Solver-owned UB sub-stream specification for vector-only candidates. The
     // default is infeasible/empty for cube and mixed candidates.
     VectorStreamPlan vector_stream;
+    // Whether the vector roofline used max(compute, DDR). False means the
+    // emitted loop structure requires serialized compute + DDR.
+    bool vector_overlap_granted = false;
 
     // 910B parallel-roofline introspection (set by the cores>1 override). Lets
     // tests visualize the chosen strategy and the eventual emit act on it.

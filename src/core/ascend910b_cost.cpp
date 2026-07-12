@@ -232,24 +232,31 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   std::vector<bool> is_in_sg(num_ops, false);
   std::vector<bool> is_produced(num_tensors, false);
   bool reduces_width = false, reduces_height = false;  // for reduced-axis homogeneity
+  int64_t vector_min_dtype_bytes = INT64_MAX;
 
   for (auto i : sg.ops_) {
+    const Op &candidate_op = prob.ops[i];
     is_in_sg[i] = true;
-    { size_t t = prob.ops[i].output();
+    { size_t t = candidate_op.output();
       is_produced[t] = true; }
-    if (prob.ops[i].type == OpType::Pointwise ||
-        prob.ops[i].type == OpType::Reduction)
+    for (size_t input : candidate_op.inputs)
+      vector_min_dtype_bytes =
+          std::min(vector_min_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[input].dtype));
+    vector_min_dtype_bytes = std::min(
+        vector_min_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[candidate_op.output()].dtype));
+    if (candidate_op.type == OpType::Pointwise ||
+        candidate_op.type == OpType::Reduction)
       sg.has_vector_ = true;
-    if (prob.ops[i].type == OpType::MatMul) {
+    if (candidate_op.type == OpType::MatMul) {
       sg.has_matmul_ = true;
-      int64_t Ki = prob.tensors[prob.ops[i].inputs[0]].width;
+      int64_t Ki = prob.tensors[candidate_op.inputs[0]].width;
       sg.max_K_ = std::max(sg.max_K_, Ki);
     }
-    if (prob.ops[i].type == OpType::Reduction) {
+    if (candidate_op.type == OpType::Reduction) {
       sg.has_reduction_ = true;
       sg.reduction_count_++;
       // Reduced axis = the dim that collapses (input extent -> 1 in the output).
-      size_t in0 = prob.ops[i].inputs[0], out = prob.ops[i].output();
+      size_t in0 = candidate_op.inputs[0], out = candidate_op.output();
       if (prob.tensors[out].width < prob.tensors[in0].width) {
         sg.reduced_axis_ = 1;  // width  (row reduction: [H,W] -> [H,1])
         sg.reduced_extent_ = std::max(sg.reduced_extent_, prob.tensors[in0].width);
@@ -260,6 +267,11 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         reduces_height = true;
       }
     }
+  }
+  if (vector_min_dtype_bytes != INT64_MAX) {
+    sg.vector_min_dtype_bytes_ = vector_min_dtype_bytes;
+    sg.vector_emit_granule_ =
+        std::max<int64_t>(1, prob.vec_dma_align_bytes / vector_min_dtype_bytes);
   }
 
   // 910B: subgraphs must be UNIT-HOMOGENEOUS. Cube (MatMul) and vector
@@ -1285,15 +1297,9 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   // that padded footprint, else a thin free axis (e.g. an M-tile of 3 -> 8 for fp32, ~2.7x) is
   // under-counted and an over-UB group looks materializable (it then overflows AllocateMemoryAddr).
   // The whole tile chain shares the padded extent, so the emit uses the group's SMALLEST dtype
-  // (largest element granule); match it by scanning the subgraph's dtypes.
-  int64_t min_dtype_b = INT64_MAX;
-  for (int oi : dfs_order_) {
-    const Op &gop = prob_->ops[(size_t)oi];
-    for (auto in : gop.inputs) min_dtype_b = std::min(min_dtype_b, (int64_t)dtype_bytes(prob_->tensors[in].dtype));
-    min_dtype_b = std::min(min_dtype_b, (int64_t)dtype_bytes(prob_->tensors[gop.output()].dtype));
-  }
-  if (min_dtype_b == INT64_MAX) min_dtype_b = 4;  // fp32 fallback (empty subgraph shouldn't occur)
-  const int64_t emit_gran = std::max<int64_t>(1, prob_->vec_dma_align_bytes / min_dtype_b);
+  // (largest element granule). create() caches it once per candidate subgraph; do not rescan the
+  // op DAG inside every peak query/binary-search probe.
+  const int64_t emit_gran = vector_emit_granule_;
   auto align_up = [](int64_t x, int64_t g) -> int64_t { return g <= 1 ? x : ((x + g - 1) / g) * g; };
 
   auto tile_bytes = [&](size_t t) -> int64_t {
@@ -1359,9 +1365,9 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
 // Derive the single-core UB stream — the analog of the matmul per-op seq-k.
 // Materialize when the whole tile fits UB; otherwise stream the largest
 // UB-fitting chunk. Besides geometry, record the loop trips/stages required by
-// the emitted P1/P2/P4 algorithm. Costing does not consume those phase fields
-// yet; carrying them in CostResult is the behavior-preserving first step toward
-// one model/emit schedule contract.
+// the emitted P1/P2/P4 algorithm. The cost consumes the same chunk/pass/stage
+// fields the emitter receives. Peak values stay in the plan so compute_cost does
+// not repeat the O(|ops|+|edges|) pebbling sweep.
 VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these) const {
@@ -1369,63 +1375,97 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   // Full UB budget -- double-buffering streams the tile in sub-chunks (the emit
   // ping-pong), it does not reserve half the pool.
   const int64_t budget = (int64_t)prob_->vec_capacity;
-  if (vector_peak_ub(cfg, retained_from_prev, retain_these) <= budget) {
+  plan.full_peak_ub_bytes = vector_peak_ub(cfg, retained_from_prev, retain_these);
+  if (plan.full_peak_ub_bytes <= budget) {
     plan.feasible = true;
+    plan.chunk_peak_ub_bytes = plan.full_peak_ub_bytes;
     return plan;  // materialized — no sub-streaming
   }
 
   int stream_axis;
-  int64_t ext, min_chunk;
-  if (has_reduction_) {  // reduction: stream the coupled reduced axis, min 16-granule
+  int64_t ext, best = 0, best_peak = 0;
+  if (has_reduction_) {
+    // The streamed reduction emitter has phase-specific scratch that is not present in the
+    // original tensor DAG (the persistent accumulator, P2 assemble state, and P4 online stats).
+    // Size the chunk from that emitted algorithm, not solely from the original-DAG pebble peak.
+    // This is the former emitter rule moved into the solver-owned plan:
+    //   P1 bands = |ops|+2, P2 = |ops|+5, P4 = |ops|+6.
     stream_axis = reduced_axis_;
     ext = (reduced_axis_ == 1) ? std::max(out_W_, reduced_extent_)
                                : std::max(out_H_, reduced_extent_);
-    min_chunk = 16;
-  } else {  // pointwise: stream the larger tile axis (shrinks the footprint most)
+    if (p4_pattern_kind_ == P4PatternKind::SoftmaxFlash)
+      plan.kind = VectorStreamKind::SoftmaxFlash;
+    else if (p4_pattern_kind_ == P4PatternKind::LayerNormWelford)
+      plan.kind = VectorStreamKind::LayerNormWelford;
+    else if (reduction_count_ > 1)
+      plan.kind = VectorStreamKind::ModelAheadMultiReduction;
+    else
+      plan.kind = reduction_spans_output_ ? VectorStreamKind::ReductionSpanning
+                                          : VectorStreamKind::ReductionFolded;
+
+    const int64_t extra_bands =
+        (plan.kind == VectorStreamKind::SoftmaxFlash ||
+         plan.kind == VectorStreamKind::LayerNormWelford ||
+         plan.kind == VectorStreamKind::ModelAheadMultiReduction)
+            ? 6
+            : (plan.kind == VectorStreamKind::ReductionSpanning ? 5 : 2);
+    plan.stream_band_count = (int64_t)ops_.size() + extra_bands;
+    const int64_t free_extent = reduced_axis_ == 1 ? out_H_ : out_W_;
+    const int64_t raw_free_tile =
+        reduced_axis_ == 1 ? std::min(cfg.h, out_H_) : std::min(cfg.w, out_W_);
+    auto align_up = [](int64_t x, int64_t g) {
+      return g <= 1 ? x : ((x + g - 1) / g) * g;
+    };
+    plan.free_tile = std::min(align_up(raw_free_tile, vector_emit_granule_), free_extent);
+    const int64_t dtb = boundary_outputs_.empty()
+                            ? vector_min_dtype_bytes_
+                            : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+    const int64_t bytes_per_element =
+        std::max<int64_t>(1, plan.stream_band_count * plan.free_tile * dtb);
+    const int64_t cap = budget / bytes_per_element;
+    best = std::max<int64_t>(vector_emit_granule_,
+                             (cap / vector_emit_granule_) * vector_emit_granule_);
+    best = std::min(best, ext);
+    best_peak = plan.stream_band_count * plan.free_tile *
+                align_up(best, vector_emit_granule_) * dtb;
+    if (best <= 0 || best_peak > budget) return plan;
+  } else {
+    // Pointwise: stream the larger tile axis (shrinks the exact pebble footprint most).
+    // Peak is monotone in the chunk, so binary-search the largest fitting value.
+    plan.kind = VectorStreamKind::Pointwise;
     stream_axis = (cfg.w >= cfg.h) ? 1 : 2;
     ext = (stream_axis == 1) ? std::min(cfg.w, out_W_) : std::min(cfg.h, out_H_);
-    min_chunk = 1;
+    int64_t lo = 1, hi = std::max<int64_t>(ext, 1);
+    while (lo <= hi) {
+      const int64_t mid = lo + (hi - lo) / 2;
+      const int64_t peak =
+          vector_peak_ub(cfg, retained_from_prev, retain_these, mid, stream_axis);
+      if (peak <= budget) {
+        best = mid;
+        best_peak = peak;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (best < 1) return plan;
   }
-  int64_t lo = min_chunk, hi = std::max(ext, min_chunk), best = 0;
-  while (lo <= hi) {
-    const int64_t mid = lo + (hi - lo) / 2;
-    if (vector_peak_ub(cfg, retained_from_prev, retain_these, mid, stream_axis) <= budget) {
-      best = mid; lo = mid + 1;
-    } else hi = mid - 1;
-  }
-  if (best < min_chunk) return plan;
 
   plan.feasible = true;
   plan.axis = stream_axis;
   plan.extent = ext;
   plan.chunk = best;
+  plan.chunk_peak_ub_bytes = best_peak;
   plan.full_chunks = ext / best;
   plan.tail = ext - plan.full_chunks * best;
 
-  const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-  const int64_t dtb = boundary_outputs_.empty()
-                          ? 4
-                          : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
-  const bool double_buffer =
-      (double)cfg.w * (double)cfg.h * (double)dtb >= 2.0 * (double)vreg;
-  auto stages_for = [&](int64_t trips) { return double_buffer && trips >= 2 ? 2 : 1; };
+  auto stages_for = [](int64_t trips) { return trips >= 2 ? 2 : 1; };
 
   if (!has_reduction_) {
-    plan.kind = VectorStreamKind::Pointwise;
     plan.stream_passes = 1;
     plan.body = {0, plan.full_chunks, stages_for(plan.full_chunks)};
     return plan;
   }
-
-  if (p4_pattern_kind_ == P4PatternKind::SoftmaxFlash)
-    plan.kind = VectorStreamKind::SoftmaxFlash;
-  else if (p4_pattern_kind_ == P4PatternKind::LayerNormWelford)
-    plan.kind = VectorStreamKind::LayerNormWelford;
-  else if (reduction_count_ > 1)
-    plan.kind = VectorStreamKind::ModelAheadMultiReduction;
-  else
-    plan.kind = reduction_spans_output_ ? VectorStreamKind::ReductionSpanning
-                                        : VectorStreamKind::ReductionFolded;
 
   plan.stream_passes = reduction_spans_output_ ? 2 : 1;
   const int64_t stats_trips = std::max<int64_t>(0, plan.full_chunks - 1);
@@ -1858,7 +1898,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         if (info.is_boundary_out && !retain_these.count(info.id))
           io_out += bytes * bc.ub_out; // UB->GM boundary store
       }
-      // Step 2b — UB-overflow streaming (Fix 2, vec_stream). When the reduced band can't
+      // Step 2b — UB-overflow streaming (Fix 2, vector_stream_plan). When the reduced band can't
       // materialize, the feasible schedule streams the reduced axis in chunks. The real
       // emit is ONLINE / flash (pto_macro_fa_softmax): each chunk's pointwise runs ONCE per
       // element and each band is read once, so compute and IO are NOT multiplied by
@@ -1866,44 +1906,37 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // surcharge is a thin per-chunk correction -- the re-paid vector startup + an
       // O(ROWS*1) running max/sum rescale -- O(nchunks * #reductions) cheap work.
       const double vbudget = (double)prob_->vec_capacity;  // full UB; reused by the split gate (C2) below
-      if (has_reduction_ && vbudget > 0.0) {
-        const double peak = (double)vector_peak_ub(cfg);
-        if (peak > vbudget) {
-          // G1: the AutoFuse emit streams only a SINGLE reduction (P1/P2). A group that must
-          // stream (peak > UB) with >1 reduction (softmax/layernorm) has no emittable schedule
-          // yet — the online multi-reduction path (P4) is not built. In BUILDABLE mode mark it
-          // INFEASIBLE so the partitioner cuts it into single-reduction (streamable) + pointwise
-          // pieces (an UNFUSED softmax IS buildable) instead of fusing a group the emit can only
-          // lower to an over-UB tile. Analytic mode (default) keeps it feasible (assumes P4).
-          const bool exact_p4 = p4_pattern_kind_ != P4PatternKind::None;
-          if (reduction_count_ > 1 && !prob_->allow_model_ahead_multi_reduction_stream && !exact_p4) {
-            result.feasible = false;
-            return result;
-          }
-          const double nchunks = std::ceil(peak / vbudget);
-          total_compute += nchunks * (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
-          // G3 (A7) — scale the input read by `stream_passes`. A streamed reduction reads each input
-          // band once per pass. If EVERY live-out folds into the reduction (its extent along the
-          // reduced axis == 1: a bare col/row reduction, P1), the reduction result IS the output and
-          // ONE streamed pass suffices. If any live-out SPANS the reduced axis (extent > 1: P2 /
-          // softmax / layernorm), each output element needs the FINALIZED whole-axis statistic, so
-          // the emit re-streams the input in a second APPLY pass — the input is read TWICE. Streamed
-          // reductions are DDR-bound, so pricing that second read (io_in x2) is what keeps the model
-          // from under-costing a spanning streamed group and over-fusing. The output write stays x1.
-          // General form is `1 + depth` (chained spanning reductions); our op set has depth <= 1, so
-          // stream_passes in {1, 2}. Only io scales here: for the CUT P2 emit the stats-cone and
-          // apply-cone are DISJOINT ops (each counted once in total_compute), so compute is already
-          // right; a FUSED online path (P4) that recomputes a shared op — e.g. exp — in both cones
-          // would additionally need the apply-cone compute scaled (deferred with P4).
-          // Applied unconditionally now. The accurate 2×-read pricing steers the partitioner toward
-          // cuts that route a reduced-axis stat as a CROSS-GROUP [.,1] broadcast input; the emit now
-          // BUILDS those (the G4 broadcast-operand fix — auto_fuse_pass.cpp emit_strip), so the more
-          // accurate optimum is realizable in buildable mode (softmax/layernorm G1-cut pieces still
-          // build + run exactly, verified 4096/8192/16384). Was briefly gated on
-          // allow_model_ahead_multi_reduction_stream until G4 landed. (contract §5.2 / A7.)
-          if (reduction_spans_output_)
-            io_in *= 2.0;  // stream_passes = 2: online-stats pass + apply pass
+      if (has_reduction_ && vbudget > 0.0 && result.vector_stream.streamed()) {
+        // G1: a streamed multi-reduction requires either the analytic model-ahead override or an
+        // exact P4 descriptor for the complete candidate. Buildable mode cuts every other shape.
+        const bool exact_p4 = p4_pattern_kind_ != P4PatternKind::None;
+        if (reduction_count_ > 1 && !prob_->allow_model_ahead_multi_reduction_stream && !exact_p4) {
+          result.feasible = false;
+          return result;
         }
+        const double nchunks = (double)result.vector_stream.full_chunks +
+                               (result.vector_stream.tail > 0 ? 1.0 : 0.0);
+        total_compute +=
+            nchunks * (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
+        // G3 (A7) — scale the input read by `stream_passes`. A streamed reduction reads each input
+        // band once per pass. If EVERY live-out folds into the reduction (its extent along the
+        // reduced axis == 1: a bare col/row reduction or thin finalize, P1), ONE streamed pass
+        // suffices. If any live-out SPANS the reduced axis (extent > 1: P2 / softmax / layernorm),
+        // each output element needs the FINALIZED whole-axis statistic, so the emit re-streams the
+        // input in a second APPLY pass — the input is read TWICE. Streamed reductions are DDR-bound,
+        // so pricing that second read (io_in x2) keeps the model from under-costing a spanning group
+        // and over-fusing. The output write stays x1. General form is `1 + depth` (chained spanning
+        // reductions); our op set has depth <= 1, so stream_passes in {1, 2}. Only io scales here:
+        // for the CUT P2 emit the stats-cone and apply-cone are DISJOINT ops (each counted once in
+        // total_compute), so compute is already right; a FUSED online path (P4) that recomputes a
+        // shared op — e.g. exp — in both cones would additionally need the apply-cone compute scaled
+        // (deferred with P4). Applied unconditionally now. The accurate 2×-read pricing steers the
+        // partitioner toward cuts that route a reduced-axis stat as a CROSS-GROUP [.,1] broadcast
+        // input; the emit now BUILDS those (the G4 broadcast-operand fix — auto_fuse_pass.cpp
+        // emit_strip), so the more accurate optimum is realizable in buildable mode (softmax/
+        // layernorm G1-cut pieces still build + run exactly, verified 4096/8192/16384). Was briefly
+        // gated on allow_model_ahead_multi_reduction_stream until G4 landed. (contract §5.2 / A7.)
+        io_in *= (double)result.vector_stream.stream_passes;
       }
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
       const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
@@ -1931,7 +1964,18 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // bytes), so chunk s+1's load overlaps chunk s's compute. Too small to
       // ping-pong -> SERIALIZE (compute + DDR). BINARY: crossing grants max, no more.
       const double tile_bytes = (double)cfg.w * (double)cfg.h * (double)dtb;
-      const bool db = tile_bytes >= 2.0 * (double)vreg;
+      bool db = tile_bytes >= 2.0 * (double)vreg;
+      if (has_reduction_ && result.vector_stream.streamed()) {
+        // A5: an over-UB reduction is a sequence of emitted phases, not an abstract large tile.
+        // The stats loop peels chunk zero; the apply loop (when present) rolls all full chunks.
+        // If either data-moving loop is serial, the emitted kernel cannot realize the global
+        // compute/DDR overlap, even though the unchunked tile is larger than 2*vreg.
+        const bool stats_pipeline = result.vector_stream.stats.pipeline_stages >= 2;
+        const bool apply_pipeline = result.vector_stream.stream_passes == 1 ||
+                                    result.vector_stream.apply.pipeline_stages >= 2;
+        db = db && stats_pipeline && apply_pipeline;
+      }
+      result.vector_overlap_granted = db;
       auto rfl = [&](double comp, double dram) { return db ? std::max(comp, dram) : comp + dram; };
       double lat = rfl(compute_mk, ddr_io(eff, io_out));
       result.parallel_split = 1;
@@ -1958,8 +2002,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // AND at the feasibility/compute sites — no manual coupling needed. (Non-
       // streamed max/row-reduction splits the emit also declines are a separate,
       // unmeasured fidelity gap — left as-is.)
-      const bool reduction_materializes = vbudget <= 0.0 /* no UB model -> legacy */
-                                          || (double)vector_peak_ub(cfg) <= vbudget;
+      const bool reduction_materializes =
+          vbudget <= 0.0 /* no UB model -> legacy */ || !result.vector_stream.streamed();
       if (has_reduction_ && reduction_is_sink_ && reduction_materializes) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         struct RS { double lat, eff, ddr, compute; };

@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <numeric>
 #include <vector>
 
 static int g_pass = 0, g_fail = 0;
@@ -1759,6 +1760,9 @@ static void test_g1_multi_reduction_stream_decline() {
     CHECK("P4PLAN: selected CostResult carries a feasible softmax stream plan",
           stream.feasible && stream.kind == VectorStreamKind::SoftmaxFlash &&
               stream.axis == 1 && stream.extent == 32768 && stream.stream_passes == 2);
+    CHECK("P4PLAN: selected chunk peak fits UB while the materialized peak does not",
+          stream.full_peak_ub_bytes > p.vec_capacity &&
+              stream.chunk_peak_ub_bytes <= p.vec_capacity);
     CHECK("P4PLAN: chunk geometry exactly covers full chunks plus a serial tail",
           stream.chunk > 0 && stream.full_chunks >= 1 &&
               stream.full_chunks * stream.chunk + stream.tail == stream.extent);
@@ -2124,6 +2128,8 @@ static void test_pointwise_stream_explicit() {
     CHECK("PWPLAN: public stream plan preserves the compatibility axis/chunk view",
           plan.feasible && plan.kind == VectorStreamKind::Pointwise &&
               plan.axis == s.axis && plan.chunk == s.chunk && plan.extent == 8192);
+    CHECK("PWPLAN: peak accounting is cached on the selected plan",
+          plan.full_peak_ub_bytes > UB && plan.chunk_peak_ub_bytes <= UB);
     CHECK("PWPLAN: geometry and body loop describe every full chunk plus the tail",
           plan.full_chunks * plan.chunk + plan.tail == plan.extent &&
               plan.body.first_chunk == 0 && plan.body.trip_count == plan.full_chunks);
@@ -2142,6 +2148,69 @@ static void test_pointwise_stream_explicit() {
           materialized.feasible && !materialized.streamed() &&
               materialized.kind == VectorStreamKind::Materialized &&
               materialized.chunk == 0 && materialized.body.trip_count == 0);
+}
+
+// --- A5: a large abstract tile does not grant overlap to serial stream phases ---
+// Keep many pointwise branches live across one reduction so the full-DAG UB peak is close to the
+// emitted P2 stream-band peak. With UB set just below the materialized peak, the selected chunk is
+// large enough that stats/apply have fewer than two rolled iterations. The old whole-tile byte gate
+// still says "double buffer"; the plan-aware gate must nevertheless serialize compute + DDR.
+static void test_vector_stream_short_loop_serializes() {
+    std::cout << "[A5PLAN] short streamed phases do not receive roofline overlap\n";
+    constexpr int64_t W = 4096, H = 1;
+    Problem p;
+    p.tensors.push_back({W, H});  // x
+    std::vector<size_t> branches;
+    for (int i = 0; i < 16; ++i) {
+        p.tensors.push_back({W, H});
+        const size_t out = p.tensors.size() - 1;
+        p.ops.push_back({OpType::Pointwise, {0}, {out}});
+        branches.push_back(out);
+    }
+    p.tensors.push_back({1, H});
+    const size_t reduced = p.tensors.size() - 1;
+    p.ops.push_back({OpType::Reduction, {0}, {reduced}});
+    p.tensors.push_back({W, H});
+    const size_t output = p.tensors.size() - 1;
+    std::vector<size_t> sink_inputs = branches;
+    sink_inputs.push_back(reduced);
+    p.ops.push_back({OpType::Pointwise, std::move(sink_inputs), {output}});
+    p.fast_memory_capacity = 1LL << 30;
+    set_910b(p);
+
+    DAG dag = DAG::build(p);
+    std::vector<size_t> all_ops(p.ops.size());
+    std::iota(all_ops.begin(), all_ops.end(), 0);
+    auto sg = Subgraph::create(p, dag, all_ops);
+    CHECK("A5PLAN: fan-out reduction candidate is valid", (bool)sg);
+    const TileConfig cfg{W, H, 1};
+    const int64_t full_peak = sg->vector_peak_ub(cfg);
+    p.vec_capacity = full_peak - 1;
+    auto short_cost = sg->compute_cost(cfg);
+    CHECK("A5PLAN: near-peak UB produces a feasible streamed P2 plan",
+          short_cost.feasible && short_cost.vector_stream.streamed() &&
+              short_cost.vector_stream.kind == VectorStreamKind::ReductionSpanning);
+    CHECK("A5PLAN: at least one data-moving phase is serial",
+          short_cost.vector_stream.stats.pipeline_stages == 1 ||
+              short_cost.vector_stream.apply.pipeline_stages == 1);
+    CHECK("A5PLAN: serial phase withholds max(compute,DDR) overlap",
+          !short_cost.vector_overlap_granted);
+
+    CostResult long_cost;
+    for (int divisor = 2; divisor <= 32; divisor *= 2) {
+        p.vec_capacity = full_peak / divisor;
+        auto candidate = sg->compute_cost(cfg);
+        if (candidate.feasible && candidate.vector_stream.stats.pipeline_stages == 2 &&
+            candidate.vector_stream.apply.pipeline_stages == 2) {
+            long_cost = candidate;
+            break;
+        }
+    }
+    CHECK("A5PLAN: smaller chunks produce stage-2 stats and apply loops",
+          long_cost.feasible && long_cost.vector_stream.stats.pipeline_stages == 2 &&
+              long_cost.vector_stream.apply.pipeline_stages == 2);
+    CHECK("A5PLAN: fully pipelined phases retain roofline overlap",
+          long_cost.vector_overlap_granted);
 }
 
 int main() {
@@ -2169,6 +2238,7 @@ int main() {
     test_mixed_axis_reduction_rejected();
     test_kernel_fill_one_per_core();
     test_pointwise_stream_explicit();
+    test_vector_stream_short_loop_serializes();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_streamed_reduction_sink_no_split();

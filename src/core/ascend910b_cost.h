@@ -269,6 +269,10 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int reduced_axis_ = 0;
   int reduction_count_ = 0;
   bool reduction_spans_output_ = false;
+  // Candidate-invariant vector layout facts. Cached once in create() because
+  // vector_peak_ub() is called repeatedly while evaluating tile candidates.
+  int64_t vector_min_dtype_bytes_ = 4;
+  int64_t vector_emit_granule_ = 1;
   // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;

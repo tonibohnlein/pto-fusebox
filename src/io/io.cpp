@@ -290,12 +290,17 @@ void write_solution(const std::string& filename, const Solution& sol) {
             const VectorStreamPlan& plan = cost.vector_stream;
             j["vector_stream"].push_back(
                 {{"kind", vector_stream_kind_name(plan.kind)},
+                 {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
+                 {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
+                 {"stream_band_count", plan.stream_band_count},
                  {"axis", plan.axis},
+                 {"free_tile", plan.free_tile},
                  {"extent", plan.extent},
                  {"chunk", plan.chunk},
                  {"full_chunks", plan.full_chunks},
                  {"tail", plan.tail},
                  {"stream_passes", plan.stream_passes},
+                 {"overlap_granted", cost.vector_overlap_granted},
                  {"body", vector_loop_json(plan.body)},
                  {"stats", vector_loop_json(plan.stats)},
                  {"apply", vector_loop_json(plan.apply)}});
