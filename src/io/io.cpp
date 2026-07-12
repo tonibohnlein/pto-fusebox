@@ -224,6 +224,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("vec_op_tail"))      p.vec_op_tail      = j["vec_op_tail"].get<double>();
     if (j.contains("vec_slope_pw"))     p.vec_slope_pw     = j["vec_slope_pw"].get<double>();
     if (j.contains("vec_slope_reduce")) p.vec_slope_reduce = j["vec_slope_reduce"].get<double>();
+    if (j.contains("require_uniform_cube_dag_grid")) {
+      p.require_uniform_cube_dag_grid = j["require_uniform_cube_dag_grid"].get<bool>();
+    }
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
@@ -353,29 +356,32 @@ void write_solution(const std::string& filename, const Solution& sol) {
         if (cube_plan.feasible) {
             json matmuls = json::array();
             for (const auto& mm : cube_plan.matmuls) {
-                matmuls.push_back(
-                    {{"op", mm.op},
-                     {"is_sink", mm.is_sink},
-                     {"lhs_ephemeral", mm.lhs_ephemeral},
-                     {"rhs_ephemeral", mm.rhs_ephemeral},
-                     {"output_ephemeral", mm.output_ephemeral},
-                     {"contraction", mm.contraction},
-                     {"effective_contraction", mm.effective_contraction},
-                     {"lhs", cube_region_json(mm.lhs)},
-                     {"rhs", cube_region_json(mm.rhs)},
-                     {"output", cube_region_json(mm.output)},
-                     {"k_loop", cube_k_loop_json(mm.k_loop)}});
+              matmuls.push_back({{"instance", mm.instance},
+                                 {"op", mm.op},
+                                 {"lhs_producer", mm.lhs_producer},
+                                 {"rhs_producer", mm.rhs_producer},
+                                 {"is_sink", mm.is_sink},
+                                 {"lhs_ephemeral", mm.lhs_ephemeral},
+                                 {"rhs_ephemeral", mm.rhs_ephemeral},
+                                 {"output_ephemeral", mm.output_ephemeral},
+                                 {"contraction", mm.contraction},
+                                 {"effective_contraction", mm.effective_contraction},
+                                 {"lhs", cube_region_json(mm.lhs)},
+                                 {"rhs", cube_region_json(mm.rhs)},
+                                 {"output", cube_region_json(mm.output)},
+                                 {"k_loop", cube_k_loop_json(mm.k_loop)}});
             }
-            j["cube_schedule"].push_back(
-                {{"emit_compatible", cube_plan.emit_compatible},
-                 {"spatial_tiles", cube_plan.spatial_tiles},
-                 {"split_k", cube_plan.split_k},
-                 {"work_units", cube_plan.work_units},
-                 {"peak_l1_bytes", cube_plan.peak_l1_bytes},
-                 {"seed_required", cube_plan.seed_required},
-                 {"model_overlap_granted", cube_plan.model_overlap_granted},
-                 {"overlap_implementable", cube_plan.overlap_implementable},
-                 {"matmuls", matmuls}});
+            j["cube_schedule"].push_back({{"emit_compatible", cube_plan.emit_compatible},
+                                          {"spatial_tiles", cube_plan.spatial_tiles},
+                                          {"split_k", cube_plan.split_k},
+                                          {"work_units", cube_plan.work_units},
+                                          {"peak_l1_bytes", cube_plan.peak_l1_bytes},
+                                          {"l0_tile_m", cube_plan.l0_tile_m},
+                                          {"l0_tile_n", cube_plan.l0_tile_n},
+                                          {"seed_required", cube_plan.seed_required},
+                                          {"model_overlap_granted", cube_plan.model_overlap_granted},
+                                          {"overlap_implementable", cube_plan.overlap_implementable},
+                                          {"matmuls", matmuls}});
         } else {
             j["cube_schedule"].push_back(nullptr);
         }

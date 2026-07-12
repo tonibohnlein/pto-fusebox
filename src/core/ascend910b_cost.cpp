@@ -4,6 +4,8 @@
 #include <cassert>
 #include <climits>
 #include <cmath>
+#include <limits>
+#include <map>
 #include <numeric>
 #include <set>
 #include <tuple>
@@ -122,21 +124,24 @@ ByteCost MakeByteCost(const Problem* p) {
 // Largest per-load K chunk that fits two ping-pong buffers in the L1 window and
 // leaves at least two rolled iterations after a serial first accumulation
 // initializes the carry. Returning 0 means the concrete emitter has no stage-2
-// steady state and must serialize. This describes emission only; the first
-// CubeSchedulePlan increment intentionally preserves the historical cost gate.
+// steady state and the outer GM/compute roofline must serialize.
 int64_t CubePipelinedChunk(int64_t extent, int64_t window) {
   if (extent < 48 || window < 32) return 0;
   const int64_t limit = (std::min(window / 2, extent / 3) / 16) * 16;
   return limit >= 16 ? limit : 0;
 }
 
+// Preserve the pre-request-DAG lone-matmul window exactly. The displayed/emit
+// window was a divisor of the full contraction, capped by the selected core's
+// K share; choosing merely a divisor of K/S can change the K-loop while leaving
+// the candidate cost unchanged.
 int64_t CappedSinkWindow(int64_t output_k, int64_t l1_window, int64_t split) {
   split = std::max<int64_t>(1, split);
-  const int64_t kfrac = std::max<int64_t>(1, output_k / 16);
-  const int64_t share_k = ((kfrac + split - 1) / split) * 16;
+  const int64_t k_fractals = std::max<int64_t>(1, output_k / 16);
+  const int64_t share_k = ((k_fractals + split - 1) / split) * 16;
   const int64_t cap = std::min({l1_window, share_k, output_k});
-  for (int64_t d = (cap / 16) * 16; d >= 16; d -= 16) {
-    if (output_k % d == 0) return d;
+  for (int64_t candidate = (cap / 16) * 16; candidate >= 16; candidate -= 16) {
+    if (output_k % candidate == 0) return candidate;
   }
   return 0;
 }
@@ -228,6 +233,40 @@ double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition
   double mk = 0.0;
   for (double l : load) mk = std::max(mk, l);
   return mk;
+}
+
+// Role-aware cube split: region_work already describes ONE concrete split-K
+// work unit, including any upstream recomputation induced by that K share. It
+// must not be divided uniformly by ksplit (the historical left-band shortcut),
+// because a general request DAG may contain Full-bound work that every split
+// unit repeats and ParallelK-bound work whose M or N extent actually shrinks.
+template <typename RegionWork>
+double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
+                          RegionWork region_work, int64_t ksplit) {
+  ksplit = std::max<int64_t>(1, ksplit);
+  const int64_t m_sizes[2] = {pm.big, pm.small};
+  const int64_t m_counts[2] = {pm.num_big, pm.parts - pm.num_big};
+  const int64_t n_sizes[2] = {pn.big, pn.small};
+  const int64_t n_counts[2] = {pn.num_big, pn.parts - pn.num_big};
+  std::vector<double> regions;
+  for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+      const int64_t count = m_counts[mi] * n_counts[ni];
+      if (count <= 0 || m_sizes[mi] <= 0 || n_sizes[ni] <= 0) continue;
+      const double work = region_work(m_sizes[mi], n_sizes[ni], ksplit);
+      for (int64_t i = 0; i < count * ksplit; ++i) regions.push_back(work);
+    }
+  }
+  std::sort(regions.begin(), regions.end(), [](double lhs, double rhs) { return lhs > rhs; });
+  std::vector<double> load(std::max<int64_t>(1, n_cores), 0.0);
+  for (double work : regions) {
+    size_t least = 0;
+    for (size_t core = 1; core < load.size(); ++core) {
+      if (load[core] < load[least]) least = core;
+    }
+    load[least] += work;
+  }
+  return *std::max_element(load.begin(), load.end());
 }
 
 }  // namespace
@@ -912,17 +951,28 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // triple (no internal S sweep). PQ == 1 (the whole-output region) IS included
   // so the grid is self-sufficient on the 910B path: (1,1,S) is the pure
   // split-K / single-region fill the uniform whole-output tile used to provide.
-  auto gen_grid = [&](int64_t C, int64_t maxP, int64_t maxQ,
-                      const std::vector<int64_t> &s_vals) {
+  auto gen_grid = [&](int64_t C, int64_t maxP, int64_t maxQ, const std::vector<int64_t>& s_vals) {
+    size_t cube_op_count = 0;
+    for (size_t op_idx : sg.ops_) {
+      if (prob.ops[op_idx].type == OpType::MatMul) ++cube_op_count;
+    }
+    const bool uniform_cube_only = matmul_910b && cube_op_count > 1 && prob.require_uniform_cube_dag_grid;
     std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C} (incl. 1)
     for (int64_t R : {C, 2 * C})
       for (int64_t d = 1; d * d <= R; ++d)
-        if (R % d == 0) { region_counts.insert(d); region_counts.insert(R / d); }
+        if (R % d == 0) {
+          region_counts.insert(d);
+          region_counts.insert(R / d);
+        }
     for (int64_t PQ : region_counts) {
       for (int64_t P = 1; P <= PQ; ++P) {
         if (PQ % P != 0) continue;
         const int64_t Q = PQ / P;
         if (P > maxP || Q > maxQ) continue;
+        if (uniform_cube_only && (sg.out_H_ % P != 0 || sg.out_W_ % Q != 0 || (sg.out_H_ / P) % 16 != 0 ||
+                                  (sg.out_W_ / Q) % 16 != 0)) {
+          continue;
+        }
         for (int64_t S : s_vals) sg.grid_cand_.push_back({P, Q, S});
       }
     }
@@ -936,28 +986,22 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   const int64_t Fm = (sg.out_H_ + sg.grid_gran_h_ - 1) / sg.grid_gran_h_;
   const int64_t Fn = (sg.out_W_ + sg.grid_gran_w_ - 1) / sg.grid_gran_w_;
   if (matmul_910b) {
-    // Cube: the grid tiles the SINK output; the chain backpropagates from it, so
-    // every matmul must share the sink's M (tensors[o].height == out_H_) -- the
-    // (A@B)@D chain does; a DAG tiling M differently falls back to uniform. split_k
-    // is the sink-K split S (S | kfrac, each partial a 16-aligned K-slice), so a
-    // power-of-two shape that can't form C spatial regions still fills the cores
-    // via split-K (64^2 = 4x4 fractals -> no P*Q=24, but (4,3) grid x S=2 = 24).
-    bool shared_m = true;
-    for (auto i : sg.ops_)
-      if (prob.ops[i].type == OpType::MatMul &&
-          prob.tensors[prob.ops[i].output()].height != sg.out_H_)
-        shared_m = false;
-    if (shared_m) {
-      const int64_t kfrac = std::max<int64_t>(1, sg.output_K_ / 16);
-      // A mixed subgraph with a REDUCTION (fused flash-attention style: matmul -> softmax)
-      // must PIN the reduction's reduced axis spatially — the reduction consumes the full
-      // axis online, and splitting it across cores would need a cross-core merge with no
-      // mid-kernel sync. The matmul's OWN contraction rides seq-k / split-K, a separate axis
-      // (the tiling chooses it). Pure cube (reduced_axis_ == 0) is unchanged: pm=Fm, pn=Fn.
-      const int64_t pm = (sg.reduced_axis_ == 2) ? 1 : Fm;  // height reduced -> pin M (parts_m=1)
-      const int64_t pn = (sg.reduced_axis_ == 1) ? 1 : Fn;  // width  reduced -> pin N (parts_n=1)
-      gen_grid(std::max<int64_t>(1, prob.num_cube_cores), pm, pn, all_divisors(kfrac));
+    // Cube: the grid tiles the SINK output. Consumer-request propagation maps
+    // those root M/N coordinates through arbitrary producer shapes, so internal
+    // matmuls no longer need to share the sink's M dimension. split_k is legal
+    // only with one matmul sink: multiple sinks need distinct split coordinates
+    // and atomic targets, which are not represented by one SpatialTriple.
+    const int64_t kfrac = std::max<int64_t>(1, sg.output_K_ / 16);
+    size_t cube_sink_count = 0;
+    for (size_t op_idx : sg.ops_) {
+      if (sg.is_sink_op_vec_[op_idx] && prob.ops[op_idx].type == OpType::MatMul) ++cube_sink_count;
     }
+    const std::vector<int64_t> split_values =
+        cube_sink_count == 1 ? all_divisors(kfrac) : std::vector<int64_t>{1};
+    // A mixed subgraph with a REDUCTION must still pin its reduced spatial axis.
+    const int64_t pm = (sg.reduced_axis_ == 2) ? 1 : Fm;
+    const int64_t pn = (sg.reduced_axis_ == 1) ? 1 : Fn;
+    gen_grid(std::max<int64_t>(1, prob.num_cube_cores), pm, pn, split_values);
   } else if (sg.has_vector_) {
     // Vector: tile the output across the AIV cores. A reduced axis cannot be
     // spatially tiled (the whole row/col must be present to reduce), so its parts
@@ -1037,6 +1081,72 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         for (auto it = preds.rbegin(); it != preds.rend(); ++it)
           if (!visited[*it]) stack.push_back({*it, false});
       }
+    }
+  }
+
+  // Build the pure-cube recursive request DAG once. The sink owns SpatialM x
+  // SpatialN. A matmul output request O[rows, cols] induces A[rows, K] and
+  // B[K, cols]; only the designated sink's K is bound to the cross-core split.
+  // Identical tensor-region requests are memoized, while distinct fan-out roles
+  // become distinct schedule instances and are therefore explicitly recomputed.
+  if (sg.has_matmul_ && !sg.has_vector_) {
+    using B = CubeAxisBinding;
+    using Key = std::tuple<size_t, int, int>;
+    std::vector<size_t> cube_sinks;
+    for (size_t op_idx : sg.ops_) {
+      if (sg.is_sink_op_vec_[op_idx] && prob.ops[op_idx].type == OpType::MatMul) cube_sinks.push_back(op_idx);
+    }
+    std::sort(cube_sinks.begin(), cube_sinks.end(),
+              [&](size_t a, size_t b) { return dag.topo_position(a) < dag.topo_position(b); });
+    std::map<Key, int64_t> memo;
+    auto request_tensor = [&](auto&& self, size_t tensor, B height_binding, B width_binding) -> int64_t {
+      const Key key{tensor, static_cast<int>(height_binding), static_cast<int>(width_binding)};
+      auto found = memo.find(key);
+      if (found != memo.end()) return found->second;
+
+      const int producer = dag.tensor_producer[tensor];
+      if (producer < 0 || !is_in_sg[static_cast<size_t>(producer)]) return -1;
+      const size_t op_idx = static_cast<size_t>(producer);
+      const Op& op = prob.ops[op_idx];
+      if (op.type != OpType::MatMul || op.inputs.size() != 2) return -1;
+
+      // One split coordinate can belong to only one boundary sink. A multi-root
+      // group is enumerated with S=1, so all of its contractions remain Full;
+      // this also lets identical producer requests from two roots memoize.
+      int64_t signed_op_idx = -1;
+      if (op_idx <= static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        signed_op_idx = static_cast<int64_t>(op_idx);
+      }
+      const bool parallel_sink = cube_sinks.size() == 1 && signed_op_idx == sg.sink_mm_op_;
+      const B produced_k_binding = parallel_sink ? B::ParallelK : B::Full;
+      const B loaded_k_binding = parallel_sink ? B::ParallelK : B::SequentialK;
+      const int64_t lhs_producer = self(self, op.inputs[0], height_binding, produced_k_binding);
+      const int64_t rhs_producer = self(self, op.inputs[1], produced_k_binding, width_binding);
+
+      CubeRequestNode node;
+      node.op = op_idx;
+      node.output.tensor = tensor;
+      node.output.height_binding = height_binding;
+      node.output.width_binding = width_binding;
+      node.lhs.tensor = op.inputs[0];
+      node.lhs.height_binding = height_binding;
+      node.lhs.width_binding = loaded_k_binding;
+      node.rhs.tensor = op.inputs[1];
+      node.rhs.height_binding = loaded_k_binding;
+      node.rhs.width_binding = width_binding;
+      node.lhs_producer = lhs_producer;
+      node.rhs_producer = rhs_producer;
+      node.parallel_sink = parallel_sink;
+      const int64_t node_idx = static_cast<int64_t>(sg.cube_request_nodes_.size());
+      sg.cube_request_nodes_.push_back(node);
+      memo.emplace(key, node_idx);
+      if (parallel_sink) sg.cube_sink_request_node_ = node_idx;
+      return node_idx;
+    };
+
+    for (size_t sink : cube_sinks) {
+      const int64_t root = request_tensor(request_tensor, prob.ops[sink].output(), B::SpatialM, B::SpatialN);
+      if (root >= 0) sg.cube_request_roots_.push_back(static_cast<size_t>(root));
     }
   }
 
@@ -1264,10 +1374,27 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
 // headroom the bands leave. Peak = max over steps of (live bands + this step's
 // operand strip). Strips count BOUNDARY operands only — an intermediate operand
 // is already a live band (the same boundary/ephemeral split the roofline uses).
-int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
-                              const FlatSet<size_t> &retained_from_prev,
-                              const FlatSet<size_t> &retain_these,
-                              std::vector<int64_t> *perop_k_out) const {
+int64_t Ascend910BCost::cube_binding_extent(CubeAxisBinding binding, int64_t full_extent, int64_t m_extent,
+                                            int64_t n_extent, int64_t split) const {
+  switch (binding) {
+    case CubeAxisBinding::Full:
+    case CubeAxisBinding::SequentialK:
+      return full_extent;
+    case CubeAxisBinding::SpatialM:
+      return std::min(full_extent, m_extent);
+    case CubeAxisBinding::SpatialN:
+      return std::min(full_extent, n_extent);
+    case CubeAxisBinding::ParallelK:
+      if (split <= 0 || full_extent % split != 0) return 0;
+      return full_extent / split;
+  }
+  return 0;
+}
+
+int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
+                                    const FlatSet<size_t>& retained_from_prev,
+                                    const FlatSet<size_t>& retain_these,
+                                    std::vector<int64_t>* pernode_k_out) const {
   // Full L1/Mat budget -- double-buffering does NOT reserve half. The two
   // ping-pong buffers are not "L1 + a spare half"; together they ARE the L1, so
   // the operand strip that fits is the full pool. Double-buffering is realized in
@@ -1276,6 +1403,99 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
   // half here would double-count the prefetch buffer and wrongly reject tiles
   // whose operand genuinely fits.
   const double l1 = (double)prob_->l1_capacity;
+
+  if (!cube_request_nodes_.empty()) {
+    if (sink_K_eff <= 0 || output_K_ % sink_K_eff != 0) return INT64_MAX;
+    const int64_t split = output_K_ / sink_K_eff;
+    const int64_t m_extent = std::min(cfg.h, out_H_);
+    const int64_t n_extent = std::min(cfg.w, out_W_);
+    const size_t node_count = cube_request_nodes_.size();
+
+    // One liveness interval per memoized tensor-region request. Different
+    // fan-out roles are distinct nodes; identical roles share one producer and
+    // remain live through their last requesting consumer.
+    std::vector<int64_t> last_use(node_count, -1);
+    for (size_t consumer = 0; consumer < node_count; ++consumer) {
+      const CubeRequestNode& node = cube_request_nodes_[consumer];
+      if (node.lhs_producer >= 0) {
+        last_use[static_cast<size_t>(node.lhs_producer)] = std::max<int64_t>(
+            last_use[static_cast<size_t>(node.lhs_producer)], static_cast<int64_t>(consumer));
+      }
+      if (node.rhs_producer >= 0) {
+        last_use[static_cast<size_t>(node.rhs_producer)] = std::max<int64_t>(
+            last_use[static_cast<size_t>(node.rhs_producer)], static_cast<int64_t>(consumer));
+      }
+    }
+
+    // Difference/prefix liveness sweep. Expanding every [producer,last_use]
+    // interval here would make this candidate-hot derivation O(nodes^2).
+    std::vector<int64_t> band_delta(node_count + 1, 0);
+    for (size_t producer = 0; producer < node_count; ++producer) {
+      if (last_use[producer] < 0) continue;
+      const CubeRequest& request = cube_request_nodes_[producer].output;
+      const Tensor& tensor = prob_->tensors[request.tensor];
+      const int64_t h = cube_binding_extent(request.height_binding, tensor.height, m_extent, n_extent, split);
+      const int64_t w = cube_binding_extent(request.width_binding, tensor.width, m_extent, n_extent, split);
+      if (h <= 0 || w <= 0) return INT64_MAX;
+      const int64_t bytes = h * w * dtype_bytes(tensor.dtype);
+      band_delta[producer] += bytes;
+      const size_t after_last = static_cast<size_t>(last_use[producer]) + 1;
+      if (after_last < band_delta.size()) band_delta[after_last] -= bytes;
+    }
+    std::vector<int64_t> band_at(node_count, 0);
+    int64_t live_bytes = 0;
+    for (size_t step = 0; step < node_count; ++step) {
+      live_bytes += band_delta[step];
+      band_at[step] = live_bytes;
+    }
+
+    int64_t base = 0;
+    for (size_t tensor : retained_from_prev) base += prob_->tensors[tensor].size_bytes();
+    for (size_t tensor : retain_these) {
+      if (!retained_from_prev.count(tensor)) base += prob_->tensors[tensor].size_bytes();
+    }
+
+    if (pernode_k_out) pernode_k_out->assign(node_count, 0);
+    int64_t peak = 0;
+    for (size_t step = 0; step < node_count; ++step) {
+      const CubeRequestNode& node = cube_request_nodes_[step];
+      const Op& op = prob_->ops[node.op];
+      const Tensor& output = prob_->tensors[node.output.tensor];
+      const int64_t h =
+          cube_binding_extent(node.output.height_binding, output.height, m_extent, n_extent, split);
+      const int64_t w =
+          cube_binding_extent(node.output.width_binding, output.width, m_extent, n_extent, split);
+      if (h <= 0 || w <= 0) return INT64_MAX;
+      const int64_t K_eff = node.parallel_sink ? sink_K_eff : op_K(node.op);
+      const int64_t lhs_b = node.lhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.lhs.tensor].dtype);
+      const int64_t rhs_b = node.rhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.rhs.tensor].dtype);
+      const int64_t per_unit = lhs_b * h + rhs_b * w;
+      const int64_t bands = base + band_at[step];
+      if (bands > static_cast<int64_t>(l1)) return INT64_MAX;
+
+      int64_t kk = K_eff;
+      if (per_unit > 0) {
+        const double headroom = l1 - static_cast<double>(bands);
+        if (headroom <= 0) return INT64_MAX;
+        int64_t max_kk = static_cast<int64_t>(headroom / static_cast<double>(per_unit));
+        max_kk = (max_kk / 16) * 16;
+        if (max_kk < 16) return INT64_MAX;
+        max_kk = std::min(max_kk, K_eff);
+        kk = 0;
+        for (int64_t d = std::min(max_kk, K_eff); d >= 16; d -= 16) {
+          if (K_eff % d == 0) {
+            kk = d;
+            break;
+          }
+        }
+        if (kk == 0) return INT64_MAX;
+      }
+      if (pernode_k_out) (*pernode_k_out)[step] = kk;
+      peak = std::max(peak, bands + per_unit * kk);
+    }
+    return peak;
+  }
+
   const auto &order = dfs_order_;
 
   // Position of each op in the execution order (-1 = not in this subgraph).
@@ -1333,7 +1553,7 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
   for (auto t : retain_these)
     if (!retained_from_prev.count(t)) base += prob_->tensors[t].size_bytes();
 
-  if (perop_k_out) perop_k_out->assign(prob_->num_ops(), 0);
+  if (pernode_k_out) pernode_k_out->assign(prob_->num_ops(), 0);
 
   int64_t peak = 0;
   for (int s = 0; s < (int)order.size(); ++s) {
@@ -1372,7 +1592,7 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
         if (K_eff % d == 0) { kk = d; break; }
       if (kk == 0) return INT64_MAX;
     }
-    if (perop_k_out) (*perop_k_out)[opi] = kk;
+    if (pernode_k_out) (*pernode_k_out)[opi] = kk;
     peak = std::max(peak, bands + per_unit * kk);
   }
   return peak;
@@ -1380,7 +1600,18 @@ int64_t Ascend910BCost::derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
 
 int64_t Ascend910BCost::cube_peak_l1(const TileConfig &cfg,
                                std::vector<int64_t> *perop_k) const {
-  return derive_exec(cfg, output_K_, {}, {}, perop_k);
+  if (cube_request_nodes_.empty()) return derive_exec(cfg, output_K_, {}, {}, perop_k);
+  std::vector<int64_t> pernode_k;
+  const int64_t peak = derive_exec(cfg, output_K_, {}, {}, perop_k ? &pernode_k : nullptr);
+  if (perop_k) {
+    perop_k->assign(prob_->num_ops(), 0);
+    for (size_t node_idx = 0; node_idx < cube_request_nodes_.size(); ++node_idx) {
+      const size_t op = cube_request_nodes_[node_idx].op;
+      const int64_t k = pernode_k[node_idx];
+      if ((*perop_k)[op] == 0 || k < (*perop_k)[op]) (*perop_k)[op] = k;
+    }
+  }
+  return peak;
 }
 
 CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
@@ -1390,11 +1621,20 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
     int64_t parallel_split) const {
   CubeSchedulePlan plan;
   plan.config = cfg;
-  if (!has_matmul_ || has_vector_ || !is_valid_tiling(cfg)) return plan;
+  const int64_t split = std::max<int64_t>(1, parallel_split);
+  if (!has_matmul_ || has_vector_ || cube_request_nodes_.empty() || !is_valid_tiling(cfg) ||
+      output_K_ % split != 0) {
+    return plan;
+  }
 
-  std::vector<int64_t> perop_window_k;
-  const int64_t peak =
-      derive_exec(cfg, output_K_, retained_from_prev, retain_these, &perop_window_k);
+  const bool lone_matmul = cube_request_nodes_.size() == 1;
+  std::vector<int64_t> pernode_window_k;
+  // The pre-plan lone path derived its L1 window against the full contraction,
+  // then capped that full-K divisor to the selected share. Keep that exact
+  // reconstruction; general request DAGs derive directly at K/S because their
+  // upstream request shapes themselves depend on S.
+  const int64_t derive_sink_k = lone_matmul ? output_K_ : output_K_ / split;
+  const int64_t peak = derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &pernode_window_k);
   if (peak == INT64_MAX) return plan;
 
   const int64_t parts_m = cfg.parts_m > 0
@@ -1403,7 +1643,6 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
   const int64_t parts_n = cfg.parts_n > 0
                               ? cfg.parts_n
                               : std::max<int64_t>(1, out_W_ / std::max<int64_t>(1, cfg.w));
-  const int64_t split = std::max<int64_t>(1, parallel_split);
   plan.feasible = true;
   plan.emit_compatible = true;
   plan.m_partition = partition_axis(out_H_, parts_m, grid_gran_h_);
@@ -1412,59 +1651,64 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
   plan.peak_l1_bytes = peak;
+  plan.l0_tile_m = std::max<int64_t>(1, prob_->l0_tile_m);
+  plan.l0_tile_n = std::max<int64_t>(1, prob_->l0_tile_n);
   plan.seed_required = split > 1;
-  plan.model_overlap_granted = output_K_ / split >= 32;
+  plan.model_overlap_granted = true;
   plan.overlap_implementable = true;
-  plan.execution_order = dfs_order_;
+  const int64_t m_extent = std::min(cfg.h, out_H_);
+  const int64_t n_extent = std::min(cfg.w, out_W_);
 
-  for (size_t op_idx : dfs_order_) {
-    const Op &op = prob_->ops[op_idx];
-    if (op.type != OpType::MatMul) continue;
+  std::vector<int64_t> last_use(cube_request_nodes_.size(), -1);
+  FlatSet<size_t> roots(cube_request_roots_.begin(), cube_request_roots_.end());
+  for (size_t consumer = 0; consumer < cube_request_nodes_.size(); ++consumer) {
+    const CubeRequestNode& node = cube_request_nodes_[consumer];
+    if (node.lhs_producer >= 0) {
+      last_use[static_cast<size_t>(node.lhs_producer)] =
+          std::max<int64_t>(last_use[static_cast<size_t>(node.lhs_producer)], static_cast<int64_t>(consumer));
+    }
+    if (node.rhs_producer >= 0) {
+      last_use[static_cast<size_t>(node.rhs_producer)] =
+          std::max<int64_t>(last_use[static_cast<size_t>(node.rhs_producer)], static_cast<int64_t>(consumer));
+    }
+  }
+
+  auto concrete_region = [&](const CubeRequest& request) {
+    CubeTensorRegionPlan region;
+    region.tensor = request.tensor;
+    region.height_binding = request.height_binding;
+    region.width_binding = request.width_binding;
+    const Tensor& tensor = prob_->tensors[request.tensor];
+    region.height = cube_binding_extent(request.height_binding, tensor.height, m_extent, n_extent, split);
+    region.width = cube_binding_extent(request.width_binding, tensor.width, m_extent, n_extent, split);
+    return region;
+  };
+
+  for (size_t node_idx = 0; node_idx < cube_request_nodes_.size(); ++node_idx) {
+    const CubeRequestNode& node = cube_request_nodes_[node_idx];
+    const Op& op = prob_->ops[node.op];
 
     CubeMatmulSchedule mm;
-    mm.op = op_idx;
-    mm.is_sink = is_sink_op_vec_[op_idx];
-    mm.lhs_ephemeral = ephemeral_.count(op.inputs[0]);
-    mm.rhs_ephemeral = ephemeral_.count(op.inputs[1]);
-    mm.output_ephemeral = ephemeral_.count(op.output());
-    // The historical cube pebble/reload model is a shared-M/full-N algorithm.
-    // An internally produced RHS needs a K-row/N-column band instead; record the
-    // mismatch now so the emitter cannot silently treat this as a left chain.
-    if (mm.rhs_ephemeral) plan.emit_compatible = false;
+    mm.instance = node_idx;
+    mm.op = node.op;
+    mm.lhs_producer = node.lhs_producer;
+    mm.rhs_producer = node.rhs_producer;
+    mm.is_sink = roots.count(node_idx) != 0;
+    mm.lhs_ephemeral = node.lhs_producer >= 0;
+    mm.rhs_ephemeral = node.rhs_producer >= 0;
+    mm.output_ephemeral = last_use[node_idx] >= 0;
+    mm.contraction = op_K(node.op);
+    mm.effective_contraction = node.parallel_sink ? mm.contraction / split : mm.contraction;
+    mm.output = concrete_region(node.output);
+    mm.lhs = concrete_region(node.lhs);
+    mm.rhs = concrete_region(node.rhs);
 
-    const Tensor &out = prob_->tensors[op.output()];
-    mm.contraction = op_K(op_idx);
-    mm.effective_contraction = mm.is_sink ? mm.contraction / split : mm.contraction;
-    const int64_t out_h = std::min(cfg.h, out.height);
-    const int64_t out_w = mm.output_ephemeral ? out.width : std::min(cfg.w, out.width);
-
-    mm.output.tensor = op.output();
-    mm.output.height_binding = CubeAxisBinding::SpatialM;
-    mm.output.width_binding =
-        mm.output_ephemeral ? CubeAxisBinding::Full : CubeAxisBinding::SpatialN;
-    mm.output.height = out_h;
-    mm.output.width = out_w;
-    mm.lhs.tensor = op.inputs[0];
-    mm.lhs.height_binding = CubeAxisBinding::SpatialM;
-    mm.lhs.width_binding =
-        mm.is_sink && split > 1 ? CubeAxisBinding::ParallelK
-                                : CubeAxisBinding::SequentialK;
-    mm.lhs.height = out_h;
-    mm.lhs.width = mm.effective_contraction;
-    mm.rhs.tensor = op.inputs[1];
-    mm.rhs.height_binding =
-        mm.is_sink && split > 1 ? CubeAxisBinding::ParallelK
-                                : CubeAxisBinding::SequentialK;
-    mm.rhs.width_binding =
-        mm.output_ephemeral ? CubeAxisBinding::Full : CubeAxisBinding::SpatialN;
-    mm.rhs.height = mm.effective_contraction;
-    mm.rhs.width = out_w;
-
-    int64_t window = op_idx < perop_window_k.size() && perop_window_k[op_idx] > 0
-                         ? perop_window_k[op_idx]
+    int64_t window = node_idx < pernode_window_k.size() && pernode_window_k[node_idx] > 0
+                         ? pernode_window_k[node_idx]
                          : mm.effective_contraction;
-    if (mm.is_sink && split > 1) {
-      window = CappedSinkWindow(output_K_, window, split);
+    if (lone_matmul && node.parallel_sink) {
+      window = CappedSinkWindow(mm.contraction, window, split);
+      if (window == 0) return CubeSchedulePlan{};
     }
     window = std::min(window, mm.effective_contraction);
     mm.k_loop.l1_window_k = window;
@@ -1484,18 +1728,15 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
     mm.k_loop.tail = mm.effective_contraction -
                      mm.k_loop.full_chunks * mm.k_loop.chunk;
     if (loads_boundary && mm.k_loop.pipeline_stages != 2) {
+      plan.model_overlap_granted = false;
       plan.overlap_implementable = false;
     }
     plan.matmuls.push_back(mm);
+    plan.execution_order.push_back(node.op);
   }
 
-  if (sink_mm_op_ >= 0) {
-    for (const auto &mm : plan.matmuls) {
-      if (mm.op == static_cast<size_t>(sink_mm_op_)) {
-        plan.config.k = mm.k_loop.l1_window_k;
-        break;
-      }
-    }
+  if (cube_sink_request_node_ >= 0 && static_cast<size_t>(cube_sink_request_node_) < plan.matmuls.size()) {
+    plan.config.k = plan.matmuls[static_cast<size_t>(cube_sink_request_node_)].k_loop.l1_window_k;
   }
   return plan;
 }
@@ -1808,9 +2049,12 @@ bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
   // bands that physically sit in L1/Mat between matmuls; derive_exec is the
   // red-blue pebble peak that the cost model's ephemeral-on-chip assumption
   // implies. Infeasible iff no per-op k assignment keeps the peak under L1.
-  if (cube)
-    return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) !=
-           INT64_MAX;
+  if (cube) {
+    const int64_t split = cfg.parts_m > 0 && cfg.split_k > 0 ? cfg.split_k : 1;
+    const int64_t derive_sink_k = cube_request_nodes_.size() == 1 ? output_K_ : output_K_ / split;
+    return output_K_ % split == 0 &&
+           derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, nullptr) != INT64_MAX;
+  }
 
   // Vector: feasible iff the subgraph materializes OR streams to fit UB.
   return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
@@ -1893,6 +2137,60 @@ double Ascend910BCost::cube_operand_reload(const TileConfig &cfg,
   return reload;
 }
 
+double Ascend910BCost::cube_request_reload(const TileConfig& cfg, int64_t split, double* lhs_bytes_out,
+                                           double* rhs_bytes_out) const {
+  split = std::max<int64_t>(1, split);
+  if (cube_request_nodes_.empty() || output_K_ % split != 0) {
+    if (lhs_bytes_out) *lhs_bytes_out = 0.0;
+    if (rhs_bytes_out) *rhs_bytes_out = 0.0;
+    return 0.0;
+  }
+
+  const int64_t parts_m =
+      cfg.parts_m > 0 ? cfg.parts_m : std::max<int64_t>(1, out_H_ / std::max<int64_t>(1, cfg.h));
+  const int64_t parts_n =
+      cfg.parts_n > 0 ? cfg.parts_n : std::max<int64_t>(1, out_W_ / std::max<int64_t>(1, cfg.w));
+  const AxisPartition pm = partition_axis(out_H_, parts_m, grid_gran_h_);
+  const AxisPartition pn = partition_axis(out_W_, parts_n, grid_gran_w_);
+  const int64_t m_sizes[2] = {pm.big, pm.small};
+  const int64_t n_sizes[2] = {pn.big, pn.small};
+  const int64_t m_counts[2] = {pm.num_big, pm.parts - pm.num_big};
+  const int64_t n_counts[2] = {pn.num_big, pn.parts - pn.num_big};
+
+  double lhs_total = 0.0;
+  double rhs_total = 0.0;
+  for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+      const int64_t region_count = m_counts[mi] * n_counts[ni];
+      if (region_count <= 0) continue;
+      std::set<std::tuple<size_t, int, int, int>> counted;
+      double lhs_unit = 0.0;
+      double rhs_unit = 0.0;
+      auto add_request = [&](const CubeRequest& request, int port, double& bytes) {
+        const auto key = std::make_tuple(request.tensor, port, static_cast<int>(request.height_binding),
+                                         static_cast<int>(request.width_binding));
+        if (!counted.insert(key).second) return;
+        const Tensor& tensor = prob_->tensors[request.tensor];
+        const int64_t h =
+            cube_binding_extent(request.height_binding, tensor.height, m_sizes[mi], n_sizes[ni], split);
+        const int64_t w =
+            cube_binding_extent(request.width_binding, tensor.width, m_sizes[mi], n_sizes[ni], split);
+        if (h > 0 && w > 0) bytes += static_cast<double>(h * w * dtype_bytes(tensor.dtype));
+      };
+      for (const CubeRequestNode& node : cube_request_nodes_) {
+        if (node.lhs_producer < 0) add_request(node.lhs, 0, lhs_unit);
+        if (node.rhs_producer < 0) add_request(node.rhs, 1, rhs_unit);
+      }
+      const double copies = static_cast<double>(region_count * split);
+      lhs_total += lhs_unit * copies;
+      rhs_total += rhs_unit * copies;
+    }
+  }
+  if (lhs_bytes_out) *lhs_bytes_out = lhs_total;
+  if (rhs_bytes_out) *rhs_bytes_out = rhs_total;
+  return lhs_total + rhs_total;
+}
+
 // ============================================================================
 // Cost computation
 // ============================================================================
@@ -1909,9 +2207,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   if (has_matmul_) {
     if (has_vector_) {
       if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
-    } else if (derive_exec(cfg, output_K_, retained_from_prev, retain_these,
-                           &cube_window_k) == INT64_MAX) {
-      return result;
+    } else {
+      const int64_t feasibility_split = cfg.parts_m > 0 && cfg.split_k > 0 ? cfg.split_k : 1;
+      const int64_t derive_sink_k =
+          cube_request_nodes_.size() == 1 ? output_K_ : output_K_ / feasibility_split;
+      if (output_K_ % feasibility_split != 0 ||
+          derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &cube_window_k) == INT64_MAX) {
+        return result;
+      }
     }
   } else {
     vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
@@ -1949,147 +2252,87 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       return std::max(1.0, std::min(active, cap));
     };
     if (has_matmul_) {
-      // Matmul (cube). Compute is the full M*N*K work, INVARIANT to the tile:
-      // 16-aligned cube tiles have no padding (the op_scale native-128 padding
-      // is a single-level competition artifact that belongs at the L0 fractal,
-      // not at our DDR->L1 level). Sum each matmul's own work scaled by ITS
-      // output (#native tiles) — for a CHAINED group the intermediate has a
-      // different shape than the sink, so a single sink-scaled basis would
-      // mis-count it. Single matmul: output == sink, identical to before.
-      // In-subgraph consumed set: an op is a boundary-output op iff its output is
-      // not consumed within the subgraph (drives the recompute factor below).
-      FlatSet<size_t> consumed;
-      for (auto i : ops_)
-        for (auto t : prob_->ops[i].inputs) consumed.insert(t);
-      // Per-core cube work is HIERARCHICAL and double-buffered: producing a tile
-      // needs both the cube MACs (Matrix pipe) AND the L1->L0A/L0B operand
-      // extract (MTE1 pipe), which OVERLAP — so the work is max(MACs, extract),
-      // not their sum. Accumulate the two pipes separately, then take the max.
-      // (Validated against pto-isa's measured 7680^3 GEMM: with the L0 128x256
-      // base tile the extract lands at ~0.6x the MACs — i.e. cube-bound, extract
-      // hidden — matching its 63% vs 80.6% pipe-utilisation split.)
-      double total_cube = 0.0;     // Matrix-pipe cycles (cube MACs)
-      double total_extract = 0.0;  // MTE1-pipe cycles (L1->L0 operand extract)
-      for (auto i : ops_) {
-        if (prob_->ops[i].type != OpType::MatMul) continue;
-        size_t o = prob_->ops[i].output();
-        // RECOMPUTE under the M-partition: an INTERMEDIATE matmul's output is a
-        // sink left-operand band, shared by all sink COLUMN-tiles in the same
-        // M-band. When the sink fills the cores over M alone (num_tw==1) the band
-        // is produced once — truly ephemeral. When M can't fill the cores and the
-        // sink tiles over N (num_tw>1), each owning core recomputes the band, so
-        // the intermediate compute is paid num_tw times. (The alternative — share
-        // the band across cores via DDR — is just splitting the subgraph, costed
-        // separately; the partitioner picks the cheaper.) Boundary/sink outputs
-        // are produced once: factor 1.
-        const double recompute = consumed.count(o) ? (double)num_tw : 1.0;
-        // Grounded machine model: dtype-aware fractal MACs + the hierarchical
-        // L1->L0 extract (CubeMacCycles / CubeExtractCycles). CEIL granularity
-        // so a sub-16 dim pads up to one fractal — a small-batch GEMV (M<16)
-        // still costs a full fractal row, matching the cube's 16-granularity.
-        const int64_t Mo = prob_->tensors[o].height;
-        const int64_t No = prob_->tensors[o].width;
-        const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;  // contraction
-        const DType dt = prob_->tensors[o].dtype;
-        total_cube += CubeMacCycles(prob_, Mo, No, Ko, dt) * recompute;
-        total_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt) * recompute;
-      }
-      // Double-buffered overlap of the two per-core cube pipes (MACs || extract).
-      const double total_compute = std::max(total_cube, total_extract);
-      // --- BSP/superstep matmul roofline (910B; no shared L2) ----------------
-      // Parallelize the (possibly fused-chain) subgraph over the SHARED output
-      // dim M: each core owns a sink-output band and computes its own
-      // intermediate slices ON-CHIP. Consequences:
-      //   * DDR counts only (a) boundary/graph-input operands and (b) the sink
-      //     output store. Intermediate tensors are EPHEMERAL (zero DDR) — a
-      //     deeper matmul's partials are computed independently per output tile,
-      //     never crossing cores, so they need no barrier.
-      //   * A sink split-K writes the output S times (S atomic-add partials via
-      //     SetAtomicAdd). That is extra DDR write traffic riding the roofline with
-      //     compute — NOT an additive barrier (each core writes independently).
-      //     Intermediate k-split is disallowed: it would round-trip the intermediate
-      //     through DDR, i.e. be no better than splitting the subgraph there (which
-      //     also frees independent tiling) — so any k-split lands on the output only.
-      // (produced/consumed sets built above for the recompute factor are reused.)
-      // Sink output store = sum over boundary outputs, byte-based (intermediates
-      // are is_internally_produced and excluded).
+      // --- Request-DAG cube cost -------------------------------------------
+      // Every work unit recursively produces exactly the tensor regions its
+      // sinks request. This handles left chains, produced RHS operands, trees,
+      // and memoized fan-out with the same symbolic roles derive_exec uses.
       double out_store = 0.0;
       for (const auto& info : boundary_tensor_info_)
         if (info.is_boundary_out)
           out_store += (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
-      // Matmul boundary-operand reload — distribution-aware MNK*(1/w + 1/h),
-      // deduped per (tensor, role). See cube_operand_reload(); the cube path
-      // treats a consumed (chained) intermediate matmul as a full-width band.
-      double reload_lhs_b = 0.0, reload_rhs_b = 0.0;
-      const double reload = cube_operand_reload(cfg, /*matmul_at_output_grid=*/false,
-                                                &reload_lhs_b, &reload_rhs_b);
-      // L1->L0 extract cycles (MTE1), a TIEBREAKER only: lhs via L0A (fast 441),
-      // rhs via L0B (slow 220.5). Same per-port byte split as the GM reload, charged
-      // at the L0 ports — so among reload-equal transposed tiles the TALL one (large h,
-      // less slow-L0B traffic) wins. Perf-sim-driven (gml1_decision); device eval pending.
-      const double l1l0_extract = reload_lhs_b * bc.l0a + reload_rhs_b * bc.l0b;
-      // DDR is two SEPARATE concurrent pipes: the operand reload (MTE2, GM->L1,
-      // 135 GiB/s) and the output store (FixPipe, L0C->GM, 70 GiB/s). They are
-      // distinct hardware (pto-isa scores GM reads/writes as independent groups),
-      // so the DDR term is their MAX, not their sum. Each pipe's traffic DIVIDES
-      // across active cores up to the aggregate HBM ceiling (see par()): cycles =
-      // bytes*cyc_per_byte / par(active, peak). Compute is wave-aware (ceil(U/C)
-      // waves); the DDR bytes are NOT wave-scaled (a K-split divides the operand
-      // slices, it does not inflate the total reload bytes).
-      // Grid mode: LPT makespan over the non-uniform (+-1-fractal) regions. The
-      // per-region work is the SINK matmul at the region extent (m_ext, n_ext)
-      // PLUS each consumed INTERMEDIATE as a full-width [m_ext, N_int] row-band:
-      // the grid is the sink-output tiling, and the chain backpropagates from it
-      // -- the sink M-partition slices every intermediate's rows, while the
-      // intermediate is consumed full-width (it is the next matmul's contraction),
-      // so each N-region in an M-band recomputes the band (counted per region,
-      // reproducing the num_tw recompute factor of total_compute). Hoisted so the
-      // split-K loop below reuses it (LPT-consistent split-K on the grid). Uniform
-      // mode: the wave makespan over equal work units.
       const AxisPartition g_pm = partition_axis(out_H_, std::max<int64_t>(1, cfg.parts_m), grid_gran_h_);
       const AxisPartition g_pn = partition_axis(out_W_, std::max<int64_t>(1, cfg.parts_n), grid_gran_w_);
-      // L0 base tile (pto-isa GEMM oracle); the K-step is baseK=64. Used for the
-      // Phase-D pipeline depth. Fall back to {1,1} when ungrounded (extract==0
-      // then, so the depth is immaterial).
       const int64_t l0m = std::max<int64_t>(1, prob_->l0_tile_m);
       const int64_t l0n = std::max<int64_t>(1, prob_->l0_tile_n);
-      auto grid_region_work = [&](int64_t m_ext, int64_t n_ext) {
+      const bool lone_matmul = cube_request_nodes_.size() == 1;
+      const int64_t configured_split = cfg.parts_m > 0 && cfg.split_k > 0 ? cfg.split_k : 1;
+
+      auto request_pipes = [&](int64_t m_ext, int64_t n_ext, int64_t split, bool phase_d) {
         double work = 0.0;
-        for (auto i : ops_) {
-          if (prob_->ops[i].type != OpType::MatMul) continue;
-          const size_t o = prob_->ops[i].output();
-          const int64_t Ko = prob_->tensors[prob_->ops[i].inputs[0]].width;
-          const DType dt = prob_->tensors[o].dtype;
-          const int64_t n = consumed.count(o) ? prob_->tensors[o].width  // full band
-                                              : n_ext;                    // sink region
-          const double mac = CubeMacCycles(prob_, m_ext, n, Ko, dt);
-          const double ext = CubeExtractCycles(prob_, bc, m_ext, n, Ko, dt);
-          // Phase D — double-buffer overlap over L L0-MAD steps:
-          //   T = (mac + ext + (L-1)*max(mac,ext)) / L
-          // L=1 (one L0 tile) => mac+ext (no steady state to overlap); L>>1 =>
-          // max(mac,ext) (full ping-pong). L = #L0 sub-tiles of this matmul's
-          // region: ceil(m/baseM)*ceil(n/baseN)*ceil(K/baseK), baseK=64.
-          const int64_t L = std::max<int64_t>(
-              1, ((m_ext + l0m - 1) / l0m) * ((n + l0n - 1) / l0n) *
-                     ((Ko + 63) / 64));
-          // Matmuls in a region run SEQUENTIALLY (the intermediate feeds the
-          // sink), so their pipeline times SUM (not max-of-sums).
-          work += (mac + ext + (double)(L - 1) * std::max(mac, ext)) / (double)L;
+        double mac_pipe = 0.0;
+        double extract_pipe = 0.0;
+        for (const CubeRequestNode& node : cube_request_nodes_) {
+          const Tensor& output = prob_->tensors[node.output.tensor];
+          const int64_t m =
+              cube_binding_extent(node.output.height_binding, output.height, m_ext, n_ext, split);
+          const int64_t n = cube_binding_extent(node.output.width_binding, output.width, m_ext, n_ext, split);
+          const int64_t k = node.parallel_sink ? op_K(node.op) / split : op_K(node.op);
+          // Cube MAC/extract precision follows the operand dtype. The
+          // accumulator/output is commonly FP32 for BF16/FP16 inputs and must
+          // not make the Matrix/MTE1 work look like an FP32-input GEMM.
+          const DType dtype = prob_->tensors[prob_->ops[node.op].inputs[0]].dtype;
+          const double mac = CubeMacCycles(prob_, m, n, k, dtype);
+          const double extract = CubeExtractCycles(prob_, bc, m, n, k, dtype);
+          mac_pipe += mac;
+          extract_pipe += extract;
+          if (!phase_d) continue;
+          const int64_t L =
+              std::max<int64_t>(1, ((m + l0m - 1) / l0m) * ((n + l0n - 1) / l0n) * ((k + 63) / 64));
+          work +=
+              (mac + extract + static_cast<double>(L - 1) * std::max(mac, extract)) / static_cast<double>(L);
         }
-        return work;
+        return phase_d ? work : std::max(mac_pipe, extract_pipe);
       };
-      // parts_m > 0 (grid + LPT makespan) is the ONLY mode best_cost emits on the
-      // 910B. The WaveComputeCycles arm is the uniform parts_m == 0 tile, reached
-      // only by a directly-constructed TileConfig (tests / ad-hoc) -- see the
-      // matching note in is_valid_tiling. Not produced by the live solver.
+
       // Double-buffer floor: the max(compute, ddr) overlap is only real when the
       // operand reload can ping-pong, i.e. the per-core contraction is halvable
       // into >=2 seq-K sub-strips (>= 32 = two K-fractals; the emit's implicit
       // halving needs that). A tiny contraction can't overlap -> reload and
       // compute SERIALIZE (compute + ddr).
-      auto db_roofline = [&](double comp, double dram, int64_t per_core_K) {
-        const bool overlap = per_core_K >= 32;
+      auto db_roofline = [&](double comp, double dram, bool overlap) {
         return overlap ? std::max(comp, dram) : comp + dram;
+      };
+
+      // A global max(compute, DDR) is legal only if every request instance that
+      // reads a boundary operand has a concrete stage-2 rolled K loop. The old
+      // K/S>=32 scalar gate could grant overlap to a one-chunk sink in a chain.
+      // Reuse the feasibility derivation for the configured split. Ad-hoc
+      // non-grid callers can still sweep S and pay one O(nodes) derivation for
+      // each alternative; no CubeSchedulePlan enters the enumeration hot path.
+      auto overlap_implementable = [&](int64_t split) {
+        std::vector<int64_t> derived_windows;
+        const std::vector<int64_t>* windows = &cube_window_k;
+        if (split != configured_split) {
+          const int64_t derive_sink_k = lone_matmul ? output_K_ : output_K_ / split;
+          if (derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &derived_windows) ==
+              INT64_MAX) {
+            return false;
+          }
+          windows = &derived_windows;
+        }
+        for (size_t node_idx = 0; node_idx < cube_request_nodes_.size(); ++node_idx) {
+          const CubeRequestNode& node = cube_request_nodes_[node_idx];
+          if (node.lhs_producer >= 0 && node.rhs_producer >= 0) continue;
+          const int64_t extent = node.parallel_sink ? op_K(node.op) / split : op_K(node.op);
+          int64_t window =
+              node_idx < windows->size() && (*windows)[node_idx] > 0 ? (*windows)[node_idx] : extent;
+          if (lone_matmul && node.parallel_sink) {
+            window = CappedSinkWindow(op_K(node.op), window, split);
+          }
+          window = std::min(window, extent);
+          if (CubePipelinedChunk(extent, window) == 0) return false;
+        }
+        return true;
       };
       // Sink split-K: split the sink contraction into S per-tile partials to
       // recruit idle cores. The output write-back grows to S partials (L0C->GM via
@@ -2108,16 +2351,43 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Evaluate one split factor S (>=1). S=1 is the spatial-only roofline; S>=2
       // splits the sink contraction into S equal 16-aligned partials (each owns
       // output_K_/S), writing the output S times (S atomic-add partials).
-      struct SplitEval { double lat, compute, ddr, active; };
+      struct SplitEval {
+        double lat, compute, ddr, active, l1l0;
+      };
       auto eval_S = [&](int64_t S) -> SplitEval {
         S = std::max<int64_t>(1, S);
         const int64_t unitsS = (int64_t)num_tiles * S;
-        // Grid: LPT the P*Q regions with K split S ways (P*Q*S units) -- honest
-        // about the +-1-fractal imbalance; uniform: the equal-unit wave.
-        const double computeS =
-            (cfg.parts_m > 0) ? LptMakespan(n_cores, g_pm, g_pn, grid_region_work, S)
-                              : WaveComputeCycles(total_compute, unitsS, n_cores);
+        double computeS = 0.0;
+        if (cfg.parts_m > 0) {
+          computeS = lone_matmul ? LptMakespan(
+                                       n_cores, g_pm, g_pn,
+                                       [&](int64_t m, int64_t n) {
+                                         return request_pipes(m, n, /*split=*/1,
+                                                              /*phase_d=*/true);
+                                       },
+                                       S)
+                                 : LptMakespanPerUnit(
+                                       n_cores, g_pm, g_pn,
+                                       [&](int64_t m, int64_t n, int64_t split) {
+                                         return request_pipes(m, n, split,
+                                                              /*phase_d=*/true);
+                                       },
+                                       S);
+        } else {
+          const int64_t work_split = lone_matmul ? 1 : S;
+          const int64_t copies = lone_matmul ? num_tiles : unitsS;
+          computeS =
+              WaveComputeCycles(request_pipes(std::min(cfg.h, out_H_), std::min(cfg.w, out_W_), work_split,
+                                              /*phase_d=*/false) *
+                                    static_cast<double>(copies),
+                                unitsS, n_cores);
+        }
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
+        double reload_lhs = 0.0;
+        double reload_rhs = 0.0;
+        const double reload =
+            lone_matmul ? cube_operand_reload(cfg, /*matmul_at_output_grid=*/false, &reload_lhs, &reload_rhs)
+                        : cube_request_reload(cfg, S, &reload_lhs, &reload_rhs);
         // DDR is two SEPARATE, concurrent pipes: the operand feed (MTE2, GM->L1)
         // and the output write-back (FixPipe, L0C->GM; S atomic-add partials for a
         // split). They are distinct hardware, and pto-isa scores GM reads and GM
@@ -2128,8 +2398,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         const double writes = (double)S * out_store * bc.store / par(activeS, prob_->bw_l0c_gm);
         const double ddrS = std::max(feed, writes);
         // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
-        const double latS = db_roofline(computeS, ddrS, output_K_ / S);
-        return {latS, computeS, ddrS, activeS};
+        const double latS = db_roofline(computeS, ddrS, overlap_implementable(S));
+        return {latS, computeS, ddrS, activeS, reload_lhs * bc.l0a + reload_rhs * bc.l0b};
       };
 
       // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
@@ -2159,15 +2429,20 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       result.cores_used = (int)chosen.active;
       result.compute_bound = chosen.compute >= chosen.ddr;
       result.ddr_traffic = chosen.ddr;
-      result.l1l0_extract = l1l0_extract;  // MTE1 tiebreaker (tall tiles win the slow L0B port)
+      result.l1l0_extract = chosen.l1l0;
       // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
       // divisor of output_K_), capped for a split by the per-core fractal share
       // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
-      const int64_t l1_k =
-          (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < cube_window_k.size() &&
-           cube_window_k[sink_mm_op_] > 0)
-              ? cube_window_k[sink_mm_op_]
-              : output_K_;
+      std::vector<int64_t> chosen_windows = cube_window_k;
+      if (chosen_S != configured_split) {
+        const int64_t derive_sink_k = lone_matmul ? output_K_ : output_K_ / chosen_S;
+        derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &chosen_windows);
+      }
+      const int64_t l1_k = (cube_sink_request_node_ >= 0 &&
+                            static_cast<size_t>(cube_sink_request_node_) < chosen_windows.size() &&
+                            chosen_windows[static_cast<size_t>(cube_sink_request_node_)] > 0)
+                               ? chosen_windows[static_cast<size_t>(cube_sink_request_node_)]
+                               : output_K_;
       if (chosen_S > 1) {
         const int64_t share_k = ((kfrac + chosen_S - 1) / chosen_S) * 16;
         int64_t per_core_k = 16;
@@ -2176,11 +2451,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         }
         result.config.k = per_core_k;
       } else {
-        result.config.k =
-            (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < cube_window_k.size() &&
-             cube_window_k[sink_mm_op_] > 0)
-                ? cube_window_k[sink_mm_op_]
-                : cfg.k;
+        result.config.k = l1_k > 0 ? l1_k : cfg.k;
       }
     } else {
       const double eff = (double)std::min<int64_t>(num_tiles, n_cores);
@@ -2478,7 +2749,7 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       const int64_t Mo = prob_->tensors[o].height;
       const int64_t No = prob_->tensors[o].width;
       const int64_t Ko = prob_->tensors[op.inputs[0]].width;  // contraction
-      const DType dt = prob_->tensors[o].dtype;
+      const DType dt = prob_->tensors[op.inputs[0]].dtype;
       cube_mac += CubeMacCycles(prob_, Mo, No, Ko, dt);
       cube_extract += CubeExtractCycles(prob_, bc, Mo, No, Ko, dt);
     } else {  // Pointwise / Reduction — grounded per-op compute (reductions: axis-aware
@@ -2596,7 +2867,7 @@ CostResult Ascend910BMixed::compute_cost(const TileConfig &cfg,
       const auto& op = prob_->ops[i];
       if (op.type != OpType::MatMul) continue;
       const int64_t Ko = prob_->tensors[op.inputs[0]].width;
-      const DType dt = prob_->tensors[op.output()].dtype;
+      const DType dt = prob_->tensors[op.inputs[0]].dtype;
       rmac += CubeMacCycles(prob_, m_ext, n_ext, Ko, dt);
       rext += CubeExtractCycles(prob_, bc, m_ext, n_ext, Ko, dt);
     }

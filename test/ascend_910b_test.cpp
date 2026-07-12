@@ -518,6 +518,21 @@ static void test_geometry_compute() {
     CHECK("GEOM: cube compute = grounded fractal MACs / cores (compute-bound)",
           rc.compute_bound && std::abs(rc.latency - exp_c) < exp_c * 1e-4);
 
+    // Operand precision, not accumulator/output precision, selects the cube
+    // instruction geometry. BF16 inputs commonly accumulate to FP32; pricing
+    // that shape as FP32-input MAC/extract work overstates it by about 4x.
+    Problem cb = c;
+    cb.tensors[0].dtype = DType::BF16;
+    cb.tensors[1].dtype = DType::BF16;
+    cb.tensors[2].dtype = DType::FP32;
+    auto cb_sg = Subgraph::create(cb, DAG::build(cb), {0});
+    CHECK("GEOM: BF16-input/FP32-output subgraph is accepted", static_cast<bool>(cb_sg));
+    if (cb_sg) {
+      auto rb = cb_sg->compute_cost(rc.config);
+      CHECK("GEOM: BF16-input/FP32-output cube work follows BF16 operands",
+            rb.feasible && rb.compute_bound && rb.latency < rc.latency * 0.3);
+    }
+
     // --- VECTOR: pointwise [512,512], FP32. Vector compute parallelizes across cores
     // while DDR is the shared aggregate, so a pointwise is DDR-BOUND -- its latency is
     // the GM<->UB byte floor (load + store), tile-invariant. (The head+slope*repeat+
@@ -1433,6 +1448,54 @@ static void test_mixed_multistage_pebble() {
     }
 }
 
+static void test_cube_schedule_fanout() {
+  std::cout << "[CUBEFAN] request-instance reuse and role-switch recompute\n";
+  // Multi-sink fan-out can request one producer in two orientations. The
+  // request DAG recomputes the producer once per distinct role, while both
+  // boundary roots share one spatial work unit and never invent a split-K
+  // coordinate for either sink.
+  {
+    Problem p;
+    p.tensors = {{64, 64}, {64, 64}, {64, 64},  // A, B, T=A@B
+                 {64, 64}, {64, 64},            // C, L=T@C
+                 {64, 64}, {64, 64}};           // D, R=D@T
+    p.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::MatMul, {2, 3}, {4}}, {OpType::MatMul, {5, 2}, {6}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2});
+    CHECK("CUBEPLAN/fanout: multi-sink role-switch DAG is accepted", static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 32;
+      cfg.h = 32;
+      cfg.k = 32;
+      cfg.parts_m = 2;
+      cfg.parts_n = 2;
+      cfg.split_k = 1;
+      auto cost = sg->compute_cost(cfg);
+      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      CHECK("CUBEPLAN/fanout: fixed multi-root candidate is feasible",
+            cost.feasible && plan.feasible && plan.emit_compatible && plan.split_k == 1 &&
+                plan.work_units == 4);
+      CHECK("CUBEPLAN/fanout: producer is recomputed for its two roles",
+            plan.matmuls.size() == 4 && plan.matmuls[0].op == 0 && plan.matmuls[1].op == 1 &&
+                plan.matmuls[2].op == 0 && plan.matmuls[3].op == 2 && plan.matmuls[1].lhs_producer == 0 &&
+                plan.matmuls[3].rhs_producer == 2);
+      CHECK("CUBEPLAN/fanout: first request is SpatialM x Full",
+            plan.matmuls[0].output.height_binding == CubeAxisBinding::SpatialM &&
+                plan.matmuls[0].output.width_binding == CubeAxisBinding::Full &&
+                plan.matmuls[0].output.height == 32 && plan.matmuls[0].output.width == 64);
+      CHECK("CUBEPLAN/fanout: second request is Full x SpatialN",
+            plan.matmuls[2].output.height_binding == CubeAxisBinding::Full &&
+                plan.matmuls[2].output.width_binding == CubeAxisBinding::SpatialN &&
+                plan.matmuls[2].output.height == 64 && plan.matmuls[2].output.width == 32);
+      CHECK("CUBEPLAN/fanout: both consumers are boundary roots",
+            plan.matmuls[1].is_sink && plan.matmuls[3].is_sink);
+    }
+  }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -1463,8 +1526,10 @@ static void test_exec_enumeration() {
     std::vector<int64_t> kk;
     int64_t peak = sg->cube_peak_l1(cfg, &kk);
     CHECK("EXEC: chain feasible at [128,256]", peak != INT64_MAX);
-    // T band = 256*256*4 = 262144; op0 strip at k=128 = 1536*128 = 196608.
-    CHECK_EQ("EXEC: peak L1 = T band + op0 strip", (double)peak, 458752.0, 0.5);
+    // T is the sink's full contraction request at S=1, so op0 produces all 256
+    // columns. T band = 256*256*4 = 262144; op0's exact boundary strip at
+    // k=128 is (256 rows + 256 cols)*4*128 = 262144.
+    CHECK_EQ("EXEC: peak L1 = T band + exact op0 strip", static_cast<double>(peak), 524288.0, 0.5);
     CHECK("EXEC: op0 internal seq-k sliced to 128", kk.size() > 1 && kk[0] == 128);
     CHECK("EXEC: op1 sink seq-k = full output_K 256", kk.size() > 1 && kk[1] == 256);
     CHECK("EXEC: peak counts the intermediate band (old sum ignored it)",
@@ -1501,9 +1566,10 @@ static void test_cube_schedule_plan() {
         CHECK("CUBEPLAN/lone: fixed candidate and plan are feasible",
               cost.feasible && plan.feasible && plan.emit_compatible);
         CHECK("CUBEPLAN/lone: exact grid and split are retained",
-              plan.m_partition.parts == 2 && plan.n_partition.parts == 4 &&
-                  plan.spatial_tiles == 8 && plan.split_k == cost.parallel_split &&
-                  plan.work_units == plan.spatial_tiles * plan.split_k);
+              plan.m_partition.parts == 2 && plan.n_partition.parts == 4 && plan.spatial_tiles == 8 &&
+                  plan.split_k == cost.parallel_split &&
+                  plan.work_units == plan.spatial_tiles * plan.split_k && plan.l0_tile_m == 128 &&
+                  plan.l0_tile_n == 256);
         CHECK("CUBEPLAN/lone: peak and per-op L1 window come from derive_exec",
               plan.peak_l1_bytes == peak && plan.matmuls.size() == 1 &&
                   plan.matmuls[0].k_loop.l1_window_k == windows[0]);
@@ -1514,8 +1580,34 @@ static void test_cube_schedule_plan() {
                   plan.model_overlap_granted);
     }
 
+    // Lone split-K derives its resident window against full K, then caps that
+    // window to the emitted share. K=96, S=2 is a regression shape: 32 divides
+    // full K but not K/S=48, so deriving directly at K/S would report 16 and
+    // disagree with the final plan's 32-wide window.
+    {
+      auto p = mk_mm(16, 16, 96, 1000);
+      p.l1_capacity = 40LL * (16 + 16) * 4;  // room for K=40; full-K divisor is 32
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0});
+      CHECK("CUBEPLAN/lone-split-window: subgraph is accepted", static_cast<bool>(sg));
+      if (!sg) return;
+      TileConfig cfg;
+      cfg.w = 16;
+      cfg.h = 16;
+      cfg.k = 32;
+      cfg.parts_m = 1;
+      cfg.parts_n = 1;
+      cfg.split_k = 2;
+      auto cost = sg->compute_cost(cfg);
+      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      CHECK("CUBEPLAN/lone-split-window: cost and reconstructed plan agree",
+            cost.feasible && cost.parallel_split == 2 && cost.config.k == 32 && plan.feasible &&
+                plan.config.k == 32 && plan.matmuls.size() == 1 && plan.matmuls[0].k_loop.l1_window_k == 32 &&
+                plan.matmuls[0].k_loop.pipeline_stages == 2);
+    }
+
     // Left-deep chain: producer-before-consumer order, an internal per-op K
-    // window, and the shared-M/full-N ephemeral band are all explicit.
+    // window, and the sink-contraction request are all explicit.
     {
         auto p = mk_chained(128, 8192, 64, 64, 1000, 1000);
         DAG dag = DAG::build(p);
@@ -1529,42 +1621,69 @@ static void test_cube_schedule_plan() {
                   plan.execution_order[0] == 0 && plan.execution_order[1] == 1 &&
                   plan.matmuls.size() == 2 && plan.matmuls[0].op == 0 &&
                   plan.matmuls[1].op == 1);
-        CHECK("CUBEPLAN/chain: internal output is a spatial-M/full-N L1 band",
+        CHECK("CUBEPLAN/chain: internal output follows the sink K share",
               plan.matmuls[0].output_ephemeral &&
                   plan.matmuls[0].output.height_binding == CubeAxisBinding::SpatialM &&
-                  plan.matmuls[0].output.width_binding == CubeAxisBinding::Full);
+                  plan.matmuls[0].output.width_binding == CubeAxisBinding::ParallelK &&
+                  plan.matmuls[0].output.width == 64 / plan.split_k && plan.matmuls[1].lhs_producer == 0);
         CHECK("CUBEPLAN/chain: internal matmul owns its derived sequential K loop",
               plan.matmuls[0].k_loop.l1_window_k < 8192 &&
                   plan.matmuls[0].k_loop.chunk > 0);
     }
 
-    // Cost-preserving extraction deliberately does not change the historical
-    // K/S>=32 roofline yet. Characterize the exact gap the follow-up phase
-    // roofline must close: one 32-wide per-core contraction has no rolled
-    // stage-2 loop even though the old scalar gate grants overlap.
+    // Compiler buildability mode may restrict multi-matmul DAGs to one static
+    // region shape per SPMD body without changing analytic-mode enumeration.
+    {
+      auto p = mk_chained(128, 256, 128, 256, 1000, 1000);
+      p.require_uniform_cube_dag_grid = true;
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0, 1});
+      CHECK("CUBEPLAN/uniform: gated chain is structurally accepted", static_cast<bool>(sg));
+      if (sg) {
+        const auto plans = sg->enumerate_plans();
+        bool all_uniform = !plans.empty();
+        for (const auto& [cfg, cost] : plans) {
+          all_uniform = all_uniform && cost.feasible && cfg.parts_m > 0 && cfg.parts_n > 0 &&
+                        128 % cfg.parts_m == 0 && 256 % cfg.parts_n == 0 && (128 / cfg.parts_m) % 16 == 0 &&
+                        (256 / cfg.parts_n) % 16 == 0;
+        }
+        CHECK("CUBEPLAN/uniform: every buildable candidate has one static region shape", all_uniform);
+      }
+    }
+
+    // A one-chunk K/S=32 contraction has no rolled stage-2 loop. The cost gate
+    // must therefore serialize it instead of granting overlap from K/S alone.
     {
         auto p = mk_mm(64, 64, 64, 1000);
         DAG dag = DAG::build(p);
         auto sg = Subgraph::create(p, dag, {0});
         CHECK("CUBEPLAN/roofline-gap: subgraph is structurally accepted", static_cast<bool>(sg));
         if (!sg) return;
-        auto cost = sg->best_cost();
-        auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
-        CHECK("CUBEPLAN/roofline-gap: old K/S gate can grant overlap to a serial loop",
-              plan.feasible && plan.model_overlap_granted && !plan.overlap_implementable &&
-                  plan.matmuls.size() == 1 &&
+        TileConfig cfg;
+        cfg.w = 64;
+        cfg.h = 64;
+        cfg.k = 32;
+        cfg.parts_m = 1;
+        cfg.parts_n = 1;
+        cfg.split_k = 2;
+        auto cost = sg->compute_cost(cfg);
+        auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+        CHECK("CUBEPLAN/roofline-gap: serial loop receives no overlap credit",
+              cost.feasible && cost.parallel_split == 2 && plan.feasible && !plan.model_overlap_granted &&
+                  !plan.overlap_implementable && plan.matmuls.size() == 1 &&
                   plan.matmuls[0].k_loop.pipeline_stages == 1);
     }
 
-    // The graph layer historically accepts a matmul-produced RHS, but the old
-    // pebble/cost formula still describes every ephemeral as an M-band. The plan
-    // must expose that unsupported role instead of letting a left-chain emitter
-    // silently lower it with fictional memory/traffic.
+    // A non-square tree exercises both producer orientations. The root requests
+    // an M x K/S band from its left producer and a K/S x N band from its right
+    // producer; the two bands coexist until the root consumes them.
     {
         Problem p;
-        p.tensors = {{64, 64}, {64, 64}, {64, 64},   // A, B, L=A@B
-                     {64, 64}, {64, 64}, {64, 64},   // C, D, R=C@D
-                     {64, 64}};                       // O=L@R
+        // Stored as {width, height}:
+        // L[32,80] = A[32,48] @ B[48,80]
+        // R[80,96] = C[80,64] @ D[64,96]
+        // O[32,96] = L[32,80] @ R[80,96].
+        p.tensors = {{48, 32}, {80, 48}, {80, 32}, {64, 80}, {96, 64}, {96, 80}, {96, 32}};
         p.ops = {{OpType::MatMul, {0, 1}, {2}},
                  {OpType::MatMul, {3, 4}, {5}},
                  {OpType::MatMul, {2, 5}, {6}}};
@@ -1575,11 +1694,32 @@ static void test_cube_schedule_plan() {
         CHECK("CUBEPLAN/rhs: both-input-produced matmul DAG is structurally accepted",
               static_cast<bool>(sg));
         if (sg) {
-            auto cost = sg->best_cost();
-            auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
-            CHECK("CUBEPLAN/rhs: historical M-band model is marked non-emittable for RHS producer",
-                  plan.feasible && !plan.emit_compatible && plan.matmuls.size() == 3 &&
-                      plan.matmuls.back().rhs_ephemeral);
+          TileConfig cfg;
+          cfg.w = 48;
+          cfg.h = 16;
+          cfg.k = 16;
+          cfg.parts_m = 2;
+          cfg.parts_n = 2;
+          cfg.split_k = 5;
+          auto cost = sg->compute_cost(cfg);
+          auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+          CHECK("CUBEPLAN/rhs: fixed tree candidate and best search are feasible",
+                cost.feasible && sg->best_cost().feasible && plan.feasible && plan.emit_compatible);
+          CHECK("CUBEPLAN/rhs: plan is postorder with explicit root dependencies",
+                plan.matmuls.size() == 3 && plan.matmuls[0].op == 0 && plan.matmuls[1].op == 1 &&
+                    plan.matmuls[2].op == 2 && plan.matmuls[2].lhs_producer == 0 &&
+                    plan.matmuls[2].rhs_producer == 1);
+          CHECK("CUBEPLAN/rhs: left producer is SpatialM x ParallelK",
+                plan.matmuls[0].output.height_binding == CubeAxisBinding::SpatialM &&
+                    plan.matmuls[0].output.width_binding == CubeAxisBinding::ParallelK &&
+                    plan.matmuls[0].output.height == 16 && plan.matmuls[0].output.width == 16);
+          CHECK("CUBEPLAN/rhs: right producer is ParallelK x SpatialN",
+                plan.matmuls[1].output.height_binding == CubeAxisBinding::ParallelK &&
+                    plan.matmuls[1].output.width_binding == CubeAxisBinding::SpatialN &&
+                    plan.matmuls[1].output.height == 16 && plan.matmuls[1].output.width == 48);
+          CHECK("CUBEPLAN/rhs: split geometry is represented exactly",
+                plan.spatial_tiles == 4 && plan.split_k == 5 && plan.work_units == 20 &&
+                    plan.matmuls[2].effective_contraction == 16);
         }
     }
 }
@@ -1610,13 +1750,14 @@ static void test_seq_k_intermediate() {
 // so it would have wrongly accepted the overflowing config.
 static void test_peak_band_feasibility() {
     std::cout << "[BAND] intermediate band gates feasibility (peak vs static sum)\n";
-    auto p = mk_chained(128, 64, 4096, 64, 1000, 1000);  // T = [4096, 128], FP32
+    auto p = mk_chained(128, 64, 2048, 64, 1000, 1000);  // T = [2048, 128], FP32
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0, 1});
-    // h=128: band = 4096*128*4 = 2 MB > 512 KB L1 -> infeasible.
+    // h=128: band = 2048*128*4 = 1 MB > 512 KB L1 -> infeasible.
     CHECK("BAND: full M-band infeasible (T band overflows L1)",
           sg->cube_peak_l1({64, 128, 0}) == INT64_MAX);
-    // h=16: band = 4096*16*4 = 256 KB < 512 KB -> feasible.
+    // h=16: band = 2048*16*4 = 128 KB. The producer's exact full-width
+    // boundary panel also fits at a 32-wide sequential K window.
     CHECK("BAND: small M-band feasible (band fits, peak under L1)",
           sg->cube_peak_l1({64, 16, 0}) != INT64_MAX);
 }
@@ -2397,6 +2538,7 @@ int main() {
     test_dfs_order();
     test_exec_enumeration();
     test_cube_schedule_plan();
+    test_cube_schedule_fanout();
     test_seq_k_intermediate();
     test_peak_band_feasibility();
     test_chain_ksplit_variants();

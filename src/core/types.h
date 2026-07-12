@@ -208,6 +208,12 @@ struct Problem {
     // algorithm. A different candidate is infeasible and is cut into P1/P2-buildable groups.
     bool allow_model_ahead_multi_reduction_stream = true;
 
+    // Buildability gate for homogeneous cube DAGs with more than one matmul.
+    // When true, enumerate only exact uniform M/N partitions; the current
+    // plan-driven emitter cannot represent unequal static region shapes in one
+    // SPMD kernel. Lone matmuls retain the full balanced grid space.
+    bool require_uniform_cube_dag_grid = false;
+
     // Exact buildable P4 candidates found once by the IR adapter. The cost model compares the
     // candidate subgraph's complete op set against these entries; the emitter consumes the same
     // analysis result.
@@ -363,11 +369,10 @@ inline AxisPartition partition_axis(int64_t dim, int64_t parts, int64_t granule 
 // Derived cube schedule plan
 // ============================================================================
 
-// Symbolic source of one axis of a fixed tensor region. The first cube-plan
-// increment records the current model's shared-M/full-N band algorithm; keeping
-// the binding explicit makes a future role-aware general DAG implementation
-// able to distinguish an intermediate used as a left operand from one used as a
-// right operand without rediscovering that choice in the emitter.
+// Symbolic source of one axis of a fixed tensor region. Bindings are propagated
+// backwards from each sink request, so an emitter can recover both the concrete
+// extent and offset for a spatial tile, parallel K share, or sequential K chunk
+// without reclassifying the matmul DAG.
 enum class CubeAxisBinding {
     Full,
     SpatialM,
@@ -398,17 +403,20 @@ struct CubeKLoopPlan {
 };
 
 struct CubeMatmulSchedule {
-    size_t op = std::numeric_limits<size_t>::max();
-    bool is_sink = false;
-    bool lhs_ephemeral = false;
-    bool rhs_ephemeral = false;
-    bool output_ephemeral = false;
-    int64_t contraction = 0;
-    int64_t effective_contraction = 0;  // sink K/split; full K for internal ops
-    CubeTensorRegionPlan lhs;
-    CubeTensorRegionPlan rhs;
-    CubeTensorRegionPlan output;
-    CubeKLoopPlan k_loop;
+  size_t instance = std::numeric_limits<size_t>::max();
+  size_t op = std::numeric_limits<size_t>::max();
+  int64_t lhs_producer = -1;  // schedule-instance index, -1 = boundary input
+  int64_t rhs_producer = -1;
+  bool is_sink = false;
+  bool lhs_ephemeral = false;
+  bool rhs_ephemeral = false;
+  bool output_ephemeral = false;
+  int64_t contraction = 0;
+  int64_t effective_contraction = 0;  // sink K/split; full K for internal ops
+  CubeTensorRegionPlan lhs;
+  CubeTensorRegionPlan rhs;
+  CubeTensorRegionPlan output;
+  CubeKLoopPlan k_loop;
 };
 
 // The solver-owned algorithm descriptor for a homogeneous cube subgraph at one
@@ -417,10 +425,8 @@ struct CubeMatmulSchedule {
 // CostResult, the million-entry local-search cache value.
 struct CubeSchedulePlan {
     bool feasible = false;
-    // True when every internal matmul value follows the current model's
-    // shared-M/full-N band orientation. A right-operand producer is accepted by
-    // the historical graph model but needs the role-aware increment before it
-    // can be emitted faithfully, so the first plan marks it explicitly.
+    // True when every request instance has a role-aware region and dependency
+    // representation that the plan-driven emitter can replay.
     bool emit_compatible = false;
     TileConfig config;
     AxisPartition m_partition;
@@ -429,9 +435,12 @@ struct CubeSchedulePlan {
     int64_t split_k = 1;
     int64_t work_units = 0;
     int64_t peak_l1_bytes = 0;
+    int64_t l0_tile_m = 0;
+    int64_t l0_tile_n = 0;
     bool seed_required = false;
-    // The cost-preserving descriptor records both the historical scalar
-    // roofline gate and whether the concrete emitted loops can realize it.
+    // The cost and emitter both derive this from the concrete per-request K
+    // loops. Both fields are retained so validation can fail loudly if a future
+    // model change grants overlap that the reconstructed loop cannot realize.
     bool model_overlap_granted = false;
     bool overlap_implementable = false;
     std::vector<size_t> execution_order;

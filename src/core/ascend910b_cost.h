@@ -1,11 +1,13 @@
 #pragma once
 
-#include "core/cost_model.h"
-#include "core/dag.h"
-#include "core/types.h"
+#include <limits>
 #include <optional>
 #include <set>
 #include <vector>
+
+#include "core/cost_model.h"
+#include "core/dag.h"
+#include "core/types.h"
 
 // ============================================================================
 // Ascend910BCost: the 910B cost model. A connected group of ops that share a
@@ -223,15 +225,40 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                           const FlatSet<size_t> &retained_from_prev,
                           const FlatSet<size_t> &retain_these) const;
 
-  // Engine behind cube_peak_l1(): sweep the execution order, accumulate live
-  // intermediate-band bytes, derive each matmul's per-op k against the headroom,
+  // Engine behind cube_peak_l1(): sweep the request-instance execution order,
+  // accumulate live intermediate-region bytes, derive each matmul instance's k
+  // against the headroom,
   // return the peak L1 bytes (INT64_MAX if infeasible). sink_K_eff is the sink
   // matmul's per-core contraction share (= output_K_ for S=1 feasibility; =
-  // output_K_/S when emitting the schedule for a known parallel split).
-  int64_t derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
-                      const FlatSet<size_t> &retained_from_prev,
-                      const FlatSet<size_t> &retain_these,
-                      std::vector<int64_t> *perop_k_out) const;
+  // output_K_/S when evaluating/emitting a known parallel split). The optional
+  // vector is indexed by cube_request_nodes_, not global op id.
+  int64_t derive_exec(const TileConfig& cfg, int64_t sink_K_eff, const FlatSet<size_t>& retained_from_prev,
+                      const FlatSet<size_t>& retain_these, std::vector<int64_t>* pernode_k_out) const;
+
+  struct CubeRequest {
+    size_t tensor = std::numeric_limits<size_t>::max();
+    CubeAxisBinding height_binding = CubeAxisBinding::Full;
+    CubeAxisBinding width_binding = CubeAxisBinding::Full;
+  };
+
+  // Candidate-invariant recursive request DAG. A source op may appear more
+  // than once when fan-out asks for distinct tensor regions; identical
+  // (tensor, height binding, width binding) requests are memoized once.
+  struct CubeRequestNode {
+    size_t op = std::numeric_limits<size_t>::max();
+    CubeRequest output;
+    CubeRequest lhs;
+    CubeRequest rhs;
+    int64_t lhs_producer = -1;
+    int64_t rhs_producer = -1;
+    bool parallel_sink = false;
+  };
+
+  [[nodiscard]] int64_t cube_binding_extent(CubeAxisBinding binding, int64_t full_extent, int64_t m_extent,
+                                            int64_t n_extent, int64_t split) const;
+
+  double cube_request_reload(const TileConfig& cfg, int64_t split, double* lhs_bytes_out = nullptr,
+                             double* rhs_bytes_out = nullptr) const;
 
   // Matmul boundary-operand reload (BYTES) at this tiling: the distribution-aware
   // M*N*K*(1/w + 1/h) term, deduped per (tensor, role). Shared by the cube cost
@@ -334,6 +361,14 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // Depth-first topological execution order (see execution_order()). Fixed at
   // construction; drives the peak-working-set sweep and the emitted schedule.
   std::vector<size_t> dfs_order_;
+
+  // Pure-cube request instances, in producer-before-consumer DFS order. This is
+  // the topology/role template shared by feasibility, costing, and the final
+  // CubeSchedulePlan reconstruction; it is built once per subgraph, not once
+  // per enumerated TileConfig.
+  std::vector<CubeRequestNode> cube_request_nodes_;
+  std::vector<size_t> cube_request_roots_;
+  int64_t cube_sink_request_node_ = -1;
 
   // Precomputed per-boundary-tensor tiling info for compute_cost.
   //

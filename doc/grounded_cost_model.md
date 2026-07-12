@@ -45,7 +45,8 @@ transfer_cycles = (bytes / 2^30) / bw_GiBps * cube_freq_hz
 i.e. `MakeByteCost()` precomputes `cycles_per_byte = cube_freq_hz / (2^30 *
 bw_GiBps)`, per direction.
 
-**Cube fractals** (pto-isa `mad`): a matmul of an `M×N` output with contraction `K`:
+**Cube fractals** (pto-isa `mad`): a matmul of an `M×N` output with contraction `K`;
+`dtype` is the operand precision (not the often-FP32 accumulator/output):
 
 ```
 repeats = ceil(M/16) * ceil(N/16) * ceil(K/kF)      kF = 32 / dtype_bytes   (fp32:8, fp16/bf16:16)
@@ -104,12 +105,10 @@ lat = max( compute_makespan , ddr )    # when the reload can double-buffer
     = compute_makespan + ddr           # otherwise (no overlap)
 ```
 
-**Double-buffer floor.** The `max()` overlap is physical only when the operand
-reload can **ping-pong** — the per-core contraction halvable into ≥2 seq-K
-sub-strips (`per_core_K ≥ 32`; the emit's implicit halving needs that). A tiny
-contraction, or an over-aggressive split-K with `K/S < 32`, can't overlap →
-reload and compute **serialize** (`compute + ddr`). This caps split-K at `S ≤
-K/32`. It is a cost, not a hard reject.
+**Double-buffer floor.** The `max()` overlap requires every boundary-loading
+request to reconstruct an emitted stage-2 K loop with at least two rolled chunks.
+Otherwise compute and reload **serialize** (`compute + ddr`); the old scalar
+`K/S ≥ 32` test did not describe upstream loops.
 
 **Double-buffering does NOT reserve L1/UB.** The two ping-pong buffers *together*
 are the pool, so `derive_exec` / `vector_stream` use the **full** `l1_capacity` /
@@ -122,11 +121,13 @@ saturation:
 ```
 ddr = ( reload * cyc_per_byte(GM→L1) + out_store * cyc_per_byte(L0C→GM) ) * sat(active)
 sat(c) = max(1, n_cores / c)          # too few DMA engines underfill HBM
-reload = cube_operand_reload(cfg)     # distribution-aware MNK*(1/w + 1/h), per (tensor,role)
+reload = cube_request_reload(cfg,S)   # exact boundary requests per work unit
 ```
 
-`cfg.w / cfg.h` carry the **physical (max) region extent** in grid mode, so
-`cube_operand_reload` / `fits_on_chip` are unchanged. The vector roofline is §7.
+`cfg.w / cfg.h` carry the **physical (max) region extent**. Requests cover produced
+operands and fan-out roles. This logical count assumes panels persist across L0
+output subtiles; the current emitter may run a full K stream per subtile. The
+vector roofline is §7.
 
 ---
 
@@ -161,16 +162,17 @@ granule count; `s_vals` is the split set. The **work units `P·Q·S` range freel
 streaming gain) drives it. So a power-of-two shape that can't form `C` spatial
 regions still fills the cores via split (64² cube = 4×4 fractals → `(4,3) × S=2`).
 
-- **Cube**: `C = num_cube_cores`, `s_vals = divisors(kfrac)` (the sink split-K).
-  Gated on all matmuls sharing the sink M; else falls back to uniform.
+- **Cube**: `C = num_cube_cores`, `s_vals = divisors(kfrac)` for one sink; multiple
+  sinks use `{1}`. Request propagation handles arbitrary internal M/N. AutoFuse
+  can require uniform multi-matmul grids for emit buildability.
 - **Vector**: `C = num_vector_cores`; a reduced axis pins to 1 part (it can't be
   spatially tiled — the whole row/col must be present to reduce). `s_vals =
   divisors(2C)` capped by the reduced extent **iff the sink is a reduction**, else
   `{1}` (an internal reduction is tiled like pointwise — see §7).
 
-**Chained backpropagation** (cube): the sink M-partition slices every matmul's
-rows; a consumed intermediate is the next matmul's contraction, so it is a
-full-width `[m_ext, N_int]` row-band recomputed once per N-region.
+**Recursive request propagation** (cube): `O[rows,cols]` for `O=A@B` induces
+`A[rows,K]` and `B[K,cols]`. Binding-based memoization shares identical requests;
+different fan-out roles are recomputed. This covers arbitrary matmul DAGs.
 
 ---
 
@@ -190,9 +192,9 @@ e.g. 32 units on 24 cores → `ceil(32/24)=2` waves → `W/16`, not `W/24`.
 **LPT** (cube grid — regions are unequal by ±1 fractal):
 
 ```
-LptMakespan: enumerate the ≤4 region shapes with their counts (and ksplit S),
-             sort descending, assign each to the least-loaded of C cores;
-             makespan = busiest core
+LptMakespanPerUnit: enumerate each region shape × split partial, evaluate its
+                    full recursive request DAG, sort descending, assign each
+                    to the least-loaded of C cores; makespan = busiest core
 ```
 
 With `parts == C` this is one wave → the largest region; it also captures the
@@ -213,11 +215,11 @@ The parallel split is sink-only because the cross-core merge (atomic-add / DDR
 reduction) is clean only at the boundary output. The cube and vector parallel
 splits are **analogous**:
 
-**Cube split-K** (sink matmul). `S | kfrac` (`kfrac = output_K/16`), capped by the
-double-buffer floor `K/S ≥ 32`. On a grid, LPT-consistent: `LptMakespan(...,
-ksplit=S)` splits each region's K. Merge barrier (`ddr_atomic_add`): with
-SetAtomicAdd just the S partial writes (sat-discounted); without, a serial DDR
-read-back + sum (∝ S).
+**Cube split-K** (single sink matmul). `S | kfrac` (`kfrac = output_K/16`). On a
+grid, LPT-consistent request evaluation shrinks every `ParallelK` region and
+creates `P·Q·S` work units. A split whose concrete K loops cannot ping-pong is
+legal but pays serialized compute+DDR. With SetAtomicAdd, merge traffic is the S
+partial writes; without it, add a serial DDR read-back + sum (∝ S).
 
 **Vector reduced-axis split** (reduction **sink**). The `[H,1]`/`[1,W]` partials
 reduce across cores. `S` lets `P_spatial · S` fill the cores when the non-reduced
@@ -404,14 +406,11 @@ sink** (`c→v` — the epilogue needs the fully-reduced C, so the matmul is nev
 
 ## 9. Feasibility (recap; full detail in base doc §3)
 
-Feasibility **never depends on the spatial tile** — which is *why* the grid can
-replace uniform on the 910B path.
-
-- **Cube** → `derive_exec ≠ INT64_MAX`: the red-blue pebble peak over the fixed DFS
-  order — live ephemeral bands + per-op **greedy seq-k** operand strips fit the
-  **full** L1. The output drains L0c→DDR (**not** charged to L1); **L0c sizing is
-  deferred to `AutoTileMatmulL0`**. Infeasible ⇔ no fitting k exists; the derived
-  k is written to `config.k` for the emit.
+- **Cube** → `derive_exec ≠ INT64_MAX`: a red-blue pebble peak over the
+  producer-before-consumer request instances. Live exact intermediate regions +
+  each node's greedy sequential-K boundary strips must fit full L1. The root
+  output drains L0c→DDR (not charged to L1); L0 subdivision is recorded in
+  `CubeSchedulePlan`. Region sizes and a root K split can change feasibility.
 - **Vector** → `vector_stream(cfg).chunk > 0`: the tile streams through UB to a
   min-chunk (free for pointwise, recompute-costed for a reduction).
 - **Mixed** (cube+vector) → both: `derive_exec` (L1) *and* `vector_stream` (UB);
@@ -442,7 +441,7 @@ Among equal-latency configs, lexicographic:
 | --- | --- | --- |
 | 256³ / 1024³ / 4096³ | cube | `3×4` grid × split-2 → 24 units, 1 wave |
 | 2048³ | cube | `3×4` grid × split-2 (bigger tiles, ~8% < `4×6` spatial) |
-| 64² (K=64) | cube | only 4×4 fractals; floor caps `S ≤ 2` → 16 units (DDR-bound) |
+| small K | cube | a split that leaves no two-trip K loop serializes compute+DDR; it receives no fictional overlap |
 | 16² (K=512) | cube | `(1,1) × split-32` → fills 24 purely via split-K |
 | `[512,512]` pointwise | vector | balanced grid → 48 regions, 1 wave |
 | `[W,128]` softmax (small rows) | vector | `[W, 3]` fine-row grid → 48 regions (sub-16 rows) |
@@ -463,11 +462,12 @@ Among equal-latency configs, lexicographic:
   (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
   tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
   shape *is* now cost-driven, via §7.)
-- **Split-K is model-ahead of the emit (base *and* mixed) — behind a buildable flag.** The solver
-  credits `parallel_split > 1` for a lone matmul and a single-matmul cube sink (`v→c`), which the
-  AutoFuse auto-emit does not realize yet. `Problem::allow_model_ahead_split_k` gates it: `true`
-  (default) credits the split; `false` forces `S=1` for **both** base and mixed, so `best_cost`
-  never picks an unemittable split (`CostResult::uses_model_ahead_split_k` flags one). Flip when Phase-C lands.
+- **Pure-cube plan buildability.** AutoFuse emits uniform multi-matmul grids from
+  `CubeSchedulePlan`, including split seed/atomic stores. Unequal multi-op grids and identical
+  deduplicated boundary requests are declined. Lone ceil+clamp is numeric but can exceed LPT work.
+- **Pure-cube outer phases.** Concrete-loop gating closes one-trip overlap, but the roofline is
+  still subgraph-wide. Per-node phases, L0-subtile GM multiplicity (or retained panels), and split
+  seed/task overhead remain.
 - **Mixed cube stage — makespan + floors.** The cube/vector stages route through the base
   `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-unit makespan, not the flat
   `eff_units` average — so an imbalanced grid no longer under-predicts its biggest region, and the
@@ -489,11 +489,10 @@ Among equal-latency configs, lexicographic:
 | grounded coefficients, fields | `types.h` (`Problem`), `io.cpp` |
 | per-direction byte cost | `ascend910b_cost.cpp` `MakeByteCost` |
 | cube MACs / extract | `CubeMacCycles` / `CubeExtractCycles` |
-| wave makespan | `WaveComputeCycles` |
-| grid partition (granule) | `types.h` `AxisPartition` / `partition_axis` |
-| LPT makespan (+ ksplit) | `LptMakespan` |
+| grid, wave, and LPT | `partition_axis` / `WaveComputeCycles` / `LptMakespanPerUnit` |
+| recursive cube requests | `Ascend910BCost::create` / `CubeRequestNode` |
 | grid candidates (triples, granularity) | `Ascend910BCost::create` (`gen_grid`, `grid_gran_*`) |
-| cube roofline + split-K + Phase D | `Ascend910BCost::compute_cost` (matmul branch) |
+| cube cost and final schedule | `compute_cost` / `cube_schedule_plan` / `CubeSchedulePlan` |
 | vector roofline + double-buffer floor + reduced split | `compute_cost` (vector branch) |
 | mixed roofline (overlap max + symmetric fill + 4-port par ddr + cube-sink split-K) | `Ascend910BMixed::compute_cost` |
 | feasibility | `derive_exec` / `cube_peak_l1` / `vector_stream` (mixed: both) |
