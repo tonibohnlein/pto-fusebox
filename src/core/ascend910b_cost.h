@@ -275,9 +275,18 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // vector_peak_ub() is called repeatedly while evaluating tile candidates.
   int64_t vector_min_dtype_bytes_ = 4;
   int64_t vector_emit_granule_ = 1;
+  int64_t vector_pipe_band_count_ = 2;
+  int64_t vector_iter_W_ = 1;
+  int64_t vector_iter_H_ = 1;
   // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
+  FlatSet<size_t> p4_apply_substitutions_;
+  // Candidate-invariant phase membership.  Bits are private to the .cpp;
+  // vectors are indexed by global op/tensor id and keep per-configuration plan
+  // derivation O(1) beyond its UB geometry search.
+  std::vector<uint8_t> vector_op_phase_mask_;
+  std::vector<uint8_t> vector_input_phase_mask_;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).

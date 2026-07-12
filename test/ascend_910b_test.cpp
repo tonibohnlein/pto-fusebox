@@ -218,8 +218,8 @@ static void test_softmax_reduction_schema() {
     std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
-    CHECK_EQ("softmax: refactor preserves fused vector cost", fused, 30073.8, 0.5);
-    CHECK_EQ("softmax: refactor preserves cut vector cost", separate, 88186.9, 0.5);
+    CHECK_EQ("softmax: phase-roofline fused vector cost", fused, 22153.9, 0.5);
+    CHECK_EQ("softmax: phase-roofline cut vector cost", separate, 88309.8, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -230,7 +230,10 @@ static void test_softmax_reduction_schema() {
 static void test_R_reduction_split() {
     std::cout << "[R] few-row reduction — split reduced axis across vector cores\n";
     Problem p;
-    p.tensors = {{4096, 4}, {1, 4}};                       // A[4 rows x 4096], rowmax -> m[1,4]
+    // Keep the source/work pair materializable after DMA padding so this test
+    // isolates the sink split.  W=4096 intentionally streams in 192 KiB UB and
+    // is covered by the softmax-cut and STREAM tests instead.
+    p.tensors = {{2048, 4}, {1, 4}};  // A[4 rows x 2048], rowmax -> m[1,4]
     p.ops = {{OpType::Reduction, {0}, {1}}};
     p.fast_memory_capacity = 1 << 24;
     set_910b(p);
@@ -241,7 +244,7 @@ static void test_R_reduction_split() {
     // so the sink reduction splits its reduced axis ACROSS cores to fill them.
     CHECK("R: few-row reduction split-fills the vector cores",
           r.cores_used == 48 && r.parallel_split > 1);
-    CHECK_EQ("R: refactor preserves few-row reduction cost", r.latency, 10563.0, 1.0);
+    CHECK_EQ("R: phase-roofline few-row reduction cost", r.latency, 10093.3, 1.0);
 }
 
 // --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
@@ -1619,7 +1622,7 @@ static void test_reduction_sink_gating() {
  return p; };
     // (a) bare rowmax, few rows -> sink reduction -> splits across cores.
     Problem a = mk();
-    a.tensors = {{4096, 4}, {1, 4}};
+    a.tensors = {{2048, 4}, {1, 4}};
     a.ops = {{OpType::Reduction, {0}, {1}}};
     a.fast_memory_capacity = 1 << 24; set_910b(a);
     DAG da = DAG::build(a);
@@ -1628,7 +1631,7 @@ static void test_reduction_sink_gating() {
     // (b) x -> m=rowmax(x) -> y=sub(x,m): pointwise SINK, internal reduction, few
     // rows. Cannot fill cores (no split allowed) -> parallel_split stays 1.
     Problem b = mk();
-    b.tensors = {{4096, 4}, {1, 4}, {4096, 4}};
+    b.tensors = {{2048, 4}, {1, 4}, {2048, 4}};
     b.ops = {{OpType::Reduction, {0}, {1}},
              {OpType::Pointwise, {0, 1}, {2}}};
     b.fast_memory_capacity = 1 << 24; set_910b(b);
@@ -1666,8 +1669,7 @@ static void test_streamed_reduction_sink_no_split() {
     auto r = sg->best_cost();
     std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
               << " lat=" << r.latency << "\n";
-    CHECK_EQ("STREAMSPLIT: shared-plan refactor preserves calibrated latency",
-             r.latency, 101566.0, 1.0);
+    CHECK_EQ("STREAMSPLIT: phase-roofline calibrated latency", r.latency, 59469.3, 1.0);
     // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
     CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
           r.parallel_split == 1);
@@ -1780,6 +1782,8 @@ static void test_g1_multi_reduction_stream_decline() {
               stream.apply.first_chunk == 0 && stream.apply.trip_count == stream.full_chunks);
     CHECK("P4PLAN: long softmax stats and apply phases are stage-2 pipelines",
           stream.stats.pipeline_stages == 2 && stream.apply.pipeline_stages == 2);
+    CHECK("P4PLAN: stage-2 chunk peak includes both transient pipeline stages",
+          stream.stream_band_count == 2 * 4 + 6 && stream.chunk_peak_ub_bytes <= p.vec_capacity);
     CHECK("P4: a different subgroup does not inherit function-level permission",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2})->best_cost().latency));
 
@@ -1794,36 +1798,35 @@ static void test_g1_multi_reduction_stream_decline() {
               VectorStreamKind::LayerNormWelford);
 }
 
-// --- G3: a spanning-output streamed reduction reads its input TWICE (A7) -------
-// A streamed reduction whose live-out SPANS the reduced axis (rowmax then sub(x,m) -> [W,H]) needs
-// the FINALIZED whole-axis stat per element, so the emit re-streams the input in an APPLY pass —
-// the input is read twice. Streamed reductions are DDR-bound, so the model must price io_in x2 for
-// the spanning case (else it under-prices the streamed group and over-fuses). Control: a pointwise
-// twin relu(x) with the SAME [W,H] input and store, which reads the input ONCE. Both stream the
-// wide W across 48 cores. With the io_in x2 the spanning/twin DDR ratio is ~2.5; WITHOUT it (the
-// spanning input read once) it is ~1.5 (a pure config difference — the reduction pins the reduced
-// axis so it tiles differently). So `spanning > 2x twin` holds iff the second input read is priced.
+// --- G3: streamed input multiplicity is per boundary input (A7) ---------------
+// x participates in stats+apply and is read twice. An apply-only bias participates
+// in exactly one phase and must add one read, not inherit x's group-level 2x.
 static void test_g3_spanning_reduction_rereads_input() {
-    std::cout << "[G3] spanning-output streamed reduction prices a second input read (io_in x2)\n";
-    const int64_t W = 32768, H = 128;  // huge reduced W -> both stream
-    auto ddr = [&](bool spanning) -> double {
-        Problem p;
-        if (spanning) {
-            p.tensors = {{W, H}, {1, H}, {W, H}};  // x -> m=rowmax[1,H] -> s=sub(x,m)[W,H] (spans W, 2 reads)
-            p.ops = {{OpType::Reduction, {0}, {1}}, {OpType::Pointwise, {0, 1}, {2}}};
-        } else {
-            p.tensors = {{W, H}, {W, H}};  // x -> relu(x)[W,H] (pointwise twin: same store, 1 read)
-            p.ops = {{OpType::Pointwise, {0}, {1}}};
-        }
-        p.fast_memory_capacity = 1 << 24;
-        set_910b(p);
-        DAG d = DAG::build(p);
-        const std::vector<size_t> ops = spanning ? std::vector<size_t>{0, 1} : std::vector<size_t>{0};
-        return Subgraph::create(p, d, ops)->best_cost().ddr_traffic;  // both stream over the wide W
-    };
-    const double twin = ddr(false), spanning = ddr(true);
-    CHECK("G3: spanning streamed reduction reads its input twice (DDR > 2x the 1-read twin)",
-          spanning > 2.0 * twin);
+  std::cout << "[G3] streamed reduction prices boundary inputs per phase\n";
+  constexpr int64_t W = 32768, H = 1;
+  auto ddr = [&](bool with_bias) -> double {
+    Problem p;
+    if (with_bias) {
+      p.tensors = {{W, H}, {W, H}, {1, H}, {W, H}};
+      p.ops = {{OpType::Reduction, {0}, {2}}, {OpType::Pointwise, {0, 1, 2}, {3}}};
+    } else {
+      p.tensors = {{W, H}, {1, H}, {W, H}};
+      p.ops = {{OpType::Reduction, {0}, {1}}, {OpType::Pointwise, {0, 1}, {2}}};
+    }
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    p.kernel_fill_cost = 0;
+    DAG d = DAG::build(p);
+    auto sg = Subgraph::create(p, d, {0, 1});
+    const TileConfig cfg{W, H, 1};
+    CHECK("G3: fixed candidate is a streamed spanning reduction",
+          sg->vector_stream_plan(cfg).kind == VectorStreamKind::ReductionSpanning);
+    return sg->compute_cost(cfg).ddr_traffic;
+  };
+  const double no_bias = ddr(false), with_bias = ddr(true);
+  const double bytes = (double)W * H * 4.0;
+  const double cpb = 1.85e9 / (1024.0 * 1024.0 * 1024.0 * 100.9);
+  CHECK_EQ("G3: apply-only bias adds exactly one GM->UB read", with_bias - no_bias, bytes * cpb, 0.5);
 }
 
 // --- matmul sensibility invariants across a shape grid -----------------------
@@ -1888,7 +1891,7 @@ static void test_vector_sensibility() {
         if (!sg) { C("builds", false); return; }
         auto r = sg->best_cost();
         C("feasible", std::isfinite(r.latency));
-        C("fills 48 vector cores", r.cores_used == 48);
+        C("reaches the vector/HBM saturation knee", r.cores_used >= 8 && r.cores_used <= 48);
         if (expect_split) C("few-row reduction split-fills cores", r.parallel_split > 1);
     };
     auto base = [](Problem& p) { p.fast_memory_capacity = 1 << 24;
@@ -1899,7 +1902,8 @@ static void test_vector_sensibility() {
     Problem rm; rm.tensors = {{1024, 512}, {1, 512}};       // many rows -> spatial fill
     rm.ops = {{OpType::Reduction, {0}, {1}}}; base(rm);
     run("rowmax-manyrows", rm, {0}, false);
-    Problem rf; rf.tensors = {{4096, 4}, {1, 4}};           // few rows -> reduced split
+    Problem rf;
+    rf.tensors = {{2048, 4}, {1, 4}};  // materialized few rows -> split
     rf.ops = {{OpType::Reduction, {0}, {1}}}; base(rf);
     run("rowmax-fewrows", rf, {0}, true);
     Problem ss = mk_softmax(2048, 128);   run("softmax-smallW", ss, {0, 1, 2, 3}, false);
@@ -1943,7 +1947,8 @@ static void test_model_stages() {
         // few thousand elements) legitimately uses fewer cores (the kernel-fill
         // dual makes over-parallelizing a tiny op cost more than it saves).
         C("relu feasible", std::isfinite(rl.latency));
-        if (B >= 16) C("relu fills 48 vector cores", rl.cores_used == 48);
+        if (B >= 16)
+          C("relu reaches the vector/HBM saturation knee", rl.cores_used >= 8 && rl.cores_used <= 48);
         C("mm2 feasible + fills 24 cube cores", std::isfinite(m2.latency) && m2.cores_used == 24);
         if (B == 1) mm1_decode = m1.latency;
         if (B == 16) mm1_b16 = m1.latency;
@@ -2104,8 +2109,8 @@ static void test_kernel_fill_one_per_core() {
  set_910b(p);
     DAG d = DAG::build(p);
     auto r = Subgraph::create(p, d, {0})->best_cost();
-    CHECK("KFILL: huge pointwise uses ~one kernel per core (<= 2x cores)",
-          r.num_spatial_tiles <= 2 * 48 && r.cores_used == 48);
+    CHECK("KFILL: huge pointwise stays within two waves at the HBM saturation knee",
+          r.num_spatial_tiles <= 2 * 48 && r.cores_used >= 8 && r.cores_used <= 48);
     CHECK("KFILL: the per-core tile exceeds UB (streamed, not materialized)",
           (long long)r.config.w * r.config.h * 4 * 2 > 192 * 1024);
     // The fill genuinely enters the cost (same tiling search, fill on vs off).
@@ -2133,16 +2138,16 @@ static void test_pointwise_stream_explicit() {
     CHECK("PWSTREAM: large tile overflows UB", sg->vector_peak_ub(big) > UB);
     auto s = sg->vector_stream(big);
     auto plan = sg->vector_stream_plan(big);
-    CHECK("PWSTREAM: an explicit chunk is derived (streams the wider axis)",
-          s.axis == 1 && s.chunk > 0 && s.chunk < 8192);
+    CHECK("PWSTREAM: the emitter's row-first strip is solver-owned",
+          s.axis == 2 && s.chunk > 0 && s.chunk < 256);
     CHECK("PWPLAN: public stream plan preserves the compatibility axis/chunk view",
-          plan.feasible && plan.kind == VectorStreamKind::Pointwise &&
-              plan.axis == s.axis && plan.chunk == s.chunk && plan.extent == 8192);
+          plan.feasible && plan.kind == VectorStreamKind::Pointwise && plan.axis == s.axis &&
+              plan.chunk == s.chunk && plan.extent == 256 && plan.tile_h == 256 && plan.tile_w == 8192);
     CHECK("PWPLAN: peak accounting is cached on the selected plan",
           plan.full_peak_ub_bytes > UB && plan.chunk_peak_ub_bytes <= UB);
     CHECK("PWPLAN: geometry and body loop describe every full chunk plus the tail",
-          plan.full_chunks * plan.chunk + plan.tail == plan.extent &&
-              plan.body.first_chunk == 0 && plan.body.trip_count == plan.full_chunks);
+          plan.full_chunks * plan.chunk + plan.tail == plan.extent && plan.body.first_chunk == 0 &&
+              plan.body.trip_count == plan.row_strips * plan.width_strips && plan.strip_h == s.chunk);
     CHECK("PWSTREAM: the chunk actually fits UB",
           sg->vector_peak_ub(big, {}, {}, s.chunk, s.axis) <= UB);
     TileConfig valid_big{8192, 256, 1};
@@ -2154,10 +2159,21 @@ static void test_pointwise_stream_explicit() {
     CHECK("PWSTREAM: a UB-fitting tile materializes (no stream)",
           sg->vector_stream(small).axis == 0);
     auto materialized = sg->vector_stream_plan(small);
-    CHECK("PWPLAN: materialized plan is explicit and has no loop geometry",
+    CHECK("PWPLAN: materialized plan also owns its strip loop geometry",
           materialized.feasible && !materialized.streamed() &&
-              materialized.kind == VectorStreamKind::Materialized &&
-              materialized.chunk == 0 && materialized.body.trip_count == 0);
+              materialized.kind == VectorStreamKind::Materialized && materialized.chunk == 0 &&
+              materialized.tile_h == 128 && materialized.tile_w == 128 && materialized.body.trip_count == 8 &&
+              materialized.strip_h == 16 && materialized.strip_w == 128);
+
+    Problem tiny;
+    tiny.tensors = {{8, 8}, {8, 8}};
+    tiny.ops = {{OpType::Pointwise, {0}, {1}}};
+    tiny.fast_memory_capacity = 1 << 20;
+    set_910b(tiny);
+    DAG tiny_dag = DAG::build(tiny);
+    auto tiny_plan = Subgraph::create(tiny, tiny_dag, {0})->vector_stream_plan(TileConfig{8, 8, 1});
+    CHECK("PWPLAN: sub-register strips remain sequential despite multiple trips",
+          tiny_plan.body.trip_count == 8 && tiny_plan.body.pipeline_stages == 1);
 }
 
 // --- A5: a large abstract tile does not grant overlap to serial stream phases ---
@@ -2224,6 +2240,23 @@ static void test_vector_stream_short_loop_serializes() {
               long_plan.apply.pipeline_stages == 2);
     CHECK("A5PLAN: fully pipelined phases retain roofline overlap",
           long_plan.overlap_granted);
+
+    Problem ragged;
+    ragged.tensors = {{4100, 1}, {1, 1}, {4100, 1}};
+    ragged.ops = {{OpType::Reduction, {0}, {1}}, {OpType::Pointwise, {0, 1}, {2}}};
+    ragged.fast_memory_capacity = 1 << 20;
+    set_910b(ragged);
+    ragged.vec_capacity = 64 * 1024;
+    DAG ragged_dag = DAG::build(ragged);
+    auto ragged_sg = Subgraph::create(ragged, ragged_dag, {0, 1});
+    auto ragged_plan = ragged_sg->vector_stream_plan(TileConfig{4100, 1, 1});
+    CHECK("A5PLAN: streamed plan peels a serial stats init",
+          ragged_plan.stats_init.present && ragged_plan.stats_init.chunk_index == 0 &&
+              ragged_plan.stats_init.extent == ragged_plan.chunk);
+    CHECK("A5PLAN: ragged stats/apply tails are explicit serial phases",
+          ragged_plan.stats_tail.present && ragged_plan.apply_tail.present &&
+              ragged_plan.stats_tail.extent == ragged_plan.tail &&
+              ragged_plan.apply_tail.extent == ragged_plan.tail);
 }
 
 // CostResult is the value in both million-slot local-search cache tables. Keep

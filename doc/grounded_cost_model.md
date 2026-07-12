@@ -230,10 +230,10 @@ The single-core seq-k is **derived** (`derive_exec`), never enumerated.
 ## 7. The vector roofline — `compute_cost` (vector branch)
 
 ```
-compute_mk = WaveComputeCycles( Σ_op VecOpCompute(op), num_tiles, C )
-lat        = max( compute_mk , io * sat(eff) )    # when the tile can double-buffer
-           = compute_mk + io * sat(eff)           # otherwise
-io = Σ boundary tensors * cyc_per_byte(GM↔UB)
+lat = Σ_phase roofline(phase)
+roofline(p) = max(compute_mk[p], io[p])   # stage-2 rolled loop
+            = compute_mk[p] + io[p]       # serial body/init/tail/finalize
+compute_mk[p] = WaveComputeCycles(Σ_op∈p VecOpCompute(op), num_tiles, C)
 ```
 
 **Wave-aware** like the cube (a balanced `num_tiles == C` grid, one wave, beats an
@@ -251,12 +251,12 @@ over-tiled count). `compute_mk` is the full-op work distributed over the tiles.
   independent**. Reduce-H (col reduction, binary): `16·(H−1)+30·log₂H`. The old
   `slope_reduce·(ROWS·COLS/epr)` overcounted a tall row-reduce **up to 19×** (`vec_reduce`).
 
-**Double-buffer floor (vector).** The `max()` overlap holds only when the per-core
-tile streams in **≥2 SIMD-repeat chunks** (`tile_bytes ≥ 2·vec_reg_bytes`), so the
-load of chunk s+1 overlaps the compute of chunk s. A smaller tile can't ping-pong
-→ load and compute **serialize** (`compute + io`). **Binary**: crossing the
-threshold grants `max` and nothing more — a larger tile gets no extra (unreal)
-overlap credit. The vector analog of the cube's `K ≥ 32`.
+**Double-buffer floor (vector).** The `max()` overlap holds only for an emitted
+rolled loop with at least two trips whose per-strip transfer spans one vector
+register. Then load s+1 overlaps compute s; a short or sub-register loop cannot
+ping-pong and uses `compute + io`. **Binary**: crossing both guards grants `max`
+and nothing more — a larger strip gets no extra (unreal) overlap credit. This is
+the vector analog of the cube's `K ≥ 32` floor, applied independently per phase.
 
 **DMA-shape penalty.** GM↔UB moves a tile as `h` **strided segments** of `w`
 contiguous elements (one tile-row). The DMA reaches peak bandwidth only when that
@@ -270,14 +270,14 @@ rectangle. (pto-isa `BLOCK_BYTE_SIZE = 32` is the DMA block; contiguity below th
 burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks the
 emit-friendly tile among efficient ones.
 
-**UB-overflow streaming (Fix 2, `vector_stream_plan`).** A stack-local derivation per candidate records
-the full pebble peak, materialize/stream choice, emitted scratch-band peak, chunk/tail, algorithm kind,
-and body/stats/apply loop stages. Reduction chunks include the P1/P2/P4 accumulator, assemble,
-online-stat, and prefetch bands. The local-search `CostResult` deliberately retains only cost/config
-metadata; AutoFuse re-runs the same derivation for the final or explicitly forced config. A folded
-reduction reads each input once; a spanning one reads it twice. `max(compute,DDR)` is granted only
-when every streamed data-moving phase is stage-2; otherwise it uses `compute+DDR`. Remaining fidelity
-work is per-phase roofline summing and solver-owned materialized/pointwise strip scheduling.
+**Vector stream plan (Fix 2/A5).** A stack-local derivation per candidate owns the full pebble peak (including the
+reduction source/work pair), materialize/stream choice, materialized/pointwise strips, reduction chunks, algorithm kind,
+and serial-init/rolled/tail/finalize phases. Stage 2 duplicates source-DAG transient bands while
+accumulator/assemble/online-stat bands stay persistent. Each phase has its own roofline; only a stage-2 rolled
+loop earns `max(compute,DDR)`, while barriers and sub-register/short loops use `compute+DDR`. Boundary
+input phase masks price stats-only, apply-only, and shared inputs separately (including repeated
+broadcast chunks). `CostResult` retains only cost/config metadata; AutoFuse re-derives and consumes
+the same plan for the final or explicitly forced configuration.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction

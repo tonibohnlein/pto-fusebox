@@ -53,6 +53,11 @@ enum class P4PatternKind { None, SoftmaxFlash, LayerNormWelford };
 struct P4Pattern {
     P4PatternKind kind = P4PatternKind::None;
     FlatSet<size_t> ops;
+    // Ops whose values are supplied by the online algorithm to the apply pass.
+    // Softmax substitutes max/sum; Welford substitutes mean/variance.  Keeping
+    // these semantic cut points in the descriptor lets the model and emitter
+    // derive the same apply cone without independently recognizing P4 again.
+    FlatSet<size_t> apply_substitutions;
 };
 
 struct Op {
@@ -268,6 +273,12 @@ struct VectorLoopPlan {
     int pipeline_stages = 1;  // 1 = sequential/absent, 2 = stage-2 ping-pong
 };
 
+struct VectorSerialPhasePlan {
+  bool present = false;
+  int64_t chunk_index = 0;
+  int64_t extent = 0;
+};
+
 struct VectorStreamPlan {
     bool feasible = false;
     VectorStreamKind kind = VectorStreamKind::Materialized;
@@ -284,11 +295,30 @@ struct VectorStreamPlan {
     int64_t full_chunks = 0;
     int64_t tail = 0;
     int stream_passes = 0;
-    VectorLoopPlan body;   // pointwise stream
+    // Solver-owned materialized/pointwise strip geometry.  The emitter must not
+    // independently choose a row/width strip count: these fields are the exact
+    // uniform (clamp-overlap on a ragged edge) loop it builds.
+    int64_t tile_h = 0;
+    int64_t tile_w = 0;
+    int64_t strip_h = 0;
+    int64_t strip_w = 0;
+    int64_t row_strips = 1;
+    int64_t width_strips = 1;
+    VectorLoopPlan body;
+
+    // A streamed reduction is a sequence of barrier-separated phases.  Peeled
+    // init/tail/finalize work is always serial; only stats/apply rolled loops
+    // may receive stage-2 overlap.
+    VectorSerialPhasePlan stats_init;
     VectorLoopPlan stats;  // P1/P2/P4 online statistics
     VectorLoopPlan apply;  // P2/P4 spanning output
-    // True when this exact loop structure can realize max(compute, DDR).
-    // False means candidate pricing must serialize compute + DDR.
+    VectorSerialPhasePlan stats_tail;
+    VectorSerialPhasePlan apply_tail;
+    VectorSerialPhasePlan finalize;
+
+    // Diagnostic compatibility bit: true when every rolled data-moving loop in
+    // this plan is stage-2.  Costing is phase-local and never uses this to hide
+    // serial init/tail/finalize work behind another phase.
     bool overlap_granted = false;
 
     bool streamed() const { return feasible && axis != 0; }
