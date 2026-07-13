@@ -27,6 +27,35 @@ static json vector_loop_json(const VectorLoopPlan& loop) {
             {"pipeline_stages", loop.pipeline_stages}};
 }
 
+static const char* vector_primitive_name(VectorPrimitiveKind kind) {
+    switch (kind) {
+        case VectorPrimitiveKind::Add: return "add";
+        case VectorPrimitiveKind::Mul: return "mul";
+        case VectorPrimitiveKind::Div: return "div";
+        case VectorPrimitiveKind::Exp: return "exp";
+        case VectorPrimitiveKind::RowExpandSub: return "row_expand_sub";
+        case VectorPrimitiveKind::ScalarAdd: return "scalar_add";
+        case VectorPrimitiveKind::ScalarMul: return "scalar_mul";
+        case VectorPrimitiveKind::RowReduction: return "row_reduction";
+        case VectorPrimitiveKind::Count: break;
+    }
+    return "unknown";
+}
+
+static json vector_phase_work_json(const VectorPhaseWorkPlan& phase) {
+    json primitives = json::array();
+    for (size_t i = 0; i < static_cast<size_t>(VectorPrimitiveKind::Count); ++i) {
+        const auto kind = static_cast<VectorPrimitiveKind>(i);
+        const auto& work = phase.primitives[i];
+        if (work.wide == 0 && work.thin == 0 && work.stream_starts == 0) continue;
+        primitives.push_back({{"kind", vector_primitive_name(kind)},
+                              {"wide", static_cast<int64_t>(work.wide)},
+                              {"thin", static_cast<int64_t>(work.thin)},
+                              {"stream_starts", static_cast<int64_t>(work.stream_starts)}});
+    }
+    return {{"generated", phase.generated}, {"primitives", std::move(primitives)}};
+}
+
 static const char* cube_axis_binding_name(CubeAxisBinding binding) {
     switch (binding) {
         case CubeAxisBinding::Full: return "full";
@@ -392,7 +421,12 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"overlap_granted", plan.overlap_granted},
                  {"body", vector_loop_json(plan.body)},
                  {"stats", vector_loop_json(plan.stats)},
-                 {"apply", vector_loop_json(plan.apply)}});
+                 {"apply", vector_loop_json(plan.apply)},
+                 {"p4_work",
+                  {{"generated", plan.p4_work.generated},
+                   {"stats_init", vector_phase_work_json(plan.p4_work.stats_init)},
+                   {"stats_update", vector_phase_work_json(plan.p4_work.stats_update)},
+                   {"finalize", vector_phase_work_json(plan.p4_work.finalize)}}}});
         } else {
             j["vector_stream"].push_back(nullptr);
         }

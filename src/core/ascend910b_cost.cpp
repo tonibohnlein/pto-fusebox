@@ -101,6 +101,80 @@ inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, boo
   return cycles;
 }
 
+struct VectorPrimitiveGrounding {
+  double slope;
+  double fixed;
+  bool binary_count_mode;
+};
+
+// pto-isa cce_costmodel_vector_compute.hpp, 910B3 calibrations. These are the
+// same grounded primitive costs used by VecOpCompute, made explicit for online
+// P4 work that has no corresponding source-DAG Op.
+inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveKind kind) {
+  switch (kind) {
+    case VectorPrimitiveKind::Add: return {2.0, 24.0, true};
+    case VectorPrimitiveKind::Mul: return {2.0, 25.0, true};
+    case VectorPrimitiveKind::Div: return {4.0, 30.0, true};
+    case VectorPrimitiveKind::Exp: return {2.0, 31.0, false};
+    // TROWEXPANDSUB = vbrcb (18) + barrier (1) + vsub (2*r+24).
+    case VectorPrimitiveKind::RowExpandSub: return {2.0, 43.0, true};
+    case VectorPrimitiveKind::ScalarAdd: return {1.0, 31.0, false};
+    case VectorPrimitiveKind::ScalarMul: return {1.0, 26.0, false};
+    case VectorPrimitiveKind::RowReduction:
+    case VectorPrimitiveKind::Count: return {0.0, 0.0, false};
+  }
+  return {0.0, 0.0, false};
+}
+
+// Total compute work across all logical tasks for one generated P4 phase.
+// WaveComputeCycles consumes this total immediately afterwards. In particular,
+// every task executes its own barrier-separated reduction tree; rows do not
+// cooperate on a single tree merely because they share a wave.
+inline double GeneratedP4PhaseCompute(const Problem *p, const VectorStreamPlan &plan,
+                                      const VectorPhaseWorkPlan &phase, int64_t chunk_extent,
+                                      int64_t iterations, int64_t element_bytes) {
+  if (!phase.generated || chunk_extent <= 0 || iterations <= 0) return 0.0;
+  const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
+  const int64_t epr = std::max<int64_t>(1, reg / std::max<int64_t>(1, element_bytes));
+  const int64_t wide_repeats =
+      (std::max<int64_t>(1, plan.free_tile) * chunk_extent + epr - 1) / epr;
+  const int64_t row_expand_repeats =
+      std::max<int64_t>(1, plan.free_tile) * ((chunk_extent + epr - 1) / epr);
+  const int64_t thin_repeats = (std::max<int64_t>(1, plan.free_tile) + epr - 1) / epr;
+  const bool wide_count_mode = chunk_extent % epr != 0;
+  const int64_t block_elems = std::max<int64_t>(1, 32 / std::max<int64_t>(1, element_bytes));
+  const bool row_expand_count_mode = chunk_extent / epr > std::max<int64_t>(1, plan.free_tile) ||
+                                     (chunk_extent + block_elems - 1) / block_elems > 255;
+  const bool thin_count_mode = 1 % epr != 0;
+
+  double per_task = 0.0;
+  for (size_t i = 0; i < static_cast<size_t>(VectorPrimitiveKind::Count); ++i) {
+    const auto kind = static_cast<VectorPrimitiveKind>(i);
+    const VectorPrimitiveWork &work = phase.primitives[i];
+    if (kind == VectorPrimitiveKind::RowReduction) {
+      // A ragged/count-mode chunk still needs the final partial SIMD repeat.
+      const int64_t passes = std::max<int64_t>(1, (chunk_extent + epr - 1) / epr);
+      const double tree = kVecRowReducePass * (double)(passes - 1) + kVecRowReduceFinal;
+      per_task += (double)work.wide * tree;
+      continue;
+    }
+    const VectorPrimitiveGrounding grounding = PrimitiveGrounding(kind);
+    const int64_t primitive_wide_repeats =
+        kind == VectorPrimitiveKind::RowExpandSub ? row_expand_repeats : wide_repeats;
+    per_task += grounding.slope *
+                ((double)work.wide * (double)primitive_wide_repeats +
+                 (double)work.thin * (double)thin_repeats);
+    per_task += (double)work.stream_starts * grounding.fixed;
+    if (grounding.binary_count_mode) {
+      const bool primitive_wide_count_mode =
+          kind == VectorPrimitiveKind::RowExpandSub ? row_expand_count_mode : wide_count_mode;
+      if (primitive_wide_count_mode) per_task += (double)work.wide * kVecCountModeFloor;
+      if (thin_count_mode) per_task += (double)work.thin * kVecCountModeFloor;
+    }
+  }
+  return per_task * (double)iterations * (double)std::max<int64_t>(1, plan.work_units);
+}
+
 // Per-direction "cycles per byte" for a transfer: a byte costs
 // (1/2^30)/bw_GiBps * freq_hz cycles (pto-isa EstimateBandwidthCycles).
 struct ByteCost {
@@ -2151,6 +2225,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   else
     plan.kind =
         reduction_spans_output_ ? VectorStreamKind::ReductionSpanning : VectorStreamKind::ReductionFolded;
+  plan.p4_work = make_vector_p4_work_plan(p4_pattern_kind_);
   plan.axis = reduced_axis_;
   plan.extent = reduced_extent_;
   const int64_t extra_bands =
@@ -2750,15 +2825,27 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       double lat = 0.0;
       double compute_total_mk = 0.0;
       double ddr_total = 0.0;
-      auto add_phase = [&](uint8_t phase, int64_t covered_extent, int64_t chunks, int stages,
-                           double out_cycles, double extra_compute = 0.0) {
-        if (chunks <= 0 && covered_extent <= 0 && extra_compute <= 0.0 && out_cycles <= 0.0) return;
-        const double compute = WaveComputeCycles(phase_compute(phase, covered_extent, chunks) + extra_compute,
-                                                 num_tiles, n_cores);
-        const double ddr = ddr_phase(eff, input_cycles(phase, covered_extent, chunks), out_cycles);
+      auto record_phase = [&](uint8_t traffic_phase, int64_t covered_extent, int64_t chunks,
+                              int stages, double out_cycles, double total_compute_work) {
+        if (chunks <= 0 && covered_extent <= 0 && total_compute_work <= 0.0 && out_cycles <= 0.0) return;
+        const double compute = WaveComputeCycles(total_compute_work, num_tiles, n_cores);
+        const double ddr =
+            ddr_phase(eff, input_cycles(traffic_phase, covered_extent, chunks), out_cycles);
         lat += phase_roofline(stages, compute, ddr);
         compute_total_mk += compute;
         ddr_total += ddr;
+      };
+      auto add_phase = [&](uint8_t phase, int64_t covered_extent, int64_t chunks, int stages,
+                           double out_cycles, double extra_compute = 0.0) {
+        record_phase(phase, covered_extent, chunks, stages, out_cycles,
+                     phase_compute(phase, covered_extent, chunks) + extra_compute);
+      };
+      auto add_generated_phase = [&](uint8_t traffic_phase, const VectorPhaseWorkPlan& work,
+                                     int64_t chunk_extent, int64_t iterations, int stages,
+                                     double out_cycles) {
+        record_phase(traffic_phase, chunk_extent * iterations, iterations, stages, out_cycles,
+                     GeneratedP4PhaseCompute(prob_, vector_stream, work, chunk_extent,
+                                             iterations, dtb));
       };
 
       const double io_in = input_cycles(kVectorPhaseBody, 0, 1);
@@ -2772,17 +2859,26 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       if (!reduction_streams) {
         add_phase(kVectorPhaseBody, 0, 1, vector_stream.body.pipeline_stages, io_out);
       } else {
-        const double startup = (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
-        add_phase(kVectorPhaseStats, vector_stream.stats_init.extent, 1, 1, 0.0, startup);
-        add_phase(kVectorPhaseStats, vector_stream.stats.trip_count * vector_stream.chunk,
-                  vector_stream.stats.trip_count, vector_stream.stats.pipeline_stages, 0.0,
-                  startup * vector_stream.stats.trip_count);
-        if (vector_stream.stats_tail.present)
-          add_phase(kVectorPhaseStats, vector_stream.stats_tail.extent, 1, 1, 0.0, startup);
-
-        if (vector_stream.kind == VectorStreamKind::LayerNormWelford) {
-          const double thin_finalize = prob_->vec_op_head + prob_->vec_op_tail + prob_->vec_slope_pw;
-          add_phase(kVectorPhaseFinalize, 0, 0, 1, 0.0, thin_finalize);
+        if (vector_stream.p4_work.generated) {
+          add_generated_phase(kVectorPhaseStats, vector_stream.p4_work.stats_init,
+                              vector_stream.stats_init.extent, 1, 1, 0.0);
+          add_generated_phase(kVectorPhaseStats, vector_stream.p4_work.stats_update,
+                              vector_stream.chunk, vector_stream.stats.trip_count,
+                              vector_stream.stats.pipeline_stages, 0.0);
+          if (vector_stream.stats_tail.present)
+            add_generated_phase(kVectorPhaseStats, vector_stream.p4_work.stats_update,
+                                vector_stream.stats_tail.extent, 1, 1, 0.0);
+          if (vector_stream.finalize.present)
+            add_generated_phase(kVectorPhaseFinalize, vector_stream.p4_work.finalize,
+                                /*chunk_extent=*/1, /*iterations=*/1, 1, 0.0);
+        } else {
+          const double startup = (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
+          add_phase(kVectorPhaseStats, vector_stream.stats_init.extent, 1, 1, 0.0, startup);
+          add_phase(kVectorPhaseStats, vector_stream.stats.trip_count * vector_stream.chunk,
+                    vector_stream.stats.trip_count, vector_stream.stats.pipeline_stages, 0.0,
+                    startup * vector_stream.stats.trip_count);
+          if (vector_stream.stats_tail.present)
+            add_phase(kVectorPhaseStats, vector_stream.stats_tail.extent, 1, 1, 0.0, startup);
         }
         if (vector_stream.stream_passes == 2) {
           add_phase(kVectorPhaseApply, vector_stream.apply.trip_count * vector_stream.chunk,

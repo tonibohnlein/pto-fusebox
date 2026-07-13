@@ -2212,6 +2212,23 @@ static void test_g1_multi_reduction_stream_decline() {
           stream.stats.pipeline_stages == 2 && stream.apply.pipeline_stages == 2);
     CHECK("P4PLAN: stage-2 chunk peak includes both transient pipeline stages",
           stream.stream_band_count == 2 * 4 + 6 && stream.chunk_peak_ub_bytes <= p.vec_capacity);
+    const auto& soft_init = stream.p4_work.stats_init;
+    const auto& soft_update = stream.p4_work.stats_update;
+    CHECK("G7: softmax init records two trees and the wide sub-exp stream",
+          stream.p4_work.generated &&
+              soft_init.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+              soft_init.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
+              soft_init.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1 &&
+              soft_init.get(VectorPrimitiveKind::Exp).wide == 1);
+    CHECK("G7: softmax update records wide body and thin (m,l) correction",
+          soft_update.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+              soft_update.get(VectorPrimitiveKind::Add).thin == 3 &&
+              soft_update.get(VectorPrimitiveKind::Add).stream_starts == 2 &&
+              soft_update.get(VectorPrimitiveKind::Exp).wide == 1 &&
+              soft_update.get(VectorPrimitiveKind::Exp).thin == 1 &&
+              soft_update.get(VectorPrimitiveKind::Mul).thin == 1 &&
+              soft_update.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
+              soft_update.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1);
     TileConfig twelve_regions{32768, 11, 1};
     twelve_regions.parts_m = 12;
     twelve_regions.parts_n = 1;
@@ -2248,9 +2265,37 @@ static void test_g1_multi_reduction_stream_decline() {
     DAG ln_dag = DAG::build(ln);
     auto exact_layernorm_sg = Subgraph::create(ln, ln_dag, {0, 1, 2, 3});
     auto exact_layernorm = exact_layernorm_sg->best_cost();
+    const auto layernorm_stream = exact_layernorm_sg->vector_stream_plan(exact_layernorm.config);
     CHECK("P4PLAN: adapter-supplied Welford kind survives into the selected stream plan",
-          exact_layernorm_sg->vector_stream_plan(exact_layernorm.config).kind ==
-              VectorStreamKind::LayerNormWelford);
+          layernorm_stream.kind == VectorStreamKind::LayerNormWelford);
+    const auto& welford_init = layernorm_stream.p4_work.stats_init;
+    const auto& welford_update = layernorm_stream.p4_work.stats_update;
+    const auto& welford_finalize = layernorm_stream.p4_work.finalize;
+    CHECK("G7: Welford init records chunk mean/M2 and count construction",
+          welford_init.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+              welford_init.get(VectorPrimitiveKind::Mul).wide == 1 &&
+              welford_init.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
+              welford_init.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1 &&
+              welford_init.get(VectorPrimitiveKind::ScalarMul).thin == 2 &&
+              welford_init.get(VectorPrimitiveKind::ScalarMul).stream_starts == 2 &&
+              welford_init.get(VectorPrimitiveKind::ScalarAdd).thin == 1);
+    CHECK("G7: Welford update records the complete thin Chan merge",
+          welford_update.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+              welford_update.get(VectorPrimitiveKind::Add).thin == 4 &&
+              welford_update.get(VectorPrimitiveKind::Mul).wide == 1 &&
+              welford_update.get(VectorPrimitiveKind::Mul).thin == 2 &&
+              welford_update.get(VectorPrimitiveKind::Div).thin == 2 &&
+              welford_update.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
+              welford_update.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1 &&
+              welford_update.get(VectorPrimitiveKind::ScalarMul).thin == 3 &&
+              welford_update.get(VectorPrimitiveKind::ScalarAdd).thin == 1);
+    CHECK("G7: Welford finalize records the population-variance scalar multiply",
+          welford_finalize.generated &&
+              welford_finalize.get(VectorPrimitiveKind::ScalarMul).thin == 1 &&
+              welford_finalize.get(VectorPrimitiveKind::ScalarMul).stream_starts == 1);
+    CHECK("G7: generated Welford/Chan work costs more than softmax stats at one fixed schedule",
+          exact_layernorm_sg->compute_cost(exact_softmax.config).latency >
+              exact_softmax_sg->compute_cost(exact_softmax.config).latency);
 }
 
 // --- G3: streamed input multiplicity is per boundary input (A7) ---------------

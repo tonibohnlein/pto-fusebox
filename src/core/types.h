@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -334,6 +336,127 @@ struct VectorSerialPhasePlan {
   int64_t extent = 0;
 };
 
+// Grounded VECTOR primitives used by an emitter-generated online algorithm.
+// The source DAG remains authoritative for ordinary body/apply work, but P4
+// statistics replace the source reductions with softmax (m,l) or Welford/Chan
+// updates. A compact fixed-size tally keeps that replacement explicit without
+// adding heap allocation to candidate enumeration.
+enum class VectorPrimitiveKind : size_t {
+    Add,
+    Mul,
+    Div,
+    Exp,
+    RowExpandSub,
+    ScalarAdd,
+    ScalarMul,
+    RowReduction,
+    Count
+};
+
+struct VectorPrimitiveWork {
+    // Wide instances operate on one [free_tile, reduced_chunk] tile; thin
+    // instances operate on one persistent [free_tile, 1] statistic/carry.
+    uint8_t wide = 0;
+    uint8_t thin = 0;
+    // Number of barrier-separated pointwise streams whose first instruction is
+    // this primitive. Only those instances pay the primitive's grounded fixed
+    // head+tail cost; back-to-back operations share it.
+    uint8_t stream_starts = 0;
+
+    bool operator==(const VectorPrimitiveWork& other) const {
+        return wide == other.wide && thin == other.thin && stream_starts == other.stream_starts;
+    }
+};
+
+struct VectorPhaseWorkPlan {
+    bool generated = false;
+    std::array<VectorPrimitiveWork, static_cast<size_t>(VectorPrimitiveKind::Count)> primitives{};
+
+    void add(VectorPrimitiveKind kind, int64_t wide, int64_t thin, int64_t stream_starts = 0) {
+        auto& work = primitives[static_cast<size_t>(kind)];
+        work.wide = static_cast<uint8_t>(work.wide + wide);
+        work.thin = static_cast<uint8_t>(work.thin + thin);
+        work.stream_starts = static_cast<uint8_t>(work.stream_starts + stream_starts);
+    }
+
+    const VectorPrimitiveWork& get(VectorPrimitiveKind kind) const {
+        return primitives[static_cast<size_t>(kind)];
+    }
+
+    bool operator==(const VectorPhaseWorkPlan& other) const {
+        return generated == other.generated && primitives == other.primitives;
+    }
+};
+
+struct VectorP4WorkPlan {
+    bool generated = false;
+    VectorPhaseWorkPlan stats_init;
+    // One online update. The rolled stats loop repeats it trip_count times and
+    // a ragged stats tail executes the same update once at its shorter extent.
+    VectorPhaseWorkPlan stats_update;
+    VectorPhaseWorkPlan finalize;
+
+    bool operator==(const VectorP4WorkPlan& other) const {
+        return generated == other.generated && stats_init == other.stats_init &&
+               stats_update == other.stats_update && finalize == other.finalize;
+    }
+};
+
+// This is the single algorithm-work description shared by candidate costing
+// and final-plan emission checks. It describes exactly the primitive sequence
+// emitted in auto_fuse_pass.cpp; dependency semantics remain in the exact
+// P4Pattern descriptor and emitter builders.
+inline VectorP4WorkPlan make_vector_p4_work_plan(P4PatternKind kind) {
+    VectorP4WorkPlan plan;
+    if (kind == P4PatternKind::None) return plan;
+
+    plan.generated = true;
+    plan.stats_init.generated = true;
+    plan.stats_update.generated = true;
+
+    if (kind == P4PatternKind::SoftmaxFlash) {
+        // Init: row_max; sub -> exp; row_sum.
+        plan.stats_init.add(VectorPrimitiveKind::RowReduction, 2, 0);
+        plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+        plan.stats_init.add(VectorPrimitiveKind::Exp, 1, 0);
+
+        // Update: row_max; max(carry,cmax) -> sub -> exp; row_sum;
+        // sub(carry,m) -> exp -> mul -> add.
+        plan.stats_update.add(VectorPrimitiveKind::RowReduction, 2, 0);
+        plan.stats_update.add(VectorPrimitiveKind::Add, 0, 3, 2);
+        plan.stats_update.add(VectorPrimitiveKind::Exp, 1, 1);
+        plan.stats_update.add(VectorPrimitiveKind::Mul, 0, 1);
+        plan.stats_update.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+        return plan;
+    }
+
+    // Welford init: row_sum; muls(mean) -> sub -> mul; row_sum;
+    // muls(zero-count) -> adds(count).
+    plan.stats_init.add(VectorPrimitiveKind::RowReduction, 2, 0);
+    plan.stats_init.add(VectorPrimitiveKind::Mul, 1, 0);
+    plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+    plan.stats_init.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
+    plan.stats_init.add(VectorPrimitiveKind::ScalarMul, 0, 2, 2);
+
+    // Welford update repeats the chunk mean/M2 stream, then performs Chan's
+    // thin (mean,M2,count) merge after the second reduction barrier.
+    plan.stats_update.add(VectorPrimitiveKind::RowReduction, 2, 0);
+    plan.stats_update.add(VectorPrimitiveKind::Add, 0, 4, 1);
+    plan.stats_update.add(VectorPrimitiveKind::Mul, 1, 2);
+    plan.stats_update.add(VectorPrimitiveKind::Div, 0, 2);
+    plan.stats_update.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+    plan.stats_update.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
+    plan.stats_update.add(VectorPrimitiveKind::ScalarMul, 0, 3, 1);
+
+    // Population variance = final M2 / N.
+    plan.finalize.generated = true;
+    plan.finalize.add(VectorPrimitiveKind::ScalarMul, 0, 1, 1);
+    return plan;
+}
+
+static_assert(sizeof(VectorP4WorkPlan) <= 96,
+              "P4 work descriptors are rebuilt in candidate enumeration and must stay compact");
+
 struct VectorStreamPlan {
     bool feasible = false;
     VectorStreamKind kind = VectorStreamKind::Materialized;
@@ -380,6 +503,10 @@ struct VectorStreamPlan {
     VectorSerialPhasePlan stats_tail;
     VectorSerialPhasePlan apply_tail;
     VectorSerialPhasePlan finalize;
+
+    // P4 stats are emitter-generated work, not a scaled replay of the source
+    // DAG. Apply remains a source-DAG cone with the online stats substituted.
+    VectorP4WorkPlan p4_work;
 
     // Diagnostic compatibility bit: true when every rolled data-moving loop in
     // this plan is stage-2.  Costing is phase-local and never uses this to hide
