@@ -260,13 +260,15 @@ static void test_softmax_reduction_schema() {
 // spatially. Splitting the reduced axis across cores fills them, paying only a
 // thin per-partial merge (out_H_ here) — the flash-style parallel reduction.
 static void test_R_reduction_split() {
-    std::cout << "[R] few-row reduction — split reduced axis across vector cores\n";
+    std::cout << "[R] few-column col_sum — split reduced axis across vector cores\n";
     Problem p;
-    // Keep the source/work pair materializable after DMA padding so this test
-    // isolates the sink split.  W=4096 intentionally streams in 192 KiB UB and
-    // is covered by the softmax-cut and STREAM tests instead.
-    p.tensors = {{2048, 4}, {1, 4}};  // A[4 rows x 2048], rowmax -> m[1,4]
+    // Use the exact family/axis implemented by the generic emitter: a terminal
+    // col_sum over M, merged by zero-seed + atomic-add. Keep the source/work pair
+    // materializable so this isolates the cross-core split rather than streaming.
+    p.tensors = {{4, 2048}, {4, 1}};  // A[2048,4] -> col_sum -> [1,4]
     p.ops = {{OpType::Reduction, {0}, {1}}};
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::ColSum;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
     p.fast_memory_capacity = 1 << 24;
     set_910b(p);
     DAG dag = DAG::build(p);
@@ -274,9 +276,92 @@ static void test_R_reduction_split() {
     std::cout << "    cores=" << r.cores_used << " split=" << r.parallel_split << "\n";
     // Only 4 rows -> spatial (non-reduced) tiling can't fill the 48 vector cores,
     // so the sink reduction splits its reduced axis ACROSS cores to fill them.
-    CHECK("R: few-row reduction split-fills the vector cores",
-          r.cores_used == 48 && r.parallel_split > 1);
-    CHECK_EQ("R: logical-grid phase-roofline few-row reduction cost", r.latency, 10097.6, 1.0);
+    CHECK("R: few-column reduction reaches the largest legal exact split",
+          r.cores_used == 32 && r.parallel_split == 32);
+    CHECK_EQ("R: exact partial-replay terminal-col_sum split latency",
+             r.latency, 12207.4, 1.0);
+}
+
+static void test_g6_vector_reduction_split_admission() {
+    std::cout << "[G6] only terminal col_sum receives atomic-add split candidates\n";
+    auto make_reduction = [](int64_t in_w, int64_t in_h, int64_t out_w,
+                             int64_t out_h, VectorPrimitiveFamily family) {
+        Problem p;
+        p.tensors = {{in_w, in_h}, {out_w, out_h}};
+        p.ops = {{OpType::Reduction, {0}, {1}}};
+        p.ops[0].vector_primitive = family;
+        p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+        p.fast_memory_capacity = 1 << 24;
+        set_910b(p);
+        return p;
+    };
+    auto best = [](Problem p) {
+        DAG dag = DAG::build(p);
+        return Subgraph::create(p, dag, {0})->best_cost();
+    };
+
+    Problem col_sum = make_reduction(4, 2048, 4, 1,
+                                     VectorPrimitiveFamily::ColSum);
+    DAG col_sum_dag = DAG::build(col_sum);
+    auto col_sum_sg = Subgraph::create(col_sum, col_sum_dag, {0});
+    const auto supported = col_sum_sg->best_cost();
+    const auto supported_plan =
+        col_sum_sg->vector_stream_plan(supported.config);
+    CHECK("G6: terminal col_sum retains the implemented cross-core split",
+          supported.parallel_split > 1 &&
+              supported_plan.reduction_split_kind ==
+                  VectorReductionSplitKind::ColSumAtomicAdd &&
+              supported_plan.reduction_split_factor == supported.parallel_split &&
+              supported_plan.reduction_partial_extent * supported.parallel_split == 2048);
+
+    Problem pointwise_cone;
+    pointwise_cone.tensors = {{4, 1024}, {4, 1024}, {4, 1}};
+    pointwise_cone.ops = {{OpType::Pointwise, {0, 0}, {1}},
+                          {OpType::Reduction, {1}, {2}}};
+    pointwise_cone.ops[0].vector_primitive = VectorPrimitiveFamily::Add;
+    pointwise_cone.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    pointwise_cone.ops[1].vector_primitive = VectorPrimitiveFamily::ColSum;
+    pointwise_cone.ops[1].vector_geometry = VectorOpGeometry::Flat;
+    pointwise_cone.fast_memory_capacity = 1 << 24;
+    set_910b(pointwise_cone);
+    DAG pointwise_cone_dag = DAG::build(pointwise_cone);
+    auto pointwise_cone_sg =
+        Subgraph::create(pointwise_cone, pointwise_cone_dag, {0, 1});
+    const auto pointwise_cone_best = pointwise_cone_sg->best_cost();
+    TileConfig pointwise_split = supported.config;
+    const auto pointwise_cone_cost =
+        pointwise_cone_sg->compute_cost(pointwise_split);
+    const auto pointwise_cone_plan =
+        pointwise_cone_sg->vector_stream_plan(pointwise_split);
+    CHECK("G6: a fixed grounded pointwise cone replays inside each col_sum partial",
+          pointwise_cone_best.parallel_split > 1 &&
+              pointwise_cone_cost.feasible &&
+              pointwise_cone_cost.parallel_split == pointwise_split.split_k &&
+              pointwise_cone_plan.reduction_split_kind ==
+                  VectorReductionSplitKind::ColSumAtomicAdd);
+
+    const auto row_sum = best(make_reduction(2048, 4, 1, 4,
+                                             VectorPrimitiveFamily::RowSum));
+    const auto row_max = best(make_reduction(2048, 4, 1, 4,
+                                             VectorPrimitiveFamily::RowExtrema));
+    const auto col_max = best(make_reduction(4, 2048, 4, 1,
+                                             VectorPrimitiveFamily::ColExtrema));
+    const auto legacy = best(make_reduction(4, 2048, 4, 1,
+                                            VectorPrimitiveFamily::Reduction));
+    CHECK("G6: row sum/max, col max/min, and descriptor-free reductions stay serial",
+          row_sum.parallel_split == 1 && row_max.parallel_split == 1 &&
+              col_max.parallel_split == 1 && legacy.parallel_split == 1);
+
+    Problem ragged = make_reduction(130, 256, 130, 1,
+                                     VectorPrimitiveFamily::ColSum);
+    DAG ragged_dag = DAG::build(ragged);
+    auto ragged_sg = Subgraph::create(ragged, ragged_dag, {0});
+    TileConfig ragged_split{44, 1, 1};
+    ragged_split.parts_m = 1;
+    ragged_split.parts_n = 3;
+    ragged_split.split_k = 2;
+    CHECK("G6: atomic-add split rejects a ragged overlapping free-axis grid",
+          !ragged_sg->compute_cost(ragged_split).feasible);
 }
 
 // --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
@@ -2072,7 +2157,7 @@ static void test_vector_band_ub() {
 }
 
 // --- reduction parallel split is SINK-ONLY -----------------------------------
-// A bare rowmax (reduction IS the sink) may split its reduced axis across cores.
+// A terminal col_sum (reduction IS the sink) may split its reduced axis across cores.
 // A chain whose sink is a POINTWISE with an internal reduction may NOT — the
 // internal reduction's partials would round-trip DDR (breaking ephemerality), so
 // the model leaves it spatial-only (a cut would be the partitioner's job).
@@ -2080,13 +2165,15 @@ static void test_reduction_sink_gating() {
     std::cout << "[RGATE] reduced-axis split only when the reduction is the sink\n";
     auto mk = []() { Problem p;
  return p; };
-    // (a) bare rowmax, few rows -> sink reduction -> splits across cores.
+    // (a) exact terminal col_sum, few columns -> supported atomic-add split.
     Problem a = mk();
-    a.tensors = {{2048, 4}, {1, 4}};
+    a.tensors = {{4, 2048}, {4, 1}};
     a.ops = {{OpType::Reduction, {0}, {1}}};
+    a.ops[0].vector_primitive = VectorPrimitiveFamily::ColSum;
+    a.ops[0].vector_geometry = VectorOpGeometry::Flat;
     a.fast_memory_capacity = 1 << 24; set_910b(a);
     DAG da = DAG::build(a);
-    CHECK("RGATE: bare reduction sink splits the reduced axis",
+    CHECK("RGATE: terminal col_sum sink splits the reduced axis",
           Subgraph::create(a, da, {0})->best_cost().parallel_split > 1);
     // (b) x -> m=rowmax(x) -> y=sub(x,m): pointwise SINK, internal reduction, few
     // rows. Cannot fill cores (no split allowed) -> parallel_split stays 1.
@@ -2094,6 +2181,8 @@ static void test_reduction_sink_gating() {
     b.tensors = {{2048, 4}, {1, 4}, {2048, 4}};
     b.ops = {{OpType::Reduction, {0}, {1}},
              {OpType::Pointwise, {0, 1}, {2}}};
+    b.ops[0].vector_primitive = VectorPrimitiveFamily::RowExtrema;
+    b.ops[0].vector_geometry = VectorOpGeometry::Flat;
     b.fast_memory_capacity = 1 << 24; set_910b(b);
     DAG db = DAG::build(b);
     auto sg = Subgraph::create(b, db, {0, 1});
@@ -2497,12 +2586,18 @@ static void test_vector_sensibility() {
     pw.ops = {{OpType::Pointwise, {0}, {1}}}; base(pw);
     run("pointwise", pw, {0}, false);
     Problem rm; rm.tensors = {{1024, 512}, {1, 512}};       // many rows -> spatial fill
-    rm.ops = {{OpType::Reduction, {0}, {1}}}; base(rm);
+    rm.ops = {{OpType::Reduction, {0}, {1}}};
+    rm.ops[0].vector_primitive = VectorPrimitiveFamily::RowExtrema;
+    rm.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    base(rm);
     run("rowmax-manyrows", rm, {0}, false);
     Problem rf;
-    rf.tensors = {{2048, 4}, {1, 4}};  // materialized few rows -> split
-    rf.ops = {{OpType::Reduction, {0}, {1}}}; base(rf);
-    run("rowmax-fewrows", rf, {0}, true);
+    rf.tensors = {{4, 2048}, {4, 1}};  // materialized few columns -> col_sum split
+    rf.ops = {{OpType::Reduction, {0}, {1}}};
+    rf.ops[0].vector_primitive = VectorPrimitiveFamily::ColSum;
+    rf.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    base(rf);
+    run("colsum-fewcols", rf, {0}, true);
     Problem ss = mk_softmax(2048, 128);   run("softmax-smallW", ss, {0, 1, 2, 3}, false);
     Problem sl = mk_softmax(32768, 128);  run("softmax-largeW-stream", sl, {0, 1, 2, 3}, false);
 }
@@ -3063,6 +3158,7 @@ int main() {
     test_D_mixed_cube_vector();
     test_softmax_reduction_schema();
     test_R_reduction_split();
+    test_g6_vector_reduction_split_admission();
     test_E_matmul_2d_vs_1d();
     test_F_split_k();
     test_G_super_native_tile();

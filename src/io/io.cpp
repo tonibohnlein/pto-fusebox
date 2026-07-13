@@ -21,6 +21,14 @@ static const char* vector_stream_kind_name(VectorStreamKind kind) {
     return "unknown";
 }
 
+static const char* vector_reduction_split_kind_name(VectorReductionSplitKind kind) {
+    switch (kind) {
+        case VectorReductionSplitKind::None: return "none";
+        case VectorReductionSplitKind::ColSumAtomicAdd: return "col_sum_atomic_add";
+    }
+    return "unknown";
+}
+
 static bool parse_vector_primitive_family(const std::string& name, VectorPrimitiveFamily* family) {
     if (name == "generic") *family = VectorPrimitiveFamily::Generic;
     else if (name == "add") *family = VectorPrimitiveFamily::Add;
@@ -471,6 +479,10 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"tail", plan.tail},
                  {"stream_passes", plan.stream_passes},
                  {"overlap_granted", plan.overlap_granted},
+                 {"reduction_split",
+                  {{"kind", vector_reduction_split_kind_name(plan.reduction_split_kind)},
+                   {"factor", plan.reduction_split_factor},
+                   {"partial_extent", plan.reduction_partial_extent}}},
                  {"body", vector_loop_json(plan.body)},
                  {"stats", vector_loop_json(plan.stats)},
                  {"apply", vector_loop_json(plan.apply)},

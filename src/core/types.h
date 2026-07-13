@@ -363,6 +363,17 @@ enum class VectorStreamKind {
     ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
 };
 
+// Cross-core reduced-axis algorithm attached to a materialized vector plan.
+// The 910B backend currently lowers atomic ADD only, and the generic emitter
+// can slice the reduced M axis without changing semantics only for a terminal
+// col_sum whose upstream cone is pointwise. Unsupported reductions remain
+// single-core along their reduced axis instead of borrowing fictional split
+// parallelism from the cost model.
+enum class VectorReductionSplitKind {
+    None,
+    ColSumAtomicAdd
+};
+
 struct VectorLoopPlan {
     int64_t first_chunk = 0;
     int64_t trip_count = 0;
@@ -535,6 +546,15 @@ struct VectorStreamPlan {
     int64_t row_strips = 1;
     int64_t width_strips = 1;
     VectorLoopPlan body;
+
+    // Optional cross-core split of a materialized reduction. `work_units`
+    // remains the spatial grid size; the main launch has
+    // work_units*reduction_split_factor tasks and a separate spatial seed grid.
+    // The factor/partial extent are populated only when this exact candidate is
+    // realizable by the emitter.
+    VectorReductionSplitKind reduction_split_kind = VectorReductionSplitKind::None;
+    int64_t reduction_split_factor = 1;
+    int64_t reduction_partial_extent = 0;
 
     // A streamed reduction is a sequence of barrier-separated phases.  Peeled
     // init/tail/finalize work is always serial; only stats/apply rolled loops

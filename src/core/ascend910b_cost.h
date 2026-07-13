@@ -358,6 +358,11 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // reductions and generated P1/P2 merges at the same per-task chunk frame;
   // descriptor-free benchmark instances retain the legacy scalar anchors.
   bool has_grounded_vector_semantics_ = false;
+  // Exact candidate-invariant cross-core reduction family implemented by the
+  // generic emitter. Candidate geometry still has to prove exact reduced and
+  // free-axis partitions before VectorStreamPlan enables the split.
+  VectorReductionSplitKind vector_reduction_split_kind_ =
+      VectorReductionSplitKind::None;
   // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
@@ -372,10 +377,6 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).
   int64_t reduced_extent_ = 0;
   bool has_pw_sink_ = false;
-  bool reduction_is_sink_ = false;  // a sink op is a Reduction — the ONLY case
-                                    // where the reduced axis may be parallel-split
-                                    // across cores (cross-core merge = DDR, so an
-                                    // internal reduction split must be a subgraph cut)
   bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;
   int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul

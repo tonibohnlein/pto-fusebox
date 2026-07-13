@@ -648,6 +648,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   std::vector<bool> is_produced(num_tensors, false);
   bool reduces_width = false, reduces_height = false;  // for reduced-axis homogeneity
   int64_t vector_min_dtype_bytes = INT64_MAX;
+  bool all_vector_ops_grounded = true;
 
   for (auto i : sg.ops_) {
     const Op &candidate_op = prob.ops[i];
@@ -673,8 +674,12 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         sg.vector_iter_H_ = std::max(sg.vector_iter_H_, prob.tensors[input].height);
       }
     }
-    if (is_vector_op && HasGroundedVectorSemantics(candidate_op))
-      sg.has_grounded_vector_semantics_ = true;
+    if (is_vector_op) {
+      if (HasGroundedVectorSemantics(candidate_op))
+        sg.has_grounded_vector_semantics_ = true;
+      else
+        all_vector_ops_grounded = false;
+    }
     if (is_vector_op) sg.has_vector_ = true;
     if (candidate_op.type == OpType::MatMul) {
       sg.has_matmul_ = true;
@@ -878,12 +883,22 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         break;
       }
     }
-    // A reduction sink is the only place a reduced-axis (cross-core) split may
-    // land — its partials reduce through DDR, which is fine for a boundary output
-    // but would break ephemerality for an internal reduction (that case must be a
-    // subgraph cut instead). Mirrors matmul's sink-only parallel split-K.
-    for (auto s : sink_ops)
-      if (prob.ops[s].type == OpType::Reduction) { sg.reduction_is_sink_ = true; break; }
+    // G6/S2 admission is deliberately narrower than "a reduction sink". The
+    // emitted cross-core protocol is zero seed + atomic ADD, and replaying a
+    // sliced cone is valid only when its sole reduction is the terminal col_sum
+    // over M. Exact primitive metadata comes from the adapter; descriptor-free
+    // research problems and row/max/min reductions stay at split=1. Requiring a
+    // single structural sink also matches the emitter's serial multi-sink path.
+    if (!sg.has_matmul_ && all_vector_ops_grounded && sink_ops.size() == 1 &&
+        sg.reduction_count_ == 1) {
+      const Op& sink = prob.ops[sink_ops.front()];
+      if (sink.type == OpType::Reduction &&
+          sink.vector_primitive == VectorPrimitiveFamily::ColSum &&
+          sg.reduced_axis_ == 2) {
+        sg.vector_reduction_split_kind_ =
+            VectorReductionSplitKind::ColSumAtomicAdd;
+      }
+    }
 
     // Set output_K_ from the sink matmul (if any).
     //   MM-only sinks:  output_K_ = op_K(sink_mm) — standard temporal tiling.
@@ -1371,7 +1386,8 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // parallelism was fictional. A non-16-aligned reduced axis is not cleanly splittable at all
     // (S=1): the emit runs it serial, which the cost model now prices honestly.
     std::vector<int64_t> s_vals = {1};
-    if (sg.reduced_axis_ != 0 && sg.reduction_is_sink_ && sg.reduced_extent_ % 16 == 0) {
+    if (sg.vector_reduction_split_kind_ != VectorReductionSplitKind::None &&
+        sg.reduced_extent_ % 16 == 0) {
       const int64_t rcap = std::max<int64_t>(1, sg.reduced_extent_ / 16);
       s_vals.clear();
       for (int64_t s : all_divisors(rcap))
@@ -1736,6 +1752,30 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
     if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // 16-fractal aligned
   }
 
+  // G6: a fixed vector reduced-axis split is legal only for the exact
+  // terminal-col_sum protocol the emitter implements. Both axes must partition
+  // without padding/overlap because atomic-add would double-count an overlap:
+  // each reduced slice is DMA-granule aligned and each free-axis tile divides
+  // the output exactly. split_k==0 is the legacy/ad-hoc form and stays serial
+  // because it has no concrete emit descriptor to reconstruct.
+  if (!matmul_910b && cfg.split_k > 1) {
+    if (vector_reduction_split_kind_ == VectorReductionSplitKind::None)
+      return false;
+    if (reduced_extent_ % (cfg.split_k * vector_emit_granule_) != 0)
+      return false;
+    // cfg.w is the enumeration granule's physical maximum (16 even when the
+    // logical output is only four columns). Reconstruct the element-balanced
+    // logical region exactly as VectorStreamPlan does before testing overlap.
+    const int64_t parts_n =
+        cfg.parts_n > 0 ? cfg.parts_n
+                        : std::max<int64_t>(1, out_W_ / std::max<int64_t>(1, cfg.w));
+    const int64_t logical_w =
+        std::min(partition_axis(out_W_, parts_n, /*granule=*/1).big,
+                 vector_iter_W_);
+    if (logical_w <= 0 || vector_iter_W_ % logical_w != 0)
+      return false;
+  }
+
   // Grid (SpatialSchedule) mode: w,h carry the PHYSICAL (max) region extent of a
   // non-uniform parts_m x parts_n partition, which need NOT evenly divide the
   // output -- so skip the exact-divisor check (the 16-alignment above + the L1
@@ -1822,8 +1862,8 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   // Granule-fit check on ephemerals. Every op in the subgraph runs at the
   // subgraph's (cfg.w, cfg.h) granule; the slice its producer writes per
   // execution must be representable within that granule:
-  //   PW producer: slice ≤ (cfg.w, cfg.h) — PW has no k-loop, must produce
-  //                the whole slice in one granule execution.
+  //   PW producer: slice ≤ (cfg.w, cfg.h) — except an admitted S2 cone, whose
+  //                reduced M slice is M/S. PW has no independent k-loop.
   //   MM producer: slice ≤ native — MM's internal k-loop allows slices that
   //                exceed cfg as long as hardware-native-sized.
   // Mostly redundant with cfg ≤ native + role propagation, kept as a
@@ -1840,10 +1880,23 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
     slice_w = W / std::max(ht, (int64_t)1);
     slice_h = H / std::max(vt, (int64_t)1);
   };
+  const bool vector_reduction_split =
+      !matmul_910b && cfg.split_k > 1 &&
+      vector_reduction_split_kind_ != VectorReductionSplitKind::None;
+  const int64_t pw_slice_h_limit =
+      vector_reduction_split ? reduced_extent_ / cfg.split_k : cfg.h;
   for (size_t t : pw_produced_ephemerals_) {
     int64_t sw, sh;
     slice_for(t, sw, sh);
-    if (sw > cfg.w || sh > cfg.h) return false;
+    // A terminal col_sum split replays its upstream pointwise cone once per
+    // disjoint reduced-axis partial. Role propagation reports the unsplit M
+    // extent because the sink output has M=1; compare the actual M/S slice the
+    // emitter builds. Size-one broadcasts remain full and are not divided.
+    if (vector_reduction_split && sh > 1) {
+      if (sh % cfg.split_k != 0) return false;
+      sh /= cfg.split_k;
+    }
+    if (sw > cfg.w || sh > pw_slice_h_limit) return false;
   }
 
   // Multi-role tensors are now modeled explicitly via multi-entry
@@ -2446,6 +2499,20 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     plan.body = {0, trips, can_pipeline ? 2 : 1};
     plan.overlap_granted = plan.body.pipeline_stages == 2;
 
+    // Materialized S2 protocol. Record it in the winning plan only after both
+    // exact-partition proofs hold; emission consumes these values instead of
+    // independently deciding that a costed split is buildable. The main launch
+    // contains spatial work_units * factor partials; the zero seed remains one
+    // disjoint launch per spatial region.
+    if (materializes && cfg.split_k > 1 &&
+        vector_reduction_split_kind_ != VectorReductionSplitKind::None &&
+        reduced_extent_ % (cfg.split_k * vector_emit_granule_) == 0 &&
+        vector_iter_W_ % std::max<int64_t>(1, plan.tile_w) == 0) {
+      plan.reduction_split_kind = vector_reduction_split_kind_;
+      plan.reduction_split_factor = cfg.split_k;
+      plan.reduction_partial_extent = reduced_extent_ / cfg.split_k;
+    }
+
     if (!materializes) {
       plan.axis = width_strips > 1 ? 1 : 2;
       plan.extent = plan.axis == 1 ? plan.tile_w : plan.tile_h;
@@ -2733,6 +2800,13 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   } else {
     vector_stream = vector_stream_plan(cfg, retained_from_prev, retain_these);
     if (!vector_stream.feasible) return result;
+    // A fixed S>1 vector candidate is feasible only when UB planning produced
+    // the exact cross-core algorithm. This removes streamed-col_sum duplicates
+    // and prevents any future coarse-grid admission from degrading to split=1.
+    if (cfg.split_k > 1 &&
+        vector_stream.reduction_split_kind ==
+            VectorReductionSplitKind::None)
+      return result;
   }
   result.feasible = true;
 
@@ -2989,7 +3063,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Compute is classified once into body/stats/apply/finalize cones.  An op
       // present in both stats and apply (softmax's sub/exp) is intentionally
       // charged twice: the emitter recomputes it after the statistics barrier.
-      auto phase_compute = [&](uint8_t phase, int64_t covered_extent, int64_t chunks) {
+      auto phase_compute = [&](uint8_t phase, int64_t covered_extent, int64_t chunks,
+                               int64_t override_rows = 0,
+                               int64_t override_cols = 0,
+                               int64_t override_work_units = 0) {
         double cycles = 0.0;
         bool prev_pw = false;
         bool prev_pw_grounded = false;
@@ -3003,6 +3080,11 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           frame_cols = reduced_axis_ == 1 ? chunk_extent : vector_stream.free_tile;
           frame_iterations = std::max<int64_t>(1, chunks);
         }
+        if (override_rows > 0) frame_rows = override_rows;
+        if (override_cols > 0) frame_cols = override_cols;
+        const int64_t frame_work_units =
+            override_work_units > 0 ? override_work_units
+                                    : vector_stream.work_units;
         for (size_t i : dfs_order_) {
           if (vector_op_phase_mask_.empty() || (vector_op_phase_mask_[i] & phase) == 0) continue;
           const Op& op = prob_->ops[i];
@@ -3010,7 +3092,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           const bool grounded = pw && HasGroundedVectorSemantics(op);
           const bool stream_start = pw && (!prev_pw || prev_pw_grounded != grounded);
           if (op.type == OpType::Reduction && has_grounded_vector_semantics_) {
-            cycles += (double)vector_stream.work_units *
+            cycles += (double)frame_work_units *
                       (double)frame_iterations *
                       GroundedReductionCompute(prob_, op, reduced_axis_,
                                                frame_rows, frame_cols);
@@ -3023,7 +3105,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
             // every logical task.  This is deliberately not cached in
             // CostResult: the primitive descriptor is candidate-invariant and
             // the three scalar frame values come from this stack-local plan.
-            cycles += (double)vector_stream.work_units * (double)frame_iterations *
+            cycles += (double)frame_work_units * (double)frame_iterations *
                       GroundedVectorOpCompute(prob_, op, frame_rows, frame_cols,
                                               stream_start, has_reduction_);
             prev_pw = true;
@@ -3135,7 +3217,6 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
 
       const double io_in = input_cycles(kVectorPhaseBody, 0, 1);
       const double io_out = output_cycles(0, 1);
-      const double total_compute = phase_compute(kVectorPhaseBody, 0, 1);
       auto ddr_io = [&](double active, double io_out_eff) { return ddr_phase(active, io_in, io_out_eff); };
       auto rfl = [&](double comp, double dram) {
         return phase_roofline(vector_stream.body.pipeline_stages, comp, dram);
@@ -3218,17 +3299,32 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // split-heavy/occ=1 costed cheapest but ran slowest; device-best fills cores
       // via parts_n). `vector_peak_ub` now couples the reduced axis to its full
       // extent internally (R0), so the raw-cfg call detects streaming correctly here
-      // AND at the feasibility/compute sites — no manual coupling needed. (Non-
-      // streamed max/row-reduction splits the emit also declines are a separate,
-      // unmeasured fidelity gap — left as-is.)
+      // AND at the feasibility/compute sites — no manual coupling needed.
+      //
+      // G6: materialization alone is not sufficient. The winning
+      // VectorStreamPlan must carry the exact terminal-col_sum atomic-add
+      // protocol. Row reductions, max/min, multiple reductions/sinks, and
+      // ragged free grids never enter this block, so they cannot receive
+      // parallelism the emitter will silently discard.
       const bool reduction_materializes =
           vbudget <= 0.0 /* no UB model -> legacy */ || !vector_stream.streamed();
-      if (has_reduction_ && reduction_is_sink_ && reduction_materializes) {
+      if (reduction_materializes &&
+          vector_stream.reduction_split_kind ==
+              VectorReductionSplitKind::ColSumAtomicAdd) {
         const double red_dim = (double)(reduced_axis_ == 1 ? out_H_ : out_W_);
         struct RS { double lat, eff, ddr, compute; };
         auto eval_reduce_S = [&](int64_t S) -> RS {
           const double effS = (double)std::min<int64_t>(num_tiles * S, n_cores);
-          const double compS = WaveComputeCycles(total_compute, num_tiles * S, n_cores);
+          // Replay exactly the body each partial task emits: one
+          // [reduced_extent/S, free_tile] source/pointwise/reduction cone. This
+          // preserves per-invocation startup and the col-reduction tree instead
+          // of fractionally dividing one full-height invocation by S.
+          const double split_compute = phase_compute(
+              kVectorPhaseBody, 0, 1,
+              vector_stream.reduction_partial_extent,
+              vector_stream.tile_w, num_tiles * S);
+          const double compS =
+              WaveComputeCycles(split_compute, num_tiles * S, n_cores);
           // The thin reduced output is written S times (S atomic-add partials):
           // extra UB->GM store traffic FOLDED into the roofline, NOT an additive
           // merge. red_dim is the thin partial ([H,1] / [1,W]); charge it the same
@@ -3238,25 +3334,17 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
           const double streamS = rfl(compS, ddrS);
           return {streamS, effS, ddrS, compS};
         };
-        auto take_S = [&](int64_t S) {
+        auto apply_S = [&](int64_t S) {
           const RS e = eval_reduce_S(S);
-          if (e.lat < lat) {
-            lat = e.lat;
-            result.parallel_split = (int)S;
-            result.cores_used = (int)e.eff;
-            result.compute_bound = e.compute >= e.ddr;
-            result.ddr_traffic = e.ddr;
-          }
+          lat = e.lat;
+          result.parallel_split = (int)S;
+          result.cores_used = (int)e.eff;
+          result.compute_bound = e.compute >= e.ddr;
+          result.ddr_traffic = e.ddr;
         };
-        // The triple's split_k IS the reduced-axis split (lets P_spatial * S fill
-        // the cores). An ad-hoc non-grid tile (split_k==0, e.g. a directly-
-        // constructed TileConfig) sweeps S to fill instead. S=1 means no split.
-        if (cfg.split_k > 1) {
-          take_S(cfg.split_k);
-        } else if (cfg.split_k == 0 && num_tiles < n_cores) {
-          const int64_t S_max = (n_cores + num_tiles - 1) / num_tiles;
-          for (int64_t S = 2; S <= S_max; ++S) take_S(S);
-        }
+        // SpatialSchedule owns one concrete split factor. Ad-hoc cfg.split_k=0
+        // has no reconstructable emit descriptor and therefore stays serial.
+        apply_S(vector_stream.reduction_split_factor);
       }
       // C3 — per-task host launch overhead. The kernel_fill term below is per-WAVE
       // (rounds = ceil(num_tiles/cores)), so it is FLAT for num_tiles <= cores and the model ties
