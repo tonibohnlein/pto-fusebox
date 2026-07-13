@@ -30,6 +30,7 @@ static bool eject_creates_ephemeral_gap(const Partition& part, size_t op, size_t
         for (auto cop : dag.tensor_consumers[t])
             if (cop != op && gx_ops.count(cop)) { consumed_in_remainder = true; break; }
         if (!consumed_in_remainder) continue;  // T becomes boundary output → safe
+        if (prob.required_outputs.count(t)) continue;  // returned value is materialized
 
         // T will be ephemeral in remainder. The ejected op needs T externally.
         // Check if T is available as boundary output from another group.
@@ -76,6 +77,7 @@ static bool split_creates_ephemeral_gap_local(
                     if (cop != op && inside.count(cop))
                         { consumed_in_inside = true; break; }
                 if (!consumed_in_inside) continue;
+                if (prob.required_outputs.count(t)) continue;
 
                 // T ephemeral in inside, op in outside needs it.
                 // Available from another group?

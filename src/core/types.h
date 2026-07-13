@@ -85,6 +85,19 @@ enum class VectorOpGeometry : uint8_t {
     ColExpand
 };
 
+// Buildability contract for a source-DAG vector operation.  PrimitiveFamily
+// describes cost; capability describes which tiled algorithm the compiler can
+// actually replay.  Production adapters must never rely on the historical
+// Generic fallback for admission: an operation is either an elementwise strip,
+// one of the two implemented streaming reductions, or explicitly unsupported.
+enum class VectorOpCapability : uint8_t {
+    Generic,
+    Elementwise,
+    ReductionSum,
+    ReductionMax,
+    Unsupported
+};
+
 // Exact streamed multi-reduction algorithms implemented by the AutoFuse emit.
 // A P4 pattern identifies the complete op set whose semantics were proven to
 // match the emitted online algorithm, not merely a reduction family.
@@ -122,6 +135,7 @@ struct Op {
     // or VectorStreamPlan, so local-search cache entries stay compact.
     VectorPrimitiveFamily vector_primitive = VectorPrimitiveFamily::Generic;
     VectorOpGeometry vector_geometry = VectorOpGeometry::Generic;
+    VectorOpCapability vector_capability = VectorOpCapability::Generic;
 
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }
@@ -277,6 +291,13 @@ struct Problem {
     // candidate subgraph's complete op set against these entries; the emitter consumes the same
     // analysis result.
     std::vector<P4Pattern> p4_patterns;
+
+    // Tensor values that must be materialized as function results.  A required
+    // output can also feed another op in the same candidate subgraph; in that
+    // case it is simultaneously an on-chip intermediate and a DDR live-out.
+    // Keeping this fact in Problem prevents both the cost model and emitter
+    // from swallowing a returned-and-consumed SSA value.
+    FlatSet<size_t> required_outputs;
 
     size_t num_ops() const { return ops.size(); }
     size_t num_tensors() const { return tensors.size(); }

@@ -590,6 +590,7 @@ std::string verify_partition_feasibility(const Partition& part) {
                     if (cop != op && part.groups[gi].ops.count(cop))
                         { consumed_internal = true; break; }
                 if (!consumed_internal) continue;
+                if (prob.required_outputs.count(t)) continue;
 
                 for (auto cop : dag.tensor_consumers[t]) {
                     if (part.groups[gi].ops.count(cop)) continue;

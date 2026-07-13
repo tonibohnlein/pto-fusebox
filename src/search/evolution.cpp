@@ -1081,6 +1081,7 @@ Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
                 for (auto cop : dag.tensor_consumers[t])
                     if (cop != op && kept.count(cop)) { consumed_internal = true; break; }
                 if (!consumed_internal) continue;  // t is boundary output, no issue
+                if (prob.required_outputs.count(t)) continue;  // returned value is materialized
                 // t is ephemeral in kept. Check external consumers.
                 for (auto cop : dag.tensor_consumers[t]) {
                     if (kept.count(cop)) continue;  // internal
@@ -1090,7 +1091,7 @@ Partition crossover_dag_cut(const std::vector<const Partition*>& candidates,
                     for (size_t cgi = 0; cgi < child.groups.size(); cgi++) {
                         if (!child.groups[cgi].alive) continue;
                         if (child.groups[cgi].ops.count(op) &&
-                            is_boundary_output_of(child.groups[cgi].ops, t, dag))
+                            is_boundary_output_of(child.groups[cgi].ops, t, prob, dag))
                             { available = true; break; }
                     }
                     if (!available) { has_gap = true; break; }

@@ -362,6 +362,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // Candidate-invariant vector layout facts. Cached once in create() because
   // vector_peak_ub() is called repeatedly while evaluating tile candidates.
   int64_t vector_min_dtype_bytes_ = 4;
+  int64_t vector_max_dtype_bytes_ = 4;
   int64_t vector_emit_granule_ = 1;
   int64_t vector_pipe_band_count_ = 2;
   int64_t vector_iter_W_ = 1;

@@ -725,6 +725,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   std::vector<bool> is_produced(num_tensors, false);
   bool reduces_width = false, reduces_height = false;  // for reduced-axis homogeneity
   int64_t vector_min_dtype_bytes = INT64_MAX;
+  int64_t vector_max_dtype_bytes = 0;
   bool all_vector_ops_grounded = true;
 
   for (auto i : sg.ops_) {
@@ -734,6 +735,10 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     is_produced[output] = true;
     const bool is_vector_op = candidate_op.type == OpType::Pointwise ||
                               candidate_op.type == OpType::Reduction;
+    if (is_vector_op &&
+        candidate_op.vector_capability == VectorOpCapability::Unsupported) {
+      return std::nullopt;
+    }
     // Mixed groups reuse the homogeneous vector stream derivation for their
     // AIV stage. Its iteration frame and DMA granule must therefore see only
     // tensors touched by VECTOR ops. A MatMul-produced crossing is included as
@@ -744,9 +749,13 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       sg.vector_iter_H_ = std::max(sg.vector_iter_H_, prob.tensors[t].height);
       vector_min_dtype_bytes = std::min(
           vector_min_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[t].dtype));
+      vector_max_dtype_bytes = std::max(
+          vector_max_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[t].dtype));
       for (size_t input : candidate_op.inputs) {
         vector_min_dtype_bytes =
             std::min(vector_min_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[input].dtype));
+        vector_max_dtype_bytes =
+            std::max(vector_max_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[input].dtype));
         sg.vector_iter_W_ = std::max(sg.vector_iter_W_, prob.tensors[input].width);
         sg.vector_iter_H_ = std::max(sg.vector_iter_H_, prob.tensors[input].height);
       }
@@ -781,6 +790,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   }
   if (vector_min_dtype_bytes != INT64_MAX) {
     sg.vector_min_dtype_bytes_ = vector_min_dtype_bytes;
+    sg.vector_max_dtype_bytes_ = std::max<int64_t>(1, vector_max_dtype_bytes);
     sg.vector_emit_granule_ =
         std::max<int64_t>(1, prob.vec_dma_align_bytes / vector_min_dtype_bytes);
   }
@@ -848,9 +858,10 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // on top. (The execution-order DFS stays in the cost layer below: its roots
   // are refined by the epilogue detection, so it is not purely structural.)
   //
-  // Rule recap: a tensor produced AND consumed inside is ephemeral (zero memory
-  // footprint, zero IO). Whether an external consumer can reach it is NOT the
-  // subgraph's concern — that is the partition/solution ephemeral-gap check.
+  // Rule recap: a tensor produced AND consumed inside is ephemeral (a live UB
+  // band, normally zero DDR). Problem::required_outputs is the deliberate
+  // exception: the same tensor is also a DDR boundary output. Other external
+  // consumers remain the partition/solution ephemeral-gap concern.
   SubgraphStructure structure(prob, dag, sg.ops_);
   if (!structure.valid())
     return std::nullopt;  // empty op set, or no boundary output
@@ -884,40 +895,38 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   //   PW feeds a downstream MM's LHS (directly or through PW chain) →
   //     require cfg.w ≥ matmul.K
   //   PW feeds a downstream MM's RHS → require cfg.h ≥ matmul.K
-  // For each PW op in the subgraph, forward-BFS through PW-only chains to
-  // any MM it reaches; note the role (LHS/RHS) and record the MM's K.
-  // Subgraph-level thresholds = max K across all such pairs.
-  for (auto i : sg.ops_) {
-    if (prob.ops[i].type != OpType::Pointwise) continue;
-    // BFS forward through subgraph, crossing only PW→PW edges. A PW that
-    // reaches an MM via PW-only chain is a "prologue" of that MM.
-    std::vector<size_t> stack = {i};
-    std::vector<bool> visited(num_ops, false);
-    visited[i] = true;
-    while (!stack.empty()) {
-      size_t op = stack.back(); stack.pop_back();
-      size_t out_t = prob.ops[op].output();
-      for (auto cop : dag.tensor_consumers[out_t]) {
-        if (!is_in_sg[cop] || visited[cop]) continue;
-        visited[cop] = true;
-        const auto &cop_op = prob.ops[cop];
-        if (cop_op.type == OpType::MatMul) {
-          int64_t K = prob.tensors[cop_op.inputs[0]].width;
-          // Determine LHS vs RHS by which input slot the propagated tensor
-          // occupies. `out_t` here is the *immediate* downstream tensor we
-          // arrived at via the BFS edge; for PW-chain intermediates this
-          // still lands on the MM's LHS/RHS slot correctly since PW
-          // preserves shape and chain identity.
-          if (cop_op.inputs[0] == out_t)
-            sg.prologue_cfg_w_min_ = std::max(sg.prologue_cfg_w_min_, K);
-          if (cop_op.inputs.size() > 1 && cop_op.inputs[1] == out_t)
-            sg.prologue_cfg_h_min_ = std::max(sg.prologue_cfg_h_min_, K);
-          // Stop — MM materializes its output, so downstream-of-MM is a
-          // separate concern (that MM's epilogue, not this PW's prologue).
-        } else if (cop_op.type == OpType::Pointwise) {
-          stack.push_back(cop);
+  // One reverse-topological DP propagates the reachable matmul input role
+  // through pointwise-only chains. The former per-pointwise forward BFS was
+  // O(N^2) on a long chain and did entirely useless work for vector-only
+  // candidates. Each in-subgraph edge is now inspected at most once.
+  if (sg.has_matmul_) {
+    std::vector<int64_t> reaches_lhs_k(num_ops, 0);
+    std::vector<int64_t> reaches_rhs_k(num_ops, 0);
+    const auto& topo = dag.topological_order();
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+      const size_t op_idx = *it;
+      if (!is_in_sg[op_idx] || prob.ops[op_idx].type != OpType::Pointwise) continue;
+      const size_t out_t = prob.ops[op_idx].output();
+      for (size_t consumer : dag.tensor_consumers[out_t]) {
+        if (!is_in_sg[consumer]) continue;
+        const Op& consumer_op = prob.ops[consumer];
+        if (consumer_op.type == OpType::MatMul) {
+          const int64_t k = prob.tensors[consumer_op.inputs[0]].width;
+          if (!consumer_op.inputs.empty() && consumer_op.inputs[0] == out_t)
+            reaches_lhs_k[op_idx] = std::max(reaches_lhs_k[op_idx], k);
+          if (consumer_op.inputs.size() > 1 && consumer_op.inputs[1] == out_t)
+            reaches_rhs_k[op_idx] = std::max(reaches_rhs_k[op_idx], k);
+        } else if (consumer_op.type == OpType::Pointwise) {
+          reaches_lhs_k[op_idx] =
+              std::max(reaches_lhs_k[op_idx], reaches_lhs_k[consumer]);
+          reaches_rhs_k[op_idx] =
+              std::max(reaches_rhs_k[op_idx], reaches_rhs_k[consumer]);
         }
       }
+      sg.prologue_cfg_w_min_ =
+          std::max(sg.prologue_cfg_w_min_, reaches_lhs_k[op_idx]);
+      sg.prologue_cfg_h_min_ =
+          std::max(sg.prologue_cfg_h_min_, reaches_rhs_k[op_idx]);
     }
   }
 
@@ -1912,6 +1921,13 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
                  vector_iter_W_);
     if (logical_w <= 0 || vector_iter_W_ % logical_w != 0)
       return false;
+    // The seed is a real row-major TEXPANDS + assemble kernel. PTOAS requires
+    // one row to span at least one DMA block; a thin FP32 [1,4] seed (16 B)
+    // cannot lower even though the atomic body itself is valid.
+    if (boundary_outputs_.empty() ||
+        logical_w * dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype) <
+            prob_->vec_dma_align_bytes)
+      return false;
   }
 
   // Grid (SpatialSchedule) mode: w,h carry the PHYSICAL (max) region extent of a
@@ -2533,6 +2549,24 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
                                  : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
   const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
   auto align_up = [](int64_t x, int64_t g) { return g <= 1 ? x : ((x + g - 1) / g) * g; };
+  auto planned_tile_bytes = [&](size_t tensor_id, int64_t tile_h, int64_t tile_w,
+                                int64_t reduce_chunk, int stream_axis) {
+    const Tensor& tensor = prob_->tensors[tensor_id];
+    int64_t tw = std::min(tile_w, tensor.width);
+    int64_t th = std::min(tile_h, tensor.height);
+    const int axis = stream_axis ? stream_axis : reduced_axis_;
+    if (has_reduction_ && axis == 1)
+      tw = std::min(tensor.width, reduce_chunk);
+    else if (has_reduction_ && axis == 2)
+      th = std::min(tensor.height, reduce_chunk);
+    else if (axis == 1)
+      tw = std::min(tw, reduce_chunk);
+    else if (axis == 2)
+      th = std::min(th, reduce_chunk);
+    const int64_t tw_alloc = align_up(tw, vector_emit_granule_);
+    const int64_t th_alloc = has_reduction_ ? align_up(th, vector_emit_granule_) : th;
+    return tw_alloc * th_alloc * dtype_bytes(tensor.dtype);
+  };
 
   // The candidate grid is a partition of the logical output, not a consequence
   // of the physical UB/DMA shape. Keep its exact region count in the plan so an
@@ -2578,8 +2612,18 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     plan.stream_band_count = vector_pipe_band_count_;
     const bool has_col_reduction = reduced_axis_ == 2;
     auto strip_peak = [&](int64_t sh, int64_t sw) {
-      const int64_t sh_alloc = has_reduction_ ? align_up(sh, vector_emit_granule_) : sh;
-      return plan.stream_band_count * sh_alloc * align_up(sw, vector_emit_granule_) * output_dtb;
+      TileConfig strip_cfg = logical_cfg;
+      strip_cfg.h = sh;
+      strip_cfg.w = sw;
+      const int64_t source_peak =
+          vector_peak_ub(strip_cfg, retained_from_prev, retain_these);
+      int64_t next_iteration_inputs = 0;
+      for (size_t tensor : boundary_inputs_) {
+        next_iteration_inputs += planned_tile_bytes(
+            tensor, sh, sw, reduced_extent_ > 0 ? reduced_extent_ : std::max(sh, sw),
+            /*stream_axis=*/0);
+      }
+      return source_peak + next_iteration_inputs;
     };
     auto strip_fits = [&](int64_t sh, int64_t sw) { return budget <= 0 || strip_peak(sh, sw) <= budget; };
 
@@ -2607,11 +2651,23 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
           serial_full_tile = true;
         } else {
           if (has_reduction_) return plan;
-          const int64_t width_cap =
-              budget / std::max<int64_t>(1, plan.stream_band_count * strip_h * output_dtb);
-          strip_w = std::max<int64_t>(vector_emit_granule_,
-                                      (width_cap / vector_emit_granule_) * vector_emit_granule_);
-          strip_w = std::min<int64_t>(strip_w, align_up(plan.tile_w, vector_emit_granule_));
+          int64_t lo = 1;
+          int64_t hi =
+              std::max<int64_t>(1, align_up(plan.tile_w, vector_emit_granule_) /
+                                       vector_emit_granule_);
+          int64_t best_granules = 0;
+          while (lo <= hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            const int64_t candidate_w = mid * vector_emit_granule_;
+            if (strip_fits(strip_h, candidate_w)) {
+              best_granules = mid;
+              lo = mid + 1;
+            } else {
+              hi = mid - 1;
+            }
+          }
+          if (best_granules == 0) return plan;
+          strip_w = best_granules * vector_emit_granule_;
           width_strips = (plan.tile_w + strip_w - 1) / strip_w;
           if (!strip_fits(strip_h, strip_w)) return plan;
         }
@@ -2639,7 +2695,10 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     if (materializes && cfg.split_k > 1 &&
         vector_reduction_split_kind_ != VectorReductionSplitKind::None &&
         reduced_extent_ % (cfg.split_k * vector_emit_granule_) == 0 &&
-        vector_iter_W_ % std::max<int64_t>(1, plan.tile_w) == 0) {
+        vector_iter_W_ % std::max<int64_t>(1, plan.tile_w) == 0 &&
+        !boundary_outputs_.empty() &&
+        plan.tile_w * dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype) >=
+            prob_->vec_dma_align_bytes) {
       plan.reduction_split_kind = vector_reduction_split_kind_;
       plan.reduction_split_factor = cfg.split_k;
       plan.reduction_partial_extent = reduced_extent_ / cfg.split_k;
@@ -2692,20 +2751,61 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   int stats_stages = 1, apply_stages = 1;
   for (int iteration = 0; iteration < 2; ++iteration) {
     const int64_t bytes_per_element =
-        std::max<int64_t>(1, plan.stream_band_count * plan.free_tile_alloc * output_dtb);
+        std::max<int64_t>(1, plan.stream_band_count * plan.free_tile_alloc *
+                                vector_max_dtype_bytes_);
     const int64_t cap = budget / bytes_per_element;
     best = std::max<int64_t>(vector_emit_granule_,
                              (cap / vector_emit_granule_) * vector_emit_granule_);
     best = std::min(best, plan.extent);
-    best_peak = plan.stream_band_count * plan.free_tile_alloc *
-                align_up(best, vector_emit_granule_) * output_dtb;
-    if (best <= 0 || best_peak > budget) return plan;
+    if (best <= 0) return plan;
     const int64_t full_chunks = plan.extent / best;
     const int64_t chunk_bytes = plan.free_tile_alloc * best * vector_min_dtype_bytes_;
     auto stages_for = [&](int64_t trips) { return trips >= 2 && chunk_bytes >= vreg ? 2 : 1; };
     stats_stages = stages_for(std::max<int64_t>(0, full_chunks - 1));
     apply_stages = reduction_spans_output_ ? stages_for(full_chunks) : 1;
     const bool has_pipeline = stats_stages == 2 || apply_stages == 2;
+
+    auto exact_chunk_peak = [&](int64_t chunk) {
+      const int64_t aligned_chunk = align_up(chunk, vector_emit_granule_);
+      const int64_t source_peak = vector_peak_ub(
+          logical_cfg, retained_from_prev, retain_these, chunk, plan.axis);
+      // These are emitter-generated accumulator/assemble/online-stat bands,
+      // separate from the source-DAG lifetime replay above. Their values use
+      // the widest participating dtype; source tensors retain their individual
+      // dtypes in vector_peak_ub.
+      const int64_t generated_scratch =
+          extra_bands * plan.free_tile_alloc * aligned_chunk *
+          vector_max_dtype_bytes_;
+      int64_t next_iteration_inputs = 0;
+      if (has_pipeline) {
+        const int64_t tile_h = plan.axis == 1 ? plan.free_tile_alloc : aligned_chunk;
+        const int64_t tile_w = plan.axis == 1 ? aligned_chunk : plan.free_tile_alloc;
+        for (size_t tensor : boundary_inputs_)
+          next_iteration_inputs +=
+              planned_tile_bytes(tensor, tile_h, tile_w, chunk, plan.axis);
+      }
+      return source_peak + generated_scratch + next_iteration_inputs;
+    };
+
+    best_peak = exact_chunk_peak(best);
+    if (best_peak > budget) {
+      int64_t lo = 1;
+      int64_t hi = std::max<int64_t>(1, best / vector_emit_granule_);
+      int64_t best_granules = 0;
+      while (lo <= hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        const int64_t candidate = mid * vector_emit_granule_;
+        if (exact_chunk_peak(candidate) <= budget) {
+          best_granules = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (best_granules == 0) return plan;
+      best = best_granules * vector_emit_granule_;
+      best_peak = exact_chunk_peak(best);
+    }
     const int64_t required_bands =
         has_pipeline ? 2 * (int64_t)ops_.size() + extra_bands : plan.stream_band_count;
     if (required_bands == plan.stream_band_count) break;
@@ -3277,12 +3377,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                                         : vector_stream.n_partition.parts;
         const int64_t tensor_free = reduced_axis_ == 1 ? tensor.height : tensor.width;
         const int64_t tensor_reduced = reduced_axis_ == 1 ? tensor.width : tensor.height;
-        // Non-broadcast regions form an exact partition of the logical free
-        // axis. Do not multiply every task by the maximum (big) extent: for a
-        // 128/12 split that would price 132 rows although the emitter's 11/10
-        // clamped regions load exactly 128. A size-one broadcast is genuinely
-        // reloaded by every logical task.
-        const int64_t free_total = tensor_free == 1 ? free_regions : tensor_free;
+        // Every SPMD block executes the same maximum static body. Ragged regions
+        // clamp their base and overlap the preceding region; they do not shrink
+        // the load/store. Price that emitted traffic rather than the logical
+        // union (for example 48*3 rows, not 128 rows).
+        const int64_t free_total =
+            tensor_free == 1
+                ? free_regions
+                : free_regions * std::min<int64_t>(tensor_free, vector_stream.free_tile);
         const int64_t reduced_total = tensor_reduced == 1 ? chunks : covered_extent;
         return (double)free_total * (double)reduced_total *
                (double)dtype_bytes(tensor.dtype);
@@ -3510,14 +3612,16 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                     (double)prob_->per_task_overhead_cycles;
     }
     // Per-kernel pipeline fill — the DUAL of the eff core-fill incentive. A
-    // tiling produces num_tiles "kernels"; each core runs ceil(num_tiles/n_cores)
+    // tiling produces launched tasks; each core runs ceil(tasks/n_cores)
     // of them in sequence, paying one fill per pass. eff penalizes too FEW tiles
     // (under-filled cores); this penalizes too MANY (over-tiling), so the optimum
-    // sits at ~one kernel per core. Split-K fills a tile WITHIN a pass, so it
-    // doesn't add rounds (it's spatial num_tiles that count). kernel_fill_cost==0
-    // => no fill term.
+    // sits at ~one kernel per core. Vector reduced-axis split launches S body
+    // tasks per spatial region, so it contributes real additional fill waves.
+    // kernel_fill_cost==0 => no fill term.
     if (prob_->kernel_fill_cost > 0) {
-      const int64_t rounds = (num_tiles + n_cores - 1) / n_cores;
+      const int64_t body_tasks =
+          num_tiles * std::max<int64_t>(1, result.parallel_split);
+      const int64_t rounds = (body_tasks + n_cores - 1) / n_cores;
       const int64_t seed_rounds = vector_stream.reduction_seed.present
                                       ? (vector_stream.reduction_seed.work_units + n_cores - 1) /
                                             n_cores
@@ -3916,7 +4020,6 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
                                const FlatSet<size_t> &retain_these) const {
   CostResult best;
   auto consider = [&](const TileConfig &cfg) {
-        if (!is_valid_tiling(cfg)) return;
         auto r = compute_cost(cfg, retained_from_prev, retain_these);
         if (!r.feasible) return;
         bool take;
@@ -4015,7 +4118,6 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
     const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
     const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
     const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
-    if (!is_valid_tiling(cfg)) continue;
     const CostResult r = compute_cost(cfg, {}, {});
     if (!r.feasible) continue;
     out.emplace_back(cfg, r);

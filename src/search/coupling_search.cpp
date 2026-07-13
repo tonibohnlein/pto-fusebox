@@ -264,7 +264,7 @@ Solution CoupledPartition::to_solution() const {
         for (auto op : part.groups[g].ops) {
             {
                 size_t t = prob.ops[op].output();
-                if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
+                if (!is_boundary_output_of(part.groups[g].ops, t, prob, dag)) continue;
                 for (auto cop : dag.tensor_consumers[t]) {
                     for (auto gs : part.groups_of(cop)) {
                         if (!part.groups[gs].alive || gs == g) continue;
@@ -310,7 +310,7 @@ Solution CoupledPartition::to_solution() const {
             for (auto op : part.groups[g].ops) {
                 {
                     size_t t = prob.ops[op].output();
-                    if (!is_boundary_output_of(part.groups[g].ops, t, dag)) continue;
+                    if (!is_boundary_output_of(part.groups[g].ops, t, prob, dag)) continue;
                     for (auto cop : dag.tensor_consumers[t]) {
                         for (auto gs : part.groups_of(cop)) {
                             if (!part.groups[gs].alive || gs == g) continue;
@@ -586,7 +586,7 @@ CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
     // Reject if uncoupling T would create an ephemeral gap: T is ephemeral in
     // ga (produced+consumed internally) and gb has no other source for T.
     const DAG& dag = *cp.part.dag;
-    if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) {
+    if (!is_boundary_output_of(cp.part.groups[ga].ops, t, *cp.part.prob, dag)) {
         // T is not a boundary output of ga → it's ephemeral/internal.
         // Without retention, gb can only get T if another group exports it
         // as a boundary output or gb recomputes the producer.
@@ -595,7 +595,7 @@ CouplingEvalResult eval_uncouple(const CoupledPartition& cp,
         if (prod >= 0) {
             for (auto gj : cp.part.groups_of((size_t)prod)) {
                 if (gj == ga || !cp.part.groups[gj].alive) continue;
-                if (is_boundary_output_of(cp.part.groups[gj].ops, t, dag))
+                if (is_boundary_output_of(cp.part.groups[gj].ops, t, *cp.part.prob, dag))
                     { available = true; break; }
             }
             if (!available)
@@ -663,7 +663,8 @@ CouplingEvalResult eval_retain_force_split(const CoupledPartition& cp,
     if (!b_consumes) return {};
 
     // t already a boundary output? COUPLE handles that case.
-    if (is_boundary_output_of(cp.part.groups[g].ops, t, *cp.part.dag)) return {};
+    if (is_boundary_output_of(cp.part.groups[g].ops, t, *cp.part.prob,
+                              *cp.part.dag)) return {};
 
     // Bridge check + side feasibility (no retention yet)
     auto sr = cp.part.eval_split(op_a, op_b, g);
@@ -1282,7 +1283,8 @@ static int coupling_greedy_pass(CoupledPartition& cp,
             for (auto g : cp.part.groups_of(op_a)) {
                 if (!cp.part.groups[g].alive) continue;
                 // t already a boundary output → COUPLE handles it
-                if (is_boundary_output_of(cp.part.groups[g].ops, t, dag)) continue;
+                if (is_boundary_output_of(cp.part.groups[g].ops, t,
+                                          *cp.part.prob, dag)) continue;
 
                 // Try each internal consumer as the cut target
                 for (auto op_b : dag.tensor_consumers[t]) {

@@ -13,14 +13,17 @@ class CostCache;
 
 // ============================================================================
 // Boundary helpers — DAG-based, no Subgraph required.
-// t is a boundary output of ops if produced inside AND not consumed inside.
+// t is a boundary output of ops if produced inside AND either not consumed
+// inside or explicitly required as a function result.
 // t is a boundary input  of ops if consumed inside AND not produced inside.
 // ============================================================================
 
-inline bool is_boundary_output_of(const FlatSet<size_t>& ops, size_t t, const DAG& dag) {
+inline bool is_boundary_output_of(const FlatSet<size_t>& ops, size_t t,
+                                  const Problem& prob, const DAG& dag) {
     if (t >= dag.tensor_producer.size()) return false;
     int prod = dag.tensor_producer[t];
     if (prod < 0 || !ops.count((size_t)prod)) return false;
+    if (prob.required_outputs.count(t)) return true;
     for (auto cop : dag.tensor_consumers[t])
         if (ops.count(cop)) return false;
     return true;

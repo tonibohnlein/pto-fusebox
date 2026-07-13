@@ -50,13 +50,16 @@ class SubgraphStructure {
   [[nodiscard]] const FlatSet<size_t>& boundary_inputs() const { return boundary_inputs_; }
   [[nodiscard]] const FlatSet<size_t>& boundary_outputs() const { return boundary_outputs_; }
 
-  // Ephemeral tensors — produced AND consumed inside (never touch DDR). The
+  // Ephemeral tensors — produced AND consumed inside. Usually they never touch
+  // DDR; a Problem::required_outputs tensor is deliberately both ephemeral and
+  // a boundary output because it is consumed on-chip and returned externally.
+  // The
   // ephemeral-gap constraint forbids one subgraph's ephemeral from being a
   // boundary INPUT of another; that check lives in the partition layer and
   // reads exactly this set.
   [[nodiscard]] const FlatSet<size_t>& ephemeral() const { return ephemeral_; }
 
-  // Sink ops — no in-subgraph consumer; they produce the boundary outputs.
+  // Live-out roots — terminal ops plus producers of required function outputs.
   [[nodiscard]] const std::vector<size_t>& sinks() const { return sinks_; }
 
   // Fixed depth-first (post-order) execution order over ops: the pebbling order

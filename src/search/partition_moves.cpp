@@ -397,7 +397,7 @@ EvalResult eval_recompute(const Partition& p, size_t op, size_t into) {
         bool available = false;
         for (auto gj : p.groups_of((size_t)prod)) {
             if (!p.groups[gj].alive) continue;
-            if (is_boundary_output_of(p.groups[gj].ops, t, *p.dag))
+            if (is_boundary_output_of(p.groups[gj].ops, t, *p.prob, *p.dag))
                 { available = true; break; }
         }
         if (!available) return r;

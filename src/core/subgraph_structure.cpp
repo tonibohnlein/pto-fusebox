@@ -36,12 +36,12 @@ SubgraphStructure::SubgraphStructure(const Problem &prob, const DAG &dag,
   // Boundary / ephemeral classification (pure DAG facts):
   //   boundary input  = consumed inside, NOT produced inside
   //   ephemeral       = produced AND consumed inside
-  //   boundary output = produced inside, NOT ephemeral
+  //   boundary output = produced inside and either terminal or externally required
   //
-  // External consumers do NOT change this classification — a tensor produced
-  // and consumed inside is ephemeral here even if some op OUTSIDE the subgraph
-  // also reads it. Serving that external consumer is the partition layer's
-  // ephemeral-gap concern, not the subgraph's.
+  // Consumers in other solver groups remain a partition-layer concern. Function
+  // results are different: Problem::required_outputs is an explicit observable
+  // boundary, so a returned-and-consumed value is BOTH an on-chip intermediate
+  // (ephemeral lifetime) and a DDR live-out.
   std::vector<bool> is_ephemeral(num_tensors, false);
   for (size_t t = 0; t < num_tensors; t++) {
     if (is_consumed[t] && !is_produced[t])
@@ -50,20 +50,22 @@ SubgraphStructure::SubgraphStructure(const Problem &prob, const DAG &dag,
       is_ephemeral[t] = true;
   }
   for (size_t t = 0; t < num_tensors; t++) {
-    if (is_produced[t] && !is_ephemeral[t])
+    if (is_produced[t] && (!is_ephemeral[t] || prob.required_outputs.count(t)))
       boundary_outputs_.insert(t);
     if (is_ephemeral[t])
       ephemeral_.insert(t);
   }
 
-  // Sinks: ops whose output has NO in-subgraph consumer. (Built iterating ops_
-  // in order, matching subgraph.cpp's sink_ops ordering.)
+  // Execution roots / live-outs: terminal ops plus producers of explicitly
+  // required outputs. A required value may still have an internal successor;
+  // rooting its producer makes the DFS replay and sink metadata retain both
+  // observable paths.
   for (auto i : ops_) {
     bool has_internal_succ = false;
     size_t t = prob.ops[i].output();
     for (auto cop : dag.tensor_consumers[t])
       if (is_in_sg[cop]) { has_internal_succ = true; break; }
-    if (!has_internal_succ)
+    if (!has_internal_succ || prob.required_outputs.count(t))
       sinks_.push_back(i);
   }
 

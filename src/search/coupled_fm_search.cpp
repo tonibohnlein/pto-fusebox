@@ -262,7 +262,7 @@ CoupledFMMove best_coupled_move_for_op(const CoupledPartition& cp,
         {
             size_t t = prob.ops[op].output();
             if (feasibly_ret.count(t) &&
-                !is_boundary_output_of(part.groups[ga].ops, t, dag)) {
+                !is_boundary_output_of(part.groups[ga].ops, t, prob, dag)) {
 
                 // t is internal to ga. Look for consumers of t also in ga.
                 for (auto cop : dag.tensor_consumers[t]) {
@@ -516,7 +516,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     if (!re_ga.empty()) {
         FlatSet<size_t> v;
         for (auto t : re_ga)
-            if (is_boundary_output_of(new_ga, t, *part.dag)) v.insert(t);
+            if (is_boundary_output_of(new_ga, t, *part.prob, *part.dag)) v.insert(t);
         re_ga = std::move(v);
     }
     if (!en_gb.empty()) {
@@ -528,7 +528,7 @@ static double coupled_steal_saving(const CoupledPartition& cp,
     if (!re_gb.empty() && !is_eject) {
         FlatSet<size_t> v;
         for (auto t : re_gb)
-            if (is_boundary_output_of(new_gb, t, *part.dag)) v.insert(t);
+            if (is_boundary_output_of(new_gb, t, *part.prob, *part.dag)) v.insert(t);
         re_gb = std::move(v);
     }
 
@@ -700,7 +700,7 @@ static double coupled_merge_saving(const CoupledPartition& cp, size_t ga, size_t
     {
         FlatSet<size_t> valid_retain;
         for (auto t : retain)
-            if (is_boundary_output_of(merged, t, dag))
+            if (is_boundary_output_of(merged, t, *part.prob, dag))
                 valid_retain.insert(t);
         retain = std::move(valid_retain);
     }
@@ -856,7 +856,7 @@ static double coupled_tensor_merge_saving(const CoupledPartition& cp,
     {
         FlatSet<size_t> valid;
         for (auto t : retain)
-            if (is_boundary_output_of(merged, t, dag)) valid.insert(t);
+            if (is_boundary_output_of(merged, t, *cp.part.prob, dag)) valid.insert(t);
         retain = std::move(valid);
     }
 
@@ -898,9 +898,10 @@ static void fixup_coupling_merge(CoupledPartition& cp,
         for (auto t : it->second) {
             // Producer side: must still be boundary output of the producer group
             if (edge.first == ga) {
-                if (!is_boundary_output_of(cp.part.groups[ga].ops, t, dag)) continue;
+                if (!is_boundary_output_of(cp.part.groups[ga].ops, t, *cp.part.prob, dag)) continue;
             } else if (cp.part.groups[edge.first].alive) {
-                if (!is_boundary_output_of(cp.part.groups[edge.first].ops, t, dag)) continue;
+                if (!is_boundary_output_of(cp.part.groups[edge.first].ops, t,
+                                           *cp.part.prob, dag)) continue;
             }
             // Consumer side: must still be boundary input of the consumer group
             if (edge.second == ga) {
@@ -1078,9 +1079,11 @@ static void fixup_coupling_split(CoupledPartition& cp, size_t ga, size_t gb_new)
             if (it != cp.retained.end()) {
                 FlatSet<size_t> keep, move;
                 for (auto t : it->second) {
-                    if (is_boundary_output_of(cp.part.groups[ga].ops, t, dag))
+                    if (is_boundary_output_of(cp.part.groups[ga].ops, t,
+                                              *cp.part.prob, dag))
                         keep.insert(t);
-                    else if (is_boundary_output_of(cp.part.groups[gb_new].ops, t, dag))
+                    else if (is_boundary_output_of(cp.part.groups[gb_new].ops, t,
+                                                   *cp.part.prob, dag))
                         move.insert(t);
                     // else: producer vanished — dissolve below
                 }

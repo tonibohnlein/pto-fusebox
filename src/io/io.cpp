@@ -61,6 +61,17 @@ static bool parse_vector_op_geometry(const std::string& name, VectorOpGeometry* 
     return true;
 }
 
+static bool parse_vector_op_capability(const std::string& name,
+                                       VectorOpCapability* capability) {
+    if (name == "generic") *capability = VectorOpCapability::Generic;
+    else if (name == "elementwise") *capability = VectorOpCapability::Elementwise;
+    else if (name == "reduction_sum") *capability = VectorOpCapability::ReductionSum;
+    else if (name == "reduction_max") *capability = VectorOpCapability::ReductionMax;
+    else if (name == "unsupported") *capability = VectorOpCapability::Unsupported;
+    else return false;
+    return true;
+}
+
 static json vector_loop_json(const VectorLoopPlan& loop) {
     return {{"first_chunk", loop.first_chunk},
             {"trip_count", loop.trip_count},
@@ -277,7 +288,28 @@ Problem read_problem(const std::string& filename) {
                 std::exit(1);
             }
         }
+        if (j.contains("vector_op_capabilities") &&
+            i < j["vector_op_capabilities"].size()) {
+            const std::string name = j["vector_op_capabilities"][i].get<std::string>();
+            if (!parse_vector_op_capability(name, &op.vector_capability)) {
+                std::cerr << "Error: unknown vector op capability '" << name
+                          << "' for op " << i << "\n";
+                std::exit(1);
+            }
+        }
         p.ops.push_back(std::move(op));
+    }
+
+    if (j.contains("required_outputs")) {
+        for (const auto& value : j["required_outputs"]) {
+            const size_t tensor = value.get<size_t>();
+            if (tensor >= num_tensors) {
+                std::cerr << "Error: required output tensor index " << tensor
+                          << " out of range (num_tensors=" << num_tensors << ")\n";
+                std::exit(1);
+            }
+            p.required_outputs.insert(tensor);
+        }
     }
 
     // --- Tensor integrity checks ---

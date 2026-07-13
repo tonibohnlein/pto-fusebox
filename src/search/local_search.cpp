@@ -130,6 +130,7 @@ bool partition_has_gap(const Partition& part, std::function<bool(size_t)> is_ret
                     if (cop != op && part.groups[gi].ops.count(cop))
                         { consumed_internal = true; break; }
                 if (!consumed_internal) continue;
+                if (prob.required_outputs.count(t)) continue;
 
                 // T is ephemeral in gi.  Check all groups that need T from
                 // slow memory: external consumers + recomputed internal consumers.
@@ -139,7 +140,7 @@ bool partition_has_gap(const Partition& part, std::function<bool(size_t)> is_ret
                 auto t_available_from_slow = [&]() -> bool {
                     for (auto gj : part.groups_of(op)) {
                         if (gj == gi || !part.groups[gj].alive) continue;
-                        if (!is_boundary_output_of(part.groups[gj].ops, t, dag))
+                        if (!is_boundary_output_of(part.groups[gj].ops, t, prob, dag))
                             continue;
                         return true;
                     }

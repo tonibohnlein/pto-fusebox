@@ -5,6 +5,8 @@
 #include <vector>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <cstring>
 
 // ============================================================================
@@ -81,26 +83,32 @@ inline uint64_t hash_vec(const std::vector<size_t>& v) {
 }
 
 // ============================================================================
-// Lock-free open-addressed hash table with hash-only keys.
+// Concurrent open-addressed hash table with hash-only keys. Readers may yield
+// briefly behind a slot whose immutable payload is still being published.
 //
-// Each slot is: atomic<uint64_t> hash + Value.
-// hash == 0 means empty.  hash != 0 means occupied (hash is the key).
+// Each slot has an explicit EMPTY -> WRITING -> READY publication state.
 //
-// Read path:  compute slot index → load hash(acquire) → if match, return value.
-// Write path: CAS(0, hash) → write value → done.
+// Read path: acquire READY, then read the immutable hash/value.
+// Write path: claim WRITING, populate hash/value, release-publish READY.
 //
-// No stored keys, no vector comparisons.  ~48 bytes per slot (vs ~100+ before).
+// No stored keys and no vector comparisons. Slot size is
+// sizeof(state/hash/Value); the default 131072-slot base table plus a lazily
+// allocated retention table avoid the former unconditional million slots per
+// tier. Vector-only 910B searches never allocate the retention tier.
 // Collision probability with 64-bit hash: ~n²/2^64 where n = entries.
 // With n = 100K entries: ~5e-10 — negligible.
 //
-// No size counter — avoiding shared atomic contention. Size is approximated
-// from a per-thread counter that's collected lazily.
+// The size counter changes only on successful insert and is not on the lookup
+// hot path.
 // ============================================================================
 
 template<typename Value>
 class HashOnlyMap {
+    enum class SlotState : uint8_t { Empty, Writing, Ready };
+
     struct Slot {
-        std::atomic<uint64_t> hash{0};  // 0 = empty
+        std::atomic<SlotState> state{SlotState::Empty};
+        uint64_t hash = 0;
         Value value{};
     };
 
@@ -121,9 +129,14 @@ public:
     const Value* find(uint64_t h) const {
         size_t idx = (size_t)h & mask_;
         for (size_t i = 0; i < 32; i++) {  // bounded probe length
-            uint64_t sh = slots_[idx].hash.load(std::memory_order_acquire);
-            if (sh == 0) return nullptr;     // empty → end of chain
-            if (sh == h) return &slots_[idx].value;
+            const Slot& slot = slots_[idx];
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            while (state == SlotState::Writing) {
+                std::this_thread::yield();
+                state = slot.state.load(std::memory_order_acquire);
+            }
+            if (state == SlotState::Empty) return nullptr;
+            if (slot.hash == h) return &slot.value;
             idx = (idx + 1) & mask_;
         }
         return nullptr;  // probe limit reached
@@ -134,14 +147,27 @@ public:
         size_t idx = (size_t)h & mask_;
         for (size_t i = 0; i < 32; i++) {
             auto& slot = slots_[idx];
-            uint64_t expected = 0;
-            if (slot.hash.compare_exchange_strong(expected, h,
+            SlotState state = slot.state.load(std::memory_order_acquire);
+            while (state == SlotState::Writing) {
+                std::this_thread::yield();
+                state = slot.state.load(std::memory_order_acquire);
+            }
+            SlotState expected = SlotState::Empty;
+            if (state == SlotState::Empty &&
+                slot.state.compare_exchange_strong(expected, SlotState::Writing,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+                slot.hash = h;
                 slot.value = value;
+                slot.state.store(SlotState::Ready, std::memory_order_release);
                 size_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            if (expected == h) return false;  // duplicate
+            if (state == SlotState::Empty) state = expected;
+            while (state == SlotState::Writing) {
+                std::this_thread::yield();
+                state = slot.state.load(std::memory_order_acquire);
+            }
+            if (state == SlotState::Ready && slot.hash == h) return false;
             idx = (idx + 1) & mask_;
         }
         return false;  // probe limit
@@ -151,7 +177,8 @@ public:
 
     void clear() {
         for (size_t i = 0; i < capacity_; i++) {
-            slots_[i].hash.store(0, std::memory_order_relaxed);
+            slots_[i].state.store(SlotState::Empty, std::memory_order_relaxed);
+            slots_[i].hash = 0;
             slots_[i].value = Value{};
         }
         size_.store(0, std::memory_order_relaxed);
@@ -184,8 +211,7 @@ class CostCache {
 public:
     explicit CostCache(size_t max_entries = 0)
         : max_entries_(max_entries)
-        , base_map_(std::max<size_t>(1048576, max_entries > 0 ? max_entries * 2 : 1048576))
-        , ret_map_(1048576)
+        , base_map_(std::max<size_t>(131072, max_entries > 0 ? max_entries * 2 : 131072))
     {
         auto& s = thread_cache_stats();
         s.base_hits = s.base_misses = s.ret_hits = s.ret_misses = s.base_overcapacity = 0;
@@ -246,7 +272,8 @@ public:
 
         uint64_t h = hash_retention(ops, entering, retain);
 
-        auto* hit = ret_map_.find(h);
+        auto& ret_map = retention_map();
+        auto* hit = ret_map.find(h);
         if (hit) {
             thread_cache_stats().ret_hits++;
             return *hit;
@@ -258,7 +285,7 @@ public:
         CostResult cr;
         if (sg_opt) cr = sg_opt->best_cost(entering, retain);
 
-        ret_map_.insert(h, cr);
+        ret_map.insert(h, cr);
         return cr;
     }
 
@@ -281,7 +308,8 @@ public:
         FlatSet<size_t> ops_set(sg.ops().begin(), sg.ops().end());
         uint64_t h = hash_retention(ops_set, entering, retain);
 
-        auto* hit = ret_map_.find(h);
+        auto& ret_map = retention_map();
+        auto* hit = ret_map.find(h);
         if (hit) {
             thread_cache_stats().ret_hits++;
             return *hit;
@@ -289,7 +317,7 @@ public:
 
         thread_cache_stats().ret_misses++;
         auto cr = sg.best_cost(entering, retain);
-        ret_map_.insert(h, cr);
+        ret_map.insert(h, cr);
         return cr;
     }
 
@@ -299,7 +327,7 @@ public:
 
     void clear() {
         base_map_.clear();
-        ret_map_.clear();
+        if (ret_map_) ret_map_->clear();
         auto& s = thread_cache_stats();
         s.base_hits = s.base_misses = s.ret_hits = s.ret_misses = s.base_overcapacity = 0;
     }
@@ -315,12 +343,19 @@ public:
     size_t misses()       const { return base_misses(); }
     size_t overcapacity() const { return thread_cache_stats().base_overcapacity; }
     size_t size()         const { return base_map_.size(); }
-    size_t ret_size()     const { return ret_map_.size(); }
+    size_t ret_size()     const { return ret_map_ ? ret_map_->size() : 0; }
     size_t max_entries()  const { return max_entries_; }
 
 private:
+    HashOnlyMap<CostResult>& retention_map() {
+        std::call_once(ret_map_once_, [&] {
+            ret_map_ = std::make_unique<HashOnlyMap<CostResult>>(131072);
+        });
+        return *ret_map_;
+    }
+
     const size_t max_entries_;
     HashOnlyMap<CostResult> base_map_;
-
-    HashOnlyMap<CostResult> ret_map_;
+    std::once_flag ret_map_once_;
+    std::unique_ptr<HashOnlyMap<CostResult>> ret_map_;
 };

@@ -329,6 +329,7 @@ Solution::ValidationResult Solution::validate() const {
                 for (auto cop : dag_->tensor_consumers[t])
                     if (cop != op && op_set.count(cop)) { consumed_internal = true; break; }
                 if (!consumed_internal) continue;
+                if (prob_->required_outputs.count(t)) continue;
 
                 // T is ephemeral in step si. If T is a boundary output of
                 // some OTHER step, external consumers can read it from slow
@@ -392,6 +393,7 @@ bool Solution::creates_ephemeral_gap(const Problem& prob, const DAG& dag,
             for (auto cop : dag.tensor_consumers[t])
                 if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
             if (!any_consumer_internal) continue;  // pure boundary output → safe
+            if (prob.required_outputs.count(t)) continue;  // materialized live-out → safe
 
             // T is ephemeral → external consumers need it from elsewhere
             for (auto cop : dag.tensor_consumers[t]) {

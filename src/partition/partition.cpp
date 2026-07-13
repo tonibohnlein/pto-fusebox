@@ -139,7 +139,7 @@ void Partition::rebuild_group_dag() {
     for (size_t i = 0; i < ng; i++) {
         if (!groups[i].alive) continue;
         for (size_t t = 0; t < dag->tensor_producer.size(); t++)
-            if (is_boundary_output_of(groups[i].ops, t, *dag))
+            if (is_boundary_output_of(groups[i].ops, t, *prob, *dag))
                 tensor_to_group[t] = i;
     }
 
@@ -585,6 +585,7 @@ bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
             if (!any_consumer_internal) continue;  // pure boundary output → safe
+            if (prob->required_outputs.count(t)) continue;  // materialized live-out → safe
 
             // T is ephemeral in proposed_ops → not written to slow memory.
             // Any external consumer needs T from another group.
@@ -639,6 +640,7 @@ bool Partition::creates_ephemeral_gap(const FlatSet<size_t>& proposed_ops,
             for (auto cop : dag->tensor_consumers[t])
                 if (proposed_ops.count(cop)) { any_consumer_internal = true; break; }
             if (!any_consumer_internal) continue;  // pure boundary output → safe
+            if (prob->required_outputs.count(t)) continue;  // materialized live-out → safe
 
             // T is ephemeral → external consumers need it from elsewhere
             for (auto cop : dag->tensor_consumers[t]) {
@@ -698,6 +700,7 @@ bool Partition::split_creates_ephemeral_gap(
                 for (auto cop : dag->tensor_consumers[t])
                     if (comp.count(cop)) { any_consumer_in_comp = true; break; }
                 if (!any_consumer_in_comp) continue;  // pure boundary output → safe
+                if (prob->required_outputs.count(t)) continue;  // materialized live-out → safe
 
                 int prod_op = dag->tensor_producer[t];
                 if (prod_op < 0) continue;
