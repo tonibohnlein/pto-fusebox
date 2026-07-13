@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -208,6 +209,19 @@ struct Problem {
     // algorithm. A different candidate is infeasible and is cut into P1/P2-buildable groups.
     bool allow_model_ahead_multi_reduction_stream = true;
 
+    // Runtime architecture policy. False keeps the production solver strictly
+    // unit-homogeneous; true lets the same monomorphized Ascend910BCost admit
+    // and price mixed cube+vector groups. The dedicated Ascend910BMixed test/
+    // research model still opts in directly.
+    bool fuse_cube_vector = false;
+
+    // Analytic/research permission for a mixed topology whose FIFO contains
+    // more than one round trip (for example full C->V->C->V attention). The
+    // existing PyPTO skew pass demotes it to sequential, so the model prices a
+    // serial stage sum. Compiler/buildable mode sets this false until a whole-
+    // FIFO wavefront emitter exists.
+    bool allow_model_ahead_mixed_multi_roundtrip = true;
+
     // Buildability gate for homogeneous cube DAGs with more than one matmul.
     // When true, enumerate only exact uniform M/N partitions; the current
     // plan-driven emitter cannot represent unequal static region shapes in one
@@ -254,82 +268,6 @@ struct TileConfig {
     int64_t split_k = 0;
 };
 
-// ============================================================================
-// Derived vector streaming plan
-// ============================================================================
-
-// The algorithm realized when a vector tile does not materialize in UB. This is
-// derived from (subgraph, TileConfig, retention context) by Ascend910BCost. Candidate
-// pricing uses it as a stack-local value; downstream consumers re-derive it only
-// for a final or explicitly forced configuration. Materialized means no UB
-// sub-stream is required.
-enum class VectorStreamKind {
-    Materialized,
-    Pointwise,
-    ReductionFolded,          // P1: bare reduction or thin folded finalize
-    ReductionSpanning,        // P2: stats pass + spanning apply pass
-    SoftmaxFlash,             // P4: online (m,l) + apply
-    LayerNormWelford,         // P4: online (mean,M2,count) + apply
-    ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
-};
-
-struct VectorLoopPlan {
-    int64_t first_chunk = 0;
-    int64_t trip_count = 0;
-    int pipeline_stages = 1;  // 1 = sequential/absent, 2 = stage-2 ping-pong
-};
-
-struct VectorSerialPhasePlan {
-  bool present = false;
-  int64_t chunk_index = 0;
-  int64_t extent = 0;
-};
-
-struct VectorStreamPlan {
-    bool feasible = false;
-    VectorStreamKind kind = VectorStreamKind::Materialized;
-    // Peak UB footprint before streaming and at the selected chunk. Keeping
-    // both in the derived plan lets compute_cost reuse the feasibility work
-    // instead of rescanning the pebbling order for every cost term.
-    int64_t full_peak_ub_bytes = 0;
-    int64_t chunk_peak_ub_bytes = 0;
-    int64_t stream_band_count = 0;
-    int axis = 0;  // 0 = materialized, 1 = width, 2 = height
-    int64_t free_tile = 0;
-    int64_t extent = 0;
-    int64_t chunk = 0;
-    int64_t full_chunks = 0;
-    int64_t tail = 0;
-    int stream_passes = 0;
-    // Solver-owned materialized/pointwise strip geometry.  The emitter must not
-    // independently choose a row/width strip count: these fields are the exact
-    // uniform (clamp-overlap on a ragged edge) loop it builds.
-    int64_t tile_h = 0;
-    int64_t tile_w = 0;
-    int64_t strip_h = 0;
-    int64_t strip_w = 0;
-    int64_t row_strips = 1;
-    int64_t width_strips = 1;
-    VectorLoopPlan body;
-
-    // A streamed reduction is a sequence of barrier-separated phases.  Peeled
-    // init/tail/finalize work is always serial; only stats/apply rolled loops
-    // may receive stage-2 overlap.
-    VectorSerialPhasePlan stats_init;
-    VectorLoopPlan stats;  // P1/P2/P4 online statistics
-    VectorLoopPlan apply;  // P2/P4 spanning output
-    VectorSerialPhasePlan stats_tail;
-    VectorSerialPhasePlan apply_tail;
-    VectorSerialPhasePlan finalize;
-
-    // Diagnostic compatibility bit: true when every rolled data-moving loop in
-    // this plan is stage-2.  Costing is phase-local and never uses this to hide
-    // serial init/tail/finalize work behind another phase.
-    bool overlap_granted = false;
-
-    bool streamed() const { return feasible && axis != 0; }
-};
-
 // Even distribution of an axis of `dim` elements into `parts` regions, in units
 // of `granule`-element blocks. F = ceil(dim/granule) blocks split as evenly as
 // possible: `num_big` regions get (base+1) blocks, the rest get `base`. Since
@@ -364,6 +302,92 @@ inline AxisPartition partition_axis(int64_t dim, int64_t parts, int64_t granule 
     p.small = base * g;
     return p;
 }
+
+// ============================================================================
+// Derived vector streaming plan
+// ============================================================================
+
+// The algorithm realized when a vector tile does not materialize in UB. This is
+// derived from (subgraph, TileConfig, retention context) by Ascend910BCost. Candidate
+// pricing uses it as a stack-local value; downstream consumers re-derive it only
+// for a final or explicitly forced configuration. Materialized means no UB
+// sub-stream is required.
+enum class VectorStreamKind {
+    Materialized,
+    Pointwise,
+    ReductionFolded,          // P1: bare reduction or thin folded finalize
+    ReductionSpanning,        // P2: stats pass + spanning apply pass
+    SoftmaxFlash,             // P4: online (m,l) + apply
+    LayerNormWelford,         // P4: online (mean,M2,count) + apply
+    ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
+};
+
+struct VectorLoopPlan {
+    int64_t first_chunk = 0;
+    int64_t trip_count = 0;
+    int pipeline_stages = 1;  // 1 = sequential/absent, 2 = stage-2 ping-pong
+};
+
+struct VectorSerialPhasePlan {
+  bool present = false;
+  int64_t chunk_index = 0;
+  int64_t extent = 0;
+};
+
+struct VectorStreamPlan {
+    bool feasible = false;
+    VectorStreamKind kind = VectorStreamKind::Materialized;
+    // One logical region is one runtime work unit / SPMD block. The physical
+    // UB/DMA allocation used while replaying a region may be padded or split
+    // into strips, but it must never change this solver-owned launch grid.
+    AxisPartition m_partition;
+    AxisPartition n_partition;
+    int64_t work_units = 0;
+    // Peak UB footprint before streaming and at the selected chunk. Keeping
+    // both in the derived plan lets compute_cost reuse the feasibility work
+    // instead of rescanning the pebbling order for every cost term.
+    int64_t full_peak_ub_bytes = 0;
+    int64_t chunk_peak_ub_bytes = 0;
+    int64_t stream_band_count = 0;
+    int axis = 0;  // 0 = materialized, 1 = width, 2 = height
+    // Maximum logical free-axis extent owned by one work unit. Its physical UB
+    // allocation is `free_tile_alloc`, rounded to the DMA granule. Keeping the
+    // two separate prevents alignment from silently coarsening the SPMD grid.
+    int64_t free_tile = 0;
+    int64_t free_tile_alloc = 0;
+    int64_t extent = 0;
+    int64_t chunk = 0;
+    int64_t full_chunks = 0;
+    int64_t tail = 0;
+    int stream_passes = 0;
+    // Solver-owned materialized/pointwise strip geometry.  The emitter must not
+    // independently choose a row/width strip count: these fields are the exact
+    // uniform (clamp-overlap on a ragged edge) loop it builds.
+    int64_t tile_h = 0;
+    int64_t tile_w = 0;
+    int64_t strip_h = 0;
+    int64_t strip_w = 0;
+    int64_t row_strips = 1;
+    int64_t width_strips = 1;
+    VectorLoopPlan body;
+
+    // A streamed reduction is a sequence of barrier-separated phases.  Peeled
+    // init/tail/finalize work is always serial; only stats/apply rolled loops
+    // may receive stage-2 overlap.
+    VectorSerialPhasePlan stats_init;
+    VectorLoopPlan stats;  // P1/P2/P4 online statistics
+    VectorLoopPlan apply;  // P2/P4 spanning output
+    VectorSerialPhasePlan stats_tail;
+    VectorSerialPhasePlan apply_tail;
+    VectorSerialPhasePlan finalize;
+
+    // Diagnostic compatibility bit: true when every rolled data-moving loop in
+    // this plan is stage-2.  Costing is phase-local and never uses this to hide
+    // serial init/tail/finalize work behind another phase.
+    bool overlap_granted = false;
+
+    bool streamed() const { return feasible && axis != 0; }
+};
 
 // ============================================================================
 // Derived cube schedule plan
@@ -448,6 +472,94 @@ struct CubeSchedulePlan {
 };
 
 // ============================================================================
+// Derived mixed cube/vector schedule plan
+// ============================================================================
+
+// One logical 910B mixed group contains one cube core and two vector cores.
+// Same-engine connected ops form stages; every edge between unlike stages is a
+// GM FIFO transfer because 910B has no direct UB<->Mat/L1 path.
+enum class MixedEngine { Cube, Vector };
+
+enum class MixedPipelineMode {
+    Serial,
+    OneWay,
+    SingleRoundTripSkew,
+    MultiRoundTripSequential
+};
+
+enum class MixedPipelineAxis {
+    SpatialRegion,
+    VectorWidthChunk,
+    VectorHeightChunk,
+    AttentionKeyChunk
+};
+
+struct MixedStageTopology {
+    MixedEngine engine = MixedEngine::Vector;
+    std::vector<size_t> ops;
+};
+
+struct MixedTransferTopology {
+    size_t tensor = std::numeric_limits<size_t>::max();
+    size_t producer_stage = std::numeric_limits<size_t>::max();
+    size_t consumer_stage = std::numeric_limits<size_t>::max();
+    MixedEngine producer_engine = MixedEngine::Vector;
+    MixedEngine consumer_engine = MixedEngine::Vector;
+};
+
+// Candidate-invariant portion of a mixed schedule. It is built once by create;
+// hot candidates read the owning cost model directly, while an explicitly
+// requested final plan receives a shared owner. CostResult does not retain it.
+struct MixedScheduleTopology {
+    std::vector<MixedStageTopology> stages;
+    std::vector<MixedTransferTopology> transfers;
+    int max_alternations = 0;
+    bool output_is_cube = false;
+    bool output_engines_uniform = true;
+    bool sink_runs_early_stage = false;
+    MixedPipelineMode mode = MixedPipelineMode::Serial;
+    bool emit_compatible = false;
+};
+
+struct MixedPipelineLoopPlan {
+    MixedPipelineAxis axis = MixedPipelineAxis::SpatialRegion;
+    int64_t extent = 0;
+    int64_t chunk = 1;
+    int64_t items_per_spatial_tile = 1;
+    int64_t work_items = 0;
+    int64_t active_groups = 0;
+    int64_t min_trips_per_group = 0;
+    int64_t max_trips_per_group = 0;
+    int pipeline_stages = 1;
+    int64_t requested_skew_depth = 0;
+};
+
+// Solver-owned cross-engine algorithm for one fixed mixed candidate. The hot
+// path constructs only its scalar fields for costing; final/forced consumers
+// re-derive it once and attach the immutable topology, like the homogeneous
+// vector and cube plans.
+struct MixedSchedulePlan {
+    bool feasible = false;
+    bool emit_compatible = false;
+    TileConfig config;
+    AxisPartition m_partition;
+    AxisPartition n_partition;
+    int64_t spatial_tiles = 0;
+    int64_t split_k = 1;
+    int64_t work_units = 0;
+    int64_t group_capacity = 0;
+    MixedPipelineMode mode = MixedPipelineMode::Serial;
+    MixedPipelineLoopPlan loop;
+    // Kept separate during migration: the first bit records what the legacy
+    // scalar cost grants, while the second mirrors what the existing PyPTO
+    // pipeline passes can actually construct for this exact topology/loop.
+    bool model_overlap_granted = false;
+    bool overlap_implementable = false;
+    bool pipeline_fill_absorbed = false;
+    std::shared_ptr<const MixedScheduleTopology> topology;
+};
+
+// ============================================================================
 // Cost evaluation result
 // ============================================================================
 
@@ -473,10 +585,9 @@ struct CostResult {
                                  // Perf-sim-driven (pto-isa gml1_decision); device eval pending.
     bool pipeline_fill_absorbed = false;  // MIXED kernels only: is the cube||vector fill/drain
                                  // ACTUALLY absorbed into the max for THIS config. true iff the
-                                 // shape is 3-stage (sink unit runs an earlier stage from t=0:
-                                 // v->c->v, c->v->c) AND num_tiles >= 2 (a single tile has no
-                                 // successor to skew against, so it pays the cross-term even for
-                                 // a 3-stage shape). Grounded by mixed_tile_study's shape sweep.
+                                 // topology is an exact replayable 3-stage chain (v->c->v or
+                                 // c->v->c), the sink unit runs an early stage, and num_tiles>=2.
+                                 // Multi-message/round-trip plans are serial and never absorb it.
     bool uses_model_ahead_split_k = false;  // this config's parallel_split > 1 came from the
                                  // model-ahead split-K path (Problem::allow_model_ahead_split_k;
                                  // base lone-matmul or mixed cube-sink) — NOT yet emittable.

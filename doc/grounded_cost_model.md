@@ -281,6 +281,13 @@ input phase masks price stats-only, apply-only, and shared inputs separately (in
 broadcast chunks). `CostResult` retains only cost/config metadata; AutoFuse re-derives and consumes
 the same plan for the final or explicitly forced configuration.
 
+**Logical-region identity (A1/G5).** `parts_m * parts_n` is both the solver work-unit and SPMD-block
+count. Candidate generation may use the DMA granule to bound useful counts, but
+`VectorStreamPlan::{m,n}_partition` distributes the selected count over elements. `tile_h/tile_w`
+are maximum logical extents; `free_tile_alloc` is independent UB padding. Pointwise strips and
+reduction chunks stay inside a region/task. A “wave” is only the `ceil(work_units/cores)` queue
+makespan; neither plan nor emitter invents affinities or a second launch-block count.
+
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction
 (softmax: reductions feed a pointwise `div`, output full `[H,W]`) is tiled like
@@ -289,15 +296,13 @@ fills the cores by the fine sub-16 row tiling of §4.
 
 ---
 
-## 8. The mixed roofline — `Ascend910BMixed::compute_cost`
+## 8. The mixed roofline — `MixedSchedulePlan` / `compute_mixed_cost`
 
-A **mixed** subgraph fuses cube (matmul) and vector (pointwise/reduction) ops into one
-kernel. On the 910B there is **no direct Acc→Vec pipe** — the cube↔vector handoff
-round-trips **GM** (`ExpandMixedKernel` splits the kernel into AIC + AIV functions joined
-by a GM-backed `tpush`/`tpop` FIFO; `SkewCrossCorePipeline` software-pipelines them). So the
-two units run **concurrently**, overlapping compute with each other and with the GM traffic.
-Admissible only when the model opts in (`allow_mixed` = `Ascend910BMixed`); the base model
-routes a cube↔vector group as two separate kernels.
+A **mixed** subgraph fuses cube (matmul) and vector (pointwise/reduction) ops into one kernel. On the
+910B there is **no direct Acc→Vec pipe**: the handoff round-trips **GM**. `ExpandMixedKernel` splits
+the kernel into AIC/AIV functions joined by a GM-backed `tpush`/`tpop` FIFO, and
+`SkewCrossCorePipeline` pipelines them. Research opts in; production defaults
+`Problem::fuse_cube_vector` off.
 
 ```
 cube_stage = makespan( max(cube_mac,cube_extract) )       # AIC busiest-core wall — LPT grid / wave uniform (§5)
@@ -309,6 +314,7 @@ one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpC
                      vec_stage  + one_cube_tile,           # consumer-bound → + one producer fill
                      ddr_lat )
 3-stage: wall = max( cube_stage, vec_stage, ddr_lat )     # fill absorbed (output unit busy from t=0)
+serial:  wall = max( cube_stage + vec_stage, ddr_lat )    # unsupported FIFO topology; no skewed max
 
 lat       = wall + rounds · kernel_fill_cost              # per-LAUNCH fill — added to BOTH shapes
 rounds    = ceil(num_tiles / num_cube_cores)              # unit-rounds over the grid
@@ -318,45 +324,31 @@ eff_units = min(num_tiles, num_cube_cores)                # atomic resource = 1 
 Grounded by pto-isa **`mixed_tile_study`** (7 experiments; the study is the *evidence*, this
 section the *model*).
 
-**Overlap `max` — real and near-universal.** The cube and vector stages overlap (the
-producer skew), so the wall is a `max`, not a sum. **Every single-round-trip shape overlaps**:
-`c→v` (epilogue), `v→c` (prologue), `v→c→v`, `c→v→c` (flash-decode — #1900's depth-2 per-stage
-buffers let its two cube matmuls pipeline). A `max` is wrong only for a genuine cross-tile
-**carry** or a **multi**-round-trip loop (the skew demotes those to Sequential = the sum, and
-worse). The **multi-round-trip** case is excluded at admission — `create()` rejects a group
-whose cube↔vector alternation depth exceeds 2 (the exact dual of the emit's `num_tpush!=1`
-demote), so it never reaches this cost. The **tile-carry** case needs no separate guard: a
-cross-tile reduction carry is prevented by the reduced-axis **pinning** in the tiling (§6) — the
-mixed grid pins it (`parts_n=1`/`parts_m=1`) in **both** its cube- and vector-led branches, so a
-**mid-kernel** reduction stays resident on one unit and, when its coupled band overflows UB,
-**streams online** (fused flash attention `QK→softmax`; priced by §7's Fix-2 surcharge on the
-pooled `vec_stage`) — a matmul's own contraction rides a *separate* axis, chosen by the tiling. A
-split-K merge is instead priced as atomic-add traffic, so the `max` is only ever applied to
-genuinely skewable groups. `vec_stage` pools
-**all** Pointwise/Reduction ops (a `v→c→v`'s prologue *and* epilogue run on the same AIV pool).
+**Overlap `max` — real only for the recorded loop.** Producer skew makes the wall a `max`, not a sum,
+for exact `c→v`, `v→c`, `v→c→v`, and `c→v→c` chains (#1900's depth-2 buffers pipeline the two cube
+matmuls). A cross-tile carry or multi-round-trip FIFO demotes to Sequential. `create()` caches
+maximal same-engine stages and GM transfers once; one-way/three-stage chains are emit-compatible,
+while compiler mode rejects serial multi-message/`c→v→c→v` topologies retained for analytic use.
+Reduced-axis pinning (`parts_n=1`/`parts_m=1`) prevents a cross-tile reduction carry in either grid
+branch. A mid-kernel reduction stays on one unit and streams online if its band exceeds UB (fused
+`QK→softmax`); a matmul contraction uses a separate tiling axis. Split-K is atomic-add traffic, so
+the `max` applies only to skewable groups. `vec_stage` pools every vector op, including both sides
+of `v→c→v`.
 
-**The symmetric fill (grounded: shape sweep `mixed_vcv`/`vc`/`cvc`).** A 2-stage wall is the
-**symmetric cross-term** `max(cube_stage + one_vec_tile, vec_stage + one_cube_tile)`: the
-bottleneck unit runs its full stage plus **one tile of the other** — the un-overlapped fill
-(the output unit's first-tile wait) or drain (the last tile after the producer). Matches the
-sim to ~1 cycle (`v→c`) / ~2.7% (`c→v`). Because it lives *inside* the `max`, the fill is
-**absorbed** when DDR-bound or when the other unit dominates — so an imbalanced fusion (matmul
-+ tiny epilogue) pays only one **tiny** non-bottleneck tile, never a full cube tile. A
-**3-stage** kernel (`v→c→v`, `c→v→c`) has the output unit already running an earlier stage —
-busy from `t=0` — so the fill is **0** (plain `max`). Detection is **structural**, not a count:
-the fill is absorbed iff the sink unit (the boundary output's producing unit, `is_mm_out`) has
-an *early-stage* op whose input cone is same-unit + boundary — independent of the opposite unit
-(a `v→c→v` prologue, a `c→v→c` first matmul). Counting sink-unit ops is wrong: a same-unit tail
-(`c→v→v`) has >1 sink op yet still idles at `t=0`, so it pays the 2-stage fill.
+**The symmetric fill (grounded: `mixed_vcv`/`vc`/`cvc`).** A 2-stage wall uses
+`max(cube_stage + one_vec_tile, vec_stage + one_cube_tile)`: the bottleneck runs its full stage plus
+one opposite-unit tile for the unoverlapped fill/drain. It matches simulation to ~1 cycle (`v→c`)
+and ~2.7% (`c→v`). Inside the `max`, this fill is absorbed when DDR or the other unit dominates, so
+an imbalanced fusion pays only one tiny non-bottleneck tile. In `v→c→v`/`c→v→c`, the output unit is
+busy from `t=0`, making fill zero. Detection is structural: the sink unit must have an early-stage
+op independent of the opposite unit. Counting sink-unit ops is wrong: `c→v→v` still idles initially.
 
-Absorption additionally requires **`num_tiles >= 2`**: a single tile has no second tile to skew
-against (the sweep's `NTILES=1` row measures `overlap_factor 0.00`), so a 3-stage kernel there
-takes the cross-term too — which at one tile collapses to the sequential sum `cube_stage +
-vec_stage`. This matters for the low-batch flash-decode corner (whole output as one tile), which
-the plain `max` would otherwise credit full overlap the hardware runs serially. *Mid-band
-caveat:* `one_*_tile` does not shrink while `rounds == 1`, so partial overlap between 2 and
-`num_cube_cores` tiles is slightly over-credited when compute-bound — a bounded level-1
-imprecision; only the unambiguous, sim-contradicted `NTILES=1` case is corrected.
+Absorption also requires **`num_tiles >= 2`**: one tile has no successor to skew and the measured
+overlap factor is zero, so its cross-term becomes `cube_stage + vec_stage`. This matters for
+low-batch flash decode. *Mid-band caveat:* `one_*_tile` does not shrink while `rounds == 1`, slightly
+over-crediting compute-bound partial overlap. More fundamentally, total tiles are not per-group
+trips; `MixedSchedulePlan` must choose active groups and a real inner loop. Full attention needs a
+key-chunk axis distinct from its query grid.
 
 **Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
 pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed
@@ -494,6 +486,6 @@ Among equal-latency configs, lexicographic:
 | grid candidates (triples, granularity) | `Ascend910BCost::create` (`gen_grid`, `grid_gran_*`) |
 | cube cost and final schedule | `compute_cost` / `cube_schedule_plan` / `CubeSchedulePlan` |
 | vector roofline + double-buffer floor + reduced split | `compute_cost` (vector branch) |
-| mixed roofline (overlap max + symmetric fill + 4-port par ddr + cube-sink split-K) | `Ascend910BMixed::compute_cost` |
+| mixed roofline (plan-gated overlap/serial + fill + 4-port DDR + split-K) | `MixedSchedulePlan` / `compute_mixed_cost` |
 | feasibility | `derive_exec` / `cube_peak_l1` / `vector_stream` (mixed: both) |
 | enumeration + tiebreak | `Ascend910BCost::best_cost` |

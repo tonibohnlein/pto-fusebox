@@ -54,6 +54,30 @@ static json cube_k_loop_json(const CubeKLoopPlan& loop) {
             {"pipeline_stages", loop.pipeline_stages}};
 }
 
+static const char* mixed_engine_name(MixedEngine engine) {
+    return engine == MixedEngine::Cube ? "cube" : "vector";
+}
+
+static const char* mixed_pipeline_mode_name(MixedPipelineMode mode) {
+    switch (mode) {
+        case MixedPipelineMode::Serial: return "serial";
+        case MixedPipelineMode::OneWay: return "one_way";
+        case MixedPipelineMode::SingleRoundTripSkew: return "single_round_trip_skew";
+        case MixedPipelineMode::MultiRoundTripSequential: return "multi_round_trip_sequential";
+    }
+    return "unknown";
+}
+
+static const char* mixed_pipeline_axis_name(MixedPipelineAxis axis) {
+    switch (axis) {
+        case MixedPipelineAxis::SpatialRegion: return "spatial_region";
+        case MixedPipelineAxis::VectorWidthChunk: return "vector_width_chunk";
+        case MixedPipelineAxis::VectorHeightChunk: return "vector_height_chunk";
+        case MixedPipelineAxis::AttentionKeyChunk: return "attention_key_chunk";
+    }
+    return "unknown";
+}
+
 Problem read_problem(const std::string& filename) {
     std::ifstream f(filename);
     if (!f.is_open()) {
@@ -81,6 +105,11 @@ Problem read_problem(const std::string& filename) {
     }
 
     Problem p;
+#ifdef PYPTO_FUSE_CUBE_VECTOR
+    // Preserve the research executable's historical compile-time opt-in while
+    // the production solver uses the same policy as a runtime Problem field.
+    p.fuse_cube_vector = true;
+#endif
 
     // --- Tensors ---
     auto& widths  = j["widths"];
@@ -227,6 +256,13 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("require_uniform_cube_dag_grid")) {
       p.require_uniform_cube_dag_grid = j["require_uniform_cube_dag_grid"].get<bool>();
     }
+    if (j.contains("fuse_cube_vector")) {
+      p.fuse_cube_vector = j["fuse_cube_vector"].get<bool>();
+    }
+    if (j.contains("allow_model_ahead_mixed_multi_roundtrip")) {
+      p.allow_model_ahead_mixed_multi_roundtrip =
+          j["allow_model_ahead_mixed_multi_roundtrip"].get<bool>();
+    }
 
     // -------------------------------------------------------------------------
     // Precompute retainable_tensors.
@@ -270,6 +306,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
     j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
     j["vector_stream"]     = json::array();  // solver-owned vector UB sub-stream plan per step
     j["cube_schedule"]     = json::array();  // solver-owned cube grid/band/K-loop plan per step
+    j["mixed_schedule"]    = json::array();  // solver-owned cross-engine stage/FIFO/loop plan
     j["tensors_to_retain"] = json::array();
     j["subgraph_latencies"] = json::array();
 
@@ -285,11 +322,17 @@ void write_solution(const std::string& filename, const Solution& sol) {
                       cfg, sol.retained_entering(i), step.retain_these)
                 : VectorStreamPlan{};
         const CubeSchedulePlan cube_plan =
-            step.subgraph.has_matmul()
+            step.subgraph.has_matmul() && !step.subgraph.is_mixed()
                 ? step.subgraph.cube_schedule_plan(
                       cfg, sol.retained_entering(i), step.retain_these,
                       cost.parallel_split)
                 : CubeSchedulePlan{};
+        const MixedSchedulePlan mixed_plan =
+            step.subgraph.is_mixed()
+                ? step.subgraph.mixed_schedule_plan(
+                      cfg, sol.retained_entering(i), step.retain_these,
+                      cost.parallel_split)
+                : MixedSchedulePlan{};
 
         j["subgraphs"].push_back(step.subgraph.ops());
         j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
@@ -384,6 +427,47 @@ void write_solution(const std::string& filename, const Solution& sol) {
                                           {"matmuls", matmuls}});
         } else {
             j["cube_schedule"].push_back(nullptr);
+        }
+        if (mixed_plan.feasible && mixed_plan.topology) {
+            json stages = json::array();
+            for (const auto& stage : mixed_plan.topology->stages) {
+                stages.push_back({{"engine", mixed_engine_name(stage.engine)},
+                                  {"ops", stage.ops}});
+            }
+            json transfers = json::array();
+            for (const auto& transfer : mixed_plan.topology->transfers) {
+                transfers.push_back(
+                    {{"tensor", transfer.tensor},
+                     {"producer_stage", transfer.producer_stage},
+                     {"consumer_stage", transfer.consumer_stage},
+                     {"producer_engine", mixed_engine_name(transfer.producer_engine)},
+                     {"consumer_engine", mixed_engine_name(transfer.consumer_engine)}});
+            }
+            j["mixed_schedule"].push_back(
+                {{"emit_compatible", mixed_plan.emit_compatible},
+                 {"mode", mixed_pipeline_mode_name(mixed_plan.mode)},
+                 {"spatial_tiles", mixed_plan.spatial_tiles},
+                 {"split_k", mixed_plan.split_k},
+                 {"work_units", mixed_plan.work_units},
+                 {"group_capacity", mixed_plan.group_capacity},
+                 {"pipeline_axis", mixed_pipeline_axis_name(mixed_plan.loop.axis)},
+                 {"pipeline_extent", mixed_plan.loop.extent},
+                 {"pipeline_chunk", mixed_plan.loop.chunk},
+                 {"items_per_spatial_tile", mixed_plan.loop.items_per_spatial_tile},
+                 {"active_groups", mixed_plan.loop.active_groups},
+                 {"min_trips_per_group", mixed_plan.loop.min_trips_per_group},
+                 {"max_trips_per_group", mixed_plan.loop.max_trips_per_group},
+                 {"pipeline_stages", mixed_plan.loop.pipeline_stages},
+                 {"requested_skew_depth", mixed_plan.loop.requested_skew_depth},
+                 {"model_overlap_granted", mixed_plan.model_overlap_granted},
+                 {"overlap_implementable", mixed_plan.overlap_implementable},
+                 {"pipeline_fill_absorbed", mixed_plan.pipeline_fill_absorbed},
+                 {"max_alternations", mixed_plan.topology->max_alternations},
+                 {"output_engines_uniform", mixed_plan.topology->output_engines_uniform},
+                 {"stages", stages},
+                 {"transfers", transfers}});
+        } else {
+            j["mixed_schedule"].push_back(nullptr);
         }
         j["tensors_to_retain"].push_back(
             std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));

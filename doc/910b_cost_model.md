@@ -1,14 +1,13 @@
 # 910B cost model
 
-This document describes the level-1 scheduler for Ascend 910B. It partitions a tensor-op DAG into
-unit-homogeneous subgraphs, enumerates a spatial grid and optional cross-core split for each
-subgraph, and estimates one-kernel latency. AutoFuse then consumes a solver-owned schedule plan for
-the selected configuration. `grounded_cost_model.md` is the authority for pto-isa coefficients,
-wave/LPT makespans, vector phases, and mixed-unit cost.
+This document describes the level-1 scheduler for Ascend 910B. It partitions a tensor-op DAG,
+enumerates a spatial grid and optional cross-core split for each subgraph, and estimates one-kernel
+latency. AutoFuse then consumes a solver-owned schedule plan for the selected configuration.
+`grounded_cost_model.md` is the authority for coefficients, phase costs, and mixed-unit scheduling.
 
-A homogeneous subgraph is either pure cube (`MatMul`) or pure vector (pointwise/reduction). The base
-model does not fuse cube and vector operations into one kernel; `Ascend910BMixed` is a separate
-model.
+A homogeneous subgraph is either pure cube (`MatMul`) or pure vector (pointwise/reduction). This is
+the production default. `Problem::fuse_cube_vector` enables the same base model's mixed-plan path at
+runtime; the research `Ascend910BMixed` convenience opts in unconditionally.
 
 ---
 

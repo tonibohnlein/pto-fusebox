@@ -43,9 +43,8 @@ public:
   // Factory: returns nullopt if ops don't form a valid subgraph.
   //
   // allow_mixed relaxes unit-homogeneity to permit a fused CUBE+VECTOR group.
-  // The base model leaves it false (homogeneous); Ascend910BMixed passes true.
-  // It is the ONLY behavioural difference between the two models — the cost of a
-  // mixed group, when one is built, is the shared compute_cost mixed branch.
+  // Ascend910BMixed passes true; the production model can instead set
+  // Problem::fuse_cube_vector. Both reach the same mixed plan/cost branch.
   static std::optional<Ascend910BCost> create(const Problem &prob, const DAG &dag,
                                               std::vector<size_t> op_indices,
                                               bool allow_mixed = false);
@@ -66,6 +65,8 @@ public:
   int64_t output_height() const { return out_H_; }
 
   bool has_matmul() const { return has_matmul_; }
+  bool has_vector() const { return has_vector_; }
+  bool is_mixed() const { return has_matmul_ && has_vector_; }
 
   // Number of distinct role-signature entries for a tensor in this subgraph.
   // Returns 0 for non-boundary tensors. Multi-role tensors
@@ -127,6 +128,16 @@ public:
   // derivation once to obtain this full emit descriptor. `parallel_split` is the
   // CostResult::parallel_split selected for the candidate (1 = spatial only).
   CubeSchedulePlan cube_schedule_plan(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev = {},
+      const FlatSet<size_t> &retain_these = {},
+      int64_t parallel_split = 1) const;
+
+  // Solver-owned mixed algorithm for one fixed candidate. Candidate-invariant
+  // stage/transfer topology is shared from create(); only scalar grid and loop
+  // facts are derived here. CostResult remains compact and final/forced
+  // consumers re-run this method once for the selected configuration.
+  MixedSchedulePlan mixed_schedule_plan(
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev = {},
       const FlatSet<size_t> &retain_these = {},
@@ -201,6 +212,21 @@ public:
   // virtual destructor is needed; the implicit copy/move carry the vptr.
 
 protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
+  // Hot mixed candidate derivation. It leaves MixedSchedulePlan::topology empty
+  // so every enumerated configuration avoids a shared_ptr reference-count
+  // update; mixed_schedule_plan() attaches the owner only for an explicit
+  // final-plan request.
+  MixedSchedulePlan derive_mixed_schedule_plan(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these,
+      int64_t parallel_split) const;
+
+  CostResult compute_mixed_cost(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these) const;
+
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
   //   vector: tile + ephemerals fit UB (vec_capacity)
@@ -293,12 +319,15 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                               // has_matmul_ && has_vector_ ⇒ a MIXED kernel
                               // (allowed only when Problem::fuse_cube_vector).
   // Max cube↔vector unit ALTERNATIONS along any dependency path in the group.
-  // The mixed model's `max` overlap is the SKEWED cost, valid only for a single
-  // round-trip: depth ≤ 2 (the 4 canonical shapes c→v / v→c / v→c→v / c→v→c;
-  // #1900's depth-2 buffers cap the validated skew). Deeper multi-round-trips
-  // demote to Sequential, so create() REJECTS them (depth > 2) and compute_cost
-  // asserts the survivor is ≤ 2. 0 for a homogeneous group.
+  // The mixed model grants `max` overlap only for an exact one-way or single-
+  // round-trip topology. Deeper/multi-message FIFOs are represented and priced
+  // as a serial stage sum in analytic mode; compiler mode rejects them through
+  // Problem::allow_model_ahead_mixed_multi_roundtrip. 0 for a homogeneous group.
   int mixed_round_trip_depth_ = 0;
+  // Candidate-invariant same-engine components and cube/vector GM crossings.
+  // Hot candidates reference this owner without copying it; final plans attach
+  // it through shared ownership. Neither path rediscovers the stage DAG.
+  std::shared_ptr<const MixedScheduleTopology> mixed_topology_;
   // 910B reduction (vector): a Reduction couples its reduced axis (the whole
   // row/col must be present to reduce it), so the tile spans the FULL reduced
   // dim and only the non-reduced dim is tiled for spatial parallelism. The
@@ -486,12 +515,11 @@ static_assert(CostModel<Ascend910BCost>,
 // kernels (mixed groups), streaming the cube↔vector handoff through DDR so the
 // roundtrip latency is hidden behind the cube∥vector overlap.
 //
-// It differs from the homogeneous Ascend910BCost in exactly ONE thing:
-// admissibility. create() allows a cube+vector group instead of rejecting it.
-// Everything else — tiling, feasibility, and the cost of any given group
-// (including the mixed branch of compute_cost) — is inherited unchanged. The
-// base model is therefore left exactly as it is; selecting this model (via the
-// `Subgraph` alias in subgraph.h) is the compile-time opt-in to fusion.
+// It is the research convenience that always opts into mixed admissibility.
+// The production Ascend910BCost can select the same path at runtime through
+// Problem::fuse_cube_vector, so tiling, feasibility, plans, and costs have one
+// implementation. The `Subgraph` compile-time alias remains for the standalone
+// `mlsys_mixed` executable.
 // ============================================================================
 class Ascend910BMixed : public Ascend910BCost {
  public:
@@ -514,8 +542,8 @@ class Ascend910BMixed : public Ascend910BCost {
                           const FlatSet<size_t> &retain_these = {}) const override;
 
  private:
-  // Adds no state of its own — it is an Ascend910BCost built with mixed groups
-  // admitted, so it slices up from a fully-built base.
+  // Mixed state lives in the base so slicing a fully-built admitted model keeps
+  // the same candidate-invariant topology used by feasibility and costing.
   explicit Ascend910BMixed(Ascend910BCost base) : Ascend910BCost(std::move(base)) {}
 };
 

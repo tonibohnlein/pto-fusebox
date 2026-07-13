@@ -218,8 +218,8 @@ static void test_softmax_reduction_schema() {
     std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
-    CHECK_EQ("softmax: phase-roofline fused vector cost", fused, 22153.9, 0.5);
-    CHECK_EQ("softmax: phase-roofline cut vector cost", separate, 88309.8, 0.5);
+    CHECK_EQ("softmax: logical-grid phase-roofline fused vector cost", fused, 22208.7, 0.5);
+    CHECK_EQ("softmax: logical-grid phase-roofline cut vector cost", separate, 88371.3, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -244,7 +244,7 @@ static void test_R_reduction_split() {
     // so the sink reduction splits its reduced axis ACROSS cores to fill them.
     CHECK("R: few-row reduction split-fills the vector cores",
           r.cores_used == 48 && r.parallel_split > 1);
-    CHECK_EQ("R: phase-roofline few-row reduction cost", r.latency, 10093.3, 1.0);
+    CHECK_EQ("R: logical-grid phase-roofline few-row reduction cost", r.latency, 10097.6, 1.0);
 }
 
 // --- E: matmul tile shape — balanced (2D) reloads less than skewed (1D) ------
@@ -905,6 +905,15 @@ static void test_cube_vector_fusion() {
     CHECK("FUSE: Ascend910BMixed builds the mixed group", (bool)fused);
     if (!fused) return;
     auto fr = fused->best_cost();
+    p.fuse_cube_vector = true;
+    auto runtime_fused = Subgraph::create(p, dag, {0, 1});
+    CHECK("FUSE: runtime policy admits mixed groups in the production model",
+          (bool)runtime_fused);
+    if (runtime_fused) {
+        CHECK_EQ("FUSE: runtime and dedicated mixed models have identical cost",
+                 runtime_fused->best_cost().latency, fr.latency);
+    }
+    p.fuse_cube_vector = false;
     double f = fr.latency;
     // Pure groups: identical cost under either model (the mixed branch is unreached).
     double mm = Subgraph::create(p, dag, {0})->best_cost().latency;
@@ -1097,16 +1106,129 @@ static void test_mixed_pipeline_stages() {
         CHECK("MIXSTAGE: c->v->c absorbs fill (first matmul runs at t=0)",
               fr.pipeline_fill_absorbed);
     }
-    // c->v->c->v : a depth-3 multi-round-trip. The `max` overlap is the SKEWED cost,
-    // valid only for a single round-trip (depth <= 2); a depth-3 chain demotes to
-    // sequential, so the admission gate REJECTS it (create -> nullopt -> infeasible)
-    // and the partitioner cuts it into separate kernels. Guards the skewability gate.
+    // c->v->c->v : a depth-3 multi-round-trip. Analytic mode keeps the topology
+    // but prices it sequentially; buildable mode rejects it until whole-FIFO
+    // skew exists.
     {
-        auto fr = absorbed({sq, sq, sq, sq, sq, sq, sq},
-                           {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}},
-                            {OT::MatMul, {3, 4}, {5}}, {OT::Pointwise, {5}, {6}}},
-                           {0, 1, 2, 3});
-        CHECK("MIXSTAGE: c->v->c->v (depth 3) rejected as non-skewable", !fr.feasible);
+        Problem p;
+        p.tensors = {sq, sq, sq, sq, sq, sq, sq};
+        p.ops = {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}},
+                 {OT::MatMul, {3, 4}, {5}}, {OT::Pointwise, {5}, {6}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto analytic = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+        CHECK("MIXSTAGE: analytic c->v->c->v retains a serial descriptor", (bool)analytic);
+        if (analytic) {
+            const CostResult cost = analytic->best_cost();
+            const MixedSchedulePlan plan =
+                analytic->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+            CHECK("MIXSTAGE: depth-3 plan is finite but receives no skew overlap",
+                  cost.feasible && plan.feasible &&
+                      plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
+                      !plan.emit_compatible && !plan.model_overlap_granted &&
+                      !plan.overlap_implementable && !cost.pipeline_fill_absorbed);
+        }
+        p.allow_model_ahead_mixed_multi_roundtrip = false;
+        CHECK("MIXSTAGE: buildable c->v->c->v is cut until whole-FIFO skew",
+              !Ascend910BMixed::create(p, dag, {0, 1, 2, 3}));
+    }
+}
+
+// MixedSchedulePlan is the cost/emit handoff: same-engine stage topology is
+// candidate-invariant, while the fixed candidate supplies the 24-group mapping
+// and actual per-group pipeline trips. In particular, two GLOBAL tiles assigned
+// one-per-group do not form a two-item pipeline on either group. Keep the legacy
+// model grant visible until the next increment replaces it with the realizable
+// serial-vs-pipelined group-count choice.
+static void test_mixed_schedule_plan() {
+    std::cout << "[MIXPLAN] mixed stage topology and per-group pipeline trips\n";
+    const Tensor sq{128, 128};
+    using OT = OpType;
+
+    // C->V->V has two stages, not three: the connected vector tail is one stage
+    // and only the cube output crosses GM.
+    {
+        Problem p;
+        p.tensors = {sq, sq, sq, sq, sq};
+        p.ops = {{OT::MatMul, {0, 1}, {2}},
+                 {OT::Pointwise, {2}, {3}},
+                 {OT::Pointwise, {3}, {4}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
+        CHECK("MIXPLAN: C->V->V group builds", (bool)mixed);
+        auto two_tiles = mixed->mixed_schedule_plan(TileConfig{128, 64, 128});
+        CHECK("MIXPLAN: C->V->V is one-way with two same-engine stages",
+              two_tiles.feasible && two_tiles.mode == MixedPipelineMode::OneWay &&
+                  two_tiles.topology && two_tiles.topology->stages.size() == 2 &&
+                  two_tiles.topology->transfers.size() == 1 &&
+                  two_tiles.topology->stages[0].ops == std::vector<size_t>({0}) &&
+                  two_tiles.topology->stages[1].ops == std::vector<size_t>({1, 2}));
+        CHECK("MIXPLAN: two global tiles occupy two groups with one trip each",
+              two_tiles.spatial_tiles == 2 &&
+                  two_tiles.loop.axis == MixedPipelineAxis::SpatialRegion &&
+                  two_tiles.loop.items_per_spatial_tile == 1 &&
+                  two_tiles.loop.active_groups == 2 &&
+                  two_tiles.loop.min_trips_per_group == 1 &&
+                  two_tiles.loop.max_trips_per_group == 1);
+        CHECK("MIXPLAN: legacy overlap grant is distinguished from realizable overlap",
+              two_tiles.model_overlap_granted && !two_tiles.overlap_implementable);
+
+        auto forty_eight_tiles =
+            mixed->mixed_schedule_plan(TileConfig{16, 32, 128, 6, 8, 1});
+        CHECK("MIXPLAN: 48 items give every one of 24 groups two trips",
+              forty_eight_tiles.feasible && forty_eight_tiles.spatial_tiles == 48 &&
+                  forty_eight_tiles.loop.active_groups == 24 &&
+                  forty_eight_tiles.loop.min_trips_per_group == 2 &&
+                  forty_eight_tiles.loop.max_trips_per_group == 2 &&
+                  forty_eight_tiles.overlap_implementable);
+    }
+
+    // V->C->V is the exact single-round-trip shape recognized by
+    // SkewCrossCorePipeline: one transfer in each direction and an early vector
+    // stage on the sink unit.
+    {
+        Problem p;
+        p.tensors = {sq, sq, sq, sq, sq};
+        p.ops = {{OT::Pointwise, {0}, {1}},
+                 {OT::MatMul, {1, 2}, {3}},
+                 {OT::Pointwise, {3}, {4}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
+        auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+        CHECK("MIXPLAN: V->C->V records the exact skew topology",
+              plan.feasible && plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
+                  plan.emit_compatible && plan.topology->stages.size() == 3 &&
+                  plan.topology->transfers.size() == 2 &&
+                  plan.topology->sink_runs_early_stage &&
+                  !plan.pipeline_fill_absorbed);
+    }
+
+    // Alternation depth alone is insufficient: two vector branches create two
+    // pushes and two pops. The current pass demotes that FIFO pattern, so the
+    // plan must not claim it is replayable even though max depth is only two.
+    {
+        Problem p;
+        p.tensors = {sq, sq, sq, sq, sq, sq};
+        p.ops = {{OT::MatMul, {0, 1}, {2}},
+                 {OT::Pointwise, {2}, {3}},
+                 {OT::Pointwise, {2}, {4}},
+                 {OT::MatMul, {3, 4}, {5}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+        CHECK("MIXPLAN: branching depth-2 mixed group builds for analytic costing", (bool)mixed);
+        auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+        CHECK("MIXPLAN: multiple FIFO messages are classified sequential/incompatible",
+              plan.feasible && plan.topology->max_alternations == 2 &&
+                  plan.topology->transfers.size() == 4 &&
+                  plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
+                  !plan.emit_compatible && !plan.overlap_implementable);
     }
 }
 
@@ -1264,12 +1386,18 @@ static void test_mixed_grid_makespan_multimatmul() {
 static void test_mixed_flash_attention() {
     std::cout << "[MIXFA] fused QK->softmax pins the reduced axis + streams online (flash attention)\n";
     Problem p; int64_t d = 64, S = 2048, B = 128;   // Q@K^T -> softmax(over keys) ; d=64, S_kv=2048
-    p.tensors = {{d, B}, {S, d}, {S, B}, {1, B}, {S, B}, {1, B}, {S, B}, {d, S}, {d, B}};
+    p.tensors = {{d, B}, {S, d}, {S, B}, {1, B}, {S, B}, {1, B}, {S, B},
+                 {d, S}, {d, B}, {d, B}};
     p.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::Reduction, {2}, {3}},
              {OpType::Pointwise, {2, 3}, {4}}, {OpType::Reduction, {4}, {5}},
-             {OpType::Pointwise, {4, 5}, {6}}, {OpType::MatMul, {6, 7}, {8}}};
+             {OpType::Pointwise, {4, 5}, {6}}, {OpType::MatMul, {6, 7}, {8}},
+             {OpType::Pointwise, {8}, {9}}};
     p.fast_memory_capacity = 1LL << 30;
     set_910b(p);
+    p.allow_model_ahead_multi_reduction_stream = false;
+    p.p4_patterns.push_back(
+        {P4PatternKind::SoftmaxFlash, FlatSet<size_t>{1, 2, 3, 4},
+         FlatSet<size_t>{1, 3}});
     DAG dag = DAG::build(p);
     auto sg = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4});  // QK -> softmax (fused mixed)
     CHECK("MIXFA: fused QK->softmax is admissible (mixed cube+vector)", (bool)sg);
@@ -1284,6 +1412,52 @@ static void test_mixed_flash_attention() {
     CHECK("MIXFA: feasibility comes from online streaming (scores overflow UB)",
           sg->vector_peak_ub(fr.config, {}, {}) > p.vec_capacity
               && sg->vector_stream(fr.config, {}, {}).chunk > 0);
+    const auto stream_plan = sg->vector_stream_plan(fr.config, {}, {});
+    CHECK("MIXFA: exact embedded vector stage reuses the P4 softmax descriptor",
+          stream_plan.feasible && stream_plan.kind == VectorStreamKind::SoftmaxFlash);
+
+    // The vector-stage plan is a view of scores/stat/apply only. Changing the
+    // QK contraction (and therefore the cube-only Q/K operand extents) must not
+    // change its row geometry, UB peak, or online chunk.
+    Problem wide_k = p;
+    wide_k.tensors[0].width = 8192;   // Q [B, d]
+    wide_k.tensors[1].height = 8192;  // K^T [d, S]
+    DAG wide_k_dag = DAG::build(wide_k);
+    auto wide_k_sg = Ascend910BMixed::create(
+        wide_k, wide_k_dag, {0, 1, 2, 3, 4});
+    CHECK("MIXFA: wider cube contraction keeps the mixed group admissible",
+          (bool)wide_k_sg);
+    if (wide_k_sg) {
+        const auto wide_k_stream =
+            wide_k_sg->vector_stream_plan(fr.config, {}, {});
+        CHECK("MIXFA: cube-only operand shapes do not leak into vector stream geometry",
+              wide_k_stream.feasible &&
+                  wide_k_stream.tile_w == stream_plan.tile_w &&
+                  wide_k_stream.tile_h == stream_plan.tile_h &&
+                  wide_k_stream.extent == stream_plan.extent &&
+                  wide_k_stream.chunk == stream_plan.chunk &&
+                  wide_k_stream.full_peak_ub_bytes ==
+                      stream_plan.full_peak_ub_bytes);
+    }
+
+    // Full attention-shaped C->V->C->V is retained only in analytic mode. The
+    // current cross-core pass cannot skew all three FIFO crossings together, so
+    // the mixed plan is explicitly sequential rather than receiving a max.
+    p.allow_model_ahead_multi_reduction_stream = true;
+    auto full = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4, 5, 6});
+    CHECK("MIXFA: full C->V->C->V topology is representable in analytic mode", (bool)full);
+    if (full) {
+        const MixedSchedulePlan full_plan =
+            full->mixed_schedule_plan(TileConfig{d, B, S}, {}, {}, 1);
+        CHECK("MIXFA: full attention is four stages/three transfers and serial today",
+              full_plan.topology &&
+                  full_plan.topology->stages.size() == 4 &&
+                  full_plan.topology->transfers.size() == 3 &&
+                  full_plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
+                  !full_plan.model_overlap_granted && !full_plan.overlap_implementable);
+        CHECK("MIXFA: current unified spatial grid cannot yet express the key-chunk loop",
+              !full_plan.feasible && !full->best_cost().feasible);
+    }
 }
 
 // Split-K (base lone matmul and mixed cube-sink) is MODEL-AHEAD of the AutoFuse emit. The
@@ -1923,7 +2097,7 @@ static void test_streamed_reduction_sink_no_split() {
     auto r = sg->best_cost();
     std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
               << " lat=" << r.latency << "\n";
-    CHECK_EQ("STREAMSPLIT: phase-roofline calibrated latency", r.latency, 59469.3, 1.0);
+    CHECK_EQ("STREAMSPLIT: logical-grid phase-roofline latency", r.latency, 60614.3, 1.0);
     // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
     CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
           r.parallel_split == 1);
@@ -2038,6 +2212,33 @@ static void test_g1_multi_reduction_stream_decline() {
           stream.stats.pipeline_stages == 2 && stream.apply.pipeline_stages == 2);
     CHECK("P4PLAN: stage-2 chunk peak includes both transient pipeline stages",
           stream.stream_band_count == 2 * 4 + 6 && stream.chunk_peak_ub_bytes <= p.vec_capacity);
+    TileConfig twelve_regions{32768, 11, 1};
+    twelve_regions.parts_m = 12;
+    twelve_regions.parts_n = 1;
+    twelve_regions.split_k = 1;
+    const auto region_plan = exact_softmax_sg->vector_stream_plan(twelve_regions);
+    const auto region_cost = exact_softmax_sg->compute_cost(twelve_regions);
+    CHECK("P4GRID: logical region count is independent of DMA-padded free tile",
+          region_plan.feasible && region_plan.work_units == 12 &&
+              region_plan.m_partition.parts == 12 && region_plan.m_partition.big == 11 &&
+              region_plan.m_partition.small == 10 && region_plan.m_partition.num_big == 8 &&
+              region_plan.free_tile == 11 && region_plan.free_tile_alloc == 16 &&
+              region_cost.feasible && region_cost.num_spatial_tiles == 12);
+    Problem rank = mk_softmax(8192, 128);
+    rank.allow_model_ahead_multi_reduction_stream = false;
+    rank.p4_patterns.push_back({P4PatternKind::SoftmaxFlash, FlatSet<size_t>{0, 1, 2, 3}});
+    DAG rank_dag = DAG::build(rank);
+    auto rank_sg = Subgraph::create(rank, rank_dag, {0, 1, 2, 3});
+    TileConfig h11{8192, 11, 1};
+    h11.parts_m = 12;
+    h11.parts_n = 1;
+    h11.split_k = 1;
+    TileConfig h8{8192, 8, 1};
+    h8.parts_m = 16;
+    h8.parts_n = 1;
+    h8.split_k = 1;
+    CHECK("P4GRID: padded h=11 no longer outranks the device-best h=8 grid",
+          rank_sg->compute_cost(h8).latency < rank_sg->compute_cost(h11).latency);
     CHECK("P4: a different subgroup does not inherit function-level permission",
           !std::isfinite(Subgraph::create(p, dag, {0, 1, 2})->best_cost().latency));
 
@@ -2244,7 +2445,13 @@ static void test_model_stages() {
           std::isfinite(pv.latency)
               && pv.latency + 1e-6 >= hbm_read_floor(p, B, d, S, p.tensors[6].dtype, p.tensors[7].dtype)
               && pv.cores_used > 1 && pv.cores_used <= 24);
-        if (B >= 128) C("softmax fills 48 vector cores (enough queries)", sm.cores_used == 48);
+        if (B >= 128)
+            std::cout << "    ATTN B" << B << " softmax regions=" << sm.num_spatial_tiles
+                      << " cores=" << sm.cores_used << " tile=" << sm.config.w << "x"
+                      << sm.config.h << "\n";
+        if (B >= 128)
+            C("softmax uses one faithful logical-region wave",
+              sm.cores_used == sm.num_spatial_tiles && sm.cores_used > 1 && sm.cores_used <= 48);
     }
 }
 
@@ -2517,7 +2724,7 @@ static void test_vector_stream_short_loop_serializes() {
 // emit-only schedule descriptors out of it; they are reconstructed for winners.
 static void test_cost_result_cache_footprint() {
     std::cout << "[CACHESIZE] local-search CostResult stays compact\n";
-    CHECK("CACHESIZE: CostResult embeds neither VectorStreamPlan nor CubeSchedulePlan",
+    CHECK("CACHESIZE: CostResult embeds no vector/cube/mixed schedule plan",
           sizeof(CostResult) <= 128);
 }
 
@@ -2527,6 +2734,7 @@ int main() {
     test_mixed_unit_tiling();
     test_mixed_mm_pw_variants();
     test_mixed_pipeline_stages();
+    test_mixed_schedule_plan();
     test_mixed_sink_split_k();
     test_mixed_single_tile_no_skew();
     test_mixed_grid_makespan();
