@@ -12,6 +12,7 @@
 //   D  matmul->relu (mixed)    — cube->vector handoff costs DDR, not free (RED)
 //   softmax                    — reduction-chain schema; cost model is next (GREEN schema)
 
+#include "core/ascend910b_cost.h"
 #include "core/dag.h"
 #include "core/subgraph.h"
 #include "core/subgraph_structure.h"
@@ -75,6 +76,37 @@ static void set_910b(Problem& p, int64_t cube_cost = 1) {
     p.vec_op_tail = 18.0;      // per-op drain cycles
     p.vec_slope_pw = 2.0;      // elementwise cycles/repeat (vmul-ish)
     p.vec_slope_reduce = 14.0; // reduction cycles/repeat (vreducev2)
+}
+
+static void test_grounded_row_reduction_formulas() {
+    std::cout << "[G9] PTO-ISA row-reduction fit formulas preserve row work\n";
+    CHECK_EQ("G9: FP32 TROWSUM 64x64 matches PTO-ISA fit anchor",
+             GroundedRowReductionCycles(VectorPrimitiveFamily::RowSum,
+                                        DType::FP32, 64, 64),
+             492.0);
+    CHECK_EQ("G9: FP32 TROWMAX 64x64 matches PTO-ISA fit anchor",
+             GroundedRowReductionCycles(VectorPrimitiveFamily::RowExtrema,
+                                        DType::FP32, 64, 64),
+             480.0);
+    CHECK_EQ("G9: FP16 TROWSUM 64x128 matches PTO-ISA fit anchor",
+             GroundedRowReductionCycles(VectorPrimitiveFamily::RowSum,
+                                        DType::FP16, 64, 128),
+             495.0);
+    const double one_row = GroundedRowReductionCycles(
+        VectorPrimitiveFamily::RowSum, DType::FP32, 1, 64);
+    const double many_rows = GroundedRowReductionCycles(
+        VectorPrimitiveFamily::RowSum, DType::FP32, 64, 64);
+    CHECK("G9: count-mode reduction work grows with valid rows on hardware",
+          one_row == 51.0 && many_rows > 9.0 * one_row);
+    const double interpolated = GroundedRowReductionCycles(
+        VectorPrimitiveFamily::RowSum, DType::FP32, 64, 80);
+    const double upper = GroundedRowReductionCycles(
+        VectorPrimitiveFamily::RowSum, DType::FP32, 64, 96);
+    CHECK("G9: an AutoFuse-only width is bounded by adjacent grounded anchors",
+          interpolated > many_rows && interpolated < upper);
+    CHECK("G9: unsupported BF16 stays on the explicit structural fallback",
+          GroundedRowReductionCycles(VectorPrimitiveFamily::RowSum,
+                                     DType::BF16, 64, 64) < 0.0);
 }
 
 // HBM aggregate read floor (cycles) for one matmul C[N,M]=A[K,M]·B[N,K]: NO tiling can
@@ -218,8 +250,8 @@ static void test_softmax_reduction_schema() {
     std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
-    CHECK_EQ("softmax: logical-grid phase-roofline fused vector cost", fused, 22208.7, 0.5);
-    CHECK_EQ("softmax: logical-grid phase-roofline cut vector cost", separate, 88371.3, 0.5);
+    CHECK_EQ("softmax: logical-grid phase-roofline fused vector cost", fused, 22153.9, 0.5);
+    CHECK_EQ("softmax: logical-grid phase-roofline cut vector cost", separate, 88309.8, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -2097,7 +2129,7 @@ static void test_streamed_reduction_sink_no_split() {
     auto r = sg->best_cost();
     std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
               << " lat=" << r.latency << "\n";
-    CHECK_EQ("STREAMSPLIT: logical-grid phase-roofline latency", r.latency, 60614.3, 1.0);
+    CHECK_EQ("STREAMSPLIT: logical-grid phase-roofline latency", r.latency, 59122.1, 1.0);
     // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
     CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
           r.parallel_split == 1);
@@ -2147,6 +2179,69 @@ static Problem mk_softmax(int64_t W, int64_t H) {
     p.fast_memory_capacity = 1 << 24;
  set_910b(p);
     return p;
+}
+
+static Problem mk_grounded_p4_softmax(int64_t W, int64_t H) {
+    Problem p;
+    p.tensors = {{W, H}, {1, H}, {W, H}, {W, H}, {1, H}, {W, H}};
+    auto op = [](OpType type, std::vector<size_t> inputs, size_t output,
+                 VectorPrimitiveFamily family, VectorOpGeometry geometry) {
+        Op value;
+        value.type = type;
+        value.inputs = std::move(inputs);
+        value.outputs = {output};
+        value.vector_primitive = family;
+        value.vector_geometry = geometry;
+        return value;
+    };
+    p.ops = {
+        op(OpType::Reduction, {0}, 1, VectorPrimitiveFamily::RowExtrema,
+           VectorOpGeometry::Flat),
+        op(OpType::Pointwise, {0, 1}, 2, VectorPrimitiveFamily::Add,
+           VectorOpGeometry::RowExpand),
+        op(OpType::Pointwise, {2}, 3, VectorPrimitiveFamily::Exp,
+           VectorOpGeometry::Flat),
+        op(OpType::Reduction, {3}, 4, VectorPrimitiveFamily::RowSum,
+           VectorOpGeometry::Flat),
+        op(OpType::Pointwise, {3, 4}, 5, VectorPrimitiveFamily::Div,
+           VectorOpGeometry::RowExpand),
+    };
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    p.allow_model_ahead_multi_reduction_stream = false;
+    p.per_task_overhead_cycles = 64;
+    p.p4_patterns.push_back({P4PatternKind::SoftmaxFlash,
+                             FlatSet<size_t>{0, 1, 2, 3, 4},
+                             FlatSet<size_t>{0, 3}});
+    return p;
+}
+
+static void test_g9_row_aware_multicore_ranking() {
+    std::cout << "[G9GRID] row-aware reductions preserve the multi-wave equation\n";
+    Problem p = mk_grounded_p4_softmax(8192, 768);
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2, 3, 4});
+    auto fixed = [&](int64_t h, int64_t units) {
+        TileConfig cfg{8192, h, 1};
+        cfg.parts_m = units;
+        cfg.parts_n = 1;
+        cfg.split_k = 1;
+        return sg->compute_cost(cfg);
+    };
+    const auto u12 = fixed(64, 12);
+    const auto u32 = fixed(24, 32);
+    const auto u48 = fixed(16, 48);
+    const auto u96 = fixed(8, 96);
+    const auto natural = sg->best_cost();
+    std::cout << "    U12=" << u12.latency << " U32=" << u32.latency
+              << " U48=" << u48.latency << " U96=" << u96.latency
+              << " natural=" << natural.config.parts_m << " tasks\n";
+    CHECK("G9: grounded reduction work makes 48 tasks beat 32",
+          u48.feasible && u32.feasible && u48.latency < u32.latency);
+    CHECK("G9: 96 tasks are modeled as two waves, not twice the 48-task wall",
+          u96.feasible && u96.latency < 1.3 * u48.latency);
+    CHECK("G9: natural tall-softmax grid no longer under-fills at 12/32 tasks",
+          natural.feasible && natural.config.parts_m >= 48);
 }
 static void test_vector_streaming_reduction() {
     std::cout << "[STREAM] large-W reduction streams to fit UB (materialize can't)\n";
@@ -2216,12 +2311,14 @@ static void test_g1_multi_reduction_stream_decline() {
     const auto& soft_update = stream.p4_work.stats_update;
     CHECK("G7: softmax init records two trees and the wide sub-exp stream",
           stream.p4_work.generated &&
-              soft_init.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+              soft_init.get(VectorPrimitiveKind::RowMax).wide == 1 &&
+              soft_init.get(VectorPrimitiveKind::RowSum).wide == 1 &&
               soft_init.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
               soft_init.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1 &&
               soft_init.get(VectorPrimitiveKind::Exp).wide == 1);
     CHECK("G7: softmax update records wide body and thin (m,l) correction",
-          soft_update.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+          soft_update.get(VectorPrimitiveKind::RowMax).wide == 1 &&
+              soft_update.get(VectorPrimitiveKind::RowSum).wide == 1 &&
               soft_update.get(VectorPrimitiveKind::Add).thin == 3 &&
               soft_update.get(VectorPrimitiveKind::Add).stream_starts == 2 &&
               soft_update.get(VectorPrimitiveKind::Exp).wide == 1 &&
@@ -2272,7 +2369,7 @@ static void test_g1_multi_reduction_stream_decline() {
     const auto& welford_update = layernorm_stream.p4_work.stats_update;
     const auto& welford_finalize = layernorm_stream.p4_work.finalize;
     CHECK("G7: Welford init records chunk mean/M2 and count construction",
-          welford_init.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+          welford_init.get(VectorPrimitiveKind::RowSum).wide == 2 &&
               welford_init.get(VectorPrimitiveKind::Mul).wide == 1 &&
               welford_init.get(VectorPrimitiveKind::RowExpandSub).wide == 1 &&
               welford_init.get(VectorPrimitiveKind::RowExpandSub).stream_starts == 1 &&
@@ -2280,7 +2377,7 @@ static void test_g1_multi_reduction_stream_decline() {
               welford_init.get(VectorPrimitiveKind::ScalarMul).stream_starts == 2 &&
               welford_init.get(VectorPrimitiveKind::ScalarAdd).thin == 1);
     CHECK("G7: Welford update records the complete thin Chan merge",
-          welford_update.get(VectorPrimitiveKind::RowReduction).wide == 2 &&
+          welford_update.get(VectorPrimitiveKind::RowSum).wide == 2 &&
               welford_update.get(VectorPrimitiveKind::Add).thin == 4 &&
               welford_update.get(VectorPrimitiveKind::Mul).wide == 1 &&
               welford_update.get(VectorPrimitiveKind::Mul).thin == 2 &&
@@ -2747,7 +2844,7 @@ static void test_source_vector_primitive_geometry() {
         reduction.type = OpType::Reduction;
         reduction.inputs = {0};
         reduction.outputs = {1};
-        reduction.vector_primitive = VectorPrimitiveFamily::Reduction;
+        reduction.vector_primitive = VectorPrimitiveFamily::RowSum;
         reduction.vector_geometry = VectorOpGeometry::Flat;
         Op apply;
         apply.type = OpType::Pointwise;
@@ -2790,7 +2887,7 @@ static void test_source_vector_primitive_geometry() {
         reduction.inputs = {0};
         reduction.outputs = {1};
         if (grounded) {
-            reduction.vector_primitive = VectorPrimitiveFamily::Reduction;
+            reduction.vector_primitive = VectorPrimitiveFamily::RowSum;
             reduction.vector_geometry = VectorOpGeometry::Flat;
         }
         p.ops = {reduction};
@@ -2815,8 +2912,8 @@ static void test_source_vector_primitive_geometry() {
           grounded_p1_plan.kind == VectorStreamKind::ReductionFolded &&
               grounded_p1_plan.chunk == legacy_p1_plan.chunk &&
               grounded_p1_plan.stats.trip_count > 0);
-    CHECK("VOPS: grounded bare P1 prices each chunk tree and generated merge",
-          grounded_p1 > legacy_p1);
+    CHECK("VOPS: grounded bare P1 takes the per-chunk fit path plus generated merge",
+          std::abs(grounded_p1 - legacy_p1) > 1.0);
 }
 
 // --- A5: a large abstract tile does not grant overlap to serial stream phases ---
@@ -2938,6 +3035,7 @@ int main() {
     test_mixed_axis_reduction_rejected();
     test_kernel_fill_one_per_core();
     test_pointwise_stream_explicit();
+    test_grounded_row_reduction_formulas();
     test_source_vector_primitive_geometry();
     test_vector_stream_short_loop_serializes();
     test_cost_result_cache_footprint();
@@ -2947,6 +3045,7 @@ int main() {
     test_streaming_detected_via_coupled_peak();
     test_vector_streaming_reduction();
     test_g1_multi_reduction_stream_decline();
+    test_g9_row_aware_multicore_ranking();
     test_g3_spanning_reduction_rereads_input();
     test_vector_sensibility();
     test_visualize();

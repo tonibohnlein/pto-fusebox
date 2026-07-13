@@ -64,6 +64,13 @@ enum class VectorPrimitiveFamily : uint8_t {
     Rsqrt,
     ScalarAdd,
     ScalarMul,
+    RowSum,
+    RowExtrema,
+    ColSum,
+    ColExtrema,
+    // Backward-compatible descriptor for JSON/research instances that identify
+    // a reduction without its exact PTO instruction. Production PyPTO graphs
+    // use one of the four axis/op-specific families above.
     Reduction
 };
 
@@ -381,7 +388,8 @@ enum class VectorPrimitiveKind : size_t {
     RowExpandSub,
     ScalarAdd,
     ScalarMul,
-    RowReduction,
+    RowSum,
+    RowMax,
     Count
 };
 
@@ -448,13 +456,15 @@ inline VectorP4WorkPlan make_vector_p4_work_plan(P4PatternKind kind) {
 
     if (kind == P4PatternKind::SoftmaxFlash) {
         // Init: row_max; sub -> exp; row_sum.
-        plan.stats_init.add(VectorPrimitiveKind::RowReduction, 2, 0);
+        plan.stats_init.add(VectorPrimitiveKind::RowMax, 1, 0);
+        plan.stats_init.add(VectorPrimitiveKind::RowSum, 1, 0);
         plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
         plan.stats_init.add(VectorPrimitiveKind::Exp, 1, 0);
 
         // Update: row_max; max(carry,cmax) -> sub -> exp; row_sum;
         // sub(carry,m) -> exp -> mul -> add.
-        plan.stats_update.add(VectorPrimitiveKind::RowReduction, 2, 0);
+        plan.stats_update.add(VectorPrimitiveKind::RowMax, 1, 0);
+        plan.stats_update.add(VectorPrimitiveKind::RowSum, 1, 0);
         plan.stats_update.add(VectorPrimitiveKind::Add, 0, 3, 2);
         plan.stats_update.add(VectorPrimitiveKind::Exp, 1, 1);
         plan.stats_update.add(VectorPrimitiveKind::Mul, 0, 1);
@@ -464,7 +474,7 @@ inline VectorP4WorkPlan make_vector_p4_work_plan(P4PatternKind kind) {
 
     // Welford init: row_sum; muls(mean) -> sub -> mul; row_sum;
     // muls(zero-count) -> adds(count).
-    plan.stats_init.add(VectorPrimitiveKind::RowReduction, 2, 0);
+    plan.stats_init.add(VectorPrimitiveKind::RowSum, 2, 0);
     plan.stats_init.add(VectorPrimitiveKind::Mul, 1, 0);
     plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
     plan.stats_init.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
@@ -472,7 +482,7 @@ inline VectorP4WorkPlan make_vector_p4_work_plan(P4PatternKind kind) {
 
     // Welford update repeats the chunk mean/M2 stream, then performs Chan's
     // thin (mean,M2,count) merge after the second reduction barrier.
-    plan.stats_update.add(VectorPrimitiveKind::RowReduction, 2, 0);
+    plan.stats_update.add(VectorPrimitiveKind::RowSum, 2, 0);
     plan.stats_update.add(VectorPrimitiveKind::Add, 0, 4, 1);
     plan.stats_update.add(VectorPrimitiveKind::Mul, 1, 2);
     plan.stats_update.add(VectorPrimitiveKind::Div, 0, 2);

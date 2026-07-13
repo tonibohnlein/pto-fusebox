@@ -9,6 +9,14 @@
 #include "core/dag.h"
 #include "core/types.h"
 
+// Grounded A2/A3 fit-backend latency for one emitted TROWSUM/TROWMAX tile.
+// Exact formula-table widths reproduce PTO-ISA's rounded cycle result;
+// AutoFuse-only widths are interpolated between adjacent grounded entries.
+// Returns -1 when the family/dtype has no fit-backend grounding, allowing the
+// caller to retain the legacy structural reduction tree as an explicit fallback.
+double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
+                                  int64_t valid_rows, int64_t valid_cols);
+
 // ============================================================================
 // Ascend910BCost: the 910B cost model. A connected group of ops that share a
 // unified tiling grid, together with the 910B-specific tiling/feasibility/cost

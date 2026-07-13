@@ -39,16 +39,100 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
-// Vector REDUCTION tree coefficients (pto-isa perf-sim, vec_tile_study/vec_reduce, R^2~1.0,
-// device-eval-pending). A reduction is NOT a single slope*repeat op: it lowers to a
-// barrier-separated tree of count-mode passes, so the cost tracks the REDUCED-AXIS tree,
-// not ROWS*COLS. The old slope_reduce*(ROWS*COLS/epr) overcounted a tall row-reduce up to 19x.
-//   Row reduction (reduce W): 45*(K-1)+51 cycles, K=W/epr -- ROWS-INDEPENDENT, linear in W.
-//   Col reduction (reduce H): 16*(H-1)+30*log2(H) cycles -- pairwise vadd tree across rows.
+// Legacy vector REDUCTION tree coefficients (pto-isa stub perf-sim,
+// vec_tile_study/vec_reduce). A reduction is NOT a single slope*repeat op: it
+// lowers to a barrier-separated tree. The stub's count-mode accounting is,
+// however, rows-independent; PTO-ISA explicitly documents that simplification
+// as inaccurate on hardware. Exact PyPTO TROWSUM/TROWMAX descriptors therefore
+// use the fit-backend table below, while descriptor-free research instances and
+// unsupported dtypes retain this structural fallback.
 constexpr double kVecRowReducePass = 45.0;   // per barrier-isolated count-mode vadd pass
 constexpr double kVecRowReduceFinal = 51.0;  // K=1 base (the final cross-lane vcadd block)
 constexpr double kVecColReduceSlope = 16.0;  // streamed count-mode vadd per row-pair
 constexpr double kVecColReduceLevel = 30.0;  // per-level startup (log2(H) barriers)
+
+// PTO-ISA A2/A3 formula backend, formula_params.csv @ d5eaf8e4. Each grounded
+// entry predicts round(slope * valid_rows * valid_cols + bias) cycles and is
+// validated by PTO-ISA's fit-backend tests against cycle profiling. AutoFuse
+// emits additional DMA-aligned widths, so unsupported widths interpolate the
+// two neighboring total-cycle predictions for the requested valid row count.
+// Above the measured range, proportional continuation from the last anchor is
+// deliberately monotone and introduces no new fitted coefficient.
+struct RowReductionFormula {
+  int64_t cols;
+  double slope;
+  double bias;
+};
+
+constexpr std::array<RowReductionFormula, 12> kRowMaxFp32{{
+    {8, 0.875, 46},       {32, 0.2188, 47},   {64, 0.1094, 32},
+    {96, 0.0937, 61},     {128, 0.0625, 48},  {144, 0.0692, 77},
+    {176, 0.0558, 79},    {208, 0.0517, 100}, {240, 0.0448, 100},
+    {272, 0.0485, 98},    {304, 0.0434, 110}, {336, 0.0418, 131},
+}};
+
+constexpr std::array<RowReductionFormula, 12> kRowSumFp32{{
+    {8, 0.875, 58},       {32, 0.2187, 59},   {64, 0.1094, 44},
+    {96, 0.0938, 75},     {128, 0.0625, 61.5}, {144, 0.0698, 92},
+    {176, 0.0575, 93},    {208, 0.0535, 99},  {240, 0.0469, 99},
+    {272, 0.0484, 104},   {304, 0.0431, 104}, {336, 0.0419, 121},
+}};
+
+constexpr std::array<RowReductionFormula, 20> kRowMaxFp16{{
+    {32, 0.2187, 48},   {64, 0.1094, 43},   {96, 0.0729, 43},
+    {128, 0.0547, 33},  {160, 0.0562, 62},  {208, 0.0433, 63},
+    {240, 0.0388, 62},  {272, 0.0369, 74},  {304, 0.0323, 80},
+    {336, 0.0302, 97},  {368, 0.0276, 93},  {400, 0.0279, 92},
+    {432, 0.025, 101},  {464, 0.0232, 119}, {496, 0.0222, 119},
+    {528, 0.0254, 111}, {560, 0.0241, 110}, {592, 0.0232, 127},
+    {624, 0.022, 127},  {656, 0.0224, 125},
+}};
+
+constexpr std::array<RowReductionFormula, 20> kRowSumFp16{{
+    {32, 0.2188, 62},   {64, 0.1094, 57},   {96, 0.0729, 57},
+    {128, 0.0547, 47},  {160, 0.0563, 78},  {208, 0.0436, 79},
+    {240, 0.0391, 79},  {272, 0.0366, 94},  {304, 0.0323, 102},
+    {336, 0.0298, 115}, {368, 0.0272, 111}, {400, 0.0275, 103},
+    {432, 0.0255, 103}, {464, 0.0238, 121}, {496, 0.0229, 121},
+    {528, 0.0249, 111}, {560, 0.0234, 106}, {592, 0.0219, 140},
+    {624, 0.0208, 140}, {656, 0.0213, 126},
+}};
+
+template <size_t N>
+double InterpolateRowReductionCycles(const std::array<RowReductionFormula, N> &table,
+                                     int64_t valid_rows, int64_t valid_cols) {
+  if (valid_rows <= 0 || valid_cols <= 0) return -1.0;
+  auto at = [&](const RowReductionFormula &entry) {
+    return entry.slope * (double)valid_rows * (double)entry.cols + entry.bias;
+  };
+  const auto upper = std::lower_bound(
+      table.begin(), table.end(), valid_cols,
+      [](const RowReductionFormula &entry, int64_t cols) { return entry.cols < cols; });
+  if (upper == table.begin()) return std::round(at(*upper));
+  if (upper == table.end()) {
+    const auto &last = table.back();
+    return std::round(at(last) * (double)valid_cols / (double)last.cols);
+  }
+  if (upper->cols == valid_cols) return std::round(at(*upper));
+  const auto &lower = *(upper - 1);
+  const double alpha = (double)(valid_cols - lower.cols) /
+                       (double)(upper->cols - lower.cols);
+  return std::round(at(lower) + alpha * (at(*upper) - at(lower)));
+}
+
+double GroundedRowReductionCyclesImpl(VectorPrimitiveFamily family, DType dtype,
+                                      int64_t valid_rows, int64_t valid_cols) {
+  const bool sum = family == VectorPrimitiveFamily::RowSum;
+  const bool extrema = family == VectorPrimitiveFamily::RowExtrema;
+  if (!sum && !extrema) return -1.0;
+  if (dtype == DType::FP32)
+    return sum ? InterpolateRowReductionCycles(kRowSumFp32, valid_rows, valid_cols)
+               : InterpolateRowReductionCycles(kRowMaxFp32, valid_rows, valid_cols);
+  if (dtype == DType::FP16)
+    return sum ? InterpolateRowReductionCycles(kRowSumFp16, valid_rows, valid_cols)
+               : InterpolateRowReductionCycles(kRowMaxFp16, valid_rows, valid_cols);
+  return -1.0;
+}
 
 // Count-mode dispatch floor: a binary-ALU vector op whose contiguous width is NOT repeat-aligned
 // (cols % epr != 0) enters count-mask dispatch, paying a one-time ~16-cycle floor independent of
@@ -80,6 +164,10 @@ inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveFamily family)
     case VectorPrimitiveFamily::Rsqrt: return {1.0, 24.0, false};
     case VectorPrimitiveFamily::ScalarAdd: return {1.0, 31.0, false};
     case VectorPrimitiveFamily::ScalarMul: return {1.0, 26.0, false};
+    case VectorPrimitiveFamily::RowSum:
+    case VectorPrimitiveFamily::RowExtrema:
+    case VectorPrimitiveFamily::ColSum:
+    case VectorPrimitiveFamily::ColExtrema:
     case VectorPrimitiveFamily::Reduction: return {0.0, 0.0, false};
     case VectorPrimitiveFamily::Generic: return {0.0, 0.0, false};
   }
@@ -155,14 +243,18 @@ inline double GroundedVectorOpCompute(const Problem *p, const Op &op, int64_t fr
 inline double GroundedReductionCompute(const Problem *p, const Op &op, int reduced_axis,
                                        int64_t frame_rows, int64_t frame_cols) {
   const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
-  const int64_t epr =
-      std::max<int64_t>(1, reg / dtype_bytes(p->tensors[op.output()].dtype));
+  const DType dtype =
+      op.inputs.empty() ? p->tensors[op.output()].dtype : p->tensors[op.inputs[0]].dtype;
+  const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dtype));
   const VectorFrameShape shape = OpFrameShape(p, op, frame_rows, frame_cols);
   if (reduced_axis == 2) {
     return kVecColReduceSlope * (double)std::max<int64_t>(0, shape.rows - 1) +
            kVecColReduceLevel *
                (shape.rows > 1 ? std::log2((double)shape.rows) : 0.0);
   }
+  const double grounded =
+      GroundedRowReductionCycles(op.vector_primitive, dtype, shape.rows, shape.cols);
+  if (grounded >= 0.0) return grounded;
   const int64_t passes = std::max<int64_t>(1, (shape.cols + epr - 1) / epr);
   return kVecRowReducePass * (double)(passes - 1) + kVecRowReduceFinal;
 }
@@ -194,9 +286,9 @@ inline double GeneratedReductionMergeCompute(const Problem *p,
 //     perf-sim pays head+tail only when the VEC queue is empty (a back-to-back chain overlaps
 //     its startup), so the caller passes pw_stream_start=true only for the first pointwise op
 //     of a stream (chain start, or after a reduction/matmul barrier) -- not per op.
-//   Reduction (Fix 1): the REDUCED-AXIS tree -- ROWS-independent for reduce-W, log-depth for
-//     reduce-H -- NOT slope_reduce*(ROWS*COLS/epr) (overcounted a tall row-reduce up to 19x).
-//     Its barrier-isolated per-pass startups are already baked into the tree constants.
+//   Descriptor-free reduction (Fix 1): the legacy REDUCED-AXIS stub tree. Exact
+//     PyPTO reductions take GroundedReductionCompute at their emitted frame and
+//     use the row-aware PTO-ISA fit model instead.
 inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis,
                            bool pw_stream_start, bool row_expand_composite) {
   const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
@@ -254,7 +346,8 @@ inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveKind kind) {
     }
     case VectorPrimitiveKind::ScalarAdd: return PrimitiveGrounding(VectorPrimitiveFamily::ScalarAdd);
     case VectorPrimitiveKind::ScalarMul: return PrimitiveGrounding(VectorPrimitiveFamily::ScalarMul);
-    case VectorPrimitiveKind::RowReduction:
+    case VectorPrimitiveKind::RowSum:
+    case VectorPrimitiveKind::RowMax:
     case VectorPrimitiveKind::Count: return {0.0, 0.0, false};
   }
   return {0.0, 0.0, false};
@@ -266,8 +359,9 @@ inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveKind kind) {
 // cooperate on a single tree merely because they share a wave.
 inline double GeneratedP4PhaseCompute(const Problem *p, const VectorStreamPlan &plan,
                                       const VectorPhaseWorkPlan &phase, int64_t chunk_extent,
-                                      int64_t iterations, int64_t element_bytes) {
+                                      int64_t iterations, DType dtype) {
   if (!phase.generated || chunk_extent <= 0 || iterations <= 0) return 0.0;
+  const int64_t element_bytes = dtype_bytes(dtype);
   const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
   const int64_t epr = std::max<int64_t>(1, reg / std::max<int64_t>(1, element_bytes));
   const int64_t wide_repeats =
@@ -285,11 +379,17 @@ inline double GeneratedP4PhaseCompute(const Problem *p, const VectorStreamPlan &
   for (size_t i = 0; i < static_cast<size_t>(VectorPrimitiveKind::Count); ++i) {
     const auto kind = static_cast<VectorPrimitiveKind>(i);
     const VectorPrimitiveWork &work = phase.primitives[i];
-    if (kind == VectorPrimitiveKind::RowReduction) {
-      // A ragged/count-mode chunk still needs the final partial SIMD repeat.
-      const int64_t passes = std::max<int64_t>(1, (chunk_extent + epr - 1) / epr);
-      const double tree = kVecRowReducePass * (double)(passes - 1) + kVecRowReduceFinal;
-      per_task += (double)work.wide * tree;
+    if (kind == VectorPrimitiveKind::RowSum || kind == VectorPrimitiveKind::RowMax) {
+      const VectorPrimitiveFamily family =
+          kind == VectorPrimitiveKind::RowSum ? VectorPrimitiveFamily::RowSum
+                                              : VectorPrimitiveFamily::RowExtrema;
+      double reduction = GroundedRowReductionCycles(
+          family, dtype, std::max<int64_t>(1, plan.free_tile), chunk_extent);
+      if (reduction < 0.0) {
+        const int64_t passes = std::max<int64_t>(1, (chunk_extent + epr - 1) / epr);
+        reduction = kVecRowReducePass * (double)(passes - 1) + kVecRowReduceFinal;
+      }
+      per_task += (double)work.wide * reduction;
       continue;
     }
     const VectorPrimitiveGrounding grounding = PrimitiveGrounding(kind);
@@ -382,10 +482,12 @@ double CubeExtractCycles(const Problem* p, const ByteCost& bc, int64_t M,
   return lhs_bytes * bc.l0a + rhs_bytes * bc.l0b;
 }
 
-// Wave-aware compute makespan. The independent work units (spatial tiles x
-// split-K partials) are EQUAL-cost under the current uniform-tile / equal-K-split
-// representation, so they run in ceil(U/C) "waves" and the makespan is set by the
-// fullest wave, NOT by an idealized total/C fractional division:
+// Wave-aware compute makespan. Uniform cube grids are equal-cost; a balanced
+// vector grid totalizes U copies of its maximum valid region work, so this same
+// equation prices the critical task rather than the average 11/10-row task.
+// The hardware still sees one ready queue with no wave barriers; "waves" here
+// is only the queue-makespan count ceil(U/C). The fullest wave-equivalent sets
+// the wall, NOT an idealized total/C fractional division:
 //
 //   T_compute = ceil(U/C) * (W_total / U)
 //
@@ -477,6 +579,11 @@ double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPa
 }
 
 }  // namespace
+
+double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
+                                  int64_t valid_rows, int64_t valid_cols) {
+  return GroundedRowReductionCyclesImpl(family, dtype, valid_rows, valid_cols);
+}
 
 // ============================================================================
 // Factory
@@ -2873,7 +2980,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       }
 
       const int64_t vreg = prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256;
-      const int64_t dtb = dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
+      const DType vector_dtype = prob_->tensors[*boundary_outputs_.begin()].dtype;
+      const int64_t dtb = dtype_bytes(vector_dtype);
       const int64_t dma_width =
           (!reduction_streams && vector_stream.strip_w > 0) ? vector_stream.strip_w : cfg.w;
       const double dma_pen = std::max(1.0, (double)vreg / std::max(1.0, (double)dma_width * (double)dtb));
@@ -2953,9 +3061,14 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                                         : vector_stream.n_partition.parts;
         const int64_t tensor_free = reduced_axis_ == 1 ? tensor.height : tensor.width;
         const int64_t tensor_reduced = reduced_axis_ == 1 ? tensor.width : tensor.height;
-        const int64_t free_per_tile = tensor_free == 1 ? 1 : vector_stream.free_tile;
+        // Non-broadcast regions form an exact partition of the logical free
+        // axis. Do not multiply every task by the maximum (big) extent: for a
+        // 128/12 split that would price 132 rows although the emitter's 11/10
+        // clamped regions load exactly 128. A size-one broadcast is genuinely
+        // reloaded by every logical task.
+        const int64_t free_total = tensor_free == 1 ? free_regions : tensor_free;
         const int64_t reduced_total = tensor_reduced == 1 ? chunks : covered_extent;
-        return (double)free_regions * (double)free_per_tile * (double)reduced_total *
+        return (double)free_total * (double)reduced_total *
                (double)dtype_bytes(tensor.dtype);
       };
       auto body_tensor_bytes = [&](size_t tensor_id) {
@@ -3017,7 +3130,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                      double out_cycles) {
         record_phase(traffic_phase, chunk_extent * iterations, iterations, stages, out_cycles,
                      GeneratedP4PhaseCompute(prob_, vector_stream, work, chunk_extent,
-                                             iterations, dtb));
+                                             iterations, vector_dtype));
       };
 
       const double io_in = input_cycles(kVectorPhaseBody, 0, 1);

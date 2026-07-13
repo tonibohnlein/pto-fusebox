@@ -31,6 +31,10 @@ static bool parse_vector_primitive_family(const std::string& name, VectorPrimiti
     else if (name == "rsqrt") *family = VectorPrimitiveFamily::Rsqrt;
     else if (name == "scalar_add") *family = VectorPrimitiveFamily::ScalarAdd;
     else if (name == "scalar_mul") *family = VectorPrimitiveFamily::ScalarMul;
+    else if (name == "row_sum") *family = VectorPrimitiveFamily::RowSum;
+    else if (name == "row_extrema") *family = VectorPrimitiveFamily::RowExtrema;
+    else if (name == "col_sum") *family = VectorPrimitiveFamily::ColSum;
+    else if (name == "col_extrema") *family = VectorPrimitiveFamily::ColExtrema;
     else if (name == "reduction") *family = VectorPrimitiveFamily::Reduction;
     else return false;
     return true;
@@ -60,7 +64,8 @@ static const char* vector_primitive_name(VectorPrimitiveKind kind) {
         case VectorPrimitiveKind::RowExpandSub: return "row_expand_sub";
         case VectorPrimitiveKind::ScalarAdd: return "scalar_add";
         case VectorPrimitiveKind::ScalarMul: return "scalar_mul";
-        case VectorPrimitiveKind::RowReduction: return "row_reduction";
+        case VectorPrimitiveKind::RowSum: return "row_sum";
+        case VectorPrimitiveKind::RowMax: return "row_max";
         case VectorPrimitiveKind::Count: break;
     }
     return "unknown";
@@ -310,6 +315,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("l1_capacity"))      p.l1_capacity      = j["l1_capacity"].get<int64_t>();
     if (j.contains("cube_compute_cost"))   p.cube_compute_cost   = j["cube_compute_cost"].get<int64_t>();
     if (j.contains("kernel_fill_cost"))    p.kernel_fill_cost    = j["kernel_fill_cost"].get<int64_t>();
+    if (j.contains("per_task_overhead_cycles")) {
+        p.per_task_overhead_cycles = j["per_task_overhead_cycles"].get<int64_t>();
+    }
     // Grounded pto-isa machine model (optional; absent => legacy placeholders).
     if (j.contains("cube_freq_hz")) p.cube_freq_hz = j["cube_freq_hz"].get<double>();
     if (j.contains("bw_gm_l1"))     p.bw_gm_l1     = j["bw_gm_l1"].get<double>();
