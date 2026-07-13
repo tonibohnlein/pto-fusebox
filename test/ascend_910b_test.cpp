@@ -2682,6 +2682,143 @@ static void test_pointwise_stream_explicit() {
           tiny_plan.body.trip_count == 8 && tiny_plan.body.pipeline_stages == 1);
 }
 
+// --- source-DAG primitive work follows the emitted strip/chunk geometry ------
+// Problems without vector_primitive/vector_geometry keep the legacy full-tensor
+// estimate.  Once the adapter supplies exact semantics, every logical task pays
+// each planned strip/chunk's pto-isa primitive cost, including scalar op slopes.
+// A row expansion pays vbrcb+barrier only in a reduction-layout group; the
+// row-major pointwise form uses the raw strided binary primitive.
+static void test_source_vector_primitive_geometry() {
+    std::cout << "[VOPS] source vector primitives replay planned strip/chunk geometry\n";
+
+    auto body_cost = [&](VectorPrimitiveFamily family, VectorOpGeometry geometry,
+                         bool row_stat) {
+        constexpr int64_t W = 512, H = 8;
+        Problem p;
+        p.tensors = row_stat ? std::vector<Tensor>{{W, H}, {1, H}, {W, H}}
+                             : std::vector<Tensor>{{W, H}, {W, H}};
+        Op op;
+        op.type = OpType::Pointwise;
+        op.inputs = row_stat ? std::vector<size_t>{0, 1}
+                             : std::vector<size_t>{0};
+        op.outputs = {row_stat ? 2u : 1u};
+        op.vector_primitive = family;
+        op.vector_geometry = geometry;
+        p.ops = {op};
+        p.fast_memory_capacity = 1 << 20;
+        set_910b(p);
+        p.kernel_fill_cost = 0;
+        p.bw_gm_ub = p.bw_ub_gm = p.hbm_aggregate_gibps = 1.0e12;
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0});
+        TileConfig cfg;
+        cfg.w = W;
+        cfg.h = H;
+        cfg.k = 1;
+        cfg.parts_m = cfg.parts_n = cfg.split_k = 1;
+        const auto plan = sg->vector_stream_plan(cfg);
+        CHECK("VOPS: materialized body owns eight emitted row strips",
+              plan.feasible && plan.body.trip_count == 8 &&
+                  plan.strip_h == 1 && plan.strip_w == W);
+        return sg->compute_cost(cfg).latency;
+    };
+
+    const double flat_mul = body_cost(VectorPrimitiveFamily::Mul,
+                                      VectorOpGeometry::Flat, false);
+    const double scalar_mul = body_cost(VectorPrimitiveFamily::ScalarMul,
+                                        VectorOpGeometry::Flat, false);
+    CHECK_EQ("VOPS: flat mul pays 8 * (2*8 repeats + 25 fixed)", flat_mul, 328.0);
+    CHECK_EQ("VOPS: scalar mul pays 8 * (1*8 repeats + 26 fixed)", scalar_mul, 272.0);
+
+    const double flat_add = body_cost(VectorPrimitiveFamily::Add,
+                                      VectorOpGeometry::Flat, true);
+    const double row_sub = body_cost(VectorPrimitiveFamily::Add,
+                                     VectorOpGeometry::RowExpand, true);
+    CHECK_EQ("VOPS: pointwise row expand uses raw strided binary count mode",
+             row_sub, 448.0);
+    CHECK("VOPS: row expansion is costlier than the same flat binary geometry",
+          row_sub > flat_add);
+
+    auto p2_cost = [&](VectorOpGeometry geometry, VectorStreamPlan* out_plan) {
+        constexpr int64_t W = 32768, H = 4;
+        Problem p;
+        p.tensors = {{W, H}, {1, H}, {W, H}};
+        Op reduction;
+        reduction.type = OpType::Reduction;
+        reduction.inputs = {0};
+        reduction.outputs = {1};
+        reduction.vector_primitive = VectorPrimitiveFamily::Reduction;
+        reduction.vector_geometry = VectorOpGeometry::Flat;
+        Op apply;
+        apply.type = OpType::Pointwise;
+        apply.inputs = {0, 1};
+        apply.outputs = {2};
+        apply.vector_primitive = VectorPrimitiveFamily::Div;
+        apply.vector_geometry = geometry;
+        p.ops = {reduction, apply};
+        p.fast_memory_capacity = 1 << 24;
+        set_910b(p);
+        p.kernel_fill_cost = 0;
+        p.bw_gm_ub = p.bw_ub_gm = p.hbm_aggregate_gibps = 1.0e12;
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0, 1});
+        TileConfig cfg;
+        cfg.w = W;
+        cfg.h = H;
+        cfg.k = 1;
+        cfg.parts_m = cfg.parts_n = cfg.split_k = 1;
+        *out_plan = sg->vector_stream_plan(cfg);
+        return sg->compute_cost(cfg).latency;
+    };
+    VectorStreamPlan flat_plan, row_plan;
+    const double flat_apply = p2_cost(VectorOpGeometry::Flat, &flat_plan);
+    const double row_apply = p2_cost(VectorOpGeometry::RowExpand, &row_plan);
+    const int64_t apply_calls = row_plan.apply.trip_count +
+                                (row_plan.apply_tail.present ? 1 : 0);
+    CHECK("VOPS: P2 uses several emitted apply chunks",
+          row_plan.kind == VectorStreamKind::ReductionSpanning && apply_calls > 1 &&
+              row_plan.chunk == flat_plan.chunk);
+    CHECK("VOPS: row-expand composite overhead is paid once per P2 apply chunk",
+          row_apply - flat_apply >= 19.0 * static_cast<double>(apply_calls) - 0.5);
+
+    auto bare_reduction_cost = [&](bool grounded, VectorStreamPlan* out_plan) {
+        constexpr int64_t W = 32768, H = 4;
+        Problem p;
+        p.tensors = {{W, H}, {1, H}};
+        Op reduction;
+        reduction.type = OpType::Reduction;
+        reduction.inputs = {0};
+        reduction.outputs = {1};
+        if (grounded) {
+            reduction.vector_primitive = VectorPrimitiveFamily::Reduction;
+            reduction.vector_geometry = VectorOpGeometry::Flat;
+        }
+        p.ops = {reduction};
+        p.fast_memory_capacity = 1 << 24;
+        set_910b(p);
+        p.kernel_fill_cost = 0;
+        p.bw_gm_ub = p.bw_ub_gm = p.hbm_aggregate_gibps = 1.0e12;
+        DAG dag = DAG::build(p);
+        auto sg = Subgraph::create(p, dag, {0});
+        TileConfig cfg;
+        cfg.w = W;
+        cfg.h = H;
+        cfg.k = 1;
+        cfg.parts_m = cfg.parts_n = cfg.split_k = 1;
+        *out_plan = sg->vector_stream_plan(cfg);
+        return sg->compute_cost(cfg).latency;
+    };
+    VectorStreamPlan legacy_p1_plan, grounded_p1_plan;
+    const double legacy_p1 = bare_reduction_cost(false, &legacy_p1_plan);
+    const double grounded_p1 = bare_reduction_cost(true, &grounded_p1_plan);
+    CHECK("VOPS: grounded bare P1 keeps the same stream geometry",
+          grounded_p1_plan.kind == VectorStreamKind::ReductionFolded &&
+              grounded_p1_plan.chunk == legacy_p1_plan.chunk &&
+              grounded_p1_plan.stats.trip_count > 0);
+    CHECK("VOPS: grounded bare P1 prices each chunk tree and generated merge",
+          grounded_p1 > legacy_p1);
+}
+
 // --- A5: a large abstract tile does not grant overlap to serial stream phases ---
 // Keep many pointwise branches live across one reduction so the full-DAG UB peak is close to the
 // emitted P2 stream-band peak. With UB set just below the materialized peak, the selected chunk is
@@ -2801,6 +2938,7 @@ int main() {
     test_mixed_axis_reduction_rejected();
     test_kernel_fill_one_per_core();
     test_pointwise_stream_explicit();
+    test_source_vector_primitive_geometry();
     test_vector_stream_short_loop_serializes();
     test_cost_result_cache_footprint();
     test_vector_band_ub();

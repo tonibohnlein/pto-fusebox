@@ -21,6 +21,30 @@ static const char* vector_stream_kind_name(VectorStreamKind kind) {
     return "unknown";
 }
 
+static bool parse_vector_primitive_family(const std::string& name, VectorPrimitiveFamily* family) {
+    if (name == "generic") *family = VectorPrimitiveFamily::Generic;
+    else if (name == "add") *family = VectorPrimitiveFamily::Add;
+    else if (name == "mul") *family = VectorPrimitiveFamily::Mul;
+    else if (name == "div") *family = VectorPrimitiveFamily::Div;
+    else if (name == "exp") *family = VectorPrimitiveFamily::Exp;
+    else if (name == "log") *family = VectorPrimitiveFamily::Log;
+    else if (name == "rsqrt") *family = VectorPrimitiveFamily::Rsqrt;
+    else if (name == "scalar_add") *family = VectorPrimitiveFamily::ScalarAdd;
+    else if (name == "scalar_mul") *family = VectorPrimitiveFamily::ScalarMul;
+    else if (name == "reduction") *family = VectorPrimitiveFamily::Reduction;
+    else return false;
+    return true;
+}
+
+static bool parse_vector_op_geometry(const std::string& name, VectorOpGeometry* geometry) {
+    if (name == "generic") *geometry = VectorOpGeometry::Generic;
+    else if (name == "flat") *geometry = VectorOpGeometry::Flat;
+    else if (name == "row_expand") *geometry = VectorOpGeometry::RowExpand;
+    else if (name == "col_expand") *geometry = VectorOpGeometry::ColExpand;
+    else return false;
+    return true;
+}
+
 static json vector_loop_json(const VectorLoopPlan& loop) {
     return {{"first_chunk", loop.first_chunk},
             {"trip_count", loop.trip_count},
@@ -215,6 +239,26 @@ Problem read_problem(const std::string& filename) {
                 std::exit(1);
             }
             op.outputs.push_back(idx);
+        }
+        if (j.contains("vec_slopes") && i < j["vec_slopes"].size())
+            op.vec_slope = j["vec_slopes"][i].get<double>();
+        if (j.contains("vec_fixed_costs") && i < j["vec_fixed_costs"].size())
+            op.vec_fixed = j["vec_fixed_costs"][i].get<double>();
+        if (j.contains("vector_primitive_families") && i < j["vector_primitive_families"].size()) {
+            const std::string name = j["vector_primitive_families"][i].get<std::string>();
+            if (!parse_vector_primitive_family(name, &op.vector_primitive)) {
+                std::cerr << "Error: unknown vector primitive family '" << name
+                          << "' for op " << i << "\n";
+                std::exit(1);
+            }
+        }
+        if (j.contains("vector_op_geometries") && i < j["vector_op_geometries"].size()) {
+            const std::string name = j["vector_op_geometries"][i].get<std::string>();
+            if (!parse_vector_op_geometry(name, &op.vector_geometry)) {
+                std::cerr << "Error: unknown vector op geometry '" << name
+                          << "' for op " << i << "\n";
+                std::exit(1);
+            }
         }
         p.ops.push_back(std::move(op));
     }

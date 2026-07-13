@@ -48,6 +48,32 @@ struct Tensor {
 // concat) ops the unified-grid tiling can't fuse through — a barrier in the DAG.
 enum class OpType { MatMul, Pointwise, Reduction, Opaque };
 
+// Exact pto-isa VECTOR instruction family and tile geometry emitted for one
+// source-DAG vector op.  `Generic` preserves the historical vec_slope /
+// vec_fixed fallback for standalone benchmark instances that do not carry
+// lowering semantics.  The PyPTO adapter fills both fields after tensor shapes
+// are known, so candidate costing can replay the op at the strip/chunk geometry
+// selected by VectorStreamPlan rather than scaling a full-tensor estimate.
+enum class VectorPrimitiveFamily : uint8_t {
+    Generic,
+    Add,
+    Mul,
+    Div,
+    Exp,
+    Log,
+    Rsqrt,
+    ScalarAdd,
+    ScalarMul,
+    Reduction
+};
+
+enum class VectorOpGeometry : uint8_t {
+    Generic,
+    Flat,
+    RowExpand,
+    ColExpand
+};
+
 // Exact streamed multi-reduction algorithms implemented by the AutoFuse emit.
 // A P4 pattern identifies the complete op set whose semantics were proven to
 // match the emitted online algorithm, not merely a reduction family.
@@ -79,6 +105,12 @@ struct Op {
     // op). pto-isa device-calibrated per-op: vadd/vsub/vmax/vmin 24, vmul 25, vexp 31, vdiv 30,
     // vrsqrt/vrelu/vmuls ~24. 0.0 => use the problem default `vec_op_head+vec_op_tail` (~32).
     double vec_fixed = 0.0;
+
+    // Grounded source-op semantics.  These two bytes are candidate-invariant
+    // metadata; they are intentionally stored on Op rather than in CostResult
+    // or VectorStreamPlan, so local-search cache entries stay compact.
+    VectorPrimitiveFamily vector_primitive = VectorPrimitiveFamily::Generic;
+    VectorOpGeometry vector_geometry = VectorOpGeometry::Generic;
 
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }

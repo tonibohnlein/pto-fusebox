@@ -61,6 +61,133 @@ constexpr uint8_t kVectorPhaseStats = 1u << 1;
 constexpr uint8_t kVectorPhaseApply = 1u << 2;
 constexpr uint8_t kVectorPhaseFinalize = 1u << 3;
 
+struct VectorPrimitiveGrounding {
+  double slope;
+  double fixed;
+  bool binary_count_mode;
+};
+
+// pto-isa cce_costmodel_vector_compute.hpp, 910B3 calibrations.  This is the
+// single coefficient table for both source-DAG pointwise ops and generated P4
+// work.  Geometry-specific composite overhead is added by the caller.
+inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveFamily family) {
+  switch (family) {
+    case VectorPrimitiveFamily::Add: return {2.0, 24.0, true};
+    case VectorPrimitiveFamily::Mul: return {2.0, 25.0, true};
+    case VectorPrimitiveFamily::Div: return {4.0, 30.0, true};
+    case VectorPrimitiveFamily::Exp: return {2.0, 31.0, false};
+    case VectorPrimitiveFamily::Log: return {2.0, 33.0, false};
+    case VectorPrimitiveFamily::Rsqrt: return {1.0, 24.0, false};
+    case VectorPrimitiveFamily::ScalarAdd: return {1.0, 31.0, false};
+    case VectorPrimitiveFamily::ScalarMul: return {1.0, 26.0, false};
+    case VectorPrimitiveFamily::Reduction: return {0.0, 0.0, false};
+    case VectorPrimitiveFamily::Generic: return {0.0, 0.0, false};
+  }
+  return {0.0, 0.0, false};
+}
+
+struct VectorFrameShape {
+  int64_t rows = 1;
+  int64_t cols = 1;
+};
+
+// Shape one source op sees inside a planned frame.  A global size-one axis is
+// a broadcast/folded axis and remains one; every other axis follows the emitted
+// strip or reduced-axis chunk.  Taking the maximum over operands reproduces the
+// pointwise/reduction work shape while excluding broadcast storage.
+inline VectorFrameShape OpFrameShape(const Problem *p, const Op &op, int64_t frame_rows,
+                                     int64_t frame_cols) {
+  VectorFrameShape shape;
+  auto include = [&](size_t tensor_id) {
+    const Tensor &tensor = p->tensors[tensor_id];
+    const int64_t rows = tensor.height == 1 ? 1 : std::min(tensor.height, frame_rows);
+    const int64_t cols = tensor.width == 1 ? 1 : std::min(tensor.width, frame_cols);
+    shape.rows = std::max(shape.rows, rows);
+    shape.cols = std::max(shape.cols, cols);
+  };
+  include(op.output());
+  for (size_t input : op.inputs) include(input);
+  return shape;
+}
+
+inline bool HasGroundedVectorSemantics(const Op &op) {
+  return op.vector_primitive != VectorPrimitiveFamily::Generic &&
+         op.vector_geometry != VectorOpGeometry::Generic;
+}
+
+// Cost one source-DAG pointwise op at the exact valid frame emitted for one
+// strip/chunk in one logical task.  In a reduction-layout group TROWEXPANDBIN
+// consumes a col-major statistic: vbrcb (18) + pipe_barrier (1) precede the
+// underlying binary op, so it starts an independent stream.  A pure pointwise
+// group's row-major size-one operand uses the raw strided binary path instead.
+inline double GroundedVectorOpCompute(const Problem *p, const Op &op, int64_t frame_rows,
+                                      int64_t frame_cols, bool pw_stream_start,
+                                      bool row_expand_composite) {
+  const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
+  const int64_t element_bytes = dtype_bytes(p->tensors[op.output()].dtype);
+  const int64_t epr = std::max<int64_t>(1, reg / element_bytes);
+  const VectorFrameShape shape = OpFrameShape(p, op, frame_rows, frame_cols);
+  const bool expanded = op.vector_geometry == VectorOpGeometry::RowExpand ||
+                        op.vector_geometry == VectorOpGeometry::ColExpand;
+  const int64_t repeats = expanded
+                              ? shape.rows * ((shape.cols + epr - 1) / epr)
+                              : (shape.rows * shape.cols + epr - 1) / epr;
+
+  VectorPrimitiveGrounding grounding = PrimitiveGrounding(op.vector_primitive);
+  const bool row_expand = op.vector_geometry == VectorOpGeometry::RowExpand;
+  const bool composite = row_expand && row_expand_composite;
+  if (composite) grounding.fixed += 19.0;  // vbrcb + PIPE_V barrier
+  double cycles = grounding.slope * (double)repeats;
+  if (pw_stream_start || composite) cycles += grounding.fixed;
+
+  if (grounding.binary_count_mode) {
+    bool count_mode = shape.cols % epr != 0;
+    if (row_expand) {
+      const int64_t block_elems = std::max<int64_t>(1, 32 / element_bytes);
+      count_mode = shape.cols / epr > shape.rows ||
+                   (shape.cols + block_elems - 1) / block_elems > 255;
+    }
+    if (count_mode) cycles += kVecCountModeFloor;
+  }
+  return cycles;
+}
+
+inline double GroundedReductionCompute(const Problem *p, const Op &op, int reduced_axis,
+                                       int64_t frame_rows, int64_t frame_cols) {
+  const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
+  const int64_t epr =
+      std::max<int64_t>(1, reg / dtype_bytes(p->tensors[op.output()].dtype));
+  const VectorFrameShape shape = OpFrameShape(p, op, frame_rows, frame_cols);
+  if (reduced_axis == 2) {
+    return kVecColReduceSlope * (double)std::max<int64_t>(0, shape.rows - 1) +
+           kVecColReduceLevel *
+               (shape.rows > 1 ? std::log2((double)shape.rows) : 0.0);
+  }
+  const int64_t passes = std::max<int64_t>(1, (shape.cols + epr - 1) / epr);
+  return kVecRowReducePass * (double)(passes - 1) + kVecRowReduceFinal;
+}
+
+// P1/P2 emit one thin add/max after every non-initial statistics chunk.  The
+// merge is absent from the source DAG, so exact source semantics must add it
+// explicitly, just as P4 adds its generated online-stat work.
+inline double GeneratedReductionMergeCompute(const Problem *p,
+                                              const VectorStreamPlan &plan,
+                                              int64_t iterations,
+                                              int64_t element_bytes) {
+  if (iterations <= 0) return 0.0;
+  const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
+  const int64_t epr =
+      std::max<int64_t>(1, reg / std::max<int64_t>(1, element_bytes));
+  const int64_t repeats =
+      (std::max<int64_t>(1, plan.free_tile) + epr - 1) / epr;
+  const auto grounding = PrimitiveGrounding(VectorPrimitiveFamily::Add);
+  const bool count_mode = plan.axis == 1 || plan.free_tile % epr != 0;
+  const double per_task = grounding.slope * (double)repeats + grounding.fixed +
+                          (count_mode ? kVecCountModeFloor : 0.0);
+  return per_task * (double)iterations *
+         (double)std::max<int64_t>(1, plan.work_units);
+}
+
 // Grounded per-op VECTOR compute cycles (pto-isa perf-sim, vec_tile_study). Shared by the
 // vector-only and the mixed cube+vector paths so a reduction costs the same in both.
 //   Pointwise: slope*repeat + (head+tail IF this op starts a vector stream). Fix 3: the
@@ -70,7 +197,8 @@ constexpr uint8_t kVectorPhaseFinalize = 1u << 3;
 //   Reduction (Fix 1): the REDUCED-AXIS tree -- ROWS-independent for reduce-W, log-depth for
 //     reduce-H -- NOT slope_reduce*(ROWS*COLS/epr) (overcounted a tall row-reduce up to 19x).
 //     Its barrier-isolated per-pass startups are already baked into the tree constants.
-inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, bool pw_stream_start) {
+inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis,
+                           bool pw_stream_start, bool row_expand_composite) {
   const int64_t reg = p->vec_reg_bytes > 0 ? p->vec_reg_bytes : 256;
   const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(p->tensors[op.output()].dtype));
   if (op.type == OpType::Reduction) {
@@ -81,6 +209,16 @@ inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, boo
              kVecColReduceLevel * (H > 1 ? std::log2((double)H) : 0.0);
     const int64_t K = std::max<int64_t>(1, W / epr);  // reduce width: ROWS-independent
     return kVecRowReducePass * (double)(K - 1) + kVecRowReduceFinal;
+  }
+  if (HasGroundedVectorSemantics(op)) {
+    int64_t frame_rows = p->tensors[op.output()].height;
+    int64_t frame_cols = p->tensors[op.output()].width;
+    for (size_t input : op.inputs) {
+      frame_rows = std::max(frame_rows, p->tensors[input].height);
+      frame_cols = std::max(frame_cols, p->tensors[input].width);
+    }
+    return GroundedVectorOpCompute(p, op, frame_rows, frame_cols,
+                                   pw_stream_start, row_expand_composite);
   }
   int64_t elems = (int64_t)p->tensors[op.output()].width * p->tensors[op.output()].height;
   int64_t width = (int64_t)p->tensors[op.output()].width;  // contiguous extent (count-mode axis)
@@ -101,25 +239,21 @@ inline double VecOpCompute(const Problem *p, const Op &op, int reduced_axis, boo
   return cycles;
 }
 
-struct VectorPrimitiveGrounding {
-  double slope;
-  double fixed;
-  bool binary_count_mode;
-};
-
-// pto-isa cce_costmodel_vector_compute.hpp, 910B3 calibrations. These are the
-// same grounded primitive costs used by VecOpCompute, made explicit for online
-// P4 work that has no corresponding source-DAG Op.
+// Map generated P4 primitive tallies into the same source-DAG coefficient
+// table.  RowExpandSub adds the emitted vbrcb+barrier composite overhead.
 inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveKind kind) {
   switch (kind) {
-    case VectorPrimitiveKind::Add: return {2.0, 24.0, true};
-    case VectorPrimitiveKind::Mul: return {2.0, 25.0, true};
-    case VectorPrimitiveKind::Div: return {4.0, 30.0, true};
-    case VectorPrimitiveKind::Exp: return {2.0, 31.0, false};
-    // TROWEXPANDSUB = vbrcb (18) + barrier (1) + vsub (2*r+24).
-    case VectorPrimitiveKind::RowExpandSub: return {2.0, 43.0, true};
-    case VectorPrimitiveKind::ScalarAdd: return {1.0, 31.0, false};
-    case VectorPrimitiveKind::ScalarMul: return {1.0, 26.0, false};
+    case VectorPrimitiveKind::Add: return PrimitiveGrounding(VectorPrimitiveFamily::Add);
+    case VectorPrimitiveKind::Mul: return PrimitiveGrounding(VectorPrimitiveFamily::Mul);
+    case VectorPrimitiveKind::Div: return PrimitiveGrounding(VectorPrimitiveFamily::Div);
+    case VectorPrimitiveKind::Exp: return PrimitiveGrounding(VectorPrimitiveFamily::Exp);
+    case VectorPrimitiveKind::RowExpandSub: {
+      auto grounding = PrimitiveGrounding(VectorPrimitiveFamily::Add);
+      grounding.fixed += 19.0;
+      return grounding;
+    }
+    case VectorPrimitiveKind::ScalarAdd: return PrimitiveGrounding(VectorPrimitiveFamily::ScalarAdd);
+    case VectorPrimitiveKind::ScalarMul: return PrimitiveGrounding(VectorPrimitiveFamily::ScalarMul);
     case VectorPrimitiveKind::RowReduction:
     case VectorPrimitiveKind::Count: return {0.0, 0.0, false};
   }
@@ -432,6 +566,8 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         sg.vector_iter_H_ = std::max(sg.vector_iter_H_, prob.tensors[input].height);
       }
     }
+    if (is_vector_op && HasGroundedVectorSemantics(candidate_op))
+      sg.has_grounded_vector_semantics_ = true;
     if (is_vector_op) sg.has_vector_ = true;
     if (candidate_op.type == OpType::MatMul) {
       sg.has_matmul_ = true;
@@ -2748,10 +2884,44 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       auto phase_compute = [&](uint8_t phase, int64_t covered_extent, int64_t chunks) {
         double cycles = 0.0;
         bool prev_pw = false;
+        bool prev_pw_grounded = false;
+        int64_t frame_rows = vector_stream.strip_h;
+        int64_t frame_cols = vector_stream.strip_w;
+        int64_t frame_iterations = vector_stream.body.trip_count;
+        if (reduction_streams) {
+          const int64_t chunk_extent =
+              covered_extent > 0 ? covered_extent / std::max<int64_t>(1, chunks) : 1;
+          frame_rows = reduced_axis_ == 1 ? vector_stream.free_tile : chunk_extent;
+          frame_cols = reduced_axis_ == 1 ? chunk_extent : vector_stream.free_tile;
+          frame_iterations = std::max<int64_t>(1, chunks);
+        }
         for (size_t i : dfs_order_) {
           if (vector_op_phase_mask_.empty() || (vector_op_phase_mask_[i] & phase) == 0) continue;
           const Op& op = prob_->ops[i];
           const bool pw = op.type != OpType::Reduction;
+          const bool grounded = pw && HasGroundedVectorSemantics(op);
+          const bool stream_start = pw && (!prev_pw || prev_pw_grounded != grounded);
+          if (op.type == OpType::Reduction && has_grounded_vector_semantics_) {
+            cycles += (double)vector_stream.work_units *
+                      (double)frame_iterations *
+                      GroundedReductionCompute(prob_, op, reduced_axis_,
+                                               frame_rows, frame_cols);
+            prev_pw = false;
+            prev_pw_grounded = false;
+            continue;
+          }
+          if (grounded) {
+            // Exact source semantics are paid once per emitted strip/chunk in
+            // every logical task.  This is deliberately not cached in
+            // CostResult: the primitive descriptor is candidate-invariant and
+            // the three scalar frame values come from this stack-local plan.
+            cycles += (double)vector_stream.work_units * (double)frame_iterations *
+                      GroundedVectorOpCompute(prob_, op, frame_rows, frame_cols,
+                                              stream_start, has_reduction_);
+            prev_pw = true;
+            prev_pw_grounded = true;
+            continue;
+          }
           double scale = 1.0;
           if (reduction_streams) {
             int64_t op_extent = prob_->tensors[op.output()].width;
@@ -2764,8 +2934,10 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                         ? (double)covered_extent / (double)std::max<int64_t>(1, vector_stream.extent)
                         : (double)chunks;
           }
-          cycles += scale * VecOpCompute(prob_, op, reduced_axis_, pw && !prev_pw);
+          cycles += scale * VecOpCompute(prob_, op, reduced_axis_, stream_start,
+                                         has_reduction_);
           prev_pw = pw;
+          prev_pw_grounded = false;
         }
         return cycles;
       };
@@ -2872,13 +3044,33 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
             add_generated_phase(kVectorPhaseFinalize, vector_stream.p4_work.finalize,
                                 /*chunk_extent=*/1, /*iterations=*/1, 1, 0.0);
         } else {
-          const double startup = (double)reduction_count_ * (prob_->vec_op_head + prob_->vec_op_tail);
-          add_phase(kVectorPhaseStats, vector_stream.stats_init.extent, 1, 1, 0.0, startup);
-          add_phase(kVectorPhaseStats, vector_stream.stats.trip_count * vector_stream.chunk,
-                    vector_stream.stats.trip_count, vector_stream.stats.pipeline_stages, 0.0,
-                    startup * vector_stream.stats.trip_count);
-          if (vector_stream.stats_tail.present)
-            add_phase(kVectorPhaseStats, vector_stream.stats_tail.extent, 1, 1, 0.0, startup);
+          if (has_grounded_vector_semantics_) {
+            add_phase(kVectorPhaseStats, vector_stream.stats_init.extent, 1, 1, 0.0);
+            add_phase(kVectorPhaseStats,
+                      vector_stream.stats.trip_count * vector_stream.chunk,
+                      vector_stream.stats.trip_count,
+                      vector_stream.stats.pipeline_stages, 0.0,
+                      GeneratedReductionMergeCompute(
+                          prob_, vector_stream, vector_stream.stats.trip_count, dtb));
+            if (vector_stream.stats_tail.present)
+              add_phase(kVectorPhaseStats, vector_stream.stats_tail.extent, 1, 1,
+                        0.0, GeneratedReductionMergeCompute(
+                                 prob_, vector_stream, 1, dtb));
+          } else {
+            const double startup =
+                (double)reduction_count_ *
+                (prob_->vec_op_head + prob_->vec_op_tail);
+            add_phase(kVectorPhaseStats, vector_stream.stats_init.extent, 1, 1,
+                      0.0, startup);
+            add_phase(kVectorPhaseStats,
+                      vector_stream.stats.trip_count * vector_stream.chunk,
+                      vector_stream.stats.trip_count,
+                      vector_stream.stats.pipeline_stages, 0.0,
+                      startup * vector_stream.stats.trip_count);
+            if (vector_stream.stats_tail.present)
+              add_phase(kVectorPhaseStats, vector_stream.stats_tail.extent, 1,
+                        1, 0.0, startup);
+          }
         }
         if (vector_stream.stream_passes == 2) {
           add_phase(kVectorPhaseApply, vector_stream.apply.trip_count * vector_stream.chunk,
@@ -3107,7 +3299,9 @@ CostResult Ascend910BCost::compute_mixed_cost(
       // tree, Fix 1; pointwise startup once per stream, Fix 3). Shared with the vector-only
       // path via VecOpCompute for one consistent cost.
       const bool pw = op.type != OpType::Reduction;
-      vector_compute += VecOpCompute(prob_, op, reduced_axis_, /*pw_stream_start=*/pw && !prev_pw);
+      vector_compute += VecOpCompute(prob_, op, reduced_axis_,
+                                     /*pw_stream_start=*/pw && !prev_pw,
+                                     has_reduction_);
       prev_pw = pw;
     }
   }

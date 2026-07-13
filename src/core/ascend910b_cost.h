@@ -345,6 +345,11 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int64_t vector_pipe_band_count_ = 2;
   int64_t vector_iter_W_ = 1;
   int64_t vector_iter_H_ = 1;
+  // True when the adapter supplied exact pto-isa primitive/geometry metadata
+  // for at least one source vector op.  Such candidates replay all source
+  // reductions and generated P1/P2 merges at the same per-task chunk frame;
+  // descriptor-free benchmark instances retain the legacy scalar anchors.
+  bool has_grounded_vector_semantics_ = false;
   // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
