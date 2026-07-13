@@ -36,9 +36,13 @@ static bool parse_vector_primitive_family(const std::string& name, VectorPrimiti
     else if (name == "div") *family = VectorPrimitiveFamily::Div;
     else if (name == "exp") *family = VectorPrimitiveFamily::Exp;
     else if (name == "log") *family = VectorPrimitiveFamily::Log;
+    else if (name == "abs") *family = VectorPrimitiveFamily::Abs;
+    else if (name == "sqrt") *family = VectorPrimitiveFamily::Sqrt;
     else if (name == "rsqrt") *family = VectorPrimitiveFamily::Rsqrt;
     else if (name == "scalar_add") *family = VectorPrimitiveFamily::ScalarAdd;
     else if (name == "scalar_mul") *family = VectorPrimitiveFamily::ScalarMul;
+    else if (name == "scalar_max") *family = VectorPrimitiveFamily::ScalarMax;
+    else if (name == "scalar_min") *family = VectorPrimitiveFamily::ScalarMin;
     else if (name == "row_sum") *family = VectorPrimitiveFamily::RowSum;
     else if (name == "row_extrema") *family = VectorPrimitiveFamily::RowExtrema;
     else if (name == "col_sum") *family = VectorPrimitiveFamily::ColSum;

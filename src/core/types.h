@@ -61,9 +61,13 @@ enum class VectorPrimitiveFamily : uint8_t {
     Div,
     Exp,
     Log,
+    Abs,
+    Sqrt,
     Rsqrt,
     ScalarAdd,
     ScalarMul,
+    ScalarMax,
+    ScalarMin,
     RowSum,
     RowExtrema,
     ColSum,
@@ -386,6 +390,17 @@ struct VectorSerialPhasePlan {
   int64_t extent = 0;
 };
 
+// Separate zero-initialization launch required before an atomic cross-core
+// reduction. Each work unit emits one row-major TEXPANDS tile followed by one
+// non-atomic UB->GM store. It is a serial phase: neither operation is hidden by
+// the main reduction body's pipeline.
+struct VectorReductionSeedPlan {
+    bool present = false;
+    int64_t work_units = 0;
+    int64_t valid_rows = 0;
+    int64_t valid_cols = 0;
+};
+
 // Grounded VECTOR primitives used by an emitter-generated online algorithm.
 // The source DAG remains authoritative for ordinary body/apply work, but P4
 // statistics replace the source reductions with softmax (m,l) or Welford/Chan
@@ -555,6 +570,7 @@ struct VectorStreamPlan {
     VectorReductionSplitKind reduction_split_kind = VectorReductionSplitKind::None;
     int64_t reduction_split_factor = 1;
     int64_t reduction_partial_extent = 0;
+    VectorReductionSeedPlan reduction_seed;
 
     // A streamed reduction is a sequence of barrier-separated phases.  Peeled
     // init/tail/finalize work is always serial; only stats/apply rolled loops

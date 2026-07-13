@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <set>
@@ -16,6 +18,17 @@
 // caller to retain the legacy structural reduction tree as an explicit fallback.
 double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
                                   int64_t valid_rows, int64_t valid_cols);
+
+// Grounded A2/A3 fit-backend latency for one emitted TCOLSUM/TCOLMAX tile.
+// Widths absent from the measured table use the same bounded interpolation as
+// row reductions. Returns -1 for a non-column family or unsupported dtype.
+double GroundedColumnReductionCycles(VectorPrimitiveFamily family, DType dtype,
+                                     int64_t valid_rows, int64_t valid_cols);
+
+// PTO-ISA A2/A3 latency of one row-major TEXPANDS at the start of a fresh
+// vector stream. The current count-mode implementation charges vector_dup's
+// 11-cycle head plus 13-cycle tail independent of valid extent.
+double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols);
 
 // ============================================================================
 // Ascend910BCost: the 910B cost model. A connected group of ops that share a
@@ -367,11 +380,23 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
   FlatSet<size_t> p4_apply_substitutions_;
-  // Candidate-invariant phase membership.  Bits are private to the .cpp;
-  // vectors are indexed by global op/tensor id and keep per-configuration plan
-  // derivation O(1) beyond its UB geometry search.
-  std::vector<uint8_t> vector_op_phase_mask_;
-  std::vector<uint8_t> vector_input_phase_mask_;
+  // Candidate-hot UB and phase replay use compact metadata prepared once in
+  // create(). Shapes remain candidate-dependent; graph positions, lifetimes,
+  // transient references, and phase membership do not.
+  struct VectorUBBandInterval {
+    size_t tensor = 0;
+    size_t first = 0;
+    size_t after_last = 0;
+  };
+  struct VectorUBTransientRef {
+    size_t tensor = 0;
+    uint8_t skip_mask = 0;
+  };
+  std::vector<VectorUBBandInterval> vector_ub_band_intervals_;
+  std::vector<VectorUBTransientRef> vector_ub_transient_refs_;
+  std::vector<size_t> vector_ub_transient_offsets_;
+  std::array<std::vector<size_t>, 4> vector_phase_ops_;
+  std::array<std::vector<size_t>, 4> vector_phase_inputs_;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).

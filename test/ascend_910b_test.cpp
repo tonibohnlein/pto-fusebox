@@ -109,6 +109,50 @@ static void test_grounded_row_reduction_formulas() {
                                      DType::BF16, 64, 64) < 0.0);
 }
 
+static void test_grounded_column_reduction_formulas() {
+    std::cout << "[G10] PTO-ISA column-reduction fit formulas preserve tile work\n";
+    CHECK_EQ("G10: FP32 TCOLSUM 64x64 matches PTO-ISA fit anchor",
+             GroundedColumnReductionCycles(VectorPrimitiveFamily::ColSum,
+                                           DType::FP32, 64, 64),
+             1263.0);
+    CHECK_EQ("G10: FP32 TCOLMAX 64x64 matches PTO-ISA fit anchor",
+             GroundedColumnReductionCycles(VectorPrimitiveFamily::ColExtrema,
+                                           DType::FP32, 64, 64),
+             1137.0);
+    CHECK_EQ("G10: FP16 TCOLSUM 64x128 matches PTO-ISA fit anchor",
+             GroundedColumnReductionCycles(VectorPrimitiveFamily::ColSum,
+                                           DType::FP16, 64, 128),
+             1263.0);
+    CHECK_EQ("G10: FP16 TCOLMAX 64x128 matches PTO-ISA fit anchor",
+             GroundedColumnReductionCycles(VectorPrimitiveFamily::ColExtrema,
+                                           DType::FP16, 64, 128),
+             1137.0);
+    const double narrow = GroundedColumnReductionCycles(
+        VectorPrimitiveFamily::ColSum, DType::FP32, 64, 64);
+    const double interpolated = GroundedColumnReductionCycles(
+        VectorPrimitiveFamily::ColSum, DType::FP32, 64, 80);
+    const double wide = GroundedColumnReductionCycles(
+        VectorPrimitiveFamily::ColSum, DType::FP32, 64, 96);
+    CHECK("G10: an AutoFuse-only width is bounded by adjacent grounded anchors",
+          interpolated > narrow && interpolated < wide);
+    CHECK("G10: column-reduction work grows with valid rows",
+          GroundedColumnReductionCycles(VectorPrimitiveFamily::ColSum,
+                                        DType::FP32, 32, 64) < narrow);
+    CHECK("G10: unsupported BF16 stays on the explicit structural fallback",
+          GroundedColumnReductionCycles(VectorPrimitiveFamily::ColSum,
+                                        DType::BF16, 64, 64) < 0.0);
+}
+
+static void test_grounded_vector_fill() {
+    std::cout << "[G6SEED] PTO-ISA TEXPANDS seed work is explicit\n";
+    CHECK_EQ("G6SEED: a fresh row-major TEXPANDS pays vector_dup head+tail",
+             GroundedVectorFillCycles(1, 64), 24.0);
+    CHECK_EQ("G6SEED: count-mode fill carries extent outside the repeat field",
+             GroundedVectorFillCycles(1, 256), 24.0);
+    CHECK("G6SEED: an empty fill is not a realizable emitted primitive",
+          GroundedVectorFillCycles(0, 64) < 0.0);
+}
+
 // HBM aggregate read floor (cycles) for one matmul C[N,M]=A[K,M]·B[N,K]: NO tiling can
 // read the operands from HBM faster than the shared aggregate bandwidth, so any feasible
 // latency is >= (M·K·bytes_a + K·N·bytes_b)/hbm_aggregate. This is the physical invariant
@@ -278,8 +322,8 @@ static void test_R_reduction_split() {
     // so the sink reduction splits its reduced axis ACROSS cores to fill them.
     CHECK("R: few-column reduction reaches the largest legal exact split",
           r.cores_used == 32 && r.parallel_split == 32);
-    CHECK_EQ("R: exact partial-replay terminal-col_sum split latency",
-             r.latency, 12207.4, 1.0);
+    CHECK_EQ("R: exact seed-plus-partial-replay terminal-col_sum split latency",
+             r.latency, 22290.7, 1.0);
 }
 
 static void test_g6_vector_reduction_split_admission() {
@@ -312,7 +356,11 @@ static void test_g6_vector_reduction_split_admission() {
               supported_plan.reduction_split_kind ==
                   VectorReductionSplitKind::ColSumAtomicAdd &&
               supported_plan.reduction_split_factor == supported.parallel_split &&
-              supported_plan.reduction_partial_extent * supported.parallel_split == 2048);
+              supported_plan.reduction_partial_extent * supported.parallel_split == 2048 &&
+              supported_plan.reduction_seed.present &&
+              supported_plan.reduction_seed.work_units == supported_plan.work_units &&
+              supported_plan.reduction_seed.valid_rows == 1 &&
+              supported_plan.reduction_seed.valid_cols == supported_plan.tile_w);
 
     Problem pointwise_cone;
     pointwise_cone.tensors = {{4, 1024}, {4, 1024}, {4, 1}};
@@ -2922,6 +2970,19 @@ static void test_source_vector_primitive_geometry() {
     CHECK_EQ("VOPS: flat mul pays 8 * (2*8 repeats + 25 fixed)", flat_mul, 328.0);
     CHECK_EQ("VOPS: scalar mul pays 8 * (1*8 repeats + 26 fixed)", scalar_mul, 272.0);
 
+    CHECK_EQ("VOPS: abs pays PTO vabs slope/fixed per strip",
+             body_cost(VectorPrimitiveFamily::Abs, VectorOpGeometry::Flat, false),
+             296.0);
+    CHECK_EQ("VOPS: sqrt pays PTO vsqrt slope/fixed per strip",
+             body_cost(VectorPrimitiveFamily::Sqrt, VectorOpGeometry::Flat, false),
+             440.0);
+    CHECK_EQ("VOPS: scalar max pays PTO vmaxs slope/fixed per strip",
+             body_cost(VectorPrimitiveFamily::ScalarMax, VectorOpGeometry::Flat, false),
+             248.0);
+    CHECK_EQ("VOPS: scalar min pays PTO vmins slope/fixed per strip",
+             body_cost(VectorPrimitiveFamily::ScalarMin, VectorOpGeometry::Flat, false),
+             304.0);
+
     const double flat_add = body_cost(VectorPrimitiveFamily::Add,
                                       VectorOpGeometry::Flat, true);
     const double row_sub = body_cost(VectorPrimitiveFamily::Add,
@@ -3131,6 +3192,8 @@ int main() {
     test_kernel_fill_one_per_core();
     test_pointwise_stream_explicit();
     test_grounded_row_reduction_formulas();
+    test_grounded_column_reduction_formulas();
+    test_grounded_vector_fill();
     test_source_vector_primitive_geometry();
     test_vector_stream_short_loop_serializes();
     test_cost_result_cache_footprint();

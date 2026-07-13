@@ -1,10 +1,10 @@
 # 910B Grounded Cost Model + SpatialSchedule
 
 This document describes the Ascend-910B cost model: the pto-isa-grounded
-coefficients, the wave/LPT makespan, and the **grid-only** SpatialSchedule that
-drives **both** the cube and the vector path. It extends `doc/910b_cost_model.md`
-(backpropagation, memory feasibility, shared-input reuse) and supersedes its §4
-roofline and §8 calibration.
+coefficients, the queue/LPT makespan, the shared SpatialSchedule grid, and the
+engine-specific `VectorStreamPlan` / `CubeSchedulePlan` derived for each candidate. It extends
+`doc/910b_cost_model.md` (backpropagation, memory feasibility, shared-input reuse) and supersedes
+its §4 roofline and §8 calibration.
 
 The 910B is the **only** cost model: every term uses the grounded pto-isa
 coefficients (per-direction bandwidths, fractal-cycle compute, L1↔L0 extract,
@@ -56,11 +56,12 @@ cube_cycles = repeats * cyc(dtype)                  cyc = 2 (fp32) else 1
 so fp32 costs 4× fp16. `cube_compute_cost` is a calibration multiplier (grounded
 value 1). → `CubeMacCycles()`.
 
-**Vector repeats** (pto-isa `cce_costmodel_vector_compute.hpp`): one vector op over
-`elems` elements costs `head + slope·ceil(elems/epr) + tail`, where the SIMD repeat
-is `REPEAT_BYTE = 256 B` (`epr = vec_reg_bytes / dtype_bytes` = 128 fp16 / 64 fp32),
-`slope` is `vec_slope_pw` (pointwise) or `vec_slope_reduce` (reduction, ~14× pw).
-→ the vector branch of `compute_cost`.
+**Vector primitives** (PTO A2/A3): a flat instruction over `elems` elements costs
+`head + slope·ceil(elems/epr) + tail`, where `REPEAT_BYTE = 256 B`
+(`epr = vec_reg_bytes / dtype_bytes` = 128 fp16 / 64 fp32). Row/column reductions
+instead use PTO's profiled formula tables at their valid 2D frame. The adapter records which exact
+lowering applies and `VectorStreamPlan` replays it per emitted invocation. → §7 and
+`GroundedVectorOpCompute()`.
 
 ---
 
@@ -238,20 +239,28 @@ roofline(p) = max(compute_mk[p], io[p])   # stage-2 rolled loop
 compute_mk[p] = WaveComputeCycles(Σ_op∈p VecOpCompute(op), num_tiles, C)
 ```
 
-**Wave-aware** like the cube (a balanced `num_tiles == C` grid, one wave, beats an
-over-tiled count). `compute_mk` is the full-op work distributed over the tiles.
+**Queue-makespan aware** like the cube. `num_tiles` is the logical task/SPMD count; each task owns
+one large logical region and streams its inner strips/chunks on one core. `compute_mk` distributes
+the sum of those valid-region costs through `ceil(num_tiles/C)` queue rounds. There is no emitted
+wave identity or affinity.
 
-**Per-op compute — `VecOpCompute` (grounded, pto-isa `vec_tile_study`).**
+**Per-op compute — `GroundedVectorOpCompute` (grounded in PTO-ISA).**
 
-- *Pointwise:* `slope·ceil(elems/epr)` + `head+tail` **once per back-to-back stream** (Fix 3:
-  the perf-sim pays startup only when the VEC queue is empty, so a fused elementwise chain
-  overlaps its startup — reductions / matmuls break the stream). `elems` = the op's largest
-  tensor, tiling-invariant; `epr = vec_reg_bytes/dtype_bytes`.
-- *Reduction (Fix 1):* a reduction is **not** a single `slope_reduce·repeat` op — it lowers
-  to a barrier-separated **tree** of count-mode passes, so its cost tracks the **reduced
-  axis**, not `ROWS·COLS`. Reduce-W (row reduction): `45·(K−1)+51`, `K=W/epr` — **ROWS-
-  independent**. Reduce-H (col reduction, binary): `16·(H−1)+30·log₂H`. The old
-  `slope_reduce·(ROWS·COLS/epr)` overcounted a tall row-reduce **up to 19×** (`vec_reduce`).
+- The PyPTO adapter records a compact primitive and emitted geometry for exact one-instruction
+  lowerings: arithmetic/transcendentals, abs/sqrt/neg, scalar and row/column broadcast forms,
+  exact part add/mul/max/min, and supported reductions. Candidate costing replays each descriptor at
+  every emitted strip/chunk/task. Composite or alias-sensitive operations stay visibly `Generic`.
+- *Pointwise:* `slope·ceil(elems/epr) + head+tail`, with startup shared only inside one actual
+  back-to-back vector run. Barrier-bearing row expansion starts a new run. This charges startup per
+  emitted invocation rather than fractionally scaling one whole-tensor call.
+- *Reduction:* FP32/FP16 row and column sum/extrema use the PTO A2/A3 formula tables. Each anchor is
+  evaluated as `round(slope(cols)·valid_rows·cols + bias(cols))`; legal between-anchor shapes
+  interpolate adjacent total-cycle values. Unsupported dtypes and descriptor-free research inputs
+  use the named structural-tree fallback. Generated P1/P2 merges and P4 online-stat work use the
+  same grounded primitive table, so work absent from the source DAG is still charged.
+- *Split seed:* a terminal materialized `col_sum` split records a separate serial seed launch.
+  `TEXPANDS` contributes 24 cycles for each nonempty seed tile, followed by its UB→GM store; seed
+  tasks and kernel-fill rounds are additive and cannot hide beneath the atomic-body roofline.
 
 **Double-buffer floor (vector).** The `max()` overlap holds only for an emitted
 rolled loop with at least two trips whose per-strip transfer spans one vector
@@ -280,6 +289,15 @@ loop earns `max(compute,DDR)`, while barriers and sub-register/short loops use `
 input phase masks price stats-only, apply-only, and shared inputs separately (including repeated
 broadcast chunks). `CostResult` retains only cost/config metadata; AutoFuse re-derives and consumes
 the same plan for the final or explicitly forced configuration.
+
+**Candidate-evaluation complexity.** `create()` computes graph-only facts once: UB band intervals,
+flattened transient tensor references, and ordered op/input lists for each phase. A candidate still
+derives its shape-dependent bytes, chunk, loop stages, and cost, but it does not rebuild
+producer/consumer positions or phase cones. The UB sweep uses inline delta storage through 64 ops
+and falls back to a local vector for deeper groups. Thus evaluation is linear in the selected
+subgraph plus a constant number of P1/P2/P4 phases; special streaming kinds do not multiply the tile
+enumeration.
+The local-search cache continues to retain only `CostResult`, not a stream plan.
 
 **Logical-region identity (A1/G5).** `parts_m * parts_n` is both the solver work-unit and SPMD-block
 count. Candidate generation may use the DMA granule to bound useful counts, but
@@ -443,17 +461,14 @@ Among equal-latency configs, lexicographic:
 
 ## 12. Known limitations / open calibration
 
-- **Calibration constants (perf-sim-grounded, device-eval-pending).** The reduction tree
-  (`45/51/16/30`, §7 Fix 1), streaming surcharge (Fix 2), and per-op startup (Fix 3, once-per-
-  stream via `pw_stream_start`) are perf-sim-grounded (`pto-isa vec_tile_study`, R²≈1.0) but
-  device-eval-pending (count-mode flat-per-pass is itself coarse vs real HW). The vector
-  double-buffer threshold (`2·vec_reg_bytes`) and DMA-shape burst (`vec_reg_bytes`) remain
-  reasoned bounds, not measured. The stream-break heuristic (reductions/matmuls reset the chain)
-  approximates the true VEC-queue-empty condition; exact only when the op order matches the emit.
-- **Per-tile compute overhead.** The vector *compute* is still tiling-invariant
-  (full-op cost) — it charges no per-tile SIMD pipeline-fill. So among same-width
-  tiles, "favor larger tiles" is a *tiebreak* (§10.5), not cost-driven. (The DMA
-  shape *is* now cost-driven, via §7.)
+- **Remaining vector calibration.** Row/column reduction work comes directly from PTO A2/A3 fit
+  tables, and the G7/G8/G9 phase model is silicon-validated. The double-buffer threshold
+  (`2·vec_reg_bytes`) and DMA-shape burst (`vec_reg_bytes`) remain reasoned machine bounds rather
+  than separately fitted device constants. Count-mode startup sharing is exact only when the
+  descriptor order matches the emitted vector run; barriers deliberately break the run.
+- **Short-grid ranking.** Grounded valid-row work fixed the tall-softmax under-parallel plan, but
+  `[128,8192]` mildly over-splits to 48 tasks (about 7.1% wall regret versus 16 tasks). This is a
+  bounded ranking/calibration issue, not a task-count, traffic, or emitted-grid mismatch.
 - **Pure-cube plan buildability.** AutoFuse emits uniform multi-matmul grids from
   `CubeSchedulePlan`, including split seed/atomic stores. Unequal multi-op grids and identical
   deduplicated boundary requests are declined. Lone ceil+clamp is numeric but can exceed LPT work.

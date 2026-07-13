@@ -44,12 +44,14 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 // lowers to a barrier-separated tree. The stub's count-mode accounting is,
 // however, rows-independent; PTO-ISA explicitly documents that simplification
 // as inaccurate on hardware. Exact PyPTO TROWSUM/TROWMAX descriptors therefore
-// use the fit-backend table below, while descriptor-free research instances and
-// unsupported dtypes retain this structural fallback.
+// use the fit-backend tables below, while descriptor-free research instances
+// and unsupported dtypes retain this structural fallback.
 constexpr double kVecRowReducePass = 45.0;   // per barrier-isolated count-mode vadd pass
 constexpr double kVecRowReduceFinal = 51.0;  // K=1 base (the final cross-lane vcadd block)
 constexpr double kVecColReduceSlope = 16.0;  // streamed count-mode vadd per row-pair
 constexpr double kVecColReduceLevel = 30.0;  // per-level startup (log2(H) barriers)
+constexpr double kVecExpandScalarHead = 11.0;
+constexpr double kVecExpandScalarTail = 13.0;
 
 // PTO-ISA A2/A3 formula backend, formula_params.csv @ d5eaf8e4. Each grounded
 // entry predicts round(slope * valid_rows * valid_cols + bias) cycles and is
@@ -58,27 +60,27 @@ constexpr double kVecColReduceLevel = 30.0;  // per-level startup (log2(H) barri
 // two neighboring total-cycle predictions for the requested valid row count.
 // Above the measured range, proportional continuation from the last anchor is
 // deliberately monotone and introduces no new fitted coefficient.
-struct RowReductionFormula {
+struct AxisReductionFormula {
   int64_t cols;
   double slope;
   double bias;
 };
 
-constexpr std::array<RowReductionFormula, 12> kRowMaxFp32{{
+constexpr std::array<AxisReductionFormula, 12> kRowMaxFp32{{
     {8, 0.875, 46},       {32, 0.2188, 47},   {64, 0.1094, 32},
     {96, 0.0937, 61},     {128, 0.0625, 48},  {144, 0.0692, 77},
     {176, 0.0558, 79},    {208, 0.0517, 100}, {240, 0.0448, 100},
     {272, 0.0485, 98},    {304, 0.0434, 110}, {336, 0.0418, 131},
 }};
 
-constexpr std::array<RowReductionFormula, 12> kRowSumFp32{{
+constexpr std::array<AxisReductionFormula, 12> kRowSumFp32{{
     {8, 0.875, 58},       {32, 0.2187, 59},   {64, 0.1094, 44},
     {96, 0.0938, 75},     {128, 0.0625, 61.5}, {144, 0.0698, 92},
     {176, 0.0575, 93},    {208, 0.0535, 99},  {240, 0.0469, 99},
     {272, 0.0484, 104},   {304, 0.0431, 104}, {336, 0.0419, 121},
 }};
 
-constexpr std::array<RowReductionFormula, 20> kRowMaxFp16{{
+constexpr std::array<AxisReductionFormula, 20> kRowMaxFp16{{
     {32, 0.2187, 48},   {64, 0.1094, 43},   {96, 0.0729, 43},
     {128, 0.0547, 33},  {160, 0.0562, 62},  {208, 0.0433, 63},
     {240, 0.0388, 62},  {272, 0.0369, 74},  {304, 0.0323, 80},
@@ -88,7 +90,7 @@ constexpr std::array<RowReductionFormula, 20> kRowMaxFp16{{
     {624, 0.022, 127},  {656, 0.0224, 125},
 }};
 
-constexpr std::array<RowReductionFormula, 20> kRowSumFp16{{
+constexpr std::array<AxisReductionFormula, 20> kRowSumFp16{{
     {32, 0.2188, 62},   {64, 0.1094, 57},   {96, 0.0729, 57},
     {128, 0.0547, 47},  {160, 0.0563, 78},  {208, 0.0436, 79},
     {240, 0.0391, 79},  {272, 0.0366, 94},  {304, 0.0323, 102},
@@ -98,16 +100,44 @@ constexpr std::array<RowReductionFormula, 20> kRowSumFp16{{
     {624, 0.0208, 140}, {656, 0.0213, 126},
 }};
 
+constexpr std::array<AxisReductionFormula, 5> kColMaxFp32{{
+    {8, 2.125, 24}, {32, 0.5391, 16}, {64, 0.2734, 17},
+    {96, 0.3646, 2}, {128, 0.1571, 10},
+}};
+
+constexpr std::array<AxisReductionFormula, 6> kColMaxFp16{{
+    {32, 0.5352, 16}, {64, 0.2695, 16}, {96, 0.1836, 19},
+    {128, 0.1367, 17}, {160, 0.2187, 2}, {192, 0.1823, 2.3325},
+}};
+
+constexpr std::array<AxisReductionFormula, 13> kColSumFp32{{
+    {8, 2.375, 29}, {16, 1.1958, 18.271}, {32, 0.6016, 15},
+    {64, 0.3047, 15}, {96, 0.2187, 14}, {128, 0.1728, 8},
+    {144, 0.1578, 27}, {176, 0.1314, 30}, {208, 0.1166, 36},
+    {240, 0.1031, 36}, {272, 0.096, 35}, {304, 0.0876, 35},
+    {336, 0.0833, 34},
+}};
+
+constexpr std::array<AxisReductionFormula, 21> kColSumFp16{{
+    {16, 1.1916, 20.664}, {32, 0.5977, 15}, {64, 0.3008, 15},
+    {96, 0.2044, 15}, {128, 0.1523, 15}, {160, 0.1312, 14},
+    {208, 0.1029, 25}, {240, 0.09, 28}, {272, 0.0838, 27},
+    {304, 0.0755, 30}, {336, 0.069, 30}, {368, 0.069, 30},
+    {400, 0.0616, 29}, {432, 0.057, 36}, {464, 0.0536, 36},
+    {496, 0.0507, 36}, {528, 0.0498, 35}, {560, 0.0474, 35},
+    {592, 0.0453, 35}, {624, 0.0434, 35}, {656, 0.0431, 34},
+}};
+
 template <size_t N>
-double InterpolateRowReductionCycles(const std::array<RowReductionFormula, N> &table,
-                                     int64_t valid_rows, int64_t valid_cols) {
+double InterpolateReductionCycles(const std::array<AxisReductionFormula, N> &table,
+                                  int64_t valid_rows, int64_t valid_cols) {
   if (valid_rows <= 0 || valid_cols <= 0) return -1.0;
-  auto at = [&](const RowReductionFormula &entry) {
+  auto at = [&](const AxisReductionFormula &entry) {
     return entry.slope * (double)valid_rows * (double)entry.cols + entry.bias;
   };
   const auto upper = std::lower_bound(
       table.begin(), table.end(), valid_cols,
-      [](const RowReductionFormula &entry, int64_t cols) { return entry.cols < cols; });
+      [](const AxisReductionFormula &entry, int64_t cols) { return entry.cols < cols; });
   if (upper == table.begin()) return std::round(at(*upper));
   if (upper == table.end()) {
     const auto &last = table.back();
@@ -126,11 +156,25 @@ double GroundedRowReductionCyclesImpl(VectorPrimitiveFamily family, DType dtype,
   const bool extrema = family == VectorPrimitiveFamily::RowExtrema;
   if (!sum && !extrema) return -1.0;
   if (dtype == DType::FP32)
-    return sum ? InterpolateRowReductionCycles(kRowSumFp32, valid_rows, valid_cols)
-               : InterpolateRowReductionCycles(kRowMaxFp32, valid_rows, valid_cols);
+    return sum ? InterpolateReductionCycles(kRowSumFp32, valid_rows, valid_cols)
+               : InterpolateReductionCycles(kRowMaxFp32, valid_rows, valid_cols);
   if (dtype == DType::FP16)
-    return sum ? InterpolateRowReductionCycles(kRowSumFp16, valid_rows, valid_cols)
-               : InterpolateRowReductionCycles(kRowMaxFp16, valid_rows, valid_cols);
+    return sum ? InterpolateReductionCycles(kRowSumFp16, valid_rows, valid_cols)
+               : InterpolateReductionCycles(kRowMaxFp16, valid_rows, valid_cols);
+  return -1.0;
+}
+
+double GroundedColumnReductionCyclesImpl(VectorPrimitiveFamily family, DType dtype,
+                                         int64_t valid_rows, int64_t valid_cols) {
+  const bool sum = family == VectorPrimitiveFamily::ColSum;
+  const bool extrema = family == VectorPrimitiveFamily::ColExtrema;
+  if (!sum && !extrema) return -1.0;
+  if (dtype == DType::FP32)
+    return sum ? InterpolateReductionCycles(kColSumFp32, valid_rows, valid_cols)
+               : InterpolateReductionCycles(kColMaxFp32, valid_rows, valid_cols);
+  if (dtype == DType::FP16)
+    return sum ? InterpolateReductionCycles(kColSumFp16, valid_rows, valid_cols)
+               : InterpolateReductionCycles(kColMaxFp16, valid_rows, valid_cols);
   return -1.0;
 }
 
@@ -144,6 +188,19 @@ constexpr uint8_t kVectorPhaseBody = 1u << 0;
 constexpr uint8_t kVectorPhaseStats = 1u << 1;
 constexpr uint8_t kVectorPhaseApply = 1u << 2;
 constexpr uint8_t kVectorPhaseFinalize = 1u << 3;
+constexpr std::array<uint8_t, 4> kVectorPhases{
+    kVectorPhaseBody, kVectorPhaseStats, kVectorPhaseApply,
+    kVectorPhaseFinalize};
+constexpr uint8_t kSkipRetainedFromPrev = 1u << 0;
+constexpr uint8_t kSkipRetainThese = 1u << 1;
+constexpr uint8_t kSkipAnyRetained =
+    kSkipRetainedFromPrev | kSkipRetainThese;
+
+size_t VectorPhaseIndex(uint8_t phase) {
+  for (size_t i = 0; i < kVectorPhases.size(); ++i)
+    if (kVectorPhases[i] == phase) return i;
+  return 0;
+}
 
 struct VectorPrimitiveGrounding {
   double slope;
@@ -161,9 +218,13 @@ inline VectorPrimitiveGrounding PrimitiveGrounding(VectorPrimitiveFamily family)
     case VectorPrimitiveFamily::Div: return {4.0, 30.0, true};
     case VectorPrimitiveFamily::Exp: return {2.0, 31.0, false};
     case VectorPrimitiveFamily::Log: return {2.0, 33.0, false};
+    case VectorPrimitiveFamily::Abs: return {1.0, 29.0, false};
+    case VectorPrimitiveFamily::Sqrt: return {2.0, 39.0, false};
     case VectorPrimitiveFamily::Rsqrt: return {1.0, 24.0, false};
     case VectorPrimitiveFamily::ScalarAdd: return {1.0, 31.0, false};
     case VectorPrimitiveFamily::ScalarMul: return {1.0, 26.0, false};
+    case VectorPrimitiveFamily::ScalarMax: return {1.0, 23.0, false};
+    case VectorPrimitiveFamily::ScalarMin: return {1.0, 30.0, false};
     case VectorPrimitiveFamily::RowSum:
     case VectorPrimitiveFamily::RowExtrema:
     case VectorPrimitiveFamily::ColSum:
@@ -248,6 +309,9 @@ inline double GroundedReductionCompute(const Problem *p, const Op &op, int reduc
   const int64_t epr = std::max<int64_t>(1, reg / dtype_bytes(dtype));
   const VectorFrameShape shape = OpFrameShape(p, op, frame_rows, frame_cols);
   if (reduced_axis == 2) {
+    const double grounded =
+        GroundedColumnReductionCycles(op.vector_primitive, dtype, shape.rows, shape.cols);
+    if (grounded >= 0.0) return grounded;
     return kVecColReduceSlope * (double)std::max<int64_t>(0, shape.rows - 1) +
            kVecColReduceLevel *
                (shape.rows > 1 ? std::log2((double)shape.rows) : 0.0);
@@ -583,6 +647,19 @@ double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPa
 double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
                                   int64_t valid_rows, int64_t valid_cols) {
   return GroundedRowReductionCyclesImpl(family, dtype, valid_rows, valid_cols);
+}
+
+double GroundedColumnReductionCycles(VectorPrimitiveFamily family, DType dtype,
+                                     int64_t valid_rows, int64_t valid_cols) {
+  return GroundedColumnReductionCyclesImpl(family, dtype, valid_rows, valid_cols);
+}
+
+double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols) {
+  if (valid_rows <= 0 || valid_cols <= 0) return -1.0;
+  // TEXPANDS uses count-mode vector_dup(repeat=0). At a fresh seed-kernel
+  // boundary PTO-ISA's vector queue is empty, so only its calibrated stream
+  // head and tail remain; the valid extent is carried by SetVectorCount.
+  return kVecExpandScalarHead + kVecExpandScalarTail;
 }
 
 // ============================================================================
@@ -1520,8 +1597,11 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // interval count in O(|ops|+|edges|+|tensors|), rather than its O(ops^2)
     // nested scan.
     std::vector<int> first(num_tensors, INT_MAX), last(num_tensors, -1);
+    std::vector<int> vector_pos(num_ops, -1);
     for (int step = 0; step < (int)sg.dfs_order_.size(); ++step) {
-      const Op& op = prob.ops[sg.dfs_order_[(size_t)step]];
+      const size_t op_idx = sg.dfs_order_[(size_t)step];
+      vector_pos[op_idx] = step;
+      const Op& op = prob.ops[op_idx];
       if (op.type == OpType::MatMul) continue;
       const size_t out = op.output();
       first[out] = std::min(first[out], step);
@@ -1544,11 +1624,58 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     }
     sg.vector_pipe_band_count_ = std::max<int64_t>(2, (int64_t)peak_live + 1);
 
-    sg.vector_op_phase_mask_.assign(num_ops, 0);
-    sg.vector_input_phase_mask_.assign(num_tensors, 0);
+    // Cache the candidate-invariant UB liveness topology. The tensor byte
+    // contribution still depends on cfg/chunk, but producer/last-consumer
+    // positions and transient membership do not. This replaces three local
+    // vectors plus an interval-expansion loop in every vector_peak_ub() call.
+    std::vector<bool> is_ub_band(num_tensors, false);
+    for (size_t tensor : sg.ephemeral_) {
+      const int producer = dag.tensor_producer[tensor];
+      if (producer >= 0 && prob.ops[(size_t)producer].type == OpType::MatMul)
+        continue;
+      const int first_step =
+          producer >= 0 && vector_pos[(size_t)producer] >= 0
+              ? vector_pos[(size_t)producer]
+              : 0;
+      int last_consumer = -1;
+      for (size_t consumer : dag.tensor_consumers[tensor]) {
+        const int step = vector_pos[consumer];
+        if (step >= 0 && prob.ops[consumer].type != OpType::MatMul)
+          last_consumer = std::max(last_consumer, step);
+      }
+      if (last_consumer < 0) continue;
+      sg.vector_ub_band_intervals_.push_back(
+          {tensor, (size_t)first_step, (size_t)last_consumer + 1});
+      is_ub_band[tensor] = true;
+    }
+
+    sg.vector_ub_transient_offsets_.reserve(sg.dfs_order_.size() + 1);
+    sg.vector_ub_transient_offsets_.push_back(0);
+    for (size_t op_idx : sg.dfs_order_) {
+      const Op& op = prob.ops[op_idx];
+      if (op.type != OpType::MatMul) {
+        for (size_t input : op.inputs) {
+          if (!is_ub_band[input])
+            sg.vector_ub_transient_refs_.push_back(
+                {input, kSkipAnyRetained});
+        }
+        // Reduction lowering owns a distinct work/layout tile even when the
+        // source is already a live or retained band.
+        if (op.type == OpType::Reduction && !op.inputs.empty())
+          sg.vector_ub_transient_refs_.push_back({op.inputs[0], 0});
+        const size_t output = op.output();
+        if (!is_ub_band[output])
+          sg.vector_ub_transient_refs_.push_back({output, kSkipRetainThese});
+      }
+      sg.vector_ub_transient_offsets_.push_back(
+          sg.vector_ub_transient_refs_.size());
+    }
+
+    std::vector<uint8_t> vector_op_phase_mask(num_ops, 0);
+    std::vector<uint8_t> vector_input_phase_mask(num_tensors, 0);
     for (size_t op : sg.ops_)
       if (prob.ops[op].type != OpType::MatMul)
-        sg.vector_op_phase_mask_[op] |= kVectorPhaseBody;
+        vector_op_phase_mask[op] |= kVectorPhaseBody;
 
     if (sg.has_reduction_) {
       FlatSet<size_t> reduction_ops;
@@ -1569,7 +1696,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
           if (seen[op] || !is_in_sg[op] || stops.count(op)) continue;
           if (prob.ops[op].type == OpType::MatMul) continue;
           seen[op] = true;
-          sg.vector_op_phase_mask_[op] |= phase;
+          vector_op_phase_mask[op] |= phase;
           for (size_t input : prob.ops[op].inputs) {
             const int producer = dag.tensor_producer[input];
             if (producer >= 0 && is_in_sg[(size_t)producer]) stack.push_back((size_t)producer);
@@ -1585,11 +1712,22 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
 
     for (size_t op : sg.ops_) {
       if (prob.ops[op].type == OpType::MatMul) continue;
-      const uint8_t phases = sg.vector_op_phase_mask_[op];
+      const uint8_t phases = vector_op_phase_mask[op];
       for (size_t input : prob.ops[op].inputs) {
         const int producer = dag.tensor_producer[input];
-        if (producer < 0 || !is_in_sg[(size_t)producer]) sg.vector_input_phase_mask_[input] |= phases;
+        if (producer < 0 || !is_in_sg[(size_t)producer])
+          vector_input_phase_mask[input] |= phases;
       }
+    }
+
+    for (size_t phase_idx = 0; phase_idx < kVectorPhases.size(); ++phase_idx) {
+      const uint8_t phase = kVectorPhases[phase_idx];
+      for (size_t op : sg.dfs_order_)
+        if ((vector_op_phase_mask[op] & phase) != 0)
+          sg.vector_phase_ops_[phase_idx].push_back(op);
+      for (size_t tensor : sg.boundary_inputs_)
+        if ((vector_input_phase_mask[tensor] & phase) != 0)
+          sg.vector_phase_inputs_[phase_idx].push_back(tensor);
     }
   }
 
@@ -2291,8 +2429,6 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
                                  const FlatSet<size_t> &retain_these,
                                  int64_t reduce_chunk, int stream_axis) const {
   const auto &order = dfs_order_;
-  std::vector<int> pos(prob_->num_ops(), -1);
-  for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
 
   // Tile footprint. The reduced axis of a reduction is READ FULL (FIXED_1 role), so
   // size it from the TENSOR's own extent — NOT the thin output-derived cfg on that
@@ -2332,26 +2468,22 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     return tw_al * th_al * dtype_bytes(prob_->tensors[t].dtype);
   };
 
-  // Ephemeral bands resident across [producer, last in-subgraph VECTOR consumer].
-  // A vector->vector ephemeral is a UB band; a CUBE-produced ephemeral (a
-  // cube->vector crossing) is NOT — it streams through the GM ring, so it is only
-  // a transient at the consuming step (below). Homogeneous vector: every ephemeral
-  // is vector-produced and vector-consumed, so is_ub_band == ephemeral and this is
-  // unchanged; it only differs inside a mixed group.
-  std::vector<int64_t> band_at(order.size(), 0);
-  std::vector<bool> is_ub_band(prob_->num_tensors(), false);
-  for (size_t t : ephemeral_) {
-    int pr = dag_->tensor_producer[t];
-    if (pr >= 0 && prob_->ops[(size_t)pr].type == OpType::MatMul) continue;  // crossing
-    int prod = (pr >= 0 && pos[pr] >= 0) ? pos[pr] : 0;
-    int last_vec = -1;
-    for (auto c : dag_->tensor_consumers[t])
-      if (pos[c] >= 0 && prob_->ops[c].type != OpType::MatMul)
-        last_vec = std::max(last_vec, pos[c]);
-    if (last_vec < 0) continue;  // no in-subgraph vector consumer -> not a UB band
-    const int64_t b = tile_bytes(t);
-    for (int s = prod; s <= last_vec; ++s) band_at[s] += b;
-    is_ub_band[t] = true;
+  // Ephemeral vector bands use candidate-invariant intervals built once in
+  // create(). Only their cfg/chunk-dependent byte sizes are replayed here.
+  constexpr size_t kInlineVectorOps = 64;
+  std::array<int64_t, kInlineVectorOps + 1> inline_band_delta;
+  std::vector<int64_t> heap_band_delta;
+  int64_t* band_delta = inline_band_delta.data();
+  if (order.size() > kInlineVectorOps) {
+    heap_band_delta.assign(order.size() + 1, 0);
+    band_delta = heap_band_delta.data();
+  } else {
+    std::fill_n(band_delta, order.size() + 1, 0);
+  }
+  for (const VectorUBBandInterval& interval : vector_ub_band_intervals_) {
+    const int64_t bytes = tile_bytes(interval.tensor);
+    band_delta[interval.first] += bytes;
+    band_delta[interval.after_last] -= bytes;
   }
 
   // Retained (coupling) tensors resident across the subgraph (disabled on 910B).
@@ -2361,25 +2493,25 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     if (!retained_from_prev.count(t)) base += prob_->tensors[t].size_bytes();
 
   int64_t peak = 0;
+  int64_t live_bands = 0;
   for (int s = 0; s < (int)order.size(); ++s) {
+    live_bands += band_delta[(size_t)s];
     const Op &op = prob_->ops[order[s]];
     if (op.type == OpType::MatMul) continue;  // cube op: not in the UB (vector) sweep
     int64_t transient = 0;
-    // UB-band inputs are already in band_at; a non-band input is a transient tile
-    // (a boundary read, or a crossing tile popped from the GM ring).
-    for (auto in : op.inputs)
-      if (!is_ub_band[in] && !retained_from_prev.count(in) && !retain_these.count(in))
-        transient += tile_bytes(in);
-    // Tensor reduction lowering needs a layout/count-mode work tile in addition
-    // to the source tile (observed as exactly two full input bands at
-    // AllocateMemoryAddr).  This applies whether the source is a boundary load
-    // or an already-live ephemeral.  Without this materialization floor a
-    // [free, full-reduced-axis] band can look UB-feasible and then allocate 2x
-    // that band downstream (the G1-threshold row_max crash).
-    if (op.type == OpType::Reduction && !op.inputs.empty()) transient += tile_bytes(op.inputs[0]);
-    const size_t o = op.output();  // boundary/crossing output tile (resident while written)
-    if (!is_ub_band[o] && !retain_these.count(o)) transient += tile_bytes(o);
-    peak = std::max(peak, base + band_at[s] + transient);
+    const size_t begin = vector_ub_transient_offsets_[(size_t)s];
+    const size_t end = vector_ub_transient_offsets_[(size_t)s + 1];
+    for (size_t ref_idx = begin; ref_idx < end; ++ref_idx) {
+      const VectorUBTransientRef& ref = vector_ub_transient_refs_[ref_idx];
+      if ((ref.skip_mask & kSkipRetainedFromPrev) != 0 &&
+          retained_from_prev.count(ref.tensor))
+        continue;
+      if ((ref.skip_mask & kSkipRetainThese) != 0 &&
+          retain_these.count(ref.tensor))
+        continue;
+      transient += tile_bytes(ref.tensor);
+    }
+    peak = std::max(peak, base + live_bands + transient);
   }
   return peak;
 }
@@ -2511,6 +2643,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       plan.reduction_split_kind = vector_reduction_split_kind_;
       plan.reduction_split_factor = cfg.split_k;
       plan.reduction_partial_extent = reduced_extent_ / cfg.split_k;
+      plan.reduction_seed = {/*present=*/true, plan.work_units,
+                             /*valid_rows=*/out_H_,
+                             /*valid_cols=*/plan.tile_w};
     }
 
     if (!materializes) {
@@ -3085,8 +3220,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         const int64_t frame_work_units =
             override_work_units > 0 ? override_work_units
                                     : vector_stream.work_units;
-        for (size_t i : dfs_order_) {
-          if (vector_op_phase_mask_.empty() || (vector_op_phase_mask_[i] & phase) == 0) continue;
+        for (size_t i : vector_phase_ops_[VectorPhaseIndex(phase)]) {
           const Op& op = prob_->ops[i];
           const bool pw = op.type != OpType::Reduction;
           const bool grounded = pw && HasGroundedVectorSemantics(op);
@@ -3163,9 +3297,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       };
       auto input_cycles = [&](uint8_t phase, int64_t covered_extent, int64_t chunks) {
         double cycles = 0.0;
-        for (size_t tensor : boundary_inputs_) {
+        for (size_t tensor : vector_phase_inputs_[VectorPhaseIndex(phase)]) {
           if (retained_from_prev.count(tensor)) continue;
-          if (!vector_input_phase_mask_.empty() && (vector_input_phase_mask_[tensor] & phase) == 0) continue;
           const double bytes = reduction_streams ? streamed_tensor_bytes(tensor, covered_extent, chunks)
                                                  : body_tensor_bytes(tensor);
           cycles += bytes * bc.ub_in * dma_pen;
@@ -3336,11 +3469,27 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         };
         auto apply_S = [&](int64_t S) {
           const RS e = eval_reduce_S(S);
-          lat = e.lat;
+          const VectorReductionSeedPlan& seed = vector_stream.reduction_seed;
+          const double seed_active =
+              (double)std::min<int64_t>(seed.work_units, n_cores);
+          const double seed_compute_work =
+              (double)seed.work_units *
+              GroundedVectorFillCycles(seed.valid_rows, seed.valid_cols);
+          const double seed_compute =
+              WaveComputeCycles(seed_compute_work, seed.work_units, n_cores);
+          const double seed_store_cycles =
+              (double)seed.work_units * (double)seed.valid_rows *
+              (double)seed.valid_cols * (double)dtb * bc.ub_out * dma_pen;
+          const double seed_ddr =
+              seed_store_cycles / par(seed_active, prob_->bw_ub_gm);
+          // The seed launch completes before the atomic body is runnable.
+          // TEXPANDS also precedes its dependent store, so this phase is a
+          // serial compute+DDR sum rather than another roofline maximum.
+          lat = e.lat + seed_compute + seed_ddr;
           result.parallel_split = (int)S;
           result.cores_used = (int)e.eff;
-          result.compute_bound = e.compute >= e.ddr;
-          result.ddr_traffic = e.ddr;
+          result.compute_bound = e.compute + seed_compute >= e.ddr + seed_ddr;
+          result.ddr_traffic = e.ddr + seed_ddr;
         };
         // SpatialSchedule owns one concrete split factor. Ad-hoc cfg.split_k=0
         // has no reconstructable emit descriptor and therefore stays serial.
@@ -3352,8 +3501,13 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // Charge each launched work unit (num_tiles spatial x the reduced-axis split) a small grounded
       // overhead so best_cost separates them toward fewer tasks. Self-gates: negligible vs a big
       // kernel's compute, comparable-to-compute for small ones. Vector-only (device-grounded here).
-      result.latency = lat + (double)num_tiles * (double)std::max(1, result.parallel_split) *
-                                 (double)prob_->per_task_overhead_cycles;
+      const int64_t seed_tasks = vector_stream.reduction_seed.present
+                                     ? vector_stream.reduction_seed.work_units
+                                     : 0;
+      result.latency =
+          lat + ((double)num_tiles * (double)std::max(1, result.parallel_split) +
+                 (double)seed_tasks) *
+                    (double)prob_->per_task_overhead_cycles;
     }
     // Per-kernel pipeline fill — the DUAL of the eff core-fill incentive. A
     // tiling produces num_tiles "kernels"; each core runs ceil(num_tiles/n_cores)
@@ -3364,7 +3518,12 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
     // => no fill term.
     if (prob_->kernel_fill_cost > 0) {
       const int64_t rounds = (num_tiles + n_cores - 1) / n_cores;
-      result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
+      const int64_t seed_rounds = vector_stream.reduction_seed.present
+                                      ? (vector_stream.reduction_seed.work_units + n_cores - 1) /
+                                            n_cores
+                                      : 0;
+      result.latency += (double)(rounds + seed_rounds) *
+                        (double)prob_->kernel_fill_cost;
     }
   }
 
