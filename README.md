@@ -1,19 +1,30 @@
-# mlsys26
+# PTO Fusebox
 
-Track A submission for the MLSys 2026 Scheduling Contest. C++ solver
-that takes a JSON description of a computation graph plus hardware
-constraints and emits a JSON schedule (subgraph grouping, tile
-granularities, retention sets, traversal orders) minimising total
-roofline latency.
+PTO Fusebox is a solver-driven fusion and tiling engine for tensor-operation
+graphs. It partitions a DAG into convex kernel groups, selects each group's
+tile/grid/split strategy, and exposes the execution schedule needed by a
+faithful kernel emitter.
+
+The current hardware model targets the Ascend 910B. It includes:
+
+- grounded vector primitive, reduction, DMA, and launch costs;
+- `VectorStreamPlan` schedules for materialized, streamed, and online
+  multi-stat reductions;
+- recursive `CubeSchedulePlan` schedules for matmuls and matmul DAGs;
+- an experimental mixed cube/vector model; and
+- compact cost evaluation suitable for local-search enumeration.
+
+The repository began as a Track A entry for the MLSys 2026 Scheduling Contest
+and was subsequently developed into the scheduling and cost-model component of
+PyPTO AutoFuse. The historical `mlsys` and `mlsys_mixed` executable names are
+retained for command-line compatibility; embedders normally link `solver_lib`.
 
 ## Requirements
 
 - Linux x86_64 (Ubuntu 22.04 LTS or compatible)
-- C++20 compiler — `g++ 12` or newer recommended (gcc 11.4 has a
-  miscompile that produces infeasible solutions on this code base)
-- CMake ≥ 3.16
-- `nlohmann-json3-dev` (Debian/Ubuntu) or `nlohmann-json-devel`
-  (Fedora/RHEL)
+- A C++20 compiler (`g++-12` or newer is recommended)
+- CMake 3.16 or newer
+- `nlohmann-json3-dev` on Debian/Ubuntu, or `nlohmann-json-devel` on Fedora/RHEL
 
 On Ubuntu 22.04:
 
@@ -23,80 +34,63 @@ sudo apt install build-essential cmake g++-12 nlohmann-json3-dev
 
 ## Build
 
-Standard release build:
+Use at most two parallel compilation jobs; the search and cost-model sources
+are memory intensive.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j2
+cmake --build build --parallel 2
 ```
 
-To produce a portable binary with libstdc++ and libgcc statically
-linked (only glibc remains dynamic — required for the contest
-submission), add `-DSTATIC_STDLIB=ON`:
+The primary targets are:
 
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_STDLIB=ON
-cmake --build build -j2 --target mlsys
-ldd build/mlsys      # should list only linux-vdso, libm, libc, ld-linux
-```
+- `solver_lib`: embeddable static library;
+- `mlsys`: standalone solver using the homogeneous 910B model;
+- `mlsys_mixed`: standalone solver using the experimental mixed model; and
+- `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
-If your default `g++` is older than 12, set `CXX` explicitly:
+For a portable standalone binary with static libstdc++ and libgcc:
 
 ```bash
 CXX=g++-12 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_STDLIB=ON
+cmake --build build --parallel 2 --target mlsys
 ```
-
-Use `-j2` rather than higher parallelism — the larger source files in
-`src/search/` are memory-hungry to compile.
 
 ## Run
 
 ```bash
-./build/mlsys <input.json> <output.json>
+./build/mlsys input.json output.json
 ```
 
-The time budget is parsed from the benchmark filename (e.g.
-`mlsys-2026-9.json` → 15s); for any other filename it falls back to a
-size-based heuristic. The solver writes the solution to `<output.json>`
-before its deadline expires, so it works correctly under an external
-timeout-and-kill harness.
+The input is a JSON computation graph plus hardware constraints. The output
+records the selected subgraph grouping, tile granularities, retention choices,
+and traversal order.
 
-A reference evaluator binary is also produced; it replays a solution
-and cross-checks per-step feasibility and latency against the
-problem's cost model:
+## Test
 
 ```bash
-./build/evaluate <input.json> <output.json>
+cmake --build build --parallel 2 --target ascend_910b_test
+./build/tests/ascend_910b_test
 ```
 
-## Tests
+The suite intentionally reports a small documented baseline of model research
+failures while checking the implemented vector, cube, and mixed schedule-plan
+surface.
 
-47 unit and integration tests cover the cost model, every move type,
-FM/greedy correctness, ordering, coupling, and end-to-end regression.
+## Repository layout
 
-```bash
-cd build && ctest -j2 --output-on-failure
-```
-
-## Layout
-
-```
-src/
-  core/        DAG, subgraph, tiling, cost cache
-  partition/   Partition state, eval_set, group bookkeeping
-  init/        Initialisation strategies (chain+edge, seed+grow, ...)
-  search/      Greedy, FM (inner pass + outer loop), evolution,
-               coupling-aware search, parallel orchestration
-  solution/    Schedule construction (DFS / beam ordering), latency
-  symmetry/    Merkle hashing, parallel + series pattern detection
-  io/          JSON I/O
-  pipeline/    main, evaluate, solver entry points
-benchmarks/    Released contest benchmarks + custom test graphs
-test/          Unit and integration tests
-doc/           Cost model, FM, ephemeral-gap, acyclicity notes
-scripts/       Regression harness, dimension verifier, build helpers
+```text
+src/core/       DAG, subgraph, hardware costs, and schedule plans
+src/partition/  Partition state and group bookkeeping
+src/search/     Greedy, FM, evolution, and parallel search
+src/solution/   Schedule construction and traversal ordering
+src/io/         JSON input and output
+src/pipeline/   Library and standalone entry points
+test/           Unit, integration, and 910B grounding tests
+doc/            Cost-model and solver design notes
+scripts/        Validation, rendering, and benchmark helpers
 ```
 
 ## License
 
-MIT (see `LICENSE`).
+PTO Fusebox is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
