@@ -2177,14 +2177,17 @@ static void test_cube_schedule_plan() {
         const auto feed = [&](int64_t k) {
           return static_cast<double>((variant.height * k + k * variant.width) * 4) * reload_cpb;
         };
-        double tile = feed(init_k) + variant.l0_init.phases.wall_cycles;
+        const double init_feed = feed(init_k);
+        const double init_inner = variant.l0_init.phases.wall_cycles;
+        double tile = init_feed + init_inner;
         const int64_t rolled = std::max<int64_t>(0, mm.k_loop.full_chunks - 1);
         if (rolled > 0) {
           const double inner = variant.l0_rolled.phases.wall_cycles;
           const double load = feed(mm.k_loop.chunk);
-          tile += mm.k_loop.pipeline_stages >= 2 && rolled >= 2
-                      ? load + inner + static_cast<double>(rolled - 1) * std::max(load, inner)
-                      : static_cast<double>(rolled) * (load + inner);
+          tile = mm.k_loop.pipeline_stages >= 2
+                     ? init_feed + std::max(init_inner, load) +
+                           static_cast<double>(rolled - 1) * std::max(inner, load) + inner
+                     : init_feed + init_inner + static_cast<double>(rolled) * (load + inner);
         }
         if (mm.k_loop.tail > 0) {
           tile += feed(mm.k_loop.tail) + variant.l0_tail.phases.wall_cycles;

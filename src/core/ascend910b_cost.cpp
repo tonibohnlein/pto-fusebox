@@ -39,6 +39,27 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
+// Wall time of the concrete two-stage K-window ring emitted by AutoFuse.
+// The first window is not peeled: after its GM->L1 feed, its child work
+// overlaps the next feed; the final child work is the drain.  Keeping this
+// composition in one helper prevents the cube-only and mixed paths from
+// silently pricing different K-loop algorithms.
+double KWindowStreamWall(int64_t full_chunks, int32_t pipeline_stages,
+                         double first_feed, double first_work,
+                         double rolled_feed, double rolled_work) {
+  if (full_chunks <= 0) return 0.0;
+  const int64_t rolled = full_chunks - 1;
+  if (rolled == 0) return first_feed + first_work;
+  if (pipeline_stages < 2) {
+    return first_feed + first_work +
+           static_cast<double>(rolled) * (rolled_feed + rolled_work);
+  }
+  return first_feed + std::max(first_work, rolled_feed) +
+         static_cast<double>(rolled - 1) *
+             std::max(rolled_work, rolled_feed) +
+         rolled_work;
+}
+
 // Legacy vector REDUCTION tree coefficients (pto-isa stub perf-sim,
 // vec_tile_study/vec_reduce). A reduction is NOT a single slope*repeat op: it
 // lowers to a barrier-separated tree. The stub's count-mode accounting is,
@@ -3563,9 +3584,10 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
               if (rolled > 0) {
                 const double inner = variant.l0_rolled.phases.wall_cycles;
                 const double feed = feed_cycles(variant, mm.k_loop.chunk);
-                tile_wall += mm.k_loop.pipeline_stages >= 2 && rolled >= 2
-                                 ? feed + inner + static_cast<double>(rolled - 1) * std::max(feed, inner)
-                                 : static_cast<double>(rolled) * (feed + inner);
+                tile_wall = KWindowStreamWall(mm.k_loop.full_chunks,
+                                              mm.k_loop.pipeline_stages,
+                                              init_feed, init_inner, feed,
+                                              inner);
                 tile_compute += static_cast<double>(rolled) * inner;
                 tile_ddr += static_cast<double>(rolled) * feed;
                 tile_l1l0 += static_cast<double>(rolled) * variant.l0_rolled.phases.load_cycles;
@@ -4561,23 +4583,15 @@ CostResult Ascend910BCost::compute_mixed_cost(
       if (full_chunks < 2 || (tail_k > 0 && tail_k % 16 != 0)) {
         item_cube = serial_k_phase(full_k);
       } else {
-        // Serial first window seeds the accumulator.
-        item_cube = serial_k_phase(k_window);
-
-        // Remaining full windows are the only stage-2 region.  The loop is
-        // pipelined exactly when at least two rolled iterations exist; model
-        // its fill/drain rather than granting max() to init or tail.
+        // Every full window shares one stage ring.  The first child initializes
+        // the accumulator while its successor feed is already in flight; the
+        // final child is the drain.  The ragged K tail remains serial.
         const int64_t rolled = full_chunks - 1;
         const double rolled_compute = buildable_cube_region_work(k_window);
         const double rolled_feed = feed_for_k(k_window);
-        if (rolled >= 2) {
-          item_cube += rolled_compute + rolled_feed +
-                       static_cast<double>(rolled - 1) *
-                           std::max(rolled_compute, rolled_feed);
-        } else {
-          item_cube += static_cast<double>(rolled) *
-                       (rolled_compute + rolled_feed);
-        }
+        item_cube = KWindowStreamWall(
+            full_chunks, rolled >= 2 ? 2 : 1, rolled_feed, rolled_compute,
+            rolled_feed, rolled_compute);
         if (tail_k > 0) item_cube += serial_k_phase(tail_k);
       }
 
