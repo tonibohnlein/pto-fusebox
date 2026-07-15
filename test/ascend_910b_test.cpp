@@ -2194,6 +2194,62 @@ static void test_cube_schedule_plan() {
             split_cost.feasible && !std::isfinite(split_cost.latency));
     }
 
+    // The current shared L0 descriptor has one M/N extent for both physical
+    // allocation and valid data, with padding disabled. An oversized 1x1
+    // outer tile on a non-fractal output would need sub-fractal child variants
+    // (130x260 -> a 2x4 tail), so both cost modes must reject it rather than let
+    // analytic selection hand an emit-incompatible winner to AutoFuse.
+    {
+      TileConfig cfg;
+      cfg.w = 272;
+      cfg.h = 144;
+      cfg.k = 64;
+      cfg.parts_m = 1;
+      cfg.parts_n = 1;
+      cfg.split_k = 1;
+
+      auto analytic_problem = mk_mm(260, 130, 64, 1000);
+      analytic_problem.require_uniform_cube_dag_grid = true;
+      analytic_problem.use_hierarchical_cube_cost = false;
+      DAG analytic_dag = DAG::build(analytic_problem);
+      auto analytic = Subgraph::create(analytic_problem, analytic_dag, {0});
+      CHECK("CUBEPLAN/subfractal: analytic subgraph is structurally accepted",
+            static_cast<bool>(analytic));
+      if (!analytic) return;
+      const auto analytic_cost = analytic->compute_cost(cfg);
+
+      auto exact_problem = analytic_problem;
+      exact_problem.use_hierarchical_cube_cost = true;
+      DAG exact_dag = DAG::build(exact_problem);
+      auto exact = Subgraph::create(exact_problem, exact_dag, {0});
+      CHECK("CUBEPLAN/subfractal: exact subgraph is structurally accepted",
+            static_cast<bool>(exact));
+      if (!exact) return;
+      const auto exact_cost = exact->compute_cost(cfg);
+      CHECK("CUBEPLAN/subfractal: analytic and exact reject the same oversized region",
+            analytic_cost.feasible && exact_cost.feasible &&
+                !std::isfinite(analytic_cost.latency) &&
+                !std::isfinite(exact_cost.latency));
+
+      // Equal aligned blocks can still exceed the logical axis on the final
+      // block. Classify by exact coverage rather than AxisPartition::num_big:
+      // nine 16-row blocks cover 130 rows through the same idempotent clamp.
+      TileConfig clipped;
+      clipped.w = 16;
+      clipped.h = 16;
+      clipped.k = 64;
+      clipped.parts_m = 9;
+      clipped.parts_n = 17;
+      clipped.split_k = 1;
+      const auto clipped_cost = exact->compute_cost(clipped);
+      const auto clipped_plan = exact->cube_schedule_plan(clipped, {}, {}, 1);
+      CHECK("CUBEPLAN/subfractal: aligned clipped grid uses clamped overlap",
+            clipped_cost.feasible && std::isfinite(clipped_cost.latency) &&
+                clipped_plan.feasible && clipped_plan.emit_compatible &&
+                clipped_plan.spatial_policy == CubeSpatialPolicy::ClampedOverlap &&
+                clipped_plan.work_units == 9 * 17);
+    }
+
     // A boundary result spanning several L0 M/N tiles nests those output tiles
     // outside the GM K-window loop. Every partial remains in L0C and drains
     // once; no impossible Mat->Acc reload or full-region L1 carry is present.

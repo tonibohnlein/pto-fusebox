@@ -523,6 +523,18 @@ int64_t CubePipelinedChunk(int64_t extent, int64_t window) {
   return limit >= 16 ? limit : 0;
 }
 
+bool CubeGridCoversExactly(int64_t full_m, int64_t full_n, int64_t parts_m,
+                           int64_t parts_n, int64_t region_m, int64_t region_n) {
+  return parts_m * region_m == full_m && parts_n * region_n == full_n;
+}
+
+bool CubeRegionNeedsSubfractalL0Edge(const Problem* problem, int64_t region_m,
+                                     int64_t region_n) {
+  const int64_t align_m = std::max<int64_t>(1, problem->l0_matmul_config.align_m);
+  const int64_t align_n = std::max<int64_t>(1, problem->l0_matmul_config.align_n);
+  return region_m % align_m != 0 || region_n % align_n != 0;
+}
+
 // Preserve the pre-request-DAG lone-matmul window exactly. The displayed/emit
 // window was a divisor of the full contraction, capped by the selected core's
 // K share; choosing merely a divisor of K/S can change the K-loop while leaving
@@ -2511,7 +2523,11 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.emit_compatible = true;
   plan.m_partition = partition_axis(out_H_, parts_m, grid_gran_h_);
   plan.n_partition = partition_axis(out_W_, parts_n, grid_gran_w_);
-  const bool uniform_grid = plan.m_partition.num_big == 0 && plan.n_partition.num_big == 0;
+  const int64_t m_extent = std::min(cfg.h, out_H_);
+  const int64_t n_extent = std::min(cfg.w, out_W_);
+  const bool uniform_grid =
+      CubeGridCoversExactly(out_H_, out_W_, plan.m_partition.parts,
+                            plan.n_partition.parts, m_extent, n_extent);
   if (!uniform_grid) {
     // PyPTO realizes a ragged lone-matmul grid with one static maximum region:
     // the edge tasks clamp backward and recompute their overlap identically.
@@ -2531,8 +2547,6 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.seed_required = split > 1;
   plan.model_overlap_granted = true;
   plan.overlap_implementable = true;
-  const int64_t m_extent = std::min(cfg.h, out_H_);
-  const int64_t n_extent = std::min(cfg.w, out_W_);
   if (plan.seed_required && !boundary_outputs_.empty()) {
     const DType output_dtype = prob_->tensors[*boundary_outputs_.begin()].dtype;
     const int64_t bytes = dtype_bytes(output_dtype);
@@ -3545,7 +3559,11 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         // emission. Output/L0C tiles are outer to GM->L1 K windows; each child
         // L0 plan keeps Acc resident, rolled boundary loads overlap only inside
         // an actual stage-2 loop, and init/tail/final drain remain serial.
-        const bool uniform_grid = g_pm.num_big == 0 && g_pn.num_big == 0;
+        const int64_t static_region_m = std::min(cfg.h, out_H_);
+        const int64_t static_region_n = std::min(cfg.w, out_W_);
+        const bool uniform_grid =
+            CubeGridCoversExactly(out_H_, out_W_, g_pm.parts, g_pn.parts,
+                                  static_region_m, static_region_n);
         // A ragged spatial grid is emitted by the lone-matmul ceil-and-clamp
         // fallback only for split=1.  Combining that overlapping clamp with
         // split-K atomic partials would give more than one owner to edge output
@@ -3553,6 +3571,17 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         // let the older analytic roofline rank that fictional configuration.
         const bool clamped_overlap_grid = prob_->require_uniform_cube_dag_grid && lone_matmul &&
                                           !uniform_grid && S == 1;
+        // The shared L0 chooser currently represents physical and valid M/N
+        // extents with one number and has padding disabled. A request whose
+        // static region ends in a sub-fractal edge would therefore reconstruct
+        // an infeasible child variant (for example 130x260 -> a 2x4 tail).
+        // Keep the cheap analytic compiler path on the same buildable surface
+        // as exact mode until L0 plans carry separate physical/valid extents.
+        if (prob_->require_uniform_cube_dag_grid &&
+            CubeRegionNeedsSubfractalL0Edge(prob_, static_region_m,
+                                            static_region_n)) {
+          return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
+        }
         if (prob_->require_uniform_cube_dag_grid && !uniform_grid && S > 1) {
           return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
         }

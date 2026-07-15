@@ -214,6 +214,8 @@ maximum static region shape; a ragged edge clamps backward and recomputes the ov
 Both analytic and exact costs charge those repeated reads, MADs, and drains. Ragged split-K remains
 invalid because atomic edge partials would have multiple spatial owners. General multi-op
 non-uniform emission is not claimed complete because it needs variable-shape recursive requests.
+A valid M/N region ending inside one cube fractal is compiler-infeasible in both modes until the
+shared L0 plan represents physical padding separately from its valid extent.
 
 The plan emitter also declines a deduplicated identical boundary request until an explicit shared L1
 panel and lifetime are represented. In non-strict production mode, declined groups fall back to

@@ -509,6 +509,8 @@ Among equal-latency configs, lexicographic:
   and split seed/atomic stores. Unequal multi-op grids and identical deduplicated boundary requests
   are declined. Lone split=1 ceil+clamp is an explicit `ClampedOverlap` plan and charges every
   maximum-shape task; ragged split-K declines because overlapping atomic owners are invalid.
+  Sub-fractal valid M/N edge variants decline identically in analytic and exact compiler modes until
+  their physical padded allocation is explicit in the shared L0 descriptor.
 - **Pure-cube inner/outer integration.** AutoFuse owns the GM↔L1 request DAG, L1 lifetimes, K
   windows, output-tile order, split ownership, and final drains. It attaches the shared backend L0
   descriptor; `AutoTileMatmulL0` validates and lowers L1↔L0 geometry, stationarity, buffering, and
