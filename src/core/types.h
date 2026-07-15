@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/flat_set.h"
+#include "core/l0_matmul_plan.h"
 
 // ============================================================================
 // Tensor & Op
@@ -29,6 +30,21 @@ inline int dtype_bytes(DType dt) {
         case DType::BOOL:  return 1;
     }
     return 4;
+}
+
+inline DType cube_accumulator_dtype(DType operand_dtype) {
+  switch (operand_dtype) {
+    case DType::FP32:
+    case DType::FP16:
+    case DType::BF16:
+      return DType::FP32;
+    case DType::INT32:
+    case DType::INT16:
+    case DType::INT8:
+    case DType::BOOL:
+      return DType::INT32;
+  }
+  return DType::FP32;
 }
 
 struct Tensor {
@@ -137,6 +153,12 @@ struct Op {
     VectorOpGeometry vector_geometry = VectorOpGeometry::Generic;
     VectorOpCapability vector_capability = VectorOpCapability::Generic;
 
+    // True only when the production mixed emitter can replay this source op
+    // without losing semantic attributes.  The first C->V increment accepts a
+    // default-orientation tensor.matmul; transposed/NZ variants remain a clean
+    // partition boundary until their semantics are carried by the plan.
+    bool mixed_emit_compatible = true;
+
     // Convenience: each op produces exactly one output tensor.
     size_t output() const { return outputs[0]; }
 };
@@ -233,6 +255,10 @@ struct Problem {
     double hbm_aggregate_gibps = 0.0;
     int64_t l0_tile_m = 0;       // L0 GEMM base M (pto-isa oracle 128) — L1->L0 reuse
     int64_t l0_tile_n = 0;       // L0 GEMM base N (pto-isa oracle 256) — L1->L0 reuse
+    // Shared lower-level planner configuration. PTO Fusebox fills the request-
+    // specific M/N/K/dtype fields before calling choose_l0_matmul_plan();
+    // AutoTileMatmulL0 calls the same chooser and realizes the selected plan.
+    L0MatmulConfig l0_matmul_config;
 
     // Grounded vector (AIV) compute, in CYCLES (pto-isa A2A3
     // cce_costmodel_vector_compute.hpp). Active in grounded mode (cube_freq_hz>0).
@@ -274,6 +300,12 @@ struct Problem {
     // research model still opts in directly.
     bool fuse_cube_vector = false;
 
+    // Compiler/buildability policy for mixed candidates.  `fuse_cube_vector`
+    // controls admission; this stricter bit restricts admitted groups to the
+    // exact topology the production emitter can replay.  Analytic users may
+    // keep it false while studying broader mixed schedules.
+    bool require_buildable_mixed = false;
+
     // Analytic/research permission for a mixed topology whose FIFO contains
     // more than one round trip (for example full C->V->C->V attention). The
     // existing PyPTO skew pass demotes it to sequential, so the model prices a
@@ -286,6 +318,9 @@ struct Problem {
     // plan-driven emitter cannot represent unequal static region shapes in one
     // SPMD kernel. Lone matmuls retain the full balanced grid space.
     bool require_uniform_cube_dag_grid = false;
+    // Price the explicit output-tile/K-window hierarchy reconstructed by
+    // CubeSchedulePlan. PyPTO enables this for buildable solver decisions.
+    bool use_hierarchical_cube_cost = false;
 
     // Exact buildable P4 candidates found once by the IR adapter. The cost model compares the
     // candidate subgraph's complete op set against these entries; the emitter consumes the same
@@ -652,6 +687,30 @@ struct CubeKLoopPlan {
     int pipeline_stages = 1;
 };
 
+struct CubeFinalDrainPlan {
+  // One explicit drain after the complete K-window loop. The partial C remains
+  // in L0C throughout the loop: A2/A3 supports Acc->Mat/GM but no Mat->Acc.
+  bool required = false;
+  bool target_l1 = false;
+  bool atomic = false;
+  int64_t valid_rows = 0;
+  int64_t valid_cols = 0;
+  int64_t tile_count = 0;
+  int64_t bytes = 0;
+  double cycles = 0.0;
+};
+
+struct CubeOutputTileVariant {
+  // At most four variants exist: full/full, tail/full, full/tail, tail/tail.
+  // `count` lets the cost path remain O(1) in the number of L0 output tiles.
+  int64_t height = 0;
+  int64_t width = 0;
+  int64_t count = 0;
+  L0MatmulPlan l0_init;
+  L0MatmulPlan l0_rolled;
+  L0MatmulPlan l0_tail;
+};
+
 struct CubeMatmulSchedule {
   size_t instance = std::numeric_limits<size_t>::max();
   size_t op = std::numeric_limits<size_t>::max();
@@ -666,7 +725,30 @@ struct CubeMatmulSchedule {
   CubeTensorRegionPlan lhs;
   CubeTensorRegionPlan rhs;
   CubeTensorRegionPlan output;
+  // TMATMUL accumulates float operands in FP32 (integer operands in INT32),
+  // independently of the tensor dtype used when the result drains to GM/L1.
+  // A fused A2/A3 producer may drain FP32 Acc to BF16/FP16 Mat, but cannot
+  // carry an FP32 Mat value back into Acc.
+  DType accumulator_dtype = DType::FP32;
+  DType storage_dtype = DType::FP32;
   CubeKLoopPlan k_loop;
+  // Output/L0C subtiles are outer to the GM->L1 K-window loop. Every child
+  // plan targets Acc, so its C stays resident across serial-init, rolled, and
+  // tail phases. The explicit final_drain then publishes that completed tile.
+  int64_t output_tile_m = 0;
+  int64_t output_tile_n = 0;
+  int64_t output_tiles_m = 0;
+  int64_t output_tiles_n = 0;
+  std::vector<CubeOutputTileVariant> output_variants;
+  CubeFinalDrainPlan final_drain;
+};
+
+struct CubeSplitSeedPlan {
+  bool present = false;
+  int64_t work_units = 0;
+  int64_t valid_rows = 0;
+  int64_t valid_cols = 0;
+  int64_t bytes = 0;
 };
 
 // The solver-owned algorithm descriptor for a homogeneous cube subgraph at one
@@ -685,9 +767,8 @@ struct CubeSchedulePlan {
     int64_t split_k = 1;
     int64_t work_units = 0;
     int64_t peak_l1_bytes = 0;
-    int64_t l0_tile_m = 0;
-    int64_t l0_tile_n = 0;
     bool seed_required = false;
+    CubeSplitSeedPlan seed;
     // The cost and emitter both derive this from the concrete per-request K
     // loops. Both fields are retained so validation can fail loudly if a future
     // model change grants overlap that the reconstructed loop cannot realize.
@@ -720,6 +801,21 @@ enum class MixedPipelineAxis {
     AttentionKeyChunk
 };
 
+// How the vector stage uses the two AIV lanes in one 910B mixed group.  This
+// is an algorithmic fact, not merely a hardware count: an unsplit mixed kernel
+// executes real vector work on lane 0 while lane 1 only replays FIFO
+// handshakes.  The cost may divide vector work by two only for Rows/Columns.
+enum class MixedVectorSplit {
+    None,
+    Rows,
+    Columns
+};
+
+enum class MixedTransferDirection {
+    CubeToVector,
+    VectorToCube
+};
+
 struct MixedStageTopology {
     MixedEngine engine = MixedEngine::Vector;
     std::vector<size_t> ops;
@@ -745,6 +841,23 @@ struct MixedScheduleTopology {
     bool sink_runs_early_stage = false;
     MixedPipelineMode mode = MixedPipelineMode::Serial;
     bool emit_compatible = false;
+    // Strict subset that production AutoFuse can currently replay.  The more
+    // permissive emit_compatible bit remains useful to analytic/research
+    // callers studying the generic cross-core passes.
+    bool compiler_emit_compatible = false;
+};
+
+struct MixedFifoPlan {
+    size_t tensor = std::numeric_limits<size_t>::max();
+    MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
+    int64_t valid_rows = 0;
+    int64_t valid_cols = 0;
+    int64_t slot_bytes = 0;
+    int64_t slot_count = 0;
+    // Vec memory reserved by ExpandMixedKernel for this FIFO.  Keeping this in
+    // the winning descriptor makes the plan's feasibility proof inspectable
+    // and lets emission fail closed if the downstream default changes.
+    int64_t reserved_bytes = 0;
 };
 
 struct MixedPipelineLoopPlan {
@@ -774,8 +887,17 @@ struct MixedSchedulePlan {
     int64_t split_k = 1;
     int64_t work_units = 0;
     int64_t group_capacity = 0;
+    // Stage-local facts consumed by the first compiler emitter.  These are
+    // populated only when reconstructing a winning/forced plan, not retained
+    // in the hot CostResult cache.
+    int64_t cube_window_k = 0;
+    VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
+    int64_t vector_stage_peak_ub_bytes = 0;
+    MixedVectorSplit vector_split = MixedVectorSplit::None;
+    int64_t vector_lanes = 1;
     MixedPipelineMode mode = MixedPipelineMode::Serial;
     MixedPipelineLoopPlan loop;
+    std::vector<MixedFifoPlan> fifos;
     // Kept separate during migration: the first bit records what the legacy
     // scalar cost grants, while the second mirrors what the existing PyPTO
     // pipeline passes can actually construct for this exact topology/loop.

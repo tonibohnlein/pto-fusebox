@@ -1097,11 +1097,10 @@ static void test_subgraph_structure() {
 
 // --- cube+vector fusion: the Ascend910BMixed model ---------------------------
 // MM -> PW (C=A@B, D=relu(C)). The homogeneous Ascend910BCost rejects the mixed
-// group (unit-homogeneity); Ascend910BMixed permits it and the fused cost beats
-// running the two kernels separately — the cube and vector pools overlap (the
-// DDR roundtrip latency is hidden) and only one kernel fill is paid. The two
-// models differ ONLY in admissibility; a pure cube or pure vector group costs
-// identically under both.
+// group (unit-homogeneity); Ascend910BMixed permits it.  This candidate gives
+// each active group one item, so the corrected model grants no pipeline
+// overlap and may prefer the separated kernels. The two models differ only in
+// admissibility; a pure cube or pure vector group costs identically under both.
 static void test_cube_vector_fusion() {
     std::cout << "[FUSE] cube+vector fusion — Ascend910BMixed model\n";
     Problem p;
@@ -1135,7 +1134,8 @@ static void test_cube_vector_fusion() {
     double pw = Subgraph::create(p, dag, {1})->best_cost().latency;
     std::cout << "    fused=" << f << "  separated=" << (mm + pw)
               << "  (mm=" << mm << " pw=" << pw << ")  cores=" << fr.cores_used << "\n";
-    CHECK("FUSE: fused < separated (overlap + one fill)", f < mm + pw);
+    CHECK("FUSE: one-trip mixed candidate is honestly cut (no fictional overlap)",
+          f >= mm + pw);
     // Tiling for units: cores_used = 3 per active unit (1 cube + 2 vector).
     const int eff_units = (fr.num_spatial_tiles < p.num_cube_cores)
                               ? fr.num_spatial_tiles : p.num_cube_cores;
@@ -1259,10 +1259,10 @@ static void test_mixed_mm_pw_variants() {
 // idle at t=0 (every sink-unit op transitively waits on the opposite unit). If the
 // sink unit has an "early stage" op whose cone is same-unit + boundary (runs from
 // t=0), the fill is ABSORBED into the max. This is a STRUCTURAL property of the op
-// graph — independent of tile dims — so we probe the 4 canonical shapes with uniform
-// square tiles. Grounded by mixed_tile_study's shape sweep (v->c->v / c->v->c absorb;
-// c->v / v->c add). Guards against the old output_unit_op_count==1 heuristic, which
-// mis-classified same-unit tails (c->v->v has 2 vector ops yet still idles at t=0).
+// graph, but it can affect the wall only when each active group owns at least
+// two successor items.  These small controls intentionally have one trip per
+// group: all four must therefore report no absorbed fill even when the topology
+// has an early same-engine stage.
 static void test_mixed_pipeline_stages() {
     std::cout << "[MIXSTAGE] fill absorption across the 4 canonical mixed shapes\n";
     const Tensor sq{128, 128};  // uniform square tile — dims don't affect the (structural)
@@ -1307,8 +1307,8 @@ static void test_mixed_pipeline_stages() {
                            {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}, {OT::Pointwise, {3}, {4}}},
                            {0, 1, 2});
         CHECK("MIXSTAGE: v->c->v feasible", fr.feasible);
-        CHECK("MIXSTAGE: v->c->v absorbs fill (prologue vector runs at t=0)",
-              fr.pipeline_fill_absorbed);
+        CHECK("MIXSTAGE: v->c->v one-trip grid cannot absorb fill",
+              !fr.pipeline_fill_absorbed);
     }
     // c->v->c : MatMul -> PW -> MatMul. Sink = cube; the FIRST matmul reads boundary
     // inputs and runs at t=0 (an earlier cube stage) -> fill ABSORBED (3-stage). t4 =
@@ -1318,8 +1318,8 @@ static void test_mixed_pipeline_stages() {
                            {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}, {OT::MatMul, {3, 4}, {5}}},
                            {0, 1, 2});
         CHECK("MIXSTAGE: c->v->c feasible", fr.feasible);
-        CHECK("MIXSTAGE: c->v->c absorbs fill (first matmul runs at t=0)",
-              fr.pipeline_fill_absorbed);
+        CHECK("MIXSTAGE: c->v->c one-trip grid cannot absorb fill",
+              !fr.pipeline_fill_absorbed);
     }
     // c->v->c->v : a depth-3 multi-round-trip. Analytic mode keeps the topology
     // but prices it sequentially; buildable mode rejects it until whole-FIFO
@@ -1353,9 +1353,8 @@ static void test_mixed_pipeline_stages() {
 // MixedSchedulePlan is the cost/emit handoff: same-engine stage topology is
 // candidate-invariant, while the fixed candidate supplies the 24-group mapping
 // and actual per-group pipeline trips. In particular, two GLOBAL tiles assigned
-// one-per-group do not form a two-item pipeline on either group. Keep the legacy
-// model grant visible until the next increment replaces it with the realizable
-// serial-vs-pipelined group-count choice.
+// one-per-group do not form a two-item pipeline on either group.  The model and
+// emit bits must agree; there is no longer a legacy optimistic grant.
 static void test_mixed_schedule_plan() {
     std::cout << "[MIXPLAN] mixed stage topology and per-group pipeline trips\n";
     const Tensor sq{128, 128};
@@ -1388,8 +1387,8 @@ static void test_mixed_schedule_plan() {
                   two_tiles.loop.active_groups == 2 &&
                   two_tiles.loop.min_trips_per_group == 1 &&
                   two_tiles.loop.max_trips_per_group == 1);
-        CHECK("MIXPLAN: legacy overlap grant is distinguished from realizable overlap",
-              two_tiles.model_overlap_granted && !two_tiles.overlap_implementable);
+        CHECK("MIXPLAN: one-trip groups receive no overlap",
+              !two_tiles.model_overlap_granted && !two_tiles.overlap_implementable);
 
         auto forty_eight_tiles =
             mixed->mixed_schedule_plan(TileConfig{16, 32, 128, 6, 8, 1});
@@ -1398,7 +1397,140 @@ static void test_mixed_schedule_plan() {
                   forty_eight_tiles.loop.active_groups == 24 &&
                   forty_eight_tiles.loop.min_trips_per_group == 2 &&
                   forty_eight_tiles.loop.max_trips_per_group == 2 &&
+                  forty_eight_tiles.model_overlap_granted &&
                   forty_eight_tiles.overlap_implementable);
+    }
+
+    // Production compiler descriptor: one standard matmul followed by a
+    // same-shape elementwise epilogue.  A fixed 6x8 grid launches 24 mixed
+    // groups, each owning two successor items; UP_DOWN is an explicit
+    // two-lane algorithm and the one C->V FIFO slot is the full [32,32] tile.
+    {
+        Problem p;
+        p.tensors = {{64, 192}, {256, 64}, {256, 1}, {256, 192}, {256, 192}};
+        p.ops = {{OT::MatMul, {0, 1}, {3}}, {OT::Pointwise, {3, 2}, {4}}};
+        p.ops[1].vector_capability = VectorOpCapability::Elementwise;
+        p.ops[1].vector_primitive = VectorPrimitiveFamily::Add;
+        p.ops[1].vector_geometry = VectorOpGeometry::Flat;
+        p.fast_memory_capacity = 1 << 26;
+        p.fuse_cube_vector = true;
+        p.require_buildable_mixed = true;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+        CHECK("MIXPLAN: compiler C->V epilogue is admitted", (bool)mixed);
+        if (mixed) {
+            const auto plan = mixed->mixed_schedule_plan(
+                TileConfig{32, 32, 64, 6, 8, 1});
+            CHECK("MIXPLAN: compiler descriptor owns groups, trips, lanes, and FIFO",
+                  plan.feasible && plan.emit_compatible &&
+                      plan.loop.active_groups == 24 &&
+                      plan.loop.min_trips_per_group == 2 &&
+                      plan.loop.max_trips_per_group == 2 &&
+                      plan.model_overlap_granted && plan.overlap_implementable &&
+                      plan.vector_split == MixedVectorSplit::Rows &&
+                      plan.vector_lanes == 2 && plan.fifos.size() == 1 &&
+                      plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
+                      plan.fifos[0].slot_bytes == 32 * 32 * 4 &&
+                      plan.fifos[0].slot_count == 8 &&
+                      plan.fifos[0].reserved_bytes == 8 * 32 * 32 * 4 &&
+                      plan.loop.pipeline_stages == 1);
+        }
+
+        Problem too_wide = p;
+        too_wide.tensors = {{64, 128}, {128, 64}, {128, 1}, {128, 128}, {128, 128}};
+        DAG too_wide_dag = DAG::build(too_wide);
+        auto too_wide_mixed = Ascend910BMixed::create(too_wide, too_wide_dag, {0, 1});
+        CHECK("MIXPLAN: oversized eight-slot FIFO candidate is rejected",
+              too_wide_mixed &&
+                  !too_wide_mixed->mixed_schedule_plan(
+                      TileConfig{128, 64, 64, 2, 1, 1}).feasible);
+
+        Problem large_k = p;
+        large_k.tensors = {
+            {8192, 192}, {256, 8192}, {256, 1}, {256, 192}, {256, 192}};
+        DAG large_k_dag = DAG::build(large_k);
+        auto large_k_mixed = Ascend910BMixed::create(large_k, large_k_dag, {0, 1});
+        const TileConfig large_k_cfg{32, 32, 8192, 6, 8, 1};
+        const auto large_k_plan = large_k_mixed
+                                      ? large_k_mixed->mixed_schedule_plan(large_k_cfg)
+                                      : MixedSchedulePlan{};
+        const auto large_k_cost = large_k_mixed
+                                      ? large_k_mixed->compute_cost(large_k_cfg)
+                                      : CostResult{};
+        CHECK("MIXPLAN: derived large-K L1 window reaches plan and cost",
+              large_k_plan.feasible && large_k_plan.cube_window_k > 0 &&
+                  large_k_plan.cube_window_k < 8192 &&
+                  large_k_plan.config.k == large_k_plan.cube_window_k &&
+                  large_k_cost.feasible &&
+                  large_k_cost.config.k == large_k_plan.cube_window_k &&
+                  large_k_cost.num_k_passes ==
+                      (8192 + large_k_plan.cube_window_k - 1) /
+                          large_k_plan.cube_window_k);
+
+        Problem low_precision = large_k;
+        for (Tensor& tensor : low_precision.tensors) tensor.dtype = DType::FP16;
+        DAG low_precision_dag = DAG::build(low_precision);
+        CHECK("MIXPLAN: low-precision C->V waits for an explicit accumulator/narrow stage",
+              !Ascend910BMixed::create(low_precision, low_precision_dag, {0, 1}));
+
+        Problem heterogeneous = large_k;
+        heterogeneous.tensors[0].dtype = DType::FP16;
+        DAG heterogeneous_dag = DAG::build(heterogeneous);
+        CHECK("MIXPLAN: heterogeneous cube operands are a clean mixed boundary",
+              !Ascend910BMixed::create(heterogeneous, heterogeneous_dag, {0, 1}));
+
+        Problem promoted_bias = large_k;
+        promoted_bias.tensors[2].dtype = DType::FP16;
+        DAG promoted_bias_dag = DAG::build(promoted_bias);
+        CHECK("MIXPLAN: promoted vector tensor operand is a clean mixed boundary",
+              !Ascend910BMixed::create(promoted_bias, promoted_bias_dag, {0, 1}));
+
+        Problem integer_epilogue = large_k;
+        integer_epilogue.tensors[0].dtype = DType::INT8;
+        integer_epilogue.tensors[1].dtype = DType::INT8;
+        integer_epilogue.tensors[2].dtype = DType::INT32;
+        integer_epilogue.tensors[3].dtype = DType::INT32;
+        integer_epilogue.tensors[4].dtype = DType::INT32;
+        DAG integer_epilogue_dag = DAG::build(integer_epilogue);
+        CHECK("MIXPLAN: INT8->INT32 waits for an integer vector capability table",
+              !Ascend910BMixed::create(integer_epilogue, integer_epilogue_dag, {0, 1}));
+
+        Problem unsupported_dtype = large_k;
+        unsupported_dtype.tensors[0].dtype = DType::INT16;
+        unsupported_dtype.tensors[1].dtype = DType::INT16;
+        unsupported_dtype.tensors[2].dtype = DType::INT32;
+        unsupported_dtype.tensors[3].dtype = DType::INT32;
+        unsupported_dtype.tensors[4].dtype = DType::INT32;
+        DAG unsupported_dtype_dag = DAG::build(unsupported_dtype);
+        CHECK("MIXPLAN: non-PTO cube operand dtype is a clean mixed boundary",
+              !Ascend910BMixed::create(unsupported_dtype, unsupported_dtype_dag, {0, 1}));
+
+        Problem transposed = p;
+        transposed.ops[0].mixed_emit_compatible = false;
+        DAG transposed_dag = DAG::build(transposed);
+        CHECK("MIXPLAN: non-default matmul semantics are a clean boundary",
+              !Ascend910BMixed::create(transposed, transposed_dag, {0, 1}));
+
+        Problem escaped = p;
+        escaped.tensors.push_back({256, 192});
+        escaped.ops.push_back({OT::Pointwise, {3}, {5}});
+        escaped.ops.back().vector_capability = VectorOpCapability::Elementwise;
+        escaped.ops.back().vector_primitive = VectorPrimitiveFamily::Abs;
+        escaped.ops.back().vector_geometry = VectorOpGeometry::Flat;
+        DAG escaped_dag = DAG::build(escaped);
+        CHECK("MIXPLAN: escaped cube intermediate rejects buildable C->V",
+              !Ascend910BMixed::create(escaped, escaped_dag, {0, 1}));
+
+        Problem reverse = p;
+        reverse.tensors = {{64, 192}, {64, 192}, {256, 64}, {256, 192}};
+        reverse.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}};
+        reverse.ops[0].vector_capability = VectorOpCapability::Elementwise;
+        reverse.ops[0].vector_primitive = VectorPrimitiveFamily::Abs;
+        reverse.ops[0].vector_geometry = VectorOpGeometry::Flat;
+        DAG reverse_dag = DAG::build(reverse);
+        CHECK("MIXPLAN: compiler V->C remains a clean partition boundary",
+              !Ascend910BMixed::create(reverse, reverse_dag, {0, 1}));
     }
 
     // V->C->V is the exact single-round-trip shape recognized by
@@ -1499,8 +1631,8 @@ static void test_mixed_sink_split_k() {
 // fill gate: without it, a single-tile 3-stage kernel is credited full overlap (the plain
 // max), which the sim contradicts and which biases the solver toward the low-batch
 // flash-decode corner. We compare a balanced compute-bound c->v->c (MM -> PW*16 -> MM) at
-// one tile vs two tiles: the WALL (latency minus the per-launch fill) ratio is ~3.3 (the
-// single tile is the sum), whereas the old plain-max gave exactly 2.0 (pure tiling).
+// one tile vs two tiles.  Two global tiles still occupy two groups and are not
+// a pipeline; this guards the exact gap that MixedSchedulePlan used to expose.
 static void test_mixed_single_tile_no_skew() {
     std::cout << "[MIXNT1] single-tile 3-stage kernel pays the un-overlapped sum\n";
     const Tensor sq{128, 128};
@@ -1525,12 +1657,10 @@ static void test_mixed_single_tile_no_skew() {
     auto [f2, w2] = wall(TileConfig{128, 64, 128});   // two output tiles
     CHECK("MIXNT1: single tile does NOT absorb fill (no successor to skew against), compute-bound",
           f1.feasible && !f1.pipeline_fill_absorbed && f1.compute_bound && f1.num_spatial_tiles == 1);
-    CHECK("MIXNT1: the SAME shape at 2 tiles DOES absorb (confirms it is a 3-stage shape)",
-          f2.feasible && f2.pipeline_fill_absorbed && f2.num_spatial_tiles == 2);
-    // The single tile is charged the un-overlapped sum (cube+vec), so wall1/wall2 > 2.0 (the
-    // plain-max pure-tiling ratio the old code gave); ~3.3 here. Threshold 2.3 leaves margin.
-    CHECK("MIXNT1: single-tile wall is the un-overlapped sum (ratio > 2.3, not the 2.0 plain-max)",
-          w1 > 2.3 * w2);
+    CHECK("MIXNT1: two global tiles on two groups also receive no skew overlap",
+          f2.feasible && !f2.pipeline_fill_absorbed && f2.num_spatial_tiles == 2);
+    CHECK("MIXNT1: serial two-tile grid still reduces the busiest-group work",
+          w1 > w2);
 }
 
 // A non-uniform grid's cube_stage is the LPT makespan (busiest core = biggest region), not the
@@ -1932,11 +2062,41 @@ static void test_exec_enumeration() {
 static void test_cube_schedule_plan() {
     std::cout << "[CUBEPLAN] winning cube configs re-derive their emit schedule\n";
 
+    // The shared lower-level planner mirrors PTO's output-tile-outer/K-inner
+    // GEMM loop. A one-output-tile child pays a serial first L1->L0+MAD fill,
+    // overlaps only subsequent full K blocks, then pays tail and drain outside
+    // that steady state. The older max(total-load,total-MAD) omitted the fill.
+    {
+      L0MatmulConfig l0;
+      l0.m = 128;
+      l0.n = 256;
+      l0.k = 256;
+      l0.bytes_a = 2;
+      l0.bytes_b = 2;
+      l0.bytes_c = 4;
+      l0.allow_k_boundary = true;
+      l0.output_target = L0OutputTarget::Acc;
+      const auto child = choose_l0_matmul_plan(l0);
+      CHECK("CUBEPLAN/l0-phase: shared child is feasible and keeps one full output tile in Acc",
+            child.feasible && child.m == 128 && child.n == 256 && child.output_target == L0OutputTarget::Acc);
+      CHECK(
+          "CUBEPLAN/l0-phase: init/rolled/tail/drain exactly cover the K loop",
+          child.k_loop.chunk == child.k &&
+              child.k_loop.full_chunks * child.k_loop.chunk + child.k_loop.tail == l0.k &&
+              child.k_loop.pipeline_stages == (child.k_loop.full_chunks >= 2 ? 2 : 1) &&
+              child.phases.init_cycles > 0.0 && child.phases.drain_cycles == 0.0 &&
+              std::abs(child.phases.wall_cycles - (child.phases.init_cycles + child.phases.rolled_cycles +
+                                                   child.phases.tail_cycles + child.phases.drain_cycles)) <
+                  1e-9 &&
+              child.phases.wall_cycles + 1e-9 >= std::max(child.phases.load_cycles, child.phases.mad_cycles));
+    }
+
     // Lone matmul: the L1 window is split into two actual load chunks. This is
     // the implementation of the historical "implicit halving" comment and the
     // prerequisite for the model's max(compute, DDR) roofline.
     {
         auto p = mk_mm(256, 256, 512, 1000);
+        p.use_hierarchical_cube_cost = true;
         DAG dag = DAG::build(p);
         auto sg = Subgraph::create(p, dag, {0});
         CHECK("CUBEPLAN/lone: subgraph is structurally accepted", static_cast<bool>(sg));
@@ -1957,8 +2117,7 @@ static void test_cube_schedule_plan() {
         CHECK("CUBEPLAN/lone: exact grid and split are retained",
               plan.m_partition.parts == 2 && plan.n_partition.parts == 4 && plan.spatial_tiles == 8 &&
                   plan.split_k == cost.parallel_split &&
-                  plan.work_units == plan.spatial_tiles * plan.split_k && plan.l0_tile_m == 128 &&
-                  plan.l0_tile_n == 256);
+                  plan.work_units == plan.spatial_tiles * plan.split_k);
         CHECK("CUBEPLAN/lone: peak and per-op L1 window come from derive_exec",
               plan.peak_l1_bytes == peak && plan.matmuls.size() == 1 &&
                   plan.matmuls[0].k_loop.l1_window_k == windows[0]);
@@ -1967,6 +2126,82 @@ static void test_cube_schedule_plan() {
                   2 * plan.matmuls[0].k_loop.chunk <= plan.matmuls[0].k_loop.l1_window_k &&
                   plan.matmuls[0].k_loop.full_chunks >= 3 && plan.overlap_implementable &&
                   plan.model_overlap_granted);
+        const auto& mm = plan.matmuls[0];
+        bool children_hold_acc = !mm.output_variants.empty();
+        for (const auto& variant : mm.output_variants) {
+          children_hold_acc =
+              children_hold_acc && variant.l0_init.feasible && variant.l0_rolled.feasible &&
+              variant.l0_init.output_target == L0OutputTarget::Acc &&
+              variant.l0_rolled.output_target == L0OutputTarget::Acc &&
+              variant.l0_tail.feasible == (mm.k_loop.tail > 0) &&
+              (!variant.l0_tail.feasible || variant.l0_tail.output_target == L0OutputTarget::Acc);
+        }
+        CHECK("CUBEPLAN/lone: output tiles hold Acc across GM/L1 windows then drain",
+              children_hold_acc && mm.output_tile_m > 0 && mm.output_tile_n > 0 && mm.final_drain.required &&
+                  !mm.final_drain.target_l1 && !mm.final_drain.atomic);
+    }
+
+    // A boundary result spanning several L0 M/N tiles nests those output tiles
+    // outside the GM K-window loop. Every partial remains in L0C and drains
+    // once; no impossible Mat->Acc reload or full-region L1 carry is present.
+    {
+      auto p = mk_mm(256, 256, 512, 1000);
+      p.use_hierarchical_cube_cost = true;
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0});
+      CHECK("CUBEPLAN/root-carry: subgraph is analytically accepted", static_cast<bool>(sg));
+      if (!sg) return;
+      TileConfig cfg;
+      cfg.w = 256;
+      cfg.h = 256;
+      cfg.k = 512;
+      cfg.parts_m = 1;
+      cfg.parts_n = 1;
+      cfg.split_k = 1;
+      auto cost = sg->compute_cost(cfg);
+      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      const auto& mm = plan.matmuls[0];
+      const int64_t output_bytes = 256LL * 256 * 4;
+      double expected_drain = 0.0;
+      L0MatmulConfig drain_config = p.l0_matmul_config;
+      drain_config.bytes_c = 4;
+      for (const auto& variant : mm.output_variants) {
+        expected_drain += variant.count * estimate_l0_output_drain_cycles(variant.height, variant.width,
+                                                                          drain_config, L0OutputTarget::GM);
+      }
+      const double reload_cpb = p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * p.bw_gm_l1);
+      double expected_phases = 0.0;
+      const int64_t init_k = mm.k_loop.full_chunks >= 2 ? mm.k_loop.chunk : mm.effective_contraction;
+      for (const auto& variant : mm.output_variants) {
+        const double count = static_cast<double>(variant.count);
+        const auto feed = [&](int64_t k) {
+          return static_cast<double>((variant.height * k + k * variant.width) * 4) * reload_cpb;
+        };
+        double tile = feed(init_k) + variant.l0_init.phases.wall_cycles;
+        const int64_t rolled = std::max<int64_t>(0, mm.k_loop.full_chunks - 1);
+        if (rolled > 0) {
+          const double inner = variant.l0_rolled.phases.wall_cycles;
+          const double load = feed(mm.k_loop.chunk);
+          tile += mm.k_loop.pipeline_stages >= 2 && rolled >= 2
+                      ? load + inner + static_cast<double>(rolled - 1) * std::max(load, inner)
+                      : static_cast<double>(rolled) * (load + inner);
+        }
+        if (mm.k_loop.tail > 0) {
+          tile += feed(mm.k_loop.tail) + variant.l0_tail.phases.wall_cycles;
+        }
+        tile +=
+            estimate_l0_output_drain_cycles(variant.height, variant.width, drain_config, L0OutputTarget::GM);
+        expected_phases += count * tile;
+      }
+      CHECK("CUBEPLAN/root-carry: output-tile outer hierarchy and final drains are explicit",
+            cost.feasible && plan.feasible && plan.matmuls.size() == 1 && mm.k_loop.full_chunks >= 2 &&
+                (mm.output_tile_m < mm.output.height || mm.output_tile_n < mm.output.width) &&
+                plan.emit_compatible && mm.final_drain.required && !mm.final_drain.target_l1 &&
+                !mm.final_drain.atomic && mm.final_drain.bytes == output_bytes &&
+                std::abs(mm.final_drain.cycles - expected_drain) < 1e-9 &&
+                plan.peak_l1_bytes <= p.l1_capacity);
+      CHECK("CUBEPLAN/root-carry: candidate cost is the exact phase-local hierarchy",
+            std::abs(cost.latency - (expected_phases + p.kernel_fill_cost)) < 1e-9);
     }
 
     // Lone split-K derives its resident window against full K, then caps that
@@ -2018,6 +2253,11 @@ static void test_cube_schedule_plan() {
         CHECK("CUBEPLAN/chain: internal matmul owns its derived sequential K loop",
               plan.matmuls[0].k_loop.l1_window_k < 8192 &&
                   plan.matmuls[0].k_loop.chunk > 0);
+        CHECK("CUBEPLAN/chain: internal output drains to L1 and the root drains to GM",
+              !plan.matmuls[0].output_variants.empty() && !plan.matmuls[1].output_variants.empty() &&
+                  plan.matmuls[0].output_variants[0].l0_init.output_target == L0OutputTarget::Acc &&
+                  plan.matmuls[1].output_variants[0].l0_init.output_target == L0OutputTarget::Acc &&
+                  plan.matmuls[0].final_drain.target_l1 && !plan.matmuls[1].final_drain.target_l1);
     }
 
     // Compiler buildability mode may restrict multi-matmul DAGs to one static
@@ -2037,6 +2277,58 @@ static void test_cube_schedule_plan() {
                         (256 / cfg.parts_n) % 16 == 0;
         }
         CHECK("CUBEPLAN/uniform: every buildable candidate has one static region shape", all_uniform);
+      }
+    }
+
+    // PTO A2/A3's fused-chain handoff is FP32 Acc -> BF16/FP16 Mat. The child
+    // L0 plans therefore use FP32 accumulator bytes while the internal L1
+    // lifetime and final drain use the tensor's low-precision storage dtype.
+    // A same-type FP32 internal Mat would require the nonexistent Mat->Acc
+    // reload (and FP32 Acc->Mat is not supported), so buildable mode rejects it.
+    {
+      auto bf16 = mk_chained(128, 256, 128, 256, 1000, 1000);
+      for (Tensor& tensor : bf16.tensors) tensor.dtype = DType::BF16;
+      bf16.require_uniform_cube_dag_grid = true;
+      bf16.use_hierarchical_cube_cost = true;
+      DAG dag = DAG::build(bf16);
+      auto sg = Subgraph::create(bf16, dag, {0, 1});
+      CHECK("CUBEPLAN/dtype: BF16 chain is structurally accepted", static_cast<bool>(sg));
+      if (sg) {
+        TileConfig cfg;
+        cfg.w = 64;
+        cfg.h = 64;
+        cfg.k = 128;
+        cfg.parts_m = 2;
+        cfg.parts_n = 4;
+        cfg.split_k = 1;
+        const auto cost = sg->compute_cost(cfg);
+        const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+        CHECK("CUBEPLAN/dtype: BF16 chain has a buildable FP32-Acc/BF16-Mat handoff",
+              cost.feasible && plan.feasible && plan.emit_compatible && plan.matmuls.size() == 2 &&
+                  plan.matmuls[0].accumulator_dtype == DType::FP32 &&
+                  plan.matmuls[0].storage_dtype == DType::BF16 && plan.matmuls[0].final_drain.target_l1 &&
+                  plan.matmuls[0].final_drain.bytes == 64LL * 128 * 2);
+      }
+
+      auto fp32 = mk_chained(128, 256, 128, 256, 1000, 1000);
+      fp32.require_uniform_cube_dag_grid = true;
+      fp32.use_hierarchical_cube_cost = true;
+      DAG fp32_dag = DAG::build(fp32);
+      auto fp32_sg = Subgraph::create(fp32, fp32_dag, {0, 1});
+      CHECK("CUBEPLAN/dtype: FP32 chain is structurally accepted for partitioning",
+            static_cast<bool>(fp32_sg));
+      if (fp32_sg) {
+        TileConfig cfg;
+        cfg.w = 64;
+        cfg.h = 64;
+        cfg.k = 128;
+        cfg.parts_m = 2;
+        cfg.parts_n = 4;
+        cfg.split_k = 1;
+        const auto cost = fp32_sg->compute_cost(cfg);
+        const auto plan = fp32_sg->cube_schedule_plan(cfg, {}, {}, 1);
+        CHECK("CUBEPLAN/dtype: same-type FP32 internal L1 carry is not buildable",
+              !std::isfinite(cost.latency) && (!plan.feasible || !plan.emit_compatible));
       }
     }
 

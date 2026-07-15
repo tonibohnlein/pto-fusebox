@@ -135,6 +135,66 @@ static json cube_k_loop_json(const CubeKLoopPlan& loop) {
             {"pipeline_stages", loop.pipeline_stages}};
 }
 
+static const char* l0_stationarity_name(L0Stationarity stationarity) {
+  switch (stationarity) {
+    case L0Stationarity::Output:
+      return "output";
+    case L0Stationarity::A:
+      return "a";
+    case L0Stationarity::B:
+      return "b";
+  }
+  return "unknown";
+}
+
+static const char* dtype_name(DType dtype) {
+  switch (dtype) {
+    case DType::FP32:
+      return "fp32";
+    case DType::FP16:
+      return "fp16";
+    case DType::BF16:
+      return "bf16";
+    case DType::INT32:
+      return "int32";
+    case DType::INT16:
+      return "int16";
+    case DType::INT8:
+      return "int8";
+    case DType::BOOL:
+      return "bool";
+  }
+  return "unknown";
+}
+
+static json l0_matmul_plan_json(const L0MatmulPlan& plan) {
+  if (!plan.feasible) return nullptr;
+  const char* target = "gm";
+  if (plan.output_target == L0OutputTarget::Acc) target = "acc";
+  if (plan.output_target == L0OutputTarget::L1) target = "l1";
+  return {{"tile", {plan.m, plan.n, plan.k}},
+          {"stationarity", l0_stationarity_name(plan.stationarity)},
+          {"output_stationary_holds_a", plan.output_stationary_holds_a},
+          {"buffer_depths", {plan.buffer_depth_a, plan.buffer_depth_b, plan.buffer_depth_c}},
+          {"output_target", target},
+          {"k_loop",
+           {{"chunk", plan.k_loop.chunk},
+            {"full_chunks", plan.k_loop.full_chunks},
+            {"tail", plan.k_loop.tail},
+            {"pipeline_stages", plan.k_loop.pipeline_stages}}},
+          {"estimated_traffic_bytes", plan.estimated_traffic_bytes},
+          {"estimated_cost_cycles", plan.estimated_cost_cycles},
+          {"padded_compute_volume", plan.padded_compute_volume},
+          {"phases",
+           {{"load_cycles", plan.phases.load_cycles},
+            {"mad_cycles", plan.phases.mad_cycles},
+            {"init_cycles", plan.phases.init_cycles},
+            {"rolled_cycles", plan.phases.rolled_cycles},
+            {"tail_cycles", plan.phases.tail_cycles},
+            {"drain_cycles", plan.phases.drain_cycles},
+            {"wall_cycles", plan.phases.wall_cycles}}}};
+}
+
 static const char* mixed_engine_name(MixedEngine engine) {
     return engine == MixedEngine::Cube ? "cube" : "vector";
 }
@@ -157,6 +217,20 @@ static const char* mixed_pipeline_axis_name(MixedPipelineAxis axis) {
         case MixedPipelineAxis::AttentionKeyChunk: return "attention_key_chunk";
     }
     return "unknown";
+}
+
+static const char* mixed_vector_split_name(MixedVectorSplit split) {
+    switch (split) {
+        case MixedVectorSplit::None: return "none";
+        case MixedVectorSplit::Rows: return "rows";
+        case MixedVectorSplit::Columns: return "columns";
+    }
+    return "unknown";
+}
+
+static const char* mixed_transfer_direction_name(MixedTransferDirection direction) {
+    return direction == MixedTransferDirection::CubeToVector ? "cube_to_vector"
+                                                              : "vector_to_cube";
 }
 
 Problem read_problem(const std::string& filename) {
@@ -373,6 +447,56 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("hbm_aggregate_gibps")) p.hbm_aggregate_gibps = j["hbm_aggregate_gibps"].get<double>();
     if (j.contains("l0_tile_m"))    p.l0_tile_m    = j["l0_tile_m"].get<int64_t>();
     if (j.contains("l0_tile_n"))    p.l0_tile_n    = j["l0_tile_n"].get<int64_t>();
+    if (j.contains("l0_matmul_config")) {
+      const auto& l0 = j["l0_matmul_config"];
+      auto& config = p.l0_matmul_config;
+      if (l0.contains("l0a_bytes")) config.l0a_bytes = l0["l0a_bytes"].get<int64_t>();
+      if (l0.contains("l0b_bytes")) config.l0b_bytes = l0["l0b_bytes"].get<int64_t>();
+      if (l0.contains("l0c_bytes")) config.l0c_bytes = l0["l0c_bytes"].get<int64_t>();
+      if (l0.contains("min_m")) config.min_m = l0["min_m"].get<int64_t>();
+      if (l0.contains("min_n")) config.min_n = l0["min_n"].get<int64_t>();
+      if (l0.contains("min_k")) config.min_k = l0["min_k"].get<int64_t>();
+      if (l0.contains("align_m")) config.align_m = l0["align_m"].get<int64_t>();
+      if (l0.contains("align_n")) config.align_n = l0["align_n"].get<int64_t>();
+      if (l0.contains("align_k")) config.align_k = l0["align_k"].get<int64_t>();
+      if (l0.contains("allow_a_stationary")) {
+        config.allow_a_stationary = l0["allow_a_stationary"].get<bool>();
+      }
+      if (l0.contains("allow_b_stationary")) {
+        config.allow_b_stationary = l0["allow_b_stationary"].get<bool>();
+      }
+      if (l0.contains("allow_double_buffer_c")) {
+        config.allow_double_buffer_c = l0["allow_double_buffer_c"].get<bool>();
+      }
+      if (l0.contains("allow_padding")) {
+        config.allow_padding = l0["allow_padding"].get<bool>();
+      }
+      if (l0.contains("allow_k_boundary")) {
+        config.allow_k_boundary = l0["allow_k_boundary"].get<bool>();
+      }
+      if (l0.contains("bw_l0a")) config.bw_l0a = l0["bw_l0a"].get<double>();
+      if (l0.contains("bw_l0b")) config.bw_l0b = l0["bw_l0b"].get<double>();
+      if (l0.contains("bw_drain")) config.bw_drain = l0["bw_drain"].get<double>();
+      if (l0.contains("bw_l0c_l1")) config.bw_l0c_l1 = l0["bw_l0c_l1"].get<double>();
+      if (l0.contains("drain_fixed_cycles")) {
+        config.drain_fixed_cycles = l0["drain_fixed_cycles"].get<double>();
+      }
+      if (l0.contains("drain_row_cycles")) {
+        config.drain_row_cycles = l0["drain_row_cycles"].get<double>();
+      }
+      if (l0.contains("drain_penalty_cycles")) {
+        config.drain_penalty_cycles = l0["drain_penalty_cycles"].get<double>();
+      }
+      if (l0.contains("drain_c0_bytes")) {
+        config.drain_c0_bytes = l0["drain_c0_bytes"].get<int64_t>();
+      }
+      if (l0.contains("mad_head_cycles")) {
+        config.mad_head_cycles = l0["mad_head_cycles"].get<int64_t>();
+      }
+      if (l0.contains("mad_k_fractal_bytes")) {
+        config.mad_k_fractal_bytes = l0["mad_k_fractal_bytes"].get<int64_t>();
+      }
+    }
     if (j.contains("vec_reg_bytes"))    p.vec_reg_bytes    = j["vec_reg_bytes"].get<int64_t>();
     if (j.contains("vec_op_head"))      p.vec_op_head      = j["vec_op_head"].get<double>();
     if (j.contains("vec_op_tail"))      p.vec_op_tail      = j["vec_op_tail"].get<double>();
@@ -381,8 +505,14 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("require_uniform_cube_dag_grid")) {
       p.require_uniform_cube_dag_grid = j["require_uniform_cube_dag_grid"].get<bool>();
     }
+    if (j.contains("use_hierarchical_cube_cost")) {
+      p.use_hierarchical_cube_cost = j["use_hierarchical_cube_cost"].get<bool>();
+    }
     if (j.contains("fuse_cube_vector")) {
       p.fuse_cube_vector = j["fuse_cube_vector"].get<bool>();
+    }
+    if (j.contains("require_buildable_mixed")) {
+      p.require_buildable_mixed = j["require_buildable_mixed"].get<bool>();
     }
     if (j.contains("allow_model_ahead_mixed_multi_roundtrip")) {
       p.allow_model_ahead_mixed_multi_roundtrip =
@@ -533,6 +663,14 @@ void write_solution(const std::string& filename, const Solution& sol) {
         if (cube_plan.feasible) {
             json matmuls = json::array();
             for (const auto& mm : cube_plan.matmuls) {
+              json variants = json::array();
+              for (const auto& variant : mm.output_variants) {
+                variants.push_back({{"shape", {variant.height, variant.width}},
+                                    {"count", variant.count},
+                                    {"l0_init", l0_matmul_plan_json(variant.l0_init)},
+                                    {"l0_rolled", l0_matmul_plan_json(variant.l0_rolled)},
+                                    {"l0_tail", l0_matmul_plan_json(variant.l0_tail)}});
+              }
               matmuls.push_back({{"instance", mm.instance},
                                  {"op", mm.op},
                                  {"lhs_producer", mm.lhs_producer},
@@ -543,19 +681,37 @@ void write_solution(const std::string& filename, const Solution& sol) {
                                  {"output_ephemeral", mm.output_ephemeral},
                                  {"contraction", mm.contraction},
                                  {"effective_contraction", mm.effective_contraction},
+                                 {"accumulator_dtype", dtype_name(mm.accumulator_dtype)},
+                                 {"storage_dtype", dtype_name(mm.storage_dtype)},
                                  {"lhs", cube_region_json(mm.lhs)},
                                  {"rhs", cube_region_json(mm.rhs)},
                                  {"output", cube_region_json(mm.output)},
-                                 {"k_loop", cube_k_loop_json(mm.k_loop)}});
+                                 {"k_loop", cube_k_loop_json(mm.k_loop)},
+                                 {"output_tile", {mm.output_tile_m, mm.output_tile_n}},
+                                 {"output_grid", {mm.output_tiles_m, mm.output_tiles_n}},
+                                 {"output_variants", std::move(variants)},
+                                 {"final_drain",
+                                  {{"required", mm.final_drain.required},
+                                   {"target_l1", mm.final_drain.target_l1},
+                                   {"atomic", mm.final_drain.atomic},
+                                   {"valid_rows", mm.final_drain.valid_rows},
+                                   {"valid_cols", mm.final_drain.valid_cols},
+                                   {"tile_count", mm.final_drain.tile_count},
+                                   {"bytes", mm.final_drain.bytes},
+                                   {"cycles", mm.final_drain.cycles}}}});
             }
             j["cube_schedule"].push_back({{"emit_compatible", cube_plan.emit_compatible},
                                           {"spatial_tiles", cube_plan.spatial_tiles},
                                           {"split_k", cube_plan.split_k},
                                           {"work_units", cube_plan.work_units},
                                           {"peak_l1_bytes", cube_plan.peak_l1_bytes},
-                                          {"l0_tile_m", cube_plan.l0_tile_m},
-                                          {"l0_tile_n", cube_plan.l0_tile_n},
                                           {"seed_required", cube_plan.seed_required},
+                                          {"seed",
+                                           {{"present", cube_plan.seed.present},
+                                            {"work_units", cube_plan.seed.work_units},
+                                            {"valid_rows", cube_plan.seed.valid_rows},
+                                            {"valid_cols", cube_plan.seed.valid_cols},
+                                            {"bytes", cube_plan.seed.bytes}}},
                                           {"model_overlap_granted", cube_plan.model_overlap_granted},
                                           {"overlap_implementable", cube_plan.overlap_implementable},
                                           {"matmuls", matmuls}});
@@ -577,6 +733,17 @@ void write_solution(const std::string& filename, const Solution& sol) {
                      {"producer_engine", mixed_engine_name(transfer.producer_engine)},
                      {"consumer_engine", mixed_engine_name(transfer.consumer_engine)}});
             }
+            json fifos = json::array();
+            for (const auto& fifo : mixed_plan.fifos) {
+                fifos.push_back(
+                    {{"tensor", fifo.tensor},
+                     {"direction", mixed_transfer_direction_name(fifo.direction)},
+                     {"valid_rows", fifo.valid_rows},
+                     {"valid_cols", fifo.valid_cols},
+                     {"slot_bytes", fifo.slot_bytes},
+                     {"slot_count", fifo.slot_count},
+                     {"reserved_bytes", fifo.reserved_bytes}});
+            }
             j["mixed_schedule"].push_back(
                 {{"emit_compatible", mixed_plan.emit_compatible},
                  {"mode", mixed_pipeline_mode_name(mixed_plan.mode)},
@@ -584,6 +751,13 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"split_k", mixed_plan.split_k},
                  {"work_units", mixed_plan.work_units},
                  {"group_capacity", mixed_plan.group_capacity},
+                 {"cube_window_k", mixed_plan.cube_window_k},
+                 {"vector_stage_kind",
+                  vector_stream_kind_name(mixed_plan.vector_stage_kind)},
+                 {"vector_stage_peak_ub_bytes",
+                  mixed_plan.vector_stage_peak_ub_bytes},
+                 {"vector_split", mixed_vector_split_name(mixed_plan.vector_split)},
+                 {"vector_lanes", mixed_plan.vector_lanes},
                  {"pipeline_axis", mixed_pipeline_axis_name(mixed_plan.loop.axis)},
                  {"pipeline_extent", mixed_plan.loop.extent},
                  {"pipeline_chunk", mixed_plan.loop.chunk},
@@ -599,7 +773,8 @@ void write_solution(const std::string& filename, const Solution& sol) {
                  {"max_alternations", mixed_plan.topology->max_alternations},
                  {"output_engines_uniform", mixed_plan.topology->output_engines_uniform},
                  {"stages", stages},
-                 {"transfers", transfers}});
+                 {"transfers", transfers},
+                 {"fifos", fifos}});
         } else {
             j["mixed_schedule"].push_back(nullptr);
         }

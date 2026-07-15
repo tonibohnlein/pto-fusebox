@@ -3,8 +3,11 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <memory>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <vector>
 
 #include "core/cost_model.h"
@@ -29,6 +32,15 @@ double GroundedColumnReductionCycles(VectorPrimitiveFamily family, DType dtype,
 // vector stream. The current count-mode implementation charges vector_dup's
 // 11-cycle head plus 13-cycle tail independent of valid extent.
 double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols);
+
+// Ephemeral memo for one best_cost()/enumerate_plans() call. It is deliberately
+// absent from CostResult and CostCache: exact L0 costing may revisit the same
+// local shape across many outer grids, but global search cache entries must stay
+// scalar and compact. The Problem/backend configuration is constant during one
+// evaluation, so the key needs only request-specific fields.
+using L0PlanMemoKey =
+    std::tuple<int64_t, int64_t, int64_t, DType, DType, DType, bool, L0OutputTarget>;
+using L0PlanMemo = std::map<L0PlanMemoKey, L0MatmulPlan>;
 
 // ============================================================================
 // Ascend910BCost: the 910B cost model. A connected group of ops that share a
@@ -144,10 +156,11 @@ public:
                        std::vector<int64_t> *perop_k = nullptr) const;
 
   // Solver-owned cube algorithm for one fixed candidate and parallel split.
-  // The hot candidate path uses derive_exec() directly for the peak/per-op
-  // windows it needs to price; final/forced-solution consumers re-run the same
-  // derivation once to obtain this full emit descriptor. `parallel_split` is the
-  // CostResult::parallel_split selected for the candidate (1 = spatial only).
+  // Analytic candidate costing uses derive_exec() directly for the peak/per-op
+  // windows it needs. Exact/co-optimized costing derives this hierarchy with an
+  // ephemeral per-best_cost L0 memo; final/forced-solution consumers re-run the
+  // same derivation once to obtain the full emit descriptor. `parallel_split`
+  // is the CostResult::parallel_split selected for the candidate (1 = spatial only).
   CubeSchedulePlan cube_schedule_plan(
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev = {},
@@ -233,6 +246,18 @@ public:
   // virtual destructor is needed; the implicit copy/move carry the vptr.
 
 protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
+  CostResult compute_cost_impl(const TileConfig &cfg,
+                               const FlatSet<size_t> &retained_from_prev,
+                               const FlatSet<size_t> &retain_these,
+                               L0PlanMemo *l0_memo) const;
+
+  CubeSchedulePlan derive_cube_schedule_plan(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these,
+      int64_t parallel_split,
+      L0PlanMemo *l0_memo) const;
+
   // Hot mixed candidate derivation. It leaves MixedSchedulePlan::topology empty
   // so every enumerated configuration avoids a shared_ptr reference-count
   // update; mixed_schedule_plan() attaches the owner only for an explicit

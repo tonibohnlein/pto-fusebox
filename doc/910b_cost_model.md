@@ -88,9 +88,9 @@ the L1 divisor against full K, then cap that divisor to the selected K share.
 
 ---
 
-## 4. Per-request cube work
+## 4. Per-request cube work and the L0 child plan
 
-The pto-isa-grounded work for one request instance has two inner pipes:
+The legacy analytic work for one request instance has two inner pipes:
 
 - Matrix-pipe `CubeMacCycles(m,n,k,input_dtype)`;
 - MTE1 `CubeExtractCycles(m,n,k,input_dtype)` for L1→L0A/B extraction. Precision and operand bytes
@@ -106,6 +106,19 @@ The requested region is subdivided using `Problem::l0_tile_m/l0_tile_n` (normall
 One step serializes MAC and extraction; a long sequence approaches their overlapped maximum.
 Matmul request instances have data dependencies, so their Phase-D times sum within a work unit.
 
+The model deliberately exposes two policies. Analytic mode (the default `Problem` setting) uses the
+aggregate fixed-base-tile formula above. Exact/co-optimized mode sets
+`Problem::use_hierarchical_cube_cost=true` and derives a backend-parameterized `L0MatmulPlan` for
+every init/rolled/tail tensor phase. The shared chooser records actual L0 M/N/K, stationarity,
+buffer depths, an L0 K loop, and serial-init/rolled/tail/drain costs; the uniform candidate cost then
+composes those child phase walls directly. The aggregate formula remains both the cheap policy and
+the already-grounded geometry-selection oracle: using phase granularity to re-select baseK before
+adding a grounded per-iteration event cost incorrectly prefers baseK=16.
+
+Exact enumeration uses an ephemeral memo keyed by local M/N/K, operand/storage dtypes,
+accumulator-read state, and output target. It is scoped to one `best_cost()` or plan dump: neither
+the `L0MatmulPlan` nor the memo enters `CostResult` or the global op-set cost cache.
+
 For a balanced grid, `LptMakespanPerUnit` creates every concrete
 `region-shape × split-partial` task and assigns longest tasks first to the least-loaded cube core.
 This preserves unequal region work and upstream recomputation. The lone-matmul path retains the
@@ -115,31 +128,27 @@ pre-refactor LPT formula as a fixed cost anchor.
 
 ## 5. GM traffic and outer roofline
 
-Only boundary inputs and boundary outputs touch GM. `cube_request_reload()` walks the same request
-DAG and charges each logical boundary request once per work unit, deduplicated by
-`(tensor, input port, height binding, width binding)`. A role switch is a different request and is
-charged separately. Produced intermediates cost zero GM traffic but non-zero L1 capacity.
+Only boundary inputs and boundary outputs touch GM. The buildable hierarchical cost charges each
+boundary request once per emitted output tile and GM K window. This includes the emitter's actual
+reload multiplicity: another N output tile reloads its LHS unless an explicit retained-panel
+lifetime is added. Produced intermediates cost zero GM traffic but non-zero L1 capacity.
 
 GM→L1 operand reads and L0C→GM output writes are separate concurrent pipes. Each divides across
 active cores up to its aggregate bandwidth cap. Split-K writes the root output `S` times using
 atomic add.
 
-The current outer roofline is:
+For each output variant, the outer phase cost is:
 
 ```
-latency = max(compute_makespan, ddr)   if every boundary-loading node has a real stage-2 K loop
-        = compute_makespan + ddr       otherwise
+first window = GM feed + child L0 wall
+rolled       = feed + child + (R-1) * max(feed, child)
+tail         = GM feed + child L0 wall
+final        = one Acc->L1/GM drain
 ```
 
-The overlap predicate is reconstructed from each node's actual L1 window and chunk count. This
-replaces the historical scalar `root_K/S >= 32` test, which could grant overlap to a one-iteration
-loop. It is conservative but still global: serial init/tail and rolled phases are not yet costed as
-separate rooflines.
-
-The current reload term also assumes each logical GM panel is retained across L0 output subtiles.
-AutoFuse presently puts a complete K stream inside each L0 output-subtile loop, so a panel can be
-loaded more often than this term charges. This is an open model↔emit contract item, not a calibrated
-reuse claim.
+Only an actual stage-2 rolled phase receives `max`; first/tail/final work is additive. Up to four
+ragged output variants carry exact counts. The split seed is a separate vector fill/store/task
+phase and contributes another kernel-fill wave.
 
 ---
 
@@ -166,13 +175,16 @@ merge and is represented by cutting the subgraph, not by this in-kernel plan.
 For the winning or forced configuration, `cube_schedule_plan()` re-runs the lightweight derivation
 and returns:
 
-- exact M/N partitions, split, work units, peak L1, and L0 tile sizes;
+- exact M/N partitions, split, work units, and peak L1;
 - one `CubeMatmulSchedule` per request instance;
 - producer-instance dependencies and root markers;
 - concrete output/LHS/RHS regions plus their symbolic bindings;
 - full/effective contraction;
+- accumulator dtype and result-storage dtype;
 - L1 K window, emitted chunk, rolled trips, tail, and pipeline stage;
-- seed requirement and overlap/buildability flags.
+- output/L0C variants with shared-backend init/rolled/tail child plans;
+- one explicit final Acc→L1/GM drain;
+- the split seed plus overlap/buildability flags.
 
 The plan is intentionally absent from `CostResult`, which is stored in the local-search cache. The
 topology is built once per subgraph; O(nodes) candidate derivations remain stack-local. This keeps
@@ -186,6 +198,16 @@ The current plan-driven emitter exactly replays uniform multi-matmul grids. Auto
 `Problem::require_uniform_cube_dag_grid`, which filters non-uniform M/N partitions only for groups
 with more than one matmul. This is a buildability restriction, not an analytic limitation of the
 cost model.
+
+AutoFuse emits the planned tensor-level output tiles and K windows and attaches each child
+`L0MatmulPlan`; it does not create an L0 tile. `AutoTileMatmulL0` validates the descriptor against
+the active backend chooser and builds Left/Right/Acc IR. Output tiles remain in L0C through the
+complete K stream and drain once. The outer GM→L1 pipeline is marked so its stage depth is not
+multiplied into nested L0 buffers.
+
+Floating operands accumulate in FP32. A2/A3's fused-chain path drains an internal FP32 Acc to a
+BF16/FP16 Mat tile. Same-type FP32 Acc→Mat and Mat→Acc do not exist, so an explicitly FP32 internal
+result is not a buildable fused chain and is partitioned into standalone matmuls.
 
 Lone matmuls retain the established balanced non-uniform search and ceil+clamp emitter. That emitter
 is numerically idempotent, but it can execute more max-size tiles than the LPT-balanced cost prices.
@@ -205,19 +227,22 @@ Host coverage includes:
 - produced LHS/RHS, both inputs produced, non-square trees, deep chains, fan-out role switches, and
   multiple sinks;
 - role-aware L1 peak/reload, one-trip no-overlap, uniform-grid buildability, and compact cache state;
-- Torch numerics and default-stack lowering, including an intermediate larger than one L0 tile that
-  is assembled in L1.
+- Torch numerics and PTOAS-backed default-stack lowering, including a 192 KiB BF16 intermediate,
+  explicit FP32 accumulation/narrowing, and FP32-chain decline.
 
 Before device ranking is trusted, complete:
 
-1. match GM reload multiplicity to the emitted L0 loop nest or change the emitter to retain panels;
-2. replace the global outer roofline with per-node init/rolled/tail/store phase rooflines;
-3. price seed/barrier and per-task launch overhead;
-4. implement or consistently price non-uniform multi-op grids and lone ceil+clamp work;
-5. represent shared boundary-panel lifetimes;
-6. represent final FIXPIPE narrowing before streaming/splitting an FP16/BF16 output;
-7. validate numerics, GM traffic, Matrix/MTE overlap, atomic stores, wall time, and forced-plan regret
-   on Ascend 910B2.
+1. implement or consistently price non-uniform multi-op grids and lone ceil+clamp work;
+2. add shared boundary-panel retention only with an explicit lifetime and matching traffic change;
+3. ground a per-baseK event/synchronization term before phase cost changes geometry selection;
+4. extend the Acc→Mat capability table beyond BF16/FP16 only when PTO supports it;
+5. validate descriptor consumption, actual reload multiplicity, nested MTE2/MTE1/Matrix/FIXPIPE
+   overlap, narrowing, atomic stores, wall time, and forced-plan regret on Ascend 910B2 with the
+   latest PTOAS;
+6. profile and optimize buildable candidate evaluation.
+
+The production nested schedule uses the PTOAS memory planner. The host PyPTO allocator cannot yet
+interval-pack every disjoint ping-pong and full-region scratch lifetime required by this path.
 
 ---
 
@@ -233,4 +258,5 @@ Before device ranking is trusted, complete:
 | cube candidate cost | `Ascend910BCost::compute_cost` |
 | final plan reconstruction | `cube_schedule_plan` |
 | plan data structures | `types.h` |
+| shared L0 chooser | `l0_matmul_plan.h`, `l0_matmul_plan.cpp` |
 | JSON interchange | `io.cpp` and AutoFuse `DumpProblemJson` |

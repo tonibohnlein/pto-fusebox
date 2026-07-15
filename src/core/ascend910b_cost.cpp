@@ -546,6 +546,35 @@ double CubeExtractCycles(const Problem* p, const ByteCost& bc, int64_t M,
   return lhs_bytes * bc.l0a + rhs_bytes * bc.l0b;
 }
 
+L0MatmulPlan DeriveL0MatmulPlan(const Problem* p, int64_t m, int64_t n, int64_t k, DType lhs_dtype,
+                                DType rhs_dtype, DType output_dtype, bool accumulator_read,
+                                L0OutputTarget output_target, L0PlanMemo* memo) {
+  const L0PlanMemoKey key{m, n, k, lhs_dtype, rhs_dtype, output_dtype, accumulator_read, output_target};
+  if (memo != nullptr) {
+    const auto it = memo->find(key);
+    if (it != memo->end()) return it->second;
+  }
+  L0MatmulConfig config = p->l0_matmul_config;
+  config.m = m;
+  config.n = n;
+  config.k = k;
+  config.bytes_a = dtype_bytes(lhs_dtype);
+  config.bytes_b = dtype_bytes(rhs_dtype);
+  config.bytes_c = dtype_bytes(output_dtype);
+  config.accumulator_read = accumulator_read;
+  config.output_target = output_target;
+  // AutoTileMatmulL0's Mat-scratch placement currently forces an internal
+  // producer to output-stationary. Keep the child plan on the same buildable
+  // subset until operand-stationary scratch packing is implemented.
+  if (output_target == L0OutputTarget::L1) {
+    config.allow_a_stationary = false;
+    config.allow_b_stationary = false;
+  }
+  L0MatmulPlan plan = choose_l0_matmul_plan(config);
+  if (memo != nullptr) memo->emplace(key, plan);
+  return plan;
+}
+
 // Wave-aware compute makespan. Uniform cube grids are equal-cost; a balanced
 // vector grid totalizes U copies of its maximum valid region work, so this same
 // equation prices the critical task rather than the average 11/10-row task.
@@ -1038,6 +1067,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       if (valid && found_mm != SIZE_MAX) {
         sg.has_simple_epilogue_ = true;
         sg.output_K_ = sg.op_K(found_mm);
+        sg.sink_mm_op_ = static_cast<int64_t>(found_mm);
         sg.is_sink_op_vec_[found_mm] = true;
       }
     }
@@ -1401,7 +1431,10 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     for (size_t op_idx : sg.ops_) {
       if (prob.ops[op_idx].type == OpType::MatMul) ++cube_op_count;
     }
-    const bool uniform_cube_only = matmul_910b && cube_op_count > 1 && prob.require_uniform_cube_dag_grid;
+    const bool uniform_cube_only =
+        matmul_910b &&
+        ((cube_op_count > 1 && prob.require_uniform_cube_dag_grid) ||
+         (sg.has_matmul_ && sg.has_vector_ && prob.require_buildable_mixed));
     std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C} (incl. 1)
     for (int64_t R : {C, 2 * C})
       for (int64_t d = 1; d * d <= R; ++d)
@@ -1852,6 +1885,107 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         (topology->mode == MixedPipelineMode::OneWay ||
          topology->mode == MixedPipelineMode::SingleRoundTripSkew);
 
+    // Production increment 1 is deliberately narrower than the generic
+    // infrastructure: one matmul followed by a linear, same-shape elementwise
+    // epilogue.  This is the exact source algorithm replayed by AutoFuse.  In
+    // particular, reductions/P4 and V->C/C->V->C remain analytic-only until
+    // their stage-local plans and FIFO protocols are emitted.
+    bool compiler_emit_compatible =
+        one_way_chain && topology->stages[0].engine == MixedEngine::Cube &&
+        topology->stages[1].engine == MixedEngine::Vector &&
+        topology->stages[0].ops.size() == 1;
+    if (compiler_emit_compatible) {
+      const size_t matmul_op = topology->stages[0].ops.front();
+      if (!prob.ops[matmul_op].mixed_emit_compatible) {
+        compiler_emit_compatible = false;
+      }
+      // The tensor-level C->V emitter carries a K-window accumulator in the
+      // matmul result value.  That is exact only when the result already has
+      // the hardware accumulator dtype (FP32 for floating operands, INT32 for
+      // integer operands).  A low-precision result needs a separate FP32/INT32
+      // carry plus one final FIXPIPE narrowing before TPUSH; until that stage
+      // contract is represented, reject the whole mixed topology rather than
+      // silently falling back to one full-K slice.
+      const Op& matmul = prob.ops[matmul_op];
+      const bool has_binary_operands = matmul.inputs.size() == 2;
+      const DType lhs_dtype = has_binary_operands
+                                  ? prob.tensors[matmul.inputs[0]].dtype
+                                  : DType::BOOL;
+      const DType rhs_dtype = has_binary_operands
+                                  ? prob.tensors[matmul.inputs[1]].dtype
+                                  : DType::BOOL;
+      // Keep compiler v0 on the floating accumulator surface. PTO also has an
+      // INT8->INT32 matmul, but its successor needs an integer-family vector
+      // capability table before we can price arbitrary elementwise epilogues.
+      const bool compiler_cube_dtype = lhs_dtype == DType::FP32 ||
+                                       lhs_dtype == DType::FP16 ||
+                                       lhs_dtype == DType::BF16;
+      if (!has_binary_operands || lhs_dtype != rhs_dtype || !compiler_cube_dtype ||
+          prob.tensors[matmul.output()].dtype != cube_accumulator_dtype(lhs_dtype)) {
+        compiler_emit_compatible = false;
+      }
+      const Tensor& reference = prob.tensors[prob.ops[matmul_op].output()];
+      size_t previous = matmul_op;
+      for (size_t vector_op : topology->stages[1].ops) {
+        const Op& op = prob.ops[vector_op];
+        const Tensor& output = prob.tensors[op.output()];
+        int internal_inputs = 0;
+        for (size_t tensor : op.inputs) {
+          const int producer = dag.tensor_producer[tensor];
+          if (producer >= 0 && is_in_sg[static_cast<size_t>(producer)]) {
+            ++internal_inputs;
+            if (static_cast<size_t>(producer) != previous) {
+              compiler_emit_compatible = false;
+            }
+          }
+          const Tensor& input = prob.tensors[tensor];
+          const bool broadcastable =
+              (input.height == 1 || input.height == reference.height) &&
+              (input.width == 1 || input.width == reference.width);
+          // Current emitted PTO primitives do not insert promotions/casts.
+          // Every tensor operand and result therefore stays in the crossing
+          // FP32 accumulator dtype throughout the epilogue.
+          if (!broadcastable || input.dtype != output.dtype ||
+              output.dtype != reference.dtype) {
+            compiler_emit_compatible = false;
+          }
+        }
+        if (op.type != OpType::Pointwise || !HasGroundedVectorSemantics(op) ||
+            op.vector_capability != VectorOpCapability::Elementwise ||
+            output.height != reference.height || output.width != reference.width ||
+            internal_inputs != 1) {
+          compiler_emit_compatible = false;
+        }
+        previous = vector_op;
+      }
+      for (size_t op : sg.ops_) {
+        const size_t output = prob.ops[op].output();
+        const bool is_final = op == previous;
+        bool has_external_consumer = false;
+        for (size_t consumer : dag.tensor_consumers[output]) {
+          if (!is_in_sg[consumer]) has_external_consumer = true;
+        }
+        if ((!is_final && (sg.boundary_outputs_.count(output) ||
+                           prob.required_outputs.count(output) ||
+                           has_external_consumer)) ||
+            (is_final && !sg.boundary_outputs_.count(output))) {
+          compiler_emit_compatible = false;
+        }
+        int internal_consumers = 0;
+        for (size_t consumer : dag.tensor_consumers[output]) {
+          if (is_in_sg[consumer]) ++internal_consumers;
+        }
+        if ((!is_final && internal_consumers != 1) ||
+            (is_final && internal_consumers != 0)) {
+          compiler_emit_compatible = false;
+        }
+      }
+    }
+    topology->compiler_emit_compatible = compiler_emit_compatible;
+    if (prob.require_buildable_mixed && !topology->compiler_emit_compatible) {
+      return std::nullopt;
+    }
+
     auto is_sink_unit = [&](size_t op) {
       return (prob.ops[op].type == OpType::MatMul) == topology->output_is_cube;
     };
@@ -2165,6 +2299,11 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
       const int64_t lhs_b = node.lhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.lhs.tensor].dtype);
       const int64_t rhs_b = node.rhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.rhs.tensor].dtype);
       const int64_t per_unit = lhs_b * h + rhs_b * w;
+      // Output/L0C subtiles are outer to the K-window loop, so the running C
+      // never leaves L0C and consumes no L1 band. A2/A3 has no Mat->Acc path;
+      // modeling a full-region L1 accumulator here would describe an
+      // unemittable algorithm. Internal completed outputs are already in
+      // band_at[] over their producer/consumer lifetime.
       const int64_t bands = base + band_at[step];
       if (bands > static_cast<int64_t>(l1)) return INT64_MAX;
 
@@ -2314,6 +2453,15 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
     const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these,
     int64_t parallel_split) const {
+  return derive_cube_schedule_plan(cfg, retained_from_prev, retain_these, parallel_split, nullptr);
+}
+
+CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
+    const TileConfig &cfg,
+    const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these,
+    int64_t parallel_split,
+    L0PlanMemo *l0_memo) const {
   CubeSchedulePlan plan;
   plan.config = cfg;
   const int64_t split = std::max<int64_t>(1, parallel_split);
@@ -2346,13 +2494,22 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
   plan.peak_l1_bytes = peak;
-  plan.l0_tile_m = std::max<int64_t>(1, prob_->l0_tile_m);
-  plan.l0_tile_n = std::max<int64_t>(1, prob_->l0_tile_n);
   plan.seed_required = split > 1;
   plan.model_overlap_granted = true;
   plan.overlap_implementable = true;
   const int64_t m_extent = std::min(cfg.h, out_H_);
   const int64_t n_extent = std::min(cfg.w, out_W_);
+  if (plan.seed_required && !boundary_outputs_.empty()) {
+    const DType output_dtype = prob_->tensors[*boundary_outputs_.begin()].dtype;
+    const int64_t bytes = dtype_bytes(output_dtype);
+    const int64_t seed_h = std::min(
+        m_extent, std::max<int64_t>(1, prob_->vec_capacity / std::max<int64_t>(1, n_extent * bytes)));
+    plan.seed.present = true;
+    plan.seed.work_units = ((out_H_ + seed_h - 1) / seed_h) * parts_n;
+    plan.seed.valid_rows = seed_h;
+    plan.seed.valid_cols = n_extent;
+    plan.seed.bytes = plan.seed.work_units * seed_h * n_extent * bytes;
+  }
 
   std::vector<int64_t> last_use(cube_request_nodes_.size(), -1);
   FlatSet<size_t> roots(cube_request_roots_.begin(), cube_request_roots_.end());
@@ -2425,6 +2582,118 @@ CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
     if (loads_boundary && mm.k_loop.pipeline_stages != 2) {
       plan.model_overlap_granted = false;
       plan.overlap_implementable = false;
+    }
+
+    const DType lhs_dtype = prob_->tensors[mm.lhs.tensor].dtype;
+    const DType rhs_dtype = prob_->tensors[mm.rhs.tensor].dtype;
+    const DType output_dtype = prob_->tensors[mm.output.tensor].dtype;
+    mm.accumulator_dtype = cube_accumulator_dtype(lhs_dtype);
+    mm.storage_dtype = output_dtype;
+    const bool has_chunked_carry = mm.k_loop.full_chunks >= 2;
+    const int64_t init_k = has_chunked_carry ? mm.k_loop.chunk : mm.effective_contraction;
+    auto derive_variant = [&](int64_t tile_m, int64_t tile_n) {
+      CubeOutputTileVariant variant;
+      variant.height = tile_m;
+      variant.width = tile_n;
+      variant.l0_init =
+          DeriveL0MatmulPlan(prob_, tile_m, tile_n, init_k, lhs_dtype, rhs_dtype, mm.accumulator_dtype,
+                             /*accumulator_read=*/false, L0OutputTarget::Acc, l0_memo);
+      if (has_chunked_carry) {
+        variant.l0_rolled =
+            DeriveL0MatmulPlan(prob_, tile_m, tile_n, mm.k_loop.chunk, lhs_dtype, rhs_dtype,
+                               mm.accumulator_dtype, /*accumulator_read=*/true, L0OutputTarget::Acc, l0_memo);
+        if (mm.k_loop.tail > 0) {
+          variant.l0_tail =
+              DeriveL0MatmulPlan(prob_, tile_m, tile_n, mm.k_loop.tail, lhs_dtype, rhs_dtype,
+                                 mm.accumulator_dtype, /*accumulator_read=*/true, L0OutputTarget::Acc, l0_memo);
+        }
+      }
+      return variant;
+    };
+
+    // Find one output tile that every K phase can keep wholly in L0C. This is
+    // the legal PTO nesting: output tile outer, GM->L1 K windows inner. Repeating
+    // the shared chooser to a fixed point handles a tail phase whose operand
+    // capacity requires a smaller M/N tile than the first phase.
+    int64_t tile_m = mm.output.height;
+    int64_t tile_n = mm.output.width;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+      const CubeOutputTileVariant probe = derive_variant(tile_m, tile_n);
+      if (!probe.l0_init.feasible || (has_chunked_carry && !probe.l0_rolled.feasible) ||
+          (mm.k_loop.tail > 0 && !probe.l0_tail.feasible)) {
+        plan.emit_compatible = false;
+        break;
+      }
+      int64_t next_m = std::min(tile_m, probe.l0_init.m);
+      int64_t next_n = std::min(tile_n, probe.l0_init.n);
+      if (probe.l0_rolled.feasible) {
+        next_m = std::min(next_m, probe.l0_rolled.m);
+        next_n = std::min(next_n, probe.l0_rolled.n);
+      }
+      if (probe.l0_tail.feasible) {
+        next_m = std::min(next_m, probe.l0_tail.m);
+        next_n = std::min(next_n, probe.l0_tail.n);
+      }
+      if (next_m == tile_m && next_n == tile_n) break;
+      tile_m = next_m;
+      tile_n = next_n;
+    }
+    if (tile_m <= 0 || tile_n <= 0) plan.emit_compatible = false;
+    mm.output_tile_m = tile_m;
+    mm.output_tile_n = tile_n;
+    mm.output_tiles_m = (mm.output.height + tile_m - 1) / tile_m;
+    mm.output_tiles_n = (mm.output.width + tile_n - 1) / tile_n;
+
+    const int64_t full_m = mm.output.height / tile_m;
+    const int64_t full_n = mm.output.width / tile_n;
+    const int64_t tail_m = mm.output.height % tile_m;
+    const int64_t tail_n = mm.output.width % tile_n;
+    auto add_variant = [&](int64_t h, int64_t w, int64_t count) {
+      if (h <= 0 || w <= 0 || count <= 0) return;
+      CubeOutputTileVariant variant = derive_variant(h, w);
+      variant.count = count;
+      if (!variant.l0_init.feasible || variant.l0_init.m != h || variant.l0_init.n != w ||
+          (has_chunked_carry &&
+           (!variant.l0_rolled.feasible || variant.l0_rolled.m != h || variant.l0_rolled.n != w)) ||
+          (mm.k_loop.tail > 0 &&
+           (!variant.l0_tail.feasible || variant.l0_tail.m != h || variant.l0_tail.n != w))) {
+        plan.emit_compatible = false;
+      }
+      mm.output_variants.push_back(std::move(variant));
+    };
+    add_variant(tile_m, tile_n, full_m * full_n);
+    add_variant(tail_m, tile_n, full_n);
+    add_variant(tile_m, tail_n, full_m);
+    add_variant(tail_m, tail_n, 1);
+
+    // Every output tile has one and only one post-K-loop drain. Internal
+    // request values drain Acc->Mat and live in L1; roots drain Acc->GM (atomic
+    // for split-K). No phase may perform a Mat->Acc reload.
+    mm.final_drain.required = true;
+    mm.final_drain.target_l1 = !mm.is_sink;
+    mm.final_drain.atomic = mm.is_sink && split > 1;
+    mm.final_drain.valid_rows = tile_m;
+    mm.final_drain.valid_cols = tile_n;
+    mm.final_drain.bytes = mm.output.height * mm.output.width * dtype_bytes(output_dtype);
+    // PTO A2/A3's on-chip chain path is Acc(fp32)->Mat(bf16/fp16). It has no
+    // Mat->Acc reload and no same-type fp32 Acc->Mat instruction. A boundary
+    // root may still drain fp32 Acc directly to GM.
+    if (prob_->use_hierarchical_cube_cost && mm.final_drain.target_l1 && output_dtype != DType::BF16 &&
+        output_dtype != DType::FP16) {
+      plan.emit_compatible = false;
+    }
+    L0MatmulConfig drain_config = prob_->l0_matmul_config;
+    drain_config.bytes_c = dtype_bytes(output_dtype);
+    const L0OutputTarget drain_target = mm.final_drain.target_l1 ? L0OutputTarget::L1 : L0OutputTarget::GM;
+    for (const CubeOutputTileVariant& variant : mm.output_variants) {
+      mm.final_drain.tile_count += variant.count;
+      mm.final_drain.cycles +=
+          static_cast<double>(variant.count) *
+          estimate_l0_output_drain_cycles(variant.height, variant.width, drain_config, drain_target);
+    }
+    if (mm.output_variants.empty() || mm.final_drain.tile_count != mm.output_tiles_m * mm.output_tiles_n ||
+        !std::isfinite(mm.final_drain.cycles)) {
+      plan.emit_compatible = false;
     }
     plan.matmuls.push_back(mm);
     plan.execution_order.push_back(node.op);
@@ -2890,8 +3159,53 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig &cfg,
   //     reduction). A held vector→vector intermediate is a UB band; a crossing tile
   //     popped from the ring is a transient; cube ops are skipped.
   // The crossing's DDR roundtrip is paid in compute_cost, not in feasibility.
-  return derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) != INT64_MAX &&
-         vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
+  if (derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) == INT64_MAX) {
+    return false;
+  }
+
+  // Analytic mixed studies may still use the homogeneous streaming planner.
+  // Production v0 is stricter: its AIV body materializes one explicit row-half
+  // and ExpandMixedKernel reserves eight full crossing slots in Vec memory.
+  // Admitting a merely streamable full tile here would price an algorithm the
+  // emitter does not build and can overflow MemoryReuse after expansion.
+  if (!prob_->require_buildable_mixed) {
+    return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
+  }
+  if (!mixed_topology_ || !mixed_topology_->compiler_emit_compatible ||
+      mixed_topology_->transfers.size() != 1) {
+    return false;
+  }
+  const int64_t parts_m = cfg.parts_m > 0
+                              ? cfg.parts_m
+                              : std::max<int64_t>(1, out_H_ / std::max<int64_t>(1, cfg.h));
+  const int64_t parts_n = cfg.parts_n > 0
+                              ? cfg.parts_n
+                              : std::max<int64_t>(1, out_W_ / std::max<int64_t>(1, cfg.w));
+  const AxisPartition mp = partition_axis(out_H_, parts_m, grid_gran_h_);
+  const AxisPartition np = partition_axis(out_W_, parts_n, grid_gran_w_);
+  if (mp.num_big != 0 || np.num_big != 0 || mp.big < 2 || mp.big % 2 != 0) {
+    return false;
+  }
+
+  TileConfig lane_cfg = cfg;
+  lane_cfg.h = mp.big / 2;
+  lane_cfg.w = np.big;
+  lane_cfg.parts_m = 0;
+  lane_cfg.parts_n = 0;
+  lane_cfg.split_k = 1;
+  const VectorStreamPlan lane_plan =
+      vector_stream_plan(lane_cfg, retained_from_prev, retain_these);
+  if (!lane_plan.feasible || lane_plan.kind != VectorStreamKind::Materialized) {
+    return false;
+  }
+
+  const MixedTransferTopology& transfer = mixed_topology_->transfers.front();
+  const int64_t slot_bytes =
+      mp.big * np.big * dtype_bytes(prob_->tensors[transfer.tensor].dtype);
+  constexpr int64_t kMixedFifoSlots = 8;
+  const int64_t fifo_reserved = slot_bytes * kMixedFifoSlots;
+  return fifo_reserved <= prob_->vec_capacity &&
+         lane_plan.full_peak_ub_bytes <= prob_->vec_capacity - fifo_reserved;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -3011,6 +3325,13 @@ double Ascend910BCost::cube_request_reload(const TileConfig& cfg, int64_t split,
 CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                   const FlatSet<size_t> &retained_from_prev,
                                   const FlatSet<size_t> &retain_these) const {
+  return compute_cost_impl(cfg, retained_from_prev, retain_these, nullptr);
+}
+
+CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
+                                  const FlatSet<size_t> &retained_from_prev,
+                                  const FlatSet<size_t> &retain_these,
+                                  L0PlanMemo *l0_memo) const {
   if (has_matmul_ && has_vector_) {
     return compute_mixed_cost(cfg, retained_from_prev, retain_these);
   }
@@ -3018,6 +3339,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
   result.config = cfg;
   VectorStreamPlan vector_stream;
   std::vector<int64_t> cube_window_k;
+  int64_t cube_seed_fill_rounds = 0;
 
   if (!is_valid_tiling(cfg)) return result;
   if (has_matmul_) {
@@ -3178,10 +3500,125 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       // output_K_/S), writing the output S times (S atomic-add partials).
       struct SplitEval {
         double lat, compute, ddr, active, l1l0;
+        int64_t seed_fill_rounds = 0;
       };
       auto eval_S = [&](int64_t S) -> SplitEval {
         S = std::max<int64_t>(1, S);
         const int64_t unitsS = (int64_t)num_tiles * S;
+        const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
+
+        // Buildable cube candidates use the same hierarchical descriptor as
+        // emission. Output/L0C tiles are outer to GM->L1 K windows; each child
+        // L0 plan keeps Acc resident, rolled boundary loads overlap only inside
+        // an actual stage-2 loop, and init/tail/final drain remain serial.
+        const bool uniform_grid = g_pm.num_big == 0 && g_pn.num_big == 0;
+        // A ragged spatial grid is emitted by the lone-matmul ceil-and-clamp
+        // fallback only for split=1.  Combining that overlapping clamp with
+        // split-K atomic partials would give more than one owner to edge output
+        // elements, so it is not a buildable hierarchical schedule.  Do not
+        // let the older analytic roofline rank that fictional configuration.
+        if (prob_->use_hierarchical_cube_cost && !uniform_grid && S > 1) {
+          return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
+        }
+        if (prob_->use_hierarchical_cube_cost && uniform_grid) {
+          const CubeSchedulePlan schedule =
+              derive_cube_schedule_plan(cfg, retained_from_prev, retain_these, S, l0_memo);
+          if (!schedule.feasible || !schedule.emit_compatible) {
+            return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
+          }
+          const double gm_read_scale = activeS / par(activeS, prob_->bw_gm_l1);
+          const double gm_write_scale = activeS / par(activeS, prob_->bw_l0c_gm);
+          double unit_wall = 0.0;
+          double unit_compute = 0.0;
+          double unit_ddr = 0.0;
+          double unit_l1l0 = 0.0;
+          for (const CubeMatmulSchedule& mm : schedule.matmuls) {
+            const int64_t init_k = mm.k_loop.full_chunks >= 2 ? mm.k_loop.chunk : mm.effective_contraction;
+            auto feed_cycles = [&](const CubeOutputTileVariant& variant, int64_t k_extent) {
+              double bytes = 0.0;
+              if (!mm.lhs_ephemeral) {
+                bytes += static_cast<double>(variant.height * k_extent *
+                                             dtype_bytes(prob_->tensors[mm.lhs.tensor].dtype));
+              }
+              if (!mm.rhs_ephemeral) {
+                bytes += static_cast<double>(k_extent * variant.width *
+                                             dtype_bytes(prob_->tensors[mm.rhs.tensor].dtype));
+              }
+              return bytes * bc.reload * gm_read_scale;
+            };
+            L0MatmulConfig drain_config = prob_->l0_matmul_config;
+            drain_config.bytes_c = dtype_bytes(prob_->tensors[mm.output.tensor].dtype);
+            const L0OutputTarget drain_target =
+                mm.final_drain.target_l1 ? L0OutputTarget::L1 : L0OutputTarget::GM;
+            for (const CubeOutputTileVariant& variant : mm.output_variants) {
+              const double count = static_cast<double>(variant.count);
+              const double init_inner = variant.l0_init.phases.wall_cycles;
+              const double init_feed = feed_cycles(variant, init_k);
+              double tile_wall = init_inner + init_feed;
+              double tile_compute = init_inner;
+              double tile_ddr = init_feed;
+              double tile_l1l0 = variant.l0_init.phases.load_cycles;
+
+              const int64_t rolled = std::max<int64_t>(0, mm.k_loop.full_chunks - 1);
+              if (rolled > 0) {
+                const double inner = variant.l0_rolled.phases.wall_cycles;
+                const double feed = feed_cycles(variant, mm.k_loop.chunk);
+                tile_wall += mm.k_loop.pipeline_stages >= 2 && rolled >= 2
+                                 ? feed + inner + static_cast<double>(rolled - 1) * std::max(feed, inner)
+                                 : static_cast<double>(rolled) * (feed + inner);
+                tile_compute += static_cast<double>(rolled) * inner;
+                tile_ddr += static_cast<double>(rolled) * feed;
+                tile_l1l0 += static_cast<double>(rolled) * variant.l0_rolled.phases.load_cycles;
+              }
+              if (mm.k_loop.tail > 0) {
+                const double inner = variant.l0_tail.phases.wall_cycles;
+                const double feed = feed_cycles(variant, mm.k_loop.tail);
+                tile_wall += inner + feed;
+                tile_compute += inner;
+                tile_ddr += feed;
+                tile_l1l0 += variant.l0_tail.phases.load_cycles;
+              }
+
+              double drain =
+                  estimate_l0_output_drain_cycles(variant.height, variant.width, drain_config, drain_target);
+              if (!mm.final_drain.target_l1) drain *= gm_write_scale;
+              tile_wall += drain;
+              if (mm.final_drain.target_l1) {
+                tile_compute += drain;
+              } else {
+                tile_ddr += drain;
+              }
+              unit_wall += count * tile_wall;
+              unit_compute += count * tile_compute;
+              unit_ddr += count * tile_ddr;
+              unit_l1l0 += count * tile_l1l0;
+            }
+          }
+          const int64_t waves = (unitsS + n_cores - 1) / n_cores;
+          double latency = static_cast<double>(waves) * unit_wall;
+          double compute = static_cast<double>(waves) * unit_compute;
+          double ddr = static_cast<double>(waves) * unit_ddr;
+          double l1l0 = static_cast<double>(waves) * unit_l1l0;
+          int64_t seed_rounds = 0;
+          if (schedule.seed.present) {
+            const double seed_active =
+                static_cast<double>(std::min<int64_t>(schedule.seed.work_units, prob_->num_vector_cores));
+            const double seed_compute_work =
+                static_cast<double>(schedule.seed.work_units) *
+                GroundedVectorFillCycles(schedule.seed.valid_rows, schedule.seed.valid_cols);
+            const double seed_compute =
+                WaveComputeCycles(seed_compute_work, schedule.seed.work_units, prob_->num_vector_cores);
+            const double seed_store =
+                static_cast<double>(schedule.seed.bytes) * bc.ub_out / par(seed_active, prob_->bw_ub_gm);
+            latency += seed_compute + seed_store +
+                       static_cast<double>(schedule.seed.work_units * prob_->per_task_overhead_cycles);
+            compute += seed_compute;
+            ddr += seed_store;
+            seed_rounds = (schedule.seed.work_units + prob_->num_vector_cores - 1) / prob_->num_vector_cores;
+          }
+          return {latency, compute, ddr, activeS, l1l0, seed_rounds};
+        }
+
         double computeS = 0.0;
         if (cfg.parts_m > 0) {
           computeS = lone_matmul ? LptMakespan(
@@ -3207,7 +3644,6 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                     static_cast<double>(copies),
                                 unitsS, n_cores);
         }
-        const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
         double reload_lhs = 0.0;
         double reload_rhs = 0.0;
         const double reload =
@@ -3224,7 +3660,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
         const double ddrS = std::max(feed, writes);
         // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
         const double latS = db_roofline(computeS, ddrS, overlap_implementable(S));
-        return {latS, computeS, ddrS, activeS, reload_lhs * bc.l0a + reload_rhs * bc.l0b};
+        return {latS, computeS, ddrS, activeS, reload_lhs * bc.l0a + reload_rhs * bc.l0b, 0};
       };
 
       // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
@@ -3255,6 +3691,7 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
       result.compute_bound = chosen.compute >= chosen.ddr;
       result.ddr_traffic = chosen.ddr;
       result.l1l0_extract = chosen.l1l0;
+      cube_seed_fill_rounds = chosen.seed_fill_rounds;
       // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
       // divisor of output_K_), capped for a split by the per-core fractal share
       // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
@@ -3626,8 +4063,8 @@ CostResult Ascend910BCost::compute_cost(const TileConfig &cfg,
                                       ? (vector_stream.reduction_seed.work_units + n_cores - 1) /
                                             n_cores
                                       : 0;
-      result.latency += (double)(rounds + seed_rounds) *
-                        (double)prob_->kernel_fill_cost;
+      result.latency +=
+          (double)(rounds + seed_rounds + cube_seed_fill_rounds) * (double)prob_->kernel_fill_cost;
     }
   }
 
@@ -3649,7 +4086,9 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   plan.config = cfg;
   if (!(has_matmul_ && has_vector_) || !mixed_topology_) return plan;
   plan.mode = mixed_topology_->mode;
-  plan.emit_compatible = mixed_topology_->emit_compatible;
+  plan.emit_compatible = prob_->require_buildable_mixed
+                             ? mixed_topology_->compiler_emit_compatible
+                             : mixed_topology_->emit_compatible;
 
   const int64_t split = std::max<int64_t>(1, parallel_split);
   if (!is_valid_tiling(cfg) ||
@@ -3669,7 +4108,30 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   plan.spatial_tiles = parts_m * parts_n;
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
-  plan.group_capacity = std::max<int64_t>(1, prob_->num_cube_cores);
+  plan.group_capacity = std::max<int64_t>(
+      1, std::min<int64_t>(prob_->num_cube_cores, prob_->num_vector_cores / 2));
+
+  // The buildable C->V epilogue is split across the two buddy AIVs by rows.
+  // Cube grids are 16-row aligned, so every uniform candidate has an exact
+  // half-height vector shard.  Analytic shapes that do not satisfy that
+  // invariant stay single-lane rather than receiving a fictional /2.
+  bool row_split_legal = true;
+  for (const MixedStageTopology& stage : mixed_topology_->stages) {
+    if (stage.engine != MixedEngine::Vector) continue;
+    for (size_t op_idx : stage.ops) {
+      const Op& op = prob_->ops[op_idx];
+      if (op.type == OpType::Reduction && !op.inputs.empty() &&
+          prob_->tensors[op.inputs.front()].height >
+              prob_->tensors[op.output()].height) {
+        row_split_legal = false;
+      }
+    }
+  }
+  if (plan.emit_compatible && row_split_legal && plan.m_partition.num_big == 0 &&
+      plan.m_partition.big >= 2 && plan.m_partition.big % 2 == 0) {
+    plan.vector_split = MixedVectorSplit::Rows;
+    plan.vector_lanes = 2;
+  }
 
   // This reproduces the legacy assignment exactly: use every available group
   // before issuing a second item to any group. It intentionally exposes the
@@ -3686,15 +4148,37 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   plan.loop.max_trips_per_group =
       (plan.loop.work_items + std::max<int64_t>(1, plan.loop.active_groups) - 1) /
       std::max<int64_t>(1, plan.loop.active_groups);
-  plan.loop.pipeline_stages = 2;
-  plan.loop.requested_skew_depth = 2;
+  // Each split engine executes a sequential item loop.  The one-way FIFO, not
+  // a generic software-pipeline tag around nested matmul work, decouples AIC
+  // item k+1 from AIV item k.  This avoids multiplying AutoTileL0 buffer depth.
+  plan.loop.pipeline_stages = 1;
+  plan.loop.requested_skew_depth = 0;
 
-  plan.model_overlap_granted =
-      plan.emit_compatible && plan.spatial_tiles >= 2;
   plan.overlap_implementable =
-      plan.emit_compatible && plan.loop.min_trips_per_group >= 2;
+      plan.emit_compatible && plan.loop.min_trips_per_group >= 2 &&
+      plan.loop.min_trips_per_group == plan.loop.max_trips_per_group;
+  plan.model_overlap_granted = plan.overlap_implementable;
   plan.pipeline_fill_absorbed =
       mixed_topology_->sink_runs_early_stage && plan.model_overlap_granted;
+
+  // Automatic 910B one-direction pipes use eight GM slots.  Increment 1 has
+  // one same-shaped crossing, so the fixed slot is the full cube result tile;
+  // valid bytes and transferred slot bytes are therefore identical.
+  if (mixed_topology_->compiler_emit_compatible) {
+    for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
+      const Tensor& tensor = prob_->tensors[transfer.tensor];
+      const int64_t rows = plan.m_partition.big;
+      const int64_t cols = plan.n_partition.big;
+      const int64_t slot_count = mixed_topology_->transfers.size() == 1 ? 8 : 4;
+      const int64_t slot_bytes = rows * cols * dtype_bytes(tensor.dtype);
+      plan.fifos.push_back(
+          {transfer.tensor,
+           transfer.producer_engine == MixedEngine::Cube
+               ? MixedTransferDirection::CubeToVector
+               : MixedTransferDirection::VectorToCube,
+           rows, cols, slot_bytes, slot_count, slot_bytes * slot_count});
+    }
+  }
   return plan;
 }
 
@@ -3705,6 +4189,28 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
     int64_t parallel_split) const {
   MixedSchedulePlan plan = derive_mixed_schedule_plan(
       cfg, retained_from_prev, retain_these, parallel_split);
+  if (plan.feasible) {
+    std::vector<int64_t> pernode_k;
+    derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pernode_k);
+    if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < pernode_k.size() &&
+        pernode_k[static_cast<size_t>(sink_mm_op_)] > 0) {
+      plan.cube_window_k = pernode_k[static_cast<size_t>(sink_mm_op_)];
+      plan.config.k = plan.cube_window_k;
+    }
+    if (mixed_topology_ && mixed_topology_->compiler_emit_compatible &&
+        plan.vector_split == MixedVectorSplit::Rows) {
+      TileConfig lane_cfg = cfg;
+      lane_cfg.h = plan.m_partition.big / std::max<int64_t>(1, plan.vector_lanes);
+      lane_cfg.w = plan.n_partition.big;
+      lane_cfg.parts_m = 0;
+      lane_cfg.parts_n = 0;
+      lane_cfg.split_k = 1;
+      const VectorStreamPlan vector_stage =
+          vector_stream_plan(lane_cfg, retained_from_prev, retain_these);
+      plan.vector_stage_kind = vector_stage.kind;
+      plan.vector_stage_peak_ub_bytes = vector_stage.full_peak_ub_bytes;
+    }
+  }
   plan.topology = mixed_topology_;
   return plan;
 }
@@ -3789,8 +4295,8 @@ CostResult Ascend910BCost::compute_mixed_cost(
   // ratio + the GM ring). Regions tile over n_units = num_cube_cores; WITHIN a
   // unit the cube and its 2 vector cores are pipeline STAGES (not a finer output
   // grid), so the stage times divide by 1 and 2 cores per unit.
-  const double n_units    = (double)prob_->num_cube_cores;  // 1:2 invariant
-  const double eff_units  = std::min((double)num_tiles, n_units);
+  const double n_units = (double)prob_->num_cube_cores;  // 1:2 physical capacity
+  const double eff_units = (double)std::max<int64_t>(1, schedule.loop.active_groups);
 
   // DDR traffic. CRITICAL: fusion on 910B does NOT reduce DDR — the matmul still
   // reloads its operands and the intermediate still round-trips DDR (only 950's
@@ -3814,9 +4320,27 @@ CostResult Ascend910BCost::compute_mixed_cost(
     if (prob_->ops[i].type == OpType::MatMul)
       for (auto t : prob_->ops[i].inputs) cube_operands.insert(t);
   for (const auto& info : boundary_tensor_info_) {                              // (c)
-    const double bytes = (double)info.full_size * dtype_bytes(prob_->tensors[info.id].dtype);
-    if (!info.is_internally_produced && !cube_operands.count(info.id))
-      gm_ub_bytes += bytes;  // vector-read boundary input (cube operands are in gm_l1)
+    const Tensor& tensor = prob_->tensors[info.id];
+    const double bytes = (double)info.full_size * dtype_bytes(tensor.dtype);
+    if (!info.is_internally_produced && !cube_operands.count(info.id)) {
+      double request_multiplicity = 1.0;
+      if (prob_->require_buildable_mixed) {
+        const bool broadcasts_rows = tensor.height == 1 && out_H_ > 1;
+        const bool broadcasts_cols = tensor.width == 1 && out_W_ > 1;
+        if (broadcasts_rows && broadcasts_cols) {
+          request_multiplicity =
+              (double)schedule.spatial_tiles * (double)schedule.vector_lanes;
+        } else if (broadcasts_rows) {
+          // Both UP_DOWN lanes independently pop/load the same singleton row.
+          request_multiplicity =
+              (double)schedule.m_partition.parts * (double)schedule.vector_lanes;
+        } else if (broadcasts_cols) {
+          // Rows are disjoint across lanes; only N-region replay duplicates it.
+          request_multiplicity = (double)schedule.n_partition.parts;
+        }
+      }
+      gm_ub_bytes += bytes * request_multiplicity;
+    }
     if (info.is_boundary_out)  // store direction is the sink unit: MatMul -> L0C->GM, vector -> UB->GM
       (info.is_mm_out ? l0c_gm_bytes : ub_gm_bytes) += bytes;
   }
@@ -3849,12 +4373,21 @@ CostResult Ascend910BCost::compute_mixed_cost(
     return std::max(1.0, std::min(active, cap));
   };
   // Each port -> cycles at its own cyc/byte (GM->L1 reload, GM->UB ub_in, L0C->GM store,
-  // UB->GM ub_out) and its own per-unit peak, divided by par(). The four ports OVERLAP,
+  // UB->GM ub_out) and its own per-core peak, divided by par(). The two emitted AIV lanes
+  // own independent vector pipes; buildable C->V therefore distributes vector traffic over
+  // active_groups*2, while the analytic legacy path retains its historical per-unit count.
+  // The four direction classes OVERLAP,
   // so ddr_lat = MAX over them (grounded: mixed_contention / mixed_ddr_bound). The VECTOR
   // ports + stage are split-K-INVARIANT (a sink split-K recruits CUBE cores only); the
   // cube ports, cube_stage, and ddr are recomputed per split factor S in eval_S below.
-  const double gm_ub_lat = gm_ub_bytes * bc.ub_in  / par(eff_units, prob_->bw_gm_ub);
-  const double ub_gm_lat = ub_gm_bytes * bc.ub_out / par(eff_units, prob_->bw_ub_gm);
+  const double active_vector_pipes =
+      prob_->require_buildable_mixed
+          ? eff_units * (double)std::max<int64_t>(1, schedule.vector_lanes)
+          : eff_units;
+  const double gm_ub_lat =
+      gm_ub_bytes * bc.ub_in / par(active_vector_pipes, prob_->bw_gm_ub);
+  const double ub_gm_lat =
+      ub_gm_bytes * bc.ub_out / par(active_vector_pipes, prob_->bw_ub_gm);
   // Compute distribution: the LPT makespan over the non-uniform grid regions (the BUSIEST
   // unit), NOT the flat total/eff_units average, which under-predicts an imbalanced grid's
   // biggest region (up to ~2x at one region/unit, the few-tile decode corner). The CUBE region
@@ -3882,15 +4415,53 @@ CostResult Ascend910BCost::compute_mixed_cost(
     }
     return std::max(rmac, rext);
   };
+  auto buildable_cube_region_work = [&](int64_t k_ext) {
+    // Compiler mixed v0 contains exactly one matmul.  Re-evaluate its grounded
+    // MAC-vs-L1->L0 wall for the concrete K phase so peeled init/tail work is
+    // not accidentally included in the rolled phase roofline.
+    if (!mixed_topology_ || mixed_topology_->stages.empty() ||
+        mixed_topology_->stages[0].ops.size() != 1 || k_ext <= 0) {
+      return 0.0;
+    }
+    const Op& op = prob_->ops[mixed_topology_->stages[0].ops.front()];
+    const DType dt = prob_->tensors[op.inputs.front()].dtype;
+    const int64_t m_ext = schedule.m_partition.big;
+    const int64_t n_ext = schedule.n_partition.big;
+    return std::max(CubeMacCycles(prob_, m_ext, n_ext, k_ext, dt),
+                    CubeExtractCycles(prob_, bc, m_ext, n_ext, k_ext, dt));
+  };
   auto vec_region_work = [&](int64_t m_ext, int64_t n_ext) {
     return vector_compute * ((double)(m_ext * n_ext) / out_area);  // area-fraction (approximation)
   };
+  double buildable_vector_tile = 0.0;
+  if (prob_->require_buildable_mixed) {
+    // The emitted UP_DOWN body runs the complete pointwise chain once on each
+    // half tile.  Price that exact valid frame: fixed startup is paid once per
+    // lane/item, never area-scaled away or divided after the fact.
+    const int64_t lane_rows =
+        schedule.m_partition.big / std::max<int64_t>(1, schedule.vector_lanes);
+    const int64_t tile_cols = schedule.n_partition.big;
+    bool stream_start = true;
+    for (size_t op_idx : mixed_topology_->stages[1].ops) {
+      const Op& op = prob_->ops[op_idx];
+      buildable_vector_tile += GroundedVectorOpCompute(
+          prob_, op, lane_rows, tile_cols, stream_start,
+          /*row_expand_composite=*/false);
+      stream_start = false;
+    }
+  }
   // Vector stage runs on 2 cores per unit (split-K-invariant: a sink split-K recruits CUBE
   // cores only). Makespan over the grid, then halved across the unit's 2 AIV cores.
-  const double vec_stage = (grid_mode
-      ? LptMakespan((int64_t)n_units, g_pm, g_pn, vec_region_work)
-      : WaveComputeCycles(vector_compute, num_tiles, (int64_t)n_units)) / 2.0;
-  const double one_vec_tile = vector_compute / (2.0 * (double)num_tiles);
+  const double vector_lanes = (double)std::max<int64_t>(1, schedule.vector_lanes);
+  const double vec_stage = prob_->require_buildable_mixed
+      ? buildable_vector_tile * (double)schedule.loop.max_trips_per_group
+      : (grid_mode
+             ? LptMakespan((int64_t)eff_units, g_pm, g_pn, vec_region_work)
+             : WaveComputeCycles(vector_compute, num_tiles, (int64_t)eff_units)) /
+            vector_lanes;
+  const double one_vec_tile = prob_->require_buildable_mixed
+      ? buildable_vector_tile
+      : vector_compute / (vector_lanes * (double)num_tiles);
 
   // Pipeline wall (grounded EXACTLY by mixed_tile_study, the shape sweep). The cube and
   // vector units OVERLAP. In a 2-stage kernel (c->v or v->c) the output unit runs ONLY the
@@ -3929,32 +4500,104 @@ CostResult Ascend910BCost::compute_mixed_cost(
   for (auto i : ops_) if (prob_->ops[i].type == OpType::MatMul) num_matmuls++;
   // Cube-sink split-K is MODEL-AHEAD of the emit (§12): gate on the buildable flag so a
   // buildable-mode harness never selects an unemittable mixed split (default true = analytic).
-  const bool can_split = output_is_cube && num_matmuls == 1 && prob_->allow_model_ahead_split_k;
+  const bool can_split = output_is_cube && num_matmuls == 1 &&
+                         prob_->allow_model_ahead_split_k && !prob_->require_buildable_mixed;
   const double sink_store_bytes = l0c_gm_bytes;  // single-matmul cube sink: L0C->GM == the sink store
+  std::vector<int64_t> buildable_cube_windows;
+  if (prob_->require_buildable_mixed) {
+    derive_exec(cfg, output_K_, retained_from_prev, retain_these,
+                &buildable_cube_windows);
+  }
+  const int64_t buildable_cube_window =
+      sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < buildable_cube_windows.size()
+          ? buildable_cube_windows[static_cast<size_t>(sink_mm_op_)]
+          : output_K_;
   struct MixEval { double wall, ddr, max_stage, eff_cube; };
   auto eval_S = [&](int64_t S) -> MixEval {
-    const double eff_cube = std::min((double)num_tiles * (double)S, n_units);
+    const double eff_cube =
+        std::min((double)schedule.loop.active_groups * (double)S, n_units);
     // Cube compute makespan (busiest core), split-K aware (LptMakespan ksplit = S; the wave arm
     // divides num_tiles*S units). Uniform-grid LptMakespan reduces exactly to WaveComputeCycles.
     const double cube_stage = grid_mode
-        ? LptMakespan((int64_t)n_units, g_pm, g_pn, cube_region_work, S)
-        : WaveComputeCycles(base_cube_work, num_tiles * S, (int64_t)n_units);
+        ? LptMakespan((int64_t)eff_cube, g_pm, g_pn, cube_region_work, S)
+        : WaveComputeCycles(base_cube_work, num_tiles * S, (int64_t)eff_cube);
     const double one_cube_tile = (base_cube_work / (double)num_tiles) / std::min((double)S, n_units);
     const double gm_l1_lat  = gm_l1_bytes * bc.reload / par(eff_cube, prob_->bw_gm_l1);
     const double l0c_gm_lat = (l0c_gm_bytes + (double)(S - 1) * sink_store_bytes) * bc.store
                               / par(eff_cube, prob_->bw_l0c_gm);
     const double ddr = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
-    // Double-buffer floor (ported from the base cube path's db_roofline): the cube compute
-    // hides its GM reload only with >=2 K-fractals per core (per_core_K = output_K_/S >= 32).
-    // A thin-K matmul can't ping-pong, so compute SERIALIZES with the cube's GM ports
-    // max(feed, write) -- matching the base and the emit's implicit halving. K>=32 => no-op.
+    // Analytic topologies retain the historical homogeneous two-fractal proxy
+    // until they acquire stage-local cube plans. Buildable v0 is priced below
+    // from its exact init/rolled/tail K phases instead of this global roofline.
     const double cube_dram = std::max(gm_l1_lat, l0c_gm_lat);
-    const bool cube_db = output_K_ <= 1 || (output_K_ / std::max<int64_t>(1, S)) >= 32;
+    const bool cube_db = output_K_ <= 1 ||
+                         (output_K_ / std::max<int64_t>(1, S)) >= 32;
     const double cube_wall = cube_db ? cube_stage : cube_stage + cube_dram;
-    // A single-tile kernel has nothing to skew against (mixed_tile_study NT=1: overlap_factor
-    // 0.00), so a 3-stage fill is NOT absorbed there -- take the symmetric cross-term, which at
-    // num_tiles==1 collapses to the sequential sum (cube+vec). Absorb (plain max) only NT>=2.
-    const bool overlap_ok = schedule.emit_compatible && !two_stage && num_tiles >= 2;
+    // Buildable C->V pricing follows the actual lowered item order.  Ordinary
+    // GM->L1 operand feed may overlap the K-window cube work, but TPUSH waits
+    // for the crossing write before the AIC advances.  On AIV, TPOP, the
+    // pointwise chain, and the final store are likewise ordered.  Cross-engine
+    // FIFO execution can still overlap complete successor items: equal T>=2
+    // trips use max(T*C+V, T*V+C); one trip is the serial C+V fill/drain.
+    if (prob_->require_buildable_mixed) {
+      const int64_t trips = schedule.loop.max_trips_per_group;
+      const int64_t full_k = std::max<int64_t>(1, output_K_);
+      const int64_t k_window =
+          std::clamp(buildable_cube_window, int64_t{1}, full_k);
+      const int64_t full_chunks = full_k / k_window;
+      const int64_t tail_k = full_k - full_chunks * k_window;
+      const double item_feed = gm_l1_lat / static_cast<double>(trips);
+      auto feed_for_k = [&](int64_t k_extent) {
+        return item_feed * static_cast<double>(k_extent) /
+               static_cast<double>(full_k);
+      };
+      auto serial_k_phase = [&](int64_t k_extent) {
+        return buildable_cube_region_work(k_extent) + feed_for_k(k_extent);
+      };
+
+      double item_cube = 0.0;
+      // BuildTileMatmul falls back to one full-K operation when fewer than two
+      // full windows exist or a tail cannot form a 16-wide cube fractal.
+      if (full_chunks < 2 || (tail_k > 0 && tail_k % 16 != 0)) {
+        item_cube = serial_k_phase(full_k);
+      } else {
+        // Serial first window seeds the accumulator.
+        item_cube = serial_k_phase(k_window);
+
+        // Remaining full windows are the only stage-2 region.  The loop is
+        // pipelined exactly when at least two rolled iterations exist; model
+        // its fill/drain rather than granting max() to init or tail.
+        const int64_t rolled = full_chunks - 1;
+        const double rolled_compute = buildable_cube_region_work(k_window);
+        const double rolled_feed = feed_for_k(k_window);
+        if (rolled >= 2) {
+          item_cube += rolled_compute + rolled_feed +
+                       static_cast<double>(rolled - 1) *
+                           std::max(rolled_compute, rolled_feed);
+        } else {
+          item_cube += static_cast<double>(rolled) *
+                       (rolled_compute + rolled_feed);
+        }
+        if (tail_k > 0) item_cube += serial_k_phase(tail_k);
+      }
+
+      // TPUSH is blocking after the final accumulator drain for every item.
+      item_cube += l0c_gm_lat / static_cast<double>(trips);
+      const double cube_phase = static_cast<double>(trips) * item_cube;
+      const double vector_phase = gm_ub_lat + vec_stage + ub_gm_lat;
+      const double wall = schedule.overlap_implementable
+                              ? std::max(cube_phase + vector_phase / (double)trips,
+                                         vector_phase + cube_phase / (double)trips)
+                              : cube_phase + vector_phase;
+      return {wall, std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat}),
+              std::max(cube_phase, vector_phase), eff_cube};
+    }
+
+    // Analytic/research topologies retain the broader mixed-study formula.
+    // A single-tile kernel has nothing to skew against (mixed_tile_study NT=1:
+    // overlap_factor 0.00).  A three-stage fill is absorbed only when the
+    // per-group schedule itself has successor items.
+    const bool overlap_ok = schedule.overlap_implementable && !two_stage;
     double wall = 0.0;
     if (!schedule.emit_compatible) {
       // Multi-message/multi-round-trip FIFO patterns are demoted by the
@@ -3985,23 +4628,31 @@ CostResult Ascend910BCost::compute_mixed_cost(
   result.compute_bound  = best.max_stage >= best.ddr;
   result.parallel_split = (int)best_S;
   result.uses_model_ahead_split_k = (best_S > 1);
-  result.cores_used     = (int)(best.eff_cube + 2.0 * eff_units);  // cube (split) + 2 vector/tile
+  result.cores_used =
+      (int)(best.eff_cube + vector_lanes * eff_units);
 
-  // One kernel fill per unit-round (rounds = ceil(num_tiles / n_units)) — the per-LAUNCH
-  // fill, a separate concern from the pipeline term above.
+  // AutoFuse emits one mixed launch with active_groups blocks; successor
+  // spatial items live in the per-group inner loop.  Kernel fill is therefore
+  // paid once, while the grounded per-task term follows the actual launch
+  // blocks rather than the number of logical regions.
   if (prob_->kernel_fill_cost > 0) {
-    const int64_t n_units_i = std::max<int64_t>(1, prob_->num_cube_cores);
-    const int64_t rounds = (num_tiles + n_units_i - 1) / n_units_i;
-    result.latency += (double)rounds * (double)prob_->kernel_fill_cost;
+    result.latency += (double)prob_->kernel_fill_cost;
   }
+  result.latency += (double)schedule.loop.active_groups *
+                    (double)prob_->per_task_overhead_cycles;
 
   // Emitted per-core cube k: the single-core seq-k derived for the sink matmul
   // (same derivation as the homogeneous cube), so the lowered kernel and the
   // visualised tile carry the real contraction chunk, not the candidate cfg.k.
-  std::vector<int64_t> pk;
-  derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
-  if (sink_mm_op_ >= 0 && (size_t)sink_mm_op_ < pk.size() && pk[sink_mm_op_] > 0)
+  std::vector<int64_t> pk = std::move(buildable_cube_windows);
+  if (pk.empty()) {
+    derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
+  }
+  if (sink_mm_op_ >= 0 && (size_t)sink_mm_op_ < pk.size() && pk[sink_mm_op_] > 0) {
     result.config.k = pk[sink_mm_op_];
+    result.num_k_passes = static_cast<int>(
+        (output_K_ + result.config.k - 1) / result.config.k);
+  }
   return result;
 }
 
@@ -4016,73 +4667,76 @@ CostResult Ascend910BMixed::compute_cost(
 // Granularity enumeration
 // ============================================================================
 
-CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
-                               const FlatSet<size_t> &retain_these) const {
+CostResult Ascend910BCost::best_cost(const FlatSet<size_t>& retained_from_prev,
+                                     const FlatSet<size_t>& retain_these) const {
   CostResult best;
-  auto consider = [&](const TileConfig &cfg) {
-        auto r = compute_cost(cfg, retained_from_prev, retain_these);
-        if (!r.feasible) return;
-        bool take;
-        if (best.latency == std::numeric_limits<double>::infinity()) {
-          take = true;
-        } else {
-          // Lexicographic tiebreak among equal-latency tiles:
-          //   1. fewer split-K partials — a balanced spatial grid that fills the
-          //      cores at the same latency beats a K-split (less merge traffic,
-          //      no atomic-add serialization, simpler emit). split-K only wins
-          //      when it is STRICTLY faster (caught by the latency test above).
-          //   2. lower DDR traffic   — matmul reuse (less reload); flat for PW
-          //   3. more cores used     — fill the unit's cores (parallelism)
-          //   4. EVENLY-DIVIDING tile — a grid whose +-1-fractal region extents do
-          //      NOT evenly divide the output (e.g. h=1376 on a 4096 axis) the tiling
-          //      emit cannot realize cleanly; at equal latency prefer a tile whose
-          //      extents evenly divide the output. An imbalanced grid is used only
-          //      where it is strictly faster (power-of-two / few-row fills).
-          //   5. larger tile area    — best vectorization / least per-tile
-          //      overhead (avoids the degenerate 1xN / 16x16 picks)
-          //   6. larger k            — fewer L1 passes
-          const double tol = 1e-6 * std::max(1.0, best.latency);
-          const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
-          const double etol = 1e-9 * std::max(1.0, best.l1l0_extract);
-          const long long ra = (long long)r.config.w * r.config.h;
-          const long long ba = (long long)best.config.w * best.config.h;
-          // Emit-friendliness: a tile whose extents EVENLY DIVIDE the output (every
-          // region identical) lowers cleanly; a grid's +-1-block extents (e.g.
-          // h=1366 on a 4096 axis) the tiling emit can't realize. So at equal
-          // latency prefer a dividing tile -- the imbalanced grid is used only when
-          // it is strictly faster (the power-of-two / few-row fills that have no
-          // dividing C-tiling). Uniform tiles always divide; a grid sometimes does.
-          const bool r_div = (out_W_ % std::max<int64_t>(1, r.config.w) == 0) &&
-                             (out_H_ % std::max<int64_t>(1, r.config.h) == 0);
-          const bool b_div = (out_W_ % std::max<int64_t>(1, best.config.w) == 0) &&
-                             (out_H_ % std::max<int64_t>(1, best.config.h) == 0);
-          if (r.latency < best.latency - tol) {
-            take = true;
-          } else if (r.latency > best.latency + tol) {
-            take = false;
-          } else if (r.parallel_split != best.parallel_split) {
-            take = r.parallel_split < best.parallel_split;
-          } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
-            take = true;
-          } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
-            take = false;
-          } else if (std::abs(r.l1l0_extract - best.l1l0_extract) > etol) {
-            // Lower L1->L0 extract (MTE1) wins: the GM reload is port-symmetric and
-            // ties transposes, but the L0A/L0B ports are not, so the TALL tile (large
-            // h, less slow-L0B traffic) is faster. Perf-sim-driven (pto-isa
-            // gml1_decision: removes a ~4% aspect regret); device eval pending.
-            take = r.l1l0_extract < best.l1l0_extract;
-          } else if (r.cores_used != best.cores_used) {
-            take = r.cores_used > best.cores_used;
-          } else if (r_div != b_div) {
-            take = r_div;  // emit-friendly evenly-dividing tile beats an imbalanced grid
-          } else if (ra != ba) {
-            take = ra > ba;
-          } else {
-            take = r.config.k > best.config.k;
-          }
-        }
-        if (take) best = r;
+  L0PlanMemo l0_memo;
+  auto consider = [&](const TileConfig& cfg) {
+    auto r = has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost
+                 ? compute_cost_impl(cfg, retained_from_prev, retain_these, &l0_memo)
+                 : compute_cost(cfg, retained_from_prev, retain_these);
+    if (!r.feasible) return;
+    bool take;
+    if (best.latency == std::numeric_limits<double>::infinity()) {
+      take = true;
+    } else {
+      // Lexicographic tiebreak among equal-latency tiles:
+      //   1. fewer split-K partials — a balanced spatial grid that fills the
+      //      cores at the same latency beats a K-split (less merge traffic,
+      //      no atomic-add serialization, simpler emit). split-K only wins
+      //      when it is STRICTLY faster (caught by the latency test above).
+      //   2. lower DDR traffic   — matmul reuse (less reload); flat for PW
+      //   3. more cores used     — fill the unit's cores (parallelism)
+      //   4. EVENLY-DIVIDING tile — a grid whose +-1-fractal region extents do
+      //      NOT evenly divide the output (e.g. h=1376 on a 4096 axis) the tiling
+      //      emit cannot realize cleanly; at equal latency prefer a tile whose
+      //      extents evenly divide the output. An imbalanced grid is used only
+      //      where it is strictly faster (power-of-two / few-row fills).
+      //   5. larger tile area    — best vectorization / least per-tile
+      //      overhead (avoids the degenerate 1xN / 16x16 picks)
+      //   6. larger k            — fewer L1 passes
+      const double tol = 1e-6 * std::max(1.0, best.latency);
+      const double dtol = 1e-9 * std::max(1.0, best.ddr_traffic);
+      const double etol = 1e-9 * std::max(1.0, best.l1l0_extract);
+      const long long ra = (long long)r.config.w * r.config.h;
+      const long long ba = (long long)best.config.w * best.config.h;
+      // Emit-friendliness: a tile whose extents EVENLY DIVIDE the output (every
+      // region identical) lowers cleanly; a grid's +-1-block extents (e.g.
+      // h=1366 on a 4096 axis) the tiling emit can't realize. So at equal
+      // latency prefer a dividing tile -- the imbalanced grid is used only when
+      // it is strictly faster (the power-of-two / few-row fills that have no
+      // dividing C-tiling). Uniform tiles always divide; a grid sometimes does.
+      const bool r_div = (out_W_ % std::max<int64_t>(1, r.config.w) == 0) &&
+                         (out_H_ % std::max<int64_t>(1, r.config.h) == 0);
+      const bool b_div = (out_W_ % std::max<int64_t>(1, best.config.w) == 0) &&
+                         (out_H_ % std::max<int64_t>(1, best.config.h) == 0);
+      if (r.latency < best.latency - tol) {
+        take = true;
+      } else if (r.latency > best.latency + tol) {
+        take = false;
+      } else if (r.parallel_split != best.parallel_split) {
+        take = r.parallel_split < best.parallel_split;
+      } else if (r.ddr_traffic < best.ddr_traffic - dtol) {
+        take = true;
+      } else if (r.ddr_traffic > best.ddr_traffic + dtol) {
+        take = false;
+      } else if (std::abs(r.l1l0_extract - best.l1l0_extract) > etol) {
+        // Lower L1->L0 extract (MTE1) wins: the GM reload is port-symmetric and
+        // ties transposes, but the L0A/L0B ports are not, so the TALL tile (large
+        // h, less slow-L0B traffic) is faster. Perf-sim-driven (pto-isa
+        // gml1_decision: removes a ~4% aspect regret); device eval pending.
+        take = r.l1l0_extract < best.l1l0_extract;
+      } else if (r.cores_used != best.cores_used) {
+        take = r.cores_used > best.cores_used;
+      } else if (r_div != b_div) {
+        take = r_div;  // emit-friendly evenly-dividing tile beats an imbalanced grid
+      } else if (ra != ba) {
+        take = ra > ba;
+      } else {
+        take = r.config.k > best.config.k;
+      }
+    }
+    if (take) best = r;
   };
 
   // GRID-ONLY (910B, cube AND vector). Feasibility is via derive_exec /
@@ -4113,12 +4767,15 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t> &retained_from_prev,
 // force one for the device emit). Not on the hot path.
 std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans() const {
   std::vector<std::pair<TileConfig, CostResult>> out;
+  L0PlanMemo l0_memo;
   const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
   for (const auto &g : grid_cand_) {
     const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
     const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
     const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
-    const CostResult r = compute_cost(cfg, {}, {});
+    const CostResult r = has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost
+                             ? compute_cost_impl(cfg, {}, {}, &l0_memo)
+                             : compute_cost(cfg, {}, {});
     if (!r.feasible) continue;
     out.emplace_back(cfg, r);
   }

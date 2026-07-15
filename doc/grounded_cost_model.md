@@ -29,6 +29,7 @@ Per-direction effective bandwidths (GiB/s) and the clock:
 | --- | --- | --- |
 | GM→L1  (operand reload / TLOAD)   | `bw_gm_l1`  | 135.0 |
 | L0C→GM (output store / TSTORE)    | `bw_l0c_gm` | 70.0 |
+| L0C→L1 (internal FIXPIPE drain)  | child `L0MatmulPlan` | 128.0 |
 | L1→L0A (lhs extract / TEXTRACT)   | `bw_l1_l0a` | 441.0 |
 | L1→L0B (rhs extract)              | `bw_l1_l0b` | 220.5 |
 | GM→UB  (vector load)              | `bw_gm_ub`  | 100.9 |
@@ -44,6 +45,11 @@ transfer_cycles = (bytes / 2^30) / bw_GiBps * cube_freq_hz
 
 i.e. `MakeByteCost()` precomputes `cycles_per_byte = cube_freq_hz / (2^30 *
 bw_GiBps)`, per direction.
+
+The L0C→L1 value is PTO A2/A3 `PipeKey::L0C_TO_L1` from `arch_config.hpp`. The shared L0
+planner stores its equivalent 74.3 bytes/cycle. `chain_fused_kernel.cpp` and the PTO FIXPIPE
+reference ground the operation itself: the completed FP32 accumulator narrows and drains directly
+to a BF16/FP16 L1 Mat tile. There is no intermediate L1→GM leg in the buildable cube schedule.
 
 **Cube fractals** (pto-isa `mad`): a matmul of an `M×N` output with contraction `K`;
 `dtype` is the operand precision (not the often-FP32 accumulator/output):
@@ -73,8 +79,8 @@ so per-region work is the steady-state pipeline, NOT just the MACs. (This is the
 *inner* L1↔L0 double-buffer; the *outer* DDR↔L1 reload double-buffer — and its
 roofline floor — is in §3.)
 
-**Extract** (`CubeExtractCycles`): the L1→L0 operand reload, reusing the L0 base
-tile `(l0_tile_m, l0_tile_n) = (128, 256)`:
+**Extract** (`CubeExtractCycles`): the analytic L1→L0 operand reload, using the L0 base tile
+`(l0_tile_m, l0_tile_n) = (128, 256)`:
 
 ```
 lhs_bytes = M*N*K / l0_tile_n * dtype_bytes      (lhs reloaded once per L0 N-block)
@@ -96,6 +102,21 @@ so per-matmul `T_region` **sum**.
 **Validation**: with the 128×256 L0 tile the extract lands at ≈ 0.6× the MACs for a
 square fp16 GEMM (matching pto-isa's 7680³: TEXTRACT 63% / Cube 80.6%); fp32 = 2×
 fp16 on a 2048³ → correctly reload-bound (TLOAD 98.4%).
+
+For a buildable uniform schedule, exact/co-optimized mode derives a backend-parameterized
+`L0MatmulPlan` through the same pure chooser used by `AutoTileMatmulL0`. It records actual L0 M/N/K,
+stationarity, buffer depths, the K loop, traffic, and serial-init/rolled/tail/drain phases. Candidate
+ranking composes these child phase walls into the outer GM→L1 schedule. Analytic mode instead uses
+the aggregate fixed-base-tile formula above and delegates detailed L0 selection until after the
+outer winner is known. The aggregate formula also remains the geometry-selection oracle: using the
+phase wall itself to re-select baseK before a per-iteration event/synchronization cost is grounded
+falsely favors baseK=16.
+
+The PTO A2/A3 GEMM and fused-chain kernels establish the accumulator contract. One output tile stays
+in FP32 L0C across its complete sequential-K stream, then drains exactly once. A root drains to GM;
+a buildable internal BF16/FP16 result narrows from FP32 Acc to an L1 Mat tile for its consumer. PTO
+does not provide a same-type FP32 Acc→Mat plus Mat→Acc chain, so FP32 internal matmul results are a
+capability decline, not a costed fused schedule.
 
 ---
 
@@ -125,10 +146,23 @@ sat(c) = max(1, n_cores / c)          # too few DMA engines underfill HBM
 reload = cube_request_reload(cfg,S)   # exact boundary requests per work unit
 ```
 
-`cfg.w / cfg.h` carry the **physical (max) region extent**. Requests cover produced
-operands and fan-out roles. This logical count assumes panels persist across L0
-output subtiles; the current emitter may run a full K stream per subtile. The
-vector roofline is §7.
+`cfg.w / cfg.h` carry the **physical (max) region extent**. Requests cover produced operands and
+fan-out roles. For buildable uniform cube plans, traffic follows the emitted output-tile order: each
+GM K window is loaded once for every output tile that consumes it. Thus a second N tile reloads its
+LHS unless a future plan explicitly represents a retained-panel lifetime. Produced intermediates
+cost zero GM traffic but occupy L1. A final Acc→L1/GM drain is charged once per output tile, using
+the stored dtype; split-K additionally charges the explicit seed launch and atomic root stores.
+
+The outer phase composition is local, not a subgraph-wide roofline:
+
+```
+first = GM feed + child L0 wall
+rolled = feed + child + (R-1) * max(feed, child)  # only an actual stage-2 loop
+tail = GM feed + child L0 wall
+final = one Acc→L1/GM drain
+```
+
+First/tail/final work remains serial. The vector roofline is §7.
 
 ---
 
@@ -419,8 +453,9 @@ sink** (`c→v` — the epilogue needs the fully-reduced C, so the matmul is nev
 - **Cube** → `derive_exec ≠ INT64_MAX`: a red-blue pebble peak over the
   producer-before-consumer request instances. Live exact intermediate regions +
   each node's greedy sequential-K boundary strips must fit full L1. The root
-  output drains L0c→DDR (not charged to L1); L0 subdivision is recorded in
-  `CubeSchedulePlan`. Region sizes and a root K split can change feasibility.
+  output drains L0c→DDR (not charged to L1). Each emitted phase receives a child L0 plan selected
+  from backend capacities, but the GM/L1 pebble problem remains in `CubeSchedulePlan`. Region sizes
+  and a root K split can change feasibility.
 - **Vector** → `vector_stream(cfg).chunk > 0`: the tile streams through UB to a
   min-chunk (free for pointwise, recompute-costed for a reduction).
 - **Mixed** (cube+vector) → both: `derive_exec` (L1) *and* `vector_stream` (UB);
@@ -470,11 +505,20 @@ Among equal-latency configs, lexicographic:
   `[128,8192]` mildly over-splits to 48 tasks (about 7.1% wall regret versus 16 tasks). This is a
   bounded ranking/calibration issue, not a task-count, traffic, or emitted-grid mismatch.
 - **Pure-cube plan buildability.** AutoFuse emits uniform multi-matmul grids from
-  `CubeSchedulePlan`, including split seed/atomic stores. Unequal multi-op grids and identical
-  deduplicated boundary requests are declined. Lone ceil+clamp is numeric but can exceed LPT work.
-- **Pure-cube outer phases.** Concrete-loop gating closes one-trip overlap, but the roofline is
-  still subgraph-wide. Per-node phases, L0-subtile GM multiplicity (or retained panels), and split
-  seed/task overhead remain.
+  `CubeSchedulePlan`, including exact output-tile variants, sequential K streams, one final drain,
+  and split seed/atomic stores. Unequal multi-op grids and identical deduplicated boundary requests
+  are declined. Lone ceil+clamp is numeric but can execute more maximum-size work than LPT prices.
+- **Pure-cube inner/outer integration.** AutoFuse owns the GM↔L1 request DAG, L1 lifetimes, K
+  windows, output-tile order, split ownership, and final drains. It attaches the shared backend L0
+  descriptor; `AutoTileMatmulL0` validates and lowers L1↔L0 geometry, stationarity, buffering, and
+  accumulation. The model charges the emitted panel-reload multiplicity and composes child
+  init/rolled/tail/drain walls per outer phase. The geometry chooser intentionally retains its
+  aggregate oracle until the per-baseK event/synchronization cost is grounded. FP32 internal chains
+  decline because PTO has no supported L1 handoff; BF16/FP16 chains use FP32 accumulation and one
+  narrowing drain. Remaining work is device validation of nested pipe overlap/FIXPIPE behavior,
+  forced-plan ranking, optional retained-panel schedules, and candidate-evaluation performance. The
+  production nested schedule uses PTOAS because the host PyPTO allocator cannot pack every disjoint
+  ping-pong/scratch lifetime.
 - **Mixed cube stage — makespan + floors.** The cube/vector stages route through the base
   `LptMakespan` (grid) / `WaveComputeCycles` (uniform) — the busiest-unit makespan, not the flat
   `eff_units` average — so an imbalanced grid no longer under-predicts its biggest region, and the
