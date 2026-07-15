@@ -2141,6 +2141,59 @@ static void test_cube_schedule_plan() {
                   !mm.final_drain.target_l1 && !mm.final_drain.atomic);
     }
 
+    // A ragged lone-matmul grid uses one static maximum region in PyPTO. Edge
+    // tasks clamp backward, so their duplicated reads/MADs/drains must be part
+    // of the schedule rather than the old balanced 144/128-region LPT cost.
+    // The same overlap cannot be combined with split-K atomic ownership.
+    {
+      auto p = mk_mm(272, 272, 272, 1000);
+      p.require_uniform_cube_dag_grid = true;
+      p.use_hierarchical_cube_cost = true;
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0});
+      CHECK("CUBEPLAN/clamp: subgraph is structurally accepted", static_cast<bool>(sg));
+      if (!sg) return;
+      TileConfig cfg;
+      cfg.w = 80;
+      cfg.h = 144;
+      cfg.k = 272;
+      cfg.parts_m = 2;
+      cfg.parts_n = 4;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      CHECK("CUBEPLAN/clamp: exact plan records eight maximum-shape overlap tasks",
+            cost.feasible && std::isfinite(cost.latency) && plan.feasible && plan.emit_compatible &&
+                plan.spatial_policy == CubeSpatialPolicy::ClampedOverlap && plan.work_units == 8 &&
+                plan.m_partition.big == 144 && plan.m_partition.small == 128 &&
+                plan.n_partition.big == 80 && plan.n_partition.small == 64 && plan.matmuls.size() == 1 &&
+                plan.matmuls[0].output.height == 144 && plan.matmuls[0].output.width == 80 &&
+                plan.matmuls[0].final_drain.bytes == 144LL * 80 * 4);
+
+      p.use_hierarchical_cube_cost = false;
+      DAG analytic_dag = DAG::build(p);
+      auto analytic = Subgraph::create(p, analytic_dag, {0});
+      CHECK("CUBEPLAN/clamp: analytic compiler-mode subgraph is accepted",
+            static_cast<bool>(analytic));
+      if (!analytic) return;
+      const auto clamped_cost = analytic->compute_cost(cfg);
+      const double active = 8.0;
+      const double gib = 1024.0 * 1024.0 * 1024.0;
+      const double read_par = std::min(active, p.hbm_aggregate_gibps / p.bw_gm_l1);
+      const double write_par = std::min(active, p.hbm_aggregate_gibps / p.bw_l0c_gm);
+      const double read_bytes = active * static_cast<double>((144LL * 272 + 272LL * 80) * 4);
+      const double write_bytes = active * static_cast<double>(144LL * 80 * 4);
+      const double expected_ddr =
+          std::max(read_bytes * p.cube_freq_hz / (gib * p.bw_gm_l1) / read_par,
+                   write_bytes * p.cube_freq_hz / (gib * p.bw_l0c_gm) / write_par);
+      CHECK_EQ("CUBEPLAN/clamp: analytic traffic charges all maximum-shape tasks",
+               clamped_cost.ddr_traffic, expected_ddr, 1e-9);
+      cfg.split_k = 2;
+      const auto split_cost = analytic->compute_cost(cfg);
+      CHECK("CUBEPLAN/clamp: ragged atomic split is rejected in analytic compiler mode",
+            split_cost.feasible && !std::isfinite(split_cost.latency));
+    }
+
     // A boundary result spanning several L0 M/N tiles nests those output tiles
     // outside the GM K-window loop. Every partial remains in L0C and drains
     // once; no impossible Mat->Acc reload or full-region L1 carry is present.

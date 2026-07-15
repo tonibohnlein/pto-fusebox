@@ -313,10 +313,10 @@ struct Problem {
     // FIFO wavefront emitter exists.
     bool allow_model_ahead_mixed_multi_roundtrip = true;
 
-    // Buildability gate for homogeneous cube DAGs with more than one matmul.
-    // When true, enumerate only exact uniform M/N partitions; the current
-    // plan-driven emitter cannot represent unequal static region shapes in one
-    // SPMD kernel. Lone matmuls retain the full balanced grid space.
+    // Buildability gate for homogeneous cube DAGs. Multi-matmul groups enumerate
+    // only exact uniform M/N partitions. Lone matmuls retain the full grid, but
+    // a non-uniform candidate is specified as split=1 ClampedOverlap; ragged
+    // split-K is rejected because its atomic edge regions would overlap.
     bool require_uniform_cube_dag_grid = false;
     // Price the explicit output-tile/K-window hierarchy reconstructed by
     // CubeSchedulePlan. PyPTO enables this for buildable solver decisions.
@@ -751,6 +751,15 @@ struct CubeSplitSeedPlan {
   int64_t bytes = 0;
 };
 
+// How one static per-work-unit tensor shape covers the spatial output grid.
+// Uniform regions are disjoint. ClampedOverlap is the lone-matmul split=1
+// fallback: every task computes the maximum region shape and the last task on
+// a ragged axis clamps backward, recomputing an identical overlapping edge.
+enum class CubeSpatialPolicy {
+    Uniform,
+    ClampedOverlap,
+};
+
 // The solver-owned algorithm descriptor for a homogeneous cube subgraph at one
 // fixed TileConfig and split-K factor. Like VectorStreamPlan, this is rebuilt
 // only for a winning/forced solution; it is deliberately absent from
@@ -763,6 +772,7 @@ struct CubeSchedulePlan {
     TileConfig config;
     AxisPartition m_partition;
     AxisPartition n_partition;
+    CubeSpatialPolicy spatial_policy = CubeSpatialPolicy::Uniform;
     int64_t spatial_tiles = 0;
     int64_t split_k = 1;
     int64_t work_units = 0;

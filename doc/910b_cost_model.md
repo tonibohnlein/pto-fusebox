@@ -209,9 +209,11 @@ Floating operands accumulate in FP32. A2/A3's fused-chain path drains an interna
 BF16/FP16 Mat tile. Same-type FP32 Acc→Mat and Mat→Acc do not exist, so an explicitly FP32 internal
 result is not a buildable fused chain and is partitioned into standalone matmuls.
 
-Lone matmuls retain the established balanced non-uniform search and ceil+clamp emitter. That emitter
-is numerically idempotent, but it can execute more max-size tiles than the LPT-balanced cost prices.
-General multi-op non-uniform emission is therefore not claimed complete.
+Lone split=1 matmuls admit a `ClampedOverlap` spatial policy. Every logical task computes the
+maximum static region shape; a ragged edge clamps backward and recomputes the overlap identically.
+Both analytic and exact costs charge those repeated reads, MADs, and drains. Ragged split-K remains
+invalid because atomic edge partials would have multiple spatial owners. General multi-op
+non-uniform emission is not claimed complete because it needs variable-shape recursive requests.
 
 The plan emitter also declines a deduplicated identical boundary request until an explicit shared L1
 panel and lifetime are represented. In non-strict production mode, declined groups fall back to
@@ -232,7 +234,7 @@ Host coverage includes:
 
 Before device ranking is trusted, complete:
 
-1. implement or consistently price non-uniform multi-op grids and lone ceil+clamp work;
+1. implement variable-shape non-uniform multi-op grids; lone split=1 ceil+clamp is complete;
 2. add shared boundary-panel retention only with an explicit lifetime and matching traffic change;
 3. ground a per-baseK event/synchronization term before phase cost changes geometry selection;
 4. extend the Acc→Mat capability table beyond BF16/FP16 only when PTO supports it;

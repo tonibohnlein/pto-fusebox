@@ -2511,6 +2511,19 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.emit_compatible = true;
   plan.m_partition = partition_axis(out_H_, parts_m, grid_gran_h_);
   plan.n_partition = partition_axis(out_W_, parts_n, grid_gran_w_);
+  const bool uniform_grid = plan.m_partition.num_big == 0 && plan.n_partition.num_big == 0;
+  if (!uniform_grid) {
+    // PyPTO realizes a ragged lone-matmul grid with one static maximum region:
+    // the edge tasks clamp backward and recompute their overlap identically.
+    // Atomic split-K cannot use that policy because the overlap would acquire
+    // multiple spatial owners, and a multi-matmul request DAG would need a
+    // variable-shape lifetime for every back-propagated producer request.
+    if (lone_matmul && split == 1 && prob_->require_uniform_cube_dag_grid) {
+      plan.spatial_policy = CubeSpatialPolicy::ClampedOverlap;
+    } else {
+      plan.emit_compatible = false;
+    }
+  }
   plan.spatial_tiles = parts_m * parts_n;
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
@@ -3538,10 +3551,15 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         // split-K atomic partials would give more than one owner to edge output
         // elements, so it is not a buildable hierarchical schedule.  Do not
         // let the older analytic roofline rank that fictional configuration.
-        if (prob_->use_hierarchical_cube_cost && !uniform_grid && S > 1) {
+        const bool clamped_overlap_grid = prob_->require_uniform_cube_dag_grid && lone_matmul &&
+                                          !uniform_grid && S == 1;
+        if (prob_->require_uniform_cube_dag_grid && !uniform_grid && S > 1) {
           return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
         }
-        if (prob_->use_hierarchical_cube_cost && uniform_grid) {
+        if (prob_->use_hierarchical_cube_cost && !uniform_grid && !clamped_overlap_grid) {
+          return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
+        }
+        if (prob_->use_hierarchical_cube_cost && (uniform_grid || clamped_overlap_grid)) {
           const CubeSchedulePlan schedule =
               derive_cube_schedule_plan(cfg, retained_from_prev, retain_these, S, l0_memo);
           if (!schedule.feasible || !schedule.emit_compatible) {
@@ -3643,13 +3661,19 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
 
         double computeS = 0.0;
         if (cfg.parts_m > 0) {
-          computeS = lone_matmul ? LptMakespan(
-                                       n_cores, g_pm, g_pn,
-                                       [&](int64_t m, int64_t n) {
-                                         return request_pipes(m, n, /*split=*/1,
-                                                              /*phase_d=*/true);
-                                       },
-                                       S)
+          computeS = clamped_overlap_grid
+                         ? WaveComputeCycles(
+                               request_pipes(g_pm.big, g_pn.big, /*split=*/1,
+                                             /*phase_d=*/true) *
+                                   static_cast<double>(unitsS),
+                               unitsS, n_cores)
+                         : lone_matmul ? LptMakespan(
+                                            n_cores, g_pm, g_pn,
+                                            [&](int64_t m, int64_t n) {
+                                              return request_pipes(m, n, /*split=*/1,
+                                                                   /*phase_d=*/true);
+                                            },
+                                            S)
                                  : LptMakespanPerUnit(
                                        n_cores, g_pm, g_pn,
                                        [&](int64_t m, int64_t n, int64_t split) {
@@ -3668,9 +3692,25 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         }
         double reload_lhs = 0.0;
         double reload_rhs = 0.0;
-        const double reload =
-            lone_matmul ? cube_operand_reload(cfg, /*matmul_at_output_grid=*/false, &reload_lhs, &reload_rhs)
-                        : cube_request_reload(cfg, S, &reload_lhs, &reload_rhs);
+        double write_bytes = static_cast<double>(S) * out_store;
+        double reload = 0.0;
+        if (clamped_overlap_grid) {
+          const CubeRequestNode& node = cube_request_nodes_.front();
+          const Op& op = prob_->ops[node.op];
+          const double copies = static_cast<double>(unitsS);
+          reload_lhs = copies * static_cast<double>(g_pm.big * op_K(node.op)) *
+                       dtype_bytes(prob_->tensors[op.inputs[0]].dtype);
+          reload_rhs = copies * static_cast<double>(op_K(node.op) * g_pn.big) *
+                       dtype_bytes(prob_->tensors[op.inputs[1]].dtype);
+          reload = reload_lhs + reload_rhs;
+          write_bytes = copies * static_cast<double>(g_pm.big * g_pn.big) *
+                        dtype_bytes(prob_->tensors[op.output()].dtype);
+        } else {
+          reload = lone_matmul
+                       ? cube_operand_reload(cfg, /*matmul_at_output_grid=*/false,
+                                             &reload_lhs, &reload_rhs)
+                       : cube_request_reload(cfg, S, &reload_lhs, &reload_rhs);
+        }
         // DDR is two SEPARATE, concurrent pipes: the operand feed (MTE2, GM->L1)
         // and the output write-back (FixPipe, L0C->GM; S atomic-add partials for a
         // split). They are distinct hardware, and pto-isa scores GM reads and GM
@@ -3678,7 +3718,7 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         // term is max(feed, writes), NOT their sum. Each is per-core-divided +
         // HBM-capped at its own peak (S=1 => a single output store).
         const double feed   = reload * bc.reload / par(activeS, prob_->bw_gm_l1);
-        const double writes = (double)S * out_store * bc.store / par(activeS, prob_->bw_l0c_gm);
+        const double writes = write_bytes * bc.store / par(activeS, prob_->bw_l0c_gm);
         const double ddrS = std::max(feed, writes);
         // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
         const double latS = db_roofline(computeS, ddrS, overlap_implementable(S));

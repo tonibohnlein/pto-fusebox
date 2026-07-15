@@ -119,6 +119,14 @@ static const char* cube_axis_binding_name(CubeAxisBinding binding) {
     return "unknown";
 }
 
+static const char* cube_spatial_policy_name(CubeSpatialPolicy policy) {
+    switch (policy) {
+        case CubeSpatialPolicy::Uniform: return "uniform";
+        case CubeSpatialPolicy::ClampedOverlap: return "clamped_overlap";
+    }
+    return "unknown";
+}
+
 static json cube_region_json(const CubeTensorRegionPlan& region) {
     return {{"tensor", region.tensor},
             {"height_binding", cube_axis_binding_name(region.height_binding)},
@@ -701,6 +709,7 @@ void write_solution(const std::string& filename, const Solution& sol) {
                                    {"cycles", mm.final_drain.cycles}}}});
             }
             j["cube_schedule"].push_back({{"emit_compatible", cube_plan.emit_compatible},
+                                          {"spatial_policy", cube_spatial_policy_name(cube_plan.spatial_policy)},
                                           {"spatial_tiles", cube_plan.spatial_tiles},
                                           {"split_k", cube_plan.split_k},
                                           {"work_units", cube_plan.work_units},
