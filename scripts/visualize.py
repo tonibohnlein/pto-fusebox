@@ -677,6 +677,10 @@ def _cube_operand_source(
     if producer >= 0:
         release = " · release after load" if last_use.get(producer) == request_index else ""
         return f"{side.upper()}: L1 result from request {producer}{release}"
+    retained = mm.get("retained_panels", {}).get(side, False)
+    if retained:
+        retained_bytes = mm.get("retained_panels", {}).get(f"{side}_bytes", 0)
+        return f"{side.upper()}: GM {_region(mm[side])} → retained L1 once ({retained_bytes} B)"
     return f"{side.upper()}: GM {_region(mm[side])}"
 
 
@@ -723,6 +727,17 @@ def _append_cube_request_flow(
     drain = mm["final_drain"]
     target = "L1 Mat" if drain["target_l1"] else "GM"
     atomic = " atomic-add" if drain["atomic"] else ""
+    retained = mm.get("retained_panels", {})
+    streamed_sides = [
+        side.upper()
+        for side in ("lhs", "rhs")
+        if mm.get(f"{side}_producer", -1) < 0 and not retained.get(side, False)
+    ]
+    k_feed = (
+        " + ".join(streamed_sides) + " K panel: GM → L1"
+        if streamed_sides
+        else "K panels: retained/local L1 slices"
+    )
     init_l0 = _l0_summary(representative.get("l0_init"))
     rolled_l0 = _l0_summary(representative.get("l0_rolled"))
     l0_summary = f"L0 {init_l0}"
@@ -753,7 +768,7 @@ def _append_cube_request_flow(
             _flow_node(
                 input_node,
                 (
-                    "K-slice tiles for this C tile\n"
+                    "Panels available to this C tile\n"
                     f"{_cube_operand_source(mm, 'lhs', index, last_use)}\n"
                     f"{_cube_operand_source(mm, 'rhs', index, last_use)}\n"
                     f"Aₖ [{representative['shape'][0]}×{chunk}]  +  "
@@ -769,7 +784,7 @@ def _append_cube_request_flow(
         stages.append(
             (
                 f"{prefix}_Fill",
-                "K0 panels\nGM → L1 slot 0\nfill",
+                f"K0 · {k_feed}\nslot 0 / local slice\nfill",
                 "#d9ecff",
                 "C tile in L0C\nempty",
                 None,
@@ -778,7 +793,7 @@ def _append_cube_request_flow(
         stages.append(
             (
                 f"{prefix}_First",
-                "K0: L1 → L0 → Matrix\nK1: GM → L1 slot 1\noverlap",
+                f"K0: L1 → L0 → Matrix\nK1: {k_feed}\noverlap",
                 "#e2d5ff",
                 "C tile in L0C\nΣ K0",
                 "TMATMUL",
@@ -788,7 +803,7 @@ def _append_cube_request_flow(
             stages.append(
                 (
                     f"{prefix}_Steady",
-                    f"Kᵢ: L1 → L0 → Matrix\nKᵢ₊₁: GM → alternate L1\nrepeat ×{steady}",
+                    f"Kᵢ: L1 → L0 → Matrix\nKᵢ₊₁: {k_feed}\nrepeat ×{steady}",
                     "#e2d5ff",
                     f"C tile in L0C\nΣ K0…K{full_chunks - 2}",
                     f"TMATMUL_ACC ×{steady}",
@@ -808,7 +823,7 @@ def _append_cube_request_flow(
         stages.append(
             (
                 f"{prefix}_Load0",
-                "K0 panels\nGM → L1\nfeed",
+                f"K0 · {k_feed}\nfeed",
                 "#d9ecff",
                 "C tile in L0C\nempty",
                 None,

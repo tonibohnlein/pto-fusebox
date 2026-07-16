@@ -305,7 +305,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // output_K_/S when evaluating/emitting a known parallel split). The optional
   // vector is indexed by cube_request_nodes_, not global op id.
   int64_t derive_exec(const TileConfig& cfg, int64_t sink_K_eff, const FlatSet<size_t>& retained_from_prev,
-                      const FlatSet<size_t>& retain_these, std::vector<int64_t>* pernode_k_out) const;
+                      const FlatSet<size_t>& retain_these, std::vector<int64_t>* pernode_k_out,
+                      std::vector<int64_t>* pernode_live_bytes_out = nullptr) const;
 
   struct CubeRequest {
     size_t tensor = std::numeric_limits<size_t>::max();

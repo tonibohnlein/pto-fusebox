@@ -711,6 +711,20 @@ struct CubeOutputTileVariant {
   L0MatmulPlan l0_tail;
 };
 
+struct CubeRetainedPanelPlan {
+  // Load a boundary panel from GM to L1 once before this request's output-tile
+  // loop, then take local L1 slices for every child L0 tile. Retention is
+  // deliberately scoped to one work unit and one matmul request; it assumes no
+  // cross-core affinity or cross-kernel persistence.
+  bool lhs = false;
+  bool rhs = false;
+  int64_t lhs_bytes = 0;
+  int64_t rhs_bytes = 0;
+
+  bool present() const { return lhs || rhs; }
+  int64_t bytes() const { return lhs_bytes + rhs_bytes; }
+};
+
 struct CubeMatmulSchedule {
   size_t instance = std::numeric_limits<size_t>::max();
   size_t op = std::numeric_limits<size_t>::max();
@@ -740,6 +754,7 @@ struct CubeMatmulSchedule {
   int64_t output_tiles_m = 0;
   int64_t output_tiles_n = 0;
   std::vector<CubeOutputTileVariant> output_variants;
+  CubeRetainedPanelPlan retained_panels;
   CubeFinalDrainPlan final_drain;
 };
 

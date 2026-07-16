@@ -2141,6 +2141,108 @@ static void test_cube_schedule_plan() {
                   !mm.final_drain.target_l1 && !mm.final_drain.atomic);
     }
 
+    // When the L0 chooser splits one GM/L1 output region along N, every child
+    // uses the same boundary LHS rows. Exact mode compares the serial full-LHS
+    // preload against repeated per-child feeds and, when it wins, retains that
+    // panel in L1 for the complete output-tile loop.
+    {
+      auto p = mk_mm(256, 1024, 64, 1000);
+      p.use_hierarchical_cube_cost = true;
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0});
+      CHECK("CUBEPLAN/retain: subgraph is structurally accepted",
+            static_cast<bool>(sg));
+      if (!sg) return;
+      TileConfig cfg;
+      cfg.w = 1024;
+      cfg.h = 256;
+      cfg.k = 64;
+      cfg.parts_m = 1;
+      cfg.parts_n = 1;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto& mm = plan.matmuls[0];
+      CHECK("CUBEPLAN/retain: repeated LHS is retained once across N subtiles",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                mm.output_tiles_m == 1 && mm.output_tiles_n > 1 &&
+                mm.retained_panels.lhs && !mm.retained_panels.rhs &&
+                mm.retained_panels.lhs_bytes == 256LL * 64 * 4 &&
+                mm.retained_panels.rhs_bytes == 0 &&
+                plan.peak_l1_bytes ==
+                    mm.retained_panels.lhs_bytes +
+                        mm.k_loop.l1_window_k * mm.output_tile_n * 4 &&
+                plan.peak_l1_bytes <= p.l1_capacity);
+      const double lhs_once =
+          static_cast<double>(256LL * 64 * 4) * p.cube_freq_hz /
+          (1024.0 * 1024.0 * 1024.0 * p.bw_gm_l1);
+      const double rhs_once_per_n_tile =
+          static_cast<double>(mm.output_tiles_m * 64LL * mm.output.width * 4) *
+          p.cube_freq_hz /
+          (1024.0 * 1024.0 * 1024.0 * p.bw_gm_l1);
+      CHECK("CUBEPLAN/retain: exact DDR term is one LHS preload plus RHS tile feeds",
+            std::abs(cost.ddr_traffic -
+                     (lhs_once + rhs_once_per_n_tile +
+                      mm.final_drain.cycles)) < 1e-9);
+
+      auto analytic_p = mk_mm(256, 1024, 64, 1000);
+      DAG analytic_dag = DAG::build(analytic_p);
+      auto analytic_sg = Subgraph::create(analytic_p, analytic_dag, {0});
+      bool analytic_no_retention = false;
+      if (analytic_sg) {
+        const auto analytic_plan =
+            analytic_sg->cube_schedule_plan(cfg, {}, {}, 1);
+        analytic_no_retention =
+            !analytic_plan.matmuls.empty() &&
+            !analytic_plan.matmuls[0].retained_panels.present();
+      }
+      CHECK("CUBEPLAN/retain: analytic mode keeps repeated-load emission",
+            static_cast<bool>(analytic_sg) && analytic_no_retention);
+    }
+
+    // The symmetric M-split case retains the RHS column panel across every
+    // output-row tile.
+    {
+      auto p = mk_mm(1024, 256, 64, 1000);
+      p.use_hierarchical_cube_cost = true;
+      DAG dag = DAG::build(p);
+      auto sg = Subgraph::create(p, dag, {0});
+      CHECK("CUBEPLAN/retain-rhs: subgraph is structurally accepted",
+            static_cast<bool>(sg));
+      if (!sg) return;
+      TileConfig cfg;
+      cfg.w = 256;
+      cfg.h = 1024;
+      cfg.k = 64;
+      cfg.parts_m = 1;
+      cfg.parts_n = 1;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto& mm = plan.matmuls[0];
+      CHECK("CUBEPLAN/retain-rhs: repeated RHS is retained once across M subtiles",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                mm.output_tiles_m > 1 && mm.output_tiles_n == 1 &&
+                !mm.retained_panels.lhs && mm.retained_panels.rhs &&
+                mm.retained_panels.lhs_bytes == 0 &&
+                mm.retained_panels.rhs_bytes == 64LL * 256 * 4 &&
+                plan.peak_l1_bytes ==
+                    mm.retained_panels.rhs_bytes +
+                        mm.output_tile_m * mm.k_loop.l1_window_k * 4 &&
+                plan.peak_l1_bytes <= p.l1_capacity);
+      const double rhs_once =
+          static_cast<double>(64LL * 256 * 4) * p.cube_freq_hz /
+          (1024.0 * 1024.0 * 1024.0 * p.bw_gm_l1);
+      const double lhs_once_per_m_tile =
+          static_cast<double>(mm.output_tiles_n * mm.output.height * 64LL * 4) *
+          p.cube_freq_hz /
+          (1024.0 * 1024.0 * 1024.0 * p.bw_gm_l1);
+      CHECK("CUBEPLAN/retain-rhs: exact DDR term is one RHS preload plus LHS tile feeds",
+            std::abs(cost.ddr_traffic -
+                     (rhs_once + lhs_once_per_m_tile +
+                      mm.final_drain.cycles)) < 1e-9);
+    }
+
     // A ragged lone-matmul grid uses one static maximum region in PyPTO. Edge
     // tasks clamp backward, so their duplicated reads/MADs/drains must be part
     // of the schedule rather than the old balanced 144/128-region LPT cost.
@@ -2361,6 +2463,7 @@ static void test_cube_schedule_plan() {
                 plan.emit_compatible && mm.final_drain.required && !mm.final_drain.target_l1 &&
                 !mm.final_drain.atomic && mm.final_drain.bytes == output_bytes &&
                 std::abs(mm.final_drain.cycles - expected_drain) < 1e-9 &&
+                !mm.retained_panels.present() &&
                 plan.peak_l1_bytes <= p.l1_capacity);
       CHECK("CUBEPLAN/root-carry: candidate cost is the exact phase-local hierarchy",
             std::abs(cost.latency - (expected_phases + p.kernel_fill_cost)) < 1e-9);

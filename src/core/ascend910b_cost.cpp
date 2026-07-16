@@ -513,6 +513,98 @@ ByteCost MakeByteCost(const Problem* p) {
           cpb(p->bw_l1_l0b), cpb(p->bw_gm_ub), cpb(p->bw_ub_gm)};
 }
 
+struct CubeMatmulPhaseCost {
+  double wall = 0.0;
+  double compute = 0.0;
+  double ddr = 0.0;
+  double l1_l0 = 0.0;
+};
+
+// Cost one request exactly as CubeSchedulePlan emits it. Retained boundary
+// panels are serial GM->L1 prologue loads; the output-tile/K-window body then
+// omits that operand's GM traffic and takes local L1 slices instead.
+CubeMatmulPhaseCost CostCubeMatmulPhases(const Problem* p, const ByteCost& bc,
+                                        double gm_read_scale, double gm_write_scale,
+                                        const CubeMatmulSchedule& mm,
+                                        const CubeRetainedPanelPlan* retained_override = nullptr) {
+  CubeMatmulPhaseCost result;
+  const CubeRetainedPanelPlan& retained =
+      retained_override ? *retained_override : mm.retained_panels;
+  const double preload =
+      static_cast<double>(retained.bytes()) * bc.reload * gm_read_scale;
+  result.wall += preload;
+  result.ddr += preload;
+
+  const int64_t init_k =
+      mm.k_loop.full_chunks >= 2 ? mm.k_loop.chunk : mm.effective_contraction;
+  auto feed_cycles = [&](const CubeOutputTileVariant& variant, int64_t k_extent) {
+    double bytes = 0.0;
+    if (!mm.lhs_ephemeral && !retained.lhs) {
+      bytes += static_cast<double>(
+          variant.height * k_extent * dtype_bytes(p->tensors[mm.lhs.tensor].dtype));
+    }
+    if (!mm.rhs_ephemeral && !retained.rhs) {
+      bytes += static_cast<double>(
+          k_extent * variant.width * dtype_bytes(p->tensors[mm.rhs.tensor].dtype));
+    }
+    return bytes * bc.reload * gm_read_scale;
+  };
+
+  L0MatmulConfig drain_config = p->l0_matmul_config;
+  drain_config.bytes_c = dtype_bytes(p->tensors[mm.output.tensor].dtype);
+  const L0OutputTarget drain_target =
+      mm.final_drain.target_l1 ? L0OutputTarget::L1 : L0OutputTarget::GM;
+  const bool streams_boundary =
+      (!mm.lhs_ephemeral && !retained.lhs) ||
+      (!mm.rhs_ephemeral && !retained.rhs);
+  const int pipeline_stages =
+      streams_boundary ? mm.k_loop.pipeline_stages : 1;
+  for (const CubeOutputTileVariant& variant : mm.output_variants) {
+    const double count = static_cast<double>(variant.count);
+    const double init_inner = variant.l0_init.phases.wall_cycles;
+    const double init_feed = feed_cycles(variant, init_k);
+    double tile_wall = init_inner + init_feed;
+    double tile_compute = init_inner;
+    double tile_ddr = init_feed;
+    double tile_l1_l0 = variant.l0_init.phases.load_cycles;
+
+    const int64_t rolled = std::max<int64_t>(0, mm.k_loop.full_chunks - 1);
+    if (rolled > 0) {
+      const double inner = variant.l0_rolled.phases.wall_cycles;
+      const double feed = feed_cycles(variant, mm.k_loop.chunk);
+      tile_wall = KWindowStreamWall(mm.k_loop.full_chunks, pipeline_stages,
+                                    init_feed, init_inner, feed, inner);
+      tile_compute += static_cast<double>(rolled) * inner;
+      tile_ddr += static_cast<double>(rolled) * feed;
+      tile_l1_l0 +=
+          static_cast<double>(rolled) * variant.l0_rolled.phases.load_cycles;
+    }
+    if (mm.k_loop.tail > 0) {
+      const double inner = variant.l0_tail.phases.wall_cycles;
+      const double feed = feed_cycles(variant, mm.k_loop.tail);
+      tile_wall += inner + feed;
+      tile_compute += inner;
+      tile_ddr += feed;
+      tile_l1_l0 += variant.l0_tail.phases.load_cycles;
+    }
+
+    double drain = estimate_l0_output_drain_cycles(
+        variant.height, variant.width, drain_config, drain_target);
+    if (!mm.final_drain.target_l1) drain *= gm_write_scale;
+    tile_wall += drain;
+    if (mm.final_drain.target_l1) {
+      tile_compute += drain;
+    } else {
+      tile_ddr += drain;
+    }
+    result.wall += count * tile_wall;
+    result.compute += count * tile_compute;
+    result.ddr += count * tile_ddr;
+    result.l1_l0 += count * tile_l1_l0;
+  }
+  return result;
+}
+
 // Largest per-load K chunk that fits two ping-pong buffers in the L1 window and
 // leaves at least two rolled iterations after a serial first accumulation
 // initializes the carry. Returning 0 means the concrete emitter has no stage-2
@@ -2256,7 +2348,8 @@ int64_t Ascend910BCost::cube_binding_extent(CubeAxisBinding binding, int64_t ful
 int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
                                     const FlatSet<size_t>& retained_from_prev,
                                     const FlatSet<size_t>& retain_these,
-                                    std::vector<int64_t>* pernode_k_out) const {
+                                    std::vector<int64_t>* pernode_k_out,
+                                    std::vector<int64_t>* pernode_live_bytes_out) const {
   // Full L1/Mat budget -- double-buffering does NOT reserve half. The two
   // ping-pong buffers are not "L1 + a spare half"; together they ARE the L1, so
   // the operand strip that fits is the full pool. Double-buffering is realized in
@@ -2318,6 +2411,7 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
     }
 
     if (pernode_k_out) pernode_k_out->assign(node_count, 0);
+    if (pernode_live_bytes_out) pernode_live_bytes_out->assign(node_count, 0);
     int64_t peak = 0;
     for (size_t step = 0; step < node_count; ++step) {
       const CubeRequestNode& node = cube_request_nodes_[step];
@@ -2338,6 +2432,7 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
       // unemittable algorithm. Internal completed outputs are already in
       // band_at[] over their producer/consumer lifetime.
       const int64_t bands = base + band_at[step];
+      if (pernode_live_bytes_out) (*pernode_live_bytes_out)[step] = bands;
       if (bands > static_cast<int64_t>(l1)) return INT64_MAX;
 
       int64_t kk = K_eff;
@@ -2421,12 +2516,14 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
     if (!retained_from_prev.count(t)) base += prob_->tensors[t].size_bytes();
 
   if (pernode_k_out) pernode_k_out->assign(prob_->num_ops(), 0);
+  if (pernode_live_bytes_out) pernode_live_bytes_out->assign(prob_->num_ops(), 0);
 
   int64_t peak = 0;
   for (int s = 0; s < (int)order.size(); ++s) {
     const size_t opi = order[s];
     const Op &op = prob_->ops[opi];
     const int64_t bands = base + band_at[s];
+    if (pernode_live_bytes_out) (*pernode_live_bytes_out)[opi] = bands;
     // A VECTOR op does not pressure L1 — it runs on the vector unit (UB). Skip it
     // from the cube L1 sweep. (Homogeneous cube has no vector ops, so this is never
     // taken there; it only matters inside a mixed group.)
@@ -2505,12 +2602,15 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
 
   const bool lone_matmul = cube_request_nodes_.size() == 1;
   std::vector<int64_t> pernode_window_k;
+  std::vector<int64_t> pernode_live_bytes;
   // The pre-plan lone path derived its L1 window against the full contraction,
   // then capped that full-K divisor to the selected share. Keep that exact
   // reconstruction; general request DAGs derive directly at K/S because their
   // upstream request shapes themselves depend on S.
   const int64_t derive_sink_k = lone_matmul ? output_K_ : output_K_ / split;
-  const int64_t peak = derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &pernode_window_k);
+  const int64_t peak =
+      derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these,
+                  &pernode_window_k, &pernode_live_bytes);
   if (peak == INT64_MAX) return plan;
 
   const int64_t parts_m = cfg.parts_m > 0
@@ -2543,10 +2643,10 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.spatial_tiles = parts_m * parts_n;
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
-  plan.peak_l1_bytes = peak;
+  plan.peak_l1_bytes = prob_->use_hierarchical_cube_cost ? 0 : peak;
   plan.seed_required = split > 1;
-  plan.model_overlap_granted = true;
-  plan.overlap_implementable = true;
+  plan.model_overlap_granted = false;
+  plan.overlap_implementable = false;
   if (plan.seed_required && !boundary_outputs_.empty()) {
     const DType output_dtype = prob_->tensors[*boundary_outputs_.begin()].dtype;
     const int64_t bytes = dtype_bytes(output_dtype);
@@ -2627,11 +2727,6 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     mm.k_loop.full_chunks = mm.effective_contraction / mm.k_loop.chunk;
     mm.k_loop.tail = mm.effective_contraction -
                      mm.k_loop.full_chunks * mm.k_loop.chunk;
-    if (loads_boundary && mm.k_loop.pipeline_stages != 2) {
-      plan.model_overlap_granted = false;
-      plan.overlap_implementable = false;
-    }
-
     const DType lhs_dtype = prob_->tensors[mm.lhs.tensor].dtype;
     const DType rhs_dtype = prob_->tensors[mm.rhs.tensor].dtype;
     const DType output_dtype = prob_->tensors[mm.output.tensor].dtype;
@@ -2743,9 +2838,109 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
         !std::isfinite(mm.final_drain.cycles)) {
       plan.emit_compatible = false;
     }
+
+    // Exact mode may retain a complete boundary panel across this request's
+    // output-tile loop. Enumerate the four bounded choices here, after the L0
+    // output grid is known, and keep the cheapest buildable algorithm. The
+    // retained preload is a serial phase; it is not allowed to borrow the
+    // K-window roofline's overlap.
+    if (prob_->use_hierarchical_cube_cost && plan.emit_compatible) {
+      const bool can_retain_lhs = !mm.lhs_ephemeral && mm.output_tiles_n > 1;
+      const bool can_retain_rhs = !mm.rhs_ephemeral && mm.output_tiles_m > 1;
+      const int64_t lhs_full_bytes =
+          can_retain_lhs
+              ? mm.lhs.height * mm.lhs.width *
+                    dtype_bytes(prob_->tensors[mm.lhs.tensor].dtype)
+              : 0;
+      const int64_t rhs_full_bytes =
+          can_retain_rhs
+              ? mm.rhs.height * mm.rhs.width *
+                    dtype_bytes(prob_->tensors[mm.rhs.tensor].dtype)
+              : 0;
+      const int64_t live_bytes =
+          node_idx < pernode_live_bytes.size() ? pernode_live_bytes[node_idx] : 0;
+      const int64_t lhs_window_bytes =
+          !mm.lhs_ephemeral
+              ? mm.output_tile_m * mm.k_loop.l1_window_k *
+                    dtype_bytes(prob_->tensors[mm.lhs.tensor].dtype)
+              : 0;
+      const int64_t rhs_window_bytes =
+          !mm.rhs_ephemeral
+              ? mm.k_loop.l1_window_k * mm.output_tile_n *
+                    dtype_bytes(prob_->tensors[mm.rhs.tensor].dtype)
+              : 0;
+
+      const double active =
+          static_cast<double>(std::min<int64_t>(plan.work_units, prob_->num_cube_cores));
+      auto parallel_pipes = [&](double peak_gibps) {
+        const double cap = (prob_->hbm_aggregate_gibps > 0.0 && peak_gibps > 0.0)
+                               ? prob_->hbm_aggregate_gibps / peak_gibps
+                               : std::numeric_limits<double>::infinity();
+        return std::max(1.0, std::min(active, cap));
+      };
+      const double gm_read_scale = active / parallel_pipes(prob_->bw_gm_l1);
+      const double gm_write_scale = active / parallel_pipes(prob_->bw_l0c_gm);
+      const ByteCost bc = MakeByteCost(prob_);
+
+      CubeMatmulPhaseCost best_cost =
+          CostCubeMatmulPhases(prob_, bc, gm_read_scale, gm_write_scale, mm);
+      CubeRetainedPanelPlan best_retained;
+      int64_t best_peak =
+          live_bytes + lhs_window_bytes + rhs_window_bytes;
+      for (int mask = 1; mask < 4; ++mask) {
+        const bool retain_lhs = (mask & 1) != 0;
+        const bool retain_rhs = (mask & 2) != 0;
+        if ((retain_lhs && !can_retain_lhs) ||
+            (retain_rhs && !can_retain_rhs)) {
+          continue;
+        }
+        const int64_t request_peak =
+            live_bytes + (retain_lhs ? lhs_full_bytes : lhs_window_bytes) +
+            (retain_rhs ? rhs_full_bytes : rhs_window_bytes);
+        if (request_peak > prob_->l1_capacity) continue;
+
+        CubeRetainedPanelPlan candidate;
+        candidate.lhs = retain_lhs;
+        candidate.rhs = retain_rhs;
+        candidate.lhs_bytes =
+            retain_lhs ? lhs_full_bytes : 0;
+        candidate.rhs_bytes =
+            retain_rhs ? rhs_full_bytes : 0;
+
+        const CubeMatmulPhaseCost candidate_cost =
+            CostCubeMatmulPhases(prob_, bc, gm_read_scale, gm_write_scale,
+                                 mm, &candidate);
+        if (candidate_cost.wall + 1e-9 < best_cost.wall) {
+          best_retained = candidate;
+          best_cost = candidate_cost;
+          best_peak = request_peak;
+        }
+      }
+      mm.retained_panels = best_retained;
+      const bool streams_boundary =
+          (!mm.lhs_ephemeral && !mm.retained_panels.lhs) ||
+          (!mm.rhs_ephemeral && !mm.retained_panels.rhs);
+      if (!streams_boundary) mm.k_loop.pipeline_stages = 1;
+      plan.peak_l1_bytes = std::max(plan.peak_l1_bytes, best_peak);
+    }
     plan.matmuls.push_back(mm);
     plan.execution_order.push_back(node.op);
   }
+
+  bool has_streamed_boundary = false;
+  bool all_streamed_boundaries_pipeline = true;
+  for (const CubeMatmulSchedule& mm : plan.matmuls) {
+    const bool streams_boundary =
+        (!mm.lhs_ephemeral && !mm.retained_panels.lhs) ||
+        (!mm.rhs_ephemeral && !mm.retained_panels.rhs);
+    if (!streams_boundary) continue;
+    has_streamed_boundary = true;
+    all_streamed_boundaries_pipeline &=
+        mm.k_loop.pipeline_stages >= 2 && mm.k_loop.full_chunks >= 3;
+  }
+  plan.model_overlap_granted =
+      has_streamed_boundary && all_streamed_boundaries_pipeline;
+  plan.overlap_implementable = plan.model_overlap_granted;
 
   if (cube_sink_request_node_ >= 0 && static_cast<size_t>(cube_sink_request_node_) < plan.matmuls.size()) {
     plan.config.k = plan.matmuls[static_cast<size_t>(cube_sink_request_node_)].k_loop.l1_window_k;
@@ -3601,67 +3796,12 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
           double unit_ddr = 0.0;
           double unit_l1l0 = 0.0;
           for (const CubeMatmulSchedule& mm : schedule.matmuls) {
-            const int64_t init_k = mm.k_loop.full_chunks >= 2 ? mm.k_loop.chunk : mm.effective_contraction;
-            auto feed_cycles = [&](const CubeOutputTileVariant& variant, int64_t k_extent) {
-              double bytes = 0.0;
-              if (!mm.lhs_ephemeral) {
-                bytes += static_cast<double>(variant.height * k_extent *
-                                             dtype_bytes(prob_->tensors[mm.lhs.tensor].dtype));
-              }
-              if (!mm.rhs_ephemeral) {
-                bytes += static_cast<double>(k_extent * variant.width *
-                                             dtype_bytes(prob_->tensors[mm.rhs.tensor].dtype));
-              }
-              return bytes * bc.reload * gm_read_scale;
-            };
-            L0MatmulConfig drain_config = prob_->l0_matmul_config;
-            drain_config.bytes_c = dtype_bytes(prob_->tensors[mm.output.tensor].dtype);
-            const L0OutputTarget drain_target =
-                mm.final_drain.target_l1 ? L0OutputTarget::L1 : L0OutputTarget::GM;
-            for (const CubeOutputTileVariant& variant : mm.output_variants) {
-              const double count = static_cast<double>(variant.count);
-              const double init_inner = variant.l0_init.phases.wall_cycles;
-              const double init_feed = feed_cycles(variant, init_k);
-              double tile_wall = init_inner + init_feed;
-              double tile_compute = init_inner;
-              double tile_ddr = init_feed;
-              double tile_l1l0 = variant.l0_init.phases.load_cycles;
-
-              const int64_t rolled = std::max<int64_t>(0, mm.k_loop.full_chunks - 1);
-              if (rolled > 0) {
-                const double inner = variant.l0_rolled.phases.wall_cycles;
-                const double feed = feed_cycles(variant, mm.k_loop.chunk);
-                tile_wall = KWindowStreamWall(mm.k_loop.full_chunks,
-                                              mm.k_loop.pipeline_stages,
-                                              init_feed, init_inner, feed,
-                                              inner);
-                tile_compute += static_cast<double>(rolled) * inner;
-                tile_ddr += static_cast<double>(rolled) * feed;
-                tile_l1l0 += static_cast<double>(rolled) * variant.l0_rolled.phases.load_cycles;
-              }
-              if (mm.k_loop.tail > 0) {
-                const double inner = variant.l0_tail.phases.wall_cycles;
-                const double feed = feed_cycles(variant, mm.k_loop.tail);
-                tile_wall += inner + feed;
-                tile_compute += inner;
-                tile_ddr += feed;
-                tile_l1l0 += variant.l0_tail.phases.load_cycles;
-              }
-
-              double drain =
-                  estimate_l0_output_drain_cycles(variant.height, variant.width, drain_config, drain_target);
-              if (!mm.final_drain.target_l1) drain *= gm_write_scale;
-              tile_wall += drain;
-              if (mm.final_drain.target_l1) {
-                tile_compute += drain;
-              } else {
-                tile_ddr += drain;
-              }
-              unit_wall += count * tile_wall;
-              unit_compute += count * tile_compute;
-              unit_ddr += count * tile_ddr;
-              unit_l1l0 += count * tile_l1l0;
-            }
+            const CubeMatmulPhaseCost phases =
+                CostCubeMatmulPhases(prob_, bc, gm_read_scale, gm_write_scale, mm);
+            unit_wall += phases.wall;
+            unit_compute += phases.compute;
+            unit_ddr += phases.ddr;
+            unit_l1l0 += phases.l1_l0;
           }
           const int64_t waves = (unitsS + n_cores - 1) / n_cores;
           double latency = static_cast<double>(waves) * unit_wall;
