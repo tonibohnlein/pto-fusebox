@@ -2149,6 +2149,9 @@ static void test_cube_schedule_plan() {
       auto p = mk_mm(272, 272, 272, 1000);
       p.require_uniform_cube_dag_grid = true;
       p.use_hierarchical_cube_cost = true;
+      p.l0_matmul_config.allow_a_stationary = true;
+      p.l0_matmul_config.allow_b_stationary = true;
+      p.l0_matmul_config.allow_k_boundary = true;
       DAG dag = DAG::build(p);
       auto sg = Subgraph::create(p, dag, {0});
       CHECK("CUBEPLAN/clamp: subgraph is structurally accepted", static_cast<bool>(sg));
@@ -2169,6 +2172,53 @@ static void test_cube_schedule_plan() {
                 plan.n_partition.big == 80 && plan.n_partition.small == 64 && plan.matmuls.size() == 1 &&
                 plan.matmuls[0].output.height == 144 && plan.matmuls[0].output.width == 80 &&
                 plan.matmuls[0].final_drain.bytes == 144LL * 80 * 4);
+
+      TileConfig exact_e12;
+      exact_e12.w = 96;
+      exact_e12.h = 80;
+      exact_e12.k = 272;
+      exact_e12.parts_m = 4;
+      exact_e12.parts_n = 3;
+      exact_e12.split_k = 1;
+      const auto exact_e12_cost = sg->compute_cost(exact_e12);
+      const auto exact_e12_plan = sg->cube_schedule_plan(exact_e12, {}, {}, 1);
+      CHECK("CUBEPLAN/clamp: exact comparison plan is feasible",
+            exact_e12_cost.feasible && std::isfinite(exact_e12_cost.latency) &&
+                exact_e12_plan.feasible && exact_e12_plan.emit_compatible &&
+                exact_e12_plan.work_units == 12 && exact_e12_plan.matmuls.size() == 1);
+      if (plan.matmuls.size() == 1 && exact_e12_plan.matmuls.size() == 1) {
+        const auto& a8_mm = plan.matmuls[0];
+        const auto& e12_mm = exact_e12_plan.matmuls[0];
+        CHECK("CUBEPLAN/clamp: compared grids use the same outer K stream",
+              a8_mm.k_loop.chunk == 80 && a8_mm.k_loop.full_chunks == 3 &&
+                  a8_mm.k_loop.tail == 32 && a8_mm.k_loop.pipeline_stages == 2 &&
+                  e12_mm.k_loop.chunk == a8_mm.k_loop.chunk &&
+                  e12_mm.k_loop.full_chunks == a8_mm.k_loop.full_chunks &&
+                  e12_mm.k_loop.tail == a8_mm.k_loop.tail &&
+                  e12_mm.k_loop.pipeline_stages == a8_mm.k_loop.pipeline_stages);
+        CHECK("CUBEPLAN/clamp: shared L0 chooser preserves each static output region",
+              a8_mm.output_variants.size() == 1 &&
+                  a8_mm.output_variants[0].height == 144 &&
+                  a8_mm.output_variants[0].width == 80 &&
+                  e12_mm.output_variants.size() == 1 &&
+                  e12_mm.output_variants[0].height == 80 &&
+                  e12_mm.output_variants[0].width == 96);
+
+        // The 8-task grid requests fewer total boundary operand bytes, but the
+        // per-task hierarchical terms favor the 12-task grid. Silicon tracing
+        // confirmed the nested pipe equation and final PIPE_ALL drain; the
+        // remaining ranking inversion is the outer per-work-unit dispatch cost.
+        const int64_t a8_input_bytes =
+            plan.work_units * (144LL * 272 + 272LL * 80) * 4;
+        const int64_t e12_input_bytes =
+            exact_e12_plan.work_units * (80LL * 272 + 272LL * 96) * 4;
+        CHECK("CUBEPLAN/clamp: A8 requests fewer total GM operand bytes than E12",
+              a8_input_bytes < e12_input_bytes);
+        CHECK("CUBEPLAN/clamp: per-task final-drain term favors E12",
+              a8_mm.final_drain.cycles > e12_mm.final_drain.cycles);
+        CHECK("CUBEPLAN/clamp: hierarchical DDR proxy favors E12 before dispatch",
+              cost.ddr_traffic > exact_e12_cost.ddr_traffic);
+      }
 
       p.use_hierarchical_cube_cost = false;
       DAG analytic_dag = DAG::build(p);
