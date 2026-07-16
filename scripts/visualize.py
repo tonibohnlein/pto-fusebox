@@ -661,163 +661,226 @@ def _l0_summary(plan: JsonObject | None) -> str:
     buffers = plan["buffer_depths"]
     loop = plan["k_loop"]
     return (
-        f"L0 tile {tile[0]}×{tile[1]}×{tile[2]}, {plan['stationarity']}-stationary, "
-        f"buffers A/B/C={buffers[0]}/{buffers[1]}/{buffers[2]}, "
-        f"child K stage {loop['pipeline_stages']}"
+        f"{tile[0]}×{tile[1]}×{tile[2]}, {plan['stationarity']}-stationary, "
+        f"A/B/C buffers {buffers[0]}/{buffers[1]}/{buffers[2]}, "
+        f"child stage {loop['pipeline_stages']}"
     )
 
 
-def _append_cube_matmul_events(
-    events: list[AlgorithmEvent],
+def _cube_operand_source(
+    mm: JsonObject,
+    side: str,
+    request_index: int,
+    last_use: dict[int, int],
+) -> str:
+    producer = mm.get(f"{side}_producer", -1)
+    if producer >= 0:
+        release = " · release after load" if last_use.get(producer) == request_index else ""
+        return f"{side.upper()}: L1 result from request {producer}{release}"
+    return f"{side.upper()}: GM {_region(mm[side])}"
+
+
+def _cube_last_uses(plan: JsonObject) -> dict[int, int]:
+    last_use: dict[int, int] = {}
+    for index, mm in enumerate(plan.get("matmuls", [])):
+        for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)):
+            if producer >= 0:
+                last_use[producer] = index
+    return last_use
+
+
+def _flow_node(
+    node_id: str,
+    label: str,
+    fillcolor: str,
+    *,
+    shape: str = "box",
+    penwidth: float = 1.2,
+) -> str:
+    return (
+        f'        {node_id} [label="{_dot_escape(label)}", shape={shape}, '
+        f'style="rounded,filled", fillcolor="{fillcolor}", penwidth={penwidth}, margin=0.14];'
+    )
+
+
+def _append_cube_request_flow(
+    lines: list[str],
     mm: JsonObject,
     index: int,
-    last_dependency_use: dict[int, int],
-    live_l1: set[str],
-) -> None:
-    phase = f"matmul instance {index} · Op {mm['op']}"
+    last_use: dict[int, int],
+    result_nodes: dict[int, str],
+) -> tuple[str, str]:
     variants = mm.get("output_variants", [])
     representative = max(variants, key=lambda variant: variant["shape"][0] * variant["shape"][1])
     variant_text = ", ".join(
         f"{variant['shape'][0]}×{variant['shape'][1]} ×{variant['count']}" for variant in variants
     )
-    events.append(
-        AlgorithmEvent(
-            phase,
-            "LOOP",
-            (
-                f"output/L0C grid {mm['output_grid'][0]}×{mm['output_grid'][1]}",
-                f"tile variants: {variant_text}",
-                f"trace below uses representative "
-                f"{representative['shape'][0]}×{representative['shape'][1]} tile",
-            ),
-            tuple(sorted(live_l1)),
-        )
-    )
-
-    boundary_regions: list[str] = []
-    for side, producer in (("lhs", mm.get("lhs_producer", -1)), ("rhs", mm.get("rhs_producer", -1))):
-        region = mm[side]
-        if producer < 0:
-            boundary_regions.append(f"GM → L1 {side.upper()} {_region(region)} for first K window")
-            live_l1.add(f"L1 {side.upper()}: T{region['tensor']} panel")
-    if boundary_regions:
-        events.append(
-            AlgorithmEvent(phase + " · K init", "LOAD", tuple(boundary_regions), tuple(sorted(live_l1)))
-        )
-
-    events.append(
-        AlgorithmEvent(
-            phase + " · K init",
-            "LOAD",
-            ("L1 → L0A/L0B", _l0_summary(representative.get("l0_init"))),
-            tuple(sorted(live_l1)) + ("L0A/L0B: operand tile",),
-        )
-    )
-    events.append(
-        AlgorithmEvent(
-            phase + " · K init",
-            "COMPUTE",
-            ("TMATMUL initializes the complete output tile",),
-            tuple(sorted(live_l1)) + ("L0C: FP32/INT32 accumulator",),
-        )
-    )
-
     k_loop = mm["k_loop"]
-    rolled = max(0, k_loop["full_chunks"] - 1)
-    if rolled:
-        events.append(
-            AlgorithmEvent(
-                phase + " · rolled K windows",
-                "PIPELINE" if k_loop["pipeline_stages"] > 1 else "LOOP",
-                (
-                    f"repeat {rolled} windows of K={k_loop['chunk']}",
-                    f"outer stage {k_loop['pipeline_stages']}: GM→L1(k+1) overlaps child L1→L0/MAD(k)",
-                    _l0_summary(representative.get("l0_rolled")),
-                    "TMATMUL_ACC updates the same resident L0C tile",
-                ),
-                tuple(sorted(live_l1)) + ("L0C: persistent accumulator", "L1: GM panels ping/pong"),
-            )
-        )
-    if k_loop.get("tail", 0):
-        events.append(
-            AlgorithmEvent(
-                phase + " · ragged K tail · serial",
-                "COMPUTE",
-                (
-                    f"GM→L1 tail K={k_loop['tail']}; then L1→L0 and TMATMUL_ACC",
-                    _l0_summary(representative.get("l0_tail")),
-                ),
-                tuple(sorted(live_l1)) + ("L0C: completed accumulator",),
-            )
-        )
-
+    full_chunks = k_loop["full_chunks"]
+    stage_two = k_loop["pipeline_stages"] >= 2 and full_chunks >= 2
+    steady = max(0, full_chunks - 2)
+    chunk = k_loop["chunk"]
     drain = mm["final_drain"]
     target = "L1 Mat" if drain["target_l1"] else "GM"
     atomic = " atomic-add" if drain["atomic"] else ""
-    result_state = (f"L1 result: instance {index}",) if drain["target_l1"] else ()
-    events.append(
-        AlgorithmEvent(
-            phase + " · final drain",
-            "DRAIN" if drain["target_l1"] else "STORE",
-            (
-                f"FIXPIPE L0C → {target}{atomic}",
-                f"one completed [{drain['valid_rows']}×{drain['valid_cols']}] tile; "
-                f"{drain['tile_count']} drains over this region",
-            ),
-            tuple(sorted(live_l1)) + result_state,
-        )
+    init_l0 = _l0_summary(representative.get("l0_init"))
+    rolled_l0 = _l0_summary(representative.get("l0_rolled"))
+    l0_summary = f"L0 {init_l0}"
+    if rolled_l0 != init_l0:
+        l0_summary += f"; rolled {rolled_l0}"
+    request_label = (
+        f"MATMUL REQUEST {index} · Op {mm['op']}\n"
+        f"OUTPUT-TILE LOOP ×{drain['tile_count']} "
+        f"({mm['output_grid'][0]}×{mm['output_grid'][1]} grid)\n"
+        f"one iteration shown: C [{representative['shape'][0]}×{representative['shape'][1]}] · "
+        f"variants {variant_text}\n"
+        f"{l0_summary}"
     )
-    if drain["target_l1"]:
-        live_l1.add(f"L1 result: instance {index}")
-
-    released = []
-    for producer, use in last_dependency_use.items():
-        if use == index:
-            value = f"L1 result: instance {producer}"
-            if value in live_l1:
-                live_l1.remove(value)
-                released.append(value)
-    panel_names = [name for name in live_l1 if "panel" in name]
-    for name in panel_names:
-        live_l1.remove(name)
-        released.append(name)
-    if released:
-        events.append(
-            AlgorithmEvent(
-                phase,
-                "RELEASE",
-                tuple(f"release {name} after its priced last use" for name in released),
-                tuple(sorted(live_l1)),
-            )
-        )
-
-
-def _cube_events(plan: JsonObject) -> list[AlgorithmEvent]:
-    events: list[AlgorithmEvent] = []
-    seed = plan.get("seed", {})
-    if seed.get("present"):
-        events.append(
-            AlgorithmEvent(
-                "split-K prologue",
-                "STORE",
+    prefix = f"R{index}"
+    input_node = f"{prefix}_Input"
+    lines.extend(
+        [
+            f"    subgraph cluster_{prefix} {{",
+            f'        label="{_dot_escape(request_label)}";',
+            '        labelloc="t";',
+            '        labeljust="l";',
+            '        color="#b9a8dc";',
+            '        bgcolor="#fcfbff";',
+            '        style="rounded";',
+            "        penwidth=1.3;",
+            '        fontname="Helvetica,Arial,sans-serif";',
+            "        fontsize=11;",
+            _flow_node(
+                input_node,
                 (
-                    f"seed {seed['work_units']} spatial regions with zero",
-                    f"non-atomic store [{seed['valid_rows']}×{seed['valid_cols']}]",
+                    "K-slice tiles for this C tile\n"
+                    f"{_cube_operand_source(mm, 'lhs', index, last_use)}\n"
+                    f"{_cube_operand_source(mm, 'rhs', index, last_use)}\n"
+                    f"Aₖ [{representative['shape'][0]}×{chunk}]  +  "
+                    f"Bₖ [{chunk}×{representative['shape'][1]}]"
                 ),
-                (),
+                "#d9ecff",
+            ),
+        ]
+    )
+
+    stages: list[tuple[str, str, str, str, str | None]] = []
+    if stage_two:
+        stages.append(
+            (
+                f"{prefix}_Fill",
+                "K0 panels\nGM → L1 slot 0\nfill",
+                "#d9ecff",
+                "C tile in L0C\nempty",
+                None,
+            )
+        )
+        stages.append(
+            (
+                f"{prefix}_First",
+                "K0: L1 → L0 → Matrix\nK1: GM → L1 slot 1\noverlap",
+                "#e2d5ff",
+                "C tile in L0C\nΣ K0",
+                "TMATMUL",
+            )
+        )
+        if steady:
+            stages.append(
+                (
+                    f"{prefix}_Steady",
+                    f"Kᵢ: L1 → L0 → Matrix\nKᵢ₊₁: GM → alternate L1\nrepeat ×{steady}",
+                    "#e2d5ff",
+                    f"C tile in L0C\nΣ K0…K{full_chunks - 2}",
+                    f"TMATMUL_ACC ×{steady}",
+                )
+            )
+        stages.append(
+            (
+                f"{prefix}_Drain",
+                f"K{full_chunks - 1}: L1 → L0 → Matrix\nno next prefetch\ndrain",
+                "#dcf5df",
+                f"C tile in L0C\nΣ K0…K{full_chunks - 1} · complete",
+                "TMATMUL_ACC",
+            )
+        )
+    else:
+        remaining = max(0, full_chunks - 1)
+        stages.append(
+            (
+                f"{prefix}_Load0",
+                "K0 panels\nGM → L1\nfeed",
+                "#d9ecff",
+                "C tile in L0C\nempty",
+                None,
+            )
+        )
+        stages.append(
+            (
+                f"{prefix}_Work0",
+                "K0 → L0 / Matrix\nafter feed completes",
+                "#dcf5df",
+                "C tile in L0C\nΣ K0",
+                "TMATMUL",
+            )
+        )
+        if remaining:
+            stages.append(
+                (
+                    f"{prefix}_Serial",
+                    f"K1…K{full_chunks - 1}\nfeed, then Matrix\nserial ×{remaining}",
+                    "#dcf5df",
+                    f"C tile in L0C\nΣ K0…K{full_chunks - 1} · complete",
+                    f"TMATMUL_ACC ×{remaining}",
+                )
+            )
+
+    if k_loop.get("tail", 0):
+        stages.append(
+            (
+                f"{prefix}_Tail",
+                f"ragged K tail {k_loop['tail']}\nGM → L1 → L0 / Matrix\nserial",
+                "#dcf5df",
+                "C tile in L0C\nfull K complete",
+                "TMATMUL_ACC tail",
             )
         )
 
-    matmuls = plan.get("matmuls", [])
-    last_dependency_use: dict[int, int] = {}
-    for index, mm in enumerate(matmuls):
-        for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)):
-            if producer >= 0:
-                last_dependency_use[producer] = index
-    live_l1: set[str] = set()
-    for index, mm in enumerate(matmuls):
-        _append_cube_matmul_events(events, mm, index, last_dependency_use, live_l1)
-    return events
+    pipeline_nodes = [stage[0] for stage in stages]
+    accumulator_nodes = [f"{stage[0]}_C" for stage in stages]
+    for node_id, label, fillcolor, accumulator, operation in stages:
+        lines.append(_flow_node(node_id, label, fillcolor))
+        lines.append(_flow_node(f"{node_id}_C", accumulator, "#fff1bf", penwidth=1.5))
+        if operation is not None:
+            lines.append(
+                f'        {node_id}:s -> {node_id}_C:n [style=dashed, color="#7aa874", '
+                f'xlabel="{_dot_escape(operation)}", fontsize=8];'
+            )
+    lines.append(f"        {{ rank=same; {'; '.join(pipeline_nodes)}; }}")
+    lines.append(f"        {{ rank=same; {'; '.join(accumulator_nodes)}; }}")
+    lines.append(f"        {{ rank=same; {input_node}; {'; '.join(pipeline_nodes)}; }}")
+    lines.append(f"        {input_node}:e -> {pipeline_nodes[0]}:w;")
+    for lhs, rhs in zip(pipeline_nodes, pipeline_nodes[1:]):
+        lines.append(f"        {lhs}:e -> {rhs}:w;")
+    for lhs, rhs in zip(accumulator_nodes, accumulator_nodes[1:]):
+        lines.append(f'        {lhs}:e -> {rhs}:w [color="#b99100", penwidth=2.2];')
+
+    result_node = f"{prefix}_Result"
+    result_label = (
+        f"FIXPIPE\nC tile → {target}{atomic}\nonce per output tile\n"
+        f"[{drain['valid_rows']}×{drain['valid_cols']}]"
+    )
+    lines.append(_flow_node(result_node, result_label, "#ffd8c2", penwidth=1.5))
+    lines.append(f'        {accumulator_nodes[-1]}:s -> {result_node}:n [color="#b99100", penwidth=2.2];')
+    lines.append("    }")
+
+    producers = sorted(
+        {producer for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)) if producer >= 0}
+    )
+    for producer in producers:
+        lines.append(
+            f'    {result_nodes[producer]}:s -> {input_node}:w [color="#8f6bc3", penwidth=1.5, minlen=2];'
+        )
+    return input_node, result_node
 
 
 def _algorithm_title(problem: JsonObject, solution: JsonObject, step: int, plan: JsonObject) -> str:
@@ -833,6 +896,50 @@ def _algorithm_title(problem: JsonObject, solution: JsonObject, step: int, plan:
             f"one diagrammed region · L1 peak {plan['peak_l1_bytes']} B"
         )
     return summary + "\n" + detail
+
+
+def _build_cube_algorithm_dot(
+    problem: JsonObject,
+    solution: JsonObject,
+    step: int,
+    plan: JsonObject,
+) -> str:
+    """Build a tile-centric flow for one cube work unit."""
+    lines = _graph_prelude("CubeKernelSchedule", "TB")
+    lines.append("    graph [compound=true];")
+    title = _algorithm_title(problem, solution, step, plan)
+    color = KERNEL_COLORS[step % len(KERNEL_COLORS)]
+    lines.append(
+        f'    Title [label="{_dot_escape(title)}", shape=box, style="rounded,filled", '
+        f'fillcolor="{color}", penwidth=1.6, margin=0.2];'
+    )
+    previous = "Title"
+    seed = plan.get("seed", {})
+    if seed.get("present"):
+        seed_label = (
+            "separate AIV split-K seed\n"
+            f"{seed['work_units']} UB-safe zero stores\n"
+            "not part of the cube tile pipeline"
+        )
+        lines.append(_flow_node("Seed", seed_label, "#ffd8c2", penwidth=1.4))
+        lines.append("    Title:s -> Seed:n;")
+        previous = "Seed"
+
+    last_use = _cube_last_uses(plan)
+    result_nodes: dict[int, str] = {}
+    for index, mm in enumerate(plan.get("matmuls", [])):
+        input_node, result_node = _append_cube_request_flow(lines, mm, index, last_use, result_nodes)
+        producers = {
+            producer for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)) if producer >= 0
+        }
+        if index == 0:
+            lines.append(f"    {previous}:s -> {input_node}:w [minlen=2];")
+        elif index - 1 not in producers:
+            lines.append(f"    {previous}:s -> {input_node}:n [style=invis, weight=8];")
+        result_nodes[index] = result_node
+        previous = result_node
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def _event_label(event: AlgorithmEvent, index: int) -> str:
@@ -867,8 +974,7 @@ def build_algorithm_dot(problem: JsonObject, solution: JsonObject, step: int) ->
         plan = vector_plan
         events = _vector_events(problem, solution, step, plan)
     elif cube_plan is not None:
-        plan = cube_plan
-        events = _cube_events(plan)
+        return _build_cube_algorithm_dot(problem, solution, step, cube_plan)
     else:
         raise ValueError(
             f"kernel {step} has no vector or cube schedule descriptor; regenerate the solution "
