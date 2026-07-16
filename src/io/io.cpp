@@ -78,6 +78,19 @@ static json vector_loop_json(const VectorLoopPlan& loop) {
             {"pipeline_stages", loop.pipeline_stages}};
 }
 
+static json vector_serial_phase_json(const VectorSerialPhasePlan& phase) {
+    return {{"present", phase.present},
+            {"chunk_index", phase.chunk_index},
+            {"extent", phase.extent}};
+}
+
+static json axis_partition_json(const AxisPartition& partition) {
+    return {{"big", partition.big},
+            {"small", partition.small},
+            {"num_big", partition.num_big},
+            {"parts", partition.parts}};
+}
+
 static const char* vector_primitive_name(VectorPrimitiveKind kind) {
     switch (kind) {
         case VectorPrimitiveKind::Add: return "add";
@@ -558,7 +571,7 @@ Problem read_problem(const std::string& filename) {
     return p;
 }
 
-void write_solution(const std::string& filename, const Solution& sol) {
+std::string solution_json(const Solution& sol) {
     json j;
     j["subgraphs"]         = json::array();
     j["granularities"]     = json::array();
@@ -642,24 +655,41 @@ void write_solution(const std::string& filename, const Solution& sol) {
             const VectorStreamPlan& plan = vector_plan;
             j["vector_stream"].push_back(
                 {{"kind", vector_stream_kind_name(plan.kind)},
+                 {"work_units", plan.work_units},
+                 {"m_partition", axis_partition_json(plan.m_partition)},
+                 {"n_partition", axis_partition_json(plan.n_partition)},
                  {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
                  {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
                  {"stream_band_count", plan.stream_band_count},
                  {"axis", plan.axis},
                  {"free_tile", plan.free_tile},
+                 {"free_tile_alloc", plan.free_tile_alloc},
                  {"extent", plan.extent},
                  {"chunk", plan.chunk},
                  {"full_chunks", plan.full_chunks},
                  {"tail", plan.tail},
                  {"stream_passes", plan.stream_passes},
+                 {"tile", {plan.tile_h, plan.tile_w}},
+                 {"strip", {plan.strip_h, plan.strip_w}},
+                 {"strip_grid", {plan.row_strips, plan.width_strips}},
                  {"overlap_granted", plan.overlap_granted},
                  {"reduction_split",
                   {{"kind", vector_reduction_split_kind_name(plan.reduction_split_kind)},
                    {"factor", plan.reduction_split_factor},
-                   {"partial_extent", plan.reduction_partial_extent}}},
+                   {"partial_extent", plan.reduction_partial_extent},
+                   {"seed",
+                    {{"present", plan.reduction_seed.present},
+                     {"work_units", plan.reduction_seed.work_units},
+                     {"valid_rows", plan.reduction_seed.valid_rows},
+                     {"valid_cols", plan.reduction_seed.valid_cols}}}}},
                  {"body", vector_loop_json(plan.body)},
                  {"stats", vector_loop_json(plan.stats)},
                  {"apply", vector_loop_json(plan.apply)},
+                 {"serial_phases",
+                  {{"stats_init", vector_serial_phase_json(plan.stats_init)},
+                   {"stats_tail", vector_serial_phase_json(plan.stats_tail)},
+                   {"apply_tail", vector_serial_phase_json(plan.apply_tail)},
+                   {"finalize", vector_serial_phase_json(plan.finalize)}}},
                  {"p4_work",
                   {{"generated", plan.p4_work.generated},
                    {"stats_init", vector_phase_work_json(plan.p4_work.stats_init)},
@@ -793,12 +823,16 @@ void write_solution(const std::string& filename, const Solution& sol) {
         j["subgraph_latencies"].push_back(sol.step_latency(i));
     }
 
+    return j.dump(2) + "\n";
+}
+
+void write_solution(const std::string& filename, const Solution& sol) {
     std::ofstream f(filename);
     if (!f.is_open()) {
         std::cerr << "Error: cannot write '" << filename << "'\n";
         std::exit(1);
     }
-    f << j.dump(2) << "\n";
+    f << solution_json(sol);
     if (!f) {
         std::cerr << "Error: write failed for '" << filename << "'\n";
         std::exit(1);

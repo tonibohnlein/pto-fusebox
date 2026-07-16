@@ -6,7 +6,9 @@
 #   ./scripts/render_fusion_dag.sh benchmarks/910b-2mm-chained.json
 #   ./scripts/render_fusion_dag.sh benchmarks/910b-2mm-accumulate.json
 #
-# Output: fusion_dag/<name>.dot, fusion_dag/<name>.png (+ <name>_sol.json).
+# Output: fusion_dag/<name>.dot/.png for the colored partition, one
+# <name>-kernel-<N>.dot/.png algorithm timeline per homogeneous kernel, and
+# <name>_sol.json.
 # The 910B parallel model activates when the instance JSON carries the optional
 # num_cube_cores / num_vector_cores / cube_capacity fields (else single-context).
 
@@ -28,4 +30,9 @@ mkdir -p "$OUT"
 "$SOLVER" "$INSTANCE" "$OUT/${NAME}_sol.json" | tail -3
 python3 "$ROOT/scripts/visualize.py" solution "$INSTANCE" "$OUT/${NAME}_sol.json" "$OUT/${NAME}.dot"
 dot -Tpng "$OUT/${NAME}.dot" -o "$OUT/${NAME}.png"
-echo "Rendered $OUT/${NAME}.png"
+python3 "$ROOT/scripts/visualize.py" algorithms "$INSTANCE" "$OUT/${NAME}_sol.json" "$OUT/${NAME}"
+for kernel_dot in "$OUT/${NAME}"-kernel-*.dot; do
+    [[ -e "$kernel_dot" ]] || continue
+    dot -Tpng "$kernel_dot" -o "${kernel_dot%.dot}.png"
+done
+echo "Rendered $OUT/${NAME}.png and per-kernel algorithm diagrams"
