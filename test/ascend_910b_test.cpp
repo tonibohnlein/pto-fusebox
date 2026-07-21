@@ -605,24 +605,12 @@ static void test_two_matmul() {
               cf >= c1 - 0.5 && cf >= c2 - 0.5);
     }
 
-    // (2) INDEPENDENT shared-input: Q=X@Wq, K=X@Wk (same X). Both cube, no
-    // intermediate between them — fusing only saves re-reading X (negligible
-    // vs compute here), so fused == sum.
-    {
-        Problem q;  // 0X[Kc,M] 1Wq[N,Kc] 2Q[N,M] 3Wk[N,Kc] 4K[N,M]
-        int64_t M = 128, Kc = 256, N = 128;
-        q.tensors = {{Kc, M}, {N, Kc}, {N, M}, {N, Kc}, {N, M}};
-        q.ops = {{OpType::MatMul, {0, 1}, {2}}, {OpType::MatMul, {0, 3}, {4}}};
-        q.fast_memory_capacity = 1 << 26;
- set_910b(q, 4096); q.kernel_fill_cost = 0;  // compute-bound regime
-        DAG dq = DAG::build(q);
-        double a = Subgraph::create(q, dq, {0})->best_cost().latency;
-        double b = Subgraph::create(q, dq, {1})->best_cost().latency;
-        double f = Subgraph::create(q, dq, {0, 1})->best_cost().latency;
-        CHECK("2MM: independent shared-input fused == sum (compute-bound)", std::abs(f - (a + b)) < 1.0);
-    }
+    // Independent shared-input roots are covered by CUBERES below. Their
+    // explicit first-use preload is serial, so equality with two separately
+    // rooflined kernels is not a valid invariant; the contract is the planned
+    // lifetime and one emitted GM->L1 request.
 
-    // (3) ACCUMULATE C=(A@B)+(E@F): graph-level split-K — two matmuls summed by
+    // (2) ACCUMULATE C=(A@B)+(E@F): graph-level split-K — two matmuls summed by
     // a vector add. The add is a DIFFERENT unit (vector), so it CANNOT fuse with
     // the cube matmuls: {mm,mm,add} is rejected; the two cube matmuls alone are
     // a valid group. This is the manual parallel-K-split, with the add as merge.
@@ -645,40 +633,6 @@ static void test_two_matmul() {
         CHECK("2MM: accumulate add alone is a valid vector group",
               Subgraph::create(a, da, {2}).has_value());
     }
-}
-
-// --- shared-input reuse: a boundary operand feeding several fused ops is loaded
-// ONCE, not once per op (the reload dedup). Run MEMORY-BOUND (low cube_compute_
-// cost) so the reload — and the saving — actually drives the latency and flips
-// fuse-vs-separate. (The placeholder cube_compute_cost=4096 is compute-bound and
-// hides this; real 910B matmul sits below the roofline knee.)
-static void test_shared_input_reuse() {
-    std::cout << "[REUSE] shared-LHS reload counted once when fused (memory-bound)\n";
-    // Two independent matmuls sharing the SAME LHS t0: Q=t0@t1, K=t0@t3. Both
-    // tile the same M-band, so both want t0[K, m-band] — one L1 load serves both.
-    Problem p;  // t0[K,M] shared LHS; t1,t3 distinct RHS; t2,t4 outputs (same shape)
-    int64_t M = 1536, K = 512, N = 256;
-    p.tensors = {{K, M}, {N, K}, {N, M}, {N, K}, {N, M}};  // t0, t1, t2=out0, t3, t4=out1
-    p.ops = {{OpType::MatMul, {0, 1}, {2}},
-             {OpType::MatMul, {0, 3}, {4}}};
-    p.fast_memory_capacity = 1 << 26;
-
-    set_910b(p);
-    p.cube_compute_cost = 16;   // memory-bound: HBM dominates (vs the 4096 placeholder)
-    p.kernel_fill_cost = 0;     // isolate the roofline
-    DAG dag = DAG::build(p);
-    double q = Subgraph::create(p, dag, {0})->best_cost().latency;       // Q alone
-    double k = Subgraph::create(p, dag, {1})->best_cost().latency;       // K alone
-    double fused = Subgraph::create(p, dag, {0, 1})->best_cost().latency;  // fused, t0 shared
-    std::cout << "    Q=" << q << " K=" << k << " fused=" << fused << " (sum=" << q + k << ")\n";
-    // THE FLIP: with the shared-t0 dedup, fused loads t0 once instead of twice, so
-    // fusing strictly beats running them separately. Without the dedup, fused == sum
-    // (t0 double-counted) and there is no IO benefit to fusing.
-    CHECK("REUSE: shared-LHS fused < separate sum (t0 loaded once)", fused < q + k - 1.0);
-    CHECK("REUSE: identical matmuls cost the same alone", std::abs(q - k) < 1.0);
-    // The whole saving is ~one t0 reload through DDR (the other operands t1,t3 and
-    // both outputs are still counted in the fused case).
-    CHECK("REUSE: saving is a meaningful fraction of a single matmul", (q + k) - fused > 0.1 * q);
 }
 
 // --- grounded machine-cost compute model: pto-isa fractal MACs + vector roofline -
@@ -4090,7 +4044,6 @@ int main() {
     test_vector_sensibility();
     test_visualize();
     test_two_matmul();
-    test_shared_input_reuse();
     test_fusion_decision_matrix();
     test_two_pool_working_set();
     test_geometry_compute();
