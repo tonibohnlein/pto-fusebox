@@ -9,6 +9,7 @@
 #include <set>
 #include <tuple>
 
+#include "core/pebbling_order.h"
 #include "core/subgraph_structure.h"
 #include "core/types.h"
 
@@ -539,11 +540,13 @@ CubeMatmulPhaseCost CostCubeMatmulPhases(const Problem* p, const ByteCost& bc,
       mm.k_loop.full_chunks >= 2 ? mm.k_loop.chunk : mm.effective_contraction;
   auto feed_cycles = [&](const CubeOutputTileVariant& variant, int64_t k_extent) {
     double bytes = 0.0;
-    if (!mm.lhs_ephemeral && !retained.lhs) {
+    if (!mm.lhs_ephemeral && mm.lhs_resident_boundary < 0 &&
+        !retained.lhs) {
       bytes += static_cast<double>(
           variant.height * k_extent * dtype_bytes(p->tensors[mm.lhs.tensor].dtype));
     }
-    if (!mm.rhs_ephemeral && !retained.rhs) {
+    if (!mm.rhs_ephemeral && mm.rhs_resident_boundary < 0 &&
+        !retained.rhs) {
       bytes += static_cast<double>(
           k_extent * variant.width * dtype_bytes(p->tensors[mm.rhs.tensor].dtype));
     }
@@ -555,8 +558,8 @@ CubeMatmulPhaseCost CostCubeMatmulPhases(const Problem* p, const ByteCost& bc,
   const L0OutputTarget drain_target =
       mm.final_drain.target_l1 ? L0OutputTarget::L1 : L0OutputTarget::GM;
   const bool streams_boundary =
-      (!mm.lhs_ephemeral && !retained.lhs) ||
-      (!mm.rhs_ephemeral && !retained.rhs);
+      (!mm.lhs_ephemeral && mm.lhs_resident_boundary < 0 && !retained.lhs) ||
+      (!mm.rhs_ephemeral && mm.rhs_resident_boundary < 0 && !retained.rhs);
   const int pipeline_stages =
       streams_boundary ? mm.k_loop.pipeline_stages : 1;
   for (const CubeOutputTileVariant& variant : mm.output_variants) {
@@ -1640,53 +1643,17 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     gen_grid(C, maxP, maxQ, s_vals);
   }
 
-  // Depth-first topological execution order (the fixed pebbling order). Post-
-  // order DFS from each sink over in-subgraph producers: an op is emitted only
-  // after all its producers, and a branch is finished before its sibling
-  // starts — minimizing simultaneously-live intermediate bands. Deterministic:
-  // sinks and producers are visited in topological-position order so the same
-  // subgraph always yields the same order (required for the cost cache).
-  {
-    auto by_topo = [&](size_t a, size_t b) {
-      return dag.topo_position(a) < dag.topo_position(b);
-    };
-    auto sg_producers = [&](size_t op) {
-      std::vector<size_t> preds;
-      for (auto t : prob.ops[op].inputs) {
-        int p = dag.tensor_producer[t];
-        if (p >= 0 && is_in_sg[(size_t)p]) preds.push_back((size_t)p);
-      }
-      std::sort(preds.begin(), preds.end(), by_topo);
-      preds.erase(std::unique(preds.begin(), preds.end()), preds.end());
-      return preds;
-    };
-    std::vector<size_t> sinks;
-    for (auto i : sg.ops_)
-      if (sg.is_sink_op_vec_[i]) sinks.push_back(i);
-    std::sort(sinks.begin(), sinks.end(), by_topo);
-
-    std::vector<bool> visited(num_ops, false);
-    std::vector<std::pair<size_t, bool>> stack;  // (op, expanded?)
-    for (auto root : sinks) {
-      if (visited[root]) continue;
-      stack.push_back({root, false});
-      while (!stack.empty()) {
-        auto [op, expanded] = stack.back();
-        stack.pop_back();
-        if (expanded) {  // all producers already emitted
-          sg.dfs_order_.push_back(op);
-          continue;
-        }
-        if (visited[op]) continue;
-        visited[op] = true;
-        stack.push_back({op, true});  // emit after producers
-        auto preds = sg_producers(op);
-        // Push in reverse so the smallest-topo producer is processed first.
-        for (auto it = preds.rbegin(); it != preds.rend(); ++it)
-          if (!visited[*it]) stack.push_back({*it, false});
-      }
-    }
+  // The cost layer refines the structural roots after epilogue detection, but
+  // delegates the actual deterministic ordering policy to the common
+  // pebbling-order interface.
+  std::vector<size_t> pebbling_roots;
+  for (size_t op : sg.ops_) {
+    if (sg.is_sink_op_vec_[op]) pebbling_roots.push_back(op);
   }
+  const PebblingOrderGraph pebbling_graph =
+      BuildSourceOpPebblingGraph(prob, dag, sg.ops_, pebbling_roots);
+  sg.dfs_order_ = ComputePebblingOrder(PebblingOrderKind::DfsPostOrder,
+                                       pebbling_graph);
 
   // Build the pure-cube recursive request DAG once. The sink owns SpatialM x
   // SpatialN. A matmul output request O[rows, cols] induces A[rows, K] and
@@ -1751,6 +1718,111 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     for (size_t sink : cube_sinks) {
       const int64_t root = request_tensor(request_tensor, prob.ops[sink].output(), B::SpatialM, B::SpatialN);
       if (root >= 0) sg.cube_request_roots_.push_back(static_cast<size_t>(root));
+    }
+
+    // Route the role-expanded request DAG through the same ordering interface
+    // as vector/source operations. DFS is deliberately the only policy today;
+    // reuse-distance and Gorder-inspired ready-node strategies can now be added
+    // without changing request construction, liveness, or emission.
+    PebblingOrderGraph request_graph;
+    request_graph.roots = sg.cube_request_roots_;
+    request_graph.nodes.reserve(sg.cube_request_nodes_.size());
+    for (size_t request_id = 0; request_id < sg.cube_request_nodes_.size();
+         ++request_id) {
+      const CubeRequestNode& request = sg.cube_request_nodes_[request_id];
+      PebblingOrderNode node;
+      node.id = request_id;
+      node.stable_position = dag.topo_position(request.op);
+      if (request.lhs_producer >= 0) {
+        node.predecessors.push_back(
+            static_cast<size_t>(request.lhs_producer));
+      }
+      if (request.rhs_producer >= 0) {
+        node.predecessors.push_back(
+            static_cast<size_t>(request.rhs_producer));
+      }
+      request_graph.nodes.push_back(std::move(node));
+    }
+    const std::vector<size_t> request_order = ComputePebblingOrder(
+        PebblingOrderKind::DfsPostOrder, request_graph);
+    if (request_order.size() != sg.cube_request_nodes_.size()) {
+      return std::nullopt;
+    }
+    std::vector<size_t> new_index(request_order.size(), 0);
+    for (size_t step = 0; step < request_order.size(); ++step) {
+      new_index[request_order[step]] = step;
+    }
+    std::vector<CubeRequestNode> ordered_requests;
+    ordered_requests.reserve(request_order.size());
+    for (size_t old_id : request_order) {
+      CubeRequestNode node = sg.cube_request_nodes_[old_id];
+      if (node.lhs_producer >= 0) {
+        node.lhs_producer = static_cast<int64_t>(
+            new_index[static_cast<size_t>(node.lhs_producer)]);
+      }
+      if (node.rhs_producer >= 0) {
+        node.rhs_producer = static_cast<int64_t>(
+            new_index[static_cast<size_t>(node.rhs_producer)]);
+      }
+      ordered_requests.push_back(std::move(node));
+    }
+    for (size_t& root : sg.cube_request_roots_) root = new_index[root];
+    if (sg.cube_sink_request_node_ >= 0) {
+      sg.cube_sink_request_node_ = static_cast<int64_t>(
+          new_index[static_cast<size_t>(sg.cube_sink_request_node_)]);
+    }
+    sg.cube_request_nodes_ = std::move(ordered_requests);
+
+    // Canonicalize external requests after the recursive request DAG is
+    // complete. Equal value ids mean equal tensor region and compatible Mat
+    // representation. Port is load-bearing: A used as both sides of A@A is two
+    // values because the LHS/RHS layouts and downstream pools differ.
+    using BoundaryKey = std::tuple<size_t, int, int, int>;
+    std::map<BoundaryKey, size_t> boundary_ids;
+    std::vector<PebblingValueEvent> boundary_events;
+    auto bind_boundary = [&](CubeRequest& request, CubeOperandRole role,
+                             size_t step, int64_t& value_slot) {
+      const BoundaryKey key{request.tensor,
+                            static_cast<int>(request.height_binding),
+                            static_cast<int>(request.width_binding),
+                            static_cast<int>(role)};
+      auto [it, inserted] =
+          boundary_ids.emplace(key, sg.cube_boundary_values_.size());
+      if (inserted) {
+        CubeBoundaryValue value;
+        value.request = request;
+        value.role = role;
+        sg.cube_boundary_values_.push_back(value);
+      }
+      value_slot = static_cast<int64_t>(it->second);
+      boundary_events.push_back(
+          {it->second, step, PebblingValueEventKind::Use});
+    };
+    for (size_t step = 0; step < sg.cube_request_nodes_.size(); ++step) {
+      CubeRequestNode& node = sg.cube_request_nodes_[step];
+      if (node.lhs_producer < 0) {
+        bind_boundary(node.lhs, CubeOperandRole::Lhs, step,
+                      node.lhs_boundary_value);
+      }
+      if (node.rhs_producer < 0) {
+        bind_boundary(node.rhs, CubeOperandRole::Rhs, step,
+                      node.rhs_boundary_value);
+      }
+    }
+    const PebblingValueLifetimePlan boundary_lifetimes =
+        ComputeAlwaysRetainedValueLifetimes(sg.cube_request_nodes_.size(),
+                                             boundary_events);
+    if (!boundary_lifetimes.valid) return std::nullopt;
+    for (const PebblingValueLifetime& lifetime :
+         boundary_lifetimes.lifetimes) {
+      if (lifetime.value_id >= sg.cube_boundary_values_.size()) {
+        return std::nullopt;
+      }
+      CubeBoundaryValue& value =
+          sg.cube_boundary_values_[lifetime.value_id];
+      value.first_use = lifetime.first_live_step;
+      value.last_use = lifetime.last_use_step;
+      value.use_count = lifetime.use_count;
     }
   }
 
@@ -2397,6 +2469,27 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
       const size_t after_last = static_cast<size_t>(last_use[producer]) + 1;
       if (after_last < band_delta.size()) band_delta[after_last] -= bytes;
     }
+    // Repeated boundary requests participate in the same pebbling sweep as
+    // produced intermediates. The initial policy always loads the complete
+    // canonical region at first use and retains it through last use; a
+    // single-use request remains a streamed transient below.
+    for (const CubeBoundaryValue& value : cube_boundary_values_) {
+      if (!value.resident()) continue;
+      const Tensor& tensor = prob_->tensors[value.request.tensor];
+      const int64_t h = cube_binding_extent(
+          value.request.height_binding, tensor.height, m_extent, n_extent,
+          split);
+      const int64_t w = cube_binding_extent(
+          value.request.width_binding, tensor.width, m_extent, n_extent,
+          split);
+      if (h <= 0 || w <= 0 || value.last_use >= node_count) {
+        return INT64_MAX;
+      }
+      const int64_t bytes = h * w * dtype_bytes(tensor.dtype);
+      band_delta[value.first_use] += bytes;
+      const size_t after_last = value.last_use + 1;
+      if (after_last < band_delta.size()) band_delta[after_last] -= bytes;
+    }
     std::vector<int64_t> band_at(node_count, 0);
     int64_t live_bytes = 0;
     for (size_t step = 0; step < node_count; ++step) {
@@ -2423,8 +2516,24 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
           cube_binding_extent(node.output.width_binding, output.width, m_extent, n_extent, split);
       if (h <= 0 || w <= 0) return INT64_MAX;
       const int64_t K_eff = node.parallel_sink ? sink_K_eff : op_K(node.op);
-      const int64_t lhs_b = node.lhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.lhs.tensor].dtype);
-      const int64_t rhs_b = node.rhs_producer >= 0 ? 0 : dtype_bytes(prob_->tensors[node.rhs.tensor].dtype);
+      const bool lhs_resident =
+          node.lhs_boundary_value >= 0 &&
+          cube_boundary_values_[static_cast<size_t>(
+              node.lhs_boundary_value)]
+              .resident();
+      const bool rhs_resident =
+          node.rhs_boundary_value >= 0 &&
+          cube_boundary_values_[static_cast<size_t>(
+              node.rhs_boundary_value)]
+              .resident();
+      const int64_t lhs_b =
+          node.lhs_producer >= 0 || lhs_resident
+              ? 0
+              : dtype_bytes(prob_->tensors[node.lhs.tensor].dtype);
+      const int64_t rhs_b =
+          node.rhs_producer >= 0 || rhs_resident
+              ? 0
+              : dtype_bytes(prob_->tensors[node.rhs.tensor].dtype);
       const int64_t per_unit = lhs_b * h + rhs_b * w;
       // Output/L0C subtiles are outer to the K-window loop, so the running C
       // never leaves L0C and consumes no L1 band. A2/A3 has no Mat->Acc path;
@@ -2684,6 +2793,30 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     return region;
   };
 
+  std::vector<int64_t> resident_plan_index(cube_boundary_values_.size(), -1);
+  for (size_t value_id = 0; value_id < cube_boundary_values_.size();
+       ++value_id) {
+    const CubeBoundaryValue& value = cube_boundary_values_[value_id];
+    if (!value.resident()) continue;
+    CubeResidentBoundaryPlan resident;
+    resident.id = value_id;
+    resident.region = concrete_region(value.request);
+    resident.role = value.role;
+    resident.first_use = value.first_use;
+    resident.last_use = value.last_use;
+    resident.use_count = value.use_count;
+    resident.bytes =
+        resident.region.height * resident.region.width *
+        dtype_bytes(prob_->tensors[resident.region.tensor].dtype);
+    if (resident.region.height <= 0 || resident.region.width <= 0 ||
+        resident.bytes <= 0) {
+      return CubeSchedulePlan{};
+    }
+    resident_plan_index[value_id] =
+        static_cast<int64_t>(plan.resident_boundaries.size());
+    plan.resident_boundaries.push_back(resident);
+  }
+
   for (size_t node_idx = 0; node_idx < cube_request_nodes_.size(); ++node_idx) {
     const CubeRequestNode& node = cube_request_nodes_[node_idx];
     const Op& op = prob_->ops[node.op];
@@ -2693,6 +2826,14 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     mm.op = node.op;
     mm.lhs_producer = node.lhs_producer;
     mm.rhs_producer = node.rhs_producer;
+    if (node.lhs_boundary_value >= 0) {
+      mm.lhs_resident_boundary = resident_plan_index[static_cast<size_t>(
+          node.lhs_boundary_value)];
+    }
+    if (node.rhs_boundary_value >= 0) {
+      mm.rhs_resident_boundary = resident_plan_index[static_cast<size_t>(
+          node.rhs_boundary_value)];
+    }
     mm.is_sink = roots.count(node_idx) != 0;
     mm.lhs_ephemeral = node.lhs_producer >= 0;
     mm.rhs_ephemeral = node.rhs_producer >= 0;
@@ -2845,8 +2986,12 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     // retained preload is a serial phase; it is not allowed to borrow the
     // K-window roofline's overlap.
     if (prob_->use_hierarchical_cube_cost && plan.emit_compatible) {
-      const bool can_retain_lhs = !mm.lhs_ephemeral && mm.output_tiles_n > 1;
-      const bool can_retain_rhs = !mm.rhs_ephemeral && mm.output_tiles_m > 1;
+      const bool can_retain_lhs = !mm.lhs_ephemeral &&
+                                  mm.lhs_resident_boundary < 0 &&
+                                  mm.output_tiles_n > 1;
+      const bool can_retain_rhs = !mm.rhs_ephemeral &&
+                                  mm.rhs_resident_boundary < 0 &&
+                                  mm.output_tiles_m > 1;
       const int64_t lhs_full_bytes =
           can_retain_lhs
               ? mm.lhs.height * mm.lhs.width *
@@ -2860,12 +3005,12 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
       const int64_t live_bytes =
           node_idx < pernode_live_bytes.size() ? pernode_live_bytes[node_idx] : 0;
       const int64_t lhs_window_bytes =
-          !mm.lhs_ephemeral
+          !mm.lhs_ephemeral && mm.lhs_resident_boundary < 0
               ? mm.output_tile_m * mm.k_loop.l1_window_k *
                     dtype_bytes(prob_->tensors[mm.lhs.tensor].dtype)
               : 0;
       const int64_t rhs_window_bytes =
-          !mm.rhs_ephemeral
+          !mm.rhs_ephemeral && mm.rhs_resident_boundary < 0
               ? mm.k_loop.l1_window_k * mm.output_tile_n *
                     dtype_bytes(prob_->tensors[mm.rhs.tensor].dtype)
               : 0;
@@ -2918,8 +3063,10 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
       }
       mm.retained_panels = best_retained;
       const bool streams_boundary =
-          (!mm.lhs_ephemeral && !mm.retained_panels.lhs) ||
-          (!mm.rhs_ephemeral && !mm.retained_panels.rhs);
+          (!mm.lhs_ephemeral && mm.lhs_resident_boundary < 0 &&
+           !mm.retained_panels.lhs) ||
+          (!mm.rhs_ephemeral && mm.rhs_resident_boundary < 0 &&
+           !mm.retained_panels.rhs);
       if (!streams_boundary) mm.k_loop.pipeline_stages = 1;
       plan.peak_l1_bytes = std::max(plan.peak_l1_bytes, best_peak);
     }
@@ -2931,8 +3078,10 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   bool all_streamed_boundaries_pipeline = true;
   for (const CubeMatmulSchedule& mm : plan.matmuls) {
     const bool streams_boundary =
-        (!mm.lhs_ephemeral && !mm.retained_panels.lhs) ||
-        (!mm.rhs_ephemeral && !mm.retained_panels.rhs);
+        (!mm.lhs_ephemeral && mm.lhs_resident_boundary < 0 &&
+         !mm.retained_panels.lhs) ||
+        (!mm.rhs_ephemeral && mm.rhs_resident_boundary < 0 &&
+         !mm.retained_panels.rhs);
     if (!streams_boundary) continue;
     has_streamed_boundary = true;
     all_streamed_boundaries_pipeline &=
@@ -3533,13 +3682,9 @@ double Ascend910BCost::cube_request_reload(const TileConfig& cfg, int64_t split,
     for (int ni = 0; ni < 2; ++ni) {
       const int64_t region_count = m_counts[mi] * n_counts[ni];
       if (region_count <= 0) continue;
-      std::set<std::tuple<size_t, int, int, int>> counted;
       double lhs_unit = 0.0;
       double rhs_unit = 0.0;
-      auto add_request = [&](const CubeRequest& request, int port, double& bytes) {
-        const auto key = std::make_tuple(request.tensor, port, static_cast<int>(request.height_binding),
-                                         static_cast<int>(request.width_binding));
-        if (!counted.insert(key).second) return;
+      auto add_request = [&](const CubeRequest& request, double& bytes) {
         const Tensor& tensor = prob_->tensors[request.tensor];
         const int64_t h =
             cube_binding_extent(request.height_binding, tensor.height, m_sizes[mi], n_sizes[ni], split);
@@ -3547,9 +3692,12 @@ double Ascend910BCost::cube_request_reload(const TileConfig& cfg, int64_t split,
             cube_binding_extent(request.width_binding, tensor.width, m_sizes[mi], n_sizes[ni], split);
         if (h > 0 && w > 0) bytes += static_cast<double>(h * w * dtype_bytes(tensor.dtype));
       };
-      for (const CubeRequestNode& node : cube_request_nodes_) {
-        if (node.lhs_producer < 0) add_request(node.lhs, 0, lhs_unit);
-        if (node.rhs_producer < 0) add_request(node.rhs, 1, rhs_unit);
+      for (const CubeBoundaryValue& value : cube_boundary_values_) {
+        if (value.role == CubeOperandRole::Lhs) {
+          add_request(value.request, lhs_unit);
+        } else {
+          add_request(value.request, rhs_unit);
+        }
       }
       const double copies = static_cast<double>(region_count * split);
       lhs_total += lhs_unit * copies;
@@ -3712,7 +3860,19 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         }
         for (size_t node_idx = 0; node_idx < cube_request_nodes_.size(); ++node_idx) {
           const CubeRequestNode& node = cube_request_nodes_[node_idx];
-          if (node.lhs_producer >= 0 && node.rhs_producer >= 0) continue;
+          const bool lhs_streams =
+              node.lhs_producer < 0 &&
+              !(node.lhs_boundary_value >= 0 &&
+                cube_boundary_values_[static_cast<size_t>(
+                    node.lhs_boundary_value)]
+                    .resident());
+          const bool rhs_streams =
+              node.rhs_producer < 0 &&
+              !(node.rhs_boundary_value >= 0 &&
+                cube_boundary_values_[static_cast<size_t>(
+                    node.rhs_boundary_value)]
+                    .resident());
+          if (!lhs_streams && !rhs_streams) continue;
           const int64_t extent = node.parallel_sink ? op_K(node.op) / split : op_K(node.op);
           int64_t window =
               node_idx < windows->size() && (*windows)[node_idx] > 0 ? (*windows)[node_idx] : extent;
@@ -3795,6 +3955,17 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
           double unit_compute = 0.0;
           double unit_ddr = 0.0;
           double unit_l1l0 = 0.0;
+          // Cross-request resident boundary values are loaded once per work
+          // unit before their first consumer. This serial prologue is separate
+          // from each matmul's K-window roofline; the latter sees only local
+          // L1 extracts from the resident panel.
+          for (const CubeResidentBoundaryPlan& resident :
+               schedule.resident_boundaries) {
+            const double preload = static_cast<double>(resident.bytes) *
+                                   bc.reload * gm_read_scale;
+            unit_wall += preload;
+            unit_ddr += preload;
+          }
           for (const CubeMatmulSchedule& mm : schedule.matmuls) {
             const CubeMatmulPhaseCost phases =
                 CostCubeMatmulPhases(prob_, bc, gm_read_scale, gm_write_scale, mm);

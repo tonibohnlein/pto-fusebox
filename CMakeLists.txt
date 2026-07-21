@@ -77,6 +77,7 @@ set(TEST_SOURCES
     test/ascend_910b_test.cpp
     # Cost-agnostic structural infra still used by the 910B solver.
     test/dag_test.cpp
+    test/pebbling_order_test.cpp
     test/pairing_heap_test.cpp
 )
 

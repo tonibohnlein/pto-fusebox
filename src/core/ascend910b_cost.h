@@ -324,7 +324,19 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
     CubeRequest rhs;
     int64_t lhs_producer = -1;
     int64_t rhs_producer = -1;
+    int64_t lhs_boundary_value = -1;
+    int64_t rhs_boundary_value = -1;
     bool parallel_sink = false;
+  };
+
+  struct CubeBoundaryValue {
+    CubeRequest request;
+    CubeOperandRole role = CubeOperandRole::Lhs;
+    size_t first_use = 0;
+    size_t last_use = 0;
+    size_t use_count = 0;
+
+    [[nodiscard]] bool resident() const { return first_use < last_use; }
   };
 
   [[nodiscard]] int64_t cube_binding_extent(CubeAxisBinding binding, int64_t full_extent, int64_t m_extent,
@@ -462,6 +474,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // CubeSchedulePlan reconstruction; it is built once per subgraph, not once
   // per enumerated TileConfig.
   std::vector<CubeRequestNode> cube_request_nodes_;
+  std::vector<CubeBoundaryValue> cube_boundary_values_;
   std::vector<size_t> cube_request_roots_;
   int64_t cube_sink_request_node_ = -1;
 

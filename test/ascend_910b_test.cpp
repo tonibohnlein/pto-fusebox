@@ -2036,6 +2036,133 @@ static void test_cube_schedule_fanout() {
   }
 }
 
+static void test_shared_boundary_pebbling() {
+  std::cout << "[CUBERES] boundary requests join the cube pebbling game\n";
+
+  // Two independent roots request exactly the same LHS Mat region. The model
+  // loads it at the first request, keeps it live through the second, and gives
+  // both matmul instances the same canonical resident-value id.
+  {
+    Problem p;
+    p.tensors = {{64, 64}, {64, 64}, {64, 64},
+                 {64, 64}, {64, 64}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}},
+             {OpType::MatMul, {0, 3}, {4}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    p.use_hierarchical_cube_cost = true;
+    p.require_uniform_cube_dag_grid = true;
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    CHECK("CUBERES/shared-lhs: subgraph creates", static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 32;
+      cfg.h = 32;
+      cfg.k = 64;
+      cfg.parts_m = 2;
+      cfg.parts_n = 2;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      CHECK("CUBERES/shared-lhs: fixed plan is feasible",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                plan.matmuls.size() == 2);
+      CHECK("CUBERES/shared-lhs: one region is resident first-to-last use",
+            plan.resident_boundaries.size() == 1 &&
+                plan.resident_boundaries[0].region.tensor == 0 &&
+                plan.resident_boundaries[0].role == CubeOperandRole::Lhs &&
+                plan.resident_boundaries[0].first_use == 0 &&
+                plan.resident_boundaries[0].last_use == 1 &&
+                plan.resident_boundaries[0].use_count == 2 &&
+                plan.resident_boundaries[0].bytes == 32LL * 64 * 4);
+      CHECK("CUBERES/shared-lhs: both consumers reference the resident value",
+            plan.matmuls.size() == 2 &&
+                plan.matmuls[0].lhs_resident_boundary == 0 &&
+                plan.matmuls[1].lhs_resident_boundary == 0 &&
+                plan.matmuls[0].rhs_resident_boundary < 0 &&
+                plan.matmuls[1].rhs_resident_boundary < 0);
+      CHECK("CUBERES/shared-lhs: resident bytes contribute to peak L1",
+            plan.peak_l1_bytes >= 32LL * 64 * 4 &&
+                plan.peak_l1_bytes <= p.l1_capacity);
+    }
+  }
+
+  // One source tensor is shared twice as LHS and twice as RHS. These are two
+  // incompatible requested values, not one tensor-level resident allocation.
+  {
+    Problem p;
+    for (int i = 0; i < 9; ++i) p.tensors.push_back({64, 64});
+    p.ops = {{OpType::MatMul, {0, 1}, {5}},
+             {OpType::MatMul, {0, 2}, {6}},
+             {OpType::MatMul, {3, 0}, {7}},
+             {OpType::MatMul, {4, 0}, {8}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    p.use_hierarchical_cube_cost = true;
+    p.require_uniform_cube_dag_grid = true;
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    CHECK("CUBERES/multi-role: subgraph creates", static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 32;
+      cfg.h = 32;
+      cfg.k = 64;
+      cfg.parts_m = 2;
+      cfg.parts_n = 2;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      bool saw_lhs = false;
+      bool saw_rhs = false;
+      for (const CubeResidentBoundaryPlan& resident :
+           plan.resident_boundaries) {
+        if (resident.region.tensor != 0) continue;
+        saw_lhs |= resident.role == CubeOperandRole::Lhs;
+        saw_rhs |= resident.role == CubeOperandRole::Rhs;
+      }
+      CHECK("CUBERES/multi-role: fixed plan is feasible",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                plan.matmuls.size() == 4);
+      CHECK("CUBERES/multi-role: LHS and RHS identities stay distinct",
+            plan.resident_boundaries.size() == 2 && saw_lhs && saw_rhs &&
+                plan.resident_boundaries[0].id !=
+                    plan.resident_boundaries[1].id);
+    }
+  }
+
+  // The initial policy has no reload alternative: if the shared complete panel
+  // cannot fit, the fused configuration declines rather than pricing reuse and
+  // emitting repeated loads.
+  {
+    Problem p;
+    p.tensors = {{512, 128}, {64, 512}, {64, 128},
+                 {64, 512}, {64, 128}};
+    p.ops = {{OpType::MatMul, {0, 1}, {2}},
+             {OpType::MatMul, {0, 3}, {4}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    p.l1_capacity = 96 * 1024;
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1});
+    CHECK("CUBERES/capacity: subgraph remains structurally valid",
+          static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 64;
+      cfg.h = 64;
+      cfg.k = 64;
+      cfg.parts_m = 2;
+      cfg.parts_n = 1;
+      cfg.split_k = 1;
+      CHECK("CUBERES/capacity: always-retain plan declines when panel exceeds L1",
+            !sg->compute_cost(cfg).feasible &&
+                sg->cube_peak_l1(cfg) == INT64_MAX);
+    }
+  }
+}
+
 static void test_dfs_order() {
     std::cout << "[ORDER] DFS execution order (producer before consumer)\n";
     auto p = mk_chained(256, 512, 256, 128, 1000, 1000);  // op0=T=A@B, op1=C=T@D (sink)
@@ -3932,6 +4059,7 @@ int main() {
     test_exec_enumeration();
     test_cube_schedule_plan();
     test_cube_schedule_fanout();
+    test_shared_boundary_pebbling();
     test_seq_k_intermediate();
     test_peak_band_feasibility();
     test_chain_ksplit_variants();

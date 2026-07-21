@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "core/pebbling_order.h"
+
 // ============================================================================
 // SubgraphStructure — architecture-independent structural classification.
 //
@@ -75,49 +77,10 @@ SubgraphStructure::SubgraphStructure(const Problem &prob, const DAG &dag,
   if (boundary_outputs_.empty())
     return;  // valid_ stays false
 
-  // Fixed depth-first (post-order) execution order — the pebbling order. Mirrors
-  // subgraph.cpp: post-order DFS from each sink over in-subgraph producers, with
-  // a topo-position tie-break so the same subgraph always yields the same order
-  // (required for the cost cache).
-  {
-    auto by_topo = [&](size_t a, size_t b) {
-      return dag.topo_position(a) < dag.topo_position(b);
-    };
-    auto sg_producers = [&](size_t op) {
-      std::vector<size_t> preds;
-      for (auto t : prob.ops[op].inputs) {
-        int p = dag.tensor_producer[t];
-        if (p >= 0 && is_in_sg[(size_t)p]) preds.push_back((size_t)p);
-      }
-      std::sort(preds.begin(), preds.end(), by_topo);
-      preds.erase(std::unique(preds.begin(), preds.end()), preds.end());
-      return preds;
-    };
-    std::vector<size_t> roots = sinks_;
-    std::sort(roots.begin(), roots.end(), by_topo);
-
-    std::vector<bool> visited(num_ops, false);
-    std::vector<std::pair<size_t, bool>> stack;  // (op, expanded?)
-    for (auto root : roots) {
-      if (visited[root]) continue;
-      stack.push_back({root, false});
-      while (!stack.empty()) {
-        auto [op, expanded] = stack.back();
-        stack.pop_back();
-        if (expanded) {  // all producers already emitted
-          dfs_order_.push_back(op);
-          continue;
-        }
-        if (visited[op]) continue;
-        visited[op] = true;
-        stack.push_back({op, true});  // emit after producers
-        auto preds = sg_producers(op);
-        // Push in reverse so the smallest-topo producer is processed first.
-        for (auto it = preds.rbegin(); it != preds.rend(); ++it)
-          if (!visited[*it]) stack.push_back({*it, false});
-      }
-    }
-  }
+  const PebblingOrderGraph pebbling_graph =
+      BuildSourceOpPebblingGraph(prob, dag, ops_, sinks_);
+  dfs_order_ = ComputePebblingOrder(PebblingOrderKind::DfsPostOrder,
+                                    pebbling_graph);
 
   valid_ = true;
 }

@@ -725,11 +725,33 @@ struct CubeRetainedPanelPlan {
   int64_t bytes() const { return lhs_bytes + rhs_bytes; }
 };
 
+enum class CubeOperandRole {
+  Lhs,
+  Rhs,
+};
+
+struct CubeResidentBoundaryPlan {
+  // A canonical boundary request shared by multiple matmul instances in one
+  // work unit. Identity includes the tensor region and the compatible operand
+  // representation, so LHS and RHS requests never alias accidentally.
+  size_t id = std::numeric_limits<size_t>::max();
+  CubeTensorRegionPlan region;
+  CubeOperandRole role = CubeOperandRole::Lhs;
+  size_t first_use = 0;
+  size_t last_use = 0;
+  size_t use_count = 0;
+  int64_t bytes = 0;
+};
+
 struct CubeMatmulSchedule {
   size_t instance = std::numeric_limits<size_t>::max();
   size_t op = std::numeric_limits<size_t>::max();
   int64_t lhs_producer = -1;  // schedule-instance index, -1 = boundary input
   int64_t rhs_producer = -1;
+  // Index into CubeSchedulePlan::resident_boundaries, or -1 when this operand
+  // is produced internally or streamed as a single-use boundary request.
+  int64_t lhs_resident_boundary = -1;
+  int64_t rhs_resident_boundary = -1;
   bool is_sink = false;
   bool lhs_ephemeral = false;
   bool rhs_ephemeral = false;
@@ -799,6 +821,7 @@ struct CubeSchedulePlan {
     // model change grants overlap that the reconstructed loop cannot realize.
     bool model_overlap_granted = false;
     bool overlap_implementable = false;
+    std::vector<CubeResidentBoundaryPlan> resident_boundaries;
     std::vector<size_t> execution_order;
     std::vector<CubeMatmulSchedule> matmuls;
 };
