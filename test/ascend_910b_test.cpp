@@ -171,7 +171,28 @@ static double hbm_read_floor(const Problem& p, int64_t M, int64_t N, int64_t K,
     return ((double)M * K * dtype_bytes(a_dtype) + (double)K * N * dtype_bytes(b_dtype)) * cpb;
 }
 
-// --- A: large pointwise — memory-bound, tile-invariant -----------------------
+// Realized cost of one GM direction when `active` cores each own a transfer
+// pipe, capped by the aggregate HBM bandwidth. This is the production model's
+// `par(active, peak)` law; using the serial bytes/peak floor here would ignore
+// the SPMD work-unit grid and overstate vector traffic by the active-pipe count.
+static double realized_gm_direction_floor(const Problem& p, double bytes,
+                                          double per_core_peak_gibps, int active) {
+    double parallel_pipes = std::max(1.0, static_cast<double>(active));
+    if (p.hbm_aggregate_gibps > 0.0 && per_core_peak_gibps > 0.0) {
+        parallel_pipes = std::min(parallel_pipes,
+                                  p.hbm_aggregate_gibps / per_core_peak_gibps);
+    }
+    const double cpb = p.cube_freq_hz /
+                       (1024.0 * 1024.0 * 1024.0 * per_core_peak_gibps);
+    return bytes * cpb / parallel_pipes;
+}
+
+static double realized_vector_ddr_floor(const Problem& p, double bytes, int active) {
+    return realized_gm_direction_floor(p, bytes, p.bw_gm_ub, active) +
+           realized_gm_direction_floor(p, bytes, p.bw_ub_gm, active);
+}
+
+// --- A: large pointwise — memory-bound, active-pipe DDR floor ----------------
 static void test_A_pointwise_memory_bound() {
     std::cout << "[A] large pointwise — memory-bound, latency == DDR floor\n";
     Problem p;
@@ -183,14 +204,14 @@ static void test_A_pointwise_memory_bound() {
     DAG dag = DAG::build(p);
     auto sg = Subgraph::create(p, dag, {0});
     CHECK("A: subgraph builds", (bool)sg);
-    double lat = sg->best_cost().latency;
+    const auto result = sg->best_cost();
+    double lat = result.latency;
     std::cout << "    best latency = " << lat << "\n";
-    // Grounded DDR floor: load T0 (GM->UB) + store T1 (UB->GM), byte-based and
-    // tile-invariant. cost-per-byte = freq / (2^30 * bw_GiBps) (see MakeByteCost).
-    auto cpb = [&](double bw) { return p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
+    // Grounded parallel DDR floor: load T0 (GM->UB) and store T1 (UB->GM) use
+    // independent per-core pipes, each capped by aggregate HBM bandwidth.
     const double bytes = 512.0 * 512.0 * 4.0;
-    const double floor = bytes * cpb(p.bw_gm_ub) + bytes * cpb(p.bw_ub_gm);  // ~27491.6
-    CHECK_EQ("A: latency == grounded DDR floor (GM->UB load + UB->GM store)", lat, floor);
+    const double floor = realized_vector_ddr_floor(p, bytes, result.cores_used);
+    CHECK_EQ("A: latency == realized parallel GM<->UB floor", lat, floor);
 }
 
 // --- B: thin matmul — should parallelize via split-K across cube cores --------
@@ -707,23 +728,23 @@ static void test_geometry_compute() {
     }
 
     // --- VECTOR: pointwise [512,512], FP32. Vector compute parallelizes across cores
-    // while DDR is the shared aggregate, so a pointwise is DDR-BOUND -- its latency is
-    // the GM<->UB byte floor (load + store), tile-invariant. (The head+slope*repeat+
-    // tail compute formula is exercised where it bites -- UB-overflow streaming
-    // N_passes -- in the vector sensibility tests; it never drives a simple pointwise.)
+    // while DDR is capped by the shared aggregate, so a pointwise is DDR-BOUND.
+    // Its latency is the realized parallel GM<->UB floor for the chosen active
+    // work-unit grid. The head+slope*repeat+tail compute formula is exercised
+    // where it bites -- UB-overflow streaming -- in the vector sensibility tests.
     Problem v;
     v.tensors = {{512, 512}, {512, 512}};
     v.ops = {{OpType::Pointwise, {0}, {1}}};
     v.fast_memory_capacity = 1 << 26;
     set_910b(v); v.kernel_fill_cost = 0;
     auto rv = Subgraph::create(v, DAG::build(v), {0})->best_cost();
-    auto cpb = [&](double bw) { return v.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
-    const double vfloor = 512.0 * 512 * 4 * cpb(v.bw_gm_ub) + 512.0 * 512 * 4 * cpb(v.bw_ub_gm);
+    const double bytes = 512.0 * 512 * 4;
+    const double vfloor = realized_vector_ddr_floor(v, bytes, rv.cores_used);
     std::cout << "    vector: lat=" << rv.latency << " (DDR floor " << vfloor
               << ", compute_bound=" << rv.compute_bound << ")\n";
     CHECK("GEOM: vector pointwise is DDR-bound (compute parallelizes, DDR aggregate)",
           !rv.compute_bound);
-    CHECK("GEOM: vector DDR-bound latency = GM<->UB byte floor (load + store)",
+    CHECK("GEOM: vector DDR-bound latency = realized parallel GM<->UB floor",
           std::abs(rv.latency - vfloor) < 1.0);
 }
 
