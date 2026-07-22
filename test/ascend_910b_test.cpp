@@ -2042,6 +2042,67 @@ static void test_shared_boundary_pebbling() {
     }
   }
 
+  // Two different compatible boundary values overlap: A is resident as LHS
+  // for roots 0/1, while B is resident as RHS for roots 0/2.  Root 0 uses
+  // both at once, so the peak must include both canonical values and every
+  // consumer must reference the matching resident id.
+  {
+    Problem p;
+    p.tensors.assign(7, {64, 64, DType::BF16});
+    p.ops = {{OpType::MatMul, {0, 1}, {4}},
+             {OpType::MatMul, {0, 2}, {5}},
+             {OpType::MatMul, {3, 1}, {6}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    p.use_hierarchical_cube_cost = true;
+    p.require_uniform_cube_dag_grid = true;
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2});
+    CHECK("CUBERES/two-values: subgraph creates", static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 32;
+      cfg.h = 32;
+      cfg.k = 64;
+      cfg.parts_m = 2;
+      cfg.parts_n = 2;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const CubeResidentBoundaryPlan* lhs_a = nullptr;
+      const CubeResidentBoundaryPlan* rhs_b = nullptr;
+      for (const CubeResidentBoundaryPlan& resident : plan.resident_boundaries) {
+        if (resident.region.tensor == 0 && resident.role == CubeOperandRole::Lhs) {
+          lhs_a = &resident;
+        }
+        if (resident.region.tensor == 1 && resident.role == CubeOperandRole::Rhs) {
+          rhs_b = &resident;
+        }
+      }
+      size_t lhs_a_uses = 0;
+      size_t rhs_b_uses = 0;
+      for (const CubeMatmulSchedule& matmul : plan.matmuls) {
+        lhs_a_uses += (matmul.op == 0 || matmul.op == 1) &&
+                      matmul.lhs_resident_boundary >= 0;
+        rhs_b_uses += (matmul.op == 0 || matmul.op == 2) &&
+                      matmul.rhs_resident_boundary >= 0;
+      }
+      CHECK("CUBERES/two-values: fixed plan is feasible",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                plan.matmuls.size() == 3);
+      CHECK("CUBERES/two-values: both compatible values are resident",
+            plan.resident_boundaries.size() == 2 && lhs_a != nullptr &&
+                rhs_b != nullptr && lhs_a->id != rhs_b->id &&
+                lhs_a->use_count == 2 && rhs_b->use_count == 2);
+      CHECK("CUBERES/two-values: every matching consumer uses residency",
+            lhs_a_uses == 2 && rhs_b_uses == 2);
+      CHECK("CUBERES/two-values: overlapping values both contribute to peak",
+            lhs_a != nullptr && rhs_b != nullptr &&
+                plan.peak_l1_bytes >= lhs_a->bytes + rhs_b->bytes &&
+                plan.peak_l1_bytes <= p.l1_capacity);
+    }
+  }
+
   // One source tensor is shared twice as LHS and twice as RHS. These are two
   // incompatible requested values, not one tensor-level resident allocation.
   {
