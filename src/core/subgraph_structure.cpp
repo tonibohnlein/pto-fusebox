@@ -10,9 +10,9 @@
 //
 // This mirrors EXACTLY the structural half of Subgraph::create() in
 // subgraph.cpp (boundary/ephemeral classification, sink detection, and the
-// post-order DFS execution order). The arch-specific cost model composes this
-// and adds tiling / feasibility / cost on top; nothing here depends on the
-// machine parameters, so every backend shares it verbatim.
+// selected deterministic pebbling order). The arch-specific cost model
+// composes this and adds tiling / feasibility / cost on top; nothing here
+// depends on the machine parameters, so every backend shares it verbatim.
 // ============================================================================
 
 SubgraphStructure::SubgraphStructure(const Problem &prob, const DAG &dag,
@@ -66,21 +66,20 @@ SubgraphStructure::SubgraphStructure(const Problem &prob, const DAG &dag,
     bool has_internal_succ = false;
     size_t t = prob.ops[i].output();
     for (auto cop : dag.tensor_consumers[t])
-      if (is_in_sg[cop]) { has_internal_succ = true; break; }
-    if (!has_internal_succ || prob.required_outputs.count(t))
-      sinks_.push_back(i);
+      if (is_in_sg[cop]) {
+        has_internal_succ = true;
+        break;
+      }
+    if (!has_internal_succ || prob.required_outputs.count(t)) sinks_.push_back(i);
   }
 
   // A non-empty acyclic op set always has a sink, and a sink's output is by
   // definition a boundary output — so non-empty boundary_outputs_ is the
   // structural-validity test (equivalently, non-empty sinks_).
-  if (boundary_outputs_.empty())
-    return;  // valid_ stays false
+  if (boundary_outputs_.empty()) return;  // valid_ stays false
 
-  const PebblingOrderGraph pebbling_graph =
-      BuildSourceOpPebblingGraph(prob, dag, ops_, sinks_);
-  dfs_order_ = ComputePebblingOrder(PebblingOrderKind::DfsPostOrder,
-                                    pebbling_graph);
+  const PebblingOrderGraph pebbling_graph = BuildSourceOpPebblingGraph(prob, dag, ops_, sinks_);
+  dfs_order_ = ComputePebblingOrder(kDefaultPebblingOrderKind, pebbling_graph);
 
   valid_ = true;
 }

@@ -529,125 +529,168 @@ struct VectorP4WorkPlan {
 // emitted in auto_fuse_pass.cpp; dependency semantics remain in the exact
 // P4Pattern descriptor and emitter builders.
 inline VectorP4WorkPlan make_vector_p4_work_plan(P4PatternKind kind) {
-    VectorP4WorkPlan plan;
-    if (kind == P4PatternKind::None) return plan;
+  VectorP4WorkPlan plan;
+  if (kind == P4PatternKind::None) return plan;
 
-    plan.generated = true;
-    plan.stats_init.generated = true;
-    plan.stats_update.generated = true;
+  plan.generated = true;
+  plan.stats_init.generated = true;
+  plan.stats_update.generated = true;
 
-    if (kind == P4PatternKind::SoftmaxFlash) {
-        // Init: row_max; sub -> exp; row_sum.
-        plan.stats_init.add(VectorPrimitiveKind::RowMax, 1, 0);
-        plan.stats_init.add(VectorPrimitiveKind::RowSum, 1, 0);
-        plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
-        plan.stats_init.add(VectorPrimitiveKind::Exp, 1, 0);
-
-        // Update: row_max; max(carry,cmax) -> sub -> exp; row_sum;
-        // sub(carry,m) -> exp -> mul -> add.
-        plan.stats_update.add(VectorPrimitiveKind::RowMax, 1, 0);
-        plan.stats_update.add(VectorPrimitiveKind::RowSum, 1, 0);
-        plan.stats_update.add(VectorPrimitiveKind::Add, 0, 3, 2);
-        plan.stats_update.add(VectorPrimitiveKind::Exp, 1, 1);
-        plan.stats_update.add(VectorPrimitiveKind::Mul, 0, 1);
-        plan.stats_update.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
-        return plan;
-    }
-
-    // Welford init: row_sum; muls(mean) -> sub -> mul; row_sum;
-    // muls(zero-count) -> adds(count).
-    plan.stats_init.add(VectorPrimitiveKind::RowSum, 2, 0);
-    plan.stats_init.add(VectorPrimitiveKind::Mul, 1, 0);
+  if (kind == P4PatternKind::SoftmaxFlash) {
+    // Init: row_max; sub -> exp; row_sum.
+    plan.stats_init.add(VectorPrimitiveKind::RowMax, 1, 0);
+    plan.stats_init.add(VectorPrimitiveKind::RowSum, 1, 0);
     plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
-    plan.stats_init.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
-    plan.stats_init.add(VectorPrimitiveKind::ScalarMul, 0, 2, 2);
+    plan.stats_init.add(VectorPrimitiveKind::Exp, 1, 0);
 
-    // Welford update repeats the chunk mean/M2 stream, then performs Chan's
-    // thin (mean,M2,count) merge after the second reduction barrier.
-    plan.stats_update.add(VectorPrimitiveKind::RowSum, 2, 0);
-    plan.stats_update.add(VectorPrimitiveKind::Add, 0, 4, 1);
-    plan.stats_update.add(VectorPrimitiveKind::Mul, 1, 2);
-    plan.stats_update.add(VectorPrimitiveKind::Div, 0, 2);
+    // Update: row_max; max(carry,cmax) -> sub -> exp; row_sum;
+    // sub(carry,m) -> exp -> mul -> add.
+    plan.stats_update.add(VectorPrimitiveKind::RowMax, 1, 0);
+    plan.stats_update.add(VectorPrimitiveKind::RowSum, 1, 0);
+    plan.stats_update.add(VectorPrimitiveKind::Add, 0, 3, 2);
+    plan.stats_update.add(VectorPrimitiveKind::Exp, 1, 1);
+    plan.stats_update.add(VectorPrimitiveKind::Mul, 0, 1);
     plan.stats_update.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
-    plan.stats_update.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
-    plan.stats_update.add(VectorPrimitiveKind::ScalarMul, 0, 3, 1);
-
-    // Population variance = final M2 / N.
-    plan.finalize.generated = true;
-    plan.finalize.add(VectorPrimitiveKind::ScalarMul, 0, 1, 1);
     return plan;
+  }
+
+  // Welford init: row_sum; muls(mean) -> sub -> mul; row_sum;
+  // muls(zero-count) -> adds(count).
+  plan.stats_init.add(VectorPrimitiveKind::RowSum, 2, 0);
+  plan.stats_init.add(VectorPrimitiveKind::Mul, 1, 0);
+  plan.stats_init.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+  plan.stats_init.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
+  plan.stats_init.add(VectorPrimitiveKind::ScalarMul, 0, 2, 2);
+
+  // Welford update repeats the chunk mean/M2 stream, then performs Chan's
+  // thin (mean,M2,count) merge after the second reduction barrier.
+  plan.stats_update.add(VectorPrimitiveKind::RowSum, 2, 0);
+  plan.stats_update.add(VectorPrimitiveKind::Add, 0, 4, 1);
+  plan.stats_update.add(VectorPrimitiveKind::Mul, 1, 2);
+  plan.stats_update.add(VectorPrimitiveKind::Div, 0, 2);
+  plan.stats_update.add(VectorPrimitiveKind::RowExpandSub, 1, 0, 1);
+  plan.stats_update.add(VectorPrimitiveKind::ScalarAdd, 0, 1);
+  plan.stats_update.add(VectorPrimitiveKind::ScalarMul, 0, 3, 1);
+
+  // Population variance = final M2 / N.
+  plan.finalize.generated = true;
+  plan.finalize.add(VectorPrimitiveKind::ScalarMul, 0, 1, 1);
+  return plan;
 }
 
 static_assert(sizeof(VectorP4WorkPlan) <= 96,
               "P4 work descriptors are rebuilt in candidate enumeration and must stay compact");
 
+// One vector kernel can replay the source DAG in several barrier-separated
+// phases. A boundary tensor has one compatible UB representation within a
+// phase, independent of which vector operand position consumes it. Crossing a
+// phase boundary is different: P2/P4 deliberately reload spanning inputs, so
+// each phase owns a separate lifetime instance.
+enum class VectorReplayPhase : uint8_t {
+  Body = 0,
+  Stats = 1,
+  Apply = 2,
+  Finalize = 3,
+};
+
+inline constexpr size_t vector_replay_phase_index(VectorReplayPhase phase) {
+  return static_cast<size_t>(phase);
+}
+
+struct VectorInputUsePlan {
+  size_t op = 0;
+  size_t arg = 0;
+};
+
+struct VectorInputLifetimePlan {
+  size_t tensor = 0;
+  VectorReplayPhase phase = VectorReplayPhase::Body;
+  size_t first_use_step = 0;
+  size_t last_use_step = 0;
+  size_t use_count = 0;
+  std::vector<VectorInputUsePlan> uses;
+
+  [[nodiscard]] bool spans_steps() const { return first_use_step < last_use_step; }
+};
+
+// Candidate-invariant topology shared by every tiling of one subgraph. Keeping
+// it behind a shared pointer avoids rebuilding/copying use lists in the local-
+// search hot path; candidate-dependent tile bytes remain in VectorStreamPlan.
+struct VectorInputLifetimeTopology {
+  std::array<std::vector<VectorInputLifetimePlan>, 4> phases;
+};
+
 struct VectorStreamPlan {
-    bool feasible = false;
-    VectorStreamKind kind = VectorStreamKind::Materialized;
-    // One logical region is one runtime work unit / SPMD block. The physical
-    // UB/DMA allocation used while replaying a region may be padded or split
-    // into strips, but it must never change this solver-owned launch grid.
-    AxisPartition m_partition;
-    AxisPartition n_partition;
-    int64_t work_units = 0;
-    // Peak UB footprint before streaming and at the selected chunk. Keeping
-    // both in the derived plan lets compute_cost reuse the feasibility work
-    // instead of rescanning the pebbling order for every cost term.
-    int64_t full_peak_ub_bytes = 0;
-    int64_t chunk_peak_ub_bytes = 0;
-    int64_t stream_band_count = 0;
-    int axis = 0;  // 0 = materialized, 1 = width, 2 = height
-    // Maximum logical free-axis extent owned by one work unit. Its physical UB
-    // allocation is `free_tile_alloc`, rounded to the DMA granule. Keeping the
-    // two separate prevents alignment from silently coarsening the SPMD grid.
-    int64_t free_tile = 0;
-    int64_t free_tile_alloc = 0;
-    int64_t extent = 0;
-    int64_t chunk = 0;
-    int64_t full_chunks = 0;
-    int64_t tail = 0;
-    int stream_passes = 0;
-    // Solver-owned materialized/pointwise strip geometry.  The emitter must not
-    // independently choose a row/width strip count: these fields are the exact
-    // uniform (clamp-overlap on a ragged edge) loop it builds.
-    int64_t tile_h = 0;
-    int64_t tile_w = 0;
-    int64_t strip_h = 0;
-    int64_t strip_w = 0;
-    int64_t row_strips = 1;
-    int64_t width_strips = 1;
-    VectorLoopPlan body;
+  bool feasible = false;
+  VectorStreamKind kind = VectorStreamKind::Materialized;
+  // One logical region is one runtime work unit / SPMD block. The physical
+  // UB/DMA allocation used while replaying a region may be padded or split
+  // into strips, but it must never change this solver-owned launch grid.
+  AxisPartition m_partition;
+  AxisPartition n_partition;
+  int64_t work_units = 0;
+  // Peak UB footprint before streaming and at the selected chunk. Keeping
+  // both in the derived plan lets compute_cost reuse the feasibility work
+  // instead of rescanning the pebbling order for every cost term.
+  int64_t full_peak_ub_bytes = 0;
+  int64_t chunk_peak_ub_bytes = 0;
+  int64_t stream_band_count = 0;
+  int axis = 0;  // 0 = materialized, 1 = width, 2 = height
+  // Maximum logical free-axis extent owned by one work unit. Its physical UB
+  // allocation is `free_tile_alloc`, rounded to the DMA granule. Keeping the
+  // two separate prevents alignment from silently coarsening the SPMD grid.
+  int64_t free_tile = 0;
+  int64_t free_tile_alloc = 0;
+  int64_t extent = 0;
+  int64_t chunk = 0;
+  int64_t full_chunks = 0;
+  int64_t tail = 0;
+  int stream_passes = 0;
+  // Exact boundary-input identities and phase-local first/last uses replayed
+  // by the emitter. Traffic is one GM->UB slice per tensor, phase and emitted
+  // strip/chunk; the tile stays live through the descriptor's last use.
+  std::shared_ptr<const VectorInputLifetimeTopology> input_lifetimes;
+  // Solver-owned materialized/pointwise strip geometry.  The emitter must not
+  // independently choose a row/width strip count: these fields are the exact
+  // uniform (clamp-overlap on a ragged edge) loop it builds.
+  int64_t tile_h = 0;
+  int64_t tile_w = 0;
+  int64_t strip_h = 0;
+  int64_t strip_w = 0;
+  int64_t row_strips = 1;
+  int64_t width_strips = 1;
+  VectorLoopPlan body;
 
-    // Optional cross-core split of a materialized reduction. `work_units`
-    // remains the spatial grid size; the main launch has
-    // work_units*reduction_split_factor tasks and a separate spatial seed grid.
-    // The factor/partial extent are populated only when this exact candidate is
-    // realizable by the emitter.
-    VectorReductionSplitKind reduction_split_kind = VectorReductionSplitKind::None;
-    int64_t reduction_split_factor = 1;
-    int64_t reduction_partial_extent = 0;
-    VectorReductionSeedPlan reduction_seed;
+  // Optional cross-core split of a materialized reduction. `work_units`
+  // remains the spatial grid size; the main launch has
+  // work_units*reduction_split_factor tasks and a separate spatial seed grid.
+  // The factor/partial extent are populated only when this exact candidate is
+  // realizable by the emitter.
+  VectorReductionSplitKind reduction_split_kind = VectorReductionSplitKind::None;
+  int64_t reduction_split_factor = 1;
+  int64_t reduction_partial_extent = 0;
+  VectorReductionSeedPlan reduction_seed;
 
-    // A streamed reduction is a sequence of barrier-separated phases.  Peeled
-    // init/tail/finalize work is always serial; only stats/apply rolled loops
-    // may receive stage-2 overlap.
-    VectorSerialPhasePlan stats_init;
-    VectorLoopPlan stats;  // P1/P2/P4 online statistics
-    VectorLoopPlan apply;  // P2/P4 spanning output
-    VectorSerialPhasePlan stats_tail;
-    VectorSerialPhasePlan apply_tail;
-    VectorSerialPhasePlan finalize;
+  // A streamed reduction is a sequence of barrier-separated phases.  Peeled
+  // init/tail/finalize work is always serial; only stats/apply rolled loops
+  // may receive stage-2 overlap.
+  VectorSerialPhasePlan stats_init;
+  VectorLoopPlan stats;  // P1/P2/P4 online statistics
+  VectorLoopPlan apply;  // P2/P4 spanning output
+  VectorSerialPhasePlan stats_tail;
+  VectorSerialPhasePlan apply_tail;
+  VectorSerialPhasePlan finalize;
 
-    // P4 stats are emitter-generated work, not a scaled replay of the source
-    // DAG. Apply remains a source-DAG cone with the online stats substituted.
-    VectorP4WorkPlan p4_work;
+  // P4 stats are emitter-generated work, not a scaled replay of the source
+  // DAG. Apply remains a source-DAG cone with the online stats substituted.
+  VectorP4WorkPlan p4_work;
 
-    // Diagnostic compatibility bit: true when every rolled data-moving loop in
-    // this plan is stage-2.  Costing is phase-local and never uses this to hide
-    // serial init/tail/finalize work behind another phase.
-    bool overlap_granted = false;
+  // Diagnostic compatibility bit: true when every rolled data-moving loop in
+  // this plan is stage-2.  Costing is phase-local and never uses this to hide
+  // serial init/tail/finalize work behind another phase.
+  bool overlap_granted = false;
 
-    bool streamed() const { return feasible && axis != 0; }
+  bool streamed() const { return feasible && axis != 0; }
 };
 
 // ============================================================================

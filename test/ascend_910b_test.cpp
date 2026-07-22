@@ -2115,6 +2115,82 @@ static void test_shared_boundary_pebbling() {
                 sg->cube_peak_l1(cfg) == INT64_MAX);
     }
   }
+
+  // Compose the two hard cases above: T=A@B is requested in incompatible LHS
+  // and RHS roles, while D is reused in one compatible RHS representation
+  // across two output roots.  R is a second live-out.  The
+  // request DAG must recompute T by role but retain exactly one D/RHS value.
+  {
+    Problem p;
+    p.tensors.assign(9, {64, 64, DType::BF16});
+    p.ops = {{OpType::MatMul, {0, 1}, {2}},  // T=A@B
+             {OpType::MatMul, {2, 3}, {6}},  // L=T@D
+             {OpType::MatMul, {4, 2}, {7}},  // R=E@T
+             {OpType::MatMul, {5, 3}, {8}}}; // O=F@D
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    p.use_hierarchical_cube_cost = true;
+    p.require_uniform_cube_dag_grid = true;
+    DAG dag = DAG::build(p);
+    auto sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    CHECK("CUBERES/composed: subgraph creates", static_cast<bool>(sg));
+    if (sg) {
+      TileConfig cfg;
+      cfg.w = 32;
+      cfg.h = 32;
+      cfg.k = 64;
+      cfg.parts_m = 2;
+      cfg.parts_n = 2;
+      cfg.split_k = 1;
+      const auto cost = sg->compute_cost(cfg);
+      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      size_t producer_instances = 0;
+      size_t lhs_t_consumers = 0;
+      size_t rhs_t_consumers = 0;
+      size_t resident_d_rhs_uses = 0;
+      for (const CubeMatmulSchedule& matmul : plan.matmuls) {
+        producer_instances += matmul.op == 0;
+        lhs_t_consumers += matmul.op == 1;
+        rhs_t_consumers += matmul.op == 2;
+        resident_d_rhs_uses +=
+            (matmul.op == 1 || matmul.op == 3) && matmul.rhs_resident_boundary >= 0;
+      }
+      CHECK("CUBERES/composed: fixed plan is feasible",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                plan.matmuls.size() == 5);
+      CHECK("CUBERES/composed: produced T is replayed once per incompatible role",
+            producer_instances == 2 && lhs_t_consumers == 1 &&
+                rhs_t_consumers == 1);
+      CHECK("CUBERES/composed: only compatible D/RHS use is resident",
+            plan.resident_boundaries.size() == 1 &&
+                plan.resident_boundaries[0].region.tensor == 3 &&
+                plan.resident_boundaries[0].role == CubeOperandRole::Rhs &&
+                plan.resident_boundaries[0].use_count == 2 &&
+                resident_d_rhs_uses == 2);
+      CHECK("CUBERES/composed: all three returned roots remain sinks",
+            std::count_if(plan.matmuls.begin(), plan.matmuls.end(),
+                          [](const CubeMatmulSchedule& matmul) { return matmul.is_sink; }) == 3);
+    }
+  }
+
+  // Adding D as the LHS of the second root would require three distinct
+  // partial representations of the same source (two RHS requests plus one
+  // LHS request).  The bounded role-expanded descriptor intentionally
+  // declines this case instead of aliasing representations or underpricing L1.
+  {
+    Problem p;
+    p.tensors.assign(7, {64, 64, DType::BF16});
+    p.ops = {{OpType::MatMul, {0, 1}, {2}},
+             {OpType::MatMul, {2, 3}, {4}},
+             {OpType::MatMul, {3, 2}, {5}},
+             {OpType::MatMul, {4, 3}, {6}}};
+    p.required_outputs.insert(5);
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    CHECK("CUBERES/three-role: unsupported third partial role declines safely",
+          !Subgraph::create(p, dag, {0, 1, 2, 3}));
+  }
 }
 
 static void test_dfs_order() {

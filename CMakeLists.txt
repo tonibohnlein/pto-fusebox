@@ -25,6 +25,10 @@ if(GAIN_CHECK)
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -UNDEBUG")
 endif()
 
+# Experimental dependency-constrained Gorder pebbling policy. The default DFS
+# ordering remains the production policy until model and device comparison.
+option(PTO_FUSEBOX_GORDER "Use dependency-constrained Gorder scheduling" OFF)
+
 # Threading support
 find_package(Threads REQUIRED)
 
@@ -51,6 +55,9 @@ file(GLOB_RECURSE LIB_SOURCES
 )
 
 add_library(solver_lib STATIC ${LIB_SOURCES})
+if(PTO_FUSEBOX_GORDER)
+    target_compile_definitions(solver_lib PUBLIC PTO_FUSEBOX_GORDER)
+endif()
 target_link_libraries(solver_lib Threads::Threads)
 
 # --- Main executable ---
@@ -63,6 +70,9 @@ target_link_libraries(mlsys solver_lib Threads::Threads)
 # kernels; the default `mlsys` stays the unit-homogeneous model.
 add_executable(mlsys_mixed ${LIB_SOURCES} src/pipeline/main.cpp)
 target_compile_definitions(mlsys_mixed PRIVATE PYPTO_FUSE_CUBE_VECTOR)
+if(PTO_FUSEBOX_GORDER)
+    target_compile_definitions(mlsys_mixed PRIVATE PTO_FUSEBOX_GORDER)
+endif()
 target_link_libraries(mlsys_mixed Threads::Threads)
 
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)

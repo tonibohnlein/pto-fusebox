@@ -1650,10 +1650,8 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   for (size_t op : sg.ops_) {
     if (sg.is_sink_op_vec_[op]) pebbling_roots.push_back(op);
   }
-  const PebblingOrderGraph pebbling_graph =
-      BuildSourceOpPebblingGraph(prob, dag, sg.ops_, pebbling_roots);
-  sg.dfs_order_ = ComputePebblingOrder(PebblingOrderKind::DfsPostOrder,
-                                       pebbling_graph);
+  const PebblingOrderGraph pebbling_graph = BuildSourceOpPebblingGraph(prob, dag, sg.ops_, pebbling_roots);
+  sg.dfs_order_ = ComputePebblingOrder(kDefaultPebblingOrderKind, pebbling_graph);
 
   // Build the pure-cube recursive request DAG once. The sink owns SpatialM x
   // SpatialN. A matmul output request O[rows, cols] induces A[rows, K] and
@@ -1720,31 +1718,60 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       if (root >= 0) sg.cube_request_roots_.push_back(static_cast<size_t>(root));
     }
 
+    // Canonicalize external requests before choosing an order so Gorder can
+    // score exact role-compatible reuse. Equal value ids mean equal tensor
+    // region and compatible Mat representation. Port is load-bearing: A used
+    // as both sides of A@A is two values because the LHS/RHS layouts and
+    // downstream pools differ.
+    using BoundaryKey = std::tuple<size_t, int, int, int>;
+    std::map<BoundaryKey, size_t> boundary_ids;
+    auto bind_boundary = [&](CubeRequest& request, CubeOperandRole role, int64_t& value_slot) {
+      const BoundaryKey key{request.tensor, static_cast<int>(request.height_binding),
+                            static_cast<int>(request.width_binding), static_cast<int>(role)};
+      auto [it, inserted] = boundary_ids.emplace(key, sg.cube_boundary_values_.size());
+      if (inserted) {
+        CubeBoundaryValue value;
+        value.request = request;
+        value.role = role;
+        sg.cube_boundary_values_.push_back(value);
+      }
+      value_slot = static_cast<int64_t>(it->second);
+    };
+    for (CubeRequestNode& node : sg.cube_request_nodes_) {
+      if (node.lhs_producer < 0) {
+        bind_boundary(node.lhs, CubeOperandRole::Lhs, node.lhs_boundary_value);
+      }
+      if (node.rhs_producer < 0) {
+        bind_boundary(node.rhs, CubeOperandRole::Rhs, node.rhs_boundary_value);
+      }
+    }
+
     // Route the role-expanded request DAG through the same ordering interface
-    // as vector/source operations. DFS is deliberately the only policy today;
-    // reuse-distance and Gorder-inspired ready-node strategies can now be added
-    // without changing request construction, liveness, or emission.
+    // as vector/source operations. The compile-time default remains DFS;
+    // dependency-constrained Gorder is available for controlled evaluation.
     PebblingOrderGraph request_graph;
     request_graph.roots = sg.cube_request_roots_;
     request_graph.nodes.reserve(sg.cube_request_nodes_.size());
-    for (size_t request_id = 0; request_id < sg.cube_request_nodes_.size();
-         ++request_id) {
+    for (size_t request_id = 0; request_id < sg.cube_request_nodes_.size(); ++request_id) {
       const CubeRequestNode& request = sg.cube_request_nodes_[request_id];
       PebblingOrderNode node;
       node.id = request_id;
       node.stable_position = dag.topo_position(request.op);
       if (request.lhs_producer >= 0) {
-        node.predecessors.push_back(
-            static_cast<size_t>(request.lhs_producer));
+        node.predecessors.push_back(static_cast<size_t>(request.lhs_producer));
       }
       if (request.rhs_producer >= 0) {
-        node.predecessors.push_back(
-            static_cast<size_t>(request.rhs_producer));
+        node.predecessors.push_back(static_cast<size_t>(request.rhs_producer));
+      }
+      if (request.lhs_boundary_value >= 0) {
+        node.locality_values.push_back(static_cast<size_t>(request.lhs_boundary_value));
+      }
+      if (request.rhs_boundary_value >= 0) {
+        node.locality_values.push_back(static_cast<size_t>(request.rhs_boundary_value));
       }
       request_graph.nodes.push_back(std::move(node));
     }
-    const std::vector<size_t> request_order = ComputePebblingOrder(
-        PebblingOrderKind::DfsPostOrder, request_graph);
+    const std::vector<size_t> request_order = ComputePebblingOrder(kDefaultPebblingOrderKind, request_graph);
     if (request_order.size() != sg.cube_request_nodes_.size()) {
       return std::nullopt;
     }
@@ -1773,53 +1800,26 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     }
     sg.cube_request_nodes_ = std::move(ordered_requests);
 
-    // Canonicalize external requests after the recursive request DAG is
-    // complete. Equal value ids mean equal tensor region and compatible Mat
-    // representation. Port is load-bearing: A used as both sides of A@A is two
-    // values because the LHS/RHS layouts and downstream pools differ.
-    using BoundaryKey = std::tuple<size_t, int, int, int>;
-    std::map<BoundaryKey, size_t> boundary_ids;
     std::vector<PebblingValueEvent> boundary_events;
-    auto bind_boundary = [&](CubeRequest& request, CubeOperandRole role,
-                             size_t step, int64_t& value_slot) {
-      const BoundaryKey key{request.tensor,
-                            static_cast<int>(request.height_binding),
-                            static_cast<int>(request.width_binding),
-                            static_cast<int>(role)};
-      auto [it, inserted] =
-          boundary_ids.emplace(key, sg.cube_boundary_values_.size());
-      if (inserted) {
-        CubeBoundaryValue value;
-        value.request = request;
-        value.role = role;
-        sg.cube_boundary_values_.push_back(value);
-      }
-      value_slot = static_cast<int64_t>(it->second);
-      boundary_events.push_back(
-          {it->second, step, PebblingValueEventKind::Use});
-    };
     for (size_t step = 0; step < sg.cube_request_nodes_.size(); ++step) {
       CubeRequestNode& node = sg.cube_request_nodes_[step];
-      if (node.lhs_producer < 0) {
-        bind_boundary(node.lhs, CubeOperandRole::Lhs, step,
-                      node.lhs_boundary_value);
+      if (node.lhs_boundary_value >= 0) {
+        boundary_events.push_back(
+            {static_cast<size_t>(node.lhs_boundary_value), step, PebblingValueEventKind::Use});
       }
-      if (node.rhs_producer < 0) {
-        bind_boundary(node.rhs, CubeOperandRole::Rhs, step,
-                      node.rhs_boundary_value);
+      if (node.rhs_boundary_value >= 0) {
+        boundary_events.push_back(
+            {static_cast<size_t>(node.rhs_boundary_value), step, PebblingValueEventKind::Use});
       }
     }
     const PebblingValueLifetimePlan boundary_lifetimes =
-        ComputeAlwaysRetainedValueLifetimes(sg.cube_request_nodes_.size(),
-                                             boundary_events);
+        ComputeAlwaysRetainedValueLifetimes(sg.cube_request_nodes_.size(), boundary_events);
     if (!boundary_lifetimes.valid) return std::nullopt;
-    for (const PebblingValueLifetime& lifetime :
-         boundary_lifetimes.lifetimes) {
+    for (const PebblingValueLifetime& lifetime : boundary_lifetimes.lifetimes) {
       if (lifetime.value_id >= sg.cube_boundary_values_.size()) {
         return std::nullopt;
       }
-      CubeBoundaryValue& value =
-          sg.cube_boundary_values_[lifetime.value_id];
+      CubeBoundaryValue& value = sg.cube_boundary_values_[lifetime.value_id];
       value.first_use = lifetime.first_live_step;
       value.last_use = lifetime.last_use_step;
       value.use_count = lifetime.use_count;
@@ -1868,6 +1868,31 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // positions and transient membership do not. This replaces three local
     // vectors plus an interval-expansion loop in every vector_peak_ub() call.
     std::vector<bool> is_ub_band(num_tensors, false);
+
+    // Boundary inputs participate in the same first-use/last-use pebbling
+    // game as produced intermediates. The generic emitter creates one cached
+    // GM->UB slice per input for a strip replay, so a shared input remains live
+    // across every intervening source op. Treating it as a transient only at
+    // its consumers under-counts exactly that emitted lifetime.
+    std::vector<PebblingValueEvent> boundary_input_events;
+    for (size_t step = 0; step < sg.dfs_order_.size(); ++step) {
+      const Op& op = prob.ops[sg.dfs_order_[step]];
+      if (op.type == OpType::MatMul) continue;
+      for (size_t input : op.inputs) {
+        if (sg.boundary_inputs_.count(input) != 0) {
+          boundary_input_events.push_back({input, step, PebblingValueEventKind::Use});
+        }
+      }
+    }
+    const PebblingValueLifetimePlan boundary_input_lifetimes =
+        ComputeAlwaysRetainedValueLifetimes(sg.dfs_order_.size(), boundary_input_events);
+    if (!boundary_input_lifetimes.valid) return std::nullopt;
+    for (const PebblingValueLifetime& lifetime : boundary_input_lifetimes.lifetimes) {
+      sg.vector_ub_band_intervals_.push_back(
+          {lifetime.value_id, lifetime.first_live_step, lifetime.last_use_step + 1, kSkipAnyRetained});
+      is_ub_band[lifetime.value_id] = true;
+    }
+
     for (size_t tensor : sg.ephemeral_) {
       const int producer = dag.tensor_producer[tensor];
       if (producer >= 0 && prob.ops[(size_t)producer].type == OpType::MatMul)
@@ -1883,8 +1908,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
           last_consumer = std::max(last_consumer, step);
       }
       if (last_consumer < 0) continue;
-      sg.vector_ub_band_intervals_.push_back(
-          {tensor, (size_t)first_step, (size_t)last_consumer + 1});
+      sg.vector_ub_band_intervals_.push_back({tensor, (size_t)first_step, (size_t)last_consumer + 1, 0});
       is_ub_band[tensor] = true;
     }
 
@@ -1894,27 +1918,21 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       const Op& op = prob.ops[op_idx];
       if (op.type != OpType::MatMul) {
         for (size_t input : op.inputs) {
-          if (!is_ub_band[input])
-            sg.vector_ub_transient_refs_.push_back(
-                {input, kSkipAnyRetained});
+          if (!is_ub_band[input]) sg.vector_ub_transient_refs_.push_back({input, kSkipAnyRetained});
         }
         // Reduction lowering owns a distinct work/layout tile even when the
         // source is already a live or retained band.
         if (op.type == OpType::Reduction && !op.inputs.empty())
           sg.vector_ub_transient_refs_.push_back({op.inputs[0], 0});
         const size_t output = op.output();
-        if (!is_ub_band[output])
-          sg.vector_ub_transient_refs_.push_back({output, kSkipRetainThese});
+        if (!is_ub_band[output]) sg.vector_ub_transient_refs_.push_back({output, kSkipRetainThese});
       }
-      sg.vector_ub_transient_offsets_.push_back(
-          sg.vector_ub_transient_refs_.size());
+      sg.vector_ub_transient_offsets_.push_back(sg.vector_ub_transient_refs_.size());
     }
 
     std::vector<uint8_t> vector_op_phase_mask(num_ops, 0);
-    std::vector<uint8_t> vector_input_phase_mask(num_tensors, 0);
     for (size_t op : sg.ops_)
-      if (prob.ops[op].type != OpType::MatMul)
-        vector_op_phase_mask[op] |= kVectorPhaseBody;
+      if (prob.ops[op].type != OpType::MatMul) vector_op_phase_mask[op] |= kVectorPhaseBody;
 
     if (sg.has_reduction_) {
       FlatSet<size_t> reduction_ops;
@@ -1949,25 +1967,44 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         mark_cone(sink_ops, substitutions, kVectorPhaseFinalize);
     }
 
-    for (size_t op : sg.ops_) {
-      if (prob.ops[op].type == OpType::MatMul) continue;
-      const uint8_t phases = vector_op_phase_mask[op];
-      for (size_t input : prob.ops[op].inputs) {
-        const int producer = dag.tensor_producer[input];
-        if (producer < 0 || !is_in_sg[(size_t)producer])
-          vector_input_phase_mask[input] |= phases;
-      }
-    }
-
+    auto input_topology = std::make_shared<VectorInputLifetimeTopology>();
     for (size_t phase_idx = 0; phase_idx < kVectorPhases.size(); ++phase_idx) {
       const uint8_t phase = kVectorPhases[phase_idx];
       for (size_t op : sg.dfs_order_)
-        if ((vector_op_phase_mask[op] & phase) != 0)
-          sg.vector_phase_ops_[phase_idx].push_back(op);
-      for (size_t tensor : sg.boundary_inputs_)
-        if ((vector_input_phase_mask[tensor] & phase) != 0)
-          sg.vector_phase_inputs_[phase_idx].push_back(tensor);
+        if ((vector_op_phase_mask[op] & phase) != 0) sg.vector_phase_ops_[phase_idx].push_back(op);
+
+      // Canonical vector identity is the source tensor itself: unlike cube
+      // LHS/RHS Mat operands, every use in one homogeneous vector phase has
+      // the same shape, dtype and UB representation. Phase is load-bearing,
+      // because barrier-separated stats/apply passes intentionally reload.
+      std::vector<PebblingValueEvent> events;
+      std::map<size_t, std::vector<VectorInputUsePlan>> uses_by_tensor;
+      for (size_t step = 0; step < sg.vector_phase_ops_[phase_idx].size(); ++step) {
+        const size_t op_idx = sg.vector_phase_ops_[phase_idx][step];
+        const Op& op = prob.ops[op_idx];
+        for (size_t arg = 0; arg < op.inputs.size(); ++arg) {
+          const size_t tensor = op.inputs[arg];
+          if (sg.boundary_inputs_.count(tensor) == 0) continue;
+          events.push_back({tensor, step, PebblingValueEventKind::Use});
+          uses_by_tensor[tensor].push_back({op_idx, arg});
+        }
+      }
+      const PebblingValueLifetimePlan lifetimes =
+          ComputeAlwaysRetainedValueLifetimes(sg.vector_phase_ops_[phase_idx].size(), events);
+      if (!lifetimes.valid) return std::nullopt;
+      for (const PebblingValueLifetime& lifetime : lifetimes.lifetimes) {
+        VectorInputLifetimePlan input;
+        input.tensor = lifetime.value_id;
+        input.phase = static_cast<VectorReplayPhase>(phase_idx);
+        input.first_use_step = lifetime.first_live_step;
+        input.last_use_step = lifetime.last_use_step;
+        input.use_count = lifetime.use_count;
+        input.uses = uses_by_tensor.at(lifetime.value_id);
+        input_topology->phases[phase_idx].push_back(std::move(input));
+        sg.vector_phase_inputs_[phase_idx].push_back(lifetime.value_id);
+      }
     }
+    sg.vector_input_lifetime_topology_ = std::move(input_topology);
   }
 
   // Build the mixed stage DAG once. Same-engine dependency edges form maximal
@@ -3158,6 +3195,9 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     std::fill_n(band_delta, order.size() + 1, 0);
   }
   for (const VectorUBBandInterval& interval : vector_ub_band_intervals_) {
+    if ((interval.skip_mask & kSkipRetainedFromPrev) != 0 && retained_from_prev.count(interval.tensor) != 0)
+      continue;
+    if ((interval.skip_mask & kSkipRetainThese) != 0 && retain_these.count(interval.tensor) != 0) continue;
     const int64_t bytes = tile_bytes(interval.tensor);
     band_delta[interval.first] += bytes;
     band_delta[interval.after_last] -= bytes;
@@ -3204,6 +3244,8 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these) const {
   VectorStreamPlan plan;
+  plan.input_lifetimes = vector_input_lifetime_topology_;
+  if (!plan.input_lifetimes) return plan;
   const int64_t budget = (int64_t)prob_->vec_capacity;
   const int64_t output_dtb = boundary_outputs_.empty()
                                  ? vector_min_dtype_bytes_
@@ -3276,13 +3318,15 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       TileConfig strip_cfg = logical_cfg;
       strip_cfg.h = sh;
       strip_cfg.w = sw;
-      const int64_t source_peak =
-          vector_peak_ub(strip_cfg, retained_from_prev, retain_these);
+      const int64_t source_peak = vector_peak_ub(strip_cfg, retained_from_prev, retain_these);
       int64_t next_iteration_inputs = 0;
-      for (size_t tensor : boundary_inputs_) {
-        next_iteration_inputs += planned_tile_bytes(
-            tensor, sh, sw, reduced_extent_ > 0 ? reduced_extent_ : std::max(sh, sw),
-            /*stream_axis=*/0);
+      const auto& body_inputs =
+          plan.input_lifetimes->phases[vector_replay_phase_index(VectorReplayPhase::Body)];
+      for (const VectorInputLifetimePlan& input : body_inputs) {
+        const size_t tensor = input.tensor;
+        next_iteration_inputs +=
+            planned_tile_bytes(tensor, sh, sw, reduced_extent_ > 0 ? reduced_extent_ : std::max(sh, sw),
+                               /*stream_axis=*/0);
       }
       return source_peak + next_iteration_inputs;
     };
@@ -3428,22 +3472,32 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
 
     auto exact_chunk_peak = [&](int64_t chunk) {
       const int64_t aligned_chunk = align_up(chunk, vector_emit_granule_);
-      const int64_t source_peak = vector_peak_ub(
-          logical_cfg, retained_from_prev, retain_these, chunk, plan.axis);
+      const int64_t source_peak =
+          vector_peak_ub(logical_cfg, retained_from_prev, retain_these, chunk, plan.axis);
       // These are emitter-generated accumulator/assemble/online-stat bands,
       // separate from the source-DAG lifetime replay above. Their values use
       // the widest participating dtype; source tensors retain their individual
       // dtypes in vector_peak_ub.
       const int64_t generated_scratch =
-          extra_bands * plan.free_tile_alloc * aligned_chunk *
-          vector_max_dtype_bytes_;
+          extra_bands * plan.free_tile_alloc * aligned_chunk * vector_max_dtype_bytes_;
       int64_t next_iteration_inputs = 0;
       if (has_pipeline) {
         const int64_t tile_h = plan.axis == 1 ? plan.free_tile_alloc : aligned_chunk;
         const int64_t tile_w = plan.axis == 1 ? aligned_chunk : plan.free_tile_alloc;
-        for (size_t tensor : boundary_inputs_)
-          next_iteration_inputs +=
-              planned_tile_bytes(tensor, tile_h, tile_w, chunk, plan.axis);
+        auto phase_input_bytes = [&](VectorReplayPhase phase) {
+          int64_t bytes = 0;
+          for (const VectorInputLifetimePlan& input :
+               plan.input_lifetimes->phases[vector_replay_phase_index(phase)]) {
+            bytes += planned_tile_bytes(input.tensor, tile_h, tile_w, chunk, plan.axis);
+          }
+          return bytes;
+        };
+        if (stats_stages == 2)
+          next_iteration_inputs =
+              std::max(next_iteration_inputs, phase_input_bytes(VectorReplayPhase::Stats));
+        if (apply_stages == 2)
+          next_iteration_inputs =
+              std::max(next_iteration_inputs, phase_input_bytes(VectorReplayPhase::Apply));
       }
       return source_peak + generated_scratch + next_iteration_inputs;
     };
@@ -4237,8 +4291,13 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
                (double)strip_n * (double)dtype_bytes(tensor.dtype);
       };
       auto input_cycles = [&](uint8_t phase, int64_t covered_extent, int64_t chunks) {
+        if (!vector_stream.input_lifetimes) {
+          return std::numeric_limits<double>::infinity();
+        }
         double cycles = 0.0;
-        for (size_t tensor : vector_phase_inputs_[VectorPhaseIndex(phase)]) {
+        const auto& inputs = vector_stream.input_lifetimes->phases[VectorPhaseIndex(phase)];
+        for (const VectorInputLifetimePlan& input : inputs) {
+          const size_t tensor = input.tensor;
           if (retained_from_prev.count(tensor)) continue;
           const double bytes = reduction_streams ? streamed_tensor_bytes(tensor, covered_extent, chunks)
                                                  : body_tensor_bytes(tensor);

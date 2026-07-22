@@ -62,10 +62,10 @@ class SubgraphStructure {
   // Live-out roots — terminal ops plus producers of required function outputs.
   [[nodiscard]] const std::vector<size_t>& sinks() const { return sinks_; }
 
-  // Fixed depth-first (post-order) execution order over ops: the pebbling order
-  // the cost model evaluates the working-set peak along, and the order emitted
-  // with the solution. Deterministic (topo-position tie-break) so the cost
-  // cache keys on it.
+  // Fixed selected execution order over ops: the pebbling order the cost model
+  // evaluates the working-set peak along, and the order emitted with the
+  // solution. Deterministic so the cost cache keys on it. The member retains
+  // its legacy `dfs_order_` name while DFS remains the default strategy.
   [[nodiscard]] const std::vector<size_t>& execution_order() const { return dfs_order_; }
 
  private:

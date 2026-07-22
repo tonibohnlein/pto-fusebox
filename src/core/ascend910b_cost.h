@@ -125,14 +125,12 @@ public:
   // For pure-PW subgraphs: 1 (no K dimension).
   int64_t output_K() const { return output_K_; }
 
-  // Fixed depth-first execution order over this subgraph's ops (post-order DFS
-  // from the sinks, each op after its in-subgraph producers). This is the
-  // pebbling order: peak working set is evaluated along it, and it is emitted
-  // with the solution because the peak depends on it. (Optimizing the order is
-  // black-pebbling = PSPACE-complete; one DFS post-order is the accepted
-  // heuristic — optimal for chains/trees, good for diamonds.) Empty until
-  // create() populates it.
-  const std::vector<size_t> &execution_order() const { return dfs_order_; }
+  // Fixed selected producer-before-consumer execution order over this
+  // subgraph's ops. This is the pebbling order: peak working set is evaluated
+  // along it, and it is emitted with the solution because the peak depends on
+  // it. DFS remains default; dependency-constrained Gorder is experimental.
+  // Empty until create() populates it.
+  const std::vector<size_t>& execution_order() const { return dfs_order_; }
 
   // Op id of the boundary-output MatMul (the sink whose contraction may be
   // parallel-split across cores), or -1 if the subgraph has none. Its emitted
@@ -426,6 +424,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
     size_t tensor = 0;
     size_t first = 0;
     size_t after_last = 0;
+    uint8_t skip_mask = 0;
   };
   struct VectorUBTransientRef {
     size_t tensor = 0;
@@ -436,6 +435,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<size_t> vector_ub_transient_offsets_;
   std::array<std::vector<size_t>, 4> vector_phase_ops_;
   std::array<std::vector<size_t>, 4> vector_phase_inputs_;
+  std::shared_ptr<const VectorInputLifetimeTopology> vector_input_lifetime_topology_;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).
@@ -465,14 +465,15 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<size_t> reverse_topo_ops_;
   std::vector<bool> is_sink_op_vec_;
 
-  // Depth-first topological execution order (see execution_order()). Fixed at
-  // construction; drives the peak-working-set sweep and the emitted schedule.
+  // Selected topological execution order (see execution_order()). Fixed at
+  // construction; drives the peak-working-set sweep and emitted schedule. The
+  // member keeps its legacy name while DFS remains the default.
   std::vector<size_t> dfs_order_;
 
-  // Pure-cube request instances, in producer-before-consumer DFS order. This is
-  // the topology/role template shared by feasibility, costing, and the final
-  // CubeSchedulePlan reconstruction; it is built once per subgraph, not once
-  // per enumerated TileConfig.
+  // Pure-cube request instances, in the selected producer-before-consumer
+  // order. This topology/role template is shared by feasibility, costing, and
+  // final CubeSchedulePlan reconstruction; it is built once per subgraph, not
+  // once per enumerated TileConfig.
   std::vector<CubeRequestNode> cube_request_nodes_;
   std::vector<CubeBoundaryValue> cube_boundary_values_;
   std::vector<size_t> cube_request_roots_;
