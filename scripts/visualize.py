@@ -929,16 +929,17 @@ def _build_cube_algorithm_dot(
         f'fillcolor="{color}", penwidth=1.6, margin=0.2];'
     )
     previous = "Title"
-    seed = plan.get("seed", {})
-    if seed.get("present"):
-        seed_label = (
-            "separate AIV split-K seed\n"
-            f"{seed['work_units']} UB-safe zero stores\n"
-            "not part of the cube tile pipeline"
+    split = plan.get("first_partial_then_atomic", {})
+    if split.get("present"):
+        split_label = (
+            "ordered split-K merge\n"
+            f"phase 1 · {split['first_work_units']} AIC tasks · share 0 → normal store\n"
+            f"dependency boundary · {split.get('synchronization_cycles', 0)} modeled cycles\n"
+            f"phase 2 · {split['atomic_work_units']} AIC tasks · remaining shares → atomic add"
         )
-        lines.append(_flow_node("Seed", seed_label, "#ffd8c2", penwidth=1.4))
-        lines.append("    Title:s -> Seed:n;")
-        previous = "Seed"
+        lines.append(_flow_node("SplitMerge", split_label, "#ffd8c2", penwidth=1.4))
+        lines.append("    Title:s -> SplitMerge:n;")
+        previous = "SplitMerge"
 
     last_use = _cube_last_uses(plan)
     result_nodes: dict[int, str] = {}

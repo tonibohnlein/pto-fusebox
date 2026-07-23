@@ -587,6 +587,23 @@ static void test_two_matmul() {
     // recompute and can LOSE -- see test_fusion_decision_matrix; the correct outcome.)
     CHECK("2MM: chained (fat sink) fused < M1+M2 (keeps intermediate on-chip)",
           fused < m1 + m2 - 0.5);
+    {
+        // Fixed-grid anchor for the serial request contract. Both requests may
+        // overlap their own K-window feed with their own cube work, but the
+        // producer's final drain and the consumer request remain additive.
+        TileConfig cfg;
+        cfg.w = 64;
+        cfg.h = 128;
+        cfg.k = 256;
+        cfg.parts_m = 2;
+        cfg.parts_n = 2;
+        cfg.split_k = 1;
+        const auto fixed = Subgraph::create(p, dag, {0, 1})->compute_cost(cfg);
+        CHECK("2MM: serial fixed-grid request composition is feasible",
+              fixed.feasible && std::isfinite(fixed.latency));
+        CHECK_EQ("2MM: serial fixed-grid sums request-local phase roofs",
+                 fixed.latency, 36653.1, 1.0);
+    }
     // Per-matmul COMPUTE accounting: in a compute-bound regime (latency ~= compute)
     // the fused kernel does BOTH matmuls' fractals, so it cannot undercut either part
     // (the old bug scaled all compute by the narrower sink output -> fused < M1). The
@@ -792,11 +809,11 @@ static void test_two_pool_working_set() {
 // That pypto test fixes the L0-LEVEL tiling for a thin matmul: output tile
 // [16,64] in the Acc/L0c, the K=2048 contraction tiled by the 16-fractal, run
 // SINGLE-core sequentially (tile.matmul -> tile.matmul_acc K-loop). Our solver
-// works one level UP (DDR->L1, multi-core): for the same thin matmul it keeps
-// the whole [16,64] output as ONE tile and SPLIT-Ks the contraction across the
-// 24 cube cores. The two compose: our cross-core split-K partial, then pypto's
-// per-core fractal K-loop inside each core. So our solver ADDS the parallelism
-// the single-core L0 pass cannot express; they don't conflict.
+// works one level UP (DDR->L1, multi-core). FirstPartialThenAtomic makes a
+// cross-core split pay two ordered launch walls, so this shape may instead
+// partition N spatially and keep the full contraction in each work unit. The
+// later L0 pass still chooses its own inner K loop; the two levels do not
+// conflict.
 static void test_pypto_l0_comparison() {
     std::cout << "[PYPTO] test_auto_tile_matmul_l0 matmul (M16 N64 K2048) vs our solver\n";
     // out[N=64, M=16] = A[K=2048, M=16] @ B[N=64, K=2048]; base = per-native FLOPs.
@@ -810,24 +827,19 @@ static void test_pypto_l0_comparison() {
     std::cout << "    our solver (DDR->L1)   : out tile[" << r.config.w << "," << r.config.h
               << "] k=" << r.config.k << " spatial=" << r.num_spatial_tiles
               << " split-K=" << r.parallel_split << " cores=" << r.cores_used << "\n";
-    // Thin output (16x64) << 24 cores => our level parallelizes via split-K.
-    CHECK("PYPTO: our solver split-Ks the thin L0 matmul across cube cores", r.parallel_split > 1);
-    // BSP model: the split-K merge is an additive tail S*out_store, so the solver
-    // spreads a LITTLE spatially (here a few tiles) to halve the partial count S and
-    // shrink the tail, rather than putting the whole output in one tile and
-    // split-K'ing it 24 ways. Under the realistic HBM cap (gml1_multicore) extra split-K
-    // can't lower the capped feed, so it saturates HBM below 24 cores (here 12). The
-    // invariant is that it PARALLELIZES (spatial x split) and clears the HBM read floor,
-    // not that it rigidly fills 24 cores.
+    CHECK("PYPTO: serialized split merge may prefer pure spatial ownership",
+          r.parallel_split == 1 && r.num_spatial_tiles > 1);
+    // The invariant is that the outer schedule parallelizes within the HBM
+    // budget and never assumes affinity or fractional tasks.
     CHECK("PYPTO: solver parallelizes within the HBM-bound core budget",
           r.cores_used > 1 && r.cores_used <= 24
           && r.latency + 1e-6 >= hbm_read_floor(p, 16, 64, 2048,
                                                 p.tensors[0].dtype, p.tensors[1].dtype));
-    // Three k-levels now compose: OUR DDR->L1 k-tile (largest k whose operand
-    // strips fit L1, < full K=2048), then AutoTileMatmulL0's 16-fractal K-loop
-    // inside each core, then the hardware. So our k is L1-bounded, not full K.
-    CHECK("PYPTO: our k is L1-tiled at the DDR->L1 level (16 <= k < K)",
-          r.config.k >= 16 && r.config.k < 2048);
+    // The outer K window may be full K when the spatial N region makes both
+    // panels fit. AutoTileMatmulL0 still subdivides it independently.
+    CHECK("PYPTO: outer K window is positive, bounded, and L1-feasible",
+          r.config.k >= 16 && r.config.k <= 2048 &&
+              r.config.k * (r.config.w + r.config.h) * 4 <= p.l1_capacity);
 }
 
 // --- sweep output shape: spatial parallelism vs split-K transition -----------
@@ -848,24 +860,20 @@ static void test_sweep_matmul_dims() {
         CHECK("SWEEP: split-K factor is non-increasing as output grows", s <= prev_split);
         prev_split = s;
     }
-    // Tiny 16x16 output = 1 fractal tile << 24 cores -> heavy split-K. As the
-    // output grows the solver fills the cores SPATIALLY (with big L1-bounded
-    // tiles), so the split factor falls sharply. A huge 4096x4096 reaches pure
-    // spatial (>=24 big tiles, split=1).
+    // A short K=512 does not amortize FirstPartialThenAtomic's ordered launch,
+    // so even the tiny output stays S=1. A huge output is also pure spatial.
     auto ps = mk_mm(16, 16, 512, 16384 * 512);
     auto pl = mk_mm(4096, 4096, 512, 16384 * 512);
     int split_tiny = Subgraph::create(ps, DAG::build(ps), {0})->best_cost().parallel_split;
     int split_huge = Subgraph::create(pl, DAG::build(pl), {0})->best_cost().parallel_split;
-    CHECK("SWEEP: tiny 16x16 output split-Ks heavily across cores", split_tiny > 1);
-    CHECK("SWEEP: split-K falls sharply as output grows (huge << tiny)", split_huge < split_tiny);
-    // Thin output (64x64 = 16 native-16 tiles < 24 cores) with LARGE K: spatial
-    // sub-tiling can't fill the cores, so split-K is required. (128x128 = 64 tiles
-    // would fill spatially under the BSP model and take split=1 — large K raises
-    // COMPUTE, keeping it compute-bound and spatial, not split-K.)
-    auto pk = mk_mm(64, 64, 8192, 2400000);
+    CHECK("SWEEP: short-K tiny output avoids an unamortized split launch",
+          split_tiny == 1);
+    CHECK("SWEEP: huge output is pure spatial", split_huge == 1);
+    // A deep contraction can still amortize the ordered phase boundary.
+    auto pk = mk_mm(128, 128, 8192, 16384 * 512);
     int sk = Subgraph::create(pk, DAG::build(pk), {0})->best_cost().parallel_split;
-    std::cout << "    64x64 K=8192 -> split=" << sk << "\n";
-    CHECK("SWEEP: 64x64 thin output, large K -> split-K fills cores", sk > 1);
+    std::cout << "    128x128 K=8192 -> split=" << sk << "\n";
+    CHECK("SWEEP: deep K amortizes FirstPartialThenAtomic", sk > 1);
     // A LARGE matmul gets a big DDR<->L1 tile (operand strips fill L1, NOT the
     // L0c accumulator — that sub-tiling is the later L1->L0 pass). So the output
     // tile can exceed L0c; only small outputs are forced small.
@@ -1804,8 +1812,8 @@ static void test_model_ahead_split_k_flag() {
               analytic.feasible && analytic.parallel_split == 2 && analytic.uses_model_ahead_split_k);
         CHECK("MIXBUILD: base buildable forces S=1 despite cfg.split_k=2 (flag respected)",
               buildable.feasible && buildable.parallel_split == 1 && !buildable.uses_model_ahead_split_k);
-        CHECK("MIXBUILD: base analytic <= buildable (the gated split only helps)",
-              analytic.latency <= buildable.latency);
+        CHECK("MIXBUILD: the fixed split is a distinct serialized algorithm",
+              std::abs(analytic.latency - buildable.latency) > 1e-9);
     }
     // (2) mixed cube-sink v->c (the MIXSPLIT shape): split-Ks the sole sink matmul.
     {
@@ -2731,7 +2739,31 @@ static void test_cube_schedule_plan() {
       CHECK("CUBEPLAN/lone-split-window: cost and reconstructed plan agree",
             cost.feasible && cost.parallel_split == 2 && cost.config.k == 32 && plan.feasible &&
                 plan.config.k == 32 && plan.matmuls.size() == 1 && plan.matmuls[0].k_loop.l1_window_k == 32 &&
-                plan.matmuls[0].k_loop.pipeline_stages == 2);
+                plan.matmuls[0].k_loop.pipeline_stages == 2 &&
+                plan.split_merge_policy ==
+                    CubeSplitMergePolicy::FirstPartialThenAtomic &&
+                plan.first_partial_then_atomic.present &&
+                plan.first_partial_then_atomic.first_work_units ==
+                    plan.spatial_tiles &&
+                plan.first_partial_then_atomic.atomic_work_units ==
+                    plan.spatial_tiles * (plan.split_k - 1));
+
+      auto sync_problem = p;
+      sync_problem.cube_split_sync_cycles = 137;
+      DAG sync_dag = DAG::build(sync_problem);
+      auto sync_sg = Subgraph::create(sync_problem, sync_dag, {0});
+      auto sync_cost = sync_sg->compute_cost(cfg);
+      CHECK("CUBEPLAN/lone-split-window: explicit split synchronization is additive",
+            sync_cost.feasible &&
+                std::abs(sync_cost.latency - cost.latency - 137.0) < 1e-9);
+
+      auto invalid_problem = p;
+      invalid_problem.cube_split_sync_cycles = -1;
+      DAG invalid_dag = DAG::build(invalid_problem);
+      auto invalid_sg =
+          Subgraph::create(invalid_problem, invalid_dag, {0});
+      CHECK("CUBEPLAN/lone-split-window: negative synchronization declines",
+            invalid_sg && !invalid_sg->compute_cost(cfg).feasible);
     }
 
     // Left-deep chain: producer-before-consumer order, an internal per-op K
@@ -3010,9 +3042,12 @@ static void test_chain_ksplit_variants() {
     CHECK("KVAR/internal-k: sink still runs full K", ink.k1 == ink.N1);
     // (3) PARALLEL k-split: sink output too small to fill cores -> split across
     // cores. Operands fit L1, so neither matmul seq-slices.
-    auto par = run(64, 128, 512, 64, 1000);
-    // THE bug trigger: intermediate T is [N1=512, M] — 8x wider than the sink
-    // C [N2=64, M]. The emitted w must tile the 64-wide sink, NOT the 512 intermediate.
+    auto par = run(16, 128, 512, 16, 1000);
+    // THE bug trigger: intermediate T is [N1=512, M] — 32x wider than the sink
+    // C [N2=16, M]. The emitted w must tile the 16-wide sink, NOT the 512 intermediate.
+    // Keeping only one spatial fractal makes the intended split-K regime
+    // decisive after serial request-local phase costs replaced the optimistic
+    // cross-request global roofline.
     CHECK("KVAR/parallel-k: spatial tile within sink output (NOT the wider intermediate)",
           grid_within_output(par));
     CHECK("KVAR/parallel-k: sink parallel-split across cores", par.split > 1);
@@ -3471,8 +3506,6 @@ static void test_matmul_sensibility() {
         auto C = [&](const char* what, bool ok) {
             snprintf(b, sizeof b, "MMSENS/%s: %s", c.tag, what); CHECK(b, ok);
         };
-        // total atomic 16^3 fractals; <24 would justify fewer cores (none here).
-        const int64_t fractals = (c.M / 16) * (c.N / 16) * (c.K / 16);
         C("feasible", std::isfinite(r.latency));
         C("k divides K", r.config.k > 0 && c.K % r.config.k == 0);
         C("L1 strip within 512KB",
@@ -3484,8 +3517,10 @@ static void test_matmul_sensibility() {
         C("respects HBM aggregate read floor",
           r.latency + 1e-6 >= hbm_read_floor(p, c.M, c.N, c.K,
                                              p.tensors[0].dtype, p.tensors[1].dtype));
+        const int64_t spatial_fractals = (c.M / 16) * (c.N / 16);
         C("parallelizes within the 24 cube cores",
-          r.cores_used >= 1 && r.cores_used <= 24 && (fractals < 24 || r.cores_used > 1));
+          r.cores_used >= 1 && r.cores_used <= 24 &&
+              (spatial_fractals < 24 || r.cores_used > 1));
         C("split-K only when spatial tiles < cores",
           r.parallel_split == 1 || r.num_spatial_tiles < 24);
     }

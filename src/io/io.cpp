@@ -140,6 +140,14 @@ static const char* cube_spatial_policy_name(CubeSpatialPolicy policy) {
     return "unknown";
 }
 
+static const char* cube_split_merge_policy_name(CubeSplitMergePolicy policy) {
+    switch (policy) {
+        case CubeSplitMergePolicy::None: return "none";
+        case CubeSplitMergePolicy::FirstPartialThenAtomic: return "first_partial_then_atomic";
+    }
+    return "unknown";
+}
+
 static json cube_region_json(const CubeTensorRegionPlan& region) {
     return {{"tensor", region.tensor},
             {"height_binding", cube_axis_binding_name(region.height_binding)},
@@ -457,6 +465,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("per_task_overhead_cycles")) {
         p.per_task_overhead_cycles = j["per_task_overhead_cycles"].get<int64_t>();
     }
+    if (j.contains("cube_split_sync_cycles")) {
+        p.cube_split_sync_cycles = j["cube_split_sync_cycles"].get<int64_t>();
+    }
     // Grounded pto-isa machine model (optional; absent => legacy placeholders).
     if (j.contains("cube_freq_hz")) p.cube_freq_hz = j["cube_freq_hz"].get<double>();
     if (j.contains("bw_gm_l1"))     p.bw_gm_l1     = j["bw_gm_l1"].get<double>();
@@ -749,13 +760,18 @@ std::string solution_json(const Solution& sol) {
                                           {"split_k", cube_plan.split_k},
                                           {"work_units", cube_plan.work_units},
                                           {"peak_l1_bytes", cube_plan.peak_l1_bytes},
-                                          {"seed_required", cube_plan.seed_required},
-                                          {"seed",
-                                           {{"present", cube_plan.seed.present},
-                                            {"work_units", cube_plan.seed.work_units},
-                                            {"valid_rows", cube_plan.seed.valid_rows},
-                                            {"valid_cols", cube_plan.seed.valid_cols},
-                                            {"bytes", cube_plan.seed.bytes}}},
+                                          {"split_merge_policy",
+                                           cube_split_merge_policy_name(
+                                               cube_plan.split_merge_policy)},
+                                          {"first_partial_then_atomic",
+                                           {{"present", cube_plan.first_partial_then_atomic.present},
+                                            {"first_work_units",
+                                             cube_plan.first_partial_then_atomic.first_work_units},
+                                            {"atomic_work_units",
+                                             cube_plan.first_partial_then_atomic.atomic_work_units},
+                                            {"synchronization_cycles",
+                                             cube_plan.first_partial_then_atomic
+                                                 .synchronization_cycles}}},
                                           {"model_overlap_granted", cube_plan.model_overlap_granted},
                                           {"overlap_implementable", cube_plan.overlap_implementable},
                                           {"matmuls", matmuls}});

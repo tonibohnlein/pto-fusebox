@@ -151,7 +151,8 @@ fan-out roles. For buildable uniform cube plans, traffic follows the emitted out
 GM K window is loaded once for every output tile that consumes it. Thus a second N tile reloads its
 LHS unless a future plan explicitly represents a retained-panel lifetime. Produced intermediates
 cost zero GM traffic but occupy L1. A final Acc→L1/GM drain is charged once per output tile, using
-the stored dtype; split-K additionally charges the explicit seed launch and atomic root stores.
+the stored dtype. Split-K serializes a normal-store share-zero phase before the remaining
+atomic-add shares and charges both launch walls.
 
 The outer phase composition is local, not a subgraph-wide roofline:
 
@@ -506,7 +507,7 @@ Among equal-latency configs, lexicographic:
   bounded ranking/calibration issue, not a task-count, traffic, or emitted-grid mismatch.
 - **Pure-cube plan buildability.** AutoFuse emits uniform multi-matmul grids from
   `CubeSchedulePlan`, including exact output-tile variants, sequential K streams, one final drain,
-  and split seed/atomic stores. Unequal multi-op grids and identical deduplicated boundary requests
+  and ordered first-partial/atomic-rest split stores. Unequal multi-op grids and identical deduplicated boundary requests
   are declined. Lone split=1 ceil+clamp is an explicit `ClampedOverlap` plan and charges every
   maximum-shape task; ragged split-K declines because overlapping atomic owners are invalid.
   Sub-fractal valid M/N edge variants decline identically in analytic and exact compiler modes until

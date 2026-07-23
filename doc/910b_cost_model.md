@@ -147,8 +147,17 @@ final        = one Acc->L1/GM drain
 ```
 
 Only an actual stage-2 rolled phase receives `max`; first/tail/final work is additive. Up to four
-ragged output variants carry exact counts. The split seed is a separate vector fill/store/task
-phase and contributes another kernel-fill wave.
+ragged output variants carry exact counts. Split-K uses two ordered AIC phases:
+
+```
+first     = wall(spatial_tiles, share=0, normal store)
+atomic    = wall(spatial_tiles * (S-1), shares=1..S-1, atomic add)
+split     = first + atomic + cube_split_sync_cycles
+```
+
+The two launch walls are always additive. Each contributes its own kernel-fill waves.
+`cube_split_sync_cycles` is a separate zero-default boundary term reserved for later silicon
+calibration; it never substitutes for phase serialization.
 
 ---
 
@@ -159,7 +168,7 @@ Two mechanisms must remain distinct:
 | mechanism | scope | merge |
 |---|---|---|
 | sequential K streaming | every matmul request instance | persistent local accumulator |
-| parallel split-K | the single supported root only | zero seed + atomic-add GM stores |
+| parallel split-K | the single supported root only | first partial normal-store + remaining atomic-add GM stores |
 
 Sequential K changes memory feasibility and overlap but not mathematical work. Parallel split-K
 creates `parts_m × parts_n × S` independent work units, shrinks the root K request, and multiplies
@@ -184,7 +193,7 @@ and returns:
 - L1 K window, emitted chunk, rolled trips, tail, and pipeline stage;
 - output/L0C variants with shared-backend init/rolled/tail child plans;
 - one explicit final Acc→L1/GM drain;
-- the split seed plus overlap/buildability flags.
+- the `FirstPartialThenAtomic` launch sizes, synchronization hook, and overlap/buildability flags.
 
 The plan is intentionally absent from `CostResult`, which is stored in the local-search cache. The
 topology is built once per subgraph; O(nodes) candidate derivations remain stack-local. This keeps

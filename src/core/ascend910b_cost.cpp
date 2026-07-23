@@ -738,8 +738,11 @@ double WaveComputeCycles(double total_compute, int64_t num_work_units,
 // unit wave would optimistically ignore the +-1-fractal region imbalance).
 template <typename RegionWork>
 double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
-                   RegionWork region_work, int64_t ksplit = 1) {
+                   RegionWork region_work, int64_t ksplit = 1,
+                   int64_t task_copies = -1) {
   ksplit = std::max<int64_t>(1, ksplit);
+  task_copies =
+      task_copies < 0 ? ksplit : std::max<int64_t>(0, task_copies);
   const int64_t m_sizes[2] = {pm.big, pm.small};
   const int64_t m_cnts[2] = {pm.num_big, pm.parts - pm.num_big};
   const int64_t n_sizes[2] = {pn.big, pn.small};
@@ -750,7 +753,8 @@ double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition
       const int64_t cnt = m_cnts[a] * n_cnts[b];
       if (cnt <= 0 || m_sizes[a] <= 0 || n_sizes[b] <= 0) continue;
       const double work = region_work(m_sizes[a], n_sizes[b]) / (double)ksplit;
-      for (int64_t i = 0; i < cnt * ksplit; ++i) regions.push_back(work);
+      for (int64_t i = 0; i < cnt * task_copies; ++i)
+        regions.push_back(work);
     }
   std::sort(regions.begin(), regions.end(), [](double x, double y) { return x > y; });
   std::vector<double> load(std::max<int64_t>(1, n_cores), 0.0);
@@ -772,8 +776,11 @@ double LptMakespan(int64_t n_cores, const AxisPartition& pm, const AxisPartition
 // unit repeats and ParallelK-bound work whose M or N extent actually shrinks.
 template <typename RegionWork>
 double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
-                          RegionWork region_work, int64_t ksplit) {
+                          RegionWork region_work, int64_t ksplit,
+                          int64_t task_copies = -1) {
   ksplit = std::max<int64_t>(1, ksplit);
+  task_copies =
+      task_copies < 0 ? ksplit : std::max<int64_t>(0, task_copies);
   const int64_t m_sizes[2] = {pm.big, pm.small};
   const int64_t m_counts[2] = {pm.num_big, pm.parts - pm.num_big};
   const int64_t n_sizes[2] = {pn.big, pn.small};
@@ -784,7 +791,8 @@ double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPa
       const int64_t count = m_counts[mi] * n_counts[ni];
       if (count <= 0 || m_sizes[mi] <= 0 || n_sizes[ni] <= 0) continue;
       const double work = region_work(m_sizes[mi], n_sizes[ni], ksplit);
-      for (int64_t i = 0; i < count * ksplit; ++i) regions.push_back(work);
+      for (int64_t i = 0; i < count * task_copies; ++i)
+        regions.push_back(work);
     }
   }
   std::sort(regions.begin(), regions.end(), [](double lhs, double rhs) { return lhs > rhs; });
@@ -797,6 +805,57 @@ double LptMakespanPerUnit(int64_t n_cores, const AxisPartition& pm, const AxisPa
     load[least] += work;
   }
   return *std::max_element(load.begin(), load.end());
+}
+
+// The phase-aware counterpart used by the serial analytic cube path. Schedule
+// each concrete region once by its wall cost, while carrying the diagnostic
+// pipe totals of the same critical core into CostResult. This avoids four
+// independent rescans of a request DAG and keeps latency/DDR tie-breaks on one
+// emitted work-unit assignment.
+template <typename RegionCost>
+CubeMatmulPhaseCost LptPhaseMakespanPerUnit(
+    int64_t n_cores, const AxisPartition& pm, const AxisPartition& pn,
+    RegionCost region_cost, int64_t ksplit, int64_t task_copies = -1) {
+  ksplit = std::max<int64_t>(1, ksplit);
+  task_copies =
+      task_copies < 0 ? ksplit : std::max<int64_t>(0, task_copies);
+  const int64_t m_sizes[2] = {pm.big, pm.small};
+  const int64_t m_counts[2] = {pm.num_big, pm.parts - pm.num_big};
+  const int64_t n_sizes[2] = {pn.big, pn.small};
+  const int64_t n_counts[2] = {pn.num_big, pn.parts - pn.num_big};
+  std::vector<CubeMatmulPhaseCost> regions;
+  for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+      const int64_t count = m_counts[mi] * n_counts[ni];
+      if (count <= 0 || m_sizes[mi] <= 0 || n_sizes[ni] <= 0) continue;
+      const CubeMatmulPhaseCost cost =
+          region_cost(m_sizes[mi], n_sizes[ni], ksplit);
+      for (int64_t i = 0; i < count * task_copies; ++i)
+        regions.push_back(cost);
+    }
+  }
+  std::sort(regions.begin(), regions.end(),
+            [](const CubeMatmulPhaseCost& lhs,
+               const CubeMatmulPhaseCost& rhs) {
+              return lhs.wall > rhs.wall;
+            });
+  std::vector<CubeMatmulPhaseCost> load(
+      std::max<int64_t>(1, n_cores));
+  for (const CubeMatmulPhaseCost& cost : regions) {
+    size_t least = 0;
+    for (size_t core = 1; core < load.size(); ++core) {
+      if (load[core].wall < load[least].wall) least = core;
+    }
+    load[least].wall += cost.wall;
+    load[least].compute += cost.compute;
+    load[least].ddr += cost.ddr;
+    load[least].l1_l0 += cost.l1_l0;
+  }
+  return *std::max_element(
+      load.begin(), load.end(),
+      [](const CubeMatmulPhaseCost& lhs, const CubeMatmulPhaseCost& rhs) {
+        return lhs.wall < rhs.wall;
+      });
 }
 
 }  // namespace
@@ -2742,7 +2801,7 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.config = cfg;
   const int64_t split = std::max<int64_t>(1, parallel_split);
   if (!has_matmul_ || has_vector_ || cube_request_nodes_.empty() || !is_valid_tiling(cfg) ||
-      output_K_ % split != 0) {
+      output_K_ % split != 0 || prob_->cube_split_sync_cycles < 0) {
     return plan;
   }
 
@@ -2790,20 +2849,18 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
   plan.peak_l1_bytes = prob_->use_hierarchical_cube_cost ? 0 : peak;
-  plan.seed_required = split > 1;
+  plan.split_merge_policy =
+      split > 1 ? CubeSplitMergePolicy::FirstPartialThenAtomic
+                : CubeSplitMergePolicy::None;
+  plan.first_partial_then_atomic.present = split > 1;
+  plan.first_partial_then_atomic.first_work_units =
+      split > 1 ? plan.spatial_tiles : 0;
+  plan.first_partial_then_atomic.atomic_work_units =
+      split > 1 ? plan.spatial_tiles * (split - 1) : 0;
+  plan.first_partial_then_atomic.synchronization_cycles =
+      split > 1 ? static_cast<double>(prob_->cube_split_sync_cycles) : 0.0;
   plan.model_overlap_granted = false;
   plan.overlap_implementable = false;
-  if (plan.seed_required && !boundary_outputs_.empty()) {
-    const DType output_dtype = prob_->tensors[*boundary_outputs_.begin()].dtype;
-    const int64_t bytes = dtype_bytes(output_dtype);
-    const int64_t seed_h = std::min(
-        m_extent, std::max<int64_t>(1, prob_->vec_capacity / std::max<int64_t>(1, n_extent * bytes)));
-    plan.seed.present = true;
-    plan.seed.work_units = ((out_H_ + seed_h - 1) / seed_h) * parts_n;
-    plan.seed.valid_rows = seed_h;
-    plan.seed.valid_cols = n_extent;
-    plan.seed.bytes = plan.seed.work_units * seed_h * n_extent * bytes;
-  }
 
   std::vector<int64_t> last_use(cube_request_nodes_.size(), -1);
   FlatSet<size_t> roots(cube_request_roots_.begin(), cube_request_roots_.end());
@@ -2910,6 +2967,14 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     const DType output_dtype = prob_->tensors[mm.output.tensor].dtype;
     mm.accumulator_dtype = cube_accumulator_dtype(lhs_dtype);
     mm.storage_dtype = output_dtype;
+    // FirstPartialThenAtomic publishes the first root partial directly and
+    // merges later shares with SetAtomicAdd. Both phases therefore need the GM
+    // output to carry the hardware accumulator dtype without an intervening
+    // narrowing conversion.
+    if (mm.is_sink && split > 1 &&
+        mm.storage_dtype != mm.accumulator_dtype) {
+      plan.emit_compatible = false;
+    }
     const bool has_chunked_carry = mm.k_loop.full_chunks >= 2;
     const int64_t init_k = has_chunked_carry ? mm.k_loop.chunk : mm.effective_contraction;
     auto derive_variant = [&](int64_t tile_m, int64_t tile_n) {
@@ -2988,8 +3053,10 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     add_variant(tail_m, tail_n, 1);
 
     // Every output tile has one and only one post-K-loop drain. Internal
-    // request values drain Acc->Mat and live in L1; roots drain Acc->GM (atomic
-    // for split-K). No phase may perform a Mat->Acc reload.
+    // request values drain Acc->Mat and live in L1; roots drain Acc->GM. For
+    // split-K the first ordered phase uses a normal store and only the
+    // remaining phase uses this descriptor's atomic form. No phase may perform
+    // a Mat->Acc reload.
     mm.final_drain.required = true;
     mm.final_drain.target_l1 = !mm.is_sink;
     mm.final_drain.atomic = mm.is_sink && split > 1;
@@ -3784,9 +3851,10 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
   result.config = cfg;
   VectorStreamPlan vector_stream;
   std::vector<int64_t> cube_window_k;
-  int64_t cube_seed_fill_rounds = 0;
+  int64_t cube_split_extra_fill_rounds = 0;
 
   if (!is_valid_tiling(cfg)) return result;
+  if (prob_->cube_split_sync_cycles < 0) return result;
   if (has_matmul_) {
     if (has_vector_) {
       if (!fits_on_chip(cfg, retained_from_prev, retain_these)) return result;
@@ -3886,6 +3954,31 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         return phase_d ? work : std::max(mac_pipe, extract_pipe);
       };
 
+      auto one_request_pipes = [&](const CubeRequestNode& node, int64_t m_ext,
+                                   int64_t n_ext, int64_t split,
+                                   int64_t k_override, bool phase_d) {
+        const Tensor& output = prob_->tensors[node.output.tensor];
+        const int64_t m = cube_binding_extent(
+            node.output.height_binding, output.height, m_ext, n_ext, split);
+        const int64_t n = cube_binding_extent(
+            node.output.width_binding, output.width, m_ext, n_ext, split);
+        const int64_t full_k =
+            node.parallel_sink ? op_K(node.op) / split : op_K(node.op);
+        const int64_t k =
+            k_override > 0 ? std::min(k_override, full_k) : full_k;
+        const DType dtype =
+            prob_->tensors[prob_->ops[node.op].inputs[0]].dtype;
+        const double mac = CubeMacCycles(prob_, m, n, k, dtype);
+        const double extract = CubeExtractCycles(prob_, bc, m, n, k, dtype);
+        if (!phase_d) return std::max(mac, extract);
+        const int64_t stages = std::max<int64_t>(
+            1, ((m + l0m - 1) / l0m) * ((n + l0n - 1) / l0n) *
+                   ((k + 63) / 64));
+        return (mac + extract + static_cast<double>(stages - 1) *
+                                    std::max(mac, extract)) /
+               static_cast<double>(stages);
+      };
+
       // Double-buffer floor: the max(compute, ddr) overlap is only real when the
       // operand reload can ping-pong, i.e. the per-core contraction is halvable
       // into >=2 seq-K sub-strips (>= 32 = two K-fractals; the emit's implicit
@@ -3939,10 +4032,10 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         return true;
       };
       // Sink split-K: split the sink contraction into S per-tile partials to
-      // recruit idle cores. The output write-back grows to S partials (L0C->GM via
-      // FixPipe, SetAtomicAdd — each core writes independently, no merge barrier),
-      // but that store pipe OVERLAPS the operand feed, so split-K only pays for the
-      // writes once S*store exceeds the feed (max, not sum).
+      // recruit idle cores. Share zero publishes with a normal L0C->GM drain;
+      // after that ordered phase, shares 1..S-1 use SetAtomicAdd. Each phase may
+      // overlap its own store pipe with operand feed, but the two phase walls
+      // are additive.
       //
       // S is a FIRST-CLASS design axis (like w,h): more cores cut compute (and,
       // until HBM saturates, the per-core-divided operand feed) while the S output
@@ -3954,15 +4047,32 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
       const int64_t kfrac = std::max<int64_t>(1, output_K_ / 16);
       // Evaluate one split factor S (>=1). S=1 is the spatial-only roofline; S>=2
       // splits the sink contraction into S equal 16-aligned partials (each owns
-      // output_K_/S), writing the output S times (S atomic-add partials).
+      // output_K_/S), writing the output once normally and S-1 times atomically.
       struct SplitEval {
         double lat, compute, ddr, active, l1l0;
-        int64_t seed_fill_rounds = 0;
+        int64_t extra_fill_rounds = 0;
       };
       auto eval_S = [&](int64_t S) -> SplitEval {
         S = std::max<int64_t>(1, S);
         const int64_t unitsS = (int64_t)num_tiles * S;
         const double activeS = (double)std::min<int64_t>(unitsS, n_cores);
+        const int64_t first_units = num_tiles;
+        const int64_t atomic_units = num_tiles * (S - 1);
+        const double first_active =
+            static_cast<double>(std::min<int64_t>(first_units, n_cores));
+        const double atomic_active =
+            static_cast<double>(std::min<int64_t>(atomic_units, n_cores));
+        const double active_peak = std::max(first_active, atomic_active);
+        const int64_t pooled_rounds =
+            (unitsS + n_cores - 1) / n_cores;
+        const int64_t first_rounds =
+            (first_units + n_cores - 1) / n_cores;
+        const int64_t atomic_rounds =
+            atomic_units > 0 ? (atomic_units + n_cores - 1) / n_cores : 0;
+        const int64_t extra_fill_rounds =
+            first_rounds + atomic_rounds - pooled_rounds;
+        const double split_sync =
+            S > 1 ? static_cast<double>(prob_->cube_split_sync_cycles) : 0.0;
 
         // Buildable cube candidates use the same hierarchical descriptor as
         // emission. Output/L0C tiles are outer to GM->L1 K windows; each child
@@ -4003,87 +4113,121 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
           if (!schedule.feasible || !schedule.emit_compatible) {
             return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
           }
-          const double gm_read_scale = activeS / par(activeS, prob_->bw_gm_l1);
-          const double gm_write_scale = activeS / par(activeS, prob_->bw_l0c_gm);
-          double unit_wall = 0.0;
-          double unit_compute = 0.0;
-          double unit_ddr = 0.0;
-          double unit_l1l0 = 0.0;
-          // Cross-request resident boundary values are loaded once per work
-          // unit before their first consumer. This serial prologue is separate
-          // from each matmul's K-window roofline; the latter sees only local
-          // L1 extracts from the resident panel.
-          for (const CubeResidentBoundaryPlan& resident :
-               schedule.resident_boundaries) {
-            const double preload = static_cast<double>(resident.bytes) *
-                                   bc.reload * gm_read_scale;
-            unit_wall += preload;
-            unit_ddr += preload;
+          auto phase_cost = [&](int64_t work_units) {
+            CubeMatmulPhaseCost phase;
+            if (work_units <= 0) return phase;
+            const double active = static_cast<double>(
+                std::min<int64_t>(work_units, n_cores));
+            const double gm_read_scale =
+                active / par(active, prob_->bw_gm_l1);
+            const double gm_write_scale =
+                active / par(active, prob_->bw_l0c_gm);
+            double unit_wall = 0.0;
+            double unit_compute = 0.0;
+            double unit_ddr = 0.0;
+            double unit_l1l0 = 0.0;
+            // Cross-request resident boundary values are loaded once per work
+            // unit before their first consumer. This serial prologue is
+            // separate from each matmul's K-window roofline; the latter sees
+            // only local L1 extracts from the resident panel.
+            for (const CubeResidentBoundaryPlan& resident :
+                 schedule.resident_boundaries) {
+              const double preload =
+                  static_cast<double>(resident.bytes) * bc.reload *
+                  gm_read_scale;
+              unit_wall += preload;
+              unit_ddr += preload;
+            }
+            for (const CubeMatmulSchedule& mm : schedule.matmuls) {
+              const CubeMatmulPhaseCost phases = CostCubeMatmulPhases(
+                  prob_, bc, gm_read_scale, gm_write_scale, mm);
+              unit_wall += phases.wall;
+              unit_compute += phases.compute;
+              unit_ddr += phases.ddr;
+              unit_l1l0 += phases.l1_l0;
+            }
+            const int64_t waves =
+                (work_units + n_cores - 1) / n_cores;
+            phase.wall = static_cast<double>(waves) * unit_wall;
+            phase.compute = static_cast<double>(waves) * unit_compute;
+            phase.ddr = static_cast<double>(waves) * unit_ddr;
+            phase.l1_l0 = static_cast<double>(waves) * unit_l1l0;
+            return phase;
+          };
+
+          int64_t first_units = unitsS;
+          int64_t atomic_units = 0;
+          double synchronization = 0.0;
+          if (schedule.first_partial_then_atomic.present) {
+            first_units =
+                schedule.first_partial_then_atomic.first_work_units;
+            atomic_units =
+                schedule.first_partial_then_atomic.atomic_work_units;
+            synchronization =
+                schedule.first_partial_then_atomic.synchronization_cycles;
           }
-          for (const CubeMatmulSchedule& mm : schedule.matmuls) {
-            const CubeMatmulPhaseCost phases =
-                CostCubeMatmulPhases(prob_, bc, gm_read_scale, gm_write_scale, mm);
-            unit_wall += phases.wall;
-            unit_compute += phases.compute;
-            unit_ddr += phases.ddr;
-            unit_l1l0 += phases.l1_l0;
-          }
-          const int64_t waves = (unitsS + n_cores - 1) / n_cores;
-          double latency = static_cast<double>(waves) * unit_wall;
-          double compute = static_cast<double>(waves) * unit_compute;
-          double ddr = static_cast<double>(waves) * unit_ddr;
-          double l1l0 = static_cast<double>(waves) * unit_l1l0;
-          int64_t seed_rounds = 0;
-          if (schedule.seed.present) {
-            const double seed_active =
-                static_cast<double>(std::min<int64_t>(schedule.seed.work_units, prob_->num_vector_cores));
-            const double seed_compute_work =
-                static_cast<double>(schedule.seed.work_units) *
-                GroundedVectorFillCycles(schedule.seed.valid_rows, schedule.seed.valid_cols);
-            const double seed_compute =
-                WaveComputeCycles(seed_compute_work, schedule.seed.work_units, prob_->num_vector_cores);
-            const double seed_store =
-                static_cast<double>(schedule.seed.bytes) * bc.ub_out / par(seed_active, prob_->bw_ub_gm);
-            latency += seed_compute + seed_store +
-                       static_cast<double>(schedule.seed.work_units * prob_->per_task_overhead_cycles);
-            compute += seed_compute;
-            ddr += seed_store;
-            seed_rounds = (schedule.seed.work_units + prob_->num_vector_cores - 1) / prob_->num_vector_cores;
-          }
-          return {latency, compute, ddr, activeS, l1l0, seed_rounds};
+          const CubeMatmulPhaseCost first = phase_cost(first_units);
+          const CubeMatmulPhaseCost atomic = phase_cost(atomic_units);
+          const int64_t first_rounds =
+              (first_units + n_cores - 1) / n_cores;
+          const int64_t atomic_rounds =
+              atomic_units > 0 ? (atomic_units + n_cores - 1) / n_cores
+                               : 0;
+          const int64_t pooled_rounds =
+              (unitsS + n_cores - 1) / n_cores;
+          const int64_t extra_rounds =
+              first_rounds + atomic_rounds - pooled_rounds;
+          return {first.wall + atomic.wall + synchronization,
+                  first.compute + atomic.compute,
+                  first.ddr + atomic.ddr,
+                  std::max(
+                      static_cast<double>(
+                          std::min<int64_t>(first_units, n_cores)),
+                      static_cast<double>(
+                          std::min<int64_t>(atomic_units, n_cores))),
+                  first.l1_l0 + atomic.l1_l0, extra_rounds};
         }
 
         double computeS = 0.0;
-        if (cfg.parts_m > 0) {
-          computeS = clamped_overlap_grid
-                         ? WaveComputeCycles(
-                               request_pipes(g_pm.big, g_pn.big, /*split=*/1,
-                                             /*phase_d=*/true) *
-                                   static_cast<double>(unitsS),
-                               unitsS, n_cores)
-                         : lone_matmul ? LptMakespan(
-                                            n_cores, g_pm, g_pn,
-                                            [&](int64_t m, int64_t n) {
-                                              return request_pipes(m, n, /*split=*/1,
-                                                                   /*phase_d=*/true);
-                                            },
-                                            S)
-                                 : LptMakespanPerUnit(
-                                       n_cores, g_pm, g_pn,
-                                       [&](int64_t m, int64_t n, int64_t split) {
-                                         return request_pipes(m, n, split,
-                                                              /*phase_d=*/true);
-                                       },
-                                       S);
-        } else {
+        auto compute_phase = [&](int64_t copies) {
+          if (copies <= 0) return 0.0;
+          const int64_t phase_units = num_tiles * copies;
+          if (cfg.parts_m > 0) {
+            if (clamped_overlap_grid) {
+              return WaveComputeCycles(
+                  request_pipes(g_pm.big, g_pn.big, /*split=*/1,
+                                /*phase_d=*/true) *
+                      static_cast<double>(phase_units),
+                  phase_units, n_cores);
+            }
+            if (lone_matmul) {
+              return LptMakespan(
+                  n_cores, g_pm, g_pn,
+                  [&](int64_t m, int64_t n) {
+                    return request_pipes(m, n, /*split=*/1,
+                                         /*phase_d=*/true);
+                  },
+                  S, copies);
+            }
+            return LptMakespanPerUnit(
+                n_cores, g_pm, g_pn,
+                [&](int64_t m, int64_t n, int64_t split) {
+                  return request_pipes(m, n, split, /*phase_d=*/true);
+                },
+                S, copies);
+          }
           const int64_t work_split = lone_matmul ? 1 : S;
-          const int64_t copies = lone_matmul ? num_tiles : unitsS;
-          computeS =
-              WaveComputeCycles(request_pipes(std::min(cfg.h, out_H_), std::min(cfg.w, out_W_), work_split,
-                                              /*phase_d=*/false) *
-                                    static_cast<double>(copies),
-                                unitsS, n_cores);
-        }
+          double per_task = request_pipes(
+              std::min(cfg.h, out_H_), std::min(cfg.w, out_W_),
+              work_split, /*phase_d=*/false);
+          if (lone_matmul) per_task /= static_cast<double>(S);
+          return WaveComputeCycles(
+              per_task * static_cast<double>(phase_units), phase_units,
+              n_cores);
+        };
+        const double first_compute = compute_phase(1);
+        const double atomic_compute = compute_phase(S - 1);
+        computeS = first_compute + atomic_compute;
         double reload_lhs = 0.0;
         double reload_rhs = 0.0;
         double write_bytes = static_cast<double>(S) * out_store;
@@ -4111,12 +4255,284 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         // writes as independent aggregate groups, so they OVERLAP -- the cube DDR
         // term is max(feed, writes), NOT their sum. Each is per-core-divided +
         // HBM-capped at its own peak (S=1 => a single output store).
-        const double feed   = reload * bc.reload / par(activeS, prob_->bw_gm_l1);
-        const double writes = write_bytes * bc.store / par(activeS, prob_->bw_l0c_gm);
-        const double ddrS = std::max(feed, writes);
-        // Double-buffer floor: K/S < 32 (< 2 K-fractals) can't ping-pong -> serialize.
-        const double latS = db_roofline(computeS, ddrS, overlap_implementable(S));
-        return {latS, computeS, ddrS, activeS, reload_lhs * bc.l0a + reload_rhs * bc.l0b, 0};
+        auto phase_ddr = [&](int64_t copies, double active) {
+          if (copies <= 0) return 0.0;
+          const double fraction =
+              static_cast<double>(copies) / static_cast<double>(S);
+          const double phase_feed =
+              reload * fraction * bc.reload /
+              par(active, prob_->bw_gm_l1);
+          const double phase_writes =
+              write_bytes * fraction * bc.store /
+              par(active, prob_->bw_l0c_gm);
+          return std::max(phase_feed, phase_writes);
+        };
+        const double first_ddr = phase_ddr(1, first_active);
+        const double atomic_ddr =
+            phase_ddr(S - 1, std::max(1.0, atomic_active));
+        double ddrS = first_ddr + atomic_ddr;
+        double l1l0S = reload_lhs * bc.l0a + reload_rhs * bc.l0b;
+        double latS = 0.0;
+        if (lone_matmul) {
+          // The lone request owns the whole emitted K-window loop, so the
+          // phase-local roofline is already request-local. Split-K's first
+          // normal-store phase must complete before the atomic-rest phase.
+          const bool overlap = overlap_implementable(S);
+          latS = db_roofline(first_compute, first_ddr, overlap) +
+                 db_roofline(atomic_compute, atomic_ddr, overlap);
+        } else {
+          // The emitter completes every request before starting a dependent
+          // successor. Each request may pipeline its own K-window ring, but a
+          // group-global max(compute, DDR) would invent producer/consumer
+          // overlap and underprice both lifetimes and wall time.
+          std::vector<int64_t> derived_windows;
+          const std::vector<int64_t>* windows = &cube_window_k;
+          if (S != configured_split) {
+            const int64_t sink_k = output_K_ / S;
+            if (derive_exec(cfg, sink_k, retained_from_prev, retain_these,
+                            &derived_windows) == INT64_MAX) {
+              return {std::numeric_limits<double>::infinity(), 0.0, 0.0,
+                      activeS, 0.0, 0};
+            }
+            windows = &derived_windows;
+          }
+
+          double gm_read_scale = 1.0;
+          double gm_write_scale = 1.0;
+          auto set_phase_scales = [&](double active) {
+            active = std::max(1.0, active);
+            gm_read_scale = active / par(active, prob_->bw_gm_l1);
+            gm_write_scale = active / par(active, prob_->bw_l0c_gm);
+          };
+          const FlatSet<size_t> roots(cube_request_roots_.begin(),
+                                      cube_request_roots_.end());
+
+          auto resident_preload = [&](int64_t m_ext, int64_t n_ext,
+                                      int64_t split) {
+            double bytes = 0.0;
+            for (const CubeBoundaryValue& value : cube_boundary_values_) {
+              if (!value.resident()) continue;
+              const Tensor& tensor = prob_->tensors[value.request.tensor];
+              const int64_t h = cube_binding_extent(
+                  value.request.height_binding, tensor.height, m_ext, n_ext,
+                  split);
+              const int64_t w = cube_binding_extent(
+                  value.request.width_binding, tensor.width, m_ext, n_ext,
+                  split);
+              bytes += static_cast<double>(h * w * dtype_bytes(tensor.dtype));
+            }
+            return bytes * bc.reload * gm_read_scale;
+          };
+
+          // The analytic mode deliberately retains its fixed base L0 tile,
+          // but traffic follows the emitter's output-tile-outer loop: LHS is
+          // reloaded for each N tile and RHS for each M tile unless a boundary
+          // value is explicitly group-resident.
+          auto request_feed = [&](const CubeRequestNode& node, int64_t m_ext,
+                                  int64_t n_ext, int64_t split,
+                                  int64_t k_extent) {
+            const Tensor& output = prob_->tensors[node.output.tensor];
+            const int64_t m = cube_binding_extent(
+                node.output.height_binding, output.height, m_ext, n_ext,
+                split);
+            const int64_t n = cube_binding_extent(
+                node.output.width_binding, output.width, m_ext, n_ext,
+                split);
+            const bool lhs_resident =
+                node.lhs_boundary_value >= 0 &&
+                cube_boundary_values_[static_cast<size_t>(
+                    node.lhs_boundary_value)]
+                    .resident();
+            const bool rhs_resident =
+                node.rhs_boundary_value >= 0 &&
+                cube_boundary_values_[static_cast<size_t>(
+                    node.rhs_boundary_value)]
+                    .resident();
+            double bytes = 0.0;
+            if (node.lhs_producer < 0 && !lhs_resident) {
+              bytes += static_cast<double>(
+                  m * k_extent *
+                  dtype_bytes(prob_->tensors[node.lhs.tensor].dtype) *
+                  ((n + l0n - 1) / l0n));
+            }
+            if (node.rhs_producer < 0 && !rhs_resident) {
+              bytes += static_cast<double>(
+                  k_extent * n *
+                  dtype_bytes(prob_->tensors[node.rhs.tensor].dtype) *
+                  ((m + l0m - 1) / l0m));
+            }
+            return bytes * bc.reload * gm_read_scale;
+          };
+
+          auto request_drain = [&](size_t node_idx, int64_t m_ext,
+                                   int64_t n_ext, int64_t split) {
+            const CubeRequestNode& node = cube_request_nodes_[node_idx];
+            const Tensor& output = prob_->tensors[node.output.tensor];
+            const int64_t m = cube_binding_extent(
+                node.output.height_binding, output.height, m_ext, n_ext,
+                split);
+            const int64_t n = cube_binding_extent(
+                node.output.width_binding, output.width, m_ext, n_ext,
+                split);
+            const int64_t tile_m = std::min(l0m, m);
+            const int64_t tile_n = std::min(l0n, n);
+            const int64_t full_m = m / tile_m;
+            const int64_t full_n = n / tile_n;
+            const int64_t tail_m = m % tile_m;
+            const int64_t tail_n = n % tile_n;
+            L0MatmulConfig config = prob_->l0_matmul_config;
+            config.bytes_c = dtype_bytes(output.dtype);
+            const bool root = roots.count(node_idx) != 0;
+            const L0OutputTarget target =
+                root ? L0OutputTarget::GM : L0OutputTarget::L1;
+            double cycles = 0.0;
+            auto add = [&](int64_t h, int64_t w, int64_t count) {
+              if (h <= 0 || w <= 0 || count <= 0) return;
+              cycles += static_cast<double>(count) *
+                        estimate_l0_output_drain_cycles(h, w, config, target);
+            };
+            add(tile_m, tile_n, full_m * full_n);
+            add(tail_m, tile_n, full_n);
+            add(tile_m, tail_n, full_m);
+            add(tail_m, tail_n, 1);
+            return root ? cycles * gm_write_scale : cycles;
+          };
+
+          auto region_cost = [&](int64_t m_ext, int64_t n_ext,
+                                 int64_t split) {
+            CubeMatmulPhaseCost cost;
+            const double preload = resident_preload(m_ext, n_ext, split);
+            cost.wall += preload;
+            cost.ddr += preload;
+            for (size_t node_idx = 0;
+                 node_idx < cube_request_nodes_.size(); ++node_idx) {
+              const CubeRequestNode& node = cube_request_nodes_[node_idx];
+              const int64_t extent =
+                  node.parallel_sink ? op_K(node.op) / split : op_K(node.op);
+              int64_t window =
+                  node_idx < windows->size() && (*windows)[node_idx] > 0
+                      ? (*windows)[node_idx]
+                      : extent;
+              window = std::min(window, extent);
+              const bool lhs_streams =
+                  node.lhs_producer < 0 &&
+                  !(node.lhs_boundary_value >= 0 &&
+                    cube_boundary_values_[static_cast<size_t>(
+                        node.lhs_boundary_value)]
+                        .resident());
+              const bool rhs_streams =
+                  node.rhs_producer < 0 &&
+                  !(node.rhs_boundary_value >= 0 &&
+                    cube_boundary_values_[static_cast<size_t>(
+                        node.rhs_boundary_value)]
+                        .resident());
+              const int64_t chunk =
+                  lhs_streams || rhs_streams
+                      ? CubePipelinedChunk(extent, window)
+                      : 0;
+              if (chunk > 0) {
+                const int64_t full_chunks = extent / chunk;
+                const int64_t tail = extent - full_chunks * chunk;
+                const double inner = one_request_pipes(
+                    node, m_ext, n_ext, split, chunk, true);
+                const double feed_chunk = request_feed(
+                    node, m_ext, n_ext, split, chunk);
+                cost.wall += KWindowStreamWall(
+                    full_chunks, /*pipeline_stages=*/2, feed_chunk, inner,
+                    feed_chunk, inner);
+                cost.compute += static_cast<double>(full_chunks) * inner;
+                cost.ddr += static_cast<double>(full_chunks) * feed_chunk;
+                if (tail > 0) {
+                  const double tail_inner = one_request_pipes(
+                      node, m_ext, n_ext, split, tail, true);
+                  const double tail_feed = request_feed(
+                      node, m_ext, n_ext, split, tail);
+                  cost.wall += tail_inner + tail_feed;
+                  cost.compute += tail_inner;
+                  cost.ddr += tail_feed;
+                }
+              } else {
+                const double inner = one_request_pipes(
+                    node, m_ext, n_ext, split, extent, true);
+                const double request_ddr = request_feed(
+                    node, m_ext, n_ext, split, extent);
+                cost.wall += inner + request_ddr;
+                cost.compute += inner;
+                cost.ddr += request_ddr;
+              }
+
+              const Tensor& output = prob_->tensors[node.output.tensor];
+              const int64_t m = cube_binding_extent(
+                  node.output.height_binding, output.height, m_ext, n_ext,
+                  split);
+              const int64_t n = cube_binding_extent(
+                  node.output.width_binding, output.width, m_ext, n_ext,
+                  split);
+              const DType dtype =
+                  prob_->tensors[prob_->ops[node.op].inputs[0]].dtype;
+              cost.l1_l0 += CubeExtractCycles(
+                  prob_, bc, m, n, extent, dtype);
+
+              const double drain =
+                  request_drain(node_idx, m_ext, n_ext, split);
+              cost.wall += drain;
+              if (roots.count(node_idx) != 0) {
+                cost.ddr += drain;
+              } else {
+                cost.compute += drain;
+              }
+            }
+            return cost;
+          };
+
+          CubeMatmulPhaseCost group_cost;
+          if (cfg.parts_m > 0) {
+            set_phase_scales(first_active);
+            const CubeMatmulPhaseCost first =
+                LptPhaseMakespanPerUnit(n_cores, g_pm, g_pn, region_cost,
+                                        S, /*task_copies=*/1);
+            CubeMatmulPhaseCost atomic;
+            if (S > 1) {
+              set_phase_scales(atomic_active);
+              atomic = LptPhaseMakespanPerUnit(
+                  n_cores, g_pm, g_pn, region_cost, S,
+                  /*task_copies=*/S - 1);
+            }
+            group_cost.wall = first.wall + atomic.wall;
+            group_cost.compute = first.compute + atomic.compute;
+            group_cost.ddr = first.ddr + atomic.ddr;
+            group_cost.l1_l0 = first.l1_l0 + atomic.l1_l0;
+          } else {
+            set_phase_scales(first_active);
+            const CubeMatmulPhaseCost first = region_cost(
+                std::min(cfg.h, out_H_), std::min(cfg.w, out_W_), S);
+            CubeMatmulPhaseCost atomic;
+            if (S > 1) {
+              set_phase_scales(atomic_active);
+              atomic = region_cost(std::min(cfg.h, out_H_),
+                                   std::min(cfg.w, out_W_), S);
+            }
+            group_cost.wall =
+                first.wall * static_cast<double>(first_rounds) +
+                atomic.wall * static_cast<double>(atomic_rounds);
+            group_cost.compute =
+                first.compute * static_cast<double>(first_rounds) +
+                atomic.compute * static_cast<double>(atomic_rounds);
+            group_cost.ddr =
+                first.ddr * static_cast<double>(first_rounds) +
+                atomic.ddr * static_cast<double>(atomic_rounds);
+            group_cost.l1_l0 =
+                first.l1_l0 * static_cast<double>(first_rounds) +
+                atomic.l1_l0 * static_cast<double>(atomic_rounds);
+          }
+          latS = group_cost.wall;
+          computeS = group_cost.compute;
+          ddrS = group_cost.ddr;
+          l1l0S = group_cost.l1_l0;
+        }
+        latS += split_sync;
+        return {latS, computeS, ddrS, active_peak, l1l0S,
+                extra_fill_rounds};
       };
 
       // S source: a SpatialSchedule TRIPLE fixes S (cfg.split_k from the (P,Q,S)
@@ -4147,7 +4563,7 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
       result.compute_bound = chosen.compute >= chosen.ddr;
       result.ddr_traffic = chosen.ddr;
       result.l1l0_extract = chosen.l1l0;
-      cube_seed_fill_rounds = chosen.seed_fill_rounds;
+      cube_split_extra_fill_rounds = chosen.extra_fill_rounds;
       // Displayed per-core k: the greedy single-core L1-fit k (derive_exec, a
       // divisor of output_K_), capped for a split by the per-core fractal share
       // ceil(kfrac/S)*16 -- the largest divisor of output_K_ not exceeding both.
@@ -4525,7 +4941,8 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
                                             n_cores
                                       : 0;
       result.latency +=
-          (double)(rounds + seed_rounds + cube_seed_fill_rounds) * (double)prob_->kernel_fill_cost;
+          (double)(rounds + seed_rounds + cube_split_extra_fill_rounds) *
+          (double)prob_->kernel_fill_cost;
     }
   }
 

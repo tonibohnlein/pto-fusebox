@@ -208,14 +208,19 @@ struct Problem {
     // (verified to rank the three device-swept sizes correctly). Wants a tighter op-sim-vs-wall
     // clock-anchored calibration. 0 => off. Vector-only for now.
     int64_t per_task_overhead_cycles = 0;
+    // Additional ordered-phase synchronization cost for cube split-K's
+    // FirstPartialThenAtomic merge. The phase walls themselves are always
+    // serialized; this is only the boundary overhead between them. Zero keeps
+    // the term explicit without inventing an ungrounded device constant.
+    int64_t cube_split_sync_cycles = 0;
     // Double-buffering is ALWAYS assumed on 910B but does NOT reserve half the
     // pool: the two ping-pong buffers together ARE the L1/UB, so feasibility uses
     // the FULL l1_capacity / vec_capacity. The overlap is realized in the emit by
     // streaming each seq-K strip (or tile) as >=2 sub-strips -- it halves the
     // per-load k, not the resident operand. (Hence no double_buffer flag.)
-    // Split-K partials accumulate into the DDR output via SetAtomicAdd during
-    // write-back (the Ascend 910B always has it), so the merge is just the S
-    // full-tile atomic writes — no read-back + serial re-sum. This is now an
+    // Split-K first publishes share zero with an ordinary full-tile store, then
+    // the remaining S-1 partials accumulate via SetAtomicAdd after an ordered
+    // phase boundary. There is no read-back + serial re-sum. This is an
     // unconditional 910B capability; the old `ddr_atomic_add` toggle (and the
     // no-atomic-add serial-reduction cost) was removed with the legacy strip.
 
@@ -733,6 +738,8 @@ struct CubeKLoopPlan {
 struct CubeFinalDrainPlan {
   // One explicit drain after the complete K-window loop. The partial C remains
   // in L0C throughout the loop: A2/A3 supports Acc->Mat/GM but no Mat->Acc.
+  // For FirstPartialThenAtomic, `atomic` describes the atomic-rest variant;
+  // share zero overrides it with the ordinary first-partial store.
   bool required = false;
   bool target_l1 = false;
   bool atomic = false;
@@ -823,12 +830,23 @@ struct CubeMatmulSchedule {
   CubeFinalDrainPlan final_drain;
 };
 
-struct CubeSplitSeedPlan {
+enum class CubeSplitMergePolicy {
+    None,
+    FirstPartialThenAtomic,
+};
+
+// Split-K is emitted as two ordered AIC phases. The first phase assigns K share
+// zero to every spatial output region and publishes it with an ordinary store.
+// Only after that phase completes may the remaining shares atomic-add into the
+// initialized output. This removes the former AIV zero-fill kernel and records
+// the dependency that the cost model must serialize.
+struct CubeFirstPartialThenAtomicPlan {
   bool present = false;
-  int64_t work_units = 0;
-  int64_t valid_rows = 0;
-  int64_t valid_cols = 0;
-  int64_t bytes = 0;
+  int64_t first_work_units = 0;
+  int64_t atomic_work_units = 0;
+  // Explicit model hook for the phase boundary. It defaults to zero until a
+  // device experiment isolates synchronization from the two launch walls.
+  double synchronization_cycles = 0.0;
 };
 
 // How one static per-work-unit tensor shape covers the spatial output grid.
@@ -857,8 +875,8 @@ struct CubeSchedulePlan {
     int64_t split_k = 1;
     int64_t work_units = 0;
     int64_t peak_l1_bytes = 0;
-    bool seed_required = false;
-    CubeSplitSeedPlan seed;
+    CubeSplitMergePolicy split_merge_policy = CubeSplitMergePolicy::None;
+    CubeFirstPartialThenAtomicPlan first_partial_then_atomic;
     // The cost and emitter both derive this from the concrete per-request K
     // loops. Both fields are retained so validation can fail loudly if a future
     // model change grants overlap that the reconstructed loop cannot realize.
