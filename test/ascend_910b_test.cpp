@@ -12,6 +12,15 @@
 //   D  matmul->relu (mixed)    — cube->vector handoff costs DDR, not free (RED)
 //   softmax                    — reduction-chain schema; cost model is next (GREEN schema)
 
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
+#include <numeric>
+#include <thread>
+#include <vector>
+
 #include "core/ascend910b_cost.h"
 #include "core/cost_cache.h"
 #include "core/dag.h"
@@ -20,14 +29,6 @@
 #include "core/types.h"
 #include "pipeline/solver.h"
 #include "solution/solution.h"
-
-#include <cmath>
-#include <atomic>
-#include <cstdio>
-#include <iostream>
-#include <numeric>
-#include <thread>
-#include <vector>
 
 static int g_pass = 0, g_fail = 0;
 
@@ -1343,223 +1344,348 @@ static void test_mixed_schedule_plan() {
     const Tensor sq{128, 128};
     using OT = OpType;
 
-    // C->V->V has two stages, not three: the connected vector tail is one stage
-    // and only the cube output crosses GM.
-    {
-        Problem p;
-        p.tensors = {sq, sq, sq, sq, sq};
-        p.ops = {{OT::MatMul, {0, 1}, {2}},
-                 {OT::Pointwise, {2}, {3}},
-                 {OT::Pointwise, {3}, {4}}};
-        p.fast_memory_capacity = 1 << 26;
-        set_910b(p);
-        DAG dag = DAG::build(p);
-        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
-        CHECK("MIXPLAN: C->V->V group builds", (bool)mixed);
-        auto two_tiles = mixed->mixed_schedule_plan(TileConfig{128, 64, 128});
-        CHECK("MIXPLAN: C->V->V is one-way with two same-engine stages",
-              two_tiles.feasible && two_tiles.mode == MixedPipelineMode::OneWay &&
-                  two_tiles.topology && two_tiles.topology->stages.size() == 2 &&
-                  two_tiles.topology->transfers.size() == 1 &&
-                  two_tiles.topology->stages[0].ops == std::vector<size_t>({0}) &&
-                  two_tiles.topology->stages[1].ops == std::vector<size_t>({1, 2}));
-        CHECK("MIXPLAN: two global tiles occupy two groups with one trip each",
-              two_tiles.spatial_tiles == 2 &&
-                  two_tiles.loop.axis == MixedPipelineAxis::SpatialRegion &&
-                  two_tiles.loop.items_per_spatial_tile == 1 &&
-                  two_tiles.loop.active_groups == 2 &&
-                  two_tiles.loop.min_trips_per_group == 1 &&
-                  two_tiles.loop.max_trips_per_group == 1);
-        CHECK("MIXPLAN: one-trip groups receive no overlap",
-              !two_tiles.model_overlap_granted && !two_tiles.overlap_implementable);
+  // C->V->V has two stages, not three: the connected vector tail is one stage
+  // and only the cube output crosses GM.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq};
+    p.ops = {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}}, {OT::Pointwise, {3}, {4}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
+    CHECK("MIXPLAN: C->V->V group builds", (bool)mixed);
+    auto two_tiles = mixed->mixed_schedule_plan(TileConfig{128, 64, 128});
+    CHECK("MIXPLAN: C->V->V is one-way with two same-engine stages",
+          two_tiles.feasible && two_tiles.mode == MixedPipelineMode::OneWay &&
+              two_tiles.protocol == MixedCrossCoreProtocol::OneWay && two_tiles.topology &&
+              two_tiles.topology->stages.size() == 2 && two_tiles.topology->transfers.size() == 1 &&
+              two_tiles.topology->protocol.producer_stages == std::vector<size_t>({0}) &&
+              two_tiles.topology->protocol.peer_stage == 1 &&
+              two_tiles.topology->stages[0].ops == std::vector<size_t>({0}) &&
+              two_tiles.topology->stages[1].ops == std::vector<size_t>({1, 2}));
+    CHECK("MIXPLAN: two global tiles occupy two groups with one trip each",
+          two_tiles.spatial_tiles == 2 && two_tiles.loop.axis == MixedPipelineAxis::SpatialRegion &&
+              two_tiles.loop.items_per_spatial_tile == 1 && two_tiles.loop.active_groups == 2 &&
+              two_tiles.loop.min_trips_per_group == 1 && two_tiles.loop.max_trips_per_group == 1);
+    CHECK("MIXPLAN: one-trip groups receive no overlap",
+          !two_tiles.model_overlap_granted && !two_tiles.overlap_implementable);
 
-        auto forty_eight_tiles =
-            mixed->mixed_schedule_plan(TileConfig{16, 32, 128, 6, 8, 1});
-        CHECK("MIXPLAN: 48 items give every one of 24 groups two trips",
-              forty_eight_tiles.feasible && forty_eight_tiles.spatial_tiles == 48 &&
-                  forty_eight_tiles.loop.active_groups == 24 &&
-                  forty_eight_tiles.loop.min_trips_per_group == 2 &&
-                  forty_eight_tiles.loop.max_trips_per_group == 2 &&
-                  forty_eight_tiles.model_overlap_granted &&
-                  forty_eight_tiles.overlap_implementable);
+    auto forty_eight_tiles = mixed->mixed_schedule_plan(TileConfig{16, 32, 128, 6, 8, 1});
+    CHECK("MIXPLAN: 48 items give every one of 24 groups two trips",
+          forty_eight_tiles.feasible && forty_eight_tiles.spatial_tiles == 48 &&
+              forty_eight_tiles.loop.active_groups == 24 && forty_eight_tiles.loop.min_trips_per_group == 2 &&
+              forty_eight_tiles.loop.max_trips_per_group == 2 && forty_eight_tiles.model_overlap_granted &&
+              forty_eight_tiles.overlap_implementable);
+  }
+
+  // C->V->V->C remains one round trip: the two connected vector operations
+  // form one logical vector stage. They are not the two physical AIV lanes;
+  // lane splitting is a candidate-local MixedVectorSplit property.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq, sq};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::Pointwise, {2}, {3}},
+             {OT::Pointwise, {3}, {4}},
+             {OT::MatMul, {4, 1}, {5}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+    CHECK("MIXPLAN: C->V->V->C group builds", (bool)mixed);
+    if (mixed) {
+      const auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+      CHECK("MIXPLAN: connected vector ops dock as one round-trip peer stage",
+            plan.feasible && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
+                plan.topology->protocol.skew_pass_compatible && plan.topology->stages.size() == 3 &&
+                plan.topology->stages[1].engine == MixedEngine::Vector &&
+                plan.topology->stages[1].ops == std::vector<size_t>({1, 2}) &&
+                plan.topology->protocol.producer_stages == std::vector<size_t>({0}) &&
+                plan.topology->protocol.peer_stage == 1 && plan.topology->protocol.sink_stage == 2 &&
+                plan.topology->protocol.producer_bundle_transfers.size() == 1 &&
+                plan.topology->protocol.reply_bundle_transfers.size() == 1);
+    }
+  }
+
+  // Production compiler descriptor: one standard matmul followed by a
+  // same-shape elementwise epilogue.  A fixed 6x8 grid launches 24 mixed
+  // groups, each owning two successor items; UP_DOWN is an explicit
+  // two-lane algorithm and the one C->V FIFO slot is the full [32,32] tile.
+  {
+    Problem p;
+    p.tensors = {{64, 192}, {256, 64}, {256, 1}, {256, 192}, {256, 192}};
+    p.ops = {{OT::MatMul, {0, 1}, {3}}, {OT::Pointwise, {3, 2}, {4}}};
+    p.ops[1].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[1].vector_primitive = VectorPrimitiveFamily::Add;
+    p.ops[1].vector_geometry = VectorOpGeometry::Flat;
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("MIXPLAN: compiler C->V epilogue is admitted", (bool)mixed);
+    if (mixed) {
+      const auto plan = mixed->mixed_schedule_plan(TileConfig{32, 32, 64, 6, 8, 1});
+      CHECK("MIXPLAN: compiler descriptor owns groups, trips, lanes, and FIFO",
+            plan.feasible && plan.emit_compatible && plan.protocol == MixedCrossCoreProtocol::OneWay &&
+                plan.loop.active_groups == 24 && plan.loop.min_trips_per_group == 2 &&
+                plan.loop.max_trips_per_group == 2 && plan.model_overlap_granted &&
+                plan.overlap_implementable && plan.vector_split == MixedVectorSplit::Rows &&
+                plan.vector_lanes == 2 && plan.fifos.size() == 1 &&
+                plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
+                plan.fifos[0].slot_bytes == 32 * 32 * 4 && plan.fifos[0].slot_count == 8 &&
+                plan.fifos[0].reserved_bytes == 8 * 32 * 32 * 4 && plan.loop.pipeline_stages == 1);
     }
 
-    // Production compiler descriptor: one standard matmul followed by a
-    // same-shape elementwise epilogue.  A fixed 6x8 grid launches 24 mixed
-    // groups, each owning two successor items; UP_DOWN is an explicit
-    // two-lane algorithm and the one C->V FIFO slot is the full [32,32] tile.
-    {
-        Problem p;
-        p.tensors = {{64, 192}, {256, 64}, {256, 1}, {256, 192}, {256, 192}};
-        p.ops = {{OT::MatMul, {0, 1}, {3}}, {OT::Pointwise, {3, 2}, {4}}};
-        p.ops[1].vector_capability = VectorOpCapability::Elementwise;
-        p.ops[1].vector_primitive = VectorPrimitiveFamily::Add;
-        p.ops[1].vector_geometry = VectorOpGeometry::Flat;
-        p.fast_memory_capacity = 1 << 26;
-        p.fuse_cube_vector = true;
-        p.require_buildable_mixed = true;
-        set_910b(p);
-        DAG dag = DAG::build(p);
-        auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
-        CHECK("MIXPLAN: compiler C->V epilogue is admitted", (bool)mixed);
-        if (mixed) {
-            const auto plan = mixed->mixed_schedule_plan(
-                TileConfig{32, 32, 64, 6, 8, 1});
-            CHECK("MIXPLAN: compiler descriptor owns groups, trips, lanes, and FIFO",
-                  plan.feasible && plan.emit_compatible &&
-                      plan.loop.active_groups == 24 &&
-                      plan.loop.min_trips_per_group == 2 &&
-                      plan.loop.max_trips_per_group == 2 &&
-                      plan.model_overlap_granted && plan.overlap_implementable &&
-                      plan.vector_split == MixedVectorSplit::Rows &&
-                      plan.vector_lanes == 2 && plan.fifos.size() == 1 &&
-                      plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
-                      plan.fifos[0].slot_bytes == 32 * 32 * 4 &&
-                      plan.fifos[0].slot_count == 8 &&
-                      plan.fifos[0].reserved_bytes == 8 * 32 * 32 * 4 &&
-                      plan.loop.pipeline_stages == 1);
-        }
+    Problem too_wide = p;
+    too_wide.tensors = {{64, 128}, {128, 64}, {128, 1}, {128, 128}, {128, 128}};
+    DAG too_wide_dag = DAG::build(too_wide);
+    auto too_wide_mixed = Ascend910BMixed::create(too_wide, too_wide_dag, {0, 1});
+    CHECK("MIXPLAN: oversized eight-slot FIFO candidate is rejected",
+          too_wide_mixed && !too_wide_mixed->mixed_schedule_plan(TileConfig{128, 64, 64, 2, 1, 1}).feasible);
 
-        Problem too_wide = p;
-        too_wide.tensors = {{64, 128}, {128, 64}, {128, 1}, {128, 128}, {128, 128}};
-        DAG too_wide_dag = DAG::build(too_wide);
-        auto too_wide_mixed = Ascend910BMixed::create(too_wide, too_wide_dag, {0, 1});
-        CHECK("MIXPLAN: oversized eight-slot FIFO candidate is rejected",
-              too_wide_mixed &&
-                  !too_wide_mixed->mixed_schedule_plan(
-                      TileConfig{128, 64, 64, 2, 1, 1}).feasible);
+    Problem large_k = p;
+    large_k.tensors = {{8192, 192}, {256, 8192}, {256, 1}, {256, 192}, {256, 192}};
+    DAG large_k_dag = DAG::build(large_k);
+    auto large_k_mixed = Ascend910BMixed::create(large_k, large_k_dag, {0, 1});
+    const TileConfig large_k_cfg{32, 32, 8192, 6, 8, 1};
+    const auto large_k_plan =
+        large_k_mixed ? large_k_mixed->mixed_schedule_plan(large_k_cfg) : MixedSchedulePlan{};
+    const auto large_k_cost = large_k_mixed ? large_k_mixed->compute_cost(large_k_cfg) : CostResult{};
+    CHECK("MIXPLAN: derived large-K L1 window reaches plan and cost",
+          large_k_plan.feasible && large_k_plan.cube_window_k > 0 && large_k_plan.cube_window_k < 8192 &&
+              large_k_plan.config.k == large_k_plan.cube_window_k && large_k_cost.feasible &&
+              large_k_cost.config.k == large_k_plan.cube_window_k &&
+              large_k_cost.num_k_passes ==
+                  (8192 + large_k_plan.cube_window_k - 1) / large_k_plan.cube_window_k);
 
-        Problem large_k = p;
-        large_k.tensors = {
-            {8192, 192}, {256, 8192}, {256, 1}, {256, 192}, {256, 192}};
-        DAG large_k_dag = DAG::build(large_k);
-        auto large_k_mixed = Ascend910BMixed::create(large_k, large_k_dag, {0, 1});
-        const TileConfig large_k_cfg{32, 32, 8192, 6, 8, 1};
-        const auto large_k_plan = large_k_mixed
-                                      ? large_k_mixed->mixed_schedule_plan(large_k_cfg)
-                                      : MixedSchedulePlan{};
-        const auto large_k_cost = large_k_mixed
-                                      ? large_k_mixed->compute_cost(large_k_cfg)
-                                      : CostResult{};
-        CHECK("MIXPLAN: derived large-K L1 window reaches plan and cost",
-              large_k_plan.feasible && large_k_plan.cube_window_k > 0 &&
-                  large_k_plan.cube_window_k < 8192 &&
-                  large_k_plan.config.k == large_k_plan.cube_window_k &&
-                  large_k_cost.feasible &&
-                  large_k_cost.config.k == large_k_plan.cube_window_k &&
-                  large_k_cost.num_k_passes ==
-                      (8192 + large_k_plan.cube_window_k - 1) /
-                          large_k_plan.cube_window_k);
+    Problem low_precision = large_k;
+    for (Tensor& tensor : low_precision.tensors) tensor.dtype = DType::FP16;
+    DAG low_precision_dag = DAG::build(low_precision);
+    CHECK("MIXPLAN: low-precision C->V waits for an explicit accumulator/narrow stage",
+          !Ascend910BMixed::create(low_precision, low_precision_dag, {0, 1}));
 
-        Problem low_precision = large_k;
-        for (Tensor& tensor : low_precision.tensors) tensor.dtype = DType::FP16;
-        DAG low_precision_dag = DAG::build(low_precision);
-        CHECK("MIXPLAN: low-precision C->V waits for an explicit accumulator/narrow stage",
-              !Ascend910BMixed::create(low_precision, low_precision_dag, {0, 1}));
+    Problem heterogeneous = large_k;
+    heterogeneous.tensors[0].dtype = DType::FP16;
+    DAG heterogeneous_dag = DAG::build(heterogeneous);
+    CHECK("MIXPLAN: heterogeneous cube operands are a clean mixed boundary",
+          !Ascend910BMixed::create(heterogeneous, heterogeneous_dag, {0, 1}));
 
-        Problem heterogeneous = large_k;
-        heterogeneous.tensors[0].dtype = DType::FP16;
-        DAG heterogeneous_dag = DAG::build(heterogeneous);
-        CHECK("MIXPLAN: heterogeneous cube operands are a clean mixed boundary",
-              !Ascend910BMixed::create(heterogeneous, heterogeneous_dag, {0, 1}));
+    Problem promoted_bias = large_k;
+    promoted_bias.tensors[2].dtype = DType::FP16;
+    DAG promoted_bias_dag = DAG::build(promoted_bias);
+    CHECK("MIXPLAN: promoted vector tensor operand is a clean mixed boundary",
+          !Ascend910BMixed::create(promoted_bias, promoted_bias_dag, {0, 1}));
 
-        Problem promoted_bias = large_k;
-        promoted_bias.tensors[2].dtype = DType::FP16;
-        DAG promoted_bias_dag = DAG::build(promoted_bias);
-        CHECK("MIXPLAN: promoted vector tensor operand is a clean mixed boundary",
-              !Ascend910BMixed::create(promoted_bias, promoted_bias_dag, {0, 1}));
+    Problem integer_epilogue = large_k;
+    integer_epilogue.tensors[0].dtype = DType::INT8;
+    integer_epilogue.tensors[1].dtype = DType::INT8;
+    integer_epilogue.tensors[2].dtype = DType::INT32;
+    integer_epilogue.tensors[3].dtype = DType::INT32;
+    integer_epilogue.tensors[4].dtype = DType::INT32;
+    DAG integer_epilogue_dag = DAG::build(integer_epilogue);
+    CHECK("MIXPLAN: INT8->INT32 waits for an integer vector capability table",
+          !Ascend910BMixed::create(integer_epilogue, integer_epilogue_dag, {0, 1}));
 
-        Problem integer_epilogue = large_k;
-        integer_epilogue.tensors[0].dtype = DType::INT8;
-        integer_epilogue.tensors[1].dtype = DType::INT8;
-        integer_epilogue.tensors[2].dtype = DType::INT32;
-        integer_epilogue.tensors[3].dtype = DType::INT32;
-        integer_epilogue.tensors[4].dtype = DType::INT32;
-        DAG integer_epilogue_dag = DAG::build(integer_epilogue);
-        CHECK("MIXPLAN: INT8->INT32 waits for an integer vector capability table",
-              !Ascend910BMixed::create(integer_epilogue, integer_epilogue_dag, {0, 1}));
+    Problem unsupported_dtype = large_k;
+    unsupported_dtype.tensors[0].dtype = DType::INT16;
+    unsupported_dtype.tensors[1].dtype = DType::INT16;
+    unsupported_dtype.tensors[2].dtype = DType::INT32;
+    unsupported_dtype.tensors[3].dtype = DType::INT32;
+    unsupported_dtype.tensors[4].dtype = DType::INT32;
+    DAG unsupported_dtype_dag = DAG::build(unsupported_dtype);
+    CHECK("MIXPLAN: non-PTO cube operand dtype is a clean mixed boundary",
+          !Ascend910BMixed::create(unsupported_dtype, unsupported_dtype_dag, {0, 1}));
 
-        Problem unsupported_dtype = large_k;
-        unsupported_dtype.tensors[0].dtype = DType::INT16;
-        unsupported_dtype.tensors[1].dtype = DType::INT16;
-        unsupported_dtype.tensors[2].dtype = DType::INT32;
-        unsupported_dtype.tensors[3].dtype = DType::INT32;
-        unsupported_dtype.tensors[4].dtype = DType::INT32;
-        DAG unsupported_dtype_dag = DAG::build(unsupported_dtype);
-        CHECK("MIXPLAN: non-PTO cube operand dtype is a clean mixed boundary",
-              !Ascend910BMixed::create(unsupported_dtype, unsupported_dtype_dag, {0, 1}));
+    Problem transposed = p;
+    transposed.ops[0].mixed_emit_compatible = false;
+    DAG transposed_dag = DAG::build(transposed);
+    CHECK("MIXPLAN: non-default matmul semantics are a clean boundary",
+          !Ascend910BMixed::create(transposed, transposed_dag, {0, 1}));
 
-        Problem transposed = p;
-        transposed.ops[0].mixed_emit_compatible = false;
-        DAG transposed_dag = DAG::build(transposed);
-        CHECK("MIXPLAN: non-default matmul semantics are a clean boundary",
-              !Ascend910BMixed::create(transposed, transposed_dag, {0, 1}));
+    Problem escaped = p;
+    escaped.tensors.push_back({256, 192});
+    escaped.ops.push_back({OT::Pointwise, {3}, {5}});
+    escaped.ops.back().vector_capability = VectorOpCapability::Elementwise;
+    escaped.ops.back().vector_primitive = VectorPrimitiveFamily::Abs;
+    escaped.ops.back().vector_geometry = VectorOpGeometry::Flat;
+    DAG escaped_dag = DAG::build(escaped);
+    CHECK("MIXPLAN: escaped cube intermediate rejects buildable C->V",
+          !Ascend910BMixed::create(escaped, escaped_dag, {0, 1}));
 
-        Problem escaped = p;
-        escaped.tensors.push_back({256, 192});
-        escaped.ops.push_back({OT::Pointwise, {3}, {5}});
-        escaped.ops.back().vector_capability = VectorOpCapability::Elementwise;
-        escaped.ops.back().vector_primitive = VectorPrimitiveFamily::Abs;
-        escaped.ops.back().vector_geometry = VectorOpGeometry::Flat;
-        DAG escaped_dag = DAG::build(escaped);
-        CHECK("MIXPLAN: escaped cube intermediate rejects buildable C->V",
-              !Ascend910BMixed::create(escaped, escaped_dag, {0, 1}));
+    Problem reverse = p;
+    reverse.tensors = {{64, 192}, {64, 192}, {256, 64}, {256, 192}};
+    reverse.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}};
+    reverse.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    reverse.ops[0].vector_primitive = VectorPrimitiveFamily::Abs;
+    reverse.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    DAG reverse_dag = DAG::build(reverse);
+    CHECK("MIXPLAN: compiler V->C remains a clean partition boundary",
+          !Ascend910BMixed::create(reverse, reverse_dag, {0, 1}));
+  }
 
-        Problem reverse = p;
-        reverse.tensors = {{64, 192}, {64, 192}, {256, 64}, {256, 192}};
-        reverse.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}};
-        reverse.ops[0].vector_capability = VectorOpCapability::Elementwise;
-        reverse.ops[0].vector_primitive = VectorPrimitiveFamily::Abs;
-        reverse.ops[0].vector_geometry = VectorOpGeometry::Flat;
-        DAG reverse_dag = DAG::build(reverse);
-        CHECK("MIXPLAN: compiler V->C remains a clean partition boundary",
-              !Ascend910BMixed::create(reverse, reverse_dag, {0, 1}));
+  // V->C->V is the exact single-round-trip shape recognized by
+  // SkewCrossCorePipeline: one transfer in each direction and an early vector
+  // stage on the sink unit.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq};
+    p.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}, {OT::Pointwise, {3}, {4}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
+    auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+    CHECK("MIXPLAN: V->C->V records the exact skew topology",
+          plan.feasible && plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
+              plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle && plan.emit_compatible &&
+              plan.topology->stages.size() == 3 && plan.topology->transfers.size() == 2 &&
+              plan.topology->protocol.producer_engine == MixedEngine::Vector &&
+              plan.topology->protocol.peer_engine == MixedEngine::Cube &&
+              plan.topology->protocol.skew_pass_compatible && plan.topology->sink_runs_early_stage &&
+              !plan.pipeline_fill_absorbed);
+  }
+
+  // Alternation depth alone is insufficient: two vector branches create two
+  // pushes and two pops. The current pass demotes that FIFO pattern, so the
+  // plan must not claim it is replayable even though max depth is only two.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq, sq};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::Pointwise, {2}, {3}},
+             {OT::Pointwise, {2}, {4}},
+             {OT::MatMul, {3, 4}, {5}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+    CHECK("MIXPLAN: branching depth-2 mixed group builds for analytic costing", (bool)mixed);
+    auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+    CHECK("MIXPLAN: multiple FIFO messages are classified sequential/incompatible",
+          plan.feasible && plan.topology->max_alternations == 2 && plan.topology->transfers.size() == 4 &&
+              plan.protocol == MixedCrossCoreProtocol::Unsupported &&
+              !plan.topology->protocol.skew_pass_compatible &&
+              plan.mode == MixedPipelineMode::MultiRoundTripSequential && !plan.emit_compatible &&
+              !plan.overlap_implementable);
+  }
+
+  // The pass-level protocol is intentionally broader than generic mixed
+  // costing. A two-producer bundle is recognized, but remains model/emit
+  // incompatible until an exact algorithm owns all stage costs/lifetimes.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq, sq, sq, sq};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::MatMul, {3, 4}, {5}},
+             {OT::Pointwise, {2, 5}, {6}},
+             {OT::MatMul, {6, 1}, {7}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+    CHECK("MIXPLAN: generic bundled round trip remains analyzable", (bool)mixed);
+    if (mixed) {
+      const auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
+      CHECK("MIXPLAN: pass-compatible bundle needs an exact cost algorithm",
+            plan.feasible && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.topology->protocol.skew_pass_compatible &&
+                plan.topology->protocol.producer_bundle_transfers.size() == 2 &&
+                plan.topology->protocol.reply_bundle_transfers.size() == 1 && !plan.emit_compatible &&
+                !plan.overlap_implementable);
+    }
+  }
+
+  // Dense decoder MLP: two homogeneous cube projections, one homogeneous
+  // vector SwiGLU chain, and a final cube projection joined by three standard
+  // mixed FIFOs. Candidate k is the temporal intermediate-feature chunk.
+  {
+    Problem p;
+    p.tensors = {
+        {64, 32},                                                          // 0 x [M,D] BF16
+        {128, 64},                                                         // 1 gate weight [D,H]
+        {128, 64},                                                         // 2 up weight [D,H]
+        {64, 128},                                                         // 3 down weight [H,N]
+        {128, 32},                                                         // 4 gate FP32
+        {128, 32},                                                         // 5 up FP32
+        {128, 32},                                                         // 6..11 vector chain FP32
+        {128, 32}, {128, 32}, {128, 32}, {128, 32}, {128, 32}, {128, 32},  // 12 activation BF16
+        {64, 32},                                                          // 13 output FP32
+    };
+    for (size_t i = 0; i < p.tensors.size(); ++i) {
+      p.tensors[i].dtype = i == 4 || i == 5 || (i >= 6 && i <= 11) || i == 13 ? DType::FP32 : DType::BF16;
+    }
+    p.ops = {
+        {OT::MatMul, {0, 1}, {4}},     {OT::MatMul, {0, 2}, {5}},      {OT::Pointwise, {4}, {6}},
+        {OT::Pointwise, {6}, {7}},     {OT::Pointwise, {7}, {8}},      {OT::Pointwise, {8}, {9}},
+        {OT::Pointwise, {4, 9}, {10}}, {OT::Pointwise, {10, 5}, {11}}, {OT::Pointwise, {11}, {12}},
+        {OT::MatMul, {12, 3}, {13}},
+    };
+    const std::array<MixedVectorSemantic, 7> semantics = {
+        MixedVectorSemantic::Neg,   MixedVectorSemantic::Exp, MixedVectorSemantic::ScalarAdd,
+        MixedVectorSemantic::Recip, MixedVectorSemantic::Mul, MixedVectorSemantic::Mul,
+        MixedVectorSemantic::Cast};
+    const std::array<VectorPrimitiveFamily, 7> primitives = {
+        VectorPrimitiveFamily::ScalarMul, VectorPrimitiveFamily::Exp, VectorPrimitiveFamily::ScalarAdd,
+        VectorPrimitiveFamily::Div,       VectorPrimitiveFamily::Mul, VectorPrimitiveFamily::Mul,
+        VectorPrimitiveFamily::Generic};
+    for (size_t i = 0; i < semantics.size(); ++i) {
+      Op& op = p.ops[2 + i];
+      op.vector_capability = VectorOpCapability::Elementwise;
+      op.vector_geometry = VectorOpGeometry::Flat;
+      op.vector_primitive = primitives[i];
+      op.mixed_vector_semantic = semantics[i];
+    }
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    CHECK("MIXPLAN: dense SwiGLU MLP is admitted", (bool)mixed);
+    if (mixed) {
+      const TileConfig cfg{64, 16, 32, 2, 1, 1};
+      const MixedSchedulePlan plan = mixed->mixed_schedule_plan(cfg);
+      const CostResult cost = mixed->compute_cost(cfg);
+      CHECK("MIXPLAN: dense MLP composes four homogeneous stages",
+            plan.feasible && plan.emit_compatible && plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp &&
+                plan.topology && plan.topology->stages.size() == 4 && plan.stages.size() == 4 &&
+                plan.stages[0].engine == MixedEngine::Cube && plan.stages[1].engine == MixedEngine::Cube &&
+                plan.stages[2].engine == MixedEngine::Vector && plan.stages[3].engine == MixedEngine::Cube &&
+                plan.stages[2].vector_stream.feasible);
+      CHECK("MIXPLAN: dense MLP owns the feature loop and FIFO bundles",
+            plan.dense_mlp.present && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.topology->protocol.skew_pass_compatible &&
+                plan.topology->protocol.producer_stages == std::vector<size_t>({0, 1}) &&
+                plan.topology->protocol.peer_stage == 2 && plan.topology->protocol.sink_stage == 3 &&
+                plan.topology->protocol.producer_bundle_transfers.size() == 2 &&
+                plan.topology->protocol.reply_bundle_transfers.size() == 1 &&
+                plan.loop.axis == MixedPipelineAxis::IntermediateFeatureChunk && plan.loop.chunk == 32 &&
+                plan.loop.items_per_spatial_tile == 4 && plan.loop.active_groups == 2 &&
+                plan.loop.pipeline_stages == 3 && plan.fifos.size() == 3 && plan.fifos[0].bundle == 0 &&
+                plan.fifos[1].bundle == 0 && plan.fifos[2].bundle == 1 &&
+                plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
+                plan.fifos[2].direction == MixedTransferDirection::VectorToCube);
+      CHECK("MIXPLAN: dense MLP cost is finite and grants only realizable overlap",
+            cost.feasible && std::isfinite(cost.latency) && plan.model_overlap_granted &&
+                plan.model_overlap_granted == plan.overlap_implementable);
     }
 
-    // V->C->V is the exact single-round-trip shape recognized by
-    // SkewCrossCorePipeline: one transfer in each direction and an early vector
-    // stage on the sink unit.
-    {
-        Problem p;
-        p.tensors = {sq, sq, sq, sq, sq};
-        p.ops = {{OT::Pointwise, {0}, {1}},
-                 {OT::MatMul, {1, 2}, {3}},
-                 {OT::Pointwise, {3}, {4}}};
-        p.fast_memory_capacity = 1 << 26;
-        set_910b(p);
-        DAG dag = DAG::build(p);
-        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
-        auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
-        CHECK("MIXPLAN: V->C->V records the exact skew topology",
-              plan.feasible && plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
-                  plan.emit_compatible && plan.topology->stages.size() == 3 &&
-                  plan.topology->transfers.size() == 2 &&
-                  plan.topology->sink_runs_early_stage &&
-                  !plan.pipeline_fill_absorbed);
-    }
+    Problem escaped = p;
+    escaped.required_outputs.insert(4);
+    DAG escaped_dag = DAG::build(escaped);
+    CHECK("MIXPLAN: escaped gate result declines dense MLP fusion",
+          !Ascend910BMixed::create(escaped, escaped_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}).has_value());
 
-    // Alternation depth alone is insufficient: two vector branches create two
-    // pushes and two pops. The current pass demotes that FIFO pattern, so the
-    // plan must not claim it is replayable even though max depth is only two.
-    {
-        Problem p;
-        p.tensors = {sq, sq, sq, sq, sq, sq};
-        p.ops = {{OT::MatMul, {0, 1}, {2}},
-                 {OT::Pointwise, {2}, {3}},
-                 {OT::Pointwise, {2}, {4}},
-                 {OT::MatMul, {3, 4}, {5}}};
-        p.fast_memory_capacity = 1 << 26;
-        set_910b(p);
-        DAG dag = DAG::build(p);
-        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
-        CHECK("MIXPLAN: branching depth-2 mixed group builds for analytic costing", (bool)mixed);
-        auto plan = mixed->mixed_schedule_plan(TileConfig{128, 128, 128});
-        CHECK("MIXPLAN: multiple FIFO messages are classified sequential/incompatible",
-              plan.feasible && plan.topology->max_alternations == 2 &&
-                  plan.topology->transfers.size() == 4 &&
-                  plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
-                  !plan.emit_compatible && !plan.overlap_implementable);
-    }
+    Problem miswired = p;
+    miswired.ops[6].inputs = {5, 9};
+    DAG miswired_dag = DAG::build(miswired);
+    CHECK("MIXPLAN: non-SwiGLU dataflow declines dense MLP fusion",
+          !Ascend910BMixed::create(miswired, miswired_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}).has_value());
+  }
 }
 
 // Sink split-K in a mixed kernel. The sink matmul splits its contraction across idle

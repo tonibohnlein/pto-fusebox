@@ -114,6 +114,12 @@ enum class VectorOpCapability : uint8_t {
     Unsupported
 };
 
+// Exact source-op identity needed by a mixed algorithm recognizer. This is
+// deliberately separate from VectorPrimitiveFamily: the latter is a grounded
+// cost class, while Recip and Cast are load-bearing semantic nodes even when
+// their precise PTO instruction cost still uses the generic vector fallback.
+enum class MixedVectorSemantic : uint8_t { None, Neg, Exp, ScalarAdd, Recip, Mul, Cast };
+
 // Exact streamed multi-reduction algorithms implemented by the AutoFuse emit.
 // A P4 pattern identifies the complete op set whose semantics were proven to
 // match the emitted online algorithm, not merely a reduction family.
@@ -130,37 +136,38 @@ struct P4Pattern {
 };
 
 struct Op {
-    OpType type;
-    std::vector<size_t> inputs;   // tensor indices
-    std::vector<size_t> outputs;  // tensor indices (always exactly one)
+  OpType type;
+  std::vector<size_t> inputs;   // tensor indices
+  std::vector<size_t> outputs;  // tensor indices (always exactly one)
 
-    // Per-op VECTOR compute slope (cycles per SIMD repeat) for a Pointwise op, when it differs
-    // from the group default `vec_slope_pw` (~2). pto-isa vec_tile_study: most pointwise ops are
-    // slope 2, but `vdiv` is 4 and the scalar/activation ops (`vrsqrt`/`vrelu`/`vmuls`) are 1.
-    // 0.0 => use the problem default. Set by the PyPTO adapter from the op name; JSON instances
-    // that omit it fall back to the default (so the benchmark suite is unaffected).
-    double vec_slope = 0.0;
+  // Per-op VECTOR compute slope (cycles per SIMD repeat) for a Pointwise op, when it differs
+  // from the group default `vec_slope_pw` (~2). pto-isa vec_tile_study: most pointwise ops are
+  // slope 2, but `vdiv` is 4 and the scalar/activation ops (`vrsqrt`/`vrelu`/`vmuls`) are 1.
+  // 0.0 => use the problem default. Set by the PyPTO adapter from the op name; JSON instances
+  // that omit it fall back to the default (so the benchmark suite is unaffected).
+  double vec_slope = 0.0;
 
-    // Per-op VECTOR fixed cost (head+tail cycles), charged ONCE per fused chain (the stream-start
-    // op). pto-isa device-calibrated per-op: vadd/vsub/vmax/vmin 24, vmul 25, vexp 31, vdiv 30,
-    // vrsqrt/vrelu/vmuls ~24. 0.0 => use the problem default `vec_op_head+vec_op_tail` (~32).
-    double vec_fixed = 0.0;
+  // Per-op VECTOR fixed cost (head+tail cycles), charged ONCE per fused chain (the stream-start
+  // op). pto-isa device-calibrated per-op: vadd/vsub/vmax/vmin 24, vmul 25, vexp 31, vdiv 30,
+  // vrsqrt/vrelu/vmuls ~24. 0.0 => use the problem default `vec_op_head+vec_op_tail` (~32).
+  double vec_fixed = 0.0;
 
-    // Grounded source-op semantics.  These two bytes are candidate-invariant
-    // metadata; they are intentionally stored on Op rather than in CostResult
-    // or VectorStreamPlan, so local-search cache entries stay compact.
-    VectorPrimitiveFamily vector_primitive = VectorPrimitiveFamily::Generic;
-    VectorOpGeometry vector_geometry = VectorOpGeometry::Generic;
-    VectorOpCapability vector_capability = VectorOpCapability::Generic;
+  // Grounded source-op semantics.  These two bytes are candidate-invariant
+  // metadata; they are intentionally stored on Op rather than in CostResult
+  // or VectorStreamPlan, so local-search cache entries stay compact.
+  VectorPrimitiveFamily vector_primitive = VectorPrimitiveFamily::Generic;
+  VectorOpGeometry vector_geometry = VectorOpGeometry::Generic;
+  VectorOpCapability vector_capability = VectorOpCapability::Generic;
 
-    // True only when the production mixed emitter can replay this source op
-    // without losing semantic attributes.  The first C->V increment accepts a
-    // default-orientation tensor.matmul; transposed/NZ variants remain a clean
-    // partition boundary until their semantics are carried by the plan.
-    bool mixed_emit_compatible = true;
+  // True only when the production mixed emitter can replay this source op
+  // without losing semantic attributes.  The first C->V increment accepts a
+  // default-orientation tensor.matmul; transposed/NZ variants remain a clean
+  // partition boundary until their semantics are carried by the plan.
+  bool mixed_emit_compatible = true;
+  MixedVectorSemantic mixed_vector_semantic = MixedVectorSemantic::None;
 
-    // Convenience: each op produces exactly one output tensor.
-    size_t output() const { return outputs[0]; }
+  // Convenience: each op produces exactly one output tensor.
+  size_t output() const { return outputs[0]; }
 };
 
 // ============================================================================
@@ -903,12 +910,29 @@ enum class MixedPipelineMode {
     MultiRoundTripSequential
 };
 
+// Descriptor-level protocols shared by the mixed planner and PyPTO's
+// SkewCrossCorePipeline contract.  SingleRoundTripBundle is:
+//
+//   producer_bundle[0..N] -> one peer stage -> one reply -> sink stage
+//
+// where every producer bundle transfer has the same direction.  Adjacent
+// same-engine operations have already been collapsed into one stage; the two
+// physical AIV lanes are represented by MixedVectorSplit, not by two stages.
+enum class MixedCrossCoreProtocol { Unsupported, OneWay, SingleRoundTripBundle };
+
 enum class MixedPipelineAxis {
-    SpatialRegion,
-    VectorWidthChunk,
-    VectorHeightChunk,
-    AttentionKeyChunk
+  SpatialRegion,
+  VectorWidthChunk,
+  VectorHeightChunk,
+  AttentionKeyChunk,
+  IntermediateFeatureChunk
 };
+
+// Source algorithm recognized by the mixed planner. Generic preserves the
+// analytic stage-DAG path. DenseSwiGluMlp is the first production round-trip
+// algorithm: two independent gate/up cube projections feed one vector SwiGLU
+// stage, whose narrowed result feeds the down-projection cube stage.
+enum class MixedAlgorithmKind { Generic, DenseSwiGluMlp };
 
 // How the vector stage uses the two AIV lanes in one 910B mixed group.  This
 // is an algorithmic fact, not merely a hardware count: an unsplit mixed kernel
@@ -938,35 +962,76 @@ struct MixedTransferTopology {
     MixedEngine consumer_engine = MixedEngine::Vector;
 };
 
+struct MixedCrossCoreProtocolTopology {
+  MixedCrossCoreProtocol kind = MixedCrossCoreProtocol::Unsupported;
+  MixedEngine producer_engine = MixedEngine::Cube;
+  MixedEngine peer_engine = MixedEngine::Vector;
+  std::vector<size_t> producer_stages;
+  size_t peer_stage = std::numeric_limits<size_t>::max();
+  size_t sink_stage = std::numeric_limits<size_t>::max();
+  // Indices into MixedScheduleTopology::transfers. The producer bundle is
+  // advanced together; the current skew pass admits exactly one reply.
+  std::vector<size_t> producer_bundle_transfers;
+  std::vector<size_t> reply_bundle_transfers;
+  bool skew_pass_compatible = false;
+};
+
+struct MixedDenseMlpTopology {
+  bool present = false;
+  size_t gate_matmul = std::numeric_limits<size_t>::max();
+  size_t up_matmul = std::numeric_limits<size_t>::max();
+  size_t down_matmul = std::numeric_limits<size_t>::max();
+  size_t gate_tensor = std::numeric_limits<size_t>::max();
+  size_t up_tensor = std::numeric_limits<size_t>::max();
+  size_t activated_tensor = std::numeric_limits<size_t>::max();
+  std::vector<size_t> vector_ops;
+  int64_t input_extent = 0;
+  int64_t intermediate_extent = 0;
+  int64_t output_extent = 0;
+  DType operand_dtype = DType::FP32;
+  // Candidate K values have a different meaning for this algorithm: they
+  // partition the gate/up output and the down-projection contraction.  They
+  // are built once with the topology, then crossed with the ordinary final
+  // output grid without introducing a per-matmul combinatorial search.
+  std::vector<int64_t> feature_chunks;
+};
+
 // Candidate-invariant portion of a mixed schedule. It is built once by create;
 // hot candidates read the owning cost model directly, while an explicitly
 // requested final plan receives a shared owner. CostResult does not retain it.
 struct MixedScheduleTopology {
-    std::vector<MixedStageTopology> stages;
-    std::vector<MixedTransferTopology> transfers;
-    int max_alternations = 0;
-    bool output_is_cube = false;
-    bool output_engines_uniform = true;
-    bool sink_runs_early_stage = false;
-    MixedPipelineMode mode = MixedPipelineMode::Serial;
-    bool emit_compatible = false;
-    // Strict subset that production AutoFuse can currently replay.  The more
-    // permissive emit_compatible bit remains useful to analytic/research
-    // callers studying the generic cross-core passes.
-    bool compiler_emit_compatible = false;
+  std::vector<MixedStageTopology> stages;
+  std::vector<MixedTransferTopology> transfers;
+  int max_alternations = 0;
+  bool output_is_cube = false;
+  bool output_engines_uniform = true;
+  bool sink_runs_early_stage = false;
+  MixedPipelineMode mode = MixedPipelineMode::Serial;
+  bool emit_compatible = false;
+  // Strict subset that production AutoFuse can currently replay.  The more
+  // permissive emit_compatible bit remains useful to analytic/research
+  // callers studying the generic cross-core passes.
+  bool compiler_emit_compatible = false;
+  MixedCrossCoreProtocolTopology protocol;
+  MixedAlgorithmKind algorithm = MixedAlgorithmKind::Generic;
+  MixedDenseMlpTopology dense_mlp;
 };
 
 struct MixedFifoPlan {
-    size_t tensor = std::numeric_limits<size_t>::max();
-    MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
-    int64_t valid_rows = 0;
-    int64_t valid_cols = 0;
-    int64_t slot_bytes = 0;
-    int64_t slot_count = 0;
-    // Vec memory reserved by ExpandMixedKernel for this FIFO.  Keeping this in
-    // the winning descriptor makes the plan's feasibility proof inspectable
-    // and lets emission fail closed if the downstream default changes.
-    int64_t reserved_bytes = 0;
+  size_t tensor = std::numeric_limits<size_t>::max();
+  MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
+  int64_t valid_rows = 0;
+  int64_t valid_cols = 0;
+  int64_t slot_bytes = 0;
+  int64_t slot_count = 0;
+  // Vec memory reserved by ExpandMixedKernel for this FIFO.  Keeping this in
+  // the winning descriptor makes the plan's feasibility proof inspectable
+  // and lets emission fail closed if the downstream default changes.
+  int64_t reserved_bytes = 0;
+  // Stable protocol identity. Pipes in one bundle are advanced together by
+  // SkewCrossCorePipeline; order inside a bundle is the topology order.
+  int pipe_id = -1;
+  int bundle = -1;
 };
 
 struct MixedPipelineLoopPlan {
@@ -982,38 +1047,69 @@ struct MixedPipelineLoopPlan {
     int64_t requested_skew_depth = 0;
 };
 
+// Final-plan-only stage descriptor. Candidate-hot costing leaves this vector
+// empty; mixed_schedule_plan() reconstructs it once for a selected/forced
+// candidate so model/emit validation does not rediscover stage geometry.
+struct MixedStagePlan {
+  size_t topology_stage = std::numeric_limits<size_t>::max();
+  MixedEngine engine = MixedEngine::Vector;
+  std::vector<size_t> ops;
+  int64_t valid_rows = 0;
+  int64_t valid_cols = 0;
+  std::vector<int64_t> cube_window_k;
+  VectorStreamPlan vector_stream;
+};
+
+struct MixedDenseMlpPlan {
+  bool present = false;
+  int64_t input_extent = 0;
+  int64_t intermediate_extent = 0;
+  int64_t intermediate_chunk = 0;
+  int64_t intermediate_chunks = 0;
+  int64_t output_extent = 0;
+  int64_t gate_window_k = 0;
+  int64_t up_window_k = 0;
+  int64_t persistent_accumulator_bytes = 0;
+  bool first_chunk_initializes = false;
+  bool later_chunks_accumulate = false;
+};
+
 // Solver-owned cross-engine algorithm for one fixed mixed candidate. The hot
 // path constructs only its scalar fields for costing; final/forced consumers
 // re-derive it once and attach the immutable topology, like the homogeneous
 // vector and cube plans.
 struct MixedSchedulePlan {
-    bool feasible = false;
-    bool emit_compatible = false;
-    TileConfig config;
-    AxisPartition m_partition;
-    AxisPartition n_partition;
-    int64_t spatial_tiles = 0;
-    int64_t split_k = 1;
-    int64_t work_units = 0;
-    int64_t group_capacity = 0;
-    // Stage-local facts consumed by the first compiler emitter.  These are
-    // populated only when reconstructing a winning/forced plan, not retained
-    // in the hot CostResult cache.
-    int64_t cube_window_k = 0;
-    VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
-    int64_t vector_stage_peak_ub_bytes = 0;
-    MixedVectorSplit vector_split = MixedVectorSplit::None;
-    int64_t vector_lanes = 1;
-    MixedPipelineMode mode = MixedPipelineMode::Serial;
-    MixedPipelineLoopPlan loop;
-    std::vector<MixedFifoPlan> fifos;
-    // Kept separate during migration: the first bit records what the legacy
-    // scalar cost grants, while the second mirrors what the existing PyPTO
-    // pipeline passes can actually construct for this exact topology/loop.
-    bool model_overlap_granted = false;
-    bool overlap_implementable = false;
-    bool pipeline_fill_absorbed = false;
-    std::shared_ptr<const MixedScheduleTopology> topology;
+  bool feasible = false;
+  bool emit_compatible = false;
+  TileConfig config;
+  AxisPartition m_partition;
+  AxisPartition n_partition;
+  int64_t spatial_tiles = 0;
+  int64_t split_k = 1;
+  int64_t work_units = 0;
+  int64_t group_capacity = 0;
+  MixedCrossCoreProtocol protocol = MixedCrossCoreProtocol::Unsupported;
+  MixedAlgorithmKind algorithm = MixedAlgorithmKind::Generic;
+  // Stage-local facts consumed by the first compiler emitter.  These are
+  // populated only when reconstructing a winning/forced plan, not retained
+  // in the hot CostResult cache.
+  int64_t cube_window_k = 0;
+  VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
+  int64_t vector_stage_peak_ub_bytes = 0;
+  MixedVectorSplit vector_split = MixedVectorSplit::None;
+  int64_t vector_lanes = 1;
+  MixedPipelineMode mode = MixedPipelineMode::Serial;
+  MixedPipelineLoopPlan loop;
+  std::vector<MixedFifoPlan> fifos;
+  std::vector<MixedStagePlan> stages;
+  MixedDenseMlpPlan dense_mlp;
+  // Kept separate during migration: the first bit records what the legacy
+  // scalar cost grants, while the second mirrors what the existing PyPTO
+  // pipeline passes can actually construct for this exact topology/loop.
+  bool model_overlap_granted = false;
+  bool overlap_implementable = false;
+  bool pipeline_fill_absorbed = false;
+  std::shared_ptr<const MixedScheduleTopology> topology;
 };
 
 // ============================================================================

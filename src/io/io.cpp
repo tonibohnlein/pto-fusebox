@@ -3,8 +3,9 @@
 #include "solution/solution.h"
 #include <fstream>
 #include <iostream>
-#include <string>
+#include <limits>
 #include <nlohmann/json.hpp>
+#include <string>
 
 using json = nlohmann::json;
 
@@ -70,6 +71,26 @@ static bool parse_vector_op_capability(const std::string& name,
     else if (name == "unsupported") *capability = VectorOpCapability::Unsupported;
     else return false;
     return true;
+}
+
+static bool parse_mixed_vector_semantic(const std::string& name, MixedVectorSemantic* semantic) {
+  if (name == "none")
+    *semantic = MixedVectorSemantic::None;
+  else if (name == "neg")
+    *semantic = MixedVectorSemantic::Neg;
+  else if (name == "exp")
+    *semantic = MixedVectorSemantic::Exp;
+  else if (name == "scalar_add")
+    *semantic = MixedVectorSemantic::ScalarAdd;
+  else if (name == "recip")
+    *semantic = MixedVectorSemantic::Recip;
+  else if (name == "mul")
+    *semantic = MixedVectorSemantic::Mul;
+  else if (name == "cast")
+    *semantic = MixedVectorSemantic::Cast;
+  else
+    return false;
+  return true;
 }
 
 static json vector_loop_json(const VectorLoopPlan& loop) {
@@ -238,14 +259,42 @@ static const char* mixed_pipeline_mode_name(MixedPipelineMode mode) {
     return "unknown";
 }
 
+static const char* mixed_cross_core_protocol_name(MixedCrossCoreProtocol protocol) {
+  switch (protocol) {
+    case MixedCrossCoreProtocol::Unsupported:
+      return "unsupported";
+    case MixedCrossCoreProtocol::OneWay:
+      return "one_way";
+    case MixedCrossCoreProtocol::SingleRoundTripBundle:
+      return "single_round_trip_bundle";
+  }
+  return "unknown";
+}
+
 static const char* mixed_pipeline_axis_name(MixedPipelineAxis axis) {
-    switch (axis) {
-        case MixedPipelineAxis::SpatialRegion: return "spatial_region";
-        case MixedPipelineAxis::VectorWidthChunk: return "vector_width_chunk";
-        case MixedPipelineAxis::VectorHeightChunk: return "vector_height_chunk";
-        case MixedPipelineAxis::AttentionKeyChunk: return "attention_key_chunk";
-    }
-    return "unknown";
+  switch (axis) {
+    case MixedPipelineAxis::SpatialRegion:
+      return "spatial_region";
+    case MixedPipelineAxis::VectorWidthChunk:
+      return "vector_width_chunk";
+    case MixedPipelineAxis::VectorHeightChunk:
+      return "vector_height_chunk";
+    case MixedPipelineAxis::AttentionKeyChunk:
+      return "attention_key_chunk";
+    case MixedPipelineAxis::IntermediateFeatureChunk:
+      return "intermediate_feature_chunk";
+  }
+  return "unknown";
+}
+
+static const char* mixed_algorithm_name(MixedAlgorithmKind algorithm) {
+  switch (algorithm) {
+    case MixedAlgorithmKind::Generic:
+      return "generic";
+    case MixedAlgorithmKind::DenseSwiGluMlp:
+      return "dense_swiglu_mlp";
+  }
+  return "unknown";
 }
 
 static const char* mixed_vector_split_name(MixedVectorSplit split) {
@@ -323,7 +372,6 @@ Problem read_problem(const std::string& filename) {
             else p.tensors[i].dtype = DType::FP32;
         }
     }
-
     // --- Ops ---
     auto& inputs     = j["inputs"];
     auto& outputs    = j["outputs"];
@@ -396,6 +444,16 @@ Problem read_problem(const std::string& filename) {
             const std::string name = j["vector_op_capabilities"][i].get<std::string>();
             if (!parse_vector_op_capability(name, &op.vector_capability)) {
                 std::cerr << "Error: unknown vector op capability '" << name
+                          << "' for op " << i << "\n";
+                std::exit(1);
+            }
+        }
+        if (j.contains("mixed_vector_semantics") &&
+            i < j["mixed_vector_semantics"].size()) {
+            const std::string name =
+                j["mixed_vector_semantics"][i].get<std::string>();
+            if (!parse_mixed_vector_semantic(name, &op.mixed_vector_semantic)) {
+                std::cerr << "Error: unknown mixed vector semantic '" << name
                           << "' for op " << i << "\n";
                 std::exit(1);
             }
@@ -685,7 +743,9 @@ std::string solution_json(const Solution& sol) {
                  {"strip_grid", {plan.row_strips, plan.width_strips}},
                  {"overlap_granted", plan.overlap_granted},
                  {"reduction_split",
-                  {{"kind", vector_reduction_split_kind_name(plan.reduction_split_kind)},
+                  {{"kind",
+                    vector_reduction_split_kind_name(
+                        plan.reduction_split_kind)},
                    {"factor", plan.reduction_split_factor},
                    {"partial_extent", plan.reduction_partial_extent},
                    {"seed",
@@ -697,149 +757,176 @@ std::string solution_json(const Solution& sol) {
                  {"stats", vector_loop_json(plan.stats)},
                  {"apply", vector_loop_json(plan.apply)},
                  {"serial_phases",
-                  {{"stats_init", vector_serial_phase_json(plan.stats_init)},
-                   {"stats_tail", vector_serial_phase_json(plan.stats_tail)},
-                   {"apply_tail", vector_serial_phase_json(plan.apply_tail)},
-                   {"finalize", vector_serial_phase_json(plan.finalize)}}},
+                  {{"stats_init",
+                    vector_serial_phase_json(plan.stats_init)},
+                   {"stats_tail",
+                    vector_serial_phase_json(plan.stats_tail)},
+                   {"apply_tail",
+                    vector_serial_phase_json(plan.apply_tail)},
+                   {"finalize",
+                    vector_serial_phase_json(plan.finalize)}}},
                  {"p4_work",
                   {{"generated", plan.p4_work.generated},
-                   {"stats_init", vector_phase_work_json(plan.p4_work.stats_init)},
-                   {"stats_update", vector_phase_work_json(plan.p4_work.stats_update)},
-                   {"finalize", vector_phase_work_json(plan.p4_work.finalize)}}}});
+                   {"stats_init",
+                    vector_phase_work_json(plan.p4_work.stats_init)},
+                   {"stats_update",
+                    vector_phase_work_json(plan.p4_work.stats_update)},
+                   {"finalize",
+                    vector_phase_work_json(plan.p4_work.finalize)}}}});
         } else {
             j["vector_stream"].push_back(nullptr);
         }
         if (cube_plan.feasible) {
             json matmuls = json::array();
             for (const auto& mm : cube_plan.matmuls) {
-              json variants = json::array();
-              for (const auto& variant : mm.output_variants) {
-                variants.push_back({{"shape", {variant.height, variant.width}},
-                                    {"count", variant.count},
-                                    {"l0_init", l0_matmul_plan_json(variant.l0_init)},
-                                    {"l0_rolled", l0_matmul_plan_json(variant.l0_rolled)},
-                                    {"l0_tail", l0_matmul_plan_json(variant.l0_tail)}});
-              }
-              matmuls.push_back({{"instance", mm.instance},
-                                 {"op", mm.op},
-                                 {"lhs_producer", mm.lhs_producer},
-                                 {"rhs_producer", mm.rhs_producer},
-                                 {"is_sink", mm.is_sink},
-                                 {"lhs_ephemeral", mm.lhs_ephemeral},
-                                 {"rhs_ephemeral", mm.rhs_ephemeral},
-                                 {"output_ephemeral", mm.output_ephemeral},
-                                 {"contraction", mm.contraction},
-                                 {"effective_contraction", mm.effective_contraction},
-                                 {"accumulator_dtype", dtype_name(mm.accumulator_dtype)},
-                                 {"storage_dtype", dtype_name(mm.storage_dtype)},
-                                 {"lhs", cube_region_json(mm.lhs)},
-                                 {"rhs", cube_region_json(mm.rhs)},
-                                 {"output", cube_region_json(mm.output)},
-                                 {"k_loop", cube_k_loop_json(mm.k_loop)},
-                                 {"output_tile", {mm.output_tile_m, mm.output_tile_n}},
-                                 {"output_grid", {mm.output_tiles_m, mm.output_tiles_n}},
-                                 {"output_variants", std::move(variants)},
-                                 {"retained_panels",
-                                  {{"lhs", mm.retained_panels.lhs},
-                                   {"rhs", mm.retained_panels.rhs},
-                                   {"lhs_bytes", mm.retained_panels.lhs_bytes},
-                                   {"rhs_bytes", mm.retained_panels.rhs_bytes}}},
-                                 {"final_drain",
-                                  {{"required", mm.final_drain.required},
-                                   {"target_l1", mm.final_drain.target_l1},
-                                   {"atomic", mm.final_drain.atomic},
-                                   {"valid_rows", mm.final_drain.valid_rows},
-                                   {"valid_cols", mm.final_drain.valid_cols},
-                                   {"tile_count", mm.final_drain.tile_count},
-                                   {"bytes", mm.final_drain.bytes},
-                                   {"cycles", mm.final_drain.cycles}}}});
-            }
-            j["cube_schedule"].push_back({{"emit_compatible", cube_plan.emit_compatible},
-                                          {"spatial_policy", cube_spatial_policy_name(cube_plan.spatial_policy)},
-                                          {"spatial_tiles", cube_plan.spatial_tiles},
-                                          {"split_k", cube_plan.split_k},
-                                          {"work_units", cube_plan.work_units},
-                                          {"peak_l1_bytes", cube_plan.peak_l1_bytes},
-                                          {"split_merge_policy",
-                                           cube_split_merge_policy_name(
-                                               cube_plan.split_merge_policy)},
-                                          {"first_partial_then_atomic",
-                                           {{"present", cube_plan.first_partial_then_atomic.present},
-                                            {"first_work_units",
-                                             cube_plan.first_partial_then_atomic.first_work_units},
-                                            {"atomic_work_units",
-                                             cube_plan.first_partial_then_atomic.atomic_work_units},
-                                            {"synchronization_cycles",
-                                             cube_plan.first_partial_then_atomic
-                                                 .synchronization_cycles}}},
-                                          {"model_overlap_granted", cube_plan.model_overlap_granted},
-                                          {"overlap_implementable", cube_plan.overlap_implementable},
-                                          {"matmuls", matmuls}});
-        } else {
-            j["cube_schedule"].push_back(nullptr);
-        }
-        if (mixed_plan.feasible && mixed_plan.topology) {
-            json stages = json::array();
-            for (const auto& stage : mixed_plan.topology->stages) {
-                stages.push_back({{"engine", mixed_engine_name(stage.engine)},
-                                  {"ops", stage.ops}});
-            }
-            json transfers = json::array();
-            for (const auto& transfer : mixed_plan.topology->transfers) {
-                transfers.push_back(
-                    {{"tensor", transfer.tensor},
-                     {"producer_stage", transfer.producer_stage},
-                     {"consumer_stage", transfer.consumer_stage},
-                     {"producer_engine", mixed_engine_name(transfer.producer_engine)},
-                     {"consumer_engine", mixed_engine_name(transfer.consumer_engine)}});
-            }
-            json fifos = json::array();
-            for (const auto& fifo : mixed_plan.fifos) {
-                fifos.push_back(
-                    {{"tensor", fifo.tensor},
-                     {"direction", mixed_transfer_direction_name(fifo.direction)},
-                     {"valid_rows", fifo.valid_rows},
-                     {"valid_cols", fifo.valid_cols},
-                     {"slot_bytes", fifo.slot_bytes},
-                     {"slot_count", fifo.slot_count},
-                     {"reserved_bytes", fifo.reserved_bytes}});
-            }
-            j["mixed_schedule"].push_back(
-                {{"emit_compatible", mixed_plan.emit_compatible},
-                 {"mode", mixed_pipeline_mode_name(mixed_plan.mode)},
-                 {"spatial_tiles", mixed_plan.spatial_tiles},
-                 {"split_k", mixed_plan.split_k},
-                 {"work_units", mixed_plan.work_units},
-                 {"group_capacity", mixed_plan.group_capacity},
-                 {"cube_window_k", mixed_plan.cube_window_k},
-                 {"vector_stage_kind",
-                  vector_stream_kind_name(mixed_plan.vector_stage_kind)},
-                 {"vector_stage_peak_ub_bytes",
-                  mixed_plan.vector_stage_peak_ub_bytes},
-                 {"vector_split", mixed_vector_split_name(mixed_plan.vector_split)},
-                 {"vector_lanes", mixed_plan.vector_lanes},
-                 {"pipeline_axis", mixed_pipeline_axis_name(mixed_plan.loop.axis)},
-                 {"pipeline_extent", mixed_plan.loop.extent},
-                 {"pipeline_chunk", mixed_plan.loop.chunk},
-                 {"items_per_spatial_tile", mixed_plan.loop.items_per_spatial_tile},
-                 {"active_groups", mixed_plan.loop.active_groups},
-                 {"min_trips_per_group", mixed_plan.loop.min_trips_per_group},
-                 {"max_trips_per_group", mixed_plan.loop.max_trips_per_group},
-                 {"pipeline_stages", mixed_plan.loop.pipeline_stages},
-                 {"requested_skew_depth", mixed_plan.loop.requested_skew_depth},
-                 {"model_overlap_granted", mixed_plan.model_overlap_granted},
-                 {"overlap_implementable", mixed_plan.overlap_implementable},
-                 {"pipeline_fill_absorbed", mixed_plan.pipeline_fill_absorbed},
-                 {"max_alternations", mixed_plan.topology->max_alternations},
-                 {"output_engines_uniform", mixed_plan.topology->output_engines_uniform},
-                 {"stages", stages},
-                 {"transfers", transfers},
-                 {"fifos", fifos}});
-        } else {
-            j["mixed_schedule"].push_back(nullptr);
-        }
-        j["tensors_to_retain"].push_back(
-            std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
+                json variants = json::array();
+                for (const auto& variant : mm.output_variants) {
+                    variants.push_back(
+                        {{"shape", {variant.height, variant.width}},
+                         {"count", variant.count},
+                         {"l0_init",
+                          l0_matmul_plan_json(variant.l0_init)},
+                         {"l0_rolled",
+                          l0_matmul_plan_json(variant.l0_rolled)},
+                         {"l0_tail",
+                          l0_matmul_plan_json(variant.l0_tail)}});
+                }
+        matmuls.push_back({{"instance", mm.instance},
+                           {"op", mm.op},
+                           {"lhs_producer", mm.lhs_producer},
+                           {"rhs_producer", mm.rhs_producer},
+                           {"is_sink", mm.is_sink},
+                           {"lhs_ephemeral", mm.lhs_ephemeral},
+                           {"rhs_ephemeral", mm.rhs_ephemeral},
+                           {"output_ephemeral", mm.output_ephemeral},
+                           {"contraction", mm.contraction},
+                           {"effective_contraction", mm.effective_contraction},
+                           {"accumulator_dtype", dtype_name(mm.accumulator_dtype)},
+                           {"storage_dtype", dtype_name(mm.storage_dtype)},
+                           {"lhs", cube_region_json(mm.lhs)},
+                           {"rhs", cube_region_json(mm.rhs)},
+                           {"output", cube_region_json(mm.output)},
+                           {"k_loop", cube_k_loop_json(mm.k_loop)},
+                           {"output_tile", {mm.output_tile_m, mm.output_tile_n}},
+                           {"output_grid", {mm.output_tiles_m, mm.output_tiles_n}},
+                           {"output_variants", std::move(variants)},
+                           {"retained_panels",
+                            {{"lhs", mm.retained_panels.lhs},
+                             {"rhs", mm.retained_panels.rhs},
+                             {"lhs_bytes", mm.retained_panels.lhs_bytes},
+                             {"rhs_bytes", mm.retained_panels.rhs_bytes}}},
+                           {"final_drain",
+                            {{"required", mm.final_drain.required},
+                             {"target_l1", mm.final_drain.target_l1},
+                             {"atomic", mm.final_drain.atomic},
+                             {"valid_rows", mm.final_drain.valid_rows},
+                             {"valid_cols", mm.final_drain.valid_cols},
+                             {"tile_count", mm.final_drain.tile_count},
+                             {"bytes", mm.final_drain.bytes},
+                             {"cycles", mm.final_drain.cycles}}}});
+      }
+      j["cube_schedule"].push_back(
+          {{"emit_compatible", cube_plan.emit_compatible},
+           {"spatial_policy", cube_spatial_policy_name(cube_plan.spatial_policy)},
+           {"spatial_tiles", cube_plan.spatial_tiles},
+           {"split_k", cube_plan.split_k},
+           {"work_units", cube_plan.work_units},
+           {"peak_l1_bytes", cube_plan.peak_l1_bytes},
+           {"split_merge_policy", cube_split_merge_policy_name(cube_plan.split_merge_policy)},
+           {"first_partial_then_atomic",
+            {{"present", cube_plan.first_partial_then_atomic.present},
+             {"first_work_units", cube_plan.first_partial_then_atomic.first_work_units},
+             {"atomic_work_units", cube_plan.first_partial_then_atomic.atomic_work_units},
+             {"synchronization_cycles", cube_plan.first_partial_then_atomic.synchronization_cycles}}},
+           {"model_overlap_granted", cube_plan.model_overlap_granted},
+           {"overlap_implementable", cube_plan.overlap_implementable},
+           {"matmuls", matmuls}});
+    } else {
+      j["cube_schedule"].push_back(nullptr);
+    }
+    if (mixed_plan.feasible && mixed_plan.topology) {
+      json stages = json::array();
+      for (const auto& stage : mixed_plan.topology->stages) {
+        stages.push_back({{"engine", mixed_engine_name(stage.engine)}, {"ops", stage.ops}});
+      }
+      json transfers = json::array();
+      for (const auto& transfer : mixed_plan.topology->transfers) {
+        transfers.push_back({{"tensor", transfer.tensor},
+                             {"producer_stage", transfer.producer_stage},
+                             {"consumer_stage", transfer.consumer_stage},
+                             {"producer_engine", mixed_engine_name(transfer.producer_engine)},
+                             {"consumer_engine", mixed_engine_name(transfer.consumer_engine)}});
+      }
+      json fifos = json::array();
+      for (const auto& fifo : mixed_plan.fifos) {
+        fifos.push_back({{"tensor", fifo.tensor},
+                         {"direction", mixed_transfer_direction_name(fifo.direction)},
+                         {"valid_rows", fifo.valid_rows},
+                         {"valid_cols", fifo.valid_cols},
+                         {"slot_bytes", fifo.slot_bytes},
+                         {"slot_count", fifo.slot_count},
+                         {"reserved_bytes", fifo.reserved_bytes},
+                         {"pipe_id", fifo.pipe_id},
+                         {"bundle", fifo.bundle}});
+      }
+      json dense_mlp = nullptr;
+      if (mixed_plan.dense_mlp.present) {
+        dense_mlp = {{"input_extent", mixed_plan.dense_mlp.input_extent},
+                     {"intermediate_extent", mixed_plan.dense_mlp.intermediate_extent},
+                     {"intermediate_chunk", mixed_plan.dense_mlp.intermediate_chunk},
+                     {"intermediate_chunks", mixed_plan.dense_mlp.intermediate_chunks},
+                     {"output_extent", mixed_plan.dense_mlp.output_extent},
+                     {"gate_window_k", mixed_plan.dense_mlp.gate_window_k},
+                     {"up_window_k", mixed_plan.dense_mlp.up_window_k},
+                     {"persistent_accumulator_bytes", mixed_plan.dense_mlp.persistent_accumulator_bytes},
+                     {"first_chunk_initializes", mixed_plan.dense_mlp.first_chunk_initializes},
+                     {"later_chunks_accumulate", mixed_plan.dense_mlp.later_chunks_accumulate}};
+      }
+      auto protocol_stage = [](size_t stage) {
+        return stage == std::numeric_limits<size_t>::max() ? json(nullptr) : json(stage);
+      };
+      j["mixed_schedule"].push_back(
+          {{"emit_compatible", mixed_plan.emit_compatible},
+           {"algorithm", mixed_algorithm_name(mixed_plan.algorithm)},
+           {"protocol", mixed_cross_core_protocol_name(mixed_plan.protocol)},
+           {"mode", mixed_pipeline_mode_name(mixed_plan.mode)},
+           {"spatial_tiles", mixed_plan.spatial_tiles},
+           {"split_k", mixed_plan.split_k},
+           {"work_units", mixed_plan.work_units},
+           {"group_capacity", mixed_plan.group_capacity},
+           {"cube_window_k", mixed_plan.cube_window_k},
+           {"vector_stage_kind", vector_stream_kind_name(mixed_plan.vector_stage_kind)},
+           {"vector_stage_peak_ub_bytes", mixed_plan.vector_stage_peak_ub_bytes},
+           {"vector_split", mixed_vector_split_name(mixed_plan.vector_split)},
+           {"vector_lanes", mixed_plan.vector_lanes},
+           {"pipeline_axis", mixed_pipeline_axis_name(mixed_plan.loop.axis)},
+           {"pipeline_extent", mixed_plan.loop.extent},
+           {"pipeline_chunk", mixed_plan.loop.chunk},
+           {"items_per_spatial_tile", mixed_plan.loop.items_per_spatial_tile},
+           {"active_groups", mixed_plan.loop.active_groups},
+           {"min_trips_per_group", mixed_plan.loop.min_trips_per_group},
+           {"max_trips_per_group", mixed_plan.loop.max_trips_per_group},
+           {"pipeline_stages", mixed_plan.loop.pipeline_stages},
+           {"requested_skew_depth", mixed_plan.loop.requested_skew_depth},
+           {"model_overlap_granted", mixed_plan.model_overlap_granted},
+           {"overlap_implementable", mixed_plan.overlap_implementable},
+           {"pipeline_fill_absorbed", mixed_plan.pipeline_fill_absorbed},
+           {"max_alternations", mixed_plan.topology->max_alternations},
+           {"output_engines_uniform", mixed_plan.topology->output_engines_uniform},
+           {"protocol_producer_stages", mixed_plan.topology->protocol.producer_stages},
+           {"protocol_peer_stage", protocol_stage(mixed_plan.topology->protocol.peer_stage)},
+           {"protocol_sink_stage", protocol_stage(mixed_plan.topology->protocol.sink_stage)},
+           {"protocol_producer_bundle", mixed_plan.topology->protocol.producer_bundle_transfers},
+           {"protocol_reply_bundle", mixed_plan.topology->protocol.reply_bundle_transfers},
+           {"protocol_skew_compatible", mixed_plan.topology->protocol.skew_pass_compatible},
+           {"stages", stages},
+           {"transfers", transfers},
+           {"fifos", fifos},
+           {"dense_mlp", dense_mlp}});
+    } else {
+      j["mixed_schedule"].push_back(nullptr);
+    }
+    j["tensors_to_retain"].push_back(std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
 
         j["subgraph_latencies"].push_back(sol.step_latency(i));
     }

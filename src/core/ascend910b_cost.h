@@ -271,6 +271,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const FlatSet<size_t> &retained_from_prev,
       const FlatSet<size_t> &retain_these) const;
 
+  CostResult compute_dense_mlp_cost(const TileConfig& cfg, const MixedSchedulePlan& schedule) const;
+
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
   //   vector: tile + ephemerals fit UB (vec_capacity)
@@ -294,6 +296,20 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   bool mixed_fits_on_chip(const TileConfig &cfg,
                           const FlatSet<size_t> &retained_from_prev,
                           const FlatSet<size_t> &retain_these) const;
+
+  struct DenseMlpResources {
+    bool feasible = false;
+    int64_t gate_window_k = 0;
+    int64_t up_window_k = 0;
+    int64_t vector_peak_ub_bytes = 0;
+    int64_t fifo_reserved_bytes = 0;
+  };
+
+  // Exact resources for the production Cx2->V->C SwiGLU algorithm.  This is
+  // intentionally separate from derive_exec()/vector_stream_plan(): those
+  // homogeneous planners see a final-output tile, while this algorithm streams
+  // an intermediate-feature chunk and keeps a down-projection accumulator.
+  DenseMlpResources derive_dense_mlp_resources(const TileConfig& cfg) const;
 
   // Engine behind cube_peak_l1(): sweep the request-instance execution order,
   // accumulate live intermediate-region bytes, derive each matmul instance's k

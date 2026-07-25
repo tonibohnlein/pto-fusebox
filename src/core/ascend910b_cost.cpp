@@ -878,6 +878,84 @@ double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols) {
   return kVecExpandScalarHead + kVecExpandScalarTail;
 }
 
+namespace {
+
+MixedCrossCoreProtocolTopology ClassifyMixedCrossCoreProtocol(const MixedScheduleTopology& topology) {
+  MixedCrossCoreProtocolTopology protocol;
+
+  const bool one_way = topology.stages.size() == 2 && topology.transfers.size() == 1 &&
+                       topology.transfers[0].producer_stage == 0 && topology.transfers[0].consumer_stage == 1;
+  if (one_way) {
+    protocol.kind = MixedCrossCoreProtocol::OneWay;
+    protocol.producer_engine = topology.stages[0].engine;
+    protocol.peer_engine = topology.stages[1].engine;
+    protocol.producer_stages = {0};
+    protocol.peer_stage = 1;
+    protocol.producer_bundle_transfers = {0};
+    return protocol;
+  }
+
+  // SkewCrossCorePipeline admits one ordered producer bundle followed by one
+  // reverse-direction reply. Find the unique peer stage around which all
+  // cross-engine transfers have that shape. Adjacent same-engine operations
+  // were already collapsed when the stage DAG was built.
+  for (size_t peer = 0; peer < topology.stages.size(); ++peer) {
+    std::vector<size_t> incoming;
+    std::vector<size_t> outgoing;
+    for (size_t transfer = 0; transfer < topology.transfers.size(); ++transfer) {
+      if (topology.transfers[transfer].consumer_stage == peer) {
+        incoming.push_back(transfer);
+      }
+      if (topology.transfers[transfer].producer_stage == peer) {
+        outgoing.push_back(transfer);
+      }
+    }
+    if (incoming.empty() || outgoing.size() != 1 ||
+        incoming.size() + outgoing.size() != topology.transfers.size()) {
+      continue;
+    }
+
+    const MixedEngine peer_engine = topology.stages[peer].engine;
+    const MixedEngine producer_engine = topology.transfers[incoming.front()].producer_engine;
+    if (producer_engine == peer_engine) continue;
+
+    std::set<size_t> producer_stages;
+    bool compatible = true;
+    for (size_t transfer_index : incoming) {
+      const MixedTransferTopology& transfer = topology.transfers[transfer_index];
+      compatible &= transfer.consumer_stage == peer && transfer.consumer_engine == peer_engine &&
+                    transfer.producer_engine == producer_engine && transfer.producer_stage < peer;
+      producer_stages.insert(transfer.producer_stage);
+    }
+    const size_t reply_index = outgoing.front();
+    const MixedTransferTopology& reply = topology.transfers[reply_index];
+    compatible &= reply.producer_stage == peer && reply.producer_engine == peer_engine &&
+                  reply.consumer_engine == producer_engine && reply.consumer_stage > peer;
+    if (!compatible) continue;
+
+    std::set<size_t> covered_stages = producer_stages;
+    covered_stages.insert(peer);
+    covered_stages.insert(reply.consumer_stage);
+    if (covered_stages.size() != topology.stages.size() || topology.max_alternations > 2) {
+      continue;
+    }
+
+    protocol.kind = MixedCrossCoreProtocol::SingleRoundTripBundle;
+    protocol.producer_engine = producer_engine;
+    protocol.peer_engine = peer_engine;
+    protocol.producer_stages.assign(producer_stages.begin(), producer_stages.end());
+    protocol.peer_stage = peer;
+    protocol.sink_stage = reply.consumer_stage;
+    protocol.producer_bundle_transfers = std::move(incoming);
+    protocol.reply_bundle_transfers = {reply_index};
+    protocol.skew_pass_compatible = true;
+    return protocol;
+  }
+  return protocol;
+}
+
+}  // namespace
+
 // ============================================================================
 // Factory
 // ============================================================================
@@ -2146,47 +2224,194 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         }
       }
     }
-    int64_t cube_to_vector = 0;
-    int64_t vector_to_cube = 0;
-    for (const MixedTransferTopology& transfer : topology->transfers) {
-      if (transfer.producer_engine == MixedEngine::Cube) {
-        ++cube_to_vector;
-      } else {
-        ++vector_to_cube;
-      }
-    }
-    const bool one_way_chain =
-        topology->stages.size() == 2 && topology->transfers.size() == 1 &&
-        topology->transfers[0].producer_stage == 0 &&
-        topology->transfers[0].consumer_stage == 1;
-    const bool three_stage_chain =
-        topology->stages.size() == 3 && topology->transfers.size() == 2 &&
-        topology->transfers[0].producer_stage == 0 &&
-        topology->transfers[0].consumer_stage == 1 &&
-        topology->transfers[1].producer_stage == 1 &&
-        topology->transfers[1].consumer_stage == 2;
+    topology->protocol = ClassifyMixedCrossCoreProtocol(*topology);
+    const bool one_way_chain = topology->protocol.kind == MixedCrossCoreProtocol::OneWay;
     if (one_way_chain) {
       topology->mode = MixedPipelineMode::OneWay;
-    } else if (three_stage_chain && cube_to_vector == 1 && vector_to_cube == 1 &&
-               topology->max_alternations <= 2) {
+    } else if (topology->protocol.kind == MixedCrossCoreProtocol::SingleRoundTripBundle) {
       topology->mode = MixedPipelineMode::SingleRoundTripSkew;
     } else {
       topology->mode = MixedPipelineMode::MultiRoundTripSequential;
     }
+    const bool generic_single_round_trip = topology->protocol.skew_pass_compatible &&
+                                           topology->stages.size() == 3 &&
+                                           topology->protocol.producer_bundle_transfers.size() == 1 &&
+                                           topology->protocol.reply_bundle_transfers.size() == 1;
+    // Protocol recognition is broader than generic mixed costing. Keep a
+    // bundled topology classified for exact algorithms, but do not grant it a
+    // generic stage cost until every producer stage and lifetime is modeled.
     topology->emit_compatible =
-        topology->output_engines_uniform &&
-        (topology->mode == MixedPipelineMode::OneWay ||
-         topology->mode == MixedPipelineMode::SingleRoundTripSkew);
+        topology->output_engines_uniform && (one_way_chain || generic_single_round_trip);
 
-    // Production increment 1 is deliberately narrower than the generic
-    // infrastructure: one matmul followed by a linear, same-shape elementwise
-    // epilogue.  This is the exact source algorithm replayed by AutoFuse.  In
-    // particular, reductions/P4 and V->C/C->V->C remain analytic-only until
-    // their stage-local plans and FIFO protocols are emitted.
-    bool compiler_emit_compatible =
-        one_way_chain && topology->stages[0].engine == MixedEngine::Cube &&
-        topology->stages[1].engine == MixedEngine::Vector &&
-        topology->stages[0].ops.size() == 1;
+    // Recognize the first production round-trip algorithm without teaching the
+    // generic mixed stage model any source-language names:
+    //
+    //   gate = X @ Wg        up = X @ Wu
+    //       \                 /
+    //        sigmoid(gate)*gate*up -> cast -> @ Wd
+    //
+    // The two independent cube stages intentionally remain separate topology
+    // nodes.  Their two C->V messages form one ordered bundle; the narrowed
+    // activation is the single V->C reply.  A future generic stage scheduler
+    // can consume the same topology, while this exact recognizer keeps the
+    // first compiler surface fail-closed.
+    bool dense_mlp = false;
+    if (topology->protocol.kind == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+        topology->protocol.producer_bundle_transfers.size() == 2 &&
+        topology->protocol.reply_bundle_transfers.size() == 1 && topology->stages.size() == 4 &&
+        topology->transfers.size() == 3 && topology->stages[0].engine == MixedEngine::Cube &&
+        topology->stages[1].engine == MixedEngine::Cube &&
+        topology->stages[2].engine == MixedEngine::Vector &&
+        topology->stages[3].engine == MixedEngine::Cube && topology->stages[0].ops.size() == 1 &&
+        topology->stages[1].ops.size() == 1 && topology->stages[2].ops.size() == 7 &&
+        topology->stages[3].ops.size() == 1) {
+      const std::vector<size_t>& vector_ops = topology->stages[2].ops;
+      const std::array<MixedVectorSemantic, 7> expected = {
+          MixedVectorSemantic::Neg,   MixedVectorSemantic::Exp, MixedVectorSemantic::ScalarAdd,
+          MixedVectorSemantic::Recip, MixedVectorSemantic::Mul, MixedVectorSemantic::Mul,
+          MixedVectorSemantic::Cast};
+      bool semantics_match = true;
+      for (size_t i = 0; i < expected.size(); ++i) {
+        semantics_match &= prob.ops[vector_ops[i]].mixed_vector_semantic == expected[i] &&
+                           prob.ops[vector_ops[i]].type == OpType::Pointwise &&
+                           prob.ops[vector_ops[i]].vector_capability == VectorOpCapability::Elementwise;
+      }
+
+      auto consumes = [&](size_t op, size_t tensor) {
+        return std::find(prob.ops[op].inputs.begin(), prob.ops[op].inputs.end(), tensor) !=
+               prob.ops[op].inputs.end();
+      };
+      auto only_internal_consumer = [&](size_t tensor, size_t expected_consumer) {
+        int count = 0;
+        bool exact = true;
+        for (size_t consumer : dag.tensor_consumers[tensor]) {
+          if (!is_in_sg[consumer]) {
+            exact = false;
+          } else {
+            ++count;
+            exact &= consumer == expected_consumer;
+          }
+        }
+        return exact && count == 1;
+      };
+      auto unescaped = [&](size_t tensor) {
+        if (sg.boundary_outputs_.count(tensor) || prob.required_outputs.count(tensor)) {
+          return false;
+        }
+        for (size_t consumer : dag.tensor_consumers[tensor]) {
+          if (!is_in_sg[consumer]) return false;
+        }
+        return true;
+      };
+
+      const size_t gate_op = topology->stages[0].ops.front();
+      const size_t up_op = topology->stages[1].ops.front();
+      const size_t down_op = topology->stages[3].ops.front();
+      const size_t gate_tensor = prob.ops[gate_op].output();
+      const size_t up_tensor = prob.ops[up_op].output();
+      const size_t neg_tensor = prob.ops[vector_ops[0]].output();
+      const size_t exp_tensor = prob.ops[vector_ops[1]].output();
+      const size_t add_tensor = prob.ops[vector_ops[2]].output();
+      const size_t recip_tensor = prob.ops[vector_ops[3]].output();
+      const size_t silu_tensor = prob.ops[vector_ops[4]].output();
+      const size_t product_tensor = prob.ops[vector_ops[5]].output();
+      const size_t activated_tensor = prob.ops[vector_ops[6]].output();
+      const size_t down_tensor = prob.ops[down_op].output();
+
+      bool flow_match = semantics_match && consumes(vector_ops[0], gate_tensor) &&
+                        consumes(vector_ops[1], neg_tensor) && consumes(vector_ops[2], exp_tensor) &&
+                        consumes(vector_ops[3], add_tensor) && consumes(vector_ops[4], gate_tensor) &&
+                        consumes(vector_ops[4], recip_tensor) && consumes(vector_ops[5], silu_tensor) &&
+                        consumes(vector_ops[5], up_tensor) && consumes(vector_ops[6], product_tensor) &&
+                        !prob.ops[down_op].inputs.empty() &&
+                        prob.ops[down_op].inputs.front() == activated_tensor;
+      const std::array<std::pair<size_t, size_t>, 7> vector_chain = {{
+          {neg_tensor, vector_ops[1]},
+          {exp_tensor, vector_ops[2]},
+          {add_tensor, vector_ops[3]},
+          {recip_tensor, vector_ops[4]},
+          {silu_tensor, vector_ops[5]},
+          {product_tensor, vector_ops[6]},
+          {activated_tensor, down_op},
+      }};
+      for (const auto& [tensor, consumer] : vector_chain) {
+        flow_match &= only_internal_consumer(tensor, consumer) && unescaped(tensor);
+      }
+      // gate is used by neg and the first multiply; up by the second multiply.
+      auto exact_consumers = [&](size_t tensor, std::initializer_list<size_t> expected_ops) {
+        std::set<size_t> actual;
+        bool internal = true;
+        for (size_t consumer : dag.tensor_consumers[tensor]) {
+          internal &= is_in_sg[consumer];
+          if (is_in_sg[consumer]) actual.insert(consumer);
+        }
+        return internal && actual == std::set<size_t>(expected_ops.begin(), expected_ops.end());
+      };
+      flow_match &= exact_consumers(gate_tensor, {vector_ops[0], vector_ops[4]}) &&
+                    exact_consumers(up_tensor, {vector_ops[5]}) && unescaped(gate_tensor) &&
+                    unescaped(up_tensor);
+
+      const Op& gate = prob.ops[gate_op];
+      const Op& up = prob.ops[up_op];
+      const Op& down = prob.ops[down_op];
+      bool shape_match = flow_match && gate.inputs.size() == 2 && up.inputs.size() == 2 &&
+                         down.inputs.size() == 2 && gate.inputs[0] == up.inputs[0] &&
+                         gate.mixed_emit_compatible && up.mixed_emit_compatible && down.mixed_emit_compatible;
+      if (shape_match) {
+        const Tensor& x = prob.tensors[gate.inputs[0]];
+        const Tensor& wg = prob.tensors[gate.inputs[1]];
+        const Tensor& wu = prob.tensors[up.inputs[1]];
+        const Tensor& gate_out = prob.tensors[gate_tensor];
+        const Tensor& up_out = prob.tensors[up_tensor];
+        const Tensor& activated = prob.tensors[activated_tensor];
+        const Tensor& wd = prob.tensors[down.inputs[1]];
+        const Tensor& output = prob.tensors[down_tensor];
+        const DType operand_dtype = x.dtype;
+        shape_match =
+            (operand_dtype == DType::FP16 || operand_dtype == DType::BF16) && wg.dtype == operand_dtype &&
+            wu.dtype == operand_dtype && activated.dtype == operand_dtype && wd.dtype == operand_dtype &&
+            gate_out.dtype == DType::FP32 && up_out.dtype == DType::FP32 && output.dtype == DType::FP32 &&
+            wg.height == x.width && wu.height == x.width && wg.width == wu.width &&
+            gate_out.height == x.height && up_out.height == x.height && gate_out.width == wg.width &&
+            up_out.width == wg.width && activated.height == x.height && activated.width == wg.width &&
+            wd.height == wg.width && output.height == x.height && output.width == wd.width &&
+            prob.tensors[down.inputs[0]].height == x.height &&
+            prob.tensors[down.inputs[0]].width == wg.width && sg.boundary_outputs_.count(down_tensor) == 1;
+        if (shape_match) {
+          MixedDenseMlpTopology descriptor;
+          descriptor.present = true;
+          descriptor.gate_matmul = gate_op;
+          descriptor.up_matmul = up_op;
+          descriptor.down_matmul = down_op;
+          descriptor.gate_tensor = gate_tensor;
+          descriptor.up_tensor = up_tensor;
+          descriptor.activated_tensor = activated_tensor;
+          descriptor.vector_ops = vector_ops;
+          descriptor.input_extent = x.width;
+          descriptor.intermediate_extent = wg.width;
+          descriptor.output_extent = output.width;
+          descriptor.operand_dtype = operand_dtype;
+          for (int64_t chunk : all_divisors(descriptor.intermediate_extent)) {
+            if (chunk % 16 == 0 && descriptor.intermediate_extent / chunk >= 2) {
+              descriptor.feature_chunks.push_back(chunk);
+            }
+          }
+          dense_mlp = !descriptor.feature_chunks.empty();
+          if (dense_mlp) {
+            topology->algorithm = MixedAlgorithmKind::DenseSwiGluMlp;
+            topology->dense_mlp = std::move(descriptor);
+            topology->mode = MixedPipelineMode::SingleRoundTripSkew;
+            topology->emit_compatible = topology->output_engines_uniform;
+          }
+        }
+      }
+    }
+
+    // Production increment 1 is one default matmul plus a linear pointwise
+    // epilogue.  Increment 2 is the exact dense SwiGLU round trip above.
+    bool compiler_emit_compatible = one_way_chain && topology->stages[0].engine == MixedEngine::Cube &&
+                                    topology->stages[1].engine == MixedEngine::Vector &&
+                                    topology->stages[0].ops.size() == 1;
     if (compiler_emit_compatible) {
       const size_t matmul_op = topology->stages[0].ops.front();
       if (!prob.ops[matmul_op].mixed_emit_compatible) {
@@ -2274,7 +2499,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         }
       }
     }
-    topology->compiler_emit_compatible = compiler_emit_compatible;
+    topology->compiler_emit_compatible = dense_mlp ? topology->emit_compatible : compiler_emit_compatible;
     if (prob.require_buildable_mixed && !topology->compiler_emit_compatible) {
       return std::nullopt;
     }
@@ -2303,6 +2528,9 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         break;
       }
     }
+    if (topology->algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+      sg.ks_cand_ = topology->dense_mlp.feature_chunks;
+    }
     sg.mixed_topology_ = std::move(topology);
   }
 
@@ -2324,6 +2552,27 @@ bool Ascend910BCost::is_valid_tiling(const TileConfig &cfg) const {
   const bool matmul_910b = has_matmul_;
   if (matmul_910b) {
     if (cfg.w % 16 != 0 || cfg.h % 16 != 0) return false;  // 16-fractal aligned
+  }
+
+  // The dense mixed algorithm gives cfg.k a different, explicit meaning: it
+  // is the intermediate-feature item supplied to gate/up -> SwiGLU -> down,
+  // not the generic sink-only K granule. Its vector ephemerals therefore span
+  // [spatial-M, feature-chunk] and cannot be validated with the generic
+  // whole-subgraph tensor_tiling_ propagation below. The exact recognizer has
+  // already proved the source shapes and flow; validate only the output grid
+  // and the admitted feature chunks here. derive_dense_mlp_resources() owns
+  // all stage-local capacity checks.
+  if (mixed_topology_ && mixed_topology_->algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+    if (cfg.parts_m <= 0 || cfg.parts_n <= 0 || cfg.split_k != 1 ||
+        std::find(mixed_topology_->dense_mlp.feature_chunks.begin(),
+                  mixed_topology_->dense_mlp.feature_chunks.end(),
+                  cfg.k) == mixed_topology_->dense_mlp.feature_chunks.end()) {
+      return false;
+    }
+    const AxisPartition mp = partition_axis(out_H_, cfg.parts_m, grid_gran_h_);
+    const AxisPartition np = partition_axis(out_W_, cfg.parts_n, grid_gran_w_);
+    return mp.num_big == 0 && np.num_big == 0 && mp.big == cfg.h && np.big == cfg.w &&
+           mp.parts * np.parts > 0;
   }
 
   // G6: a fixed vector reduced-axis split is legal only for the exact
@@ -3655,9 +3904,83 @@ bool Ascend910BCost::fits_on_chip(const TileConfig &cfg,
   return vector_stream(cfg, retained_from_prev, retain_these).chunk > 0;
 }
 
-bool Ascend910BCost::mixed_fits_on_chip(const TileConfig &cfg,
-                                  const FlatSet<size_t> &retained_from_prev,
-                                  const FlatSet<size_t> &retain_these) const {
+Ascend910BCost::DenseMlpResources Ascend910BCost::derive_dense_mlp_resources(const TileConfig& cfg) const {
+  DenseMlpResources resources;
+  if (!mixed_topology_ || mixed_topology_->algorithm != MixedAlgorithmKind::DenseSwiGluMlp ||
+      !mixed_topology_->dense_mlp.present || cfg.split_k != 1) {
+    return resources;
+  }
+  const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
+  if (std::find(mlp.feature_chunks.begin(), mlp.feature_chunks.end(), cfg.k) == mlp.feature_chunks.end()) {
+    return resources;
+  }
+  const int64_t parts_m = cfg.parts_m > 0 ? cfg.parts_m : 1;
+  const int64_t parts_n = cfg.parts_n > 0 ? cfg.parts_n : 1;
+  const AxisPartition mp = partition_axis(out_H_, parts_m, grid_gran_h_);
+  const AxisPartition np = partition_axis(out_W_, parts_n, grid_gran_w_);
+  const int64_t groups = mp.parts * np.parts;
+  if (mp.num_big != 0 || np.num_big != 0 || mp.big < 2 || mp.big % 2 != 0 || groups <= 0 ||
+      groups > std::min<int64_t>(prob_->num_cube_cores, prob_->num_vector_cores / 2) ||
+      mlp.intermediate_extent % cfg.k != 0 || mlp.intermediate_extent / cfg.k < 2) {
+    return resources;
+  }
+
+  const int64_t operand_bytes = dtype_bytes(mlp.operand_dtype);
+  const int64_t l1_capacity =
+      prob_->l1_capacity > 0 ? prob_->l1_capacity : prob_->fast_memory_capacity * operand_bytes;
+  const int64_t cube_capacity =
+      prob_->cube_capacity > 0
+          ? prob_->cube_capacity
+          : prob_->fast_memory_capacity * dtype_bytes(cube_accumulator_dtype(mlp.operand_dtype));
+  const int64_t vec_capacity =
+      prob_->vec_capacity > 0 ? prob_->vec_capacity : prob_->fast_memory_capacity * 4;
+  if (l1_capacity <= 0 || cube_capacity <= 0 || vec_capacity <= 0) {
+    return resources;
+  }
+
+  // Gate and up execute serially and reuse the same two-stage L1 operand
+  // banks.  Choose one shared input-K window so their emitted loops and cost
+  // descriptor cannot diverge.
+  for (int64_t window : all_divisors(mlp.input_extent)) {
+    if (window % 16 != 0) continue;
+    const int64_t two_stage_bytes = 2 * window * (mp.big + cfg.k) * operand_bytes;
+    if (two_stage_bytes <= l1_capacity) {
+      resources.gate_window_k = window;
+      resources.up_window_k = window;
+    }
+  }
+  if (resources.gate_window_k <= 0) return resources;
+
+  // The down projection consumes one complete feature chunk.  Its operand
+  // feed reuses the same serial L1 banks after gate/up have pushed their
+  // results; only the FP32 output accumulator persists on the cube side.
+  const int64_t down_two_stage_bytes = 2 * cfg.k * (mp.big + np.big) * operand_bytes;
+  const int64_t projection_acc_bytes = mp.big * cfg.k * 4;
+  const int64_t down_acc_bytes = mp.big * np.big * 4;
+  if (down_two_stage_bytes > l1_capacity || std::max(projection_acc_bytes, down_acc_bytes) > cube_capacity) {
+    return resources;
+  }
+
+  constexpr int64_t kFifoSlots = 4;
+  const int64_t gate_slot = mp.big * cfg.k * 4;
+  const int64_t up_slot = mp.big * cfg.k * 4;
+  const int64_t activation_slot = mp.big * cfg.k * operand_bytes;
+  resources.fifo_reserved_bytes = kFifoSlots * (gate_slot + up_slot + activation_slot);
+  // Each AIV lane owns half the rows.  Four FP32 bands cover the exact peak:
+  // gate + up plus the current and next values of the unary sigmoid chain.
+  const int64_t lane_rows = mp.big / 2;
+  const int64_t vector_live_bytes = lane_rows * cfg.k * 4 * 4;
+  resources.vector_peak_ub_bytes = resources.fifo_reserved_bytes + vector_live_bytes;
+  resources.feasible =
+      resources.fifo_reserved_bytes <= vec_capacity && resources.vector_peak_ub_bytes <= vec_capacity;
+  return resources;
+}
+
+bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<size_t>& retained_from_prev,
+                                        const FlatSet<size_t>& retain_these) const {
+  if (mixed_topology_ && mixed_topology_->algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+    return derive_dense_mlp_resources(cfg).feasible;
+  }
   // Two-pool feasibility for a mixed cube+vector kernel — REUSE the homogeneous
   // single-core streams, now that both are affinity-aware (each skips the other
   // unit's ops, and treats a cube↔vector crossing as ring-streamed, not a resident
@@ -4963,6 +5286,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   MixedSchedulePlan plan;
   plan.config = cfg;
   if (!(has_matmul_ && has_vector_) || !mixed_topology_) return plan;
+  plan.algorithm = mixed_topology_->algorithm;
+  plan.protocol = mixed_topology_->protocol.kind;
   plan.mode = mixed_topology_->mode;
   plan.emit_compatible = prob_->require_buildable_mixed
                              ? mixed_topology_->compiler_emit_compatible
@@ -4988,6 +5313,60 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   plan.work_units = plan.spatial_tiles * split;
   plan.group_capacity = std::max<int64_t>(
       1, std::min<int64_t>(prob_->num_cube_cores, prob_->num_vector_cores / 2));
+
+  if (plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+    const DenseMlpResources resources = derive_dense_mlp_resources(cfg);
+    if (!resources.feasible || split != 1 || plan.spatial_tiles > plan.group_capacity) {
+      plan.feasible = false;
+      return plan;
+    }
+    const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
+    const int64_t chunks = mlp.intermediate_extent / cfg.k;
+    plan.vector_split = MixedVectorSplit::Rows;
+    plan.vector_lanes = 2;
+    plan.loop.axis = MixedPipelineAxis::IntermediateFeatureChunk;
+    plan.loop.extent = mlp.intermediate_extent;
+    plan.loop.chunk = cfg.k;
+    plan.loop.items_per_spatial_tile = chunks;
+    plan.loop.work_items = plan.spatial_tiles * chunks;
+    plan.loop.active_groups = plan.spatial_tiles;
+    plan.loop.min_trips_per_group = chunks;
+    plan.loop.max_trips_per_group = chunks;
+    plan.loop.pipeline_stages = 3;
+    plan.loop.requested_skew_depth = 2;
+    plan.overlap_implementable = plan.emit_compatible && chunks >= 2;
+    plan.model_overlap_granted = plan.overlap_implementable;
+    plan.pipeline_fill_absorbed = false;
+    plan.vector_stage_kind = VectorStreamKind::Materialized;
+    plan.vector_stage_peak_ub_bytes = resources.vector_peak_ub_bytes - resources.fifo_reserved_bytes;
+
+    constexpr int64_t kFifoSlots = 4;
+    auto add_fifo = [&](size_t tensor, MixedTransferDirection direction, int pipe_id, int bundle) {
+      const Tensor& value = prob_->tensors[tensor];
+      const int64_t slot_bytes = plan.m_partition.big * cfg.k * dtype_bytes(value.dtype);
+      plan.fifos.push_back({tensor, direction, plan.m_partition.big, cfg.k, slot_bytes, kFifoSlots,
+                            slot_bytes * kFifoSlots, pipe_id, bundle});
+    };
+    add_fifo(mlp.gate_tensor, MixedTransferDirection::CubeToVector,
+             /*pipe_id=*/0, /*bundle=*/0);
+    add_fifo(mlp.up_tensor, MixedTransferDirection::CubeToVector,
+             /*pipe_id=*/1, /*bundle=*/0);
+    add_fifo(mlp.activated_tensor, MixedTransferDirection::VectorToCube,
+             /*pipe_id=*/2, /*bundle=*/1);
+
+    plan.dense_mlp.present = true;
+    plan.dense_mlp.input_extent = mlp.input_extent;
+    plan.dense_mlp.intermediate_extent = mlp.intermediate_extent;
+    plan.dense_mlp.intermediate_chunk = cfg.k;
+    plan.dense_mlp.intermediate_chunks = chunks;
+    plan.dense_mlp.output_extent = mlp.output_extent;
+    plan.dense_mlp.gate_window_k = resources.gate_window_k;
+    plan.dense_mlp.up_window_k = resources.up_window_k;
+    plan.dense_mlp.persistent_accumulator_bytes = plan.m_partition.big * plan.n_partition.big * 4;
+    plan.dense_mlp.first_chunk_initializes = true;
+    plan.dense_mlp.later_chunks_accumulate = true;
+    return plan;
+  }
 
   // The buildable C->V epilogue is split across the two buddy AIVs by rows.
   // Cube grids are 16-row aligned, so every uniform candidate has an exact
@@ -5068,6 +5447,48 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
   MixedSchedulePlan plan = derive_mixed_schedule_plan(
       cfg, retained_from_prev, retain_these, parallel_split);
   if (plan.feasible) {
+    if (plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+      const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
+      plan.stages.reserve(mixed_topology_->stages.size());
+      for (size_t stage_idx = 0; stage_idx < mixed_topology_->stages.size(); ++stage_idx) {
+        const MixedStageTopology& topology_stage = mixed_topology_->stages[stage_idx];
+        MixedStagePlan stage;
+        stage.topology_stage = stage_idx;
+        stage.engine = topology_stage.engine;
+        stage.ops = topology_stage.ops;
+        stage.valid_rows = stage.engine == MixedEngine::Vector ? plan.m_partition.big / plan.vector_lanes
+                                                               : plan.m_partition.big;
+        stage.valid_cols = stage_idx == mixed_topology_->stages.size() - 1 ? plan.n_partition.big : cfg.k;
+        if (topology_stage.engine == MixedEngine::Cube) {
+          if (topology_stage.ops.front() == mlp.gate_matmul) {
+            stage.cube_window_k.push_back(plan.dense_mlp.gate_window_k);
+          } else if (topology_stage.ops.front() == mlp.up_matmul) {
+            stage.cube_window_k.push_back(plan.dense_mlp.up_window_k);
+          } else {
+            stage.cube_window_k.push_back(cfg.k);
+          }
+        } else {
+          stage.vector_stream.feasible = true;
+          stage.vector_stream.kind = VectorStreamKind::Materialized;
+          stage.vector_stream.work_units = plan.work_units;
+          stage.vector_stream.full_peak_ub_bytes = plan.vector_stage_peak_ub_bytes;
+          stage.vector_stream.chunk_peak_ub_bytes = plan.vector_stage_peak_ub_bytes;
+          stage.vector_stream.tile_h = stage.valid_rows;
+          stage.vector_stream.tile_w = stage.valid_cols;
+          stage.vector_stream.strip_h = stage.valid_rows;
+          stage.vector_stream.strip_w = stage.valid_cols;
+          stage.vector_stream.free_tile = stage.valid_rows;
+          stage.vector_stream.free_tile_alloc = stage.valid_rows;
+          stage.vector_stream.extent = stage.valid_cols;
+          stage.vector_stream.chunk = stage.valid_cols;
+          stage.vector_stream.full_chunks = 1;
+          stage.vector_stream.stream_passes = 1;
+        }
+        plan.stages.push_back(std::move(stage));
+      }
+      plan.topology = mixed_topology_;
+      return plan;
+    }
     std::vector<int64_t> pernode_k;
     derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pernode_k);
     if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < pernode_k.size() &&
@@ -5093,10 +5514,113 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
   return plan;
 }
 
-CostResult Ascend910BCost::compute_mixed_cost(
-    const TileConfig &cfg,
-    const FlatSet<size_t> &retained_from_prev,
-    const FlatSet<size_t> &retain_these) const {
+CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
+                                                  const MixedSchedulePlan& schedule) const {
+  CostResult result;
+  result.config = cfg;
+  if (!schedule.feasible || !schedule.dense_mlp.present || !mixed_topology_ ||
+      !mixed_topology_->dense_mlp.present) {
+    return result;
+  }
+  result.feasible = true;
+  const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
+  const ByteCost bc = MakeByteCost(prob_);
+  const int64_t rows = schedule.m_partition.big;
+  const int64_t cols = schedule.n_partition.big;
+  const int64_t chunk = schedule.dense_mlp.intermediate_chunk;
+  const int64_t chunks = schedule.dense_mlp.intermediate_chunks;
+  const int64_t groups = schedule.loop.active_groups;
+  const int64_t operand_bytes = dtype_bytes(mlp.operand_dtype);
+
+  const double gate_extract = CubeExtractCycles(prob_, bc, rows, chunk, mlp.input_extent, mlp.operand_dtype);
+  const double gate_work =
+      std::max(CubeMacCycles(prob_, rows, chunk, mlp.input_extent, mlp.operand_dtype), gate_extract);
+  const double up_work = gate_work;
+  const double down_extract = CubeExtractCycles(prob_, bc, rows, cols, chunk, mlp.operand_dtype);
+  const double down_work = std::max(CubeMacCycles(prob_, rows, cols, chunk, mlp.operand_dtype), down_extract);
+  const double cube_compute = static_cast<double>(chunks) * (gate_work + up_work + down_work);
+
+  double vector_item = 0.0;
+  bool stream_start = true;
+  const int64_t lane_rows = rows / std::max<int64_t>(1, schedule.vector_lanes);
+  for (size_t op_idx : mlp.vector_ops) {
+    const Op& op = prob_->ops[op_idx];
+    if (HasGroundedVectorSemantics(op)) {
+      vector_item += GroundedVectorOpCompute(prob_, op, lane_rows, chunk, stream_start,
+                                             /*row_expand_composite=*/false);
+    } else {
+      const int64_t element_bytes = dtype_bytes(prob_->tensors[op.output()].dtype);
+      const int64_t epr =
+          std::max<int64_t>(1, (prob_->vec_reg_bytes > 0 ? prob_->vec_reg_bytes : 256) / element_bytes);
+      const int64_t repeats = (lane_rows * chunk + epr - 1) / epr;
+      const double slope = op.vec_slope > 0.0 ? op.vec_slope : prob_->vec_slope_pw;
+      const double fixed = op.vec_fixed > 0.0 ? op.vec_fixed : prob_->vec_op_head + prob_->vec_op_tail;
+      vector_item += slope * static_cast<double>(repeats) + (stream_start ? fixed : 0.0);
+      if (chunk % epr != 0) vector_item += kVecCountModeFloor;
+    }
+    stream_start = false;
+  }
+  const double vector_compute = static_cast<double>(chunks) * vector_item;
+
+  // Exact whole-grid GM traffic of the emitted algorithm.  Gate/up are
+  // recomputed for every final-N region, so X is read twice per feature chunk
+  // and their weight panels are duplicated by parts_m.  Crossings pay one
+  // producer write and one consumer read; only the final down accumulator is
+  // drained once.
+  const double regions = static_cast<double>(schedule.spatial_tiles);
+  const double per_item_gm_l1 =
+      static_cast<double>(operand_bytes) *
+      (2.0 * rows * mlp.input_extent + 2.0 * mlp.input_extent * chunk + rows * chunk + chunk * cols);
+  const double per_item_gm_ub = static_cast<double>(rows * chunk * 4 * 2);
+  const double per_item_l0c_gm = static_cast<double>(rows * chunk * 4 * 2);
+  const double per_item_ub_gm = static_cast<double>(rows * chunk * operand_bytes);
+  const double gm_l1_bytes = regions * static_cast<double>(chunks) * per_item_gm_l1;
+  const double gm_ub_bytes = regions * static_cast<double>(chunks) * per_item_gm_ub;
+  const double l0c_gm_bytes =
+      regions * (static_cast<double>(chunks) * per_item_l0c_gm + static_cast<double>(rows * cols * 4));
+  const double ub_gm_bytes = regions * static_cast<double>(chunks) * per_item_ub_gm;
+
+  const double hbm = prob_->hbm_aggregate_gibps;
+  auto parallelism = [&](double active, double peak_gibps) {
+    const double cap =
+        hbm > 0.0 && peak_gibps > 0.0 ? hbm / peak_gibps : std::numeric_limits<double>::infinity();
+    return std::max(1.0, std::min(active, cap));
+  };
+  const double cube_pipes = static_cast<double>(groups);
+  const double vector_pipes = cube_pipes * static_cast<double>(schedule.vector_lanes);
+  const double gm_l1 = gm_l1_bytes * bc.reload / parallelism(cube_pipes, prob_->bw_gm_l1);
+  const double gm_ub = gm_ub_bytes * bc.ub_in / parallelism(vector_pipes, prob_->bw_gm_ub);
+  const double l0c_gm = l0c_gm_bytes * bc.store / parallelism(cube_pipes, prob_->bw_l0c_gm);
+  const double ub_gm = ub_gm_bytes * bc.ub_out / parallelism(vector_pipes, prob_->bw_ub_gm);
+
+  // Gate/up/down are serial on one AIC, but each matmul's ordinary GM->L1
+  // feed overlaps its local Matrix/MTE1 work.  The AIV side is a blocking
+  // pop/compute/push chain.  Across feature chunks, the ordered two-push bundle
+  // and one reply form the standard successor-item wavefront.
+  const double cube_phase = std::max(cube_compute, gm_l1) + l0c_gm;
+  const double vector_phase = gm_ub + vector_compute + ub_gm;
+  result.latency = schedule.overlap_implementable
+                       ? std::max(cube_phase + vector_phase / static_cast<double>(chunks),
+                                  vector_phase + cube_phase / static_cast<double>(chunks))
+                       : cube_phase + vector_phase;
+  if (prob_->kernel_fill_cost > 0) {
+    result.latency += static_cast<double>(prob_->kernel_fill_cost);
+  }
+  result.latency += static_cast<double>(groups) * prob_->per_task_overhead_cycles;
+  result.ddr_traffic = std::max({gm_l1, gm_ub, l0c_gm, ub_gm});
+  result.l1l0_extract = static_cast<double>(chunks) * (2.0 * gate_extract + down_extract);
+  result.compute_bound = std::max(cube_compute, vector_compute) >= result.ddr_traffic;
+  result.parallel_split = 1;
+  result.cores_used = static_cast<int>(groups * (1 + schedule.vector_lanes));
+  result.num_spatial_tiles = static_cast<int>(schedule.spatial_tiles);
+  result.num_k_passes = static_cast<int>(chunks);
+  result.pipeline_fill_absorbed = false;
+  return result;
+}
+
+CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
+                                              const FlatSet<size_t>& retained_from_prev,
+                                              const FlatSet<size_t>& retain_these) const {
   // ===== MIXED cube+vector kernel — 910B DDR-streamed, latency hidden =====
   // Cube ops run on the cube pool and vector ops on the vector pool CONCURRENTLY.
   // A cube↔vector intermediate cannot stay on chip (910B has no direct Acc→Vec
@@ -5118,6 +5642,9 @@ CostResult Ascend910BCost::compute_mixed_cost(
   // shared tile that overflows UB is infeasible to fuse even when the separate
   // kernels each fit their one pool.
   if (!schedule.feasible) return result;
+  if (schedule.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+    return compute_dense_mlp_cost(cfg, schedule);
+  }
   result.feasible = true;
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
   // Grid mode (parts_m/parts_n > 0) fixes the tile count directly: cfg.w/cfg.h are
@@ -5623,11 +6150,16 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t>& retained_from_prev,
   // triple is only accepted when a memory-fitting k EXISTS, and that derived k is
   // what compute_cost writes back to result.config.k for the emit. The parallel
   // split is the triple's split_k, evaluated by compute_cost as a fixed S.
-  const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
-  for (const auto &g : grid_cand_) {
+  const bool dense_mlp = mixed_topology_ && mixed_topology_->algorithm == MixedAlgorithmKind::DenseSwiGluMlp;
+  const std::vector<int64_t> grid_ks =
+      dense_mlp ? ks_cand_
+                : std::vector<int64_t>{ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back()};
+  for (const auto& g : grid_cand_) {
     const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
     const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
-    consider(TileConfig{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k});
+    for (int64_t grid_k : grid_ks) {
+      consider(TileConfig{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k});
+    }
   }
   return best;
 }
@@ -5638,16 +6170,21 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t>& retained_from_prev,
 std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans() const {
   std::vector<std::pair<TileConfig, CostResult>> out;
   L0PlanMemo l0_memo;
-  const int64_t grid_k = ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back();
-  for (const auto &g : grid_cand_) {
+  const bool dense_mlp = mixed_topology_ && mixed_topology_->algorithm == MixedAlgorithmKind::DenseSwiGluMlp;
+  const std::vector<int64_t> grid_ks =
+      dense_mlp ? ks_cand_
+                : std::vector<int64_t>{ks_cand_.empty() ? std::max<int64_t>(output_K_, 1) : ks_cand_.back()};
+  for (const auto& g : grid_cand_) {
     const AxisPartition pm = partition_axis(out_H_, g.parts_m, grid_gran_h_);
     const AxisPartition pn = partition_axis(out_W_, g.parts_n, grid_gran_w_);
-    const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
-    const CostResult r = has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost
-                             ? compute_cost_impl(cfg, {}, {}, &l0_memo)
-                             : compute_cost(cfg, {}, {});
-    if (!r.feasible) continue;
-    out.emplace_back(cfg, r);
+    for (int64_t grid_k : grid_ks) {
+      const TileConfig cfg{pn.big, pm.big, grid_k, pm.parts, pn.parts, g.split_k};
+      const CostResult r = has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost
+                               ? compute_cost_impl(cfg, {}, {}, &l0_memo)
+                               : compute_cost(cfg, {}, {});
+      if (!r.feasible) continue;
+      out.emplace_back(cfg, r);
+    }
   }
   return out;
 }
