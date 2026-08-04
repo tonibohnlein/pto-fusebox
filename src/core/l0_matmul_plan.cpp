@@ -16,6 +16,28 @@ int64_t align_up(int64_t value, int64_t alignment) { return ceil_div(value, alig
 
 int64_t align_down(int64_t value, int64_t alignment) { return value / alignment * alignment; }
 
+std::optional<int64_t> checked_align_up(int64_t value, int64_t alignment) {
+  if (value <= 0 || alignment <= 0) return std::nullopt;
+  const int64_t remainder = value % alignment;
+  const int64_t increment = remainder == 0 ? 0 : alignment - remainder;
+  if (value > std::numeric_limits<int64_t>::max() - increment) return std::nullopt;
+  return value + increment;
+}
+struct PhysicalExtents {
+  int64_t boxed_m = 0;
+  int64_t boxed_n = 0;
+  int64_t l0c_m = 0;
+};
+
+std::optional<PhysicalExtents> physical_extents(int64_t m, int64_t n, const L0MatmulConfig& c) {
+  const auto boxed_m = checked_align_up(m, c.box_align_m);
+  const auto boxed_n = checked_align_up(n, c.box_align_n);
+  if (!boxed_m || !boxed_n) return std::nullopt;
+  const auto l0c_m = checked_align_up(*boxed_m, c.l0c_align_m);
+  if (!l0c_m) return std::nullopt;
+  return PhysicalExtents{*boxed_m, *boxed_n, *l0c_m};
+}
+
 struct Regime {
   L0Stationarity stationarity = L0Stationarity::Output;
   bool double_buffer_c = false;
@@ -61,7 +83,8 @@ double load_cycles(int64_t m, int64_t n, int64_t k, const L0MatmulConfig& c, con
 
 int64_t mad_cycles(int64_t m, int64_t n, int64_t k, const L0MatmulConfig& c) {
   const int64_t k_fractal = std::max<int64_t>(1, c.mad_k_fractal_bytes / c.bytes_a);
-  const int64_t cycles_per_repeat = std::max<int64_t>(1, c.bytes_a / 2);
+  const int64_t cycles_per_repeat =
+      c.bytes_a == 4 ? std::max<int64_t>(1, c.mad_fp32_passes) : std::max<int64_t>(1, c.bytes_a / 2);
   const int64_t full = c.k / k;
   const int64_t tail = c.k - full * k;
   const int64_t blocks = full + (tail > 0 ? 1 : 0);
@@ -78,7 +101,8 @@ double one_block_load_cycles(int64_t m, int64_t n, int64_t k, const L0MatmulConf
 
 double one_block_mad_cycles(int64_t m, int64_t n, int64_t k, const L0MatmulConfig& c) {
   const int64_t k_fractal = std::max<int64_t>(1, c.mad_k_fractal_bytes / c.bytes_a);
-  const int64_t cycles_per_repeat = std::max<int64_t>(1, c.bytes_a / 2);
+  const int64_t cycles_per_repeat =
+      c.bytes_a == 4 ? std::max<int64_t>(1, c.mad_fp32_passes) : std::max<int64_t>(1, c.bytes_a / 2);
   return static_cast<double>(c.mad_head_cycles) +
          static_cast<double>(cycles_per_repeat * ceil_div(m, c.align_m) * ceil_div(k, k_fractal) *
                              ceil_div(n, c.align_n));
@@ -124,7 +148,9 @@ int64_t traffic_bytes(int64_t m, int64_t n, int64_t k, const L0MatmulConfig& c, 
 
 std::vector<int64_t> legal_k_values(int64_t m, int64_t n, const L0MatmulConfig& c, int64_t a_budget,
                                     int64_t b_budget) {
-  const int64_t capacity = std::min(a_budget / m, b_budget / n);
+  const auto physical = physical_extents(m, n, c);
+  if (!physical) return {};
+  const int64_t capacity = std::min(a_budget / physical->boxed_m, b_budget / physical->boxed_n);
   const int64_t problem = c.allow_padding ? std::max(align_up(c.k, c.align_k), c.min_k) : c.k;
   const int64_t upper = align_down(std::min(capacity, problem), c.align_k);
   const bool peel = c.allow_k_boundary && c.k % c.align_k == 0;
@@ -155,10 +181,16 @@ std::optional<Candidate> best_in_regime(const L0MatmulConfig& c, const Regime& r
   const int64_t n_upper = c.allow_padding ? align_up(c.n, c.align_n) : c.n;
   std::optional<Candidate> best;
   for (int64_t m = c.min_m; m <= m_upper; m += c.align_m) {
-    if (m * c.min_n > c_budget) break;
+    const auto minimum_n_extents = physical_extents(m, c.min_n, c);
+    if (!minimum_n_extents ||
+        minimum_n_extents->l0c_m > c_budget / minimum_n_extents->boxed_n) {
+      break;
+    }
     if (require_2d && ceil_div(c.m, m) < 2) continue;
-    const int64_t n_max = std::min(n_upper, c_budget / m);
+    const int64_t n_max = std::min(n_upper, c_budget / minimum_n_extents->l0c_m);
     for (int64_t n = c.min_n; n <= n_max; n += c.align_n) {
+      const auto physical = physical_extents(m, n, c);
+      if (!physical || physical->l0c_m > c_budget / physical->boxed_n) continue;
       if (require_2d && ceil_div(c.n, n) < 2) continue;
       for (int64_t k : legal_k_values(m, n, c, a_budget, b_budget)) {
         if (require_full_k && k != c.k) continue;
@@ -229,13 +261,16 @@ std::string validate(const L0MatmulConfig& c) {
   if (c.l0a_bytes <= 0 || c.l0b_bytes <= 0 || c.l0c_bytes <= 0) return "L0 capacities must be positive";
   if (c.bytes_a <= 0 || c.bytes_b <= 0 || c.bytes_c <= 0) return "element byte sizes must be positive";
   if (c.min_m <= 0 || c.min_n <= 0 || c.min_k <= 0) return "minimum tile dimensions must be positive";
-  if (c.align_m <= 0 || c.align_n <= 0 || c.align_k <= 0) return "tile alignments must be positive";
+  if (c.align_m <= 0 || c.align_n <= 0 || c.align_k <= 0 || c.l0c_align_m <= 0 || c.box_align_m <= 0 ||
+      c.box_align_n <= 0) {
+    return "tile and physical L0C alignments must be positive";
+  }
   if (c.bw_l0a <= 0 || c.bw_l0b <= 0 || c.bw_drain <= 0 || c.bw_l0c_l1 <= 0) {
     return "roofline bandwidths must be positive";
   }
   if (c.drain_fixed_cycles < 0 || c.drain_row_cycles < 0 || c.drain_penalty_cycles < 0 ||
-      c.drain_c0_bytes <= 0) {
-    return "drain parameters must be non-negative and drain_c0_bytes positive";
+      c.drain_c0_bytes <= 0 || c.mad_fp32_passes <= 0) {
+    return "drain parameters must be non-negative and drain_c0_bytes/mad_fp32_passes positive";
   }
   if (!c.allow_padding && c.m < c.min_m) {
     return "allow_padding=false but M=" + std::to_string(c.m) + " is below the cube minimum tile dimension " +

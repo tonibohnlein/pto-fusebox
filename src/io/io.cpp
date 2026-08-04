@@ -549,6 +549,9 @@ Problem read_problem(const std::string& filename) {
       if (l0.contains("align_m")) config.align_m = l0["align_m"].get<int64_t>();
       if (l0.contains("align_n")) config.align_n = l0["align_n"].get<int64_t>();
       if (l0.contains("align_k")) config.align_k = l0["align_k"].get<int64_t>();
+      if (l0.contains("l0c_align_m")) config.l0c_align_m = l0["l0c_align_m"].get<int64_t>();
+      if (l0.contains("box_align_m")) config.box_align_m = l0["box_align_m"].get<int64_t>();
+      if (l0.contains("box_align_n")) config.box_align_n = l0["box_align_n"].get<int64_t>();
       if (l0.contains("allow_a_stationary")) {
         config.allow_a_stationary = l0["allow_a_stationary"].get<bool>();
       }
@@ -579,6 +582,9 @@ Problem read_problem(const std::string& filename) {
       }
       if (l0.contains("drain_c0_bytes")) {
         config.drain_c0_bytes = l0["drain_c0_bytes"].get<int64_t>();
+      }
+      if (l0.contains("mad_fp32_passes")) {
+        config.mad_fp32_passes = l0["mad_fp32_passes"].get<int64_t>();
       }
       if (l0.contains("mad_head_cycles")) {
         config.mad_head_cycles = l0["mad_head_cycles"].get<int64_t>();

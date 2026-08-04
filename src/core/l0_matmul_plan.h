@@ -31,6 +31,13 @@ struct L0MatmulConfig {
   int64_t align_n = 16;
   int64_t align_k = 16;
 
+  // Physical accumulator-row alignment is distinct from the legal logical M
+  // work shape. Mat boundary boxes are applied before this L0C alignment and
+  // also size the corresponding L0A/L0B operands.
+  int64_t l0c_align_m = 16;
+  int64_t box_align_m = 1;
+  int64_t box_align_n = 1;
+
   bool allow_a_stationary = false;
   bool allow_b_stationary = false;
   bool allow_double_buffer_c = false;
@@ -50,6 +57,7 @@ struct L0MatmulConfig {
   int64_t drain_c0_bytes = 32;
   int64_t mad_head_cycles = 21;
   int64_t mad_k_fractal_bytes = 32;
+  int64_t mad_fp32_passes = 2;
 };
 
 struct L0MatmulPhaseCost {

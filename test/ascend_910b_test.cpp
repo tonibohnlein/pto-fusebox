@@ -2428,6 +2428,82 @@ static void test_exec_enumeration() {
           (double)peak > 262144.0);
 }
 
+// The shared L0 chooser is consumed by both AutoFuse and AutoTileMatmulL0.
+// Admission must therefore use the same *physical* Mat/L0C footprints as
+// lowering, while keeping logical m/n for work and traffic accounting.
+static void test_l0_physical_footprints() {
+    std::cout << "[L0PHYS] boxed operands and physical accumulator rows gate candidates\n";
+
+    L0MatmulConfig int32;
+    int32.m = 16;
+    int32.n = 1152;
+    int32.k = 128;
+    int32.bytes_a = 1;
+    int32.bytes_b = 1;
+    int32.bytes_c = 4;
+    int32.allow_k_boundary = true;
+    const auto logical = choose_l0_matmul_plan(int32);
+    int32.l0c_align_m = 32;
+    const auto physical = choose_l0_matmul_plan(int32);
+    CHECK("L0PHYS: logical 16-row INT32 accumulator can keep the complete N window",
+          logical.feasible && logical.m == 16 && logical.n == 1152);
+    CHECK("L0PHYS: 910B physical 32-row INT32 accumulator forces N tiling",
+          physical.feasible && physical.m == 16 && physical.n < 1152 &&
+              32 * physical.n * int32.bytes_c <= int32.l0c_bytes);
+
+    L0MatmulConfig boxed;
+    boxed.m = 656;
+    boxed.n = 80;
+    boxed.k = 768;
+    boxed.bytes_a = 1;
+    boxed.bytes_b = 1;
+    boxed.bytes_c = 4;
+    boxed.l0c_align_m = 32;
+    boxed.box_align_m = 16;
+    boxed.box_align_n = 32;
+    boxed.allow_k_boundary = true;
+    const auto boxed_plan = choose_l0_matmul_plan(boxed);
+    CHECK("L0PHYS: post-boxing L0C overflow candidate is rejected",
+          boxed_plan.feasible &&
+              !(boxed_plan.m == 336 && boxed_plan.n == 80 && boxed_plan.k == 96));
+
+    L0MatmulConfig operand;
+    operand.m = 16;
+    operand.n = 16;
+    operand.k = 64;
+    operand.bytes_a = 1;
+    operand.bytes_b = 1;
+    operand.allow_k_boundary = true;
+    operand.l0a_bytes = 2048;
+    operand.box_align_m = 32;
+    const auto boxed_lhs = choose_l0_matmul_plan(operand);
+    CHECK("L0PHYS: boxed L0A rows constrain the K chunk",
+          boxed_lhs.feasible && boxed_lhs.m == 16 && boxed_lhs.n == 16 && boxed_lhs.k == 32);
+
+    operand.l0a_bytes = 64 * 1024;
+    operand.box_align_m = 1;
+    operand.l0b_bytes = 2048;
+    operand.box_align_n = 32;
+    const auto boxed_rhs = choose_l0_matmul_plan(operand);
+    CHECK("L0PHYS: boxed L0B columns constrain the K chunk",
+          boxed_rhs.feasible && boxed_rhs.m == 16 && boxed_rhs.n == 16 && boxed_rhs.k == 32);
+
+    L0MatmulConfig fp32;
+    fp32.m = 16;
+    fp32.n = 16;
+    fp32.k = 16;
+    fp32.bytes_a = 4;
+    fp32.bytes_b = 4;
+    fp32.output_target = L0OutputTarget::Acc;
+    fp32.mad_fp32_passes = 2;
+    const auto a2a3 = choose_l0_matmul_plan(fp32);
+    fp32.mad_fp32_passes = 8;
+    const auto a5 = choose_l0_matmul_plan(fp32);
+    CHECK("L0PHYS: backend FP32 decomposition passes reach the shared Cube cost",
+          a2a3.feasible && a5.feasible &&
+              a2a3.phases.mad_cycles == 25.0 && a5.phases.mad_cycles == 37.0);
+}
+
 // --- CubeSchedulePlan: one source of truth for final cube emission -----------
 // Candidate costing keeps only CostResult plus the lightweight peak/per-op-k
 // derivation. A winning/forced configuration is re-derived into this descriptor,
@@ -4309,6 +4385,7 @@ int main() {
     test_mixed_multistage_pebble();
     test_dfs_order();
     test_exec_enumeration();
+    test_l0_physical_footprints();
     test_cube_schedule_plan();
     test_cube_schedule_fanout();
     test_shared_boundary_pebbling();
