@@ -4503,6 +4503,9 @@ static void test_singleton_column_transform_reaches_vector_plan() {
     CHECK("COL2ROW: normalized reduction is feasible", best.feasible && plan.feasible);
     CHECK("COL2ROW: winning vector plan preserves the coordinate transform",
           plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow);
+    const int64_t reduction_peak = subgraph->vector_peak_ub(TileConfig{8192, 1, 0});
+    CHECK("COL2ROW: full-frame singleton row is padded while thin result column stays one",
+          reduction_peak == 2 * 8LL * 8192 * 4 + 8LL * 1 * 4);
 
     Problem cone;
     cone.tensors = {{8192, 1, DType::FP32}, {8192, 1, DType::FP32},
@@ -4530,6 +4533,26 @@ static void test_singleton_column_transform_reaches_vector_plan() {
           cone_best.feasible && cone_plan.feasible);
     CHECK("COL2ROW: cone plan preserves the coordinate transform",
           cone_plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow);
+    CHECK("COL2ROW: cone prices the reduction output as [8,1], not [8,8] or [1,1]",
+          cone_subgraph->vector_peak_ub(TileConfig{8192, 1, 0}) ==
+              2 * 8LL * 8192 * 4 + 8LL * 1 * 4);
+
+    Problem broadcast;
+    broadcast.tensors = {{64, 16, DType::FP32}, {1, 16, DType::FP32},
+                         {64, 16, DType::FP32}};
+    broadcast.ops = {{OpType::Pointwise, {0, 1}, {2}}};
+    broadcast.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    broadcast.ops[0].vector_primitive = VectorPrimitiveFamily::Add;
+    broadcast.ops[0].vector_geometry = VectorOpGeometry::ColExpand;
+    broadcast.required_outputs.insert(2);
+    broadcast.fast_memory_capacity = 1 << 24;
+    set_910b(broadcast);
+    DAG broadcast_dag = DAG::build(broadcast);
+    auto broadcast_subgraph = Subgraph::create(broadcast, broadcast_dag, {0});
+    CHECK("COL2ROW: a true singleton-column broadcast remains physically singleton",
+          broadcast_subgraph &&
+              broadcast_subgraph->vector_peak_ub(TileConfig{64, 16, 0}) ==
+                  16LL * 64 * 4 + 16LL * 1 * 4 + 16LL * 64 * 4);
 }
 
 int main() {

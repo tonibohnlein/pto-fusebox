@@ -40,6 +40,40 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
+struct VectorPhysicalFrame {
+  int64_t rows;
+  int64_t cols;
+};
+
+// Mirror the generic vector emitter's physical-frame contract.  Extent one is
+// not enough to identify a broadcast: a full-frame singleton axis must still
+// satisfy the active tile layout's 32-byte allocation rule.  Conversely, a
+// true broadcast axis and the collapsed axis of a reduction result stay thin.
+VectorPhysicalFrame VectorAllocatedFrame(const Tensor &tensor,
+                                         int64_t logical_rows,
+                                         int64_t logical_cols,
+                                         int64_t iteration_rows,
+                                         int64_t iteration_cols,
+                                         int reduced_axis,
+                                         bool reduction_layout,
+                                         int64_t element_granule) {
+  const auto align_up = [](int64_t value, int64_t granule) {
+    return granule <= 1 ? value
+                        : ((value + granule - 1) / granule) * granule;
+  };
+  const bool row_broadcast = tensor.height == 1 && iteration_rows > 1;
+  const bool col_broadcast = tensor.width == 1 && iteration_cols > 1;
+  const bool thin_reduction_row = tensor.height == 1 && reduced_axis == 2;
+  const bool thin_reduction_col = tensor.width == 1 && reduced_axis == 1;
+
+  VectorPhysicalFrame frame{logical_rows, logical_cols};
+  if (reduction_layout && !row_broadcast && !thin_reduction_row)
+    frame.rows = align_up(frame.rows, element_granule);
+  if (!col_broadcast && !thin_reduction_col)
+    frame.cols = align_up(frame.cols, element_granule);
+  return frame;
+}
+
 // Wall time of the concrete two-stage K-window ring emitted by AutoFuse.
 // The first window is not peeled: after its GM->L1 feed, its child work
 // overlaps the next feed; the final child work is the drain.  Keeping this
@@ -3639,7 +3673,6 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
   // (largest element granule). create() caches it once per candidate subgraph; do not rescan the
   // op DAG inside every peak query/binary-search probe.
   const int64_t emit_gran = vector_emit_granule_;
-  auto align_up = [](int64_t x, int64_t g) -> int64_t { return g <= 1 ? x : ((x + g - 1) / g) * g; };
 
   auto tile_bytes = [&](size_t t) -> int64_t {
     int64_t tw = std::min(cfg.w, prob_->tensors[t].width);
@@ -3650,10 +3683,11 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
       th = std::min(prob_->tensors[t].height, reduce_chunk);
     else if (ax == 1) tw = std::min(tw, reduce_chunk);   // pure-pointwise stream axis (cfg-tiled)
     else if (ax == 2) th = std::min(th, reduce_chunk);
-    // Pad to the emit's ALLOCATED shape: width always; height only for a reduction (col-major).
-    const int64_t tw_al = align_up(tw, emit_gran);
-    const int64_t th_al = has_reduction_ ? align_up(th, emit_gran) : th;
-    return tw_al * th_al * dtype_bytes(prob_->tensors[t].dtype);
+    const VectorPhysicalFrame frame =
+        VectorAllocatedFrame(prob_->tensors[t], th, tw, vector_iter_H_,
+                             vector_iter_W_, reduced_axis_, has_reduction_,
+                             emit_gran);
+    return frame.rows * frame.cols * dtype_bytes(prob_->tensors[t].dtype);
   };
 
   // Ephemeral vector bands use candidate-invariant intervals built once in
@@ -3741,9 +3775,11 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       tw = std::min(tw, reduce_chunk);
     else if (axis == 2)
       th = std::min(th, reduce_chunk);
-    const int64_t tw_alloc = align_up(tw, vector_emit_granule_);
-    const int64_t th_alloc = has_reduction_ ? align_up(th, vector_emit_granule_) : th;
-    return tw_alloc * th_alloc * dtype_bytes(tensor.dtype);
+    const VectorPhysicalFrame frame =
+        VectorAllocatedFrame(tensor, th, tw, vector_iter_H_, vector_iter_W_,
+                             reduced_axis_, has_reduction_,
+                             vector_emit_granule_);
+    return frame.rows * frame.cols * dtype_bytes(tensor.dtype);
   };
 
   // The candidate grid is a partition of the logical output, not a consequence
