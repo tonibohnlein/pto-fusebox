@@ -55,7 +55,7 @@ VectorPhysicalFrame VectorAllocatedFrame(const Tensor &tensor,
                                          int64_t iteration_rows,
                                          int64_t iteration_cols,
                                          int reduced_axis,
-                                         bool reduction_layout,
+                                         bool align_rows,
                                          int64_t element_granule) {
   const auto align_up = [](int64_t value, int64_t granule) {
     return granule <= 1 ? value
@@ -67,7 +67,7 @@ VectorPhysicalFrame VectorAllocatedFrame(const Tensor &tensor,
   const bool thin_reduction_col = tensor.width == 1 && reduced_axis == 1;
 
   VectorPhysicalFrame frame{logical_rows, logical_cols};
-  if (reduction_layout && !row_broadcast && !thin_reduction_row)
+  if (align_rows && !row_broadcast && !thin_reduction_row)
     frame.rows = align_up(frame.rows, element_granule);
   if (!col_broadcast && !thin_reduction_col)
     frame.cols = align_up(frame.cols, element_granule);
@@ -1136,6 +1136,17 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     sg.vector_max_dtype_bytes_ = std::max<int64_t>(1, vector_max_dtype_bytes);
     sg.vector_emit_granule_ =
         std::max<int64_t>(1, prob.vec_dma_align_bytes / vector_min_dtype_bytes);
+  }
+  for (size_t op_id : sg.ops_) {
+    const Op &op = prob.ops[op_id];
+    if (op.type != OpType::Pointwise && op.type != OpType::Reduction) continue;
+    for (size_t input : op.inputs) {
+      if (prob.tensors[input].width == 1 && sg.vector_iter_W_ > 1) {
+        sg.vector_align_rows_ = true;
+        break;
+      }
+    }
+    if (sg.vector_align_rows_) break;
   }
 
   // 910B defaults to unit-homogeneous subgraphs. Cube (MatMul) and vector
@@ -3685,7 +3696,8 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     else if (ax == 2) th = std::min(th, reduce_chunk);
     const VectorPhysicalFrame frame =
         VectorAllocatedFrame(prob_->tensors[t], th, tw, vector_iter_H_,
-                             vector_iter_W_, reduced_axis_, has_reduction_,
+                             vector_iter_W_, reduced_axis_,
+                             has_reduction_ || vector_align_rows_,
                              emit_gran);
     return frame.rows * frame.cols * dtype_bytes(prob_->tensors[t].dtype);
   };
@@ -3777,7 +3789,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       th = std::min(th, reduce_chunk);
     const VectorPhysicalFrame frame =
         VectorAllocatedFrame(tensor, th, tw, vector_iter_H_, vector_iter_W_,
-                             reduced_axis_, has_reduction_,
+                             reduced_axis_, has_reduction_ || vector_align_rows_,
                              vector_emit_granule_);
     return frame.rows * frame.cols * dtype_bytes(tensor.dtype);
   };

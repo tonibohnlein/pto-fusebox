@@ -419,6 +419,10 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int64_t vector_pipe_band_count_ = 2;
   int64_t vector_iter_W_ = 1;
   int64_t vector_iter_H_ = 1;
+  // The generic emitter gives every value in a pointwise group one compatible
+  // row frame when an [H,1] operand is consumed as a column broadcast. The
+  // broadcast column stays one; only the orthogonal row frame is aligned.
+  bool vector_align_rows_ = false;
   // True when the adapter supplied exact pto-isa primitive/geometry metadata
   // for at least one source vector op.  Such candidates replay all source
   // reductions and generated P1/P2 merges at the same per-task chunk frame;

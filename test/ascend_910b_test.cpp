@@ -320,7 +320,9 @@ static void test_softmax_reduction_schema() {
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
     CHECK_EQ("softmax: emitted-grid phase-roofline fused vector cost", fused, 22208.7, 0.5);
-    CHECK_EQ("softmax: emitted-grid phase-roofline cut vector cost", separate, 88373.3, 0.5);
+    // The separated column-broadcast stage uses an eight-row physical frame;
+    // the fused schedule already had the same reduction-layout framing.
+    CHECK_EQ("softmax: emitted-grid phase-roofline cut vector cost", separate, 88379.1, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -4553,6 +4555,25 @@ static void test_singleton_column_transform_reaches_vector_plan() {
           broadcast_subgraph &&
               broadcast_subgraph->vector_peak_ub(TileConfig{64, 16, 0}) ==
                   16LL * 64 * 4 + 16LL * 1 * 4 + 16LL * 64 * 4);
+
+    Problem col_broadcast;
+    col_broadcast.tensors = {{16, 64, DType::FP32}, {1, 64, DType::FP32},
+                             {16, 64, DType::FP32}};
+    col_broadcast.ops = {{OpType::Pointwise, {0, 1}, {2}}};
+    col_broadcast.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    col_broadcast.ops[0].vector_primitive = VectorPrimitiveFamily::Add;
+    col_broadcast.ops[0].vector_geometry = VectorOpGeometry::ColExpand;
+    col_broadcast.required_outputs.insert(2);
+    col_broadcast.fast_memory_capacity = 1 << 24;
+    set_910b(col_broadcast);
+    DAG col_broadcast_dag = DAG::build(col_broadcast);
+    auto col_broadcast_subgraph =
+        Subgraph::create(col_broadcast, col_broadcast_dag, {0});
+    CHECK_EQ("COL2ROW: column broadcast keeps width one and aligns its row frame",
+             col_broadcast_subgraph
+                 ? col_broadcast_subgraph->vector_peak_ub(TileConfig{16, 4, 0})
+                 : -1,
+             8LL * 16 * 4 + 8LL * 1 * 4 + 8LL * 16 * 4);
 }
 
 int main() {
