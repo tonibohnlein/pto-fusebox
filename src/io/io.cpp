@@ -505,6 +505,18 @@ Problem read_problem(const std::string& filename) {
     // --- Hardware parameters ---
     p.fast_memory_capacity  = j["fast_memory_capacity"].get<int64_t>();
 
+    if (j.contains("vector_coordinate_transform")) {
+        const std::string transform = j["vector_coordinate_transform"].get<std::string>();
+        if (transform == "none") {
+            p.vector_coordinate_transform = VectorCoordinateTransform::None;
+        } else if (transform == "singleton_column_to_row") {
+            p.vector_coordinate_transform = VectorCoordinateTransform::SingletonColumnToRow;
+        } else {
+            std::cerr << "Error: unknown vector coordinate transform '" << transform << "'\n";
+            std::exit(1);
+        }
+    }
+
     if (p.fast_memory_capacity <= 0) {
         std::cerr << "Error: hardware parameters must be positive\n";
         std::exit(1);
@@ -728,8 +740,13 @@ std::string solution_json(const Solution& sol) {
         }
         if (vector_plan.feasible) {
             const VectorStreamPlan& plan = vector_plan;
+            const char* coordinate_transform =
+                plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
+                    ? "singleton_column_to_row"
+                    : "none";
             j["vector_stream"].push_back(
                 {{"kind", vector_stream_kind_name(plan.kind)},
+                 {"coordinate_transform", coordinate_transform},
                  {"work_units", plan.work_units},
                  {"m_partition", axis_partition_json(plan.m_partition)},
                  {"n_partition", axis_partition_json(plan.n_partition)},

@@ -114,6 +114,11 @@ enum class VectorOpCapability : uint8_t {
     Unsupported
 };
 
+enum class VectorCoordinateTransform : uint8_t {
+    None,
+    SingletonColumnToRow
+};
+
 // Exact source-op identity needed by a mixed algorithm recognizer. This is
 // deliberately separate from VectorPrimitiveFamily: the latter is a grounded
 // cost class, while Recip and Cast are load-bearing semantic nodes even when
@@ -178,6 +183,9 @@ struct Problem {
     std::vector<Tensor> tensors;
     std::vector<Op> ops;
     int64_t fast_memory_capacity;
+    // Candidate-invariant zero-copy coordinate normalization selected by the
+    // frontend. Every vector subgraph and its emitted plan must preserve it.
+    VectorCoordinateTransform vector_coordinate_transform = VectorCoordinateTransform::None;
 
     // --- Ascend 910B machine model -------------------------------------------
     // Compute parallelizes across these cores; DDR bandwidth is shared (one HBM).
@@ -635,6 +643,7 @@ struct VectorInputLifetimeTopology {
 struct VectorStreamPlan {
   bool feasible = false;
   VectorStreamKind kind = VectorStreamKind::Materialized;
+  VectorCoordinateTransform coordinate_transform = VectorCoordinateTransform::None;
   // One logical region is one runtime work unit / SPMD block. The physical
   // UB/DMA allocation used while replaying a region may be padded or split
   // into strips, but it must never change this solver-owned launch grid.

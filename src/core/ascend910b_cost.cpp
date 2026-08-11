@@ -3560,6 +3560,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these) const {
   VectorStreamPlan plan;
+  plan.coordinate_transform = prob_->vector_coordinate_transform;
   plan.input_lifetimes = vector_input_lifetime_topology_;
   if (!plan.input_lifetimes) return plan;
   const int64_t budget = (int64_t)prob_->vec_capacity;

@@ -4368,6 +4368,56 @@ static void test_vector_capability_gates_cost_admission() {
           !Subgraph::create(p, dag, {0}).has_value());
 }
 
+static void test_native_cast_chain_uses_dtype_sized_pebble_bands() {
+    std::cout << "[CASTCHAIN] native conversion intermediates keep their own dtype sizes\n";
+    Problem p;
+    p.tensors = {{512, 16, DType::FP32},
+                 {512, 16, DType::FP16},
+                 {512, 16, DType::INT8}};
+    p.ops = {{OpType::Pointwise, {0}, {1}},
+             {OpType::Pointwise, {1}, {2}}};
+    for (auto& op : p.ops) {
+        op.vector_capability = VectorOpCapability::Elementwise;
+        op.vector_primitive = VectorPrimitiveFamily::Generic;
+        op.vector_geometry = VectorOpGeometry::Flat;
+    }
+    p.required_outputs.insert(2);
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible ? subgraph->vector_stream_plan(best.config) : VectorStreamPlan{};
+    CHECK("CASTCHAIN: native two-hop conversion is feasible", best.feasible && plan.feasible);
+    CHECK("CASTCHAIN: FP32/FP16 live pair is priced as six bytes per element",
+          plan.full_peak_ub_bytes == plan.tile_h * plan.tile_w * 6);
+}
+
+static void test_singleton_column_transform_reaches_vector_plan() {
+    std::cout << "[COL2ROW] normalized singleton-column reduction keeps its plan descriptor\n";
+    Problem p;
+    // Frontend normalization has already reinterpreted original [8192,1]
+    // coordinates as a zero-copy [1,8192] row-reduction frame.
+    p.tensors = {{8192, 1, DType::FP32}, {1, 1, DType::FP32}};
+    p.ops = {{OpType::Reduction, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::ReductionSum;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::RowSum;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs.insert(1);
+    p.vector_coordinate_transform = VectorCoordinateTransform::SingletonColumnToRow;
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible ? subgraph->vector_stream_plan(best.config) : VectorStreamPlan{};
+    CHECK("COL2ROW: normalized reduction is feasible", best.feasible && plan.feasible);
+    CHECK("COL2ROW: winning vector plan preserves the coordinate transform",
+          plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow);
+}
+
 int main() {
     test_subgraph_structure();
     test_cube_vector_fusion();
@@ -4407,6 +4457,8 @@ int main() {
     test_cost_result_cache_footprint();
     test_cost_cache_concurrent_publication();
     test_vector_capability_gates_cost_admission();
+    test_native_cast_chain_uses_dtype_sized_pebble_bands();
+    test_singleton_column_transform_reaches_vector_plan();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_streamed_reduction_sink_no_split();
