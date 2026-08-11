@@ -1527,6 +1527,93 @@ static void test_mixed_schedule_plan() {
           !Ascend910BMixed::create(reverse, reverse_dag, {0, 1}));
   }
 
+  // Generic production C->V->C: one unified output grid propagates the full
+  // score/reduction extent S through both FIFOs. The vector stage is admitted
+  // from ordinary op capabilities, not an attention/QK/PV algorithm tag.
+  {
+    Problem p;
+    constexpr int64_t M = 96, D = 64, S = 64, N = 128;
+    p.tensors = {{D, M}, {S, D}, {S, M}, {1, M}, {S, M},
+                 {S, M}, {1, M}, {S, M}, {N, S}, {N, M}};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::Reduction, {2}, {3}},
+             {OT::Pointwise, {2, 3}, {4}},
+             {OT::Pointwise, {4}, {5}},
+             {OT::Reduction, {5}, {6}},
+             {OT::Pointwise, {5, 6}, {7}},
+             {OT::MatMul, {7, 8}, {9}}};
+    p.ops[0].mixed_emit_compatible = true;
+    p.ops[6].mixed_emit_compatible = true;
+    p.ops[1].vector_capability = VectorOpCapability::ReductionMax;
+    p.ops[1].vector_primitive = VectorPrimitiveFamily::RowExtrema;
+    p.ops[1].vector_geometry = VectorOpGeometry::Flat;
+    p.ops[2].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[2].vector_primitive = VectorPrimitiveFamily::Add;
+    p.ops[2].vector_geometry = VectorOpGeometry::RowExpand;
+    p.ops[3].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[3].vector_primitive = VectorPrimitiveFamily::Exp;
+    p.ops[3].vector_geometry = VectorOpGeometry::Flat;
+    p.ops[4].vector_capability = VectorOpCapability::ReductionSum;
+    p.ops[4].vector_primitive = VectorPrimitiveFamily::RowSum;
+    p.ops[4].vector_geometry = VectorOpGeometry::Flat;
+    p.ops[5].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[5].vector_primitive = VectorPrimitiveFamily::Div;
+    p.ops[5].vector_geometry = VectorOpGeometry::RowExpand;
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    p.allow_model_ahead_multi_reduction_stream = false;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4, 5, 6});
+    CHECK("MIXPLAN: generic capability-defined C->V->C is admitted", (bool)mixed);
+    if (mixed) {
+      const TileConfig cfg{16, 16, 64, 6, 8, 1};
+      const auto plan = mixed->mixed_schedule_plan(cfg);
+      const auto cost = mixed->compute_cost(cfg);
+      CHECK("MIXPLAN: generic round trip preserves one grid and propagated crossings",
+            plan.feasible && plan.emit_compatible && cost.feasible &&
+                plan.algorithm == MixedAlgorithmKind::Generic &&
+                plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
+                plan.loop.pipeline_stages == 3 && plan.loop.requested_skew_depth == 2 &&
+                plan.loop.active_groups == 24 && plan.loop.min_trips_per_group == 2 &&
+                plan.loop.max_trips_per_group == 2 && plan.overlap_implementable &&
+                plan.model_overlap_granted && plan.vector_split == MixedVectorSplit::Rows &&
+                plan.vector_lanes == 2 && plan.fifos.size() == 2 &&
+                plan.fifos[0].valid_rows == 16 && plan.fifos[0].valid_cols == S &&
+                plan.fifos[1].valid_rows == 16 && plan.fifos[1].valid_cols == S &&
+                plan.fifos[0].slot_bytes == 16 * S * 4 && plan.fifos[1].slot_bytes == 16 * S * 4 &&
+                plan.fifos[0].slot_count == 4 && plan.fifos[1].slot_count == 4 &&
+                plan.stages.size() == 3 && plan.stages[1].valid_rows == 8 &&
+                plan.stages[1].valid_cols == S &&
+                plan.stages[1].vector_stream.kind == VectorStreamKind::Materialized);
+    }
+
+    // Axis identity is semantic, not equality of extents. When intermediate
+    // S happens to equal final N, S must remain whole while N follows the
+    // output partition.
+    Problem equal_axes = p;
+    equal_axes.tensors[8].width = S;
+    equal_axes.tensors[9].width = S;
+    DAG equal_dag = DAG::build(equal_axes);
+    auto equal_mixed = Ascend910BMixed::create(
+        equal_axes, equal_dag, {0, 1, 2, 3, 4, 5, 6});
+    CHECK("MIXPLAN: equal-size S and N axes remain distinct", (bool)equal_mixed);
+    if (equal_mixed) {
+      const TileConfig equal_cfg{16, 16, 64, 6, 4, 1};
+      const auto equal_plan = equal_mixed->mixed_schedule_plan(equal_cfg);
+      CHECK("MIXPLAN: propagated axis bindings do not compare numeric extents",
+            equal_plan.feasible && equal_plan.fifos.size() == 2 &&
+                equal_plan.fifos[0].valid_cols == S &&
+                equal_plan.fifos[1].valid_cols == S &&
+                equal_plan.stages.size() == 3 &&
+                equal_plan.stages[0].valid_cols == S &&
+                equal_plan.stages[1].valid_cols == S &&
+                equal_plan.stages[2].valid_cols == 16);
+    }
+  }
+
   // V->C->V is the exact single-round-trip shape recognized by
   // SkewCrossCorePipeline: one transfer in each direction and an early vector
   // stage on the sink unit.
@@ -4416,6 +4503,33 @@ static void test_singleton_column_transform_reaches_vector_plan() {
     CHECK("COL2ROW: normalized reduction is feasible", best.feasible && plan.feasible);
     CHECK("COL2ROW: winning vector plan preserves the coordinate transform",
           plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow);
+
+    Problem cone;
+    cone.tensors = {{8192, 1, DType::FP32}, {8192, 1, DType::FP32},
+                    {1, 1, DType::FP32}};
+    cone.ops = {{OpType::Pointwise, {0}, {1}},
+                {OpType::Reduction, {1}, {2}}};
+    cone.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    cone.ops[0].vector_primitive = VectorPrimitiveFamily::Exp;
+    cone.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    cone.ops[1].vector_capability = VectorOpCapability::ReductionSum;
+    cone.ops[1].vector_primitive = VectorPrimitiveFamily::RowSum;
+    cone.ops[1].vector_geometry = VectorOpGeometry::Flat;
+    cone.required_outputs.insert(2);
+    cone.vector_coordinate_transform = VectorCoordinateTransform::SingletonColumnToRow;
+    cone.fast_memory_capacity = 1 << 24;
+    set_910b(cone);
+    DAG cone_dag = DAG::build(cone);
+    auto cone_subgraph = Subgraph::create(cone, cone_dag, {0, 1});
+    const CostResult cone_best = cone_subgraph ? cone_subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan cone_plan =
+        cone_subgraph && cone_best.feasible
+            ? cone_subgraph->vector_stream_plan(cone_best.config)
+            : VectorStreamPlan{};
+    CHECK("COL2ROW: normalized pointwise-reduction cone is feasible",
+          cone_best.feasible && cone_plan.feasible);
+    CHECK("COL2ROW: cone plan preserves the coordinate transform",
+          cone_plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow);
 }
 
 int main() {
