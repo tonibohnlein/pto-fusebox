@@ -1,0 +1,45 @@
+inputs=v0000,v0001
+outputs=v0010
+value v0000 parameter float32[64] producer=- alias=- target=weight
+value v0001 user_input float16[8x64] producer=- alias=- target=-
+value v0002 intermediate float32[8x64] producer=op0000 alias=- target=-
+value v0003 intermediate float32[8x64] producer=op0001 alias=- target=-
+value v0004 intermediate float32[8x1] producer=op0002 alias=- target=-
+value v0005 intermediate float32[8x1] producer=op0003 alias=- target=-
+value v0006 intermediate float32[8x1] producer=op0004 alias=- target=-
+value v0007 intermediate float32[8x1] producer=op0005 alias=- target=-
+value v0008 intermediate float32[8x64] producer=op0006 alias=- target=-
+value v0009 intermediate float32[8x64] producer=op0007 alias=- target=-
+value v0010 intermediate float16[8x64] producer=op0008 alias=- target=-
+op op0000 cast(v0001)->v0002 supported=1 metadata=0 reason=- attrs={"dtype":"float32","source_operator":"aten.to.dtype"}
+op op0001 mul(v0002,v0002)->v0003 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.mul.Tensor"}
+op op0002 sum(v0003)->v0004 supported=1 metadata=0 reason=- attrs={"axis":-1,"keepdim":true,"source_operator":"aten.mean.dim"}
+op op0003 mul(v0004)->v0005 supported=1 metadata=0 reason=- attrs={"lowered_from":"mean","scalars":[{"position":1,"value":0.015625}]}
+op op0004 add(v0005)->v0006 supported=1 metadata=0 reason=- attrs={"scalars":[{"position":1,"value":1e-05}],"source_operator":"aten.add.Tensor"}
+op op0005 rsqrt(v0006)->v0007 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.rsqrt.default"}
+op op0006 mul(v0002,v0007)->v0008 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.mul.Tensor"}
+op op0007 mul(v0008,v0000)->v0009 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.mul.Tensor"}
+op op0008 cast(v0009)->v0010 supported=1 metadata=0 reason=- attrs={"dtype":"float16","source_operator":"aten.to.dtype"}
+region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007,op0008 inputs=v0001,v0000 outputs=v0010 diagnostics=-
+  tensor 0=v0001 FP16[8x64] alias=- synthetic=0
+  tensor 1=v0002 FP32[8x64] alias=- synthetic=0
+  tensor 2=v0003 FP32[8x64] alias=- synthetic=0
+  tensor 3=v0004 FP32[8x1] alias=- synthetic=0
+  tensor 4=v0005 FP32[8x1] alias=- synthetic=0
+  tensor 5=v0006 FP32[8x1] alias=- synthetic=0
+  tensor 6=v0007 FP32[8x1] alias=- synthetic=0
+  tensor 7=v0008 FP32[8x64] alias=- synthetic=0
+  tensor 8=v0000 FP32[1x64] alias=- synthetic=0
+  tensor 9=v0009 FP32[8x64] alias=- synthetic=0
+  tensor 10=v0010 FP16[8x64] alias=- synthetic=0
+  solver_op 0 graph=op0000 Pointwise primitive=generic geometry=flat capability=elementwise mixed=cast (0)->(1)
+  solver_op 1 graph=op0001 Pointwise primitive=mul geometry=flat capability=elementwise mixed=mul (1,1)->(2)
+  solver_op 2 graph=op0002 Reduction primitive=row_sum geometry=flat capability=reduction_sum mixed=none (2)->(3)
+  solver_op 3 graph=op0003 Pointwise primitive=scalar_mul geometry=flat capability=elementwise mixed=mul (3)->(4)
+  solver_op 4 graph=op0004 Pointwise primitive=add geometry=flat capability=elementwise mixed=none (4)->(5)
+  solver_op 5 graph=op0005 Pointwise primitive=rsqrt geometry=flat capability=elementwise mixed=none (5)->(6)
+  solver_op 6 graph=op0006 Pointwise primitive=mul geometry=row_expand capability=elementwise mixed=mul (1,6)->(7)
+  solver_op 7 graph=op0007 Pointwise primitive=mul geometry=col_expand capability=elementwise mixed=mul (7,8)->(9)
+  solver_op 8 graph=op0008 Pointwise primitive=generic geometry=flat capability=elementwise mixed=cast (9)->(10)
+  required=10
+  p4=[]

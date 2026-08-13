@@ -2,9 +2,110 @@
 
 ## Status
 
-This document records a future PTO-Fusebox direction. It does not describe a
-currently supported API. Dynamic-shape classes beyond the first static-chunk
-class are catalogued here and deliberately deferred.
+The first frontend milestone is implemented. PTO-Fusebox can capture a
+`torch.nn.Module` through `torch.export`, normalize an existing
+`torch.export.ExportedProgram`, preserve unsupported operations as explicit
+boundaries, extract statically schedulable regions, lower them into a versioned
+solver problem, and invoke an already-built C++ solver.
+
+PyPTO DSL source generation is the next milestone. The current result is a
+schedule and a bidirectional graph/solver mapping, not generated kernel source.
+Dynamic-shape classes are preserved in the normalized graph but remain
+unschedulable when they affect solver geometry. They are catalogued below and
+deliberately deferred.
+
+## Python API
+
+Install the optional Torch frontend dependencies and import the public package:
+
+```bash
+python -m pip install -e ".[torch]"
+```
+
+```python
+from pto_fusebox import export_and_normalize, solve_graph
+
+graph = export_and_normalize(module, example_args, dynamic_shapes=constraints)
+result = solve_graph(
+    graph,
+    target="ascend910b",
+    solver_binary="build/mlsys_mixed",
+)
+```
+
+The core entry points are:
+
+- `export_and_normalize(module, args, ...) -> NormalizedGraph`;
+- `normalize_exported(program) -> NormalizedGraph`;
+- `extract_solver_regions(graph, target) -> list[SolverRegion]`; and
+- `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`.
+
+`normalize_exported` is authoritative; `export_and_normalize` is a convenience
+wrapper around `torch.export.export`. `solve_graph` never builds the solver. A
+caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
+
+## Versioned boundaries
+
+The frontend publishes three schemas:
+
+- `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
+- `pto_fusebox.problem.v1`: a statically lowered solver region; and
+- `pto_fusebox.solution.v1`: the C++ schedule response.
+
+The normalized graph records stable topological IDs, ordered operands, exact
+normalized operator kinds, attributes, input roles, target names for parameters
+and buffers, logical shapes, strides, storage offsets, dtypes, alias
+relationships, ordered duplicate outputs, input/output PyTree structures,
+explicit output kinds and mutation targets, opaque reasons, symbolic bounds,
+diagnostics, and exact algorithm patterns. Parameter and buffer payloads are
+never embedded. Canonical JSON is independent of temporary paths, object
+addresses, and PyTorch's process-global symbolic names. Deserialization checks
+producer consistency, topological order, alias cycles, interface IDs, positive
+static dimensions, pattern references, and output-spec ordering before a graph
+can reach the scheduler.
+
+The problem schema is intentionally narrower. It contains one supported static
+region in the existing solver's two-dimensional tensor representation plus a
+`frontend_mapping` that maps every solver tensor/op back to normalized graph
+IDs. Missing `schema_version` remains accepted for legacy benchmark inputs;
+unknown explicit versions fail closed.
+
+## v1 normalization and admission
+
+The implemented closed set includes casts; tensor/scalar arithmetic; exp, log,
+abs, sqrt, rsqrt and negation; last-axis sum/max/mean with `keepdim=True`;
+rank-2 matmul/mm; rank-2-or-higher linear with contiguous leading dimensions
+collapsed into solver height; metadata-only shape aliases; and an immediately
+consumed rank-2 transpose represented as a zero-copy view.
+
+Softmax is decomposed into its ordinary max/sub/exp/sum/div tensor DAG. The
+graph also carries the exact P4 op set and substitutions that permit the
+existing online softmax implementation. There is no attention, RMSNorm, or
+model-name recognizer. Mean is similarly lowered to sum plus reciprocal
+multiplication, and linear becomes matmul plus optional broadcast bias.
+
+Ascend 910B admission keeps FP16/FP32 vector arithmetic, BF16 storage/cube/cast
+endpoints, and the supported cube dtypes distinct. It accepts dense storage at
+zero offset and only the equal/scalar/row-singleton/column-singleton broadcast
+geometries represented by the existing two-dimensional problem. A rank-2
+transpose is retained only as an explicit external matmul operand; an internal
+transpose remains a scheduling boundary until transformed-alias edges exist in
+the solver schema. Unsupported operations, mutations, copying views,
+non-default operator semantics, data-dependent results, batched matmul, and
+schedule-defining symbolic dimensions are never approximated. They remain in
+the normalized graph with a stable reason and delimit deterministic maximal
+convex solver regions. Same-dtype `to(copy=False)` is a metadata alias, while
+`copy=True` declines. Real casts are expanded at the target-lowering boundary
+into the 910B native conversion path (for example FP16 -> FP32 -> BF16 and FP32
+-> FP16 -> INT8), so every intermediate dtype and lifetime is visible to solver
+UB accounting without changing the public normalized graph.
+
+The first contract suite fixes the exact normalized and solver DAG for RMSNorm,
+softmax, rank-3 linear with bias, plain matmul, generic `QK -> softmax -> PV`,
+and a TopK boundary. Additional adversarial tests cover opaque bypass diamonds,
+metadata aliases between computations, structured duplicate outputs, layout
+and storage-offset rejection, broadcast admission, native cast chains, and
+near misses for exact mixed-algorithm scalar semantics.
 
 ## Goal and ownership
 
@@ -30,7 +131,7 @@ ordinary PyPTO compiler and runtime
 ```
 
 No compiler-integrated AutoFuse pass is required for this path. The generated
-PyPTO source already contains the selected fusion boundaries, grid, propagated
+PyPTO source will contain the selected fusion boundaries, grid, propagated
 regions, topological order, physical tiles, loops, pipelines, lifetimes,
 cross-core FIFOs, and valid-shape handling. PyPTO parses, verifies, lowers, and
 executes that explicit program without rerunning the Fusebox planner.
@@ -206,15 +307,15 @@ Dynamic physical tile extents and dynamic rank remain unsupported. Hardware
 allocations need static sizes, and the PyPTO compiler correctly rejects a
 dynamic physical tile that reaches allocation or tile-flattening.
 
-## First implementation sequence
+## Implementation sequence
 
-1. Import a static vector RMSNorm FX graph and compare it with the current
-   Fusebox vector plan and a hand-written PyPTO reference.
+1. Import static RMSNorm, softmax, linear, and generic `QK -> softmax DAG -> PV`
+   Export graphs into the implemented normalized IR and existing solver.
 2. Generate readable PyPTO from the solution and compare graph semantics,
    schedule fields, lowered PTO, and device numerics.
 3. Repeat for a static cube matmul.
-4. Generate a generic `QK -> vector softmax DAG -> PV` program without an
-   attention recognizer.
+4. Expand the generic mixed source backend from one round trip while continuing
+   to reject unsupported multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
 6. Add Type-1 dynamic outer chunks with a static physical tile and runtime

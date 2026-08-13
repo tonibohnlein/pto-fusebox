@@ -66,6 +66,26 @@ The input is a JSON computation graph plus hardware constraints. The output
 records the selected subgraph grouping, tile granularities, retention choices,
 and traversal order.
 
+### Torch Export frontend
+
+The optional Python package captures and normalizes Torch programs without
+adding a C++ dependency on Torch:
+
+```bash
+python -m pip install -e ".[torch]"
+```
+
+```python
+from pto_fusebox import export_and_normalize, solve_graph
+
+graph = export_and_normalize(module, example_args)
+result = solve_graph(graph, solver_binary="build/mlsys_mixed")
+```
+
+Unsupported operations remain explicit graph boundaries. The v1 frontend
+produces versioned normalized/problem JSON and solver schedules; readable PyPTO
+DSL generation is the next milestone.
+
 ## Test
 
 ```bash
@@ -93,6 +113,7 @@ src/solution/   Schedule construction and traversal ordering
 src/io/         JSON input and output
 src/pipeline/   Library and standalone entry points
 test/           Unit, integration, and 910B grounding tests
+python/         Torch Export normalization and solver subprocess frontend
 doc/            Cost-model and solver design notes
 scripts/        Validation, rendering, and benchmark helpers
 ```

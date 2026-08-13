@@ -1,0 +1,21 @@
+inputs=v0000,v0001,v0002
+outputs=v0005
+value v0000 parameter float32[24x16] producer=- alias=- target=weight
+value v0001 parameter float32[24] producer=- alias=- target=bias
+value v0002 user_input float32[2x5x16] producer=- alias=- target=-
+value v0003 alias float32[16x24] producer=op0000 alias=v0000 target=-
+value v0004 intermediate float32[2x5x24] producer=op0001 alias=- target=-
+value v0005 intermediate float32[2x5x24] producer=op0002 alias=- target=-
+op op0000 transpose_view(v0000)->v0003 supported=1 metadata=1 reason=- attrs={"permutation":[1,0],"source_operator":"aten.linear.default"}
+op op0001 matmul(v0002,v0003)->v0004 supported=1 metadata=0 reason=- attrs={"flatten_leading_dimensions":true,"rhs_transposed":true,"source_operator":"aten.linear.default"}
+op op0002 add(v0004,v0001)->v0005 supported=1 metadata=0 reason=- attrs={"linear_bias":true,"source_operator":"aten.linear.default"}
+region region0000 ops=op0000,op0001,op0002 inputs=v0000,v0002,v0001 outputs=v0005 diagnostics=-
+  tensor 0=v0002 FP32[10x16] alias=- synthetic=0
+  tensor 1=v0003 FP32[16x24] alias=v0000 synthetic=0
+  tensor 2=v0004 FP32[10x24] alias=- synthetic=0
+  tensor 3=v0001 FP32[1x24] alias=- synthetic=0
+  tensor 4=v0005 FP32[10x24] alias=- synthetic=0
+  solver_op 0 graph=op0001 MatMul primitive=generic geometry=generic capability=generic mixed=none (0,1)->(2)
+  solver_op 1 graph=op0002 Pointwise primitive=add geometry=col_expand capability=elementwise mixed=none (2,3)->(4)
+  required=4
+  p4=[]

@@ -89,6 +89,7 @@ set(TEST_SOURCES
     test/dag_test.cpp
     test/pebbling_order_test.cpp
     test/pairing_heap_test.cpp
+    test/io_schema_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})

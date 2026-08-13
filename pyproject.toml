@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pto-fusebox"
+version = "0.1.0"
+description = "Graph capture and scheduling frontend for PTO-Fusebox"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+torch = ["torch>=2.6"]
+test = ["pytest>=8", "torch>=2.6"]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["test/python"]
+
+[tool.pyright]
+extraPaths = ["python"]

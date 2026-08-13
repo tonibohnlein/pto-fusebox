@@ -93,6 +93,16 @@ static bool parse_mixed_vector_semantic(const std::string& name, MixedVectorSema
   return true;
 }
 
+static bool parse_p4_pattern_kind(const std::string& name, P4PatternKind* kind) {
+  if (name == "softmax_flash")
+    *kind = P4PatternKind::SoftmaxFlash;
+  else if (name == "layernorm_welford")
+    *kind = P4PatternKind::LayerNormWelford;
+  else
+    return false;
+  return true;
+}
+
 static json vector_loop_json(const VectorLoopPlan& loop) {
     return {{"first_chunk", loop.first_chunk},
             {"trip_count", loop.trip_count},
@@ -326,6 +336,15 @@ Problem read_problem(const std::string& filename) {
         std::exit(1);
     }
 
+    if (j.contains("schema_version")) {
+        const std::string schema = j["schema_version"].get<std::string>();
+        if (schema != "pto_fusebox.problem.v1") {
+            std::cerr << "Error: unsupported problem schema '" << schema
+                      << "' (expected 'pto_fusebox.problem.v1')\n";
+            std::exit(1);
+        }
+    }
+
     // Validate required top-level keys exist before accessing them.
     for (const char* key : {"widths", "heights", "inputs", "outputs",
                              "op_types",
@@ -361,15 +380,23 @@ Problem read_problem(const std::string& filename) {
     // "INT8"/"BOOL".
     if (j.contains("dtypes")) {
         auto& dts = j["dtypes"];
-        for (size_t i = 0; i < dts.size() && i < num_tensors; i++) {
+        if (dts.size() != num_tensors) {
+            std::cerr << "Error: explicit dtypes array must match tensor count\n";
+            std::exit(1);
+        }
+        for (size_t i = 0; i < dts.size(); i++) {
             const auto& s = dts[i].get_ref<const std::string&>();
-            if (s == "FP16") p.tensors[i].dtype = DType::FP16;
+            if (s == "FP32") p.tensors[i].dtype = DType::FP32;
+            else if (s == "FP16") p.tensors[i].dtype = DType::FP16;
             else if (s == "BF16") p.tensors[i].dtype = DType::BF16;
             else if (s == "INT32") p.tensors[i].dtype = DType::INT32;
             else if (s == "INT16") p.tensors[i].dtype = DType::INT16;
             else if (s == "INT8") p.tensors[i].dtype = DType::INT8;
             else if (s == "BOOL") p.tensors[i].dtype = DType::BOOL;
-            else p.tensors[i].dtype = DType::FP32;
+            else {
+                std::cerr << "Error: unknown dtype '" << s << "' for tensor " << i << "\n";
+                std::exit(1);
+            }
         }
     }
     // --- Ops ---
@@ -458,7 +485,51 @@ Problem read_problem(const std::string& filename) {
                 std::exit(1);
             }
         }
+        if (j.contains("mixed_emit_compatible") &&
+            i < j["mixed_emit_compatible"].size()) {
+            op.mixed_emit_compatible = j["mixed_emit_compatible"][i].get<bool>();
+        }
         p.ops.push_back(std::move(op));
+    }
+
+    if (j.contains("p4_patterns")) {
+        for (size_t pattern_index = 0; pattern_index < j["p4_patterns"].size();
+             ++pattern_index) {
+            const auto& encoded = j["p4_patterns"][pattern_index];
+            if (!encoded.contains("kind") || !encoded.contains("ops")) {
+                std::cerr << "Error: P4 pattern " << pattern_index
+                          << " requires kind and ops\n";
+                std::exit(1);
+            }
+            P4Pattern pattern;
+            const std::string kind = encoded["kind"].get<std::string>();
+            if (!parse_p4_pattern_kind(kind, &pattern.kind)) {
+                std::cerr << "Error: unknown P4 pattern kind '" << kind << "'\n";
+                std::exit(1);
+            }
+            for (const auto& item : encoded["ops"]) {
+                const size_t op = item.get<size_t>();
+                if (op >= num_ops) {
+                    std::cerr << "Error: P4 pattern " << pattern_index
+                              << " references out-of-range op " << op << "\n";
+                    std::exit(1);
+                }
+                pattern.ops.insert(op);
+            }
+            if (encoded.contains("apply_substitutions")) {
+                for (const auto& item : encoded["apply_substitutions"]) {
+                    const size_t op = item.get<size_t>();
+                    if (op >= num_ops || pattern.ops.count(op) == 0) {
+                        std::cerr << "Error: P4 pattern " << pattern_index
+                                  << " substitution op " << op
+                                  << " is not a member of the pattern\n";
+                        std::exit(1);
+                    }
+                    pattern.apply_substitutions.insert(op);
+                }
+            }
+            p.p4_patterns.push_back(std::move(pattern));
+        }
     }
 
     if (j.contains("required_outputs")) {
@@ -606,6 +677,9 @@ Problem read_problem(const std::string& filename) {
       }
     }
     if (j.contains("vec_reg_bytes"))    p.vec_reg_bytes    = j["vec_reg_bytes"].get<int64_t>();
+    if (j.contains("vec_dma_align_bytes")) {
+      p.vec_dma_align_bytes = j["vec_dma_align_bytes"].get<int64_t>();
+    }
     if (j.contains("vec_op_head"))      p.vec_op_head      = j["vec_op_head"].get<double>();
     if (j.contains("vec_op_tail"))      p.vec_op_tail      = j["vec_op_tail"].get<double>();
     if (j.contains("vec_slope_pw"))     p.vec_slope_pw     = j["vec_slope_pw"].get<double>();
@@ -621,6 +695,13 @@ Problem read_problem(const std::string& filename) {
     }
     if (j.contains("require_buildable_mixed")) {
       p.require_buildable_mixed = j["require_buildable_mixed"].get<bool>();
+    }
+    if (j.contains("allow_model_ahead_split_k")) {
+      p.allow_model_ahead_split_k = j["allow_model_ahead_split_k"].get<bool>();
+    }
+    if (j.contains("allow_model_ahead_multi_reduction_stream")) {
+      p.allow_model_ahead_multi_reduction_stream =
+          j["allow_model_ahead_multi_reduction_stream"].get<bool>();
     }
     if (j.contains("allow_model_ahead_mixed_multi_roundtrip")) {
       p.allow_model_ahead_mixed_multi_roundtrip =
@@ -660,6 +741,7 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
+    j["schema_version"] = "pto_fusebox.solution.v1";
     j["subgraphs"]         = json::array();
     j["granularities"]     = json::array();
     j["parts"]             = json::array();  // 910B spatial grid (parts_m, parts_n) per step

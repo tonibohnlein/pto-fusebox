@@ -1,0 +1,42 @@
+inputs=v0000,v0001,v0002
+outputs=v0010
+value v0000 user_input float32[16x32] producer=- alias=- target=-
+value v0001 user_input float32[24x32] producer=- alias=- target=-
+value v0002 user_input float32[24x40] producer=- alias=- target=-
+value v0003 alias float32[32x24] producer=op0000 alias=v0001 target=-
+value v0004 intermediate float32[16x24] producer=op0001 alias=- target=-
+value v0005 intermediate float32[16x1] producer=op0002 alias=- target=-
+value v0006 intermediate float32[16x24] producer=op0003 alias=- target=-
+value v0007 intermediate float32[16x24] producer=op0004 alias=- target=-
+value v0008 intermediate float32[16x1] producer=op0005 alias=- target=-
+value v0009 intermediate float32[16x24] producer=op0006 alias=- target=-
+value v0010 intermediate float32[16x40] producer=op0007 alias=- target=-
+op op0000 transpose_view(v0001)->v0003 supported=1 metadata=1 reason=- attrs={"permutation":[1,0],"source_operator":"aten.t.default"}
+op op0001 matmul(v0000,v0003)->v0004 supported=1 metadata=0 reason=- attrs={"lhs_transposed":false,"rhs_transposed":true,"source_operator":"aten.mm.default"}
+op op0002 max(v0004)->v0005 supported=1 metadata=0 reason=- attrs={"axis":-1,"keepdim":true}
+op op0003 sub(v0004,v0005)->v0006 supported=1 metadata=0 reason=- attrs={}
+op op0004 exp(v0006)->v0007 supported=1 metadata=0 reason=- attrs={}
+op op0005 sum(v0007)->v0008 supported=1 metadata=0 reason=- attrs={"axis":-1,"keepdim":true}
+op op0006 div(v0007,v0008)->v0009 supported=1 metadata=0 reason=- attrs={}
+op op0007 matmul(v0009,v0002)->v0010 supported=1 metadata=0 reason=- attrs={"lhs_transposed":false,"rhs_transposed":false,"source_operator":"aten.mm.default"}
+pattern softmax_flash ops=op0002,op0003,op0004,op0005,op0006 substitutions=op0002,op0005
+region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007 inputs=v0001,v0000,v0002 outputs=v0010 diagnostics=-
+  tensor 0=v0000 FP32[16x32] alias=- synthetic=0
+  tensor 1=v0003 FP32[32x24] alias=v0001 synthetic=0
+  tensor 2=v0004 FP32[16x24] alias=- synthetic=0
+  tensor 3=v0005 FP32[16x1] alias=- synthetic=0
+  tensor 4=v0006 FP32[16x24] alias=- synthetic=0
+  tensor 5=v0007 FP32[16x24] alias=- synthetic=0
+  tensor 6=v0008 FP32[16x1] alias=- synthetic=0
+  tensor 7=v0009 FP32[16x24] alias=- synthetic=0
+  tensor 8=v0002 FP32[24x40] alias=- synthetic=0
+  tensor 9=v0010 FP32[16x40] alias=- synthetic=0
+  solver_op 0 graph=op0001 MatMul primitive=generic geometry=generic capability=generic mixed=none (0,1)->(2)
+  solver_op 1 graph=op0002 Reduction primitive=row_extrema geometry=flat capability=reduction_max mixed=none (2)->(3)
+  solver_op 2 graph=op0003 Pointwise primitive=add geometry=row_expand capability=elementwise mixed=none (2,3)->(4)
+  solver_op 3 graph=op0004 Pointwise primitive=exp geometry=flat capability=elementwise mixed=exp (4)->(5)
+  solver_op 4 graph=op0005 Reduction primitive=row_sum geometry=flat capability=reduction_sum mixed=none (5)->(6)
+  solver_op 5 graph=op0006 Pointwise primitive=div geometry=row_expand capability=elementwise mixed=none (5,6)->(7)
+  solver_op 6 graph=op0007 MatMul primitive=generic geometry=generic capability=generic mixed=none (7,8)->(9)
+  required=9
+  p4=[{"apply_substitutions":[1,4],"kind":"softmax_flash","ops":[1,2,3,4,5]}]

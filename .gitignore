@@ -42,5 +42,10 @@ build-ubuntu22/*
 *.out
 *.app
 
+# Python frontend caches
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
 # debug information files
 *.dwo

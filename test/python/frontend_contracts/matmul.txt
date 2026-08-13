@@ -1,0 +1,13 @@
+inputs=v0000,v0001
+outputs=v0002
+value v0000 user_input float32[16x32] producer=- alias=- target=-
+value v0001 user_input float32[32x24] producer=- alias=- target=-
+value v0002 intermediate float32[16x24] producer=op0000 alias=- target=-
+op op0000 matmul(v0000,v0001)->v0002 supported=1 metadata=0 reason=- attrs={"lhs_transposed":false,"rhs_transposed":false,"source_operator":"aten.mm.default"}
+region region0000 ops=op0000 inputs=v0000,v0001 outputs=v0002 diagnostics=-
+  tensor 0=v0000 FP32[16x32] alias=- synthetic=0
+  tensor 1=v0001 FP32[32x24] alias=- synthetic=0
+  tensor 2=v0002 FP32[16x24] alias=- synthetic=0
+  solver_op 0 graph=op0000 MatMul primitive=generic geometry=generic capability=generic mixed=none (0,1)->(2)
+  required=2
+  p4=[]
