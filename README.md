@@ -86,6 +86,22 @@ Unsupported operations remain explicit graph boundaries. The v1 frontend
 produces versioned normalized/problem JSON and solver schedules; readable PyPTO
 DSL generation is the next milestone.
 
+Runnable capture examples include the basic positive contracts plus
+shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
+Qwen3 final RMSNorm/LM head:
+
+```bash
+python -m examples.torch_frontend.basic
+python -m examples.torch_frontend.deepseek_v4
+python -m examples.torch_frontend.qwen3
+```
+
+Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`
+to also submit its supported regions to an existing solver build. The model
+examples preserve the relevant tensor algebra from `pypto-lib`; their shapes
+and, where documented in the source, dtypes are reduced for readability. They
+are not full checkpoint implementations.
+
 ## Test
 
 ```bash

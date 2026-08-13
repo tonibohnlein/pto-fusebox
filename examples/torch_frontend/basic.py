@@ -1,0 +1,44 @@
+"""Small positive Torch capture examples used by the frontend contract tests."""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from ._runner import Example, run_examples
+
+
+class Softmax(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(value, dim=-1)
+
+
+class Matmul(nn.Module):
+    def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        return torch.mm(lhs, rhs)
+
+
+class AttentionCore(nn.Module):
+    """Generic QK -> softmax -> PV tensor DAG, without an attention recognizer."""
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        scores = torch.mm(query, key.t())
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.mm(probabilities, value)
+
+
+def build_examples() -> dict[str, Example]:
+    """Return deterministic example modules and representative inputs."""
+
+    return {
+        "softmax": (Softmax(), (torch.zeros(32, 128),)),
+        "matmul": (Matmul(), (torch.zeros(16, 32), torch.zeros(32, 24))),
+        "attention_core": (
+            AttentionCore(),
+            (torch.zeros(16, 32), torch.zeros(24, 32), torch.zeros(24, 40)),
+        ),
+    }
+
+
+if __name__ == "__main__":
+    run_examples(build_examples())
