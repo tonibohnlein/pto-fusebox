@@ -29,7 +29,7 @@ def run_examples(examples: Mapping[str, Example]) -> None:
         op_kinds = " -> ".join(op.kind for op in graph.ops)
         opaque = [f"{op.kind}: {op.opaque_reason}" for op in graph.ops if not op.supported]
 
-        print(f"{name}: {len(graph.ops)} ops, {len(regions)} schedulable region(s)")
+        print(f"{name}: {len(graph.ops)} ops, {len(regions)} supported region candidate(s)")
         print(f"  DAG: {op_kinds}")
         if graph.patterns:
             print(f"  annotations: {', '.join(pattern.kind for pattern in graph.patterns)}")
