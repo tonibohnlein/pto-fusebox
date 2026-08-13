@@ -152,6 +152,55 @@ static json vector_phase_work_json(const VectorPhaseWorkPlan& phase) {
     return {{"generated", phase.generated}, {"primitives", std::move(primitives)}};
 }
 
+static json vector_stream_plan_json(const VectorStreamPlan& plan) {
+    const char* coordinate_transform =
+        plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
+            ? "singleton_column_to_row"
+            : "none";
+    return {{"kind", vector_stream_kind_name(plan.kind)},
+            {"coordinate_transform", coordinate_transform},
+            {"work_units", plan.work_units},
+            {"m_partition", axis_partition_json(plan.m_partition)},
+            {"n_partition", axis_partition_json(plan.n_partition)},
+            {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
+            {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
+            {"stream_band_count", plan.stream_band_count},
+            {"axis", plan.axis},
+            {"free_tile", plan.free_tile},
+            {"free_tile_alloc", plan.free_tile_alloc},
+            {"extent", plan.extent},
+            {"chunk", plan.chunk},
+            {"full_chunks", plan.full_chunks},
+            {"tail", plan.tail},
+            {"stream_passes", plan.stream_passes},
+            {"tile", {plan.tile_h, plan.tile_w}},
+            {"strip", {plan.strip_h, plan.strip_w}},
+            {"strip_grid", {plan.row_strips, plan.width_strips}},
+            {"overlap_granted", plan.overlap_granted},
+            {"reduction_split",
+             {{"kind", vector_reduction_split_kind_name(plan.reduction_split_kind)},
+              {"factor", plan.reduction_split_factor},
+              {"partial_extent", plan.reduction_partial_extent},
+              {"seed",
+               {{"present", plan.reduction_seed.present},
+                {"work_units", plan.reduction_seed.work_units},
+                {"valid_rows", plan.reduction_seed.valid_rows},
+                {"valid_cols", plan.reduction_seed.valid_cols}}}}},
+            {"body", vector_loop_json(plan.body)},
+            {"stats", vector_loop_json(plan.stats)},
+            {"apply", vector_loop_json(plan.apply)},
+            {"serial_phases",
+             {{"stats_init", vector_serial_phase_json(plan.stats_init)},
+              {"stats_tail", vector_serial_phase_json(plan.stats_tail)},
+              {"apply_tail", vector_serial_phase_json(plan.apply_tail)},
+              {"finalize", vector_serial_phase_json(plan.finalize)}}},
+            {"p4_work",
+             {{"generated", plan.p4_work.generated},
+              {"stats_init", vector_phase_work_json(plan.p4_work.stats_init)},
+              {"stats_update", vector_phase_work_json(plan.p4_work.stats_update)},
+              {"finalize", vector_phase_work_json(plan.p4_work.finalize)}}}};
+}
+
 static const char* cube_axis_binding_name(CubeAxisBinding binding) {
     switch (binding) {
         case CubeAxisBinding::Full: return "full";
@@ -821,63 +870,7 @@ std::string solution_json(const Solution& sol) {
             }
         }
         if (vector_plan.feasible) {
-            const VectorStreamPlan& plan = vector_plan;
-            const char* coordinate_transform =
-                plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
-                    ? "singleton_column_to_row"
-                    : "none";
-            j["vector_stream"].push_back(
-                {{"kind", vector_stream_kind_name(plan.kind)},
-                 {"coordinate_transform", coordinate_transform},
-                 {"work_units", plan.work_units},
-                 {"m_partition", axis_partition_json(plan.m_partition)},
-                 {"n_partition", axis_partition_json(plan.n_partition)},
-                 {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
-                 {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
-                 {"stream_band_count", plan.stream_band_count},
-                 {"axis", plan.axis},
-                 {"free_tile", plan.free_tile},
-                 {"free_tile_alloc", plan.free_tile_alloc},
-                 {"extent", plan.extent},
-                 {"chunk", plan.chunk},
-                 {"full_chunks", plan.full_chunks},
-                 {"tail", plan.tail},
-                 {"stream_passes", plan.stream_passes},
-                 {"tile", {plan.tile_h, plan.tile_w}},
-                 {"strip", {plan.strip_h, plan.strip_w}},
-                 {"strip_grid", {plan.row_strips, plan.width_strips}},
-                 {"overlap_granted", plan.overlap_granted},
-                 {"reduction_split",
-                  {{"kind",
-                    vector_reduction_split_kind_name(
-                        plan.reduction_split_kind)},
-                   {"factor", plan.reduction_split_factor},
-                   {"partial_extent", plan.reduction_partial_extent},
-                   {"seed",
-                    {{"present", plan.reduction_seed.present},
-                     {"work_units", plan.reduction_seed.work_units},
-                     {"valid_rows", plan.reduction_seed.valid_rows},
-                     {"valid_cols", plan.reduction_seed.valid_cols}}}}},
-                 {"body", vector_loop_json(plan.body)},
-                 {"stats", vector_loop_json(plan.stats)},
-                 {"apply", vector_loop_json(plan.apply)},
-                 {"serial_phases",
-                  {{"stats_init",
-                    vector_serial_phase_json(plan.stats_init)},
-                   {"stats_tail",
-                    vector_serial_phase_json(plan.stats_tail)},
-                   {"apply_tail",
-                    vector_serial_phase_json(plan.apply_tail)},
-                   {"finalize",
-                    vector_serial_phase_json(plan.finalize)}}},
-                 {"p4_work",
-                  {{"generated", plan.p4_work.generated},
-                   {"stats_init",
-                    vector_phase_work_json(plan.p4_work.stats_init)},
-                   {"stats_update",
-                    vector_phase_work_json(plan.p4_work.stats_update)},
-                   {"finalize",
-                    vector_phase_work_json(plan.p4_work.finalize)}}}});
+            j["vector_stream"].push_back(vector_stream_plan_json(vector_plan));
         } else {
             j["vector_stream"].push_back(nullptr);
         }
@@ -950,9 +943,24 @@ std::string solution_json(const Solution& sol) {
       j["cube_schedule"].push_back(nullptr);
     }
     if (mixed_plan.feasible && mixed_plan.topology) {
-      json stages = json::array();
+      json topology_stages = json::array();
       for (const auto& stage : mixed_plan.topology->stages) {
-        stages.push_back({{"engine", mixed_engine_name(stage.engine)}, {"ops", stage.ops}});
+        topology_stages.push_back(
+            {{"engine", mixed_engine_name(stage.engine)}, {"ops", stage.ops}});
+      }
+      json stages = json::array();
+      for (const auto& stage : mixed_plan.stages) {
+        stages.push_back(
+            {{"topology_stage", stage.topology_stage},
+             {"engine", mixed_engine_name(stage.engine)},
+             {"ops", stage.ops},
+             {"valid_rows", stage.valid_rows},
+             {"valid_cols", stage.valid_cols},
+             {"cube_window_k", stage.cube_window_k},
+             {"vector_stream",
+              stage.vector_stream.feasible
+                  ? vector_stream_plan_json(stage.vector_stream)
+                  : json(nullptr)}});
       }
       json transfers = json::array();
       for (const auto& transfer : mixed_plan.topology->transfers) {
@@ -992,9 +1000,12 @@ std::string solution_json(const Solution& sol) {
       };
       j["mixed_schedule"].push_back(
           {{"emit_compatible", mixed_plan.emit_compatible},
+           {"source_codegen_ready", mixed_plan.source_codegen_ready},
            {"algorithm", mixed_algorithm_name(mixed_plan.algorithm)},
            {"protocol", mixed_cross_core_protocol_name(mixed_plan.protocol)},
            {"mode", mixed_pipeline_mode_name(mixed_plan.mode)},
+           {"m_partition", axis_partition_json(mixed_plan.m_partition)},
+           {"n_partition", axis_partition_json(mixed_plan.n_partition)},
            {"spatial_tiles", mixed_plan.spatial_tiles},
            {"split_k", mixed_plan.split_k},
            {"work_units", mixed_plan.work_units},
@@ -1024,6 +1035,7 @@ std::string solution_json(const Solution& sol) {
            {"protocol_producer_bundle", mixed_plan.topology->protocol.producer_bundle_transfers},
            {"protocol_reply_bundle", mixed_plan.topology->protocol.reply_bundle_transfers},
            {"protocol_skew_compatible", mixed_plan.topology->protocol.skew_pass_compatible},
+           {"topology_stages", topology_stages},
            {"stages", stages},
            {"transfers", transfers},
            {"fifos", fifos},

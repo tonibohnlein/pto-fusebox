@@ -1411,6 +1411,132 @@ static void test_mixed_schedule_plan() {
     }
   }
 
+  // A single round trip preserves the complete intermediate/contraction axis
+  // even when its extent differs from the final output tile. One-way C->V
+  // rebinding must not shrink this FIFO to the sink's N partition.
+  {
+    Problem p;
+    p.tensors = {{64, 96}, {128, 64}, {128, 96},
+                 {128, 96}, {64, 128}, {64, 96}};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::Pointwise, {2}, {3}},
+             {OT::MatMul, {3, 4}, {5}}};
+    p.ops[0].mixed_emit_compatible = true;
+    p.ops[2].mixed_emit_compatible = true;
+    p.ops[1].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[1].vector_primitive = VectorPrimitiveFamily::Abs;
+    p.ops[1].vector_geometry = VectorOpGeometry::Flat;
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2});
+    CHECK("MIXPLAN: unequal-axis non-reduction C->V->C group builds",
+          (bool)mixed);
+    if (mixed) {
+      const CostResult cost = mixed->best_cost();
+      const auto plan = mixed->mixed_schedule_plan(
+          cost.config, {}, {}, cost.parallel_split);
+      CHECK("MIXPLAN: round-trip C->V FIFO retains full intermediate axis",
+            cost.feasible && plan.feasible && plan.source_codegen_ready &&
+                plan.protocol ==
+                    MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.stages.size() == 3 && plan.fifos.size() == 2 &&
+                plan.stages[1].engine == MixedEngine::Vector &&
+                plan.stages[1].valid_cols == 128 &&
+                plan.fifos[0].direction ==
+                    MixedTransferDirection::CubeToVector &&
+                plan.fifos[0].valid_cols == plan.stages[1].valid_cols);
+    }
+  }
+
+  // One produced value in both matmul roles needs two differently bound
+  // operand panels. Keep it analytically visible, but do not claim one FIFO is
+  // a complete source contract.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq};
+    p.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 1}, {2}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("MIXPLAN: multi-role V->C remains analytically visible", (bool)mixed);
+    if (mixed) {
+      const CostResult cost = mixed->best_cost();
+      const auto plan = mixed->mixed_schedule_plan(
+          cost.config, {}, {}, cost.parallel_split);
+      CHECK("MIXPLAN: one FIFO cannot claim both matmul operand roles",
+            cost.feasible && plan.feasible && !plan.source_codegen_ready);
+    }
+  }
+
+  // Standalone analytic planning admits the symmetric one-way V->C topology.
+  // Its selected plan must expose a directional FIFO descriptor for the
+  // source backend instead of relying on the historical C->V-only emitter.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq};
+    p.ops = {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("MIXPLAN: analytic V->C group builds", (bool)mixed);
+    if (mixed) {
+      const CostResult cost = mixed->best_cost();
+      const auto plan = mixed->mixed_schedule_plan(
+          cost.config, {}, {}, cost.parallel_split);
+      CHECK("MIXPLAN: analytic V->C exports its complete source-backend contract",
+            cost.feasible && plan.feasible && plan.emit_compatible &&
+                plan.source_codegen_ready && plan.split_k == 1 &&
+                plan.work_units == plan.spatial_tiles &&
+                plan.loop.work_items == plan.spatial_tiles &&
+                plan.protocol == MixedCrossCoreProtocol::OneWay &&
+                plan.mode == MixedPipelineMode::OneWay &&
+                plan.stages.size() == 2 &&
+                plan.stages[0].engine == MixedEngine::Vector &&
+                plan.stages[1].engine == MixedEngine::Cube &&
+                plan.fifos.size() == 1 &&
+                plan.fifos[0].direction ==
+                    MixedTransferDirection::VectorToCube &&
+                plan.fifos[0].valid_rows > 0 &&
+                plan.fifos[0].valid_cols > 0 &&
+                plan.fifos[0].slot_bytes ==
+                    plan.fifos[0].valid_rows * plan.fifos[0].valid_cols * 4 &&
+                plan.fifos[0].slot_count == 8);
+    }
+  }
+
+  // The same generic contract is operand-role aware. A vector-produced RHS
+  // owns [full-K, spatial-N], not the sink output's [spatial-M, spatial-N].
+  {
+    Problem p;
+    p.tensors = {{64, 96}, {128, 64}, {128, 64}, {128, 96}};
+    p.ops = {{OT::Pointwise, {1}, {2}}, {OT::MatMul, {0, 2}, {3}}};
+    p.fast_memory_capacity = 1 << 26;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+    CHECK("MIXPLAN: analytic RHS V->C group builds", (bool)mixed);
+    if (mixed) {
+      const CostResult cost = mixed->best_cost();
+      const auto plan = mixed->mixed_schedule_plan(
+          cost.config, {}, {}, cost.parallel_split);
+      CHECK("MIXPLAN: RHS V->C exports K-by-N stage and FIFO geometry",
+            cost.feasible && plan.feasible && plan.source_codegen_ready &&
+                plan.split_k == 1 && plan.stages.size() == 2 &&
+                plan.stages[0].valid_rows * plan.vector_lanes == 64 &&
+                plan.stages[0].valid_cols == plan.n_partition.big &&
+                plan.fifos.size() == 1 &&
+                plan.fifos[0].valid_rows == 64 &&
+                plan.fifos[0].valid_cols == plan.n_partition.big &&
+                plan.fifos[0].direction ==
+                    MixedTransferDirection::VectorToCube);
+    }
+  }
+
   // Production compiler descriptor: one standard matmul followed by a
   // same-shape elementwise epilogue.  A fixed 6x8 grid launches 24 mixed
   // groups, each owning two successor items; UP_DOWN is an explicit
@@ -1775,16 +1901,66 @@ static void test_mixed_schedule_plan() {
     CHECK("MIXPLAN: non-SwiGLU dataflow declines dense MLP fusion",
           !Ascend910BMixed::create(miswired, miswired_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}).has_value());
   }
+
+  // Analytic V->C vector-input traffic is request-role aware. A value
+  // broadcast over the stage's partitioned M axis reloads in every M region,
+  // and a tensor used by both engines still needs its independent GM->UB load.
+  {
+    auto traffic_problem = [](Tensor input) {
+      Problem p;
+      p.tensors = {input, {64, 96}, {128, 64}, {128, 96}};
+      p.ops = {{OpType::Pointwise, {0}, {1}},
+               {OpType::MatMul, {1, 2}, {3}}};
+      p.fast_memory_capacity = 1 << 26;
+      set_910b(p, 0);
+      p.kernel_fill_cost = 0;
+      p.bw_gm_ub = 1.0;
+      p.bw_gm_l1 = p.bw_l0c_gm = p.bw_ub_gm = 1.0e12;
+      p.hbm_aggregate_gibps = 1.0e12;
+      return p;
+    };
+    auto fixed_ddr = [](const Problem& p, const TileConfig& cfg) {
+      DAG dag = DAG::build(p);
+      auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+      return mixed ? mixed->compute_cost(cfg).ddr_traffic : -1.0;
+    };
+    const TileConfig cfg{64, 48, 64, 2, 2, 1};
+    const double cpb = 1.85e9 / (1024.0 * 1024.0 * 1024.0);
+    const double full = fixed_ddr(traffic_problem({64, 96}), cfg);
+    const double row = fixed_ddr(traffic_problem({64, 1}), cfg);
+    const double scalar = fixed_ddr(traffic_problem({1, 1}), cfg);
+    CHECK_EQ("MIXPLAN: full V->C input loads once across M and replays over N",
+             full, 96.0 * 64.0 * 4.0 * 2.0 * cpb / 4.0);
+    CHECK_EQ("MIXPLAN: row-broadcast V->C input reloads across M and N",
+             row, 64.0 * 4.0 * 2.0 * 2.0 * cpb / 4.0);
+    CHECK_EQ("MIXPLAN: scalar V->C input reloads across M and N",
+             scalar, 4.0 * 2.0 * 2.0 * cpb / 4.0);
+
+    Problem shared;
+    shared.tensors = {{64, 64}, {64, 64}, {64, 64}};
+    shared.ops = {{OpType::Pointwise, {0}, {1}},
+                  {OpType::MatMul, {1, 0}, {2}}};
+    shared.fast_memory_capacity = 1 << 26;
+    set_910b(shared, 0);
+    shared.kernel_fill_cost = 0;
+    shared.bw_gm_ub = 1.0;
+    shared.bw_gm_l1 = shared.bw_l0c_gm = shared.bw_ub_gm = 1.0e12;
+    shared.hbm_aggregate_gibps = 1.0e12;
+    Problem distinct = shared;
+    distinct.tensors = {{64, 64}, {64, 64}, {64, 64}, {64, 64}};
+    distinct.ops = {{OpType::Pointwise, {0}, {1}},
+                    {OpType::MatMul, {1, 2}, {3}}};
+    const TileConfig square_cfg{32, 32, 64, 2, 2, 1};
+    CHECK_EQ("MIXPLAN: multi-role boundary still pays its vector-engine load",
+             fixed_ddr(shared, square_cfg), fixed_ddr(distinct, square_cfg));
+  }
 }
 
-// Sink split-K in a mixed kernel. The sink matmul splits its contraction across idle
-// CUBE cores — atomic-add partials with no merge barrier, so the cores stay independent
-// (exactly the base cube split-K; the vector overlaps orthogonally). ONLY the sink is
-// ever split, and only when it is the SOLE matmul: a vector-sink (c->v) does not split,
-// nor does a multi-matmul cube sink (c->v->c). A small output (few tiles) leaves idle
-// cube cores for a large-K sink to recruit.
+// Split-K is not selected for mixed pipelines until their FIFO contract maps
+// producer items to K shares and records the merge. Homogeneous cube keeps its
+// independent model-ahead split-K surface.
 static void test_mixed_sink_split_k() {
-    std::cout << "[MIXSPLIT] cube-sink mixed kernel split-Ks the sole sink matmul\n";
+    std::cout << "[MIXSPLIT] mixed FIFO schedules remain one item per spatial tile\n";
     auto run = [&](std::vector<Tensor> ts, std::vector<Op> ops, std::vector<size_t> grp, int64_t cc) {
         Problem p; p.tensors = std::move(ts); p.ops = std::move(ops);
         p.fast_memory_capacity = 1 << 26; set_910b(p, cc);
@@ -1793,15 +1969,16 @@ static void test_mixed_sink_split_k() {
         return m ? m->best_cost() : CostResult{};
     };
     using OT = OpType;
-    // v->c: PW prologue on the matmul LHS -> matmul SINK. Output [N=256, M=64] is few
-    // tiles, so idle cube cores; the sole sink matmul split-Ks across them.
+    // v->c: one full-K vector reply feeds one cube work item. Do not create
+    // additional split shares that have no FIFO fan-out contract.
     {
         auto fr = run({{128, 64}, {128, 64}, {256, 128}, {256, 64}},  // A0 A1 B[N,K] C[N,M], K=128
                       {{OT::Pointwise, {0}, {1}}, {OT::MatMul, {1, 2}, {3}}}, {0, 1}, /*cc=*/256);
         CHECK("MIXSPLIT: v->c feasible", fr.feasible);
-        CHECK("MIXSPLIT: v->c cube-sink split-Ks the idle cores", fr.parallel_split > 1);
-        CHECK("MIXSPLIT: v->c split recruits cube cores beyond spatial tiling",
-              fr.cores_used > 3 * fr.num_spatial_tiles);
+        CHECK("MIXSPLIT: v->c stays one cube share per FIFO item",
+              fr.parallel_split == 1 && !fr.uses_model_ahead_split_k);
+        CHECK("MIXSPLIT: v->c core count follows spatial mixed groups",
+              fr.cores_used <= 3 * fr.num_spatial_tiles);
     }
     // c->v: same matmul but a vector EPILOGUE (vector sink). The sink is not the matmul,
     // so split-K is sink-only -> no split.
@@ -1983,6 +2160,36 @@ static void test_mixed_flash_attention() {
                       stream_plan.full_peak_ub_bytes);
     }
 
+    // Cutting immediately before softmax leaves the symmetric V->C partial
+    // region. Standalone analytic planning must retain it as a legal option:
+    // the exact vector P4 stage writes one reply consumed by PV.
+    auto softmax_pv = Ascend910BMixed::create(p, dag, {1, 2, 3, 4, 5});
+    CHECK("MIXFA: softmax->PV V->C partial group is analytically admissible",
+          (bool)softmax_pv);
+    if (softmax_pv) {
+        const CostResult partial_cost = softmax_pv->best_cost();
+        const MixedSchedulePlan partial_plan = softmax_pv->mixed_schedule_plan(
+            partial_cost.config, {}, {}, partial_cost.parallel_split);
+        CHECK("MIXFA: softmax->PV exports its V->C source-backend contract",
+              partial_cost.feasible && partial_plan.feasible &&
+                  partial_plan.source_codegen_ready &&
+                  partial_plan.split_k == 1 &&
+                  partial_plan.protocol == MixedCrossCoreProtocol::OneWay &&
+                  partial_plan.stages.size() == 2 &&
+                  partial_plan.stages[0].engine == MixedEngine::Vector &&
+                  partial_plan.stages[1].engine == MixedEngine::Cube &&
+                  partial_plan.stages[0].valid_cols == S &&
+                  partial_plan.stages[1].valid_cols ==
+                      partial_plan.n_partition.big &&
+                  partial_plan.stages[0].vector_stream.feasible &&
+                  partial_plan.stages[0].vector_stream.kind ==
+                      VectorStreamKind::SoftmaxFlash &&
+                  partial_plan.fifos.size() == 1 &&
+                  partial_plan.fifos[0].direction ==
+                      MixedTransferDirection::VectorToCube &&
+                  partial_plan.fifos[0].valid_cols == S);
+    }
+
     // Full attention-shaped C->V->C->V is retained only in analytic mode. The
     // current cross-core pass cannot skew all three FIFO crossings together, so
     // the mixed plan is explicitly sequential rather than receiving a max.
@@ -2030,7 +2237,8 @@ static void test_model_ahead_split_k_flag() {
         CHECK("MIXBUILD: the fixed split is a distinct serialized algorithm",
               std::abs(analytic.latency - buildable.latency) > 1e-9);
     }
-    // (2) mixed cube-sink v->c (the MIXSPLIT shape): split-Ks the sole sink matmul.
+    // (2) mixed cube-sink v->c: analytic and buildable modes both stay S=1
+    // until the FIFO descriptor has an explicit split-share routing policy.
     {
         Problem p;
         p.tensors = {{128, 64}, {128, 64}, {256, 128}, {256, 64}};  // A0 A1 B[N,K] C[N,M]
@@ -2040,8 +2248,8 @@ static void test_model_ahead_split_k_flag() {
         auto analytic = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
         p.allow_model_ahead_split_k = false;  // buildable mode
         auto buildable = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
-        CHECK("MIXBUILD: mixed analytic cube-sink split-Ks (S>1, flagged model-ahead)",
-              analytic.parallel_split > 1 && analytic.uses_model_ahead_split_k);
+        CHECK("MIXBUILD: mixed analytic cube-sink keeps one share per FIFO item",
+              analytic.parallel_split == 1 && !analytic.uses_model_ahead_split_k);
         CHECK("MIXBUILD: mixed buildable forces S=1 (no model-ahead split)",
               buildable.parallel_split == 1 && !buildable.uses_model_ahead_split_k);
     }

@@ -30,6 +30,43 @@ class RegionSolveResult:
     stderr: str = ""
     returncode: int | None = None
 
+    @property
+    def source_codegen_ready(self) -> bool:
+        """Whether the selected steps carry complete source-backend schedules."""
+
+        if self.status != "solved" or self.solution is None:
+            return False
+        schedules = self.solution.get("mixed_schedule")
+        vector_schedules = self.solution.get("vector_stream")
+        cube_schedules = self.solution.get("cube_schedule")
+        subgraphs = self.solution.get("subgraphs")
+        if (
+            not isinstance(schedules, list)
+            or not isinstance(vector_schedules, list)
+            or not isinstance(cube_schedules, list)
+            or not isinstance(subgraphs, list)
+            or len(schedules) != len(subgraphs)
+            or len(vector_schedules) != len(subgraphs)
+            or len(cube_schedules) != len(subgraphs)
+        ):
+            return False
+        for mixed, vector, cube in zip(
+            schedules, vector_schedules, cube_schedules, strict=True
+        ):
+            if mixed is not None:
+                if not (
+                    isinstance(mixed, Mapping)
+                    and mixed.get("source_codegen_ready") is True
+                ):
+                    return False
+            elif vector is None and cube is None:
+                return False
+            elif vector is not None and not isinstance(vector, Mapping):
+                return False
+            elif cube is not None and not isinstance(cube, Mapping):
+                return False
+        return True
+
 
 @dataclass(frozen=True)
 class SolveResult:
@@ -37,10 +74,27 @@ class SolveResult:
     regions: tuple[RegionSolveResult, ...]
     graph_diagnostics: tuple[str, ...]
     solver_binary: str
+    whole_graph_supported: bool
+
+    @property
+    def regions_solved(self) -> bool:
+        return bool(self.regions) and all(region.status == "solved" for region in self.regions)
 
     @property
     def successful(self) -> bool:
-        return bool(self.regions) and all(region.status == "solved" for region in self.regions)
+        """Backward-compatible alias for analytic region-solving success."""
+
+        return self.regions_solved
+
+    @property
+    def whole_graph_codegen_ready(self) -> bool:
+        """Whether the whole graph and every selected schedule are source-ready."""
+
+        return (
+            self.whole_graph_supported
+            and self.regions_solved
+            and all(region.source_codegen_ready for region in self.regions)
+        )
 
 
 def solve_graph(
@@ -60,6 +114,10 @@ def solve_graph(
     if solver_workers is not None and solver_workers <= 0:
         raise ValueError("solver_workers must be a positive integer")
     profile = resolve_target(target)
+    values = graph.value_map()
+    whole_graph_supported = all(
+        profile.admission_reason(op, values) is None for op in graph.ops
+    )
     regions = extract_solver_regions(graph, profile)
     lowered_by_region: dict[str, LoweredProblem] = {}
     declined_by_region: dict[str, RegionSolveResult] = {}
@@ -93,6 +151,7 @@ def solve_graph(
         regions=tuple(region_results),
         graph_diagnostics=graph.diagnostics,
         solver_binary="" if executable is None else str(executable),
+        whole_graph_supported=whole_graph_supported,
     )
 
 

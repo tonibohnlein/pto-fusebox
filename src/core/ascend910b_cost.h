@@ -266,6 +266,13 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const FlatSet<size_t> &retain_these,
       int64_t parallel_split) const;
 
+  // Analytic one-way V->C contract in which the vector stage produces one
+  // sink-matmul operand. Returns 0 for LHS ([spatial-M, full-K]), 1 for RHS
+  // ([full-K, spatial-N]), and -1 when the topology is not this contract.
+  int vector_to_cube_operand_index() const;
+  bool has_unrepresentable_vector_to_cube_multi_role() const;
+  TileConfig vector_to_cube_stage_config(const TileConfig& sink_cfg) const;
+
   CostResult compute_mixed_cost(
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev,

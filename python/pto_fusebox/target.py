@@ -139,12 +139,16 @@ class Ascend910BTarget(TargetProfile):
             "vec_op_tail": 18.0,
             "vec_slope_pw": 2.0,
             "vec_slope_reduce": 14.0,
-            "allow_model_ahead_split_k": False,
-            "allow_model_ahead_multi_reduction_stream": False,
+            "allow_model_ahead_split_k": True,
+            "allow_model_ahead_multi_reduction_stream": True,
             "fuse_cube_vector": True,
-            "require_buildable_mixed": True,
-            "allow_model_ahead_mixed_multi_roundtrip": False,
-            "require_uniform_cube_dag_grid": True,
+            # PTO-Fusebox is the planner in the standalone source-to-source
+            # architecture.  Its search space is therefore the analytic model,
+            # not the narrower set of schedules replayable by the historical
+            # in-compiler AutoFuse emitter.
+            "require_buildable_mixed": False,
+            "allow_model_ahead_mixed_multi_roundtrip": True,
+            "require_uniform_cube_dag_grid": False,
             "use_hierarchical_cube_cost": True,
         }
 

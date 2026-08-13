@@ -1090,6 +1090,10 @@ struct MixedDenseMlpPlan {
 struct MixedSchedulePlan {
   bool feasible = false;
   bool emit_compatible = false;
+  // True only when this selected analytic plan carries a complete stage/FIFO
+  // contract that a source backend can consume without re-planning. Analytic
+  // solutions may remain feasible when this is false.
+  bool source_codegen_ready = false;
   TileConfig config;
   AxisPartition m_partition;
   AxisPartition n_partition;

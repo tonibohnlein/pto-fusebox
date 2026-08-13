@@ -290,7 +290,11 @@ def test_qk_softmax_pv_is_one_generic_cube_vector_cube_region() -> None:
         "MatMul",
     ]
     assert lowered["fuse_cube_vector"] is True
-    assert lowered["allow_model_ahead_mixed_multi_roundtrip"] is False
+    assert lowered["require_buildable_mixed"] is False
+    assert lowered["allow_model_ahead_split_k"] is True
+    assert lowered["allow_model_ahead_multi_reduction_stream"] is True
+    assert lowered["allow_model_ahead_mixed_multi_roundtrip"] is True
+    assert lowered["require_uniform_cube_dag_grid"] is False
 
 
 def test_topk_is_opaque_and_splits_supported_regions() -> None:
@@ -472,6 +476,7 @@ def test_internal_transpose_is_an_explicit_region_boundary() -> None:
     assert regions[1].diagnostics == (
         "boundary op0001: transpose of a region-produced value requires an explicit solver layout edge",
     )
+
 
 
 def test_non_dense_external_input_declines() -> None:

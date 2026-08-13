@@ -119,6 +119,21 @@ matmul contraction and output shape, require every `M`, `N`, and `K` to span at
 least one legal cube tile, and run every complete supported region through an
 existing `mlsys_mixed` build when one is available.
 
+The standalone target admits the complete analytic schedule surface. It does
+not restrict partition search to schedules supported by the historical
+in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate tensor/tile
+PyPTO source from its own selected schedule. Analytic split-K, multi-reduction
+streaming, non-uniform cube-DAG grids, one-way `V -> C`, complete
+`C -> V -> C`, and deeper serial mixed topologies therefore remain eligible
+even when no legacy emitter path exists. Solution metadata records the stages,
+directional transfers, and protocol for every analytic mixed plan. Plans with
+a complete stage-local geometry, vector stream, cube-window, and FIFO contract
+also set `source_codegen_ready=true`; broader analytic winners remain valid
+research results but are not presented as source-emittable. `regions_solved`
+therefore reports analytic solver success separately from
+`whole_graph_codegen_ready`, which additionally requires no opaque graph
+boundaries and a source-ready contract for every selected step.
+
 ## Goal and ownership
 
 PTO-Fusebox should own the complete source-to-source scheduling path:
