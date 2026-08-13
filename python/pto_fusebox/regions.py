@@ -410,6 +410,8 @@ def _vector_primitive(
         return "row_extrema"
     if op.kind in {"add", "sub", "maximum", "minimum"}:
         scalar = bool(op.attributes.get("scalars"))
+        if op.kind in {"add", "sub"} and scalar:
+            return "scalar_add"
         if op.kind == "maximum" and scalar:
             return "scalar_max"
         if op.kind == "minimum" and scalar:

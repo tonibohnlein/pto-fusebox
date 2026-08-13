@@ -580,6 +580,25 @@ def test_mixed_scalar_semantics_require_exact_constants() -> None:
     ]
 
 
+def test_scalar_add_and_sub_use_grounded_scalar_primitive() -> None:
+    class ScalarArithmetic(nn.Module):
+        def forward(
+            self, lhs: torch.Tensor, rhs: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return lhs + 2, lhs - 2, lhs + rhs
+
+    graph = export_and_normalize(
+        ScalarArithmetic(),
+        (torch.randn(2, 8), torch.randn(2, 8)),
+    )
+    primitives = [
+        primitive
+        for region in extract_solver_regions(graph)
+        for primitive in region.lower(graph).problem["vector_primitive_families"]
+    ]
+    assert primitives == ["scalar_add", "scalar_add", "add"]
+
+
 def test_bf16_vector_arithmetic_is_boundary_but_cast_is_admitted() -> None:
     class Bf16Arithmetic(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
