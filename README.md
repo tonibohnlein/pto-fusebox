@@ -77,6 +77,12 @@ The suite intentionally reports a small documented baseline of model research
 failures while checking the implemented vector, cube, and mixed schedule-plan
 surface.
 
+## Design notes
+
+- [Torch/Hugging Face to PyPTO source generation](doc/torch_to_pypto_frontend.md)
+  records the proposed PTO-Fusebox-owned external frontend, source backend, and
+  staged dynamic-shape scope.
+
 ## Repository layout
 
 ```text
