@@ -95,13 +95,20 @@ Solution pick_best_valid(Solution coupled, Solution uncoupled) {
     return std::move(coupled);
 }
 
+int effective_num_threads(int requested) {
+    if (requested > 0) return requested;
+    int detected = static_cast<int>(std::thread::hardware_concurrency());
+    return detected > 0 ? detected : 4;
+}
+
 } // anonymous namespace
 
 // ============================================================================
 // Full pipeline
 // ============================================================================
 
-Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
+Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
+               int num_threads) {
 
     auto now              = SteadyClock::now();
     auto effective_dl     = deadline;
@@ -135,6 +142,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
     CostCache shared_cache;
 
     ParallelConfig pcfg;
+    pcfg.num_threads = num_threads;
     pcfg.fm.deadline = phase1_dl;
     pcfg.cache = &shared_cache;
     // When there are no retainable tensors Phase 3 is skipped entirely, so
@@ -204,8 +212,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
         std::cerr << "Phase 2: Building coupled partitions from "
                   << partition_pool.size() << " partitions...\n";
 
-        int hw_threads = (int)std::thread::hardware_concurrency();
-        if (hw_threads <= 0) hw_threads = 4;
+        int hw_threads = effective_num_threads(num_threads);
         int n_tasks = (int)partition_pool.size();
         std::atomic<int> next_task{0};
         std::mutex cp_mutex;
@@ -305,6 +312,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
         }
 
         CouplingParallelConfig ccfg;
+        ccfg.num_threads = num_threads;
         ccfg.pool_size   = std::min((int)coupled_pool.size(), 16);
         ccfg.fm.deadline = effective_dl;
         ccfg.cache       = &shared_cache;
@@ -371,7 +379,8 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline) {
 //   - Fork on has_retain: partition evo loop vs coupled evo loop
 // ============================================================================
 
-Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
+Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline,
+                  int num_threads) {
     auto now = SteadyClock::now();
     auto effective_dl = deadline;
     if (deadline == TimePoint::max())
@@ -408,8 +417,7 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
             seed_pool.push_back(std::move(sp));
     }
 
-    int hw_threads = (int)std::thread::hardware_concurrency();
-    if (hw_threads <= 0) hw_threads = 4;
+    int hw_threads = effective_num_threads(num_threads);
 
     // Run each init strategy + greedy descent (no FM).
     // Add 3 extra random inits for diversity.
@@ -495,6 +503,7 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
         std::cerr << "Partition evo loop (no retention)...\n";
 
         ParallelConfig pcfg;
+        pcfg.num_threads = num_threads;
         pcfg.fm.deadline = effective_dl;
         pcfg.cache = &shared_cache;
         pcfg.early_stop = false;
@@ -622,6 +631,7 @@ Solution solve_v2(const Problem& prob, const DAG& dag, TimePoint deadline) {
                 prob, dag, v2_parallel, v2_series, v2_merkle);
 
         CouplingParallelConfig ccfg;
+        ccfg.num_threads = num_threads;
         ccfg.pool_size = std::min((int)coupled_pool.size(), 16);
         ccfg.fm.deadline = effective_dl;
         ccfg.cache = &shared_cache;

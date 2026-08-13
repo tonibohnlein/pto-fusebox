@@ -49,19 +49,23 @@ class DeepSeekV4MtpProjection(nn.Module):
 
 
 def build_examples() -> dict[str, Example]:
-    """Return small inputs that preserve the model tensor-DAG structure."""
+    """Return reduced but 910B-buildable model inputs.
+
+    The token and hidden extents are intentionally smaller than a production
+    checkpoint, but remain at least one legal cube tile in every matmul axis.
+    """
 
     torch.manual_seed(0)
     return {
         "deepseek_v4_rmsnorm": (
-            DeepSeekV4RmsNorm(64),
-            (torch.randn(8, 64, dtype=torch.bfloat16),),
+            DeepSeekV4RmsNorm(1024),
+            (torch.randn(128, 1024, dtype=torch.bfloat16),),
         ),
         "deepseek_v4_mtp_projection": (
-            DeepSeekV4MtpProjection(64),
+            DeepSeekV4MtpProjection(256),
             (
-                torch.randn(8, 64, dtype=torch.bfloat16),
-                torch.randn(8, 64, dtype=torch.float32),
+                torch.randn(64, 256, dtype=torch.bfloat16),
+                torch.randn(64, 256, dtype=torch.float32),
             ),
         ),
     }

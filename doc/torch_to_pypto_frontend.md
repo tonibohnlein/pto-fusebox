@@ -30,6 +30,7 @@ result = solve_graph(
     graph,
     target="ascend910b",
     solver_binary="build/mlsys_mixed",
+    solver_workers=2,
 )
 ```
 
@@ -70,6 +71,11 @@ region in the existing solver's two-dimensional tensor representation plus a
 IDs. Missing `schema_version` remains accepted for legacy benchmark inputs;
 unknown explicit versions fail closed.
 
+A zero-valued granularity and infinite latency are internal C++ cost-search
+sentinels meaning that no feasible tile was found. They are never a valid
+schedule. The Python bridge classifies such a response as `infeasible` and
+must not pass it to the future PyPTO source backend.
+
 ## v1 normalization and admission
 
 The implemented closed set includes casts; tensor/scalar arithmetic; exp, log,
@@ -107,6 +113,12 @@ metadata aliases between computations, structured duplicate outputs, layout
 and storage-offset rejection, broadcast admission, native cast chains, and
 near misses for exact mixed-algorithm scalar semantics.
 
+The runnable model examples use reduced, hardware-representative static shapes
+rather than production checkpoint sizes. Their tests independently verify each
+matmul contraction and output shape, require every `M`, `N`, and `K` to span at
+least one legal cube tile, and run every complete supported region through an
+existing `mlsys_mixed` build when one is available.
+
 ## Goal and ownership
 
 PTO-Fusebox should own the complete source-to-source scheduling path:
@@ -135,6 +147,12 @@ PyPTO source will contain the selected fusion boundaries, grid, propagated
 regions, topological order, physical tiles, loops, pipelines, lifetimes,
 cross-core FIFOs, and valid-shape handling. PyPTO parses, verifies, lowers, and
 executes that explicit program without rerunning the Fusebox planner.
+
+Consequently, generated functions must not carry `auto_fuse` or `auto_tile`
+attributes. Those attributes belong to the earlier compiler-integrated
+prototype. Adding either attribute to already planned source would ask a second
+planner to reinterpret the selected partition and would break the
+solution-to-emission fidelity contract.
 
 The frontend and backend may be Python components because `torch.export` and FX
 are Python APIs, but they belong to the PTO-Fusebox repository. PyPTO remains a
@@ -174,6 +192,13 @@ connected candidate group, Fusebox:
 6. checks UB, L1, L0, and cross-core FIFO feasibility;
 7. prices compute, transfers, drains, and implementable overlap; and
 8. returns a complete, code-generatable solution descriptor.
+
+The frontend passes each maximal supported region as one complete solver input
+DAG. This does not require the region to become one kernel: AutoFuse partition
+search chooses any number of feasible groups that cover it. The Ascend 910B
+profile enables the restricted buildable mixed model by default; unsupported
+mixed topologies remain candidate cuts rather than making the whole region an
+AutoTile-style all-or-nothing request.
 
 Fusebox does not replace the runtime scheduler. It forms good kernels and
 preserves their dependency graph. The PyPTO runtime remains responsible for

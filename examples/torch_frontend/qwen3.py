@@ -28,13 +28,13 @@ class Qwen3RmsLmHead(nn.Module):
 
 
 def build_examples() -> dict[str, Example]:
-    """Return a compact Qwen3 output-head example."""
+    """Return a reduced but 910B-buildable Qwen3 output-head example."""
 
     torch.manual_seed(0)
     return {
         "qwen3_rms_lm_head": (
-            Qwen3RmsLmHead(hidden_size=64, vocab_size=96),
-            (torch.randn(8, 64, dtype=torch.bfloat16),),
+            Qwen3RmsLmHead(hidden_size=256, vocab_size=512),
+            (torch.randn(64, 256, dtype=torch.bfloat16),),
         )
     }
 

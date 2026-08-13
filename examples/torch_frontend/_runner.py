@@ -20,6 +20,12 @@ def run_examples(examples: Mapping[str, Example]) -> None:
     parser.add_argument("--case", choices=tuple(examples), help="run only one example")
     parser.add_argument("--json", action="store_true", help="print normalized graph JSON")
     parser.add_argument("--solver", type=Path, help="optional path to a built mlsys_mixed solver")
+    parser.add_argument(
+        "--solver-workers",
+        type=int,
+        default=2,
+        help="solver search workers (default: 2)",
+    )
     args = parser.parse_args()
 
     selected = examples if args.case is None else {args.case: examples[args.case]}
@@ -38,8 +44,27 @@ def run_examples(examples: Mapping[str, Example]) -> None:
         if args.json:
             print(graph.to_json(), end="")
         if args.solver is not None:
-            result = solve_graph(graph, solver_binary=args.solver)
+            result = solve_graph(
+                graph,
+                solver_binary=args.solver,
+                solver_workers=args.solver_workers,
+            )
+            op_by_id = graph.op_map()
             for region in result.regions:
                 print(f"  {region.region.id}: {region.status}")
                 for diagnostic in region.diagnostics:
                     print(f"    {diagnostic}")
+                if region.status != "solved" or region.solution is None:
+                    continue
+                steps = zip(
+                    region.solution["subgraphs"],
+                    region.solution["granularities"],
+                    region.solution["subgraph_latencies"],
+                    strict=True,
+                )
+                for index, (solver_ops, tile, latency) in enumerate(steps):
+                    kinds = " -> ".join(
+                        op_by_id[region.solver_op_to_graph[solver_op]].kind
+                        for solver_op in solver_ops
+                    )
+                    print(f"    step {index}: {kinds}; tile={tile}; latency={latency:.1f}")

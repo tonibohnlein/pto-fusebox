@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 from pto_fusebox import (
+    Ascend910BTarget,
     NormalizedGraph,
     export_and_normalize,
     extract_solver_regions,
@@ -217,6 +219,40 @@ def test_duplicate_matmul_operands_remain_ordered_and_distinct_roles() -> None:
     assert matmul.inputs == (matmul.inputs[0], matmul.inputs[0])
     lowered = extract_solver_regions(graph)[0].lower(graph).problem
     assert lowered["inputs"][0][0] == lowered["inputs"][0][1]
+
+
+def test_target_rejects_incoherent_matmul_geometry() -> None:
+    class Matmul(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs)
+
+    graph = export_and_normalize(
+        Matmul(),
+        (torch.randn(16, 32), torch.randn(32, 24)),
+    )
+    op = next(op for op in graph.ops if op.kind == "matmul")
+    values = graph.value_map()
+    target = Ascend910BTarget()
+
+    bad_rhs = dict(values)
+    bad_rhs[op.inputs[1]] = replace(
+        bad_rhs[op.inputs[1]],
+        shape=(31, 24),
+        strides=(24, 1),
+    )
+    assert target.admission_reason(op, bad_rhs) == (
+        "matmul contraction dimensions do not match: lhs K=32, rhs K=31"
+    )
+
+    bad_output = dict(values)
+    bad_output[op.outputs[0]] = replace(
+        bad_output[op.outputs[0]],
+        shape=(16, 25),
+        strides=(25, 1),
+    )
+    assert target.admission_reason(op, bad_output) == (
+        "matmul output geometry does not match its inputs: expected [16,24], got [16,25]"
+    )
 
 
 def test_qk_softmax_pv_is_one_generic_cube_vector_cube_region() -> None:
@@ -728,22 +764,33 @@ def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) 
     solver.write_text(
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
-        "problem=json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        "assert sys.argv[1:3]==['--threads','2']\n"
+        "problem=json.loads(pathlib.Path(sys.argv[3]).read_text())\n"
         "assert problem['schema_version']=='pto_fusebox.problem.v1'\n"
-        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "pathlib.Path(sys.argv[4]).write_text(json.dumps({"
         "'schema_version':'pto_fusebox.solution.v1','subgraphs':[[0]],"
         "'granularities':[[16,4,1]],'subgraph_latencies':[1.0]}))\n",
         encoding="utf-8",
     )
     solver.chmod(solver.stat().st_mode | stat.S_IXUSR)
 
-    result = solve_graph(graph, solver_binary=solver)
+    result = solve_graph(graph, solver_binary=solver, solver_workers=2)
 
     assert result.successful
     assert result.regions[0].solver_op_to_graph == (graph.ops[0].id,)
     problem = result.regions[0].problem
     assert problem is not None
     assert problem["frontend_mapping"]["region_id"] == "region0000"
+
+
+def test_solve_graph_rejects_nonpositive_worker_count(tmp_path: Path) -> None:
+    class Pointwise(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.exp(value)
+
+    graph = export_and_normalize(Pointwise(), (torch.randn(4, 16),))
+    with pytest.raises(ValueError, match="solver_workers must be a positive integer"):
+        solve_graph(graph, solver_binary=tmp_path / "not-used", solver_workers=0)
 
 
 def test_invalid_solver_subgraph_is_not_reported_as_solved(tmp_path: Path) -> None:

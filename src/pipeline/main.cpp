@@ -4,6 +4,7 @@
 #include "search/verbose.h"
 #include <iostream>
 #include <iomanip>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -36,17 +37,36 @@ static double get_time_budget(const std::string& filename, size_t num_ops) {
 int main(int argc, char* argv[]) {
     bool verbose = false;
     bool use_v2 = false;
+    int num_threads = 0;
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "-v") verbose = true;
-        else if (std::string(argv[i]) == "--v2") use_v2 = true;
-        else if (std::string(argv[i]) == "--v1") use_v2 = false;
+        std::string arg = argv[i];
+        if (arg == "-v") verbose = true;
+        else if (arg == "--v2") use_v2 = true;
+        else if (arg == "--v1") use_v2 = false;
+        else if (arg == "--threads") {
+            if (++i >= argc) {
+                std::cerr << "--threads requires a positive integer\n";
+                return 1;
+            }
+            try {
+                num_threads = std::stoi(argv[i]);
+            } catch (const std::exception&) {
+                std::cerr << "--threads requires a positive integer\n";
+                return 1;
+            }
+            if (num_threads <= 0) {
+                std::cerr << "--threads requires a positive integer\n";
+                return 1;
+            }
+        }
         else args.push_back(argv[i]);
     }
     g_verbose = verbose;
 
     if (args.size() != 2) {
-        std::cerr << "Usage: " << argv[0] << " [-v] <input.json> <output.json>\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " [-v] [--v1|--v2] [--threads N] <input.json> <output.json>\n";
         return 1;
     }
 
@@ -82,8 +102,8 @@ int main(int argc, char* argv[]) {
               << budget << "s (deadline=" << (budget * 0.95) << "s)\n\n";
 
     DAG dag = DAG::build(prob);
-    auto sol = use_v2 ? solve_v2(prob, dag, deadline)
-                      : solve(prob, dag, deadline);
+    auto sol = use_v2 ? solve_v2(prob, dag, deadline, num_threads)
+                      : solve(prob, dag, deadline, num_threads);
 
     auto elapsed = std::chrono::duration<double>(SteadyClock::now() - start).count();
 

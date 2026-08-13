@@ -28,14 +28,18 @@ class AttentionCore(nn.Module):
 
 
 def build_examples() -> dict[str, Example]:
-    """Return deterministic example modules and representative inputs."""
+    """Return deterministic, 910B-buildable representative inputs."""
 
     return {
-        "softmax": (Softmax(), (torch.zeros(32, 128),)),
-        "matmul": (Matmul(), (torch.zeros(16, 32), torch.zeros(32, 24))),
+        "softmax": (Softmax(), (torch.zeros(128, 1024),)),
+        "matmul": (Matmul(), (torch.zeros(128, 256), torch.zeros(256, 192))),
         "attention_core": (
             AttentionCore(),
-            (torch.zeros(16, 32), torch.zeros(24, 32), torch.zeros(24, 40)),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 128),
+            ),
         ),
     }
 

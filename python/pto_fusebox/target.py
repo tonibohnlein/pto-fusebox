@@ -198,6 +198,25 @@ def _matmul_admission_reason(
     )
     if not ranks_supported:
         return "Ascend910B cube scheduling requires rank-2 normalized matmul tensors"
+    lhs_geometry = _solver_geometry(values[op.inputs[0]])
+    rhs_geometry = _solver_geometry(values[op.inputs[1]])
+    output_geometry = _solver_geometry(values[op.outputs[0]])
+    if lhs_geometry is not None and rhs_geometry is not None and output_geometry is not None:
+        lhs_width, lhs_height = lhs_geometry
+        rhs_width, rhs_height = rhs_geometry
+        output_width, output_height = output_geometry
+        if min(lhs_width, lhs_height, rhs_width, rhs_height, output_width, output_height) <= 0:
+            return "matmul dimensions must be positive"
+        if lhs_width != rhs_height:
+            return (
+                "matmul contraction dimensions do not match: "
+                f"lhs K={lhs_width}, rhs K={rhs_height}"
+            )
+        if output_height != lhs_height or output_width != rhs_width:
+            return (
+                "matmul output geometry does not match its inputs: "
+                f"expected [{lhs_height},{rhs_width}], got [{output_height},{output_width}]"
+            )
     if any(values[value_id].dtype not in {"float16", "bfloat16", "float32"} for value_id in op.inputs):
         return "unsupported Ascend910B cube operand dtype"
     return None

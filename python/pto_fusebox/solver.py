@@ -48,6 +48,7 @@ def solve_graph(
     *,
     target: str | TargetProfile = "ascend910b",
     solver_binary: str | os.PathLike[str] | None = None,
+    solver_workers: int | None = None,
 ) -> SolveResult:
     """Partition, lower, and solve every supported region in ``graph``.
 
@@ -56,6 +57,8 @@ def solve_graph(
     separate, reproducible steps.
     """
 
+    if solver_workers is not None and solver_workers <= 0:
+        raise ValueError("solver_workers must be a positive integer")
     profile = resolve_target(target)
     regions = extract_solver_regions(graph, profile)
     lowered_by_region: dict[str, LoweredProblem] = {}
@@ -77,7 +80,12 @@ def solve_graph(
     region_results = [
         declined_by_region[region.id]
         if region.id in declined_by_region
-        else _solve_region(executable, region, lowered_by_region[region.id])
+        else _solve_region(
+            executable,
+            region,
+            lowered_by_region[region.id],
+            solver_workers=solver_workers,
+        )
         for region in regions
     ]
     return SolveResult(
@@ -89,7 +97,11 @@ def solve_graph(
 
 
 def _solve_region(
-    executable: Path | None, region: SolverRegion, lowered: LoweredProblem
+    executable: Path | None,
+    region: SolverRegion,
+    lowered: LoweredProblem,
+    *,
+    solver_workers: int | None,
 ) -> RegionSolveResult:
     if executable is None:
         raise AssertionError("a lowerable region requires a solver executable")
@@ -100,8 +112,12 @@ def _solve_region(
         problem_path.write_text(
             json.dumps(lowered.problem, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
+        command = [str(executable)]
+        if solver_workers is not None:
+            command.extend(("--threads", str(solver_workers)))
+        command.extend((str(problem_path), str(solution_path)))
         process = subprocess.run(
-            [str(executable), str(problem_path), str(solution_path)],
+            command,
             check=False,
             capture_output=True,
             text=True,

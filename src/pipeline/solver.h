@@ -27,9 +27,11 @@
 // ============================================================================
 
 Solution solve(const Problem& prob, const DAG& dag,
-               TimePoint deadline = TimePoint::max());
+               TimePoint deadline = TimePoint::max(),
+               int num_threads = 0);
 
 // V2 pipeline: init-only seeding → evo loop (partition or coupled).
 // Skips Phase 2 (ordering+greedy) and does no FM in the init phase.
 Solution solve_v2(const Problem& prob, const DAG& dag,
-                  TimePoint deadline = TimePoint::max());
+                  TimePoint deadline = TimePoint::max(),
+                  int num_threads = 0);

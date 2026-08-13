@@ -14,10 +14,13 @@ The current hardware model targets the Ascend 910B. It includes:
 - an experimental mixed cube/vector model; and
 - compact cost evaluation suitable for local-search enumeration.
 
-The repository began as a Track A entry for the MLSys 2026 Scheduling Contest
-and was subsequently developed into the scheduling and cost-model component of
-PyPTO AutoFuse. The historical `mlsys` and `mlsys_mixed` executable names are
-retained for command-line compatibility; embedders normally link `solver_lib`.
+The repository began as a Track A entry for the MLSys 2026 Scheduling Contest.
+It now owns a standalone source-to-source path: capture and normalize a tensor
+DAG, choose fusion and tiling with PTO Fusebox, and emit the selected schedule
+as explicit PyPTO DSL. PTO Fusebox is not a PyPTO submodule, and the generated
+program does not invoke a compiler-side AutoFuse or AutoTile pass. The
+historical `mlsys` and `mlsys_mixed` executable names are retained for
+command-line compatibility; embedders normally link `solver_lib`.
 
 ## Requirements
 
@@ -79,12 +82,18 @@ python -m pip install -e ".[torch]"
 from pto_fusebox import export_and_normalize, solve_graph
 
 graph = export_and_normalize(module, example_args)
-result = solve_graph(graph, solver_binary="build/mlsys_mixed")
+result = solve_graph(
+    graph,
+    solver_binary="build/mlsys_mixed",
+    solver_workers=2,
+)
 ```
 
 Unsupported operations remain explicit graph boundaries. The v1 frontend
 produces versioned normalized/problem JSON and solver schedules; readable PyPTO
-DSL generation is the next milestone.
+DSL generation is the next milestone. Each maximal supported region is one
+solver input DAG, not one mandatory fused kernel: the solver may partition it
+into several feasible groups and may select supported mixed cube/vector groups.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
@@ -99,8 +108,10 @@ python -m examples.torch_frontend.qwen3
 Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`
 to also submit its supported regions to an existing solver build. The model
 examples preserve the relevant tensor algebra from `pypto-lib`; their shapes
-and, where documented in the source, dtypes are reduced for readability. They
-are not full checkpoint implementations.
+and, where documented in the source, dtypes are reduced for practical local
+execution. Every example matmul still satisfies `[M,K] @ [K,N] -> [M,N]`, and
+all three axes span at least one legal 910B cube tile. They are coherent
+reduced computations, not full checkpoint implementations.
 
 ## Test
 

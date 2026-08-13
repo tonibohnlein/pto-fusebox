@@ -3969,7 +3969,7 @@ static bool step_homogeneous(const Problem& p, const ScheduleStep& s) {
 }
 static void check_solution(const char* tag, const Problem& p) {
     DAG dag = DAG::build(p);
-    auto sol = solve(p, dag);
+    auto sol = solve(p, dag, TimePoint::max(), 2);
     char b[80];
     auto C = [&](const char* w, bool ok) { snprintf(b, sizeof b, "BIG/%s: %s", tag, w); CHECK(b, ok); };
     C("solution valid", sol.validate().valid);
