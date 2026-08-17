@@ -100,7 +100,8 @@ print(source.source)
 
 Unsupported operations remain explicit graph boundaries. The first source
 backend emits one selected homogeneous step: materialized/pointwise vector
-replay or one spatial cube matmul. Other schedules raise a precise
+replay, the versioned two-pass online-softmax schedule, or one spatial cube
+matmul. Other schedules raise a precise
 `SourceEmissionError` rather than being approximated. Each maximal supported
 region is one solver input DAG, not one mandatory fused kernel: the solver may
 partition it into several feasible groups and may select supported mixed
@@ -113,18 +114,24 @@ and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
 implements `can_emit_region` and actual emission, so readiness cannot accept a
 program that the renderer later rejects. The renderer is organized as separate
-API, shared-mechanics, vector, and cube modules. Analytically feasible streamed
-and mixed schedules remain explicitly not source-ready until their complete
+API, shared-mechanics, vector, and cube modules. The online-softmax path consumes
+the solver's versioned semantic state/substitution recipe; it does not recognize
+a program or model name. Other analytically feasible streamed and mixed
+schedules remain explicitly not source-ready until their complete
 state/transport contracts are serialized.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
-Qwen3 final RMSNorm/LM head:
+Qwen3 final RMSNorm/LM head. The
+[PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335) reproduction
+surface retains the exact four softmax shapes plus RMSNorm, LayerNorm, and SiLU
+formulas used by the closed in-compiler AutoTile comparison:
 
 ```bash
 python -m examples.torch_frontend.basic
 python -m examples.torch_frontend.deepseek_v4
 python -m examples.torch_frontend.qwen3
+python -m examples.torch_frontend.pr2335_vector
 ```
 
 Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`

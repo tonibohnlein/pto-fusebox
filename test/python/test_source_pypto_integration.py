@@ -38,6 +38,16 @@ class _MatmulWithTail(nn.Module):
         return torch.mm(lhs, rhs)
 
 
+class _WideSoftmax(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(value, dim=-1)
+
+
+class _Silu(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value * torch.reciprocal(torch.exp(value * -1.0) + 1.0)
+
+
 def _solver() -> Path:
     configured = os.environ.get("PTO_FUSEBOX_TEST_SOLVER")
     if configured:
@@ -65,6 +75,18 @@ def _solver() -> Path:
             _MatmulWithTail(),
             (torch.zeros(64, 272), torch.zeros(272, 80)),
             "pto.tmatmul.acc",
+        ),
+        (
+            "wide_softmax",
+            _WideSoftmax(),
+            (torch.zeros(32, 8192),),
+            "pto.trowmax",
+        ),
+        (
+            "silu",
+            _Silu(),
+            (torch.zeros(512, 256),),
+            "pto.trecip",
         ),
     ],
 )

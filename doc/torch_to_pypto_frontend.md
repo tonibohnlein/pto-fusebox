@@ -12,11 +12,12 @@ The first PyPTO DSL source slice is also implemented. A solved homogeneous
 region can be validated as a typed schedule and emitted as an ordinary
 `@pl.program` containing the selected grid, balanced region partition,
 physical vector frame, strip/K-window loops, pipeline stages, operations, and
-loads/stores. The initial closed set is materialized/pointwise vector replay
-and one spatial, output-stationary cube matmul. Unsupported schedules fail
-closed; the backend does not approximate them or ask PyPTO to plan them again.
+loads/stores. The initial closed set is materialized/pointwise vector replay,
+the versioned two-pass online-softmax schedule, and one spatial,
+output-stationary cube matmul. Unsupported schedules fail closed; the backend
+does not approximate them or ask PyPTO to plan them again.
 
-Streamed vector phases, split reductions, split-K, retained panels,
+Other streamed vector phases, split reductions, split-K, retained panels,
 multi-matmul DAGs, mixed schedules, multiple selected kernel steps, and whole
 graph orchestration remain source-backend milestones. Dynamic-shape classes
 are preserved in the normalized graph but remain unschedulable when they
@@ -309,20 +310,23 @@ launching ready kernels and overlapping independent AIC and AIV work.
 
 The backend deterministically serializes the selected solution descriptor as
 readable PyPTO DSL. The installed homogeneous slice emits one materialized or
-pointwise vector step, or one uniform spatial cube matmul, using `pl.parallel`,
-static physical tile shapes, runtime `valid_shape`, `pl.range`/`pl.pipeline`,
-and explicit GM boundaries. It executes the vector plan's `body.ops` directly;
-for this schedule family the parser requires that list to equal the selected
-step order and requires all other phases to be empty.
+pointwise vector step, the `softmax_flash.v1` two-pass online schedule, or one
+uniform spatial cube matmul, using `pl.parallel`, static physical tile shapes,
+runtime `valid_shape`, `pl.range`/`pl.pipeline`, and explicit GM boundaries.
+Materialized/pointwise schedules execute `body.ops` directly and require all
+other phases to be empty. Online softmax consumes the typed stats/apply loops,
+frames, workspaces, carry-state names, and reduction-output substitutions. Its
+selection is recipe-driven and independent of program, module, model, or shape
+names.
 
 Analytic support is deliberately broader than this installed renderer.
-Streamed reductions, P4 online algorithms, split reductions, retained cube
-panels, multi-matmul, split-K, multi-step, and mixed plans remain valid solver
-results but are not source-ready. P4 descriptors already preserve named
-substitution roles rather than reconstructing them from operation numbers, but
-source emission stays disabled until generated carry-state frames/lifetimes
-and output-publication semantics are also versioned. Future plan classes will
-add those contracts and supported `tpush`/`tpop`/`tfree` transport without
+General streamed reductions, Welford/multi-stat P4 algorithms, split
+reductions, retained cube panels, multi-matmul, split-K, multi-step, and mixed
+plans remain valid solver results but are not source-ready. P4 descriptors
+preserve named substitution roles rather than reconstructing them from
+operation numbers; each additional P4 recipe must version its carry state and
+publication semantics before source emission is enabled. Future plan classes
+will add those contracts and supported `tpush`/`tpop`/`tfree` transport without
 changing this ownership boundary.
 
 The backend must not redo planning. Every emitted loop, lifetime, transfer, and
@@ -448,11 +452,13 @@ dynamic physical tile that reaches allocation or tile-flattening.
 
 ## Implementation sequence
 
-1. Import static RMSNorm, softmax, linear, and generic `QK -> softmax DAG -> PV`
-   Export graphs into the implemented normalized IR and existing solver.
-2. Generate readable PyPTO from the solution and compare graph semantics,
-   schedule fields, lowered PTO, and device numerics.
-3. Repeat for a static cube matmul.
+1. Silicon-close the installed materialized-vector, online-softmax, and static
+   cube source slices.
+2. Reproduce [closed PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335)'s
+   seven hand-tiled vector comparisons through standalone Torch capture,
+   Fusebox planning, and explicit generated PyPTO.
+3. Extend homogeneous source replay to the remaining serialized vector and cube
+   schedule families.
 4. Expand the generic mixed source backend from one round trip while continuing
    to reject unsupported multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value

@@ -9,6 +9,7 @@ from ..lowered import LoweredRegion
 from ..schedule import VectorKernelPlan
 from ..schedule.schema import (
     VectorCoordinateTransform,
+    VectorPhasePlan,
     VectorPhysicalFramePlan,
     VectorReductionSplitKind,
     VectorReplayPhase,
@@ -36,7 +37,7 @@ def emit_vector(
     context: EmissionContext,
     program_name: str,
 ) -> str:
-    """Emit the installed materialized/pointwise vector schedule subset."""
+    """Emit one installed homogeneous vector schedule."""
 
     graph = context.graph
     lowered = context.lowered
@@ -49,18 +50,6 @@ def emit_vector(
         raise SourceEmissionError(
             "single-step vector source cannot carry inter-kernel retained tensors"
         )
-    if step.sequential_tiles is None or any(step.sequential_tiles):
-        raise SourceEmissionError(
-            "materialized/pointwise vector source requires zero sequential tiles"
-        )
-    if plan.kind not in {
-        VectorStreamKind.MATERIALIZED,
-        VectorStreamKind.POINTWISE,
-    }:
-        raise SourceEmissionError(
-            "vector source v1 supports materialized or pointwise replay, got "
-            f"{plan.kind.value!r}"
-        )
     if plan.coordinate_transform is not VectorCoordinateTransform.NONE:
         raise SourceEmissionError(
             "vector coordinate transforms are not implemented in source v1"
@@ -71,6 +60,20 @@ def emit_vector(
     ):
         raise SourceEmissionError(
             "vector reduction split emission is not implemented in source v1"
+        )
+    if plan.kind is VectorStreamKind.SOFTMAX_FLASH:
+        return _emit_softmax_flash(context, program_name, plan)
+    if plan.kind not in {
+        VectorStreamKind.MATERIALIZED,
+        VectorStreamKind.POINTWISE,
+    }:
+        raise SourceEmissionError(
+            "vector source v1 supports materialized or pointwise replay, got "
+            f"{plan.kind.value!r}"
+        )
+    if step.sequential_tiles is None or any(step.sequential_tiles):
+        raise SourceEmissionError(
+            "materialized/pointwise vector source requires zero sequential tiles"
         )
     if plan.axis != 0:
         raise SourceEmissionError(
@@ -177,6 +180,543 @@ def emit_vector(
     )
     writer.line(2, f"return {io.output_argument}")
     return writer.render()
+
+
+def _emit_softmax_flash(
+    context: EmissionContext,
+    program_name: str,
+    plan: VectorKernelPlan,
+) -> str:
+    """Replay the versioned online-softmax schedule carried by ``plan``."""
+
+    graph = context.graph
+    lowered = context.lowered
+    step = context.step
+    io = context.interface
+    recipe = plan.p4_recipe
+    if recipe is None or recipe.version != "softmax_flash.v1":
+        raise SourceEmissionError("softmax_flash source requires recipe v1")
+    if recipe.state != ("running_max", "running_sum"):
+        raise SourceEmissionError("softmax_flash recipe has an unknown state contract")
+    if plan.axis != 1 or plan.physical_frame.reduced_axis != 1:
+        raise SourceEmissionError(
+            "softmax_flash source currently supports last-axis replay only"
+        )
+    if plan.stream_passes != 2 or plan.chunk <= 0 or plan.full_chunks <= 0:
+        raise SourceEmissionError("softmax_flash stream geometry is incomplete")
+    if plan.full_chunks * plan.chunk + plan.tail != plan.extent:
+        raise SourceEmissionError(
+            "softmax_flash chunks do not cover the reduced extent"
+        )
+    if step.sequential_tiles is None or tuple(step.sequential_tiles) != (
+        plan.chunk,
+    ) * len(step.solver_ops):
+        raise SourceEmissionError(
+            "softmax_flash sequential tiles differ from the streamed chunk"
+        )
+
+    m_partition = plan.m_partition
+    n_partition = plan.n_partition
+    validate_grid(step, plan.work_units, m_partition, n_partition)
+    output_rows, output_cols = static_shape(
+        graph.value_map()[io.output_value], field="softmax_flash output"
+    )
+    validate_partition_extent(m_partition, output_rows, "vector.m_partition")
+    validate_partition_extent(n_partition, output_cols, "vector.n_partition")
+    if n_partition.parts != 1 or plan.extent != output_cols:
+        raise SourceEmissionError(
+            "softmax_flash requires one complete reduced-axis partition"
+        )
+    if plan.free_tile != m_partition.big or plan.tile != (
+        m_partition.big,
+        n_partition.big,
+    ):
+        raise SourceEmissionError("softmax_flash tile differs from its partitions")
+    if (
+        plan.physical_frame.iteration_rows,
+        plan.physical_frame.iteration_cols,
+    ) != (output_rows, output_cols):
+        raise SourceEmissionError(
+            "softmax_flash frame differs from the lowered iteration geometry"
+        )
+
+    stats = plan.phase(VectorReplayPhase.STATS)
+    apply = plan.phase(VectorReplayPhase.APPLY)
+    _validate_softmax_loops(plan, stats, apply)
+    _validate_softmax_generated_work(plan)
+    stats_init = stats.init
+    if stats_init is None:
+        raise SourceEmissionError("softmax_flash stats phase omits initialization")
+    max_op, sum_op = _softmax_semantic_ops(context, plan)
+    input_tensor = recipe.input_tensor
+    _validate_softmax_frames(plan, lowered, stats, apply)
+    input_value = lowered.tensor(input_tensor).value_id
+    try:
+        input_argument = io.input_arguments[input_value]
+    except KeyError as error:
+        raise SourceEmissionError(
+            "softmax_flash input is not a direct region input"
+        ) from error
+    max_tensor = lowered.operation(max_op).outputs[0]
+    sum_tensor = lowered.operation(sum_op).outputs[0]
+    output_tensor = solver_tensor_for_value(lowered, io.output_allocation_owner)
+
+    writer = program_header(program_name, io, graph, plan.work_units)
+    indent = 4
+    emit_partition_indices(writer, indent, m_partition, n_partition, emit_extents=True)
+    writer.line(
+        indent,
+        f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_vector')}):",
+    )
+    indent += 1
+
+    running_max, running_sum = _emit_softmax_stats_chunk(
+        writer,
+        indent,
+        lowered,
+        stats,
+        input_tensor=input_tensor,
+        input_argument=input_argument,
+        prefix="initial",
+        col_offset="0",
+        valid_cols=str(stats_init.extent),
+        old_max=None,
+        old_sum=None,
+    )
+    if stats.loop is None:
+        raise SourceEmissionError("softmax_flash stats phase omits its loop")
+    if stats.loop.trip_count:
+        stats_iter_max = "stats_running_max"
+        stats_iter_sum = "stats_running_sum"
+        stats_result_max = "stats_result_max"
+        stats_result_sum = "stats_result_sum"
+        _emit_loop_header(
+            writer,
+            indent,
+            "stats_chunk",
+            stats.loop,
+            iter_values=(stats_iter_max, stats_iter_sum),
+            init_values=(running_max, running_sum),
+        )
+        loop_indent = indent + 1
+        writer.line(loop_indent, f"stats_col = stats_chunk * {plan.chunk}")
+        next_max, next_sum = _emit_softmax_stats_chunk(
+            writer,
+            loop_indent,
+            lowered,
+            stats,
+            input_tensor=input_tensor,
+            input_argument=input_argument,
+            prefix="stats",
+            col_offset="stats_col",
+            valid_cols=str(plan.chunk),
+            old_max=stats_iter_max,
+            old_sum=stats_iter_sum,
+        )
+        writer.line(
+            loop_indent,
+            f"{stats_result_max}, {stats_result_sum} = "
+            f"pl.yield_({next_max}, {next_sum})",
+        )
+        running_max = stats_result_max
+        running_sum = stats_result_sum
+    if plan.tail:
+        if stats.tail is None or not stats.tail.present:
+            raise SourceEmissionError("softmax_flash stats phase omits its tail")
+        tail_max, tail_sum = _emit_softmax_stats_chunk(
+            writer,
+            indent,
+            lowered,
+            stats,
+            input_tensor=input_tensor,
+            input_argument=input_argument,
+            prefix="stats_tail",
+            col_offset=str(stats.tail.chunk_index * plan.chunk),
+            valid_cols=str(stats.tail.extent),
+            old_max=running_max,
+            old_sum=running_sum,
+        )
+        writer.line(indent, f"{running_max} = {tail_max}")
+        writer.line(indent, f"{running_sum} = {tail_sum}")
+
+    if apply.loop is None:
+        raise SourceEmissionError("softmax_flash apply phase omits its loop")
+    if apply.loop.trip_count:
+        _emit_loop_header(writer, indent, "apply_chunk", apply.loop)
+        loop_indent = indent + 1
+        writer.line(loop_indent, f"apply_col = apply_chunk * {plan.chunk}")
+        _emit_softmax_apply_chunk(
+            writer,
+            loop_indent,
+            context,
+            apply,
+            input_tensor=input_tensor,
+            input_argument=input_argument,
+            max_tensor=max_tensor,
+            sum_tensor=sum_tensor,
+            output_tensor=output_tensor,
+            running_max=running_max,
+            running_sum=running_sum,
+            prefix="apply",
+            col_offset="apply_col",
+            valid_cols=str(plan.chunk),
+        )
+    if plan.tail:
+        if apply.tail is None or not apply.tail.present:
+            raise SourceEmissionError("softmax_flash apply phase omits its tail")
+        _emit_softmax_apply_chunk(
+            writer,
+            indent,
+            context,
+            apply,
+            input_tensor=input_tensor,
+            input_argument=input_argument,
+            max_tensor=max_tensor,
+            sum_tensor=sum_tensor,
+            output_tensor=output_tensor,
+            running_max=running_max,
+            running_sum=running_sum,
+            prefix="apply_tail",
+            col_offset=str(apply.tail.chunk_index * plan.chunk),
+            valid_cols=str(apply.tail.extent),
+        )
+    writer.line(2, f"return {io.output_argument}")
+    return writer.render()
+
+
+def _validate_softmax_loops(
+    plan: VectorKernelPlan,
+    stats: VectorPhasePlan,
+    apply: VectorPhasePlan,
+) -> None:
+    if stats.init is None or not stats.init.present:
+        raise SourceEmissionError("softmax_flash stats phase omits initialization")
+    if stats.init.chunk_index != 0 or stats.init.extent != plan.chunk:
+        raise SourceEmissionError("softmax_flash initialization differs from its chunk")
+    if stats.loop is None or (
+        stats.loop.first_chunk,
+        stats.loop.trip_count,
+    ) != (1, plan.full_chunks - 1):
+        raise SourceEmissionError("softmax_flash stats loop is inconsistent")
+    if apply.loop is None or (
+        apply.loop.first_chunk,
+        apply.loop.trip_count,
+    ) != (0, plan.full_chunks):
+        raise SourceEmissionError("softmax_flash apply loop is inconsistent")
+    for name, loop in (("stats", stats.loop), ("apply", apply.loop)):
+        expected_stages = 2 if loop.trip_count >= 2 else 1
+        if loop.pipeline_stages != expected_stages:
+            raise SourceEmissionError(
+                f"softmax_flash {name} pipeline depth is inconsistent"
+            )
+    for name, phase in (("stats", stats), ("apply", apply)):
+        tail = phase.tail
+        if plan.tail:
+            if (
+                tail is None
+                or not tail.present
+                or tail.chunk_index != plan.full_chunks
+                or tail.extent != plan.tail
+            ):
+                raise SourceEmissionError(f"softmax_flash {name} tail is inconsistent")
+        elif tail is not None and tail.present:
+            raise SourceEmissionError(f"softmax_flash {name} has a spurious tail")
+
+
+def _validate_softmax_generated_work(plan: VectorKernelPlan) -> None:
+    def work(phase) -> dict[str, tuple[int, int, int]]:
+        result = {
+            primitive.kind: (
+                primitive.wide,
+                primitive.thin,
+                primitive.stream_starts,
+            )
+            for primitive in phase.primitives
+        }
+        if len(result) != len(phase.primitives):
+            raise SourceEmissionError(
+                "softmax_flash generated work contains duplicate primitives"
+            )
+        return result
+
+    expected_init = {
+        "exp": (1, 0, 0),
+        "row_expand_sub": (1, 0, 1),
+        "row_sum": (1, 0, 0),
+        "row_max": (1, 0, 0),
+    }
+    expected_update = {
+        "add": (0, 3, 2),
+        "mul": (0, 1, 0),
+        "exp": (1, 1, 0),
+        "row_expand_sub": (1, 0, 1),
+        "row_sum": (1, 0, 0),
+        "row_max": (1, 0, 0),
+    }
+    if (
+        not plan.p4_work.generated
+        or work(plan.p4_work.stats_init) != expected_init
+        or work(plan.p4_work.stats_update) != expected_update
+        or plan.p4_work.finalize.generated
+        or plan.p4_work.finalize.primitives
+    ):
+        raise SourceEmissionError("softmax_flash generated work differs from recipe v1")
+
+
+def _validate_softmax_frames(
+    plan: VectorKernelPlan,
+    lowered: LoweredRegion,
+    stats: VectorPhasePlan,
+    apply: VectorPhasePlan,
+) -> None:
+    """Check the recipe's wide data and thin state against solver-owned frames."""
+
+    wide_logical = (plan.free_tile, plan.chunk)
+    wide_physical = (plan.free_tile_alloc, plan.chunk)
+    thin_logical = (plan.free_tile, 1)
+    thin_physical = (plan.free_tile_alloc, 1)
+    for phase in (stats, apply):
+        for frame in phase.tensor_frames:
+            tensor = lowered.tensor(frame.tensor)
+            if tensor.height != plan.physical_frame.iteration_rows:
+                raise SourceEmissionError(
+                    "softmax_flash tensor height differs from its iteration frame"
+                )
+            if tensor.width == plan.extent:
+                expected_logical = wide_logical
+                expected_physical = wide_physical
+            elif tensor.width == 1:
+                expected_logical = thin_logical
+                expected_physical = thin_physical
+            else:
+                raise SourceEmissionError(
+                    "softmax_flash tensor is neither wide data nor thin state"
+                )
+            if frame.logical != expected_logical or frame.physical != expected_physical:
+                raise SourceEmissionError(
+                    "softmax_flash tensor frame differs from its recipe role"
+                )
+
+
+def _softmax_semantic_ops(
+    context: EmissionContext,
+    plan: VectorKernelPlan,
+) -> tuple[int, int]:
+    recipe = plan.p4_recipe
+    if recipe is None:
+        raise SourceEmissionError("softmax_flash recipe is absent")
+    bindings = {binding.value: binding.op for binding in recipe.apply_substitutions}
+    if set(bindings) != {"running_max", "running_sum"}:
+        raise SourceEmissionError("softmax_flash substitutions are incomplete")
+    max_op = bindings["running_max"]
+    sum_op = bindings["running_sum"]
+    lowered = context.lowered
+    graph_ops = context.graph.op_map()
+    stats = plan.phase(VectorReplayPhase.STATS)
+    apply = plan.phase(VectorReplayPhase.APPLY)
+    if tuple(graph_ops[lowered.operation(op).graph_op_id].kind for op in stats.ops) != (
+        "max",
+        "sub",
+        "exp",
+        "sum",
+    ):
+        raise SourceEmissionError("softmax_flash stats semantics are unsupported")
+    if tuple(graph_ops[lowered.operation(op).graph_op_id].kind for op in apply.ops) != (
+        "sub",
+        "exp",
+        "div",
+    ):
+        raise SourceEmissionError("softmax_flash apply semantics are unsupported")
+    max_desc = lowered.operation(max_op)
+    sum_desc = lowered.operation(sum_op)
+    sub_desc = lowered.operation(stats.ops[1])
+    exp_desc = lowered.operation(stats.ops[2])
+    div_desc = lowered.operation(apply.ops[2])
+    if (
+        max_desc.inputs != (recipe.input_tensor,)
+        or sub_desc.inputs != (recipe.input_tensor, max_desc.outputs[0])
+        or exp_desc.inputs != (sub_desc.outputs[0],)
+        or sum_desc.inputs != (exp_desc.outputs[0],)
+        or div_desc.inputs != (exp_desc.outputs[0], sum_desc.outputs[0])
+    ):
+        raise SourceEmissionError("softmax_flash tensor wiring is unsupported")
+    return max_op, sum_op
+
+
+def _emit_loop_header(
+    writer: SourceWriter,
+    indent: int,
+    index: str,
+    loop,
+    *,
+    iter_values: tuple[str, ...] = (),
+    init_values: tuple[str, ...] = (),
+) -> None:
+    if bool(iter_values) != bool(init_values) or len(iter_values) != len(init_values):
+        raise SourceEmissionError("loop-carried names and initial values disagree")
+    function = "pl.pipeline" if loop.pipeline_stages > 1 else "pl.range"
+    stage = f", stage={loop.pipeline_stages}" if loop.pipeline_stages > 1 else ""
+    carried = ""
+    init = ""
+    if iter_values:
+        carried = f", ({', '.join(iter_values)})"
+        init = f", init_values=({', '.join(init_values)},)"
+    stop = loop.first_chunk + loop.trip_count
+    writer.line(
+        indent,
+        f"for {index}{carried} in {function}({loop.first_chunk}, {stop}{stage}{init}):",
+    )
+
+
+def _emit_softmax_stats_chunk(  # noqa: PLR0913 -- explicit typed contract fields.
+    writer: SourceWriter,
+    indent: int,
+    lowered: LoweredRegion,
+    phase: VectorPhasePlan,
+    *,
+    input_tensor: int,
+    input_argument: str,
+    prefix: str,
+    col_offset: str,
+    valid_cols: str,
+    old_max: str | None,
+    old_sum: str | None,
+) -> tuple[str, str]:
+    frames = {frame.tensor: frame for frame in phase.tensor_frames}
+    workspaces = {workspace.op: workspace for workspace in phase.workspaces}
+    try:
+        input_frame = frames[input_tensor]
+    except KeyError as error:
+        raise SourceEmissionError("softmax_flash stats input has no frame") from error
+    max_op, sum_op = phase.ops[0], phase.ops[3]
+    try:
+        max_workspace = workspaces[max_op]
+        sum_workspace = workspaces[sum_op]
+    except KeyError as error:
+        raise SourceEmissionError(
+            "softmax_flash reduction workspace is absent"
+        ) from error
+    dtype = pypto_dtype(lowered.tensor(input_tensor).dtype)
+    physical_rows, physical_cols = input_frame.physical
+    tile = f"{prefix}_input"
+    writer.line(
+        indent,
+        f"{tile} = pl.load({input_argument}, [region_row, {col_offset}], "
+        f"[{physical_rows}, {physical_cols}], valid_shape=[region_rows, {valid_cols}], "
+        "target_memory=pl.Mem.Vec, clamp=True)",
+    )
+    max_scratch = f"{prefix}_max_scratch"
+    writer.line(
+        indent,
+        f"{max_scratch} = pl.tile.create([{max_workspace.physical[0]}, "
+        f"{max_workspace.physical[1]}], dtype={dtype}, target_memory=pl.Mem.Vec)",
+    )
+    local_max = f"{prefix}_local_max"
+    writer.line(indent, f"{local_max} = pl.row_max({tile}, {max_scratch})")
+    new_max = local_max
+    if old_max is not None:
+        new_max = f"{prefix}_next_max"
+        writer.line(indent, f"{new_max} = pl.maximum({old_max}, {local_max})")
+    shifted = f"{prefix}_shifted"
+    exponent = f"{prefix}_exponent"
+    writer.line(indent, f"{shifted} = pl.row_expand_sub({tile}, {new_max})")
+    writer.line(indent, f"{exponent} = pl.exp({shifted})")
+    sum_scratch = f"{prefix}_sum_scratch"
+    writer.line(
+        indent,
+        f"{sum_scratch} = pl.tile.create([{sum_workspace.physical[0]}, "
+        f"{sum_workspace.physical[1]}], dtype={dtype}, target_memory=pl.Mem.Vec)",
+    )
+    local_sum = f"{prefix}_local_sum"
+    writer.line(indent, f"{local_sum} = pl.row_sum({exponent}, {sum_scratch})")
+    new_sum = local_sum
+    if old_sum is not None:
+        if old_max is None:
+            raise SourceEmissionError("softmax_flash update omits its old maximum")
+        delta = f"{prefix}_delta"
+        correction = f"{prefix}_correction"
+        scaled_sum = f"{prefix}_scaled_sum"
+        new_sum = f"{prefix}_next_sum"
+        writer.line(indent, f"{delta} = pl.sub({old_max}, {new_max})")
+        writer.line(indent, f"{correction} = pl.exp({delta})")
+        writer.line(indent, f"{scaled_sum} = pl.mul({old_sum}, {correction})")
+        writer.line(indent, f"{new_sum} = pl.add({scaled_sum}, {local_sum})")
+    return new_max, new_sum
+
+
+def _emit_softmax_apply_chunk(  # noqa: PLR0913 -- explicit typed contract fields.
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    phase: VectorPhasePlan,
+    *,
+    input_tensor: int,
+    input_argument: str,
+    max_tensor: int,
+    sum_tensor: int,
+    output_tensor: int,
+    running_max: str,
+    running_sum: str,
+    prefix: str,
+    col_offset: str,
+    valid_cols: str,
+) -> None:
+    frames = {frame.tensor: frame for frame in phase.tensor_frames}
+    try:
+        input_frame = frames[input_tensor]
+    except KeyError as error:
+        raise SourceEmissionError("softmax_flash apply input has no frame") from error
+    physical_rows, physical_cols = input_frame.physical
+    tile = f"{prefix}_input"
+    writer.line(
+        indent,
+        f"{tile} = pl.load({input_argument}, [region_row, {col_offset}], "
+        f"[{physical_rows}, {physical_cols}], valid_shape=[region_rows, {valid_cols}], "
+        "target_memory=pl.Mem.Vec, clamp=True)",
+    )
+    local = {
+        input_tensor: tile,
+        max_tensor: running_max,
+        sum_tensor: running_sum,
+    }
+    graph_ops = context.graph.op_map()
+    for solver_op in phase.ops:
+        operation = context.lowered.operation(solver_op)
+        try:
+            operands = [local[tensor] for tensor in operation.inputs]
+        except KeyError as error:
+            raise SourceEmissionError(
+                "softmax_flash apply phase uses an unavailable tensor"
+            ) from error
+        graph_op = graph_ops[operation.graph_op_id]
+        output = operation.outputs[0]
+        name = f"{prefix}_tensor_{output}"
+        expression = _vector_expression(
+            writer,
+            indent,
+            graph_op,
+            operands,
+            list(operation.inputs),
+            output,
+            context.lowered,
+            physical_rows,
+            physical_cols,
+            solver_op,
+            None,
+        )
+        writer.line(indent, f"{name} = {expression}")
+        local[output] = name
+    try:
+        result = local[output_tensor]
+    except KeyError as error:
+        raise SourceEmissionError(
+            "softmax_flash apply phase does not produce the region output"
+        ) from error
+    writer.line(
+        indent,
+        f"{context.interface.output_argument} = pl.store({result}, "
+        f"[region_row, {col_offset}], {context.interface.output_argument})",
+    )
 
 
 def _emit_vector_body(
@@ -346,7 +886,13 @@ def _vector_expression(  # noqa: PLR0913 -- arguments are explicit contract fiel
     if op.kind not in {"add", "sub", "mul", "div", "maximum", "minimum"}:
         raise SourceEmissionError(f"vector source v1 does not implement {op.kind!r}")
     if len(operands) == 1:
-        scalar = _single_scalar(op)
+        position, scalar = _single_scalar(op)
+        if op.kind == "div" and position == 0 and scalar == 1:
+            return f"pl.recip({operands[0]})"
+        if position != 1:
+            raise SourceEmissionError(
+                f"{op.id} uses an unsupported scalar operand position"
+            )
         return f"pl.{op.kind}({operands[0]}, {literal(scalar)})"
     if len(operands) != 2:
         raise SourceEmissionError(
@@ -385,19 +931,20 @@ def _broadcast_operands(shapes: list[tuple[int, int]]) -> tuple[int, int, str]:
     raise SourceEmissionError(f"unsupported vector broadcast geometry {shapes}")
 
 
-def _single_scalar(op: NormalizedOp) -> int | float:
+def _single_scalar(op: NormalizedOp) -> tuple[int, int | float]:
     scalars = op.attributes.get("scalars")
     if not isinstance(scalars, Sequence) or len(scalars) != 1:
         raise SourceEmissionError(f"{op.id} does not carry exactly one scalar operand")
     scalar = scalars[0]
-    if not isinstance(scalar, Mapping) or scalar.get("position") != 1:
-        raise SourceEmissionError(
-            f"{op.id} uses an unsupported scalar operand position"
-        )
+    if not isinstance(scalar, Mapping):
+        raise SourceEmissionError(f"{op.id} has a malformed scalar operand")
+    position = scalar.get("position")
+    if not isinstance(position, int) or isinstance(position, bool):
+        raise SourceEmissionError(f"{op.id} has an invalid scalar operand position")
     value = scalar.get("value")
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise SourceEmissionError(f"{op.id} has a non-numeric scalar")
-    return value
+    return position, value
 
 
 def _tensor_producers(lowered: LoweredRegion) -> list[int | None]:

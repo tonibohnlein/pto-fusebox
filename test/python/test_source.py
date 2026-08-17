@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 import torch
 from examples.torch_frontend.basic import build_examples
+from examples.torch_frontend.pr2335_vector import (
+    build_examples as build_pr2335_examples,
+)
 from pto_fusebox import (
     KernelKind,
     ScheduleContractError,
@@ -24,6 +27,7 @@ from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
     VectorKernelPlan,
     VectorReplayPhase,
+    VectorStreamKind,
 )
 from torch import nn
 
@@ -51,6 +55,12 @@ def _solve_module(module: nn.Module, args: tuple[torch.Tensor, ...]):
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     return graph, solved.regions[0]
+
+
+@lru_cache(maxsize=None)
+def _pr2335_solved(name: str):
+    module, args = build_pr2335_examples()[name]
+    return _solve_module(module, args)
 
 
 pytestmark = pytest.mark.skipif(
@@ -439,3 +449,103 @@ def test_source_backend_rejects_mixed_plan_without_replanning_it() -> None:
     graph, result = _solved("attention_core")
     with pytest.raises(SourceEmissionError, match="mixed PyPTO source emission"):
         emit_pypto_region(graph, result)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "work_units"),
+    [
+        ("pr2335_softmax_512x256", "materialized", 16),
+        ("pr2335_softmax_256x512", "materialized", 16),
+        ("pr2335_softmax_128x1024", "materialized", 12),
+        ("pr2335_softmax_32x8192", "softmax_flash", 32),
+        ("pr2335_rms_norm", "materialized", 24),
+        ("pr2335_layer_norm", "materialized", 32),
+        ("pr2335_silu", "materialized", 16),
+    ],
+)
+def test_pr2335_vector_surface_is_source_ready(
+    name: str,
+    kind: str,
+    work_units: int,
+) -> None:
+    graph, result = _pr2335_solved(name)
+    schedule = scheduled_region(result)
+
+    assert can_emit_region(graph, result)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind.value == kind
+    assert plan.work_units == work_units
+
+    source = emit_pypto_region(graph, result, program_name=name).source
+    ast.parse(source)
+    assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+def test_pr2335_wide_softmax_replays_the_typed_online_phases() -> None:
+    graph, result = _pr2335_solved("pr2335_softmax_32x8192")
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.SOFTMAX_FLASH
+    assert plan.p4_recipe is not None
+    assert plan.p4_recipe.version == "softmax_flash.v1"
+
+    stats = plan.phase(VectorReplayPhase.STATS)
+    apply = plan.phase(VectorReplayPhase.APPLY)
+    assert stats.loop is not None and apply.loop is not None
+    source = emit_pypto_region(graph, result, program_name="renamed_program").source
+    assert (
+        f"pl.pipeline({stats.loop.first_chunk}, "
+        f"{stats.loop.first_chunk + stats.loop.trip_count}, stage=2)" in source
+    )
+    assert (
+        f"pl.pipeline({apply.loop.first_chunk}, "
+        f"{apply.loop.first_chunk + apply.loop.trip_count}, stage=2)" in source
+    )
+    assert f"[{plan.free_tile_alloc}, {plan.chunk}]" in source
+    assert source.count("pl.load(") == 5
+    assert source.count("pl.store(") == 2
+    assert "init_values=(initial_local_max, initial_local_sum,)" in source
+    assert "stats_result_max, stats_result_sum = pl.yield_(" in source
+    assert "pl.maximum" in source
+    assert "pl.row_expand_sub" in source
+    assert "pl.row_expand_div" in source
+    assert "softmax" not in source.lower()
+
+
+def test_pr2335_silu_scalar_left_division_lowers_to_reciprocal() -> None:
+    graph, result = _pr2335_solved("pr2335_silu")
+    source = emit_pypto_region(graph, result, program_name="generic_pointwise").source
+
+    assert [op.kind for op in graph.ops] == ["mul", "exp", "add", "div", "mul"]
+    assert source.count("pl.recip(") == 1
+    assert "silu" not in source.lower()
+
+
+def test_softmax_source_rejects_loop_or_generated_work_drift() -> None:
+    graph, result = _pr2335_solved("pr2335_softmax_32x8192")
+    assert result.solution is not None
+
+    stale_loop = copy.deepcopy(result.solution)
+    stale_loop["steps"][0]["plan"]["phases"][1]["loop"]["trip_count"] -= 1
+    stale_result = replace(result, solution=stale_loop)
+    assert not can_emit_region(graph, stale_result)
+    with pytest.raises(SourceEmissionError, match="stats loop is inconsistent"):
+        emit_pypto_region(graph, stale_result)
+
+    stale_work = copy.deepcopy(result.solution)
+    stale_work["steps"][0]["plan"]["p4_work"]["stats_update"]["primitives"][0][
+        "thin"
+    ] += 1
+    stale_result = replace(result, solution=stale_work)
+    assert not can_emit_region(graph, stale_result)
+    with pytest.raises(SourceEmissionError, match="generated work differs"):
+        emit_pypto_region(graph, stale_result)
+
+    stale_frame = copy.deepcopy(result.solution)
+    stale_frame["steps"][0]["plan"]["phases"][1]["tensor_frames"][0]["physical"][1] -= 8
+    stale_result = replace(result, solution=stale_frame)
+    assert not can_emit_region(graph, stale_result)
+    with pytest.raises(SourceEmissionError, match="frame differs from its recipe role"):
+        emit_pypto_region(graph, stale_result)

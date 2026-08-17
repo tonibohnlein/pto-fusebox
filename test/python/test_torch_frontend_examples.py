@@ -11,6 +11,9 @@ from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
 )
 from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
+from examples.torch_frontend.pr2335_vector import (
+    build_examples as build_pr2335_examples,
+)
 from pto_fusebox import (
     can_emit_region,
     export_and_normalize,
@@ -27,6 +30,7 @@ def _all_examples() -> dict[str, Example]:
         **build_basic_examples(),
         **build_deepseek_examples(),
         **build_qwen_examples(),
+        **build_pr2335_examples(),
     }
 
 
