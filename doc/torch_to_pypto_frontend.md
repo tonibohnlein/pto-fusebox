@@ -8,11 +8,19 @@ The first frontend milestone is implemented. PTO-Fusebox can capture a
 boundaries, extract statically schedulable regions, lower them into a versioned
 solver problem, and invoke an already-built C++ solver.
 
-PyPTO DSL source generation is the next milestone. The current result is a
-schedule and a bidirectional graph/solver mapping, not generated kernel source.
-Dynamic-shape classes are preserved in the normalized graph but remain
-unschedulable when they affect solver geometry. They are catalogued below and
-deliberately deferred.
+The first PyPTO DSL source slice is also implemented. A solved homogeneous
+region can be validated as a typed schedule and emitted as an ordinary
+`@pl.program` containing the selected grid, balanced region partition,
+physical vector frame, strip/K-window loops, pipeline stages, operations, and
+loads/stores. The initial closed set is materialized/pointwise vector replay
+and one spatial, output-stationary cube matmul. Unsupported schedules fail
+closed; the backend does not approximate them or ask PyPTO to plan them again.
+
+Streamed vector phases, split reductions, split-K, retained panels,
+multi-matmul DAGs, mixed schedules, multiple selected kernel steps, and whole
+graph orchestration remain source-backend milestones. Dynamic-shape classes
+are preserved in the normalized graph but remain unschedulable when they
+affect solver geometry. They are catalogued below and deliberately deferred.
 
 ## Python API
 
@@ -23,7 +31,7 @@ python -m pip install -e ".[torch]"
 ```
 
 ```python
-from pto_fusebox import export_and_normalize, solve_graph
+from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
 
 graph = export_and_normalize(module, example_args, dynamic_shapes=constraints)
 result = solve_graph(
@@ -32,18 +40,68 @@ result = solve_graph(
     solver_binary="build/mlsys_mixed",
     solver_workers=2,
 )
+source = emit_pypto_region(graph, result.regions[0], program_name="FusedRegion")
+print(source.source)
 ```
 
 The core entry points are:
 
 - `export_and_normalize(module, args, ...) -> NormalizedGraph`;
 - `normalize_exported(program) -> NormalizedGraph`;
-- `extract_solver_regions(graph, target) -> list[SolverRegion]`; and
-- `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`.
+- `extract_solver_regions(graph, target) -> list[SolverRegion]`;
+- `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`;
+- `scheduled_region(result) -> ScheduledRegion`; and
+- `emit_pypto_region(graph, result, ...) -> EmittedPyPTOSource`.
 
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
 wrapper around `torch.export.export`. `solve_graph` never builds the solver. A
 caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
+`scheduled_region` rejects incomplete or internally inconsistent solution
+arrays before emission. `emit_pypto_region` currently accepts one selected
+homogeneous step and raises `SourceEmissionError` for every unimplemented
+algorithm.
+
+### Source-backend structure and validation
+
+The source backend is schedule-family-driven, not model- or pattern-driven.
+It selects a vector or cube emitter from the typed solver step, replays the
+solver's operation order and serialized geometry, and dispatches individual
+operations by normalized operator kind. Names such as softmax, RMSNorm,
+attention, or a source `nn.Module` class are never emission inputs. The initial
+cube family is intentionally limited to one spatial output-stationary matmul;
+that is an explicit fail-closed schedule-family boundary, not a matmul-example
+recognizer.
+
+The replay structure follows the earlier PyPTO fusion-scheduler prototype:
+one solver-owned grid, propagated regions, planned physical frames and
+partitions, lifetime-respecting topological replay, and pipelined strip or K
+windows. The implementations are not shared code: the prototype builds PyPTO
+IR in C++, while this repository emits readable PyPTO DSL source. The
+serialized schedule is the common contract.
+
+Reference checks use three levels:
+
+- PyPTO-lib programs establish the ordinary DSL structure (`pl.parallel` or
+  `pl.spmd`, `pl.pipeline`, row reductions/expands, and
+  `pl.matmul` followed by `pl.matmul_acc`), including
+  `models/deepseek_v4_flash_dspark/rmsnorm.py` and
+  `models/qwen3_32b/decode_4d.py`;
+- PTO-ISA and PTOAS examples establish the expected lowered data path and tile
+  constraints, including PTO-ISA's A2/A3 `tmatmul_kernel.cpp` and PTOAS's
+  `matmul_static_singlecore.pto` and `trowexpandsub_v0_roundtrip.pto`; and
+- the opt-in `test_source_pypto_integration.py` gate parses the generated DSL
+  with an independently selected PyPTO checkout and compiles it through PTOAS.
+
+The integration gate is deliberately outside the default unit-test dependency
+set. Run it in the target validation environment with a built Fusebox solver,
+the intended PyPTO import on `PYTHONPATH`, and a valid `PTOAS_ROOT`:
+
+```bash
+PTO_FUSEBOX_PYPTO_INTEGRATION=1 \
+PTO_FUSEBOX_TEST_SOLVER=build/mlsys_mixed \
+PYPTO_CODEGEN_MAX_WORKERS=2 \
+python -m pytest test/python/test_source_pypto_integration.py -q
+```
 
 ## Versioned boundaries
 
@@ -74,7 +132,11 @@ unknown explicit versions fail closed.
 A zero-valued granularity and infinite latency are internal C++ cost-search
 sentinels meaning that no feasible tile was found. They are never a valid
 schedule. The Python bridge classifies such a response as `infeasible` and
-must not pass it to the future PyPTO source backend.
+must not pass it to the PyPTO source backend. For source-ready homogeneous
+steps, the solution additionally serializes vector input lifetimes and the
+physical-frame legalization contract, or cube axis partitions, execution
+order, and resident-boundary lifetimes. These fields are solver output, not
+choices rediscovered by Python emission.
 
 ## v1 normalization and admission
 
@@ -222,9 +284,11 @@ launching ready kernels and overlapping independent AIC and AIV work.
 ### PyPTO source backend
 
 The backend deterministically serializes the selected solution descriptor as
-readable PyPTO DSL. Depending on the plan, it emits `pl.spmd`, static physical
-tile shapes, runtime `valid_shape`, `pl.range`, `pl.pipeline`, tensor views,
-explicit GM boundaries, and supported `tpush`/`tpop`/`tfree` transport.
+readable PyPTO DSL. The implemented homogeneous slice emits `pl.parallel`,
+static physical tile shapes, runtime `valid_shape`, `pl.range`/`pl.pipeline`,
+and explicit GM boundaries. Future plan classes will add tensor views and
+supported `tpush`/`tpop`/`tfree` transport without changing this ownership
+boundary.
 
 The backend must not redo planning. Every emitted loop, lifetime, transfer, and
 FIFO must be traceable to the solution descriptor. It should publish the

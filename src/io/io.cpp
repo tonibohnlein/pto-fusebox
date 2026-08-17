@@ -152,6 +152,38 @@ static json vector_phase_work_json(const VectorPhaseWorkPlan& phase) {
     return {{"generated", phase.generated}, {"primitives", std::move(primitives)}};
 }
 
+static const char* vector_replay_phase_name(VectorReplayPhase phase) {
+    switch (phase) {
+        case VectorReplayPhase::Body: return "body";
+        case VectorReplayPhase::Stats: return "stats";
+        case VectorReplayPhase::Apply: return "apply";
+        case VectorReplayPhase::Finalize: return "finalize";
+    }
+    return "unknown";
+}
+
+static json vector_input_lifetimes_json(const VectorStreamPlan& plan) {
+    json result = json::object();
+    for (size_t index = 0; index < 4; ++index) {
+        const auto phase = static_cast<VectorReplayPhase>(index);
+        json lifetimes = json::array();
+        if (plan.input_lifetimes) {
+            for (const auto& lifetime : plan.input_lifetimes->phases[index]) {
+                json uses = json::array();
+                for (const auto& use : lifetime.uses)
+                    uses.push_back({{"op", use.op}, {"arg", use.arg}});
+                lifetimes.push_back({{"tensor", lifetime.tensor},
+                                     {"first_use_step", lifetime.first_use_step},
+                                     {"last_use_step", lifetime.last_use_step},
+                                     {"use_count", lifetime.use_count},
+                                     {"uses", std::move(uses)}});
+            }
+        }
+        result[vector_replay_phase_name(phase)] = std::move(lifetimes);
+    }
+    return result;
+}
+
 static json vector_stream_plan_json(const VectorStreamPlan& plan) {
     const char* coordinate_transform =
         plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
@@ -165,6 +197,12 @@ static json vector_stream_plan_json(const VectorStreamPlan& plan) {
             {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
             {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
             {"stream_band_count", plan.stream_band_count},
+            {"physical_frame",
+             {{"element_granule", plan.physical_element_granule},
+              {"iteration_rows", plan.iteration_rows},
+              {"iteration_cols", plan.iteration_cols},
+              {"reduced_axis", plan.reduced_axis},
+              {"align_rows", plan.align_rows}}},
             {"axis", plan.axis},
             {"free_tile", plan.free_tile},
             {"free_tile_alloc", plan.free_tile_alloc},
@@ -173,6 +211,7 @@ static json vector_stream_plan_json(const VectorStreamPlan& plan) {
             {"full_chunks", plan.full_chunks},
             {"tail", plan.tail},
             {"stream_passes", plan.stream_passes},
+            {"input_lifetimes", vector_input_lifetimes_json(plan)},
             {"tile", {plan.tile_h, plan.tile_w}},
             {"strip", {plan.strip_h, plan.strip_w}},
             {"strip_grid", {plan.row_strips, plan.width_strips}},
@@ -224,6 +263,14 @@ static const char* cube_split_merge_policy_name(CubeSplitMergePolicy policy) {
     switch (policy) {
         case CubeSplitMergePolicy::None: return "none";
         case CubeSplitMergePolicy::FirstPartialThenAtomic: return "first_partial_then_atomic";
+    }
+    return "unknown";
+}
+
+static const char* cube_operand_role_name(CubeOperandRole role) {
+    switch (role) {
+        case CubeOperandRole::Lhs: return "lhs";
+        case CubeOperandRole::Rhs: return "rhs";
     }
     return "unknown";
 }
@@ -876,6 +923,17 @@ std::string solution_json(const Solution& sol) {
         }
         if (cube_plan.feasible) {
             json matmuls = json::array();
+            json resident_boundaries = json::array();
+            for (const auto& resident : cube_plan.resident_boundaries) {
+                resident_boundaries.push_back(
+                    {{"id", resident.id},
+                     {"region", cube_region_json(resident.region)},
+                     {"role", cube_operand_role_name(resident.role)},
+                     {"first_use", resident.first_use},
+                     {"last_use", resident.last_use},
+                     {"use_count", resident.use_count},
+                     {"bytes", resident.bytes}});
+            }
             for (const auto& mm : cube_plan.matmuls) {
                 json variants = json::array();
                 for (const auto& variant : mm.output_variants) {
@@ -926,6 +984,8 @@ std::string solution_json(const Solution& sol) {
       j["cube_schedule"].push_back(
           {{"emit_compatible", cube_plan.emit_compatible},
            {"spatial_policy", cube_spatial_policy_name(cube_plan.spatial_policy)},
+           {"m_partition", axis_partition_json(cube_plan.m_partition)},
+           {"n_partition", axis_partition_json(cube_plan.n_partition)},
            {"spatial_tiles", cube_plan.spatial_tiles},
            {"split_k", cube_plan.split_k},
            {"work_units", cube_plan.work_units},
@@ -938,6 +998,8 @@ std::string solution_json(const Solution& sol) {
              {"synchronization_cycles", cube_plan.first_partial_then_atomic.synchronization_cycles}}},
            {"model_overlap_granted", cube_plan.model_overlap_granted},
            {"overlap_implementable", cube_plan.overlap_implementable},
+           {"execution_order", cube_plan.execution_order},
+           {"resident_boundaries", resident_boundaries},
            {"matmuls", matmuls}});
     } else {
       j["cube_schedule"].push_back(nullptr);

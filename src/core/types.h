@@ -656,6 +656,15 @@ struct VectorStreamPlan {
   int64_t full_peak_ub_bytes = 0;
   int64_t chunk_peak_ub_bytes = 0;
   int64_t stream_band_count = 0;
+  // Mechanical physical-frame contract shared by pricing and emission. These
+  // are not search choices: they record the exact legalization policy used by
+  // VectorAllocatedFrame so a source backend does not rediscover padding,
+  // broadcast, or thin-reduction rules.
+  int64_t physical_element_granule = 1;
+  int64_t iteration_rows = 1;
+  int64_t iteration_cols = 1;
+  int reduced_axis = 0;  // 0 = none, 1 = width, 2 = height
+  bool align_rows = false;
   int axis = 0;  // 0 = materialized, 1 = width, 2 = height
   // Maximum logical free-axis extent owned by one work unit. Its physical UB
   // allocation is `free_tile_alloc`, rounded to the DMA granule. Keeping the

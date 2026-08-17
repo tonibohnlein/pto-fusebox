@@ -3830,6 +3830,11 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const FlatSet<size_t> &retain_these) const {
   VectorStreamPlan plan;
   plan.coordinate_transform = prob_->vector_coordinate_transform;
+  plan.physical_element_granule = vector_emit_granule_;
+  plan.iteration_rows = vector_iter_H_;
+  plan.iteration_cols = vector_iter_W_;
+  plan.reduced_axis = reduced_axis_;
+  plan.align_rows = has_reduction_ || vector_align_rows_;
   plan.input_lifetimes = vector_input_lifetime_topology_;
   if (!plan.input_lifetimes) return plan;
   const int64_t budget = (int64_t)prob_->vec_capacity;

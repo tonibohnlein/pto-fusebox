@@ -79,7 +79,7 @@ python -m pip install -e ".[torch]"
 ```
 
 ```python
-from pto_fusebox import export_and_normalize, solve_graph
+from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
 
 graph = export_and_normalize(module, example_args)
 result = solve_graph(
@@ -87,13 +87,17 @@ result = solve_graph(
     solver_binary="build/mlsys_mixed",
     solver_workers=2,
 )
+source = emit_pypto_region(graph, result.regions[0])
+print(source.source)
 ```
 
-Unsupported operations remain explicit graph boundaries. The v1 frontend
-produces versioned normalized/problem JSON and solver schedules; readable PyPTO
-DSL generation is the next milestone. Each maximal supported region is one
-solver input DAG, not one mandatory fused kernel: the solver may partition it
-into several feasible groups and may select supported mixed cube/vector groups.
+Unsupported operations remain explicit graph boundaries. The first source
+backend emits one selected homogeneous step: materialized/pointwise vector
+replay or one spatial cube matmul. Other schedules raise a precise
+`SourceEmissionError` rather than being approximated. Each maximal supported
+region is one solver input DAG, not one mandatory fused kernel: the solver may
+partition it into several feasible groups and may select supported mixed
+cube/vector groups. Multi-step and mixed source emission remain follow-ups.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
