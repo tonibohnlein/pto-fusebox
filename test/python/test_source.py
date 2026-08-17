@@ -4,7 +4,7 @@ import ast
 import copy
 import os
 from dataclasses import replace
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -39,7 +39,7 @@ def _solver() -> Path:
     return Path(__file__).resolve().parents[2] / "build" / "mlsys_mixed"
 
 
-@lru_cache(maxsize=None)
+@cache
 def _solved(name: str):
     module, args = build_examples()[name]
     graph = export_and_normalize(module, args)
@@ -57,7 +57,7 @@ def _solve_module(module: nn.Module, args: tuple[torch.Tensor, ...]):
     return graph, solved.regions[0]
 
 
-@lru_cache(maxsize=None)
+@cache
 def _pr2335_solved(name: str):
     module, args = build_pr2335_examples()[name]
     return _solve_module(module, args)
