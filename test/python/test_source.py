@@ -497,7 +497,7 @@ def test_pr2335_wide_softmax_replays_the_typed_online_phases() -> None:
     source = emit_pypto_region(graph, result, program_name="renamed_program").source
     assert (
         f"pl.pipeline({stats.loop.first_chunk}, "
-        f"{stats.loop.first_chunk + stats.loop.trip_count}, stage=2)" in source
+        f"{stats.loop.first_chunk + stats.loop.trip_count}, stage=2," in source
     )
     assert (
         f"pl.pipeline({apply.loop.first_chunk}, "
@@ -544,7 +544,12 @@ def test_softmax_source_rejects_loop_or_generated_work_drift() -> None:
         emit_pypto_region(graph, stale_result)
 
     stale_frame = copy.deepcopy(result.solution)
-    stale_frame["steps"][0]["plan"]["phases"][1]["tensor_frames"][0]["physical"][1] -= 8
+    stats_phase = stale_frame["steps"][0]["plan"]["phases"][1]
+    frame = stats_phase["tensor_frames"][0]
+    frame["physical"][1] += 8
+    for workspace in stats_phase["workspaces"]:
+        if workspace["source_tensor"] == frame["tensor"]:
+            workspace["physical"][1] += 8
     stale_result = replace(result, solution=stale_frame)
     assert not can_emit_region(graph, stale_result)
     with pytest.raises(SourceEmissionError, match="frame differs from its recipe role"):
