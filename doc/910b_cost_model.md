@@ -60,7 +60,10 @@ split coordinate cannot identify several atomic output targets.
 
 ## 3. L1 feasibility and sequential K
 
-`derive_exec()` plays a red-blue pebble game over request instances. At each step it charges:
+`derive_exec()` performs a fixed black-pebble residency/liveness sweep over request instances. It
+does not search for evictions or GM reloads: a produced or reusable value remains resident through
+its last use, and the candidate is infeasible when that policy exceeds L1 capacity. At each step the
+sweep charges:
 
 1. every produced region live from its producer through its last requesting consumer;
 2. the current operation's boundary-operand K strip;
@@ -256,6 +259,35 @@ Before device ranking is trusted, complete:
 
 The production nested schedule uses the PTOAS memory planner. The host PyPTO allocator cannot yet
 interval-pack every disjoint ping-pong and full-region scratch lifetime required by this path.
+
+### Deferred analytic research
+
+The current multi-matmul model is deliberately a serial, on-chip-materializing baseline. Within
+each matmul request, its two-stage K-window ring may overlap GM-to-L1 feed with the request's child
+L0 work. Across dependent matmuls, however, requests are additive: the producer completes and
+drains its requested intermediate region to L1 before its consumer starts. The model never applies
+a group-wide `max(producer, consumer)` roofline.
+
+A future schedule family may pipeline dependent matmuls by intermediate panels. For a chain
+`T = A @ B; Y = T @ D`, it could keep the `Y` accumulator live while repeatedly producing one
+panel of `T`, draining that panel to L1, and immediately accumulating it into `Y`. This is an
+alternative to the serial baseline, not a correction to it. Its analytic model must represent:
+
+- a panel order and geometry compatible with both matmuls;
+- simultaneous producer and consumer accumulator lifetimes;
+- intermediate-panel ping/pong storage and both requests' operand buffers;
+- shared Matrix-pipe serialization rather than assuming the two matmuls overlap freely;
+- any realizable overlap among their distinct movement and compute phases.
+
+The candidate search should compare this panel-pipelined schedule with the existing serial schedule
+only after a matching emitted algorithm exists. A bare `max` of the two request costs would invent
+unsupported overlap and underprice both memory and wall time.
+
+Other explicitly deferred research directions are:
+
+- red-blue pebbling that compares retention against eviction and later GM-to-L1 reload;
+- reuse-distance-aware topological ordering beyond the existing DFS and Gorder choices;
+- generalizing the bounded role-expanded representation beyond two distinct tensor roles.
 
 ---
 
