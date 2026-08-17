@@ -25,4 +25,4 @@ region region0000 ops=op0000,op0001,op0002,op0003,op0004 inputs=v0000 outputs=v0
   solver_op 3 graph=op0003 Reduction primitive=row_sum geometry=flat capability=reduction_sum mixed=none (3)->(4)
   solver_op 4 graph=op0004 Pointwise primitive=div geometry=row_expand capability=elementwise mixed=none (3,4)->(5)
   required=5
-  p4=[{"apply_substitutions":[0,3],"kind":"softmax_flash","ops":[0,1,2,3,4]}]
+  p4=[{"apply_substitutions":[{"op":0,"value":"running_max"},{"op":3,"value":"running_sum"}],"kind":"softmax_flash","ops":[0,1,2,3,4]}]

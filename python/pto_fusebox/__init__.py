@@ -5,6 +5,7 @@ from .ir import (
     PROBLEM_SCHEMA,
     SOLUTION_SCHEMA,
     GraphPattern,
+    GraphPatternBinding,
     NormalizedGraph,
     NormalizedOp,
     NormalizedValue,
@@ -21,7 +22,12 @@ from .schedule import (
     scheduled_region,
 )
 from .solver import RegionSolveResult, SolveResult, solve_graph
-from .source import EmittedPyPTOSource, SourceEmissionError, emit_pypto_region
+from .source import (
+    EmittedPyPTOSource,
+    SourceEmissionError,
+    can_emit_region,
+    emit_pypto_region,
+)
 from .target import Ascend910BTarget, TargetProfile
 
 __all__ = [
@@ -32,6 +38,7 @@ __all__ = [
     "AxisPartition",
     "EmittedPyPTOSource",
     "GraphPattern",
+    "GraphPatternBinding",
     "KernelKind",
     "KernelStep",
     "NormalizedGraph",
@@ -45,6 +52,7 @@ __all__ = [
     "SolverRegion",
     "SourceEmissionError",
     "TargetProfile",
+    "can_emit_region",
     "export_and_normalize",
     "emit_pypto_region",
     "extract_solver_regions",

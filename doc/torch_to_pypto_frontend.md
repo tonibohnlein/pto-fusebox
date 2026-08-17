@@ -50,16 +50,19 @@ The core entry points are:
 - `normalize_exported(program) -> NormalizedGraph`;
 - `extract_solver_regions(graph, target) -> list[SolverRegion]`;
 - `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`;
-- `scheduled_region(result) -> ScheduledRegion`; and
+- `scheduled_region(result) -> ScheduledRegion`;
+- `can_emit_region(graph, result) -> bool`; and
 - `emit_pypto_region(graph, result, ...) -> EmittedPyPTOSource`.
 
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
 wrapper around `torch.export.export`. `solve_graph` never builds the solver. A
 caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
 `scheduled_region` rejects incomplete or internally inconsistent solution
-arrays before emission. `emit_pypto_region` currently accepts one selected
-homogeneous step and raises `SourceEmissionError` for every unimplemented
-algorithm.
+arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
+typed emission context and run the same graph-aware renderer validation; the
+readiness query is not a weaker schedule-family approximation. The emitter
+currently accepts one selected homogeneous step and raises
+`SourceEmissionError` for every unimplemented algorithm.
 
 ### Source-backend structure and validation
 
@@ -109,7 +112,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v1`: the C++ schedule response.
+- `pto_fusebox.solution.v2`: the C++ schedule response.
 
 The normalized graph records stable topological IDs, ordered operands, exact
 normalized operator kinds, attributes, input roles, target names for parameters
@@ -132,11 +135,29 @@ unknown explicit versions fail closed.
 A zero-valued granularity and infinite latency are internal C++ cost-search
 sentinels meaning that no feasible tile was found. They are never a valid
 schedule. The Python bridge classifies such a response as `infeasible` and
-must not pass it to the PyPTO source backend. For source-ready homogeneous
-steps, the solution additionally serializes vector input lifetimes and the
-physical-frame legalization contract, or cube axis partitions, execution
-order, and resident-boundary lifetimes. These fields are solver output, not
-choices rediscovered by Python emission.
+must not pass it to the PyPTO source backend. The solution uses one typed,
+nested step descriptor. Its common portion records launch geometry, selected
+topological order, sequential tile counts, retained tensors, and latency.
+The common launch tile is the optimizer's selected configuration and a
+diagnostic summary; the nested family plan is authoritative wherever lowering
+derives different replay frames, as it does for vector reductions.
+Vector plans additionally record phase operation order, input lifetimes,
+logical/physical tensor frames, reduction workspaces, and exact loop bounds.
+Cube plans record propagated regions and axis bindings, execution order,
+resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
+policy. These fields are solver output, not choices rediscovered by Python
+emission.
+
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v2`
+into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
+lowered half owns region inputs, outputs, and output-allocation lineage; the
+scheduled half owns execution. Together with the normalized graph they form a
+single `EmissionContext`, so neither readiness nor rendering reconstructs an
+ABI from a partial view. Unknown, missing, or internally inconsistent fields
+fail closed. The source package is split by responsibility: `source/api.py`
+owns context construction and dispatch, `source/common.py` owns typed
+ABI/naming/partition mechanics, and `source/vector.py` and `source/cube.py`
+replay their respective homogeneous plans.
 
 ## v1 normalization and admission
 
@@ -147,8 +168,8 @@ collapsed into solver height; metadata-only shape aliases; and an immediately
 consumed rank-2 transpose represented as a zero-copy view.
 
 Softmax is decomposed into its ordinary max/sub/exp/sum/div tensor DAG. The
-graph also carries the exact P4 op set and substitutions that permit the
-existing online softmax implementation. There is no attention, RMSNorm, or
+graph also carries the exact P4 op set and semantically named substitutions
+that permit the existing online softmax implementation. There is no attention, RMSNorm, or
 model-name recognizer. Mean is similarly lowered to sum plus reciprocal
 multiplication, and linear becomes matmul plus optional broadcast bias.
 
@@ -190,11 +211,13 @@ streaming, non-uniform cube-DAG grids, one-way `V -> C`, complete
 even when no legacy emitter path exists. Solution metadata records the stages,
 directional transfers, and protocol for every analytic mixed plan. Plans with
 a complete stage-local geometry, vector stream, cube-window, and FIFO contract
-also set `source_codegen_ready=true`; broader analytic winners remain valid
-research results but are not presented as source-emittable. `regions_solved`
-therefore reports analytic solver success separately from
-`whole_graph_codegen_ready`, which additionally requires no opaque graph
-boundaries and a source-ready contract for every selected step.
+also set their internal `source_codegen_ready=true` contract-completeness bit;
+that mixed-plan field does not by itself claim support in the installed Python
+source backend. Broader analytic winners remain valid research results but are
+not presented as source-emittable. `regions_solved` therefore reports analytic
+solver success separately from `whole_graph_codegen_ready`, which additionally
+requires no opaque graph boundaries and a successful exact
+`can_emit_region(graph, region)` check for every selected step.
 
 ## Goal and ownership
 
@@ -268,7 +291,8 @@ connected candidate group, Fusebox:
 5. accounts for boundary and produced-value lifetimes;
 6. checks UB, L1, L0, and cross-core FIFO feasibility;
 7. prices compute, transfers, drains, and implementable overlap; and
-8. returns a complete, code-generatable solution descriptor.
+8. returns a complete analytic schedule, plus the typed replay contract for
+   schedule families implemented by the source backend.
 
 The frontend passes each maximal supported region as one complete solver input
 DAG. This does not require the region to become one kernel: AutoFuse partition
@@ -284,11 +308,22 @@ launching ready kernels and overlapping independent AIC and AIV work.
 ### PyPTO source backend
 
 The backend deterministically serializes the selected solution descriptor as
-readable PyPTO DSL. The implemented homogeneous slice emits `pl.parallel`,
+readable PyPTO DSL. The installed homogeneous slice emits one materialized or
+pointwise vector step, or one uniform spatial cube matmul, using `pl.parallel`,
 static physical tile shapes, runtime `valid_shape`, `pl.range`/`pl.pipeline`,
-and explicit GM boundaries. Future plan classes will add tensor views and
-supported `tpush`/`tpop`/`tfree` transport without changing this ownership
-boundary.
+and explicit GM boundaries. It executes the vector plan's `body.ops` directly;
+for this schedule family the parser requires that list to equal the selected
+step order and requires all other phases to be empty.
+
+Analytic support is deliberately broader than this installed renderer.
+Streamed reductions, P4 online algorithms, split reductions, retained cube
+panels, multi-matmul, split-K, multi-step, and mixed plans remain valid solver
+results but are not source-ready. P4 descriptors already preserve named
+substitution roles rather than reconstructing them from operation numbers, but
+source emission stays disabled until generated carry-state frames/lifetimes
+and output-publication semantics are also versioned. Future plan classes will
+add those contracts and supported `tpush`/`tpop`/`tfree` transport without
+changing this ownership boundary.
 
 The backend must not redo planning. Every emitted loop, lifetime, transfer, and
 FIFO must be traceable to the solution descriptor. It should publish the

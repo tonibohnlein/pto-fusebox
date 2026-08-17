@@ -10,7 +10,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-from .ir import GraphPattern, NormalizedGraph, NormalizedOp, NormalizedValue, ShapeDimension
+from .ir import (
+    GraphPattern,
+    GraphPatternBinding,
+    NormalizedGraph,
+    NormalizedOp,
+    NormalizedValue,
+    ShapeDimension,
+)
 
 _POINTWISE = {
     "aten.add.Tensor": "add",
@@ -135,12 +142,16 @@ class _ExportNormalizer:
 
     def _placeholder(self, node: Any) -> None:
         role, target = self._input_specs.get(node.name, ("user_input", None))
-        value_id = self._add_value(node.name, node.meta.get("val"), role=role, target=target)
+        value_id = self._add_value(
+            node.name, node.meta.get("val"), role=role, target=target
+        )
         self.node_values[node] = (value_id,)
         self.input_ids.append(value_id)
 
     def _get_attr(self, node: Any) -> None:
-        value_id = self._add_value(node.name, node.meta.get("val"), role="constant", target=str(node.target))
+        value_id = self._add_value(
+            node.name, node.meta.get("val"), role="constant", target=str(node.target)
+        )
         self.node_values[node] = (value_id,)
         self.input_ids.append(value_id)
 
@@ -180,7 +191,9 @@ class _ExportNormalizer:
             self._view(node, target, transpose=True)
             return
         if target in _COPY_CAPABLE_VIEWS:
-            self._opaque(node, f"{target} may copy storage and is not a metadata-only alias")
+            self._opaque(
+                node, f"{target} may copy storage and is not a metadata-only alias"
+            )
             return
         if target in _VIEWS:
             self._view(node, target, transpose=False)
@@ -225,12 +238,23 @@ class _ExportNormalizer:
             self._opaque(node, f"{target} has unsupported keyword arguments: {names}")
             return
         input_shape = self._value(tensor_inputs[0]).shape
-        dims = _normalize_dims(node.args[1] if len(node.args) > 1 else None, len(input_shape))
-        keepdim = bool(node.args[2]) if len(node.args) > 2 else bool(node.kwargs.get("keepdim", False))
+        dims = _normalize_dims(
+            node.args[1] if len(node.args) > 1 else None, len(input_shape)
+        )
+        keepdim = (
+            bool(node.args[2])
+            if len(node.args) > 2
+            else bool(node.kwargs.get("keepdim", False))
+        )
         if dims != (len(input_shape) - 1,) or not keepdim:
-            self._opaque(node, "only last-axis reductions with keepdim=True are supported")
+            self._opaque(
+                node, "only last-axis reductions with keepdim=True are supported"
+            )
             return
-        if target == "aten.max.dim" and _metadata_output_count(node.meta.get("val")) != 2:
+        if (
+            target == "aten.max.dim"
+            and _metadata_output_count(node.meta.get("val")) != 2
+        ):
             self._opaque(node, "unexpected aten.max.dim result signature")
             return
         self._single_output_op(
@@ -245,7 +269,9 @@ class _ExportNormalizer:
             # a hard region boundary rather than silently dropping semantics.
             value_ids = list(self.node_values[node])
             index_meta = _metadata_outputs(node.meta.get("val"))[1]
-            index_id = self._add_value(f"{node.name}_indices", index_meta, role="intermediate")
+            index_id = self._add_value(
+                f"{node.name}_indices", index_meta, role="intermediate"
+            )
             opaque_id = self._add_op(
                 "opaque",
                 tensor_inputs,
@@ -280,11 +306,19 @@ class _ExportNormalizer:
             return
         if node.kwargs:
             names = ", ".join(sorted(str(name) for name in node.kwargs))
-            self._opaque(node, f"aten.mean.dim has unsupported keyword arguments: {names}")
+            self._opaque(
+                node, f"aten.mean.dim has unsupported keyword arguments: {names}"
+            )
             return
         source = self._value(tensor_inputs[0])
-        dims = _normalize_dims(node.args[1] if len(node.args) > 1 else None, len(source.shape))
-        keepdim = bool(node.args[2]) if len(node.args) > 2 else bool(node.kwargs.get("keepdim", False))
+        dims = _normalize_dims(
+            node.args[1] if len(node.args) > 1 else None, len(source.shape)
+        )
+        keepdim = (
+            bool(node.args[2])
+            if len(node.args) > 2
+            else bool(node.kwargs.get("keepdim", False))
+        )
         if dims != (len(source.shape) - 1,) or not keepdim:
             self._opaque(node, "only last-axis mean with keepdim=True is supported")
             return
@@ -293,7 +327,9 @@ class _ExportNormalizer:
             self._opaque(node, "mean reduction extent must be statically known")
             return
         result_meta = _metadata_outputs(node.meta.get("val"))[0]
-        reduced_id = self._add_value(f"{node.name}_sum", result_meta, role="intermediate")
+        reduced_id = self._add_value(
+            f"{node.name}_sum", result_meta, role="intermediate"
+        )
         sum_op = self._add_op(
             "sum",
             tensor_inputs,
@@ -306,7 +342,10 @@ class _ExportNormalizer:
             "mul",
             (reduced_id,),
             (output_id,),
-            {"scalars": [{"position": 1, "value": 1.0 / extent}], "lowered_from": "mean"},
+            {
+                "scalars": [{"position": 1, "value": 1.0 / extent}],
+                "lowered_from": "mean",
+            },
         )
         self._set_producer(output_id, mul_op)
         self.node_values[node] = (output_id,)
@@ -339,7 +378,9 @@ class _ExportNormalizer:
             self._opaque(node, "linear supports rank>=2 activation and rank-2 weight")
             return
         result_meta = _metadata_outputs(node.meta.get("val"))[0]
-        result_shape = _shape_from_meta(result_meta, self._constraints, self._symbol_names)
+        result_shape = _shape_from_meta(
+            result_meta, self._constraints, self._symbol_names
+        )
         if result_shape is None:
             self._opaque(node, "linear output has no tensor metadata")
             return
@@ -364,7 +405,10 @@ class _ExportNormalizer:
         )
         self._set_producer(transposed_weight, view_op)
         matmul_id = self._add_value_from_shape(
-            f"{node.name}_matmul", result_shape, _dtype_from_meta(result_meta), role="intermediate"
+            f"{node.name}_matmul",
+            result_shape,
+            _dtype_from_meta(result_meta),
+            role="intermediate",
         )
         matmul_op = self._add_op(
             "matmul",
@@ -398,7 +442,9 @@ class _ExportNormalizer:
             self._opaque(node, "softmax requires one tensor input")
             return
         source = self._value(tensor_inputs[0])
-        dim = int(node.args[1]) if len(node.args) > 1 else int(node.kwargs.get("dim", -1))
+        dim = (
+            int(node.args[1]) if len(node.args) > 1 else int(node.kwargs.get("dim", -1))
+        )
         if dim < 0:
             dim += len(source.shape)
         if dim != len(source.shape) - 1:
@@ -444,6 +490,10 @@ class _ExportNormalizer:
                 kind="softmax_flash",
                 ops=op_ids,
                 apply_substitutions=(op_ids[0], op_ids[3]),
+                apply_bindings=(
+                    GraphPatternBinding(op=op_ids[0], value="running_max"),
+                    GraphPatternBinding(op=op_ids[3], value="running_sum"),
+                ),
             )
         )
         self.node_values[node] = (output_id,)
@@ -456,10 +506,14 @@ class _ExportNormalizer:
         source = self._value(tensor_inputs[0])
         output_meta = _metadata_outputs(node.meta.get("val"))[0]
         destination_dtype = _dtype_from_meta(output_meta)
-        copy_requested = target == "aten._to_copy.default" or (len(node.args) > 3 and bool(node.args[3]))
+        copy_requested = target == "aten._to_copy.default" or (
+            len(node.args) > 3 and bool(node.args[3])
+        )
         if source.dtype == destination_dtype:
             if copy_requested:
-                self._opaque(node, "same-dtype to(copy=True) requires an explicit copy lowering")
+                self._opaque(
+                    node, "same-dtype to(copy=True) requires an explicit copy lowering"
+                )
                 return
             output_id = self._add_value(
                 node.name,
@@ -494,8 +548,12 @@ class _ExportNormalizer:
             return
         source = self._value(tensor_inputs[0])
         result_meta = _metadata_outputs(node.meta.get("val"))[0]
-        result_shape = _shape_from_meta(result_meta, self._constraints, self._symbol_names)
-        if result_shape is None or _static_numel(source.shape) != _static_numel(result_shape):
+        result_shape = _shape_from_meta(
+            result_meta, self._constraints, self._symbol_names
+        )
+        if result_shape is None or _static_numel(source.shape) != _static_numel(
+            result_shape
+        ):
             self._opaque(node, "view is not a metadata-only element-preserving alias")
             return
         permutation = _permutation(node, len(source.shape)) if transpose else None
@@ -511,13 +569,17 @@ class _ExportNormalizer:
                     "only an immediately-consumed rank-2 matmul transpose is supported",
                 )
                 return
-        elif _flattened_solver_shape(source.shape) != _flattened_solver_shape(result_shape):
+        elif _flattened_solver_shape(source.shape) != _flattened_solver_shape(
+            result_shape
+        ):
             self._opaque(
                 node,
                 "view changes the two-dimensional solver geometry",
             )
             return
-        output_id = self._add_value(node.name, result_meta, role="alias", alias_of=source.id)
+        output_id = self._add_value(
+            node.name, result_meta, role="alias", alias_of=source.id
+        )
         attrs: dict[str, Any] = {"source_operator": target}
         if transpose:
             attrs["permutation"] = permutation
@@ -544,7 +606,9 @@ class _ExportNormalizer:
         if output_index >= len(outputs):
             self._opaque(node, f"{kind} result has no tensor metadata")
             return
-        output_id = self._add_value(node.name, outputs[output_index], role="intermediate")
+        output_id = self._add_value(
+            node.name, outputs[output_index], role="intermediate"
+        )
         op_id = self._add_op(kind, inputs, (output_id,), attributes)
         self._set_producer(output_id, op_id)
         self.node_values[node] = (output_id,)
@@ -596,7 +660,9 @@ class _ExportNormalizer:
             target=target,
             alias_of=alias_of,
             strides=_strides_from_meta(meta, self._constraints, self._symbol_names),
-            storage_offset=_storage_offset_from_meta(meta, self._constraints, self._symbol_names),
+            storage_offset=_storage_offset_from_meta(
+                meta, self._constraints, self._symbol_names
+            ),
         )
 
     def _add_value_from_shape(
@@ -620,7 +686,9 @@ class _ExportNormalizer:
                 shape=tuple(shape),
                 dtype=dtype,
                 role=role,
-                strides=_contiguous_strides(shape) if strides is None else tuple(strides),
+                strides=_contiguous_strides(shape)
+                if strides is None
+                else tuple(strides),
                 storage_offset=storage_offset,
                 target=target,
                 alias_of=alias_of,
@@ -689,7 +757,10 @@ class _ExportNormalizer:
         value = self._value(value_id)
         if value.producer is None:
             return False
-        return next(op for op in self.ops if op.id == value.producer).kind == "transpose_view"
+        return (
+            next(op for op in self.ops if op.id == value.producer).kind
+            == "transpose_view"
+        )
 
     def _mark_mutated_outputs(self) -> None:
         specs = getattr(self.program.graph_signature, "output_specs", ())
@@ -698,7 +769,12 @@ class _ExportNormalizer:
                 continue
             name = getattr(spec.arg, "name", None)
             fx_node = next(
-                (node for node in self.program.graph_module.graph.nodes if node.name == name), None
+                (
+                    node
+                    for node in self.program.graph_module.graph.nodes
+                    if node.name == name
+                ),
+                None,
             )
             if fx_node is None or fx_node not in self.node_values:
                 continue
@@ -709,7 +785,9 @@ class _ExportNormalizer:
                 for index, op in enumerate(self.ops):
                     if op.id == value.producer:
                         reason = "mutated state is an automatic scheduling boundary"
-                        self.ops[index] = replace(op, supported=False, opaque_reason=reason)
+                        self.ops[index] = replace(
+                            op, supported=False, opaque_reason=reason
+                        )
                         self.diagnostics.append(f"{op.id}: {reason}")
 
 
@@ -741,7 +819,9 @@ def _range_constraints(
 ) -> tuple[dict[str, dict[str, int | None]], dict[str, str]]:
     constraints: dict[str, dict[str, int | None]] = {}
     symbol_names: dict[str, str] = {}
-    for index, (symbol, value_range) in enumerate(getattr(program, "range_constraints", {}).items()):
+    for index, (symbol, value_range) in enumerate(
+        getattr(program, "range_constraints", {}).items()
+    ):
         canonical = f"s{index}"
         symbol_names[str(symbol)] = canonical
         constraints[canonical] = {
@@ -847,7 +927,9 @@ def _serialize_tree_spec(spec: Any) -> Any:
     return json.loads(pytree.treespec_dumps(spec))
 
 
-def _output_specs(program: Any, output_ids: Sequence[str]) -> tuple[dict[str, Any], ...]:
+def _output_specs(
+    program: Any, output_ids: Sequence[str]
+) -> tuple[dict[str, Any], ...]:
     specs = getattr(program.graph_signature, "output_specs", ())
     if len(specs) != len(output_ids):
         raise ValueError(

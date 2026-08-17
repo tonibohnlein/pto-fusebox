@@ -79,7 +79,12 @@ python -m pip install -e ".[torch]"
 ```
 
 ```python
-from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
+from pto_fusebox import (
+    can_emit_region,
+    emit_pypto_region,
+    export_and_normalize,
+    solve_graph,
+)
 
 graph = export_and_normalize(module, example_args)
 result = solve_graph(
@@ -87,7 +92,9 @@ result = solve_graph(
     solver_binary="build/mlsys_mixed",
     solver_workers=2,
 )
-source = emit_pypto_region(graph, result.regions[0])
+region = result.regions[0]
+assert can_emit_region(graph, region)
+source = emit_pypto_region(graph, region)
 print(source.source)
 ```
 
@@ -98,6 +105,17 @@ replay or one spatial cube matmul. Other schedules raise a precise
 region is one solver input DAG, not one mandatory fused kernel: the solver may
 partition it into several feasible groups and may select supported mixed
 cube/vector groups. Multi-step and mixed source emission remain follow-ups.
+
+The C++/Python boundary combines the typed problem descriptor with
+`pto_fusebox.solution.v2`: C++ owns the selected launch, order, loops, physical
+frames, lifetimes, and memory policy, while the problem retains the region ABI
+and output-allocation lineage. Python builds one typed emission context from
+both halves and renders it without searching again. The same graph-aware path
+implements `can_emit_region` and actual emission, so readiness cannot accept a
+program that the renderer later rejects. The renderer is organized as separate
+API, shared-mechanics, vector, and cube modules. Analytically feasible streamed
+and mixed schedules remain explicitly not source-ready until their complete
+state/transport contracts are serialized.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the

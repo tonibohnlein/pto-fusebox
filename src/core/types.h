@@ -130,6 +130,18 @@ enum class MixedVectorSemantic : uint8_t { None, Neg, Exp, ScalarAdd, Recip, Mul
 // match the emitted online algorithm, not merely a reduction family.
 enum class P4PatternKind { None, SoftmaxFlash, LayerNormWelford };
 
+enum class P4SubstitutionValue {
+    RunningMax,
+    RunningSum,
+    Mean,
+    Variance
+};
+
+struct P4ApplyBinding {
+    size_t op = std::numeric_limits<size_t>::max();
+    P4SubstitutionValue value = P4SubstitutionValue::RunningMax;
+};
+
 struct P4Pattern {
     P4PatternKind kind = P4PatternKind::None;
     FlatSet<size_t> ops;
@@ -138,6 +150,11 @@ struct P4Pattern {
     // these semantic cut points in the descriptor lets the model and emitter
     // derive the same apply cone without independently recognizing P4 again.
     FlatSet<size_t> apply_substitutions;
+    // Semantic bindings are separate from the set above on purpose. Legacy
+    // analytic problem instances may carry only the cut-point set; only a
+    // frontend-owned, named binding is strong enough to become an executable
+    // source recipe.
+    std::vector<P4ApplyBinding> apply_bindings;
 };
 
 struct Op {
@@ -544,6 +561,15 @@ struct VectorP4WorkPlan {
     }
 };
 
+struct VectorP4RecipePlan {
+  // Versioned semantic recipe selected by the C++ planner. Python renders this
+  // recipe mechanically; it never rediscovers a softmax/normalization pattern
+  // from the source DAG.
+  P4PatternKind kind = P4PatternKind::None;
+  size_t input_tensor = std::numeric_limits<size_t>::max();
+  std::vector<P4ApplyBinding> apply_bindings;
+};
+
 // This is the single algorithm-work description shared by candidate costing
 // and final-plan emission checks. It describes exactly the primitive sequence
 // emitted in auto_fuse_pass.cpp; dependency semantics remain in the exact
@@ -637,7 +663,37 @@ struct VectorInputLifetimePlan {
 // it behind a shared pointer avoids rebuilding/copying use lists in the local-
 // search hot path; candidate-dependent tile bytes remain in VectorStreamPlan.
 struct VectorInputLifetimeTopology {
+  // Exact source-DAG replay order for each barrier-separated phase. Keeping
+  // this beside the phase-local lifetimes prevents a downstream emitter from
+  // reconstructing cones or filtering the global execution order.
+  std::array<std::vector<size_t>, 4> ops;
   std::array<std::vector<VectorInputLifetimePlan>, 4> phases;
+};
+
+struct VectorTensorFramePlan {
+  // Concrete candidate-local tile frame for one tensor in one replay phase.
+  // Logical extents drive valid_shape; physical extents drive allocation and
+  // DMA legality. Source backends consume this verbatim rather than
+  // re-implementing singleton/broadcast/reduction padding policy.
+  size_t tensor = 0;
+  VectorReplayPhase phase = VectorReplayPhase::Body;
+  int64_t logical_rows = 0;
+  int64_t logical_cols = 0;
+  int64_t physical_rows = 0;
+  int64_t physical_cols = 0;
+};
+
+struct VectorWorkspaceFramePlan {
+  // Tile-level reduction APIs require a distinct source-shaped scratch tile.
+  // It is allocation-owning and therefore part of both UB accounting and the
+  // executable source contract.
+  size_t op = 0;
+  size_t source_tensor = 0;
+  VectorReplayPhase phase = VectorReplayPhase::Body;
+  int64_t logical_rows = 0;
+  int64_t logical_cols = 0;
+  int64_t physical_rows = 0;
+  int64_t physical_cols = 0;
 };
 
 struct VectorStreamPlan {
@@ -714,6 +770,7 @@ struct VectorStreamPlan {
   // P4 stats are emitter-generated work, not a scaled replay of the source
   // DAG. Apply remains a source-DAG cone with the online stats substituted.
   VectorP4WorkPlan p4_work;
+  std::shared_ptr<const VectorP4RecipePlan> p4_recipe;
 
   // Diagnostic compatibility bit: true when every rolled data-moving loop in
   // this plan is stage-2.  Costing is phase-local and never uses this to hide

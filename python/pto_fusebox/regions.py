@@ -7,7 +7,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .ir import PROBLEM_SCHEMA, NormalizedGraph, NormalizedOp, NormalizedValue, ShapeDimension
+from .ir import (
+    PROBLEM_SCHEMA,
+    NormalizedGraph,
+    NormalizedOp,
+    NormalizedValue,
+    ShapeDimension,
+)
 from .target import TargetProfile, resolve_target
 
 
@@ -28,7 +34,9 @@ class SolverRegion:
     target: str
     diagnostics: tuple[str, ...] = ()
 
-    def lower(self, graph: NormalizedGraph, target: str | TargetProfile | None = None) -> LoweredProblem:
+    def lower(
+        self, graph: NormalizedGraph, target: str | TargetProfile | None = None
+    ) -> LoweredProblem:
         return lower_solver_region(graph, self, resolve_target(target or self.target))
 
 
@@ -103,7 +111,9 @@ def extract_solver_regions(  # noqa: PLR0912 -- each branch is one explicit regi
     consumers = _consumers(graph)
     graph_outputs = set(graph.outputs)
     regions: list[SolverRegion] = []
-    sorted_components = sorted(components.values(), key=lambda ids: min(op_index[item] for item in ids))
+    sorted_components = sorted(
+        components.values(), key=lambda ids: min(op_index[item] for item in ids)
+    )
     for ids in sorted_components:
         region_ops = set(ids)
         if not any(not op_by_id[op_id].metadata_only for op_id in ids):
@@ -117,7 +127,9 @@ def extract_solver_regions(  # noqa: PLR0912 -- each branch is one explicit regi
                 if producer not in region_ops and value_id not in inputs:
                     inputs.append(value_id)
             for value_id in op.outputs:
-                outside = any(consumer not in region_ops for consumer in consumers[value_id])
+                outside = any(
+                    consumer not in region_ops for consumer in consumers[value_id]
+                )
                 if (value_id in graph_outputs or outside) and value_id not in outputs:
                     outputs.append(value_id)
         diagnostics = tuple(
@@ -143,11 +155,17 @@ def lower_solver_region(
 ) -> LoweredProblem:
     graph_values = graph.value_map()
     ops = graph.op_map()
-    graph_compute_ops = [ops[op_id] for op_id in region.op_ids if not ops[op_id].metadata_only]
+    graph_compute_ops = [
+        ops[op_id] for op_id in region.op_ids if not ops[op_id].metadata_only
+    ]
     if not graph_compute_ops:
         raise ValueError(f"{region.id} contains no solver operations")
-    canonical_graph_ops = [_canonicalize_metadata_inputs(op, graph_values, ops) for op in graph_compute_ops]
-    compute_ops, values, solver_op_to_graph = _expand_native_casts(canonical_graph_ops, graph_values, target)
+    canonical_graph_ops = [
+        _canonicalize_metadata_inputs(op, graph_values, ops) for op in graph_compute_ops
+    ]
+    compute_ops, values, solver_op_to_graph = _expand_native_casts(
+        canonical_graph_ops, graph_values, target
+    )
     if not compute_ops:
         raise ValueError(f"{region.id} contains no operations after target lowering")
 
@@ -162,7 +180,9 @@ def lower_solver_region(
         static_shapes[value.id] = _solver_shape(value)
 
     tensor_index = {value.id: index for index, value in enumerate(ordered_values)}
-    required_value_ids = [_allocation_owner(value_id, values, ops) for value_id in region.output_values]
+    required_value_ids = [
+        _allocation_owner(value_id, values, ops) for value_id in region.output_values
+    ]
     graph_op_indices: dict[str, list[int]] = {}
     for index, graph_op in enumerate(solver_op_to_graph):
         graph_op_indices.setdefault(graph_op, []).append(index)
@@ -173,13 +193,19 @@ def lower_solver_region(
             "widths": [static_shapes[value.id][0] for value in ordered_values],
             "heights": [static_shapes[value.id][1] for value in ordered_values],
             "dtypes": [_solver_dtype(value.dtype) for value in ordered_values],
-            "inputs": [[tensor_index[item] for item in op.inputs] for op in compute_ops],
+            "inputs": [
+                [tensor_index[item] for item in op.inputs] for op in compute_ops
+            ],
             "outputs": [[tensor_index[op.outputs[0]]] for op in compute_ops],
             "op_types": [_solver_op_type(op) for op in compute_ops],
             "vec_slopes": [_vector_cost(op)[0] for op in compute_ops],
             "vec_fixed_costs": [_vector_cost(op)[1] for op in compute_ops],
-            "vector_primitive_families": [_vector_primitive(op, values, static_shapes) for op in compute_ops],
-            "vector_op_geometries": [_vector_geometry(op, values, static_shapes) for op in compute_ops],
+            "vector_primitive_families": [
+                _vector_primitive(op, values, static_shapes) for op in compute_ops
+            ],
+            "vector_op_geometries": [
+                _vector_geometry(op, values, static_shapes) for op in compute_ops
+            ],
             "vector_op_capabilities": [_vector_capability(op) for op in compute_ops],
             "mixed_vector_semantics": [_mixed_semantic(op) for op in compute_ops],
             "mixed_emit_compatible": [True for _ in compute_ops],
@@ -194,7 +220,9 @@ def lower_solver_region(
                 "solver_op_to_graph": list(solver_op_to_graph),
                 "solver_tensor_to_value": [value.id for value in ordered_values],
                 "solver_tensor_alias_of": [value.alias_of for value in ordered_values],
-                "solver_tensor_synthetic": [value.id not in graph_values for value in ordered_values],
+                "solver_tensor_synthetic": [
+                    value.id not in graph_values for value in ordered_values
+                ],
                 "region_inputs": list(region.input_values),
                 "region_outputs": list(region.output_values),
                 "region_output_allocation_owners": required_value_ids,
@@ -203,14 +231,30 @@ def lower_solver_region(
     )
     region_ops = set(region.op_ids)
     for pattern in graph.patterns:
-        if set(pattern.ops).issubset(region_ops) and all(item in graph_op_indices for item in pattern.ops):
+        if set(pattern.ops).issubset(region_ops) and all(
+            item in graph_op_indices for item in pattern.ops
+        ):
             problem["p4_patterns"].append(
                 {
                     "kind": pattern.kind,
-                    "ops": [index for item in pattern.ops for index in graph_op_indices[item]],
-                    "apply_substitutions": [
-                        index for item in pattern.apply_substitutions for index in graph_op_indices[item]
+                    "ops": [
+                        index
+                        for item in pattern.ops
+                        for index in graph_op_indices[item]
                     ],
+                    "apply_substitutions": (
+                        [
+                            {"op": index, "value": binding.value}
+                            for binding in pattern.apply_bindings
+                            for index in graph_op_indices[binding.op]
+                        ]
+                        if pattern.apply_bindings
+                        else [
+                            index
+                            for item in pattern.apply_substitutions
+                            for index in graph_op_indices[item]
+                        ]
+                    ),
                 }
             )
     return LoweredProblem(
@@ -294,7 +338,9 @@ def _expand_native_casts(
         if path is None or not path:
             if source.dtype == output.dtype:
                 continue
-            raise ValueError(f"{op.id} has no native cast path from {source.dtype} to {output.dtype}")
+            raise ValueError(
+                f"{op.id} has no native cast path from {source.dtype} to {output.dtype}"
+            )
         previous = source.id
         for hop, dtype in enumerate(path):
             final = hop + 1 == len(path)
@@ -338,7 +384,9 @@ def _consumers(graph: NormalizedGraph) -> dict[str, list[str]]:
 
 
 def _solver_shape(value: NormalizedValue) -> tuple[int, int]:
-    expressions = [dim.expression for dim in value.shape if isinstance(dim, ShapeDimension)]
+    expressions = [
+        dim.expression for dim in value.shape if isinstance(dim, ShapeDimension)
+    ]
     if expressions:
         raise ValueError(
             f"value {value.id} has schedule-defining symbolic dimensions {expressions}; "
@@ -347,7 +395,9 @@ def _solver_shape(value: NormalizedValue) -> tuple[int, int]:
     dims: list[int] = []
     for dim in value.shape:
         if not isinstance(dim, int):
-            raise AssertionError("symbolic dimensions must decline before static lowering")
+            raise AssertionError(
+                "symbolic dimensions must decline before static lowering"
+            )
         dims.append(dim)
     if not dims:
         return (1, 1)

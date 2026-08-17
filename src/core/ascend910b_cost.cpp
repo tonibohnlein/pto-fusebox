@@ -894,6 +894,80 @@ CubeMatmulPhaseCost LptPhaseMakespanPerUnit(
 
 }  // namespace
 
+std::array<std::vector<VectorTensorFramePlan>, 4>
+BuildVectorTensorFrames(const Problem& problem, const VectorStreamPlan& plan) {
+  std::array<std::vector<VectorTensorFramePlan>, 4> result;
+  if (!plan.feasible || !plan.input_lifetimes) return result;
+
+  auto phase_extent = [&](VectorReplayPhase phase) {
+    int64_t rows = plan.strip_h;
+    int64_t cols = plan.strip_w;
+    if (phase == VectorReplayPhase::Stats ||
+        phase == VectorReplayPhase::Apply) {
+      rows = plan.axis == 1 ? plan.free_tile : plan.chunk;
+      cols = plan.axis == 1 ? plan.chunk : plan.free_tile;
+    } else if (phase == VectorReplayPhase::Finalize) {
+      rows = plan.axis == 1 ? plan.free_tile : 1;
+      cols = plan.axis == 1 ? 1 : plan.free_tile;
+    }
+    return std::pair<int64_t, int64_t>{std::max<int64_t>(1, rows),
+                                       std::max<int64_t>(1, cols)};
+  };
+
+  for (size_t phase_index = 0; phase_index < result.size(); ++phase_index) {
+    const auto phase = static_cast<VectorReplayPhase>(phase_index);
+    const auto [tile_rows, tile_cols] = phase_extent(phase);
+    FlatSet<size_t> tensors;
+    for (size_t op_index : plan.input_lifetimes->ops[phase_index]) {
+      if (op_index >= problem.ops.size()) continue;
+      const Op& op = problem.ops[op_index];
+      tensors.insert(op.inputs.begin(), op.inputs.end());
+      tensors.insert(op.outputs.begin(), op.outputs.end());
+    }
+    for (size_t tensor_index : tensors) {
+      if (tensor_index >= problem.tensors.size()) continue;
+      const Tensor& tensor = problem.tensors[tensor_index];
+      const int64_t logical_rows = std::min(tile_rows, tensor.height);
+      const int64_t logical_cols = std::min(tile_cols, tensor.width);
+      const VectorPhysicalFrame frame = VectorAllocatedFrame(
+          tensor, logical_rows, logical_cols, plan.iteration_rows,
+          plan.iteration_cols, plan.reduced_axis, plan.align_rows,
+          plan.physical_element_granule);
+      result[phase_index].push_back(
+          {tensor_index, phase, logical_rows, logical_cols, frame.rows,
+           frame.cols});
+    }
+  }
+  return result;
+}
+
+std::array<std::vector<VectorWorkspaceFramePlan>, 4>
+BuildVectorWorkspaceFrames(const Problem& problem,
+                           const VectorStreamPlan& plan) {
+  std::array<std::vector<VectorWorkspaceFramePlan>, 4> result;
+  const auto frames = BuildVectorTensorFrames(problem, plan);
+  if (!plan.input_lifetimes) return result;
+  for (size_t phase_index = 0; phase_index < result.size(); ++phase_index) {
+    for (size_t op_index : plan.input_lifetimes->ops[phase_index]) {
+      if (op_index >= problem.ops.size()) continue;
+      const Op& op = problem.ops[op_index];
+      if (op.type != OpType::Reduction || op.inputs.empty()) continue;
+      const size_t source_tensor = op.inputs[0];
+      const auto frame = std::find_if(
+          frames[phase_index].begin(), frames[phase_index].end(),
+          [&](const VectorTensorFramePlan& item) {
+            return item.tensor == source_tensor;
+          });
+      if (frame == frames[phase_index].end()) continue;
+      result[phase_index].push_back(
+          {op_index, source_tensor,
+           static_cast<VectorReplayPhase>(phase_index), frame->logical_rows,
+           frame->logical_cols, frame->physical_rows, frame->physical_cols});
+    }
+  }
+  return result;
+}
+
 double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
                                   int64_t valid_rows, int64_t valid_cols) {
   return GroundedRowReductionCyclesImpl(family, dtype, valid_rows, valid_cols);
@@ -1057,7 +1131,46 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     if (exact || embedded_mixed_stage) {
       sg.p4_pattern_kind_ = pattern.kind;
       sg.p4_apply_substitutions_ = pattern.apply_substitutions;
+      sg.p4_apply_bindings_ = pattern.apply_bindings;
       break;
+    }
+  }
+  if (sg.p4_pattern_kind_ != P4PatternKind::None) {
+    auto recipe = std::make_shared<VectorP4RecipePlan>();
+    recipe->kind = sg.p4_pattern_kind_;
+    recipe->apply_bindings = sg.p4_apply_bindings_;
+    for (size_t op_index : candidate_ops) {
+      const Op& op = prob.ops[op_index];
+      if (op.type == OpType::Reduction && !op.inputs.empty()) {
+        recipe->input_tensor = op.inputs[0];
+        break;
+      }
+    }
+    // Legacy analytic Problem instances may name only the P4 cost pattern.
+    // Keep those candidates analytically feasible, but expose no executable
+    // recipe: the typed source boundary will then fail closed. Frontend-owned
+    // problems carry the two exact substitution cut points and receive the
+    // complete source recipe below.
+    const std::array<P4SubstitutionValue, 2> expected_values =
+        recipe->kind == P4PatternKind::SoftmaxFlash
+            ? std::array<P4SubstitutionValue, 2>{
+                  P4SubstitutionValue::RunningMax,
+                  P4SubstitutionValue::RunningSum}
+            : std::array<P4SubstitutionValue, 2>{
+                  P4SubstitutionValue::Mean,
+                  P4SubstitutionValue::Variance};
+    FlatSet<size_t> bound_ops;
+    std::array<bool, 2> found_values{false, false};
+    for (const P4ApplyBinding& binding : recipe->apply_bindings) {
+      bound_ops.insert(binding.op);
+      for (size_t index = 0; index < expected_values.size(); ++index) {
+        if (binding.value == expected_values[index]) found_values[index] = true;
+      }
+    }
+    if (recipe->input_tensor != std::numeric_limits<size_t>::max() &&
+        recipe->apply_bindings.size() == 2 && bound_ops.size() == 2 &&
+        found_values[0] && found_values[1]) {
+      sg.vector_p4_recipe_ = std::move(recipe);
     }
   }
 
@@ -2177,6 +2290,7 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
       const uint8_t phase = kVectorPhases[phase_idx];
       for (size_t op : sg.dfs_order_)
         if ((vector_op_phase_mask[op] & phase) != 0) sg.vector_phase_ops_[phase_idx].push_back(op);
+      input_topology->ops[phase_idx] = sg.vector_phase_ops_[phase_idx];
 
       // Canonical vector identity is the source tensor itself: unlike cube
       // LHS/RHS Mat operands, every use in one homogeneous vector phase has
@@ -3904,6 +4018,17 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   if (materializes || !has_reduction_) {
     if (!materializes && boundary_outputs_.size() > 1) return plan;
     plan.kind = materializes ? VectorStreamKind::Materialized : VectorStreamKind::Pointwise;
+    // A materialized/pointwise kernel replays the selected DAG exactly once.
+    // The candidate-invariant topology also carries stats/apply cones for a
+    // possible streamed candidate; do not publish those inactive cones as if
+    // they were executable phases of this winner.
+    auto body_only = std::make_shared<VectorInputLifetimeTopology>();
+    const size_t body_index =
+        vector_replay_phase_index(VectorReplayPhase::Body);
+    body_only->ops[body_index] = plan.input_lifetimes->ops[body_index];
+    body_only->phases[body_index] =
+        plan.input_lifetimes->phases[body_index];
+    plan.input_lifetimes = std::move(body_only);
     plan.stream_passes = 1;
     plan.stream_band_count = vector_pipe_band_count_;
     const bool has_col_reduction = reduced_axis_ == 2;
@@ -4028,6 +4153,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     plan.kind =
         reduction_spans_output_ ? VectorStreamKind::ReductionSpanning : VectorStreamKind::ReductionFolded;
   plan.p4_work = make_vector_p4_work_plan(p4_pattern_kind_);
+  plan.p4_recipe = vector_p4_recipe_;
   plan.axis = reduced_axis_;
   plan.extent = reduced_extent_;
   const int64_t extra_bands =

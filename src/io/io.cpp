@@ -1,6 +1,7 @@
 #include "io/io.h"
 #include "core/types.h"
 #include "solution/solution.h"
+#include <array>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -103,6 +104,31 @@ static bool parse_p4_pattern_kind(const std::string& name, P4PatternKind* kind) 
   return true;
 }
 
+static bool parse_p4_substitution_value(const std::string& name,
+                                        P4SubstitutionValue* value) {
+  if (name == "running_max")
+    *value = P4SubstitutionValue::RunningMax;
+  else if (name == "running_sum")
+    *value = P4SubstitutionValue::RunningSum;
+  else if (name == "mean")
+    *value = P4SubstitutionValue::Mean;
+  else if (name == "variance")
+    *value = P4SubstitutionValue::Variance;
+  else
+    return false;
+  return true;
+}
+
+static const char* p4_substitution_value_name(P4SubstitutionValue value) {
+  switch (value) {
+    case P4SubstitutionValue::RunningMax: return "running_max";
+    case P4SubstitutionValue::RunningSum: return "running_sum";
+    case P4SubstitutionValue::Mean: return "mean";
+    case P4SubstitutionValue::Variance: return "variance";
+  }
+  return "unknown";
+}
+
 static json vector_loop_json(const VectorLoopPlan& loop) {
     return {{"first_chunk", loop.first_chunk},
             {"trip_count", loop.trip_count},
@@ -162,8 +188,11 @@ static const char* vector_replay_phase_name(VectorReplayPhase phase) {
     return "unknown";
 }
 
-static json vector_input_lifetimes_json(const VectorStreamPlan& plan) {
-    json result = json::object();
+static json vector_replay_phases_json(const Problem& problem,
+                                      const VectorStreamPlan& plan) {
+    json result = json::array();
+    const auto tensor_frames = BuildVectorTensorFrames(problem, plan);
+    const auto workspace_frames = BuildVectorWorkspaceFrames(problem, plan);
     for (size_t index = 0; index < 4; ++index) {
         const auto phase = static_cast<VectorReplayPhase>(index);
         json lifetimes = json::array();
@@ -179,16 +208,70 @@ static json vector_input_lifetimes_json(const VectorStreamPlan& plan) {
                                      {"uses", std::move(uses)}});
             }
         }
-        result[vector_replay_phase_name(phase)] = std::move(lifetimes);
+        json frames = json::array();
+        for (const VectorTensorFramePlan& frame : tensor_frames[index]) {
+            frames.push_back(
+                {{"tensor", frame.tensor},
+                 {"logical", {frame.logical_rows, frame.logical_cols}},
+                 {"physical", {frame.physical_rows, frame.physical_cols}}});
+        }
+        json workspaces = json::array();
+        for (const VectorWorkspaceFramePlan& frame : workspace_frames[index]) {
+            workspaces.push_back(
+                {{"op", frame.op},
+                 {"source_tensor", frame.source_tensor},
+                 {"logical", {frame.logical_rows, frame.logical_cols}},
+                 {"physical", {frame.physical_rows, frame.physical_cols}}});
+        }
+        json phase_json =
+            {{"name", vector_replay_phase_name(phase)},
+             {"ops", plan.input_lifetimes ? plan.input_lifetimes->ops[index]
+                                           : std::vector<size_t>{}},
+             {"input_lifetimes", std::move(lifetimes)},
+             {"tensor_frames", std::move(frames)},
+             {"workspaces", std::move(workspaces)}};
+        if (phase == VectorReplayPhase::Body) {
+            phase_json["loop"] = vector_loop_json(plan.body);
+        } else if (phase == VectorReplayPhase::Stats) {
+            phase_json["init"] = vector_serial_phase_json(plan.stats_init);
+            phase_json["loop"] = vector_loop_json(plan.stats);
+            phase_json["tail"] = vector_serial_phase_json(plan.stats_tail);
+        } else if (phase == VectorReplayPhase::Apply) {
+            phase_json["loop"] = vector_loop_json(plan.apply);
+            phase_json["tail"] = vector_serial_phase_json(plan.apply_tail);
+        } else {
+            phase_json["serial"] = vector_serial_phase_json(plan.finalize);
+        }
+        result.push_back(std::move(phase_json));
     }
     return result;
 }
 
-static json vector_stream_plan_json(const VectorStreamPlan& plan) {
+static json vector_stream_plan_json(const Problem& problem,
+                                    const VectorStreamPlan& plan) {
     const char* coordinate_transform =
         plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
             ? "singleton_column_to_row"
             : "none";
+    json p4_recipe = nullptr;
+    if (plan.p4_recipe && plan.p4_recipe->kind != P4PatternKind::None) {
+        const bool softmax =
+            plan.p4_recipe->kind == P4PatternKind::SoftmaxFlash;
+        json bindings = json::array();
+        for (const P4ApplyBinding& binding : plan.p4_recipe->apply_bindings) {
+            bindings.push_back(
+                {{"op", binding.op},
+                 {"value", p4_substitution_value_name(binding.value)}});
+        }
+        p4_recipe =
+            {{"version", softmax ? "softmax_flash.v1" : "welford.v1"},
+             {"input_tensor", plan.p4_recipe->input_tensor},
+             {"state",
+              softmax ? json::array({"running_max", "running_sum"})
+                      : json::array({"running_mean", "running_m2",
+                                     "running_count"})},
+             {"apply_substitutions", std::move(bindings)}};
+    }
     return {{"kind", vector_stream_kind_name(plan.kind)},
             {"coordinate_transform", coordinate_transform},
             {"work_units", plan.work_units},
@@ -211,7 +294,7 @@ static json vector_stream_plan_json(const VectorStreamPlan& plan) {
             {"full_chunks", plan.full_chunks},
             {"tail", plan.tail},
             {"stream_passes", plan.stream_passes},
-            {"input_lifetimes", vector_input_lifetimes_json(plan)},
+            {"phases", vector_replay_phases_json(problem, plan)},
             {"tile", {plan.tile_h, plan.tile_w}},
             {"strip", {plan.strip_h, plan.strip_w}},
             {"strip_grid", {plan.row_strips, plan.width_strips}},
@@ -225,19 +308,12 @@ static json vector_stream_plan_json(const VectorStreamPlan& plan) {
                 {"work_units", plan.reduction_seed.work_units},
                 {"valid_rows", plan.reduction_seed.valid_rows},
                 {"valid_cols", plan.reduction_seed.valid_cols}}}}},
-            {"body", vector_loop_json(plan.body)},
-            {"stats", vector_loop_json(plan.stats)},
-            {"apply", vector_loop_json(plan.apply)},
-            {"serial_phases",
-             {{"stats_init", vector_serial_phase_json(plan.stats_init)},
-              {"stats_tail", vector_serial_phase_json(plan.stats_tail)},
-              {"apply_tail", vector_serial_phase_json(plan.apply_tail)},
-              {"finalize", vector_serial_phase_json(plan.finalize)}}},
             {"p4_work",
              {{"generated", plan.p4_work.generated},
               {"stats_init", vector_phase_work_json(plan.p4_work.stats_init)},
               {"stats_update", vector_phase_work_json(plan.p4_work.stats_update)},
-              {"finalize", vector_phase_work_json(plan.p4_work.finalize)}}}};
+              {"finalize", vector_phase_work_json(plan.p4_work.finalize)}}},
+            {"p4_recipe", std::move(p4_recipe)}};
 }
 
 static const char* cube_axis_binding_name(CubeAxisBinding binding) {
@@ -614,7 +690,14 @@ Problem read_problem(const std::string& filename) {
             }
             if (encoded.contains("apply_substitutions")) {
                 for (const auto& item : encoded["apply_substitutions"]) {
-                    const size_t op = item.get<size_t>();
+                    const bool named = item.is_object();
+                    if (named && !item.contains("op")) {
+                        std::cerr << "Error: P4 pattern " << pattern_index
+                                  << " named substitution requires an op\n";
+                        std::exit(1);
+                    }
+                    const size_t op = named ? item.at("op").get<size_t>()
+                                            : item.get<size_t>();
                     if (op >= num_ops || pattern.ops.count(op) == 0) {
                         std::cerr << "Error: P4 pattern " << pattern_index
                                   << " substitution op " << op
@@ -622,6 +705,50 @@ Problem read_problem(const std::string& filename) {
                         std::exit(1);
                     }
                     pattern.apply_substitutions.insert(op);
+                    if (named) {
+                        if (!item.contains("value") ||
+                            !item.at("value").is_string()) {
+                            std::cerr << "Error: P4 pattern " << pattern_index
+                                      << " named substitution requires a value\n";
+                            std::exit(1);
+                        }
+                        P4SubstitutionValue value;
+                        const std::string name =
+                            item.at("value").get<std::string>();
+                        if (!parse_p4_substitution_value(name, &value)) {
+                            std::cerr << "Error: P4 pattern " << pattern_index
+                                      << " has unknown substitution value '"
+                                      << name << "'\n";
+                            std::exit(1);
+                        }
+                        pattern.apply_bindings.push_back({op, value});
+                    }
+                }
+            }
+            if (!pattern.apply_bindings.empty()) {
+                const std::array<P4SubstitutionValue, 2> expected =
+                    pattern.kind == P4PatternKind::SoftmaxFlash
+                        ? std::array<P4SubstitutionValue, 2>{
+                              P4SubstitutionValue::RunningMax,
+                              P4SubstitutionValue::RunningSum}
+                        : std::array<P4SubstitutionValue, 2>{
+                              P4SubstitutionValue::Mean,
+                              P4SubstitutionValue::Variance};
+                std::array<bool, 2> found{false, false};
+                FlatSet<size_t> binding_ops;
+                for (const P4ApplyBinding& binding : pattern.apply_bindings) {
+                    binding_ops.insert(binding.op);
+                    for (size_t index = 0; index < expected.size(); ++index) {
+                        if (binding.value == expected[index]) found[index] = true;
+                    }
+                }
+                if (pattern.apply_bindings.size() != expected.size() ||
+                    binding_ops.size() != expected.size() || !found[0] ||
+                    !found[1]) {
+                    std::cerr << "Error: P4 pattern " << pattern_index
+                              << " named substitutions do not match its "
+                                 "semantic contract\n";
+                    std::exit(1);
                 }
             }
             p.p4_patterns.push_back(std::move(pattern));
@@ -837,19 +964,8 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v1";
-    j["subgraphs"]         = json::array();
-    j["granularities"]     = json::array();
-    j["parts"]             = json::array();  // 910B spatial grid (parts_m, parts_n) per step
-    j["splits"]            = json::array();  // 910B parallel split-K / reduction split per step
-    j["cores"]             = json::array();  // 910B cube/vector cores used per step
-    j["op_order"]          = json::array();  // DFS execution order per step (pebble order)
-    j["seq_k"]             = json::array();  // 910B per-op single-core k-tile (in op_order)
-    j["vector_stream"]     = json::array();  // solver-owned vector UB sub-stream plan per step
-    j["cube_schedule"]     = json::array();  // solver-owned cube grid/band/K-loop plan per step
-    j["mixed_schedule"]    = json::array();  // solver-owned cross-engine stage/FIFO/loop plan
-    j["tensors_to_retain"] = json::array();
-    j["subgraph_latencies"] = json::array();
+    j["schema_version"] = "pto_fusebox.solution.v2";
+    j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
@@ -875,22 +991,23 @@ std::string solution_json(const Solution& sol) {
                       cost.parallel_split)
                 : MixedSchedulePlan{};
 
-        j["subgraphs"].push_back(step.subgraph.ops());
-        j["granularities"].push_back({cfg.w, cfg.h, cfg.k});
+        json serialized_step;
+        serialized_step["ops"] = step.subgraph.ops();
+        serialized_step["launch"] =
+            {{"tile", {cfg.w, cfg.h, cfg.k}},
+             {"parts", {cfg.parts_m, cfg.parts_n}},
+             {"split", cost.parallel_split},
+             {"cores", cost.cores_used}};
         // Spatial grid shape: parts_m x parts_n regions (0,0 = a uniform tile,
         // region count = floor(out_W/w)*floor(out_H/h)). w,h above are the MAX
         // region extent (regions differ by <=1 block), NOT a uniform tile -- read
         // the region count from here, do not infer it from the tile size.
-        j["parts"].push_back({cfg.parts_m, cfg.parts_n});
-        // Parallel split + cores used for this tile (cube split-K / vector
-        // reduction split; 1 = pure spatial). Computed for the chosen config.
-        j["splits"].push_back(cost.parallel_split);
-        j["cores"].push_back(cost.cores_used);
         // Execution order (the fixed pebbling order) — emitted because the peak
         // working set depends on it, so downstream must materialize this order.
         {
             const auto& order = step.subgraph.execution_order();
-            j["op_order"].push_back(std::vector<size_t>(order.begin(), order.end()));
+            serialized_step["op_order"] =
+                std::vector<size_t>(order.begin(), order.end());
             // Per-op single-core k-tile, in execution order (cube-910B only). An
             // op's seq_k = its full K means it ran the contraction in one pass.
             const auto& prob = step.subgraph.problem();
@@ -905,21 +1022,22 @@ std::string solution_json(const Solution& sol) {
                     // share, = granularities.k). Internals: the L1-fit single-core k.
                     ks.push_back((int64_t)op == sink ? cost.config.k
                                  : ((size_t)op < pk.size() ? pk[op] : 0));
-                j["seq_k"].push_back(ks);
+                serialized_step["sequential_tiles"] = ks;
             } else if (!step.subgraph.has_matmul() && prob.num_vector_cores > 1 &&
                        prob.vec_capacity > 0) {
                 // Vector single-core k-stream: one subgraph-wide chunk along the
                 // streamed axis (the matmul-seq-k analog). Emit it per op (same value).
                 const int64_t chunk = vector_plan.streamed() ? vector_plan.chunk : 0;
-                j["seq_k"].push_back(std::vector<int64_t>(order.size(), chunk));
+                serialized_step["sequential_tiles"] =
+                    std::vector<int64_t>(order.size(), chunk);
             } else {
-                j["seq_k"].push_back(nullptr);
+                serialized_step["sequential_tiles"] = nullptr;
             }
         }
         if (vector_plan.feasible) {
-            j["vector_stream"].push_back(vector_stream_plan_json(vector_plan));
-        } else {
-            j["vector_stream"].push_back(nullptr);
+            serialized_step["kind"] = "vector";
+            serialized_step["plan"] =
+                vector_stream_plan_json(sol.problem(), vector_plan);
         }
         if (cube_plan.feasible) {
             json matmuls = json::array();
@@ -951,6 +1069,8 @@ std::string solution_json(const Solution& sol) {
                            {"op", mm.op},
                            {"lhs_producer", mm.lhs_producer},
                            {"rhs_producer", mm.rhs_producer},
+                           {"lhs_resident_boundary", mm.lhs_resident_boundary},
+                           {"rhs_resident_boundary", mm.rhs_resident_boundary},
                            {"is_sink", mm.is_sink},
                            {"lhs_ephemeral", mm.lhs_ephemeral},
                            {"rhs_ephemeral", mm.rhs_ephemeral},
@@ -981,7 +1101,8 @@ std::string solution_json(const Solution& sol) {
                              {"bytes", mm.final_drain.bytes},
                              {"cycles", mm.final_drain.cycles}}}});
       }
-      j["cube_schedule"].push_back(
+      serialized_step["kind"] = "cube";
+      serialized_step["plan"] =
           {{"emit_compatible", cube_plan.emit_compatible},
            {"spatial_policy", cube_spatial_policy_name(cube_plan.spatial_policy)},
            {"m_partition", axis_partition_json(cube_plan.m_partition)},
@@ -1000,9 +1121,7 @@ std::string solution_json(const Solution& sol) {
            {"overlap_implementable", cube_plan.overlap_implementable},
            {"execution_order", cube_plan.execution_order},
            {"resident_boundaries", resident_boundaries},
-           {"matmuls", matmuls}});
-    } else {
-      j["cube_schedule"].push_back(nullptr);
+           {"matmuls", matmuls}};
     }
     if (mixed_plan.feasible && mixed_plan.topology) {
       json topology_stages = json::array();
@@ -1021,7 +1140,7 @@ std::string solution_json(const Solution& sol) {
              {"cube_window_k", stage.cube_window_k},
              {"vector_stream",
               stage.vector_stream.feasible
-                  ? vector_stream_plan_json(stage.vector_stream)
+                  ? vector_stream_plan_json(sol.problem(), stage.vector_stream)
                   : json(nullptr)}});
       }
       json transfers = json::array();
@@ -1060,7 +1179,8 @@ std::string solution_json(const Solution& sol) {
       auto protocol_stage = [](size_t stage) {
         return stage == std::numeric_limits<size_t>::max() ? json(nullptr) : json(stage);
       };
-      j["mixed_schedule"].push_back(
+      serialized_step["kind"] = "mixed";
+      serialized_step["plan"] =
           {{"emit_compatible", mixed_plan.emit_compatible},
            {"source_codegen_ready", mixed_plan.source_codegen_ready},
            {"algorithm", mixed_algorithm_name(mixed_plan.algorithm)},
@@ -1101,13 +1221,12 @@ std::string solution_json(const Solution& sol) {
            {"stages", stages},
            {"transfers", transfers},
            {"fifos", fifos},
-           {"dense_mlp", dense_mlp}});
-    } else {
-      j["mixed_schedule"].push_back(nullptr);
+           {"dense_mlp", dense_mlp}};
     }
-    j["tensors_to_retain"].push_back(std::vector<size_t>(step.retain_these.begin(), step.retain_these.end()));
-
-        j["subgraph_latencies"].push_back(sol.step_latency(i));
+        serialized_step["retain"] =
+            std::vector<size_t>(step.retain_these.begin(), step.retain_these.end());
+        serialized_step["latency_cycles"] = sol.step_latency(i);
+        j["steps"].push_back(std::move(serialized_step));
     }
 
     return j.dump(2) + "\n";

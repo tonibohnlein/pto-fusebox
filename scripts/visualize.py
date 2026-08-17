@@ -62,6 +62,13 @@ def _at(data: JsonObject, key: str, index: int, default: Any) -> Any:
     return values[index] if index < len(values) else default
 
 
+def _solution_steps(solution: JsonObject) -> list[JsonObject]:
+    steps = solution.get("steps")
+    if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+        raise ValueError("solution must contain a steps array")
+    return steps
+
+
 def _shape(problem: JsonObject, tensor: int) -> str:
     height = problem["heights"][tensor]
     width = problem["widths"][tensor]
@@ -120,7 +127,9 @@ def build_instance_dot(problem: JsonObject) -> str:
         f'    InstanceInfo [label="{_dot_escape(hw_legend(problem))}", shape=note, '
         'style=filled, fillcolor="#fffde1", margin=0.2];'
     )
-    for tensor, (width, height) in enumerate(zip(problem["widths"], problem["heights"])):
+    for tensor, (width, height) in enumerate(
+        zip(problem["widths"], problem["heights"])
+    ):
         label = f"Tensor {tensor}\n{height}×{width}"
         lines.append(
             f'    T{tensor} [label="{label}", shape=box, style="rounded,filled", '
@@ -153,12 +162,15 @@ def _tensor_roles(
             producer[tensor] = op
 
     op_steps: dict[int, list[int]] = {}
-    for step, ops in enumerate(solution["subgraphs"]):
+    steps = _solution_steps(solution)
+    for step, item in enumerate(steps):
+        ops = item["ops"]
         for op in ops:
             op_steps.setdefault(op, []).append(step)
 
     retained: dict[int, list[int]] = {}
-    for step, tensors in enumerate(solution.get("tensors_to_retain", [])):
+    for step, item in enumerate(steps):
+        tensors = item.get("retain", [])
         for tensor in tensors:
             retained.setdefault(tensor, []).append(step)
 
@@ -170,8 +182,15 @@ def _tensor_roles(
             tensor_roles.append(f"retained {','.join(map(str, retained[tensor]))}")
         prod = producer.get(tensor)
         prod_steps = set(op_steps.get(prod, []))
-        consumer_steps = {step for op in consumers[tensor] for step in op_steps.get(op, [])}
-        if prod is None or tensor in required or not consumers[tensor] or consumer_steps - prod_steps:
+        consumer_steps = {
+            step for op in consumers[tensor] for step in op_steps.get(op, [])
+        }
+        if (
+            prod is None
+            or tensor in required
+            or not consumers[tensor]
+            or consumer_steps - prod_steps
+        ):
             tensor_roles.append("GM")
         if any(step in consumer_steps for step in prod_steps):
             tensor_roles.append("on-chip")
@@ -182,20 +201,24 @@ def _tensor_roles(
 
 
 def _kernel_kind(problem: JsonObject, solution: JsonObject, step: int) -> str:
-    ops = solution["subgraphs"][step]
+    ops = _solution_steps(solution)[step]["ops"]
     has_cube = any(problem["op_types"][op] == "MatMul" for op in ops)
-    has_vector = any(problem["op_types"][op] in ("Pointwise", "Reduction") for op in ops)
+    has_vector = any(
+        problem["op_types"][op] in ("Pointwise", "Reduction") for op in ops
+    )
     if has_cube and has_vector:
         return "mixed cube/vector"
     return "cube / AIC" if has_cube else "vector / AIV"
 
 
 def _kernel_summary(problem: JsonObject, solution: JsonObject, step: int) -> str:
-    width, height, contraction = _at(solution, "granularities", step, [0, 0, 0])
-    parts_m, parts_n = _at(solution, "parts", step, [0, 0])
-    split = _at(solution, "splits", step, 1)
-    cores = _at(solution, "cores", step, "?")
-    latency = _at(solution, "subgraph_latencies", step, 0.0)
+    item = _solution_steps(solution)[step]
+    launch = item["launch"]
+    width, height, contraction = launch["tile"]
+    parts_m, parts_n = launch["parts"]
+    split = launch["split"]
+    cores = launch["cores"]
+    latency = item["latency_cycles"]
     if parts_m and parts_n:
         grid = f"{parts_m}×{parts_n} regions"
     else:
@@ -215,7 +238,7 @@ def _kernel_legend(problem: JsonObject, solution: JsonObject) -> str:
         '<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">',
         '<TR><TD COLSPAN="2" BGCOLOR="#f7f7f7"><B>Chosen kernels</B></TD></TR>',
     ]
-    for step in range(len(solution["subgraphs"])):
+    for step in range(len(_solution_steps(solution))):
         color = KERNEL_COLORS[step % len(KERNEL_COLORS)]
         rows.append(
             f'<TR><TD BGCOLOR="{color}" WIDTH="18"></TD>'
@@ -232,57 +255,78 @@ def build_solution_dot(problem: JsonObject, solution: JsonObject) -> str:
         f'    InstanceInfo [label="{_dot_escape(hw_legend(problem))}", shape=note, '
         'style=filled, fillcolor="#fffde1", margin=0.2];'
     )
-    lines.append(f"    KernelLegend [shape=plain, label=<{_kernel_legend(problem, solution)}>];")
+    lines.append(
+        f"    KernelLegend [shape=plain, label=<{_kernel_legend(problem, solution)}>];"
+    )
     lines.append("    InstanceInfo:s -> KernelLegend:n [style=invis, weight=20];")
 
     roles, op_steps = _tensor_roles(problem, solution)
     capacity = problem.get("fast_memory_capacity", 0)
-    dtype_bytes = {"FP32": 4, "INT32": 4, "FP16": 2, "BF16": 2, "INT16": 2, "INT8": 1, "BOOL": 1}
-    for tensor, (width, height) in enumerate(zip(problem["widths"], problem["heights"])):
+    dtype_bytes = {
+        "FP32": 4,
+        "INT32": 4,
+        "FP16": 2,
+        "BF16": 2,
+        "INT16": 2,
+        "INT8": 1,
+        "BOOL": 1,
+    }
+    for tensor, (width, height) in enumerate(
+        zip(problem["widths"], problem["heights"])
+    ):
         dtype = _at(problem, "dtypes", tensor, "FP32")
         size = width * height * dtype_bytes.get(dtype, 4)
         tensor_roles = roles[tensor]
         fills = [
-            "#ffe16b" if role.startswith("retained") else "#c7c7c7" if role == "on-chip" else "#cae8f2"
+            "#ffe16b"
+            if role.startswith("retained")
+            else "#c7c7c7"
+            if role == "on-chip"
+            else "#cae8f2"
             for role in tensor_roles
         ]
         style = "rounded,filled,wedged" if len(fills) > 1 else "rounded,filled"
         border = "#c62828" if capacity and size > capacity else "#404040"
         penwidth = 2.4 if capacity and size > capacity else 1.0
-        label = f"Tensor {tensor}\n{height}×{width} {dtype}\n[{' | '.join(tensor_roles)}]"
+        label = (
+            f"Tensor {tensor}\n{height}×{width} {dtype}\n[{' | '.join(tensor_roles)}]"
+        )
         lines.append(
             f'    T{tensor} [label="{_dot_escape(label)}", shape=box, style="{style}", '
             f'fillcolor="{":".join(fills)}", color="{border}", penwidth={penwidth}, margin=0.12];'
         )
 
-    seq_k = solution.get("seq_k", [])
-    op_order = solution.get("op_order", [])
+    solution_steps = _solution_steps(solution)
     for op in range(len(problem["op_types"])):
-        steps = op_steps.get(op, [])
-        if not steps:
+        op_step_ids = op_steps.get(op, [])
+        if not op_step_ids:
             lines.append(
                 f'    Op{op} [label="Op {op}\\n{_dot_escape(_op_name(problem, op))}\\nunscheduled", '
                 'shape=ellipse, style=filled, fillcolor="#e0e0e0", ordering=out];'
             )
             continue
         extras: list[str] = []
-        first = steps[0]
+        first = op_step_ids[0]
         if (
-            first < len(seq_k)
-            and seq_k[first] is not None
-            and first < len(op_order)
-            and op in op_order[first]
+            solution_steps[first].get("sequential_tiles") is not None
+            and op in solution_steps[first]["op_order"]
         ):
-            stream = seq_k[first][op_order[first].index(op)]
+            stream = solution_steps[first]["sequential_tiles"][
+                solution_steps[first]["op_order"].index(op)
+            ]
             if stream:
-                extras.append(f"{'seq-K' if problem['op_types'][op] == 'MatMul' else 'stream'} {stream}")
-        if len(steps) > 1:
-            extras.append(f"recomputed in {','.join(map(str, steps))}")
+                extras.append(
+                    f"{'seq-K' if problem['op_types'][op] == 'MatMul' else 'stream'} {stream}"
+                )
+        if len(op_step_ids) > 1:
+            extras.append(f"recomputed in {','.join(map(str, op_step_ids))}")
         label = f"Op {op}\n{_op_name(problem, op)}"
         if extras:
             label += "\n" + " · ".join(extras)
-        fill = ":".join(KERNEL_COLORS[step % len(KERNEL_COLORS)] for step in steps)
-        style = "filled,wedged" if len(steps) > 1 else "filled"
+        fill = ":".join(
+            KERNEL_COLORS[step % len(KERNEL_COLORS)] for step in op_step_ids
+        )
+        style = "filled,wedged" if len(op_step_ids) > 1 else "filled"
         lines.append(
             f'    Op{op} [label="{_dot_escape(label)}", shape=ellipse, style="{style}", '
             f'fillcolor="{fill}", ordering=out];'
@@ -318,7 +362,12 @@ def _group_tensors(
     producer, consumers = _tensor_graph(problem)
     op_set = set(ops)
     boundary_inputs = sorted(
-        {tensor for op in ops for tensor in problem["inputs"][op] if producer.get(tensor) not in op_set}
+        {
+            tensor
+            for op in ops
+            for tensor in problem["inputs"][op]
+            if producer.get(tensor) not in op_set
+        }
     )
     required = set(problem.get("required_outputs", []))
     boundary_outputs = sorted(
@@ -351,8 +400,8 @@ def _vector_frame(problem: JsonObject, plan: JsonObject, tensor: int) -> str:
 
 
 def _source_order(solution: JsonObject, step: int) -> list[int]:
-    order = _at(solution, "op_order", step, None)
-    return list(order) if order is not None else list(solution["subgraphs"][step])
+    item = _solution_steps(solution)[step]
+    return list(item["op_order"])
 
 
 def _append_source_replay(
@@ -369,7 +418,10 @@ def _append_source_replay(
     boundary_inputs, boundary_outputs, _, consumers = _group_tensors(problem, ops)
     positions = {op: position for position, op in enumerate(ops)}
     last_use = {
-        tensor: max((positions[user] for user in consumers[tensor] if user in positions), default=-1)
+        tensor: max(
+            (positions[user] for user in consumers[tensor] if user in positions),
+            default=-1,
+        )
         for tensor in consumers
     }
     boundary_input_set = set(boundary_inputs)
@@ -382,7 +434,9 @@ def _append_source_replay(
         missing_inputs = sorted(
             tensor
             for tensor in problem["inputs"][op]
-            if tensor in boundary_input_set and tensor not in live and not substitutes_reduction
+            if tensor in boundary_input_set
+            and tensor not in live
+            and not substitutes_reduction
         )
         if missing_inputs:
             live.update(missing_inputs)
@@ -390,7 +444,10 @@ def _append_source_replay(
                 AlgorithmEvent(
                     phase,
                     "LOAD",
-                    tuple(f"GM → UB  {_vector_frame(problem, plan, tensor)}" for tensor in missing_inputs),
+                    tuple(
+                        f"GM → UB  {_vector_frame(problem, plan, tensor)}"
+                        for tensor in missing_inputs
+                    ),
                     tuple([f"UB: T{tensor}" for tensor in sorted(live)] + list(carry)),
                 )
             )
@@ -398,7 +455,9 @@ def _append_source_replay(
             live.add(tensor)
         if substitutes_reduction:
             action = "CARRY"
-            details = (f"Op {op} · {_op_name(problem, op)} is supplied by finalized online statistics",)
+            details = (
+                f"Op {op} · {_op_name(problem, op)} is supplied by finalized online statistics",
+            )
         else:
             action = "COMPUTE"
             inputs = ", ".join(f"T{tensor}" for tensor in problem["inputs"][op]) or "∅"
@@ -419,7 +478,10 @@ def _append_source_replay(
                 AlgorithmEvent(
                     phase,
                     "RELEASE",
-                    tuple(f"release T{tensor} after its last topological use" for tensor in releasable),
+                    tuple(
+                        f"release T{tensor} after its last topological use"
+                        for tensor in releasable
+                    ),
                     tuple([f"UB: T{tensor}" for tensor in sorted(live)] + list(carry)),
                 )
             )
@@ -429,7 +491,10 @@ def _append_source_replay(
             AlgorithmEvent(
                 phase,
                 "STORE",
-                tuple(f"UB → GM  {_vector_frame(problem, plan, tensor)}" for tensor in boundary_outputs),
+                tuple(
+                    f"UB → GM  {_vector_frame(problem, plan, tensor)}"
+                    for tensor in boundary_outputs
+                ),
                 tuple(carry),
             )
         )
@@ -449,30 +514,20 @@ def _primitive_work(phase: JsonObject) -> str:
     return "; ".join(work) if work else "source-DAG statistics cone"
 
 
-def _stats_ops(problem: JsonObject, solution: JsonObject, step: int) -> list[int]:
-    order = _source_order(solution, step)
-    reductions = [op for op in order if problem["op_types"][op] == "Reduction"]
-    if not reductions:
-        return []
-    producer, _ = _tensor_graph(problem)
-    group = set(order)
-    needed = set(reductions)
-    pending = list(reductions)
-    while pending:
-        op = pending.pop()
-        for tensor in problem["inputs"][op]:
-            parent = producer.get(tensor)
-            if parent in group and parent not in needed:
-                needed.add(parent)
-                pending.append(parent)
-    return [op for op in order if op in needed]
+def _stats_ops(plan: JsonObject) -> list[int]:
+    for phase in plan.get("phases", []):
+        if phase.get("name") == "stats":
+            return list(phase.get("ops", []))
+    return []
 
 
-def _stats_order(problem: JsonObject, solution: JsonObject, step: int) -> str:
-    stats_ops = _stats_ops(problem, solution, step)
+def _stats_order(problem: JsonObject, plan: JsonObject) -> str:
+    stats_ops = _stats_ops(plan)
     if not stats_ops:
         return "source-DAG statistics cone"
-    return "topological statistics: " + " → ".join(f"Op {op} {_op_name(problem, op)}" for op in stats_ops)
+    return "topological statistics: " + " → ".join(
+        f"Op {op} {_op_name(problem, op)}" for op in stats_ops
+    )
 
 
 def _vector_events(
@@ -480,6 +535,7 @@ def _vector_events(
 ) -> list[AlgorithmEvent]:
     events: list[AlgorithmEvent] = []
     kind = plan["kind"]
+    phases = {phase["name"]: phase for phase in plan.get("phases", [])}
     split = plan.get("reduction_split", {})
     seed = split.get("seed", {})
     if seed.get("present"):
@@ -496,7 +552,7 @@ def _vector_events(
         )
 
     if kind in ("materialized", "pointwise"):
-        body = plan.get("body", {})
+        body = phases.get("body", {}).get("loop", {})
         strip_h, strip_w = plan.get("strip", plan.get("tile", [0, 0]))
         row_strips, width_strips = plan.get("strip_grid", [1, 1])
         events.append(
@@ -512,18 +568,24 @@ def _vector_events(
                 (),
             )
         )
-        _append_source_replay(events, problem, solution, step, plan, "strip body", False)
+        _append_source_replay(
+            events, problem, solution, step, plan, "strip body", False
+        )
         return events
 
-    serial = plan.get("serial_phases", {})
     p4_work = plan.get("p4_work", {})
     carry_name = {
         "softmax_flash": "UB carry: (row max m, normalizer l)",
         "layernorm_welford": "UB carry: (mean, M2, count)",
     }.get(kind, "UB carry: reduction accumulator")
-    stats_ops = _stats_ops(problem, solution, step)
-    boundary_inputs, _, _, _ = _group_tensors(problem, stats_ops or _source_order(solution, step))
-    init = serial.get("stats_init", {})
+    stats_ops = _stats_ops(plan)
+    boundary_inputs, _, _, _ = _group_tensors(
+        problem, stats_ops or _source_order(solution, step)
+    )
+    stats_phase = phases.get("stats", {})
+    apply_phase = phases.get("apply", {})
+    finalize_phase = phases.get("finalize", {})
+    init = stats_phase.get("init", {})
     if init.get("present"):
         events.append(
             AlgorithmEvent(
@@ -539,7 +601,7 @@ def _vector_events(
         init_work = (
             _primitive_work(p4_work.get("stats_init", {}))
             if p4_work.get("generated")
-            else _stats_order(problem, solution, step)
+            else _stats_order(problem, plan)
         )
         events.append(
             AlgorithmEvent(
@@ -550,12 +612,12 @@ def _vector_events(
             )
         )
 
-    stats = plan.get("stats", {})
+    stats = stats_phase.get("loop", {})
     if stats.get("trip_count", 0):
         update_work = (
             _primitive_work(p4_work.get("stats_update", {}))
             if p4_work.get("generated")
-            else _stats_order(problem, solution, step)
+            else _stats_order(problem, plan)
         )
         events.append(
             AlgorithmEvent(
@@ -570,7 +632,7 @@ def _vector_events(
             )
         )
 
-    stats_tail = serial.get("stats_tail", {})
+    stats_tail = stats_phase.get("tail", {})
     if stats_tail.get("present"):
         events.append(
             AlgorithmEvent(
@@ -584,7 +646,7 @@ def _vector_events(
             )
         )
 
-    finalize = serial.get("finalize", {})
+    finalize = finalize_phase.get("serial", {})
     if finalize.get("present"):
         finalize_work = (
             _primitive_work(p4_work.get("finalize", {}))
@@ -600,8 +662,8 @@ def _vector_events(
             )
         )
 
-    apply = plan.get("apply", {})
-    if apply.get("trip_count", 0) or serial.get("apply_tail", {}).get("present"):
+    apply = apply_phase.get("loop", {})
+    if apply.get("trip_count", 0) or apply_phase.get("tail", {}).get("present"):
         events.append(
             AlgorithmEvent(
                 "spanning apply",
@@ -624,7 +686,7 @@ def _vector_events(
             True,
             (carry_name.replace("carry", "final statistics"),),
         )
-        apply_tail = serial.get("apply_tail", {})
+        apply_tail = apply_phase.get("tail", {})
         if apply_tail.get("present"):
             events.append(
                 AlgorithmEvent(
@@ -638,12 +700,17 @@ def _vector_events(
                 )
             )
     else:
-        _, boundary_outputs, _, _ = _group_tensors(problem, _source_order(solution, step))
+        _, boundary_outputs, _, _ = _group_tensors(
+            problem, _source_order(solution, step)
+        )
         events.append(
             AlgorithmEvent(
                 "reduction result",
                 "STORE",
-                tuple(f"UB accumulator → GM  {_shape(problem, tensor)}" for tensor in boundary_outputs),
+                tuple(
+                    f"UB accumulator → GM  {_shape(problem, tensor)}"
+                    for tensor in boundary_outputs
+                ),
                 (),
             )
         )
@@ -675,7 +742,9 @@ def _cube_operand_source(
 ) -> str:
     producer = mm.get(f"{side}_producer", -1)
     if producer >= 0:
-        release = " · release after load" if last_use.get(producer) == request_index else ""
+        release = (
+            " · release after load" if last_use.get(producer) == request_index else ""
+        )
         return f"{side.upper()}: L1 result from request {producer}{release}"
     retained = mm.get("retained_panels", {}).get(side, False)
     if retained:
@@ -715,9 +784,12 @@ def _append_cube_request_flow(
     result_nodes: dict[int, str],
 ) -> tuple[str, str]:
     variants = mm.get("output_variants", [])
-    representative = max(variants, key=lambda variant: variant["shape"][0] * variant["shape"][1])
+    representative = max(
+        variants, key=lambda variant: variant["shape"][0] * variant["shape"][1]
+    )
     variant_text = ", ".join(
-        f"{variant['shape'][0]}×{variant['shape'][1]} ×{variant['count']}" for variant in variants
+        f"{variant['shape'][0]}×{variant['shape'][1]} ×{variant['count']}"
+        for variant in variants
     )
     k_loop = mm["k_loop"]
     full_chunks = k_loop["full_chunks"]
@@ -885,11 +957,17 @@ def _append_cube_request_flow(
         f"[{drain['valid_rows']}×{drain['valid_cols']}]"
     )
     lines.append(_flow_node(result_node, result_label, "#ffd8c2", penwidth=1.5))
-    lines.append(f'        {accumulator_nodes[-1]}:s -> {result_node}:n [color="#b99100", penwidth=2.2];')
+    lines.append(
+        f'        {accumulator_nodes[-1]}:s -> {result_node}:n [color="#b99100", penwidth=2.2];'
+    )
     lines.append("    }")
 
     producers = sorted(
-        {producer for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)) if producer >= 0}
+        {
+            producer
+            for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1))
+            if producer >= 0
+        }
     )
     for producer in producers:
         lines.append(
@@ -898,9 +976,11 @@ def _append_cube_request_flow(
     return input_node, result_node
 
 
-def _algorithm_title(problem: JsonObject, solution: JsonObject, step: int, plan: JsonObject) -> str:
+def _algorithm_title(
+    problem: JsonObject, solution: JsonObject, step: int, plan: JsonObject
+) -> str:
     summary = _kernel_summary(problem, solution, step)
-    if _at(solution, "vector_stream", step, None) is not None:
+    if _solution_steps(solution)[step]["kind"] == "vector":
         detail = (
             f"VectorStreamPlan: {plan['kind']} · {plan.get('work_units', '?')} logical work units · "
             f"one diagrammed region · UB peak {plan.get('chunk_peak_ub_bytes', 0)} B"
@@ -944,9 +1024,13 @@ def _build_cube_algorithm_dot(
     last_use = _cube_last_uses(plan)
     result_nodes: dict[int, str] = {}
     for index, mm in enumerate(plan.get("matmuls", [])):
-        input_node, result_node = _append_cube_request_flow(lines, mm, index, last_use, result_nodes)
+        input_node, result_node = _append_cube_request_flow(
+            lines, mm, index, last_use, result_nodes
+        )
         producers = {
-            producer for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1)) if producer >= 0
+            producer
+            for producer in (mm.get("lhs_producer", -1), mm.get("rhs_producer", -1))
+            if producer >= 0
         }
         if index == 0:
             lines.append(f"    {previous}:s -> {input_node}:w [minlen=2];")
@@ -960,7 +1044,9 @@ def _build_cube_algorithm_dot(
 
 def _event_label(event: AlgorithmEvent, index: int) -> str:
     color = EVENT_COLORS[event.action]
-    details = '<BR ALIGN="LEFT"/>'.join(_html(line) for line in event.details) or "&nbsp;"
+    details = (
+        '<BR ALIGN="LEFT"/>'.join(_html(line) for line in event.details) or "&nbsp;"
+    )
     return (
         '<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="7">'
         f'<TR><TD BGCOLOR="{color}" ALIGN="LEFT"><B>{index + 1:02d} · {_html(event.action)}</B>'
@@ -982,15 +1068,15 @@ def _memory_label(event: AlgorithmEvent) -> str:
 
 def build_algorithm_dot(problem: JsonObject, solution: JsonObject, step: int) -> str:
     """Build a one-work-unit algorithm/liveness timeline for one chosen kernel."""
-    if step < 0 or step >= len(solution["subgraphs"]):
-        raise ValueError(f"kernel step must be in [0, {len(solution['subgraphs'])}), got {step}")
-    vector_plan = _at(solution, "vector_stream", step, None)
-    cube_plan = _at(solution, "cube_schedule", step, None)
-    if vector_plan is not None:
-        plan = vector_plan
+    steps = _solution_steps(solution)
+    if step < 0 or step >= len(steps):
+        raise ValueError(f"kernel step must be in [0, {len(steps)}), got {step}")
+    item = steps[step]
+    plan = item["plan"]
+    if item["kind"] == "vector":
         events = _vector_events(problem, solution, step, plan)
-    elif cube_plan is not None:
-        return _build_cube_algorithm_dot(problem, solution, step, cube_plan)
+    elif item["kind"] == "cube":
+        return _build_cube_algorithm_dot(problem, solution, step, plan)
     else:
         raise ValueError(
             f"kernel {step} has no vector or cube schedule descriptor; regenerate the solution "
@@ -1008,7 +1094,9 @@ def build_algorithm_dot(problem: JsonObject, solution: JsonObject, step: int) ->
         lines.append(f"    E{index} [shape=plain, label={_event_label(event, index)}];")
         lines.append(f"    M{index} [shape=plain, label={_memory_label(event)}];")
         lines.append(f"    {{ rank=same; E{index}; M{index}; }}")
-        lines.append(f'    E{index} -> M{index} [dir=none, style=dashed, color="#b0b0b0", constraint=false];')
+        lines.append(
+            f'    E{index} -> M{index} [dir=none, style=dashed, color="#b0b0b0", constraint=false];'
+        )
         if index == 0:
             lines.append("    Title:s -> E0:n;")
         else:
@@ -1030,7 +1118,9 @@ def generate_instance_dot(problem: JsonObject, out_filepath: str | Path) -> None
     _write_dot(build_instance_dot(problem), out_filepath, "Instance")
 
 
-def generate_solution_dot(problem: JsonObject, solution: JsonObject, out_filepath: str | Path) -> None:
+def generate_solution_dot(
+    problem: JsonObject, solution: JsonObject, out_filepath: str | Path
+) -> None:
     """Write the colored fusion-partition diagram."""
     _write_dot(build_solution_dot(problem, solution), out_filepath, "Solution")
 
@@ -1039,7 +1129,11 @@ def generate_algorithm_dot(
     problem: JsonObject, solution: JsonObject, step: int, out_filepath: str | Path
 ) -> None:
     """Write one selected kernel's algorithm timeline."""
-    _write_dot(build_algorithm_dot(problem, solution, step), out_filepath, f"Kernel {step} algorithm")
+    _write_dot(
+        build_algorithm_dot(problem, solution, step),
+        out_filepath,
+        f"Kernel {step} algorithm",
+    )
 
 
 def generate_algorithm_dots(
@@ -1048,11 +1142,8 @@ def generate_algorithm_dots(
     """Write one algorithm DOT per homogeneous vector/cube kernel."""
     prefix = Path(output_prefix)
     paths: list[Path] = []
-    for step in range(len(solution["subgraphs"])):
-        if (
-            _at(solution, "vector_stream", step, None) is None
-            and _at(solution, "cube_schedule", step, None) is None
-        ):
+    for step, item in enumerate(_solution_steps(solution)):
+        if item["kind"] not in {"vector", "cube"}:
             continue
         path = prefix.parent / f"{prefix.name}-kernel-{step}.dot"
         generate_algorithm_dot(problem, solution, step, path)
@@ -1068,7 +1159,9 @@ def _parse_args() -> argparse.Namespace:
     instance.add_argument("input_json")
     instance.add_argument("out_dot")
 
-    solution = subparsers.add_parser("solution", help="render the colored fusion partition")
+    solution = subparsers.add_parser(
+        "solution", help="render the colored fusion partition"
+    )
     solution.add_argument("input_json")
     solution.add_argument("solution_json")
     solution.add_argument("out_dot")
@@ -1079,7 +1172,9 @@ def _parse_args() -> argparse.Namespace:
     algorithm.add_argument("step", type=int)
     algorithm.add_argument("out_dot")
 
-    algorithms = subparsers.add_parser("algorithms", help="render every vector/cube kernel algorithm")
+    algorithms = subparsers.add_parser(
+        "algorithms", help="render every vector/cube kernel algorithm"
+    )
     algorithms.add_argument("input_json")
     algorithms.add_argument("solution_json")
     algorithms.add_argument("output_prefix")

@@ -65,44 +65,51 @@ The problem is specified in a JSON file containing the graph topology and hardwa
 
 ### Output
 
-You must provide a JSON object containing parallel lists that define the execution schedule.
+The current executable writes the versioned `pto_fusebox.solution.v2` schema.
+Each selected kernel is one nested step so its common launch contract and
+family-specific plan cannot drift through misaligned parallel arrays.
 
 ```json
-{ 
-  "subgraphs": [
-    [0, 1], // Step 1: Group nodes 0 and 1
-    [2]     // Step 2: Run node 2 
-  ],
-  "granularities": [
-    [64, 64, 128], // Step 1: MatMul (64x64 output, 128 depth) 
-    [128, 128, 1]  // Step 2: Pointwise (128x128 output, k=1)
-  ],
-  "tensors_to_retain": [ // REQUIRED: Output tensors to keep in Fast Memory
-    [1],                 // Step 1: Keep Tensor 1 resident (for Step 2)
-    []                   // Step 2: Evict all outputs to Slow Memory
-  ],
-  "traversal_orders": [ // OPTIONAL: Permutation of slice indices
-    [0, 1, 3, 2],       // Step 1: Custom "Snake" order
-    null                // Step 2: Default (Raster) [0, 1, 2, 3...] 
-  ],
-  "subgraph_latencies": [ // REQUIRED: The calculated latency for each step
-    2048.0, 
-    1024.0
+{
+  "schema_version": "pto_fusebox.solution.v2",
+  "steps": [
+    {
+      "kind": "cube",
+      "ops": [0, 1],
+      "op_order": [0, 1],
+      "launch": {
+        "tile": [64, 64, 128],
+        "parts": [2, 2],
+        "split": 1,
+        "cores": 4
+      },
+      "sequential_tiles": [128, 0],
+      "retain": [1],
+      "latency_cycles": 2048.0,
+      "plan": {
+        "...": "typed vector, cube, or mixed schedule descriptor"
+      }
+    }
   ]
 }
 ```
 
-Regarding the “granularities” list, the `[w, h, k]` tuple acts as a master key that deterministically sets the shape of all inputs required by the subgraph (recalling that width corresponds to columns and height corresponds to rows). The output and pointwise input will both have width `w` and height `h`. For MatMul inputs, the Left-Hand Side (LHS) input requires width `k` (reduction depth) and height `h`, while the Right-Hand Side (RHS) Input requires width `w` and height `k`.
-
-Regarding the “tensors\_to\_retain” list, a list of lists where tensors\_to\_retain\[k\] specifies which output tensors from Subgraph k should remain resident in the fast memory after the subgraph finishes. Any tensor not in this list is automatically evicted to the slow memory (if it is an output) or discarded (if it was an input). **Note on Data Reuse:** `tensors_to_retain` strictly controls **Inter-Subgraph** persistence (keeping data resident *across* the boundary from one step to the next). For **Intra-Subgraph** reuse (keeping data resident *during* the execution of a single step, e.g., by optimizing `traversal_orders`), the hardware manages residency automatically/implicitly. You do **not** need to list tensors for intra-subgraph reuse in this field.
-
-Regarding the “traversal\_orders” list, when you choose a spatial granularity `(w, h)` smaller than the output tensor, the system implicitly creates a grid of tiles indexed in Row-Major (Raster) Order. For example, a `128x128` tensor with `64x64` granularity creates indices 0 (top-left), 1 (top-right), 2 (bottom-left), and 3 (bottom-right). The “traversal\_orders” field allows you to specify the exact sequence of execution (e.g., `[0, 1, 3, 2]`) to optimize data reuse (like a "Snake" pattern). If omitted, the system defaults to Raster order.
-
-Regarding the “subgraph\_latencies” list, you must provide the total latency for that schedule entry. If a chosen granularity implies multiple tiles (e.g., 4 spatial tiles or 4 split-k steps), the reported latency must be the sum of all those steps.
+`launch.tile` retains the common `[w, h, k]` optimizer configuration and is a
+diagnostic summary. A derived family plan can have different physical replay
+frames—for example, a reduction's free output axis and streamed input axis.
+The nested `plan` is authoritative for intra-kernel order, lifetimes, physical
+frames, loops, memory policy, and family-specific traffic. `retain` controls
+inter-kernel persistence, and `latency_cycles` is the complete modeled latency
+of the step. The strict Python decoder rejects missing, unknown, or conflicting
+fields before source emission. See `doc/torch_to_pypto_frontend.md` for the
+current typed problem/solution and PyPTO source-generation contract.
 
 ## Examples
 
-This section provides five examples to demonstrate the core trade-offs of the challenge.
+This section preserves five legacy competition-format examples to demonstrate
+the core trade-offs. Their parallel-array output snippets are conceptual; the
+current executable serializes the equivalent choices as nested `solution.v2`
+steps described above.
 
 ### Example 1: Baseline
 

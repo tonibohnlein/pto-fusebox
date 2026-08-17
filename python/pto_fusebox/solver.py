@@ -30,46 +30,10 @@ class RegionSolveResult:
     stderr: str = ""
     returncode: int | None = None
 
-    @property
-    def source_codegen_ready(self) -> bool:
-        """Whether the selected steps carry complete source-backend schedules."""
-
-        if self.status != "solved" or self.solution is None:
-            return False
-        schedules = self.solution.get("mixed_schedule")
-        vector_schedules = self.solution.get("vector_stream")
-        cube_schedules = self.solution.get("cube_schedule")
-        subgraphs = self.solution.get("subgraphs")
-        if (
-            not isinstance(schedules, list)
-            or not isinstance(vector_schedules, list)
-            or not isinstance(cube_schedules, list)
-            or not isinstance(subgraphs, list)
-            or len(schedules) != len(subgraphs)
-            or len(vector_schedules) != len(subgraphs)
-            or len(cube_schedules) != len(subgraphs)
-        ):
-            return False
-        for mixed, vector, cube in zip(
-            schedules, vector_schedules, cube_schedules, strict=True
-        ):
-            if mixed is not None:
-                if not (
-                    isinstance(mixed, Mapping)
-                    and mixed.get("source_codegen_ready") is True
-                ):
-                    return False
-            elif vector is None and cube is None:
-                return False
-            elif vector is not None and not isinstance(vector, Mapping):
-                return False
-            elif cube is not None and not isinstance(cube, Mapping):
-                return False
-        return True
-
 
 @dataclass(frozen=True)
 class SolveResult:
+    graph: NormalizedGraph
     target: str
     regions: tuple[RegionSolveResult, ...]
     graph_diagnostics: tuple[str, ...]
@@ -78,7 +42,9 @@ class SolveResult:
 
     @property
     def regions_solved(self) -> bool:
-        return bool(self.regions) and all(region.status == "solved" for region in self.regions)
+        return bool(self.regions) and all(
+            region.status == "solved" for region in self.regions
+        )
 
     @property
     def successful(self) -> bool:
@@ -90,10 +56,14 @@ class SolveResult:
     def whole_graph_codegen_ready(self) -> bool:
         """Whether the whole graph and every selected schedule are source-ready."""
 
+        # Local import keeps the subprocess bridge independent of source
+        # rendering during module initialization.
+        from .source import can_emit_region
+
         return (
             self.whole_graph_supported
             and self.regions_solved
-            and all(region.source_codegen_ready for region in self.regions)
+            and all(can_emit_region(self.graph, region) for region in self.regions)
         )
 
 
@@ -147,6 +117,7 @@ def solve_graph(
         for region in regions
     ]
     return SolveResult(
+        graph=graph,
         target=profile.name,
         regions=tuple(region_results),
         graph_diagnostics=graph.diagnostics,
@@ -169,7 +140,8 @@ def _solve_region(
         problem_path = root / "problem.json"
         solution_path = root / "solution.json"
         problem_path.write_text(
-            json.dumps(lowered.problem, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+            json.dumps(lowered.problem, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
         )
         command = [str(executable)]
         if solver_workers is not None:
@@ -189,7 +161,10 @@ def _solve_region(
                 solution=None,
                 solver_op_to_graph=lowered.solver_op_to_graph,
                 solver_tensor_to_value=lowered.solver_tensor_to_value,
-                diagnostics=(*region.diagnostics, "C++ solver returned a non-zero status"),
+                diagnostics=(
+                    *region.diagnostics,
+                    "C++ solver returned a non-zero status",
+                ),
                 stdout=process.stdout,
                 stderr=process.stderr,
                 returncode=process.returncode,
@@ -202,7 +177,10 @@ def _solve_region(
                 solution=None,
                 solver_op_to_graph=lowered.solver_op_to_graph,
                 solver_tensor_to_value=lowered.solver_tensor_to_value,
-                diagnostics=(*region.diagnostics, "C++ solver did not create a solution file"),
+                diagnostics=(
+                    *region.diagnostics,
+                    "C++ solver did not create a solution file",
+                ),
                 stdout=process.stdout,
                 stderr=process.stderr,
                 returncode=process.returncode,
@@ -211,9 +189,13 @@ def _solve_region(
         if not isinstance(solution, dict):
             raise ValueError("solver solution JSON must contain an object")
         schema = solution.get("schema_version")
-        if schema not in {None, SOLUTION_SCHEMA}:
-            raise ValueError(f"unsupported solver solution schema {schema!r}; expected {SOLUTION_SCHEMA!r}")
-        infeasible_reason = _infeasible_solution_reason(solution, len(lowered.solver_op_to_graph))
+        if schema != SOLUTION_SCHEMA:
+            raise ValueError(
+                f"unsupported solver solution schema {schema!r}; expected {SOLUTION_SCHEMA!r}"
+            )
+        infeasible_reason = _infeasible_solution_reason(
+            solution, len(lowered.solver_op_to_graph)
+        )
         if infeasible_reason is not None:
             return RegionSolveResult(
                 region=region,
@@ -259,27 +241,33 @@ def _resolve_solver_binary(value: str | os.PathLike[str] | None) -> Path:
     )
 
 
-def _infeasible_solution_reason(solution: Mapping[str, Any], num_ops: int) -> str | None:
-    subgraphs = solution.get("subgraphs")
-    granularities = solution.get("granularities")
-    latencies = solution.get("subgraph_latencies")
-    if (
-        not isinstance(subgraphs, list)
-        or not isinstance(granularities, list)
-        or not isinstance(latencies, list)
-    ):
-        return "solver response omits subgraph, granularity, or latency arrays"
-    if not subgraphs or len(subgraphs) != len(granularities) or len(subgraphs) != len(latencies):
+def _infeasible_solution_reason(
+    solution: Mapping[str, Any], num_ops: int
+) -> str | None:
+    steps = solution.get("steps")
+    if not isinstance(steps, list) or not steps:
         return "solver response contains no complete schedule"
     covered: set[int] = set()
-    for index, (subgraph, granularity, latency) in enumerate(zip(subgraphs, granularities, latencies)):
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            return f"solver step {index} is not an object"
+        subgraph = step.get("ops")
+        launch = step.get("launch")
+        latency = step.get("latency_cycles")
         if (
-            not subgraph
-            or any(not isinstance(item, int) or item < 0 or item >= num_ops for item in subgraph)
+            not isinstance(subgraph, list)
+            or not subgraph
+            or any(
+                not isinstance(item, int) or item < 0 or item >= num_ops
+                for item in subgraph
+            )
             or len(set(subgraph)) != len(subgraph)
         ):
             return f"solver step {index} references an invalid subgraph"
         covered.update(subgraph)
+        if not isinstance(launch, Mapping):
+            return f"solver step {index} has no launch descriptor"
+        granularity = launch.get("tile")
         if (
             not isinstance(granularity, list)
             or len(granularity) != 3

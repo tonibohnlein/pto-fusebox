@@ -33,6 +33,15 @@ double GroundedColumnReductionCycles(VectorPrimitiveFamily family, DType dtype,
 // 11-cycle head plus 13-cycle tail independent of valid extent.
 double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols);
 
+// Candidate-local allocation descriptors produced only for final-plan
+// serialization. Keeping them outside VectorStreamPlan avoids per-tensor
+// allocations in candidate enumeration's hot path.
+std::array<std::vector<VectorTensorFramePlan>, 4>
+BuildVectorTensorFrames(const Problem& problem, const VectorStreamPlan& plan);
+std::array<std::vector<VectorWorkspaceFramePlan>, 4>
+BuildVectorWorkspaceFrames(const Problem& problem,
+                           const VectorStreamPlan& plan);
+
 // Ephemeral memo for one best_cost()/enumerate_plans() call. It is deliberately
 // absent from CostResult and CostCache: exact L0 costing may revisit the same
 // local shape across many outer grids, but global search cache entries must stay
@@ -444,6 +453,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // multi-reduction is buildable only under the analytic model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
   FlatSet<size_t> p4_apply_substitutions_;
+  std::vector<P4ApplyBinding> p4_apply_bindings_;
+  std::shared_ptr<const VectorP4RecipePlan> vector_p4_recipe_;
   // Candidate-hot UB and phase replay use compact metadata prepared once in
   // create(). Shapes remain candidate-dependent; graph positions, lifetimes,
   // transient references, and phase membership do not.

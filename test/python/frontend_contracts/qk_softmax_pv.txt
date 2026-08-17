@@ -39,4 +39,4 @@ region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007 in
   solver_op 5 graph=op0006 Pointwise primitive=div geometry=row_expand capability=elementwise mixed=none (5,6)->(7)
   solver_op 6 graph=op0007 MatMul primitive=generic geometry=generic capability=generic mixed=none (7,8)->(9)
   required=9
-  p4=[{"apply_substitutions":[1,4],"kind":"softmax_flash","ops":[1,2,3,4,5]}]
+  p4=[{"apply_substitutions":[{"op":1,"value":"running_max"},{"op":4,"value":"running_sum"}],"kind":"softmax_flash","ops":[1,2,3,4,5]}]

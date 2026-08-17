@@ -18,8 +18,12 @@ def run_examples(examples: Mapping[str, Example]) -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=tuple(examples), help="run only one example")
-    parser.add_argument("--json", action="store_true", help="print normalized graph JSON")
-    parser.add_argument("--solver", type=Path, help="optional path to a built mlsys_mixed solver")
+    parser.add_argument(
+        "--json", action="store_true", help="print normalized graph JSON"
+    )
+    parser.add_argument(
+        "--solver", type=Path, help="optional path to a built mlsys_mixed solver"
+    )
     parser.add_argument(
         "--solver-workers",
         type=int,
@@ -33,12 +37,18 @@ def run_examples(examples: Mapping[str, Example]) -> None:
         graph = export_and_normalize(module.eval(), example_args)
         regions = extract_solver_regions(graph)
         op_kinds = " -> ".join(op.kind for op in graph.ops)
-        opaque = [f"{op.kind}: {op.opaque_reason}" for op in graph.ops if not op.supported]
+        opaque = [
+            f"{op.kind}: {op.opaque_reason}" for op in graph.ops if not op.supported
+        ]
 
-        print(f"{name}: {len(graph.ops)} ops, {len(regions)} supported region candidate(s)")
+        print(
+            f"{name}: {len(graph.ops)} ops, {len(regions)} supported region candidate(s)"
+        )
         print(f"  DAG: {op_kinds}")
         if graph.patterns:
-            print(f"  annotations: {', '.join(pattern.kind for pattern in graph.patterns)}")
+            print(
+                f"  annotations: {', '.join(pattern.kind for pattern in graph.patterns)}"
+            )
         if opaque:
             print(f"  opaque boundaries: {'; '.join(opaque)}")
         if args.json:
@@ -56,15 +66,14 @@ def run_examples(examples: Mapping[str, Example]) -> None:
                     print(f"    {diagnostic}")
                 if region.status != "solved" or region.solution is None:
                     continue
-                steps = zip(
-                    region.solution["subgraphs"],
-                    region.solution["granularities"],
-                    region.solution["subgraph_latencies"],
-                    strict=True,
-                )
-                for index, (solver_ops, tile, latency) in enumerate(steps):
+                for index, step in enumerate(region.solution["steps"]):
+                    solver_ops = step["ops"]
+                    tile = step["launch"]["tile"]
+                    latency = step["latency_cycles"]
                     kinds = " -> ".join(
                         op_by_id[region.solver_op_to_graph[solver_op]].kind
                         for solver_op in solver_ops
                     )
-                    print(f"    step {index}: {kinds}; tile={tile}; latency={latency:.1f}")
+                    print(
+                        f"    step {index}: {kinds}; tile={tile}; latency={latency:.1f}"
+                    )

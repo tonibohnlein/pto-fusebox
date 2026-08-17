@@ -10,7 +10,7 @@ from typing import Any
 
 NORMALIZED_GRAPH_SCHEMA = "pto_fusebox.normalized_graph.v1"
 PROBLEM_SCHEMA = "pto_fusebox.problem.v1"
-SOLUTION_SCHEMA = "pto_fusebox.solution.v1"
+SOLUTION_SCHEMA = "pto_fusebox.solution.v2"
 
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -64,10 +64,14 @@ class NormalizedValue:
             "dtype": self.dtype,
             "role": self.role,
             "strides": (
-                None if self.strides is None else [_dimension_to_json(stride) for stride in self.strides]
+                None
+                if self.strides is None
+                else [_dimension_to_json(stride) for stride in self.strides]
             ),
             "storage_offset": (
-                None if self.storage_offset is None else _dimension_to_json(self.storage_offset)
+                None
+                if self.storage_offset is None
+                else _dimension_to_json(self.storage_offset)
             ),
             "producer": self.producer,
             "target": self.target,
@@ -88,7 +92,9 @@ class NormalizedValue:
                 else tuple(_dimension_from_json(stride) for stride in value["strides"])
             ),
             storage_offset=(
-                None if value.get("storage_offset") is None else _dimension_from_json(value["storage_offset"])
+                None
+                if value.get("storage_offset") is None
+                else _dimension_from_json(value["storage_offset"])
             ),
             producer=_optional_str(value.get("producer")),
             target=_optional_str(value.get("target")),
@@ -137,16 +143,33 @@ class NormalizedOp:
 
 
 @dataclass(frozen=True)
+class GraphPatternBinding:
+    """One semantically named value supplied by a generated algorithm."""
+
+    op: str
+    value: str
+
+    def to_json(self) -> dict[str, JsonValue]:
+        return {"op": self.op, "value": self.value}
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> GraphPatternBinding:
+        return cls(op=str(value["op"]), value=str(value["value"]))
+
+
+@dataclass(frozen=True)
 class GraphPattern:
     kind: str
     ops: tuple[str, ...]
     apply_substitutions: tuple[str, ...] = ()
+    apply_bindings: tuple[GraphPatternBinding, ...] = ()
 
     def to_json(self) -> dict[str, JsonValue]:
         return {
             "kind": self.kind,
             "ops": list(self.ops),
             "apply_substitutions": list(self.apply_substitutions),
+            "apply_bindings": [binding.to_json() for binding in self.apply_bindings],
         }
 
     @classmethod
@@ -154,7 +177,13 @@ class GraphPattern:
         return cls(
             kind=str(value["kind"]),
             ops=tuple(str(item) for item in value["ops"]),
-            apply_substitutions=tuple(str(item) for item in value.get("apply_substitutions", [])),
+            apply_substitutions=tuple(
+                str(item) for item in value.get("apply_substitutions", [])
+            ),
+            apply_bindings=tuple(
+                GraphPatternBinding.from_json(item)
+                for item in value.get("apply_bindings", [])
+            ),
         )
 
 
@@ -192,14 +221,16 @@ class NormalizedGraph:
             "diagnostics": list(self.diagnostics),
             "input_tree_spec": _canonical_json_value(self.input_tree_spec),
             "output_tree_spec": _canonical_json_value(self.output_tree_spec),
-            "output_specs": [_canonical_json_value(dict(spec)) for spec in self.output_specs],
+            "output_specs": [
+                _canonical_json_value(dict(spec)) for spec in self.output_specs
+            ],
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
         separators = (",", ":") if indent is None else None
-        return json.dumps(self.to_dict(), sort_keys=True, indent=indent, separators=separators) + (
-            "\n" if indent is not None else ""
-        )
+        return json.dumps(
+            self.to_dict(), sort_keys=True, indent=indent, separators=separators
+        ) + ("\n" if indent is not None else "")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> NormalizedGraph:
@@ -216,7 +247,9 @@ class NormalizedGraph:
             ops=tuple(NormalizedOp.from_json(item) for item in value["ops"]),
             inputs=tuple(str(item) for item in value["inputs"]),
             outputs=tuple(str(item) for item in value["outputs"]),
-            patterns=tuple(GraphPattern.from_json(item) for item in value.get("patterns", [])),
+            patterns=tuple(
+                GraphPattern.from_json(item) for item in value.get("patterns", [])
+            ),
             constraints={str(key): dict(item) for key, item in constraints.items()},
             diagnostics=tuple(str(item) for item in value.get("diagnostics", [])),
             input_tree_spec=_canonical_json_value(value.get("input_tree_spec")),
@@ -254,17 +287,25 @@ def _validate_graph(graph: NormalizedGraph) -> None:
     _validate_output_specs(graph)
 
 
-def _validate_values(graph: NormalizedGraph, known_values: set[str], known_ops: set[str]) -> None:
+def _validate_values(
+    graph: NormalizedGraph, known_values: set[str], known_ops: set[str]
+) -> None:
     op_outputs = {op.id: set(op.outputs) for op in graph.ops}
     for value in graph.values:
         if any(isinstance(dim, int) and dim <= 0 for dim in value.shape):
             raise ValueError(f"value {value.id} has a non-positive shape dimension")
         if value.strides is not None and len(value.strides) != len(value.shape):
-            raise ValueError(f"value {value.id} has rank {len(value.shape)} but {len(value.strides)} strides")
+            raise ValueError(
+                f"value {value.id} has rank {len(value.shape)} but {len(value.strides)} strides"
+            )
         if value.producer is not None and value.producer not in known_ops:
-            raise ValueError(f"value {value.id} names unknown producer {value.producer}")
+            raise ValueError(
+                f"value {value.id} names unknown producer {value.producer}"
+            )
         if value.producer is not None and value.id not in op_outputs[value.producer]:
-            raise ValueError(f"value {value.id} is absent from producer {value.producer} outputs")
+            raise ValueError(
+                f"value {value.id} is absent from producer {value.producer} outputs"
+            )
         if value.alias_of is not None and value.alias_of not in known_values:
             raise ValueError(f"value {value.id} aliases unknown value {value.alias_of}")
     _validate_aliases(graph)
@@ -288,11 +329,15 @@ def _validate_ops(graph: NormalizedGraph, known_values: set[str]) -> None:
                 raise ValueError(f"value {value_id} is produced by more than one op")
             produced_values.add(value_id)
             if value_map[value_id].producer != op.id:
-                raise ValueError(f"value {value_id} does not name its producing op {op.id}")
+                raise ValueError(
+                    f"value {value_id} does not name its producing op {op.id}"
+                )
         for value_id in op.inputs:
             producer = value_map[value_id].producer
             if producer is not None and op_index[producer] >= op_index[op.id]:
-                raise ValueError(f"op {op.id} is not topologically ordered after {producer}")
+                raise ValueError(
+                    f"op {op.id} is not topologically ordered after {producer}"
+                )
 
 
 def _validate_interface(graph: NormalizedGraph, known_values: set[str]) -> None:
@@ -306,11 +351,28 @@ def _validate_interface(graph: NormalizedGraph, known_values: set[str]) -> None:
 
 def _validate_patterns(graph: NormalizedGraph, known_ops: set[str]) -> None:
     for pattern in graph.patterns:
-        missing = (set(pattern.ops) | set(pattern.apply_substitutions)) - known_ops
+        binding_ops = {binding.op for binding in pattern.apply_bindings}
+        missing = (
+            set(pattern.ops) | set(pattern.apply_substitutions) | binding_ops
+        ) - known_ops
         if missing:
-            raise ValueError(f"pattern {pattern.kind} references unknown ops {sorted(missing)}")
+            raise ValueError(
+                f"pattern {pattern.kind} references unknown ops {sorted(missing)}"
+            )
         if not set(pattern.apply_substitutions).issubset(pattern.ops):
-            raise ValueError(f"pattern {pattern.kind} substitutions must belong to its op set")
+            raise ValueError(
+                f"pattern {pattern.kind} substitutions must belong to its op set"
+            )
+        if not binding_ops.issubset(pattern.ops):
+            raise ValueError(
+                f"pattern {pattern.kind} bindings must belong to its op set"
+            )
+        if len(binding_ops) != len(pattern.apply_bindings):
+            raise ValueError(f"pattern {pattern.kind} has duplicate binding operations")
+        if binding_ops and binding_ops != set(pattern.apply_substitutions):
+            raise ValueError(
+                f"pattern {pattern.kind} named bindings must cover its substitutions"
+            )
 
 
 def _validate_output_specs(graph: NormalizedGraph) -> None:
@@ -318,7 +380,9 @@ def _validate_output_specs(graph: NormalizedGraph) -> None:
         raise ValueError("normalized graph output specs must match ordered outputs")
     for index, spec in enumerate(graph.output_specs):
         if spec.get("value") != graph.outputs[index]:
-            raise ValueError(f"output spec {index} does not match normalized output ordering")
+            raise ValueError(
+                f"output spec {index} does not match normalized output ordering"
+            )
 
 
 def _validate_aliases(graph: NormalizedGraph) -> None:
@@ -328,7 +392,9 @@ def _validate_aliases(graph: NormalizedGraph) -> None:
         current = value.id
         while values[current].alias_of is not None:
             if current in visited:
-                raise ValueError(f"normalized graph contains an alias cycle through {value.id}")
+                raise ValueError(
+                    f"normalized graph contains an alias cycle through {value.id}"
+                )
             visited.add(current)
             alias = values[current].alias_of
             if alias is None:

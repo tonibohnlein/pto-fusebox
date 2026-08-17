@@ -1,0 +1,1966 @@
+"""Strict decoding of a PTO-Fusebox solver solution."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from enum import Enum
+from typing import Any, Literal, TypeVar, overload
+
+from ..ir import SOLUTION_SCHEMA
+from ..lowered import LoweredRegion, lowered_region
+from ..solver import RegionSolveResult
+from .schema import (
+    AxisPartition,
+    CubeAxisBinding,
+    CubeFinalDrainPlan,
+    CubeFirstPartialThenAtomicPlan,
+    CubeKLoopPlan,
+    CubeKernelPlan,
+    CubeMatmulPlan,
+    CubeOperandRole,
+    CubeOutputTileVariant,
+    CubeResidentBoundaryPlan,
+    CubeRetainedPanelPlan,
+    CubeSpatialPolicy,
+    CubeSplitMergePolicy,
+    CubeTensorRegionPlan,
+    KernelKind,
+    KernelStep,
+    L0KLoopPlan,
+    L0MatmulPlan,
+    L0OutputTarget,
+    L0PhaseCostPlan,
+    L0Stationarity,
+    LaunchPlan,
+    MixedKernelPlan,
+    ScheduleContractError,
+    ScheduledRegion,
+    VectorCoordinateTransform,
+    VectorGeneratedPhaseWorkPlan,
+    VectorInputLifetimePlan,
+    VectorInputUsePlan,
+    VectorKernelPlan,
+    VectorLoopPlan,
+    VectorP4WorkPlan,
+    VectorP4RecipePlan,
+    VectorP4SubstitutionPlan,
+    VectorPhasePlan,
+    VectorPhysicalFramePlan,
+    VectorPrimitiveWorkPlan,
+    VectorReductionSeedPlan,
+    VectorReductionSplitKind,
+    VectorReductionSplitPlan,
+    VectorReplayPhase,
+    VectorSerialPhasePlan,
+    VectorStreamKind,
+    VectorTensorFramePlan,
+    VectorWorkspaceFramePlan,
+)
+
+EnumT = TypeVar("EnumT", bound=Enum)
+
+
+def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
+    """Decode and validate one solved region without replanning it."""
+
+    if result.status != "solved" or result.solution is None or result.problem is None:
+        raise ScheduleContractError(f"region {result.region.id} is not solved")
+    solution = result.solution
+    if solution.get("schema_version") != SOLUTION_SCHEMA:
+        raise ScheduleContractError(
+            f"solution schema must be {SOLUTION_SCHEMA!r}, got "
+            f"{solution.get('schema_version')!r}"
+        )
+    _expect_keys(solution, required={"schema_version", "steps"}, field="solution")
+    raw_steps = _sequence(solution.get("steps"), "steps")
+    if not raw_steps:
+        raise ScheduleContractError("solution contains no kernel steps")
+
+    lowered = lowered_region(result)
+    graph_mapping = result.solver_op_to_graph
+    steps: list[KernelStep] = []
+    covered: set[int] = set()
+    for index, raw_step in enumerate(raw_steps):
+        item = _mapping(raw_step, f"steps[{index}]")
+        _expect_keys(
+            item,
+            required={
+                "kind",
+                "ops",
+                "op_order",
+                "launch",
+                "sequential_tiles",
+                "plan",
+                "retain",
+                "latency_cycles",
+            },
+            field=f"steps[{index}]",
+        )
+        solver_ops = tuple(
+            _bounded_int(op, f"steps[{index}].ops", len(graph_mapping))
+            for op in _sequence(item.get("ops"), f"steps[{index}].ops")
+        )
+        if not solver_ops or len(set(solver_ops)) != len(solver_ops):
+            raise ScheduleContractError(
+                f"steps[{index}].ops must contain distinct operations"
+            )
+        if covered.intersection(solver_ops):
+            raise ScheduleContractError(
+                f"steps[{index}].ops overlaps an earlier kernel step"
+            )
+        covered.update(solver_ops)
+
+        order = tuple(
+            _bounded_int(op, f"steps[{index}].op_order", len(graph_mapping))
+            for op in _sequence(item.get("op_order"), f"steps[{index}].op_order")
+        )
+        if set(order) != set(solver_ops) or len(order) != len(solver_ops):
+            raise ScheduleContractError(
+                f"steps[{index}].op_order is not a permutation of its operations"
+            )
+        raw_sequential = item.get("sequential_tiles")
+        sequential_tiles: tuple[int, ...] | None
+        if raw_sequential is None:
+            sequential_tiles = None
+        else:
+            sequential_tiles = tuple(
+                _nonnegative_int(value, f"steps[{index}].sequential_tiles")
+                for value in _sequence(
+                    raw_sequential, f"steps[{index}].sequential_tiles"
+                )
+            )
+            if len(sequential_tiles) != len(order):
+                raise ScheduleContractError(
+                    f"steps[{index}].sequential_tiles must align with op_order"
+                )
+        retained_tensors = tuple(
+            _bounded_int(
+                tensor,
+                f"steps[{index}].retain",
+                len(result.solver_tensor_to_value),
+            )
+            for tensor in _sequence(item.get("retain"), f"steps[{index}].retain")
+        )
+        if len(retained_tensors) != len(set(retained_tensors)):
+            raise ScheduleContractError(
+                f"steps[{index}].retain contains duplicate tensor ids"
+            )
+        launch = _parse_launch(item.get("launch"), field=f"steps[{index}].launch")
+        kind = _enum(KernelKind, item.get("kind"), f"steps[{index}].kind")
+        plan_value = item.get("plan")
+        if kind is KernelKind.VECTOR:
+            plan = _parse_vector_plan(
+                plan_value,
+                field=f"steps[{index}].plan",
+                op_bound=len(graph_mapping),
+                tensor_bound=len(result.solver_tensor_to_value),
+            )
+            _validate_vector_phase_links(
+                plan,
+                lowered=lowered,
+                step_ops=solver_ops,
+                step_order=order,
+                field=f"steps[{index}].plan",
+            )
+            _validate_vector_launch_contract(
+                plan,
+                launch=launch,
+                sequential_tiles=sequential_tiles,
+                field=f"steps[{index}].plan",
+            )
+        elif kind is KernelKind.CUBE:
+            plan = _parse_cube_plan(
+                plan_value,
+                field=f"steps[{index}].plan",
+                op_bound=len(graph_mapping),
+                tensor_bound=len(result.solver_tensor_to_value),
+            )
+            _validate_cube_contract(
+                plan,
+                lowered=lowered,
+                step_ops=solver_ops,
+                step_order=order,
+                sequential_tiles=sequential_tiles,
+                launch=launch,
+                field=f"steps[{index}].plan",
+            )
+        else:
+            mixed = _mapping(plan_value, f"steps[{index}].plan")
+            plan = MixedKernelPlan(
+                source_codegen_ready=_bool(
+                    mixed.get("source_codegen_ready"),
+                    f"steps[{index}].plan.source_codegen_ready",
+                )
+            )
+        latency = _finite_number(
+            item.get("latency_cycles"), f"steps[{index}].latency_cycles"
+        )
+        steps.append(
+            KernelStep(
+                index=index,
+                kind=kind,
+                solver_ops=solver_ops,
+                graph_ops=tuple(graph_mapping[op] for op in solver_ops),
+                op_order=order,
+                sequential_tiles=sequential_tiles,
+                retained_tensors=retained_tensors,
+                launch=launch,
+                latency=latency,
+                plan=plan,
+            )
+        )
+
+    if covered != set(range(len(graph_mapping))):
+        raise ScheduleContractError(
+            "kernel steps do not cover every lowered solver operation"
+        )
+    return ScheduledRegion(
+        region_id=result.region.id,
+        tensor_values=result.solver_tensor_to_value,
+        steps=tuple(steps),
+    )
+
+
+def _validate_vector_phase_links(
+    plan: VectorKernelPlan,
+    *,
+    lowered: LoweredRegion,
+    step_ops: tuple[int, ...],
+    step_order: tuple[int, ...],
+    field: str,
+) -> None:
+    if plan.kind in {
+        VectorStreamKind.MATERIALIZED,
+        VectorStreamKind.POINTWISE,
+    }:
+        body = plan.phase(VectorReplayPhase.BODY)
+        if body.ops != step_order:
+            raise ScheduleContractError(
+                f"{field}.phases[body].ops does not preserve the selected "
+                "operation order exactly"
+            )
+        for name in (
+            VectorReplayPhase.STATS,
+            VectorReplayPhase.APPLY,
+            VectorReplayPhase.FINALIZE,
+        ):
+            if plan.phase(name).ops:
+                raise ScheduleContractError(
+                    f"{field}.phases[{name.value}].ops must be empty for "
+                    f"{plan.kind.value!r} replay"
+                )
+        if body.loop is None:
+            raise ScheduleContractError(
+                f"{field}.phases[body] requires the authoritative body loop"
+            )
+
+    step_set = set(step_ops)
+    step_positions = {op: position for position, op in enumerate(step_order)}
+    for phase in plan.phases:
+        phase_field = f"{field}.phases[{phase.name.value}]"
+        if not set(phase.ops).issubset(step_set):
+            raise ScheduleContractError(
+                f"{phase_field}.ops references an operation outside its kernel step"
+            )
+        if tuple(sorted(phase.ops, key=step_positions.__getitem__)) != phase.ops:
+            raise ScheduleContractError(
+                f"{phase_field}.ops does not preserve the selected operation order"
+            )
+        positions = {op: position for position, op in enumerate(phase.ops)}
+        touched_tensors: set[int] = set()
+        for op in phase.ops:
+            operation = lowered.operation(op)
+            touched_tensors.update(operation.inputs)
+            touched_tensors.update(operation.outputs)
+        frame_tensors = {frame.tensor for frame in phase.tensor_frames}
+        if frame_tensors != touched_tensors:
+            raise ScheduleContractError(
+                f"{phase_field}.tensor_frames do not cover exactly the phase tensors"
+            )
+        for frame in phase.tensor_frames:
+            tensor = lowered.tensor(frame.tensor)
+            if frame.logical[0] > tensor.height or frame.logical[1] > tensor.width:
+                raise ScheduleContractError(
+                    f"{phase_field} frame for tensor {frame.tensor} exceeds its extent"
+                )
+        frame_by_tensor = {frame.tensor: frame for frame in phase.tensor_frames}
+        expected_workspace_ops = {
+            op for op in phase.ops if lowered.operation(op).op_type == "Reduction"
+        }
+        if {workspace.op for workspace in phase.workspaces} != expected_workspace_ops:
+            raise ScheduleContractError(
+                f"{phase_field}.workspaces do not cover exactly the phase reductions"
+            )
+        for workspace in phase.workspaces:
+            operation = lowered.operation(workspace.op)
+            if not operation.inputs or operation.inputs[0] != workspace.source_tensor:
+                raise ScheduleContractError(
+                    f"{phase_field} workspace {workspace.op} has the wrong source tensor"
+                )
+            source_frame = frame_by_tensor[workspace.source_tensor]
+            if (
+                workspace.logical != source_frame.logical
+                or workspace.physical != source_frame.physical
+            ):
+                raise ScheduleContractError(
+                    f"{phase_field} workspace {workspace.op} differs from its source frame"
+                )
+        for lifetime in phase.input_lifetimes:
+            if lifetime.tensor not in frame_tensors:
+                raise ScheduleContractError(
+                    f"{phase_field} lifetime tensor {lifetime.tensor} has no frame"
+                )
+            use_positions: list[int] = []
+            for use in lifetime.uses:
+                if use.op not in positions:
+                    raise ScheduleContractError(
+                        f"{phase_field} lifetime tensor {lifetime.tensor} has a use "
+                        f"outside the phase"
+                    )
+                operation = lowered.operation(use.op)
+                if use.arg >= len(operation.inputs):
+                    raise ScheduleContractError(
+                        f"{phase_field} use ({use.op}, {use.arg}) has no such operand"
+                    )
+                if operation.inputs[use.arg] != lifetime.tensor:
+                    raise ScheduleContractError(
+                        f"{phase_field} use ({use.op}, {use.arg}) does not reference "
+                        f"tensor {lifetime.tensor}"
+                    )
+                use_positions.append(positions[use.op])
+            if not use_positions:
+                raise ScheduleContractError(
+                    f"{phase_field} lifetime tensor {lifetime.tensor} has no uses"
+                )
+            if lifetime.first_use_step != min(
+                use_positions
+            ) or lifetime.last_use_step != max(use_positions):
+                raise ScheduleContractError(
+                    f"{phase_field} lifetime tensor {lifetime.tensor} has stale "
+                    "first/last use positions"
+                )
+    _validate_vector_p4_contract(plan, lowered=lowered, field=field)
+
+
+def _validate_vector_launch_contract(
+    plan: VectorKernelPlan,
+    *,
+    launch: LaunchPlan,
+    sequential_tiles: tuple[int, ...] | None,
+    field: str,
+) -> None:
+    if (
+        launch.parts_m != plan.m_partition.parts
+        or launch.parts_n != plan.n_partition.parts
+    ):
+        raise ScheduleContractError(f"{field} launch grid differs from its partitions")
+    if launch.cores > plan.work_units:
+        raise ScheduleContractError(f"{field} uses more cores than work units")
+    if plan.kind in {
+        VectorStreamKind.MATERIALIZED,
+        VectorStreamKind.POINTWISE,
+    } and (sequential_tiles is None or any(sequential_tiles)):
+        raise ScheduleContractError(
+            f"{field} materialized replay has nonzero sequential tiles"
+        )
+
+
+def _validate_vector_p4_contract(
+    plan: VectorKernelPlan,
+    *,
+    lowered: LoweredRegion,
+    field: str,
+) -> None:
+    expected_recipe = {
+        VectorStreamKind.SOFTMAX_FLASH: "softmax_flash.v1",
+        VectorStreamKind.LAYERNORM_WELFORD: "welford.v1",
+    }.get(plan.kind)
+    recipe = plan.p4_recipe
+    if expected_recipe is None:
+        if recipe is not None or plan.p4_work.generated:
+            raise ScheduleContractError(
+                f"{field} carries generated P4 work for {plan.kind.value!r}"
+            )
+        return
+    if recipe is None or recipe.version != expected_recipe:
+        raise ScheduleContractError(
+            f"{field} omits the {expected_recipe!r} emission recipe"
+        )
+    if not plan.p4_work.generated:
+        raise ScheduleContractError(
+            f"{field}.p4_work must be generated for {expected_recipe!r}"
+        )
+    if not plan.p4_work.stats_init.generated or not plan.p4_work.stats_update.generated:
+        raise ScheduleContractError(
+            f"{field}.p4_work omits generated online-statistics phases"
+        )
+    expected_finalize = plan.kind is VectorStreamKind.LAYERNORM_WELFORD
+    if plan.p4_work.finalize.generated != expected_finalize:
+        raise ScheduleContractError(
+            f"{field}.p4_work.finalize disagrees with {expected_recipe!r}"
+        )
+
+    stats = plan.phase(VectorReplayPhase.STATS)
+    apply = plan.phase(VectorReplayPhase.APPLY)
+    if recipe.input_tensor not in {frame.tensor for frame in stats.tensor_frames}:
+        raise ScheduleContractError(
+            f"{field}.p4_recipe input tensor is absent from the stats phase"
+        )
+    substitution_ops = tuple(item.op for item in recipe.apply_substitutions)
+    if any(
+        op not in stats.ops or lowered.operation(op).op_type != "Reduction"
+        for op in substitution_ops
+    ):
+        raise ScheduleContractError(
+            f"{field}.p4_recipe substitutions must be stats-phase reductions"
+        )
+    if any(op in apply.ops for op in substitution_ops):
+        raise ScheduleContractError(
+            f"{field}.p4_recipe substitutions must be cut from the apply replay"
+        )
+    first_reduction = lowered.operation(substitution_ops[0])
+    if not first_reduction.inputs or first_reduction.inputs[0] != recipe.input_tensor:
+        raise ScheduleContractError(
+            f"{field}.p4_recipe input tensor differs from its first reduction"
+        )
+
+
+def _parse_launch(value: Any, *, field: str) -> LaunchPlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"tile", "parts", "split", "cores"}, field=field)
+    tile = _int_tuple(item.get("tile"), 3, f"{field}.tile")
+    parts = _int_tuple(item.get("parts"), 2, f"{field}.parts")
+    return LaunchPlan(
+        tile_w=tile[0],
+        tile_h=tile[1],
+        tile_k=tile[2],
+        parts_m=parts[0],
+        parts_n=parts[1],
+        split=_positive_int(item.get("split"), f"{field}.split"),
+        cores=_positive_int(item.get("cores"), f"{field}.cores"),
+    )
+
+
+def _parse_vector_plan(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorKernelPlan:
+    item = _mapping(value, field)
+    required = {
+        "kind",
+        "coordinate_transform",
+        "work_units",
+        "m_partition",
+        "n_partition",
+        "full_peak_ub_bytes",
+        "chunk_peak_ub_bytes",
+        "stream_band_count",
+        "physical_frame",
+        "axis",
+        "free_tile",
+        "free_tile_alloc",
+        "extent",
+        "chunk",
+        "full_chunks",
+        "tail",
+        "stream_passes",
+        "phases",
+        "tile",
+        "strip",
+        "strip_grid",
+        "overlap_granted",
+        "reduction_split",
+        "p4_work",
+        "p4_recipe",
+    }
+    _expect_keys(item, required=required, field=field)
+    frame = _mapping(item.get("physical_frame"), f"{field}.physical_frame")
+    _expect_keys(
+        frame,
+        required={
+            "element_granule",
+            "iteration_rows",
+            "iteration_cols",
+            "reduced_axis",
+            "align_rows",
+        },
+        field=f"{field}.physical_frame",
+    )
+    phases = tuple(
+        _parse_vector_phase(
+            phase,
+            field=f"{field}.phases[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, phase in enumerate(_sequence(item.get("phases"), f"{field}.phases"))
+    )
+    expected_phases = tuple(VectorReplayPhase)
+    if tuple(phase.name for phase in phases) != expected_phases:
+        raise ScheduleContractError(
+            f"{field}.phases must contain body, stats, apply, finalize in order"
+        )
+    reduction = _parse_vector_reduction_split(
+        item.get("reduction_split"), field=f"{field}.reduction_split"
+    )
+    return VectorKernelPlan(
+        kind=_enum(VectorStreamKind, item.get("kind"), f"{field}.kind"),
+        coordinate_transform=_enum(
+            VectorCoordinateTransform,
+            item.get("coordinate_transform"),
+            f"{field}.coordinate_transform",
+        ),
+        work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
+        m_partition=_parse_axis_partition(
+            item.get("m_partition"), field=f"{field}.m_partition"
+        ),
+        n_partition=_parse_axis_partition(
+            item.get("n_partition"), field=f"{field}.n_partition"
+        ),
+        full_peak_ub_bytes=_nonnegative_int(
+            item.get("full_peak_ub_bytes"), f"{field}.full_peak_ub_bytes"
+        ),
+        chunk_peak_ub_bytes=_nonnegative_int(
+            item.get("chunk_peak_ub_bytes"), f"{field}.chunk_peak_ub_bytes"
+        ),
+        stream_band_count=_nonnegative_int(
+            item.get("stream_band_count"), f"{field}.stream_band_count"
+        ),
+        physical_frame=VectorPhysicalFramePlan(
+            element_granule=_positive_int(
+                frame.get("element_granule"), f"{field}.physical_frame.element_granule"
+            ),
+            iteration_rows=_positive_int(
+                frame.get("iteration_rows"), f"{field}.physical_frame.iteration_rows"
+            ),
+            iteration_cols=_positive_int(
+                frame.get("iteration_cols"), f"{field}.physical_frame.iteration_cols"
+            ),
+            reduced_axis=_bounded_axis(
+                frame.get("reduced_axis"), f"{field}.physical_frame.reduced_axis"
+            ),
+            align_rows=_bool(
+                frame.get("align_rows"), f"{field}.physical_frame.align_rows"
+            ),
+        ),
+        axis=_bounded_axis(item.get("axis"), f"{field}.axis"),
+        free_tile=_nonnegative_int(item.get("free_tile"), f"{field}.free_tile"),
+        free_tile_alloc=_nonnegative_int(
+            item.get("free_tile_alloc"), f"{field}.free_tile_alloc"
+        ),
+        extent=_nonnegative_int(item.get("extent"), f"{field}.extent"),
+        chunk=_nonnegative_int(item.get("chunk"), f"{field}.chunk"),
+        full_chunks=_nonnegative_int(item.get("full_chunks"), f"{field}.full_chunks"),
+        tail=_nonnegative_int(item.get("tail"), f"{field}.tail"),
+        stream_passes=_positive_int(
+            item.get("stream_passes"), f"{field}.stream_passes"
+        ),
+        phases=phases,
+        tile=_int_tuple(item.get("tile"), 2, f"{field}.tile"),
+        strip=_nonnegative_int_tuple(item.get("strip"), 2, f"{field}.strip"),
+        strip_grid=_int_tuple(item.get("strip_grid"), 2, f"{field}.strip_grid"),
+        overlap_granted=_bool(item.get("overlap_granted"), f"{field}.overlap_granted"),
+        reduction_split=reduction,
+        p4_work=_parse_p4_work(item.get("p4_work"), field=f"{field}.p4_work"),
+        p4_recipe=_parse_p4_recipe(
+            item.get("p4_recipe"),
+            field=f"{field}.p4_recipe",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        ),
+    )
+
+
+def _parse_vector_phase(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorPhasePlan:
+    item = _mapping(value, field)
+    name = _enum(VectorReplayPhase, item.get("name"), f"{field}.name")
+    required = {"name", "ops", "input_lifetimes", "tensor_frames", "workspaces"}
+    expected_optional: set[str]
+    if name is VectorReplayPhase.BODY:
+        expected_optional = {"loop"}
+    elif name is VectorReplayPhase.STATS:
+        expected_optional = {"init", "loop", "tail"}
+    elif name is VectorReplayPhase.APPLY:
+        expected_optional = {"loop", "tail"}
+    else:
+        expected_optional = {"serial"}
+    _expect_keys(item, required=required, optional=expected_optional, field=field)
+    ops = tuple(
+        _bounded_int(op, f"{field}.ops", op_bound)
+        for op in _sequence(item.get("ops"), f"{field}.ops")
+    )
+    if len(ops) != len(set(ops)):
+        raise ScheduleContractError(f"{field}.ops contains duplicate operations")
+    lifetimes = tuple(
+        _parse_vector_input_lifetime(
+            lifetime,
+            field=f"{field}.input_lifetimes[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, lifetime in enumerate(
+            _sequence(item.get("input_lifetimes"), f"{field}.input_lifetimes")
+        )
+    )
+    if len({lifetime.tensor for lifetime in lifetimes}) != len(lifetimes):
+        raise ScheduleContractError(f"{field} contains duplicate tensor lifetimes")
+    frames = tuple(
+        _parse_vector_tensor_frame(
+            frame,
+            field=f"{field}.tensor_frames[{index}]",
+            tensor_bound=tensor_bound,
+        )
+        for index, frame in enumerate(
+            _sequence(item.get("tensor_frames"), f"{field}.tensor_frames")
+        )
+    )
+    if len({frame.tensor for frame in frames}) != len(frames):
+        raise ScheduleContractError(f"{field} contains duplicate tensor frames")
+    workspaces = tuple(
+        _parse_vector_workspace_frame(
+            workspace,
+            field=f"{field}.workspaces[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, workspace in enumerate(
+            _sequence(item.get("workspaces"), f"{field}.workspaces")
+        )
+    )
+    if len({workspace.op for workspace in workspaces}) != len(workspaces):
+        raise ScheduleContractError(f"{field} contains duplicate op workspaces")
+    loop = _parse_optional_loop(item.get("loop"), field=f"{field}.loop")
+    init = _parse_optional_serial(item.get("init"), field=f"{field}.init")
+    tail = _parse_optional_serial(item.get("tail"), field=f"{field}.tail")
+    serial = _parse_optional_serial(item.get("serial"), field=f"{field}.serial")
+    return VectorPhasePlan(
+        name, ops, lifetimes, frames, workspaces, loop, init, tail, serial
+    )
+
+
+def _parse_vector_tensor_frame(
+    value: Any,
+    *,
+    field: str,
+    tensor_bound: int,
+) -> VectorTensorFramePlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"tensor", "logical", "physical"}, field=field)
+    logical = _int_tuple(item.get("logical"), 2, f"{field}.logical")
+    physical = _int_tuple(item.get("physical"), 2, f"{field}.physical")
+    if physical[0] < logical[0] or physical[1] < logical[1]:
+        raise ScheduleContractError(f"{field}.physical cannot shrink logical shape")
+    return VectorTensorFramePlan(
+        tensor=_bounded_int(item.get("tensor"), f"{field}.tensor", tensor_bound),
+        logical=logical,
+        physical=physical,
+    )
+
+
+def _parse_vector_workspace_frame(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorWorkspaceFramePlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"op", "source_tensor", "logical", "physical"},
+        field=field,
+    )
+    logical = _int_tuple(item.get("logical"), 2, f"{field}.logical")
+    physical = _int_tuple(item.get("physical"), 2, f"{field}.physical")
+    if physical[0] < logical[0] or physical[1] < logical[1]:
+        raise ScheduleContractError(f"{field}.physical cannot shrink logical shape")
+    return VectorWorkspaceFramePlan(
+        op=_bounded_int(item.get("op"), f"{field}.op", op_bound),
+        source_tensor=_bounded_int(
+            item.get("source_tensor"), f"{field}.source_tensor", tensor_bound
+        ),
+        logical=logical,
+        physical=physical,
+    )
+
+
+def _parse_vector_input_lifetime(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorInputLifetimePlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "tensor",
+            "first_use_step",
+            "last_use_step",
+            "use_count",
+            "uses",
+        },
+        field=field,
+    )
+    uses = tuple(
+        _parse_vector_input_use(
+            use,
+            field=f"{field}.uses[{index}]",
+            op_bound=op_bound,
+        )
+        for index, use in enumerate(_sequence(item.get("uses"), f"{field}.uses"))
+    )
+    use_count = _positive_int(item.get("use_count"), f"{field}.use_count")
+    if use_count != len(uses):
+        raise ScheduleContractError(f"{field}.use_count does not match its uses")
+    first = _nonnegative_int(item.get("first_use_step"), f"{field}.first_use_step")
+    last = _nonnegative_int(item.get("last_use_step"), f"{field}.last_use_step")
+    if first > last:
+        raise ScheduleContractError(f"{field} has an inverted lifetime")
+    return VectorInputLifetimePlan(
+        tensor=_bounded_int(item.get("tensor"), f"{field}.tensor", tensor_bound),
+        first_use_step=first,
+        last_use_step=last,
+        use_count=use_count,
+        uses=uses,
+    )
+
+
+def _parse_vector_input_use(
+    value: Any, *, field: str, op_bound: int
+) -> VectorInputUsePlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"op", "arg"}, field=field)
+    return VectorInputUsePlan(
+        op=_bounded_int(item.get("op"), f"{field}.op", op_bound),
+        arg=_nonnegative_int(item.get("arg"), f"{field}.arg"),
+    )
+
+
+def _parse_vector_reduction_split(
+    value: Any, *, field: str
+) -> VectorReductionSplitPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item, required={"kind", "factor", "partial_extent", "seed"}, field=field
+    )
+    seed_item = _mapping(item.get("seed"), f"{field}.seed")
+    _expect_keys(
+        seed_item,
+        required={"present", "work_units", "valid_rows", "valid_cols"},
+        field=f"{field}.seed",
+    )
+    seed = VectorReductionSeedPlan(
+        present=_bool(seed_item.get("present"), f"{field}.seed.present"),
+        work_units=_nonnegative_int(
+            seed_item.get("work_units"), f"{field}.seed.work_units"
+        ),
+        valid_rows=_nonnegative_int(
+            seed_item.get("valid_rows"), f"{field}.seed.valid_rows"
+        ),
+        valid_cols=_nonnegative_int(
+            seed_item.get("valid_cols"), f"{field}.seed.valid_cols"
+        ),
+    )
+    return VectorReductionSplitPlan(
+        kind=_enum(VectorReductionSplitKind, item.get("kind"), f"{field}.kind"),
+        factor=_positive_int(item.get("factor"), f"{field}.factor"),
+        partial_extent=_nonnegative_int(
+            item.get("partial_extent"), f"{field}.partial_extent"
+        ),
+        seed=seed,
+    )
+
+
+def _parse_p4_work(value: Any, *, field: str) -> VectorP4WorkPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"generated", "stats_init", "stats_update", "finalize"},
+        field=field,
+    )
+    return VectorP4WorkPlan(
+        generated=_bool(item.get("generated"), f"{field}.generated"),
+        stats_init=_parse_generated_work(
+            item.get("stats_init"), field=f"{field}.stats_init"
+        ),
+        stats_update=_parse_generated_work(
+            item.get("stats_update"), field=f"{field}.stats_update"
+        ),
+        finalize=_parse_generated_work(item.get("finalize"), field=f"{field}.finalize"),
+    )
+
+
+def _parse_p4_recipe(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorP4RecipePlan | None:
+    if value is None:
+        return None
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"version", "input_tensor", "state", "apply_substitutions"},
+        field=field,
+    )
+    version = item.get("version")
+    expected = {
+        "softmax_flash.v1": (
+            ("running_max", "running_sum"),
+            ("running_max", "running_sum"),
+        ),
+        "welford.v1": (
+            ("running_mean", "running_m2", "running_count"),
+            ("mean", "variance"),
+        ),
+    }
+    if version not in expected:
+        raise ScheduleContractError(f"{field}.version is unsupported: {version!r}")
+    state = tuple(
+        _nonempty_string(name, f"{field}.state")
+        for name in _sequence(item.get("state"), f"{field}.state")
+    )
+    bindings = tuple(
+        _parse_p4_substitution(
+            binding,
+            field=f"{field}.apply_substitutions[{index}]",
+            op_bound=op_bound,
+        )
+        for index, binding in enumerate(
+            _sequence(
+                item.get("apply_substitutions"),
+                f"{field}.apply_substitutions",
+            )
+        )
+    )
+    expected_state, expected_values = expected[str(version)]
+    if (
+        state != expected_state
+        or tuple(binding.value for binding in bindings) != expected_values
+    ):
+        raise ScheduleContractError(
+            f"{field} does not match its versioned state contract"
+        )
+    if len({binding.op for binding in bindings}) != len(bindings):
+        raise ScheduleContractError(f"{field} contains duplicate substitution ops")
+    return VectorP4RecipePlan(
+        version=str(version),
+        input_tensor=_bounded_int(
+            item.get("input_tensor"), f"{field}.input_tensor", tensor_bound
+        ),
+        state=state,
+        apply_substitutions=bindings,
+    )
+
+
+def _parse_p4_substitution(
+    value: Any, *, field: str, op_bound: int
+) -> VectorP4SubstitutionPlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"op", "value"}, field=field)
+    return VectorP4SubstitutionPlan(
+        op=_bounded_int(item.get("op"), f"{field}.op", op_bound),
+        value=_nonempty_string(item.get("value"), f"{field}.value"),
+    )
+
+
+def _parse_generated_work(value: Any, *, field: str) -> VectorGeneratedPhaseWorkPlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"generated", "primitives"}, field=field)
+    primitives = tuple(
+        _parse_primitive_work(primitive, field=f"{field}.primitives[{index}]")
+        for index, primitive in enumerate(
+            _sequence(item.get("primitives"), f"{field}.primitives")
+        )
+    )
+    return VectorGeneratedPhaseWorkPlan(
+        generated=_bool(item.get("generated"), f"{field}.generated"),
+        primitives=primitives,
+    )
+
+
+def _parse_primitive_work(value: Any, *, field: str) -> VectorPrimitiveWorkPlan:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"kind", "wide", "thin", "stream_starts"}, field=field)
+    kind = item.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise ScheduleContractError(f"{field}.kind must be a non-empty string")
+    return VectorPrimitiveWorkPlan(
+        kind=kind,
+        wide=_nonnegative_int(item.get("wide"), f"{field}.wide"),
+        thin=_nonnegative_int(item.get("thin"), f"{field}.thin"),
+        stream_starts=_nonnegative_int(
+            item.get("stream_starts"), f"{field}.stream_starts"
+        ),
+    )
+
+
+def _parse_cube_plan(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> CubeKernelPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "emit_compatible",
+            "spatial_policy",
+            "m_partition",
+            "n_partition",
+            "spatial_tiles",
+            "split_k",
+            "work_units",
+            "peak_l1_bytes",
+            "split_merge_policy",
+            "first_partial_then_atomic",
+            "model_overlap_granted",
+            "overlap_implementable",
+            "execution_order",
+            "resident_boundaries",
+            "matmuls",
+        },
+        field=field,
+    )
+    residents = tuple(
+        _parse_cube_resident(
+            resident,
+            field=f"{field}.resident_boundaries[{index}]",
+            tensor_bound=tensor_bound,
+        )
+        for index, resident in enumerate(
+            _sequence(item.get("resident_boundaries"), f"{field}.resident_boundaries")
+        )
+    )
+    if len({resident.id for resident in residents}) != len(residents):
+        raise ScheduleContractError(
+            f"{field}.resident_boundaries must use unique canonical ids"
+        )
+    matmuls = tuple(
+        _parse_cube_matmul(
+            matmul,
+            field=f"{field}.matmuls[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+            resident_bound=len(residents),
+        )
+        for index, matmul in enumerate(
+            _sequence(item.get("matmuls"), f"{field}.matmuls")
+        )
+    )
+    if tuple(matmul.instance for matmul in matmuls) != tuple(range(len(matmuls))):
+        raise ScheduleContractError(f"{field}.matmuls must use dense ordered instances")
+    split = _mapping(
+        item.get("first_partial_then_atomic"), f"{field}.first_partial_then_atomic"
+    )
+    _expect_keys(
+        split,
+        required={
+            "present",
+            "first_work_units",
+            "atomic_work_units",
+            "synchronization_cycles",
+        },
+        field=f"{field}.first_partial_then_atomic",
+    )
+    result = CubeKernelPlan(
+        emit_compatible=_bool(item.get("emit_compatible"), f"{field}.emit_compatible"),
+        spatial_policy=_enum(
+            CubeSpatialPolicy, item.get("spatial_policy"), f"{field}.spatial_policy"
+        ),
+        m_partition=_parse_axis_partition(
+            item.get("m_partition"), field=f"{field}.m_partition"
+        ),
+        n_partition=_parse_axis_partition(
+            item.get("n_partition"), field=f"{field}.n_partition"
+        ),
+        spatial_tiles=_positive_int(
+            item.get("spatial_tiles"), f"{field}.spatial_tiles"
+        ),
+        split_k=_positive_int(item.get("split_k"), f"{field}.split_k"),
+        work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
+        peak_l1_bytes=_nonnegative_int(
+            item.get("peak_l1_bytes"), f"{field}.peak_l1_bytes"
+        ),
+        split_merge_policy=_enum(
+            CubeSplitMergePolicy,
+            item.get("split_merge_policy"),
+            f"{field}.split_merge_policy",
+        ),
+        first_partial_then_atomic=CubeFirstPartialThenAtomicPlan(
+            present=_bool(
+                split.get("present"), f"{field}.first_partial_then_atomic.present"
+            ),
+            first_work_units=_nonnegative_int(
+                split.get("first_work_units"),
+                f"{field}.first_partial_then_atomic.first_work_units",
+            ),
+            atomic_work_units=_nonnegative_int(
+                split.get("atomic_work_units"),
+                f"{field}.first_partial_then_atomic.atomic_work_units",
+            ),
+            synchronization_cycles=_finite_number(
+                split.get("synchronization_cycles"),
+                f"{field}.first_partial_then_atomic.synchronization_cycles",
+            ),
+        ),
+        model_overlap_granted=_bool(
+            item.get("model_overlap_granted"), f"{field}.model_overlap_granted"
+        ),
+        overlap_implementable=_bool(
+            item.get("overlap_implementable"), f"{field}.overlap_implementable"
+        ),
+        execution_order=tuple(
+            _bounded_int(op, f"{field}.execution_order", op_bound)
+            for op in _sequence(item.get("execution_order"), f"{field}.execution_order")
+        ),
+        resident_boundaries=residents,
+        matmuls=matmuls,
+    )
+    _validate_cube_links(result, field=field)
+    return result
+
+
+def _parse_cube_resident(
+    value: Any, *, field: str, tensor_bound: int
+) -> CubeResidentBoundaryPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "id",
+            "region",
+            "role",
+            "first_use",
+            "last_use",
+            "use_count",
+            "bytes",
+        },
+        field=field,
+    )
+    first = _nonnegative_int(item.get("first_use"), f"{field}.first_use")
+    last = _nonnegative_int(item.get("last_use"), f"{field}.last_use")
+    if first > last:
+        raise ScheduleContractError(f"{field} has an inverted lifetime")
+    return CubeResidentBoundaryPlan(
+        id=_nonnegative_int(item.get("id"), f"{field}.id"),
+        region=_parse_cube_region(
+            item.get("region"), field=f"{field}.region", tensor_bound=tensor_bound
+        ),
+        role=_enum(CubeOperandRole, item.get("role"), f"{field}.role"),
+        first_use=first,
+        last_use=last,
+        use_count=_positive_int(item.get("use_count"), f"{field}.use_count"),
+        bytes=_positive_int(item.get("bytes"), f"{field}.bytes"),
+    )
+
+
+def _parse_cube_matmul(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+    resident_bound: int,
+) -> CubeMatmulPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "instance",
+            "op",
+            "lhs_producer",
+            "rhs_producer",
+            "lhs_resident_boundary",
+            "rhs_resident_boundary",
+            "is_sink",
+            "lhs_ephemeral",
+            "rhs_ephemeral",
+            "output_ephemeral",
+            "contraction",
+            "effective_contraction",
+            "accumulator_dtype",
+            "storage_dtype",
+            "lhs",
+            "rhs",
+            "output",
+            "k_loop",
+            "output_tile",
+            "output_grid",
+            "output_variants",
+            "retained_panels",
+            "final_drain",
+        },
+        field=field,
+    )
+    retained = _mapping(item.get("retained_panels"), f"{field}.retained_panels")
+    _expect_keys(
+        retained,
+        required={"lhs", "rhs", "lhs_bytes", "rhs_bytes"},
+        field=f"{field}.retained_panels",
+    )
+    return CubeMatmulPlan(
+        instance=_nonnegative_int(item.get("instance"), f"{field}.instance"),
+        op=_bounded_int(item.get("op"), f"{field}.op", op_bound),
+        lhs_producer=_optional_index(item.get("lhs_producer"), f"{field}.lhs_producer"),
+        rhs_producer=_optional_index(item.get("rhs_producer"), f"{field}.rhs_producer"),
+        lhs_resident_boundary=_optional_index(
+            item.get("lhs_resident_boundary"),
+            f"{field}.lhs_resident_boundary",
+            bound=resident_bound,
+        ),
+        rhs_resident_boundary=_optional_index(
+            item.get("rhs_resident_boundary"),
+            f"{field}.rhs_resident_boundary",
+            bound=resident_bound,
+        ),
+        is_sink=_bool(item.get("is_sink"), f"{field}.is_sink"),
+        lhs_ephemeral=_bool(item.get("lhs_ephemeral"), f"{field}.lhs_ephemeral"),
+        rhs_ephemeral=_bool(item.get("rhs_ephemeral"), f"{field}.rhs_ephemeral"),
+        output_ephemeral=_bool(
+            item.get("output_ephemeral"), f"{field}.output_ephemeral"
+        ),
+        contraction=_positive_int(item.get("contraction"), f"{field}.contraction"),
+        effective_contraction=_positive_int(
+            item.get("effective_contraction"), f"{field}.effective_contraction"
+        ),
+        accumulator_dtype=_dtype(
+            item.get("accumulator_dtype"), f"{field}.accumulator_dtype"
+        ),
+        storage_dtype=_dtype(item.get("storage_dtype"), f"{field}.storage_dtype"),
+        lhs=_parse_cube_region(
+            item.get("lhs"), field=f"{field}.lhs", tensor_bound=tensor_bound
+        ),
+        rhs=_parse_cube_region(
+            item.get("rhs"), field=f"{field}.rhs", tensor_bound=tensor_bound
+        ),
+        output=_parse_cube_region(
+            item.get("output"), field=f"{field}.output", tensor_bound=tensor_bound
+        ),
+        k_loop=_parse_cube_k_loop(item.get("k_loop"), field=f"{field}.k_loop"),
+        output_tile=_int_tuple(item.get("output_tile"), 2, f"{field}.output_tile"),
+        output_grid=_int_tuple(item.get("output_grid"), 2, f"{field}.output_grid"),
+        output_variants=tuple(
+            _parse_cube_output_variant(
+                variant, field=f"{field}.output_variants[{index}]"
+            )
+            for index, variant in enumerate(
+                _sequence(item.get("output_variants"), f"{field}.output_variants")
+            )
+        ),
+        retained_panels=CubeRetainedPanelPlan(
+            lhs=_bool(retained.get("lhs"), f"{field}.retained_panels.lhs"),
+            rhs=_bool(retained.get("rhs"), f"{field}.retained_panels.rhs"),
+            lhs_bytes=_nonnegative_int(
+                retained.get("lhs_bytes"), f"{field}.retained_panels.lhs_bytes"
+            ),
+            rhs_bytes=_nonnegative_int(
+                retained.get("rhs_bytes"), f"{field}.retained_panels.rhs_bytes"
+            ),
+        ),
+        final_drain=_parse_cube_final_drain(
+            item.get("final_drain"), field=f"{field}.final_drain"
+        ),
+    )
+
+
+def _parse_cube_region(
+    value: Any, *, field: str, tensor_bound: int
+) -> CubeTensorRegionPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"tensor", "height_binding", "width_binding", "height", "width"},
+        field=field,
+    )
+    return CubeTensorRegionPlan(
+        tensor=_bounded_int(item.get("tensor"), f"{field}.tensor", tensor_bound),
+        height_binding=_enum(
+            CubeAxisBinding, item.get("height_binding"), f"{field}.height_binding"
+        ),
+        width_binding=_enum(
+            CubeAxisBinding, item.get("width_binding"), f"{field}.width_binding"
+        ),
+        height=_positive_int(item.get("height"), f"{field}.height"),
+        width=_positive_int(item.get("width"), f"{field}.width"),
+    )
+
+
+def _parse_cube_k_loop(value: Any, *, field: str) -> CubeKLoopPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"l1_window_k", "chunk", "full_chunks", "tail", "pipeline_stages"},
+        field=field,
+    )
+    return CubeKLoopPlan(
+        l1_window_k=_positive_int(item.get("l1_window_k"), f"{field}.l1_window_k"),
+        chunk=_positive_int(item.get("chunk"), f"{field}.chunk"),
+        full_chunks=_nonnegative_int(item.get("full_chunks"), f"{field}.full_chunks"),
+        tail=_nonnegative_int(item.get("tail"), f"{field}.tail"),
+        pipeline_stages=_positive_int(
+            item.get("pipeline_stages"), f"{field}.pipeline_stages"
+        ),
+    )
+
+
+def _parse_cube_output_variant(value: Any, *, field: str) -> CubeOutputTileVariant:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"shape", "count", "l0_init", "l0_rolled", "l0_tail"},
+        field=field,
+    )
+    l0_init = _parse_l0_matmul(
+        item.get("l0_init"), field=f"{field}.l0_init", required=True
+    )
+    if l0_init is None:
+        raise AssertionError("required L0 plan parser returned None")
+    return CubeOutputTileVariant(
+        shape=_int_tuple(item.get("shape"), 2, f"{field}.shape"),
+        count=_positive_int(item.get("count"), f"{field}.count"),
+        l0_init=l0_init,
+        l0_rolled=_parse_l0_matmul(
+            item.get("l0_rolled"), field=f"{field}.l0_rolled", required=False
+        ),
+        l0_tail=_parse_l0_matmul(
+            item.get("l0_tail"), field=f"{field}.l0_tail", required=False
+        ),
+    )
+
+
+def _parse_l0_matmul(value: Any, *, field: str, required: bool) -> L0MatmulPlan | None:
+    if value is None:
+        if required:
+            raise ScheduleContractError(f"{field} must contain an L0 plan")
+        return None
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "tile",
+            "stationarity",
+            "output_stationary_holds_a",
+            "buffer_depths",
+            "output_target",
+            "k_loop",
+            "estimated_traffic_bytes",
+            "estimated_cost_cycles",
+            "padded_compute_volume",
+            "phases",
+        },
+        field=field,
+    )
+    k_loop = _mapping(item.get("k_loop"), f"{field}.k_loop")
+    _expect_keys(
+        k_loop,
+        required={"chunk", "full_chunks", "tail", "pipeline_stages"},
+        field=f"{field}.k_loop",
+    )
+    phases = _mapping(item.get("phases"), f"{field}.phases")
+    phase_names = {
+        "load_cycles",
+        "mad_cycles",
+        "init_cycles",
+        "rolled_cycles",
+        "tail_cycles",
+        "drain_cycles",
+        "wall_cycles",
+    }
+    _expect_keys(phases, required=phase_names, field=f"{field}.phases")
+    return L0MatmulPlan(
+        tile=_int_tuple(item.get("tile"), 3, f"{field}.tile"),
+        stationarity=_enum(
+            L0Stationarity, item.get("stationarity"), f"{field}.stationarity"
+        ),
+        output_stationary_holds_a=_bool(
+            item.get("output_stationary_holds_a"),
+            f"{field}.output_stationary_holds_a",
+        ),
+        buffer_depths=_int_tuple(
+            item.get("buffer_depths"), 3, f"{field}.buffer_depths"
+        ),
+        output_target=_enum(
+            L0OutputTarget, item.get("output_target"), f"{field}.output_target"
+        ),
+        k_loop=L0KLoopPlan(
+            chunk=_positive_int(k_loop.get("chunk"), f"{field}.k_loop.chunk"),
+            full_chunks=_nonnegative_int(
+                k_loop.get("full_chunks"), f"{field}.k_loop.full_chunks"
+            ),
+            tail=_nonnegative_int(k_loop.get("tail"), f"{field}.k_loop.tail"),
+            pipeline_stages=_positive_int(
+                k_loop.get("pipeline_stages"), f"{field}.k_loop.pipeline_stages"
+            ),
+        ),
+        estimated_traffic_bytes=_nonnegative_int(
+            item.get("estimated_traffic_bytes"), f"{field}.estimated_traffic_bytes"
+        ),
+        estimated_cost_cycles=_finite_number(
+            item.get("estimated_cost_cycles"), f"{field}.estimated_cost_cycles"
+        ),
+        padded_compute_volume=_nonnegative_int(
+            item.get("padded_compute_volume"), f"{field}.padded_compute_volume"
+        ),
+        phases=L0PhaseCostPlan(
+            **{
+                name: _finite_number(phases.get(name), f"{field}.phases.{name}")
+                for name in phase_names
+            }
+        ),
+    )
+
+
+def _parse_cube_final_drain(value: Any, *, field: str) -> CubeFinalDrainPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "required",
+            "target_l1",
+            "atomic",
+            "valid_rows",
+            "valid_cols",
+            "tile_count",
+            "bytes",
+            "cycles",
+        },
+        field=field,
+    )
+    return CubeFinalDrainPlan(
+        required=_bool(item.get("required"), f"{field}.required"),
+        target_l1=_bool(item.get("target_l1"), f"{field}.target_l1"),
+        atomic=_bool(item.get("atomic"), f"{field}.atomic"),
+        valid_rows=_nonnegative_int(item.get("valid_rows"), f"{field}.valid_rows"),
+        valid_cols=_nonnegative_int(item.get("valid_cols"), f"{field}.valid_cols"),
+        tile_count=_nonnegative_int(item.get("tile_count"), f"{field}.tile_count"),
+        bytes=_nonnegative_int(item.get("bytes"), f"{field}.bytes"),
+        cycles=_finite_number(item.get("cycles"), f"{field}.cycles"),
+    )
+
+
+def _validate_cube_links(plan: CubeKernelPlan, *, field: str) -> None:
+    for matmul in plan.matmuls:
+        if (
+            matmul.lhs_producer >= matmul.instance
+            or matmul.rhs_producer >= matmul.instance
+        ):
+            raise ScheduleContractError(
+                f"{field}.matmuls[{matmul.instance}] has a non-prior producer"
+            )
+        for role, resident_id in (
+            (CubeOperandRole.LHS, matmul.lhs_resident_boundary),
+            (CubeOperandRole.RHS, matmul.rhs_resident_boundary),
+        ):
+            if resident_id < 0:
+                continue
+            resident = plan.resident_boundaries[resident_id]
+            if resident.role is not role:
+                raise ScheduleContractError(
+                    f"{field}.matmuls[{matmul.instance}] links {role.value} to a "
+                    f"{resident.role.value} resident boundary"
+                )
+            if not (resident.first_use <= matmul.instance <= resident.last_use):
+                raise ScheduleContractError(
+                    f"{field}.matmuls[{matmul.instance}] lies outside resident "
+                    f"boundary {resident_id}'s lifetime"
+                )
+
+
+def _validate_cube_contract(
+    plan: CubeKernelPlan,
+    *,
+    lowered: LoweredRegion,
+    step_ops: tuple[int, ...],
+    step_order: tuple[int, ...],
+    sequential_tiles: tuple[int, ...] | None,
+    launch: LaunchPlan,
+    field: str,
+) -> None:
+    spatial_tiles = plan.m_partition.parts * plan.n_partition.parts
+    if (
+        launch.parts_m != plan.m_partition.parts
+        or launch.parts_n != plan.n_partition.parts
+    ):
+        raise ScheduleContractError(f"{field} launch grid differs from its partitions")
+    if launch.tile_h != plan.m_partition.big or launch.tile_w != plan.n_partition.big:
+        raise ScheduleContractError(
+            f"{field} launch tile differs from its spatial partitions"
+        )
+    if plan.spatial_tiles != spatial_tiles:
+        raise ScheduleContractError(
+            f"{field}.spatial_tiles differs from its partition grid"
+        )
+    if launch.split != plan.split_k:
+        raise ScheduleContractError(f"{field}.split_k differs from the launch split")
+    if plan.work_units != spatial_tiles * plan.split_k:
+        raise ScheduleContractError(f"{field}.work_units differs from grid times split")
+    if launch.cores > plan.work_units:
+        raise ScheduleContractError(f"{field} uses more cores than work units")
+
+    split = plan.first_partial_then_atomic
+    if split.synchronization_cycles < 0:
+        raise ScheduleContractError(
+            f"{field}.first_partial_then_atomic has negative synchronization cost"
+        )
+    if plan.split_k == 1:
+        if (
+            plan.split_merge_policy is not CubeSplitMergePolicy.NONE
+            or split.present
+            or split.first_work_units != 0
+            or split.atomic_work_units != 0
+            or split.synchronization_cycles != 0
+        ):
+            raise ScheduleContractError(f"{field} has split-merge work for split_k=1")
+    elif (
+        plan.split_merge_policy is not CubeSplitMergePolicy.FIRST_PARTIAL_THEN_ATOMIC
+        or not split.present
+        or split.first_work_units != spatial_tiles
+        or split.atomic_work_units != spatial_tiles * (plan.split_k - 1)
+    ):
+        raise ScheduleContractError(
+            f"{field} has an inconsistent FirstPartialThenAtomic descriptor"
+        )
+
+    step_set = set(step_ops)
+    if any(matmul.op not in step_set for matmul in plan.matmuls):
+        raise ScheduleContractError(
+            f"{field}.matmuls references an op outside its step"
+        )
+    if plan.execution_order != tuple(matmul.op for matmul in plan.matmuls):
+        raise ScheduleContractError(
+            f"{field} execution order differs from the serialized request order"
+        )
+
+    resident_uses: list[list[tuple[int, CubeOperandRole]]] = [
+        [] for _ in plan.resident_boundaries
+    ]
+    if sequential_tiles is None:
+        raise ScheduleContractError(f"{field} omits cube sequential tiles")
+    sequential_by_op = dict(zip(step_order, sequential_tiles, strict=True))
+    for matmul in plan.matmuls:
+        matmul_field = f"{field}.matmuls[{matmul.instance}]"
+        operation = lowered.operation(matmul.op)
+        if (
+            operation.op_type != "MatMul"
+            or len(operation.inputs) != 2
+            or len(operation.outputs) != 1
+        ):
+            raise ScheduleContractError(
+                f"{matmul_field} does not describe a lowered matmul"
+            )
+        if (
+            matmul.lhs.tensor != operation.inputs[0]
+            or matmul.rhs.tensor != operation.inputs[1]
+            or matmul.output.tensor != operation.outputs[0]
+        ):
+            raise ScheduleContractError(
+                f"{matmul_field} tensor regions differ from the lowered matmul operands"
+            )
+        lhs_tensor = lowered.tensor(operation.inputs[0])
+        rhs_tensor = lowered.tensor(operation.inputs[1])
+        output_tensor = lowered.tensor(operation.outputs[0])
+        if (
+            matmul.contraction != lhs_tensor.width
+            or matmul.contraction != rhs_tensor.height
+        ):
+            raise ScheduleContractError(
+                f"{matmul_field}.contraction differs from its operand tensors"
+            )
+        if (
+            output_tensor.height != lhs_tensor.height
+            or output_tensor.width != rhs_tensor.width
+        ):
+            raise ScheduleContractError(
+                f"{matmul_field} output tensor geometry differs from its operands"
+            )
+        for name, region in (
+            ("lhs", matmul.lhs),
+            ("rhs", matmul.rhs),
+            ("output", matmul.output),
+        ):
+            _validate_cube_region_geometry(
+                region,
+                lowered=lowered,
+                m_extent=plan.m_partition.big,
+                n_extent=plan.n_partition.big,
+                split=plan.split_k,
+                field=f"{matmul_field}.{name}",
+            )
+        if matmul.effective_contraction > matmul.contraction:
+            raise ScheduleContractError(
+                f"{matmul_field}.effective_contraction exceeds the full contraction"
+            )
+        if (
+            matmul.lhs.width != matmul.effective_contraction
+            or matmul.rhs.height != matmul.effective_contraction
+            or matmul.output.height != matmul.lhs.height
+            or matmul.output.width != matmul.rhs.width
+        ):
+            raise ScheduleContractError(
+                f"{matmul_field} regions do not form its scheduled matmul"
+            )
+        loop = matmul.k_loop
+        if sequential_by_op[matmul.op] != loop.l1_window_k:
+            raise ScheduleContractError(
+                f"{matmul_field}.k_loop differs from its common sequential tile"
+            )
+        if loop.full_chunks * loop.chunk + loop.tail != matmul.effective_contraction:
+            raise ScheduleContractError(f"{matmul_field}.k_loop does not cover K")
+        if loop.tail >= loop.chunk or loop.l1_window_k < loop.chunk:
+            raise ScheduleContractError(
+                f"{matmul_field}.k_loop has invalid chunk geometry"
+            )
+        if loop.pipeline_stages not in {1, 2}:
+            raise ScheduleContractError(
+                f"{matmul_field}.k_loop has unsupported pipeline depth"
+            )
+
+        for role, producer_index, operand in (
+            (CubeOperandRole.LHS, matmul.lhs_producer, matmul.lhs),
+            (CubeOperandRole.RHS, matmul.rhs_producer, matmul.rhs),
+        ):
+            if producer_index < 0:
+                continue
+            producer = plan.matmuls[producer_index]
+            if producer.output != operand:
+                raise ScheduleContractError(
+                    f"{matmul_field} {role.value} region differs from producer "
+                    f"{producer_index}'s output region"
+                )
+
+        for role, resident_index, operand in (
+            (CubeOperandRole.LHS, matmul.lhs_resident_boundary, matmul.lhs),
+            (CubeOperandRole.RHS, matmul.rhs_resident_boundary, matmul.rhs),
+        ):
+            if resident_index < 0:
+                continue
+            resident = plan.resident_boundaries[resident_index]
+            if resident.region != operand:
+                raise ScheduleContractError(
+                    f"{matmul_field} {role.value} region differs from resident "
+                    f"boundary {resident_index}"
+                )
+            resident_uses[resident_index].append((matmul.instance, role))
+
+        _validate_cube_output_contract(
+            matmul,
+            lowered=lowered,
+            split_k=plan.split_k,
+            field=matmul_field,
+        )
+
+    for index, resident in enumerate(plan.resident_boundaries):
+        uses = resident_uses[index]
+        if len(uses) != resident.use_count:
+            raise ScheduleContractError(
+                f"{field}.resident_boundaries[{index}].use_count is stale"
+            )
+        instances = [instance for instance, _ in uses]
+        if (
+            not instances
+            or resident.first_use != min(instances)
+            or resident.last_use != max(instances)
+        ):
+            raise ScheduleContractError(
+                f"{field}.resident_boundaries[{index}] has stale lifetime bounds"
+            )
+        expected_bytes = (
+            resident.region.height
+            * resident.region.width
+            * lowered.tensor(resident.region.tensor).byte_width
+        )
+        if resident.bytes != expected_bytes:
+            raise ScheduleContractError(
+                f"{field}.resident_boundaries[{index}].bytes differs from its tensor region"
+            )
+
+
+def _validate_cube_region_geometry(
+    region: CubeTensorRegionPlan,
+    *,
+    lowered: LoweredRegion,
+    m_extent: int,
+    n_extent: int,
+    split: int,
+    field: str,
+) -> None:
+    tensor = lowered.tensor(region.tensor)
+    expected_height = _cube_binding_extent(
+        region.height_binding,
+        tensor.height,
+        m_extent=m_extent,
+        n_extent=n_extent,
+        split=split,
+        field=f"{field}.height",
+    )
+    expected_width = _cube_binding_extent(
+        region.width_binding,
+        tensor.width,
+        m_extent=m_extent,
+        n_extent=n_extent,
+        split=split,
+        field=f"{field}.width",
+    )
+    if region.height != expected_height or region.width != expected_width:
+        raise ScheduleContractError(
+            f"{field} extent differs from its tensor and axis bindings"
+        )
+
+
+def _cube_binding_extent(
+    binding: CubeAxisBinding,
+    full_extent: int,
+    *,
+    m_extent: int,
+    n_extent: int,
+    split: int,
+    field: str,
+) -> int:
+    if binding in {CubeAxisBinding.FULL, CubeAxisBinding.SEQUENTIAL_K}:
+        return full_extent
+    if binding is CubeAxisBinding.SPATIAL_M:
+        return min(full_extent, m_extent)
+    if binding is CubeAxisBinding.SPATIAL_N:
+        return min(full_extent, n_extent)
+    if full_extent % split:
+        raise ScheduleContractError(
+            f"{field} cannot divide extent {full_extent} across split {split}"
+        )
+    return full_extent // split
+
+
+def _validate_cube_output_contract(
+    matmul: CubeMatmulPlan,
+    *,
+    lowered: LoweredRegion,
+    split_k: int,
+    field: str,
+) -> None:
+    tile_m, tile_n = matmul.output_tile
+    expected_grid = (
+        _ceil_div(matmul.output.height, tile_m),
+        _ceil_div(matmul.output.width, tile_n),
+    )
+    if matmul.output_grid != expected_grid:
+        raise ScheduleContractError(
+            f"{field}.output_grid does not cover its output region"
+        )
+
+    expected_variants: dict[tuple[int, int], int] = {}
+    full_m, tail_m = divmod(matmul.output.height, tile_m)
+    full_n, tail_n = divmod(matmul.output.width, tile_n)
+    for shape, count in (
+        ((tile_m, tile_n), full_m * full_n),
+        ((tail_m, tile_n), full_n),
+        ((tile_m, tail_n), full_m),
+        ((tail_m, tail_n), 1 if tail_m and tail_n else 0),
+    ):
+        if shape[0] and shape[1] and count:
+            expected_variants[shape] = expected_variants.get(shape, 0) + count
+    actual_variants = {
+        variant.shape: variant.count for variant in matmul.output_variants
+    }
+    if (
+        len(actual_variants) != len(matmul.output_variants)
+        or actual_variants != expected_variants
+    ):
+        raise ScheduleContractError(
+            f"{field}.output_variants do not partition the output grid"
+        )
+
+    chunked = matmul.k_loop.full_chunks >= 2
+    init_k = matmul.k_loop.chunk if chunked else matmul.effective_contraction
+    for index, variant in enumerate(matmul.output_variants):
+        variant_field = f"{field}.output_variants[{index}]"
+        _validate_l0_contract(
+            variant.l0_init,
+            expected_tile=(*variant.shape, init_k),
+            field=f"{variant_field}.l0_init",
+        )
+        if chunked:
+            if variant.l0_rolled is None:
+                raise ScheduleContractError(f"{variant_field}.l0_rolled is required")
+            _validate_l0_contract(
+                variant.l0_rolled,
+                expected_tile=(*variant.shape, matmul.k_loop.chunk),
+                field=f"{variant_field}.l0_rolled",
+            )
+        elif variant.l0_rolled is not None:
+            raise ScheduleContractError(f"{variant_field}.l0_rolled is unexpected")
+        if chunked and matmul.k_loop.tail:
+            if variant.l0_tail is None:
+                raise ScheduleContractError(f"{variant_field}.l0_tail is required")
+            _validate_l0_contract(
+                variant.l0_tail,
+                expected_tile=(*variant.shape, matmul.k_loop.tail),
+                field=f"{variant_field}.l0_tail",
+            )
+        elif variant.l0_tail is not None:
+            raise ScheduleContractError(f"{variant_field}.l0_tail is unexpected")
+
+    drain = matmul.final_drain
+    expected_tiles = matmul.output_grid[0] * matmul.output_grid[1]
+    expected_bytes = (
+        matmul.output.height
+        * matmul.output.width
+        * lowered.tensor(matmul.output.tensor).byte_width
+    )
+    if (
+        not drain.required
+        or drain.target_l1 != (not matmul.is_sink)
+        or drain.atomic != (matmul.is_sink and split_k > 1)
+    ):
+        raise ScheduleContractError(f"{field}.final_drain has inconsistent ownership")
+    if (
+        drain.valid_rows != tile_m
+        or drain.valid_cols != tile_n
+        or drain.tile_count != expected_tiles
+        or drain.bytes != expected_bytes
+        or drain.cycles < 0
+    ):
+        raise ScheduleContractError(f"{field}.final_drain differs from its output grid")
+
+    retained = matmul.retained_panels
+    expected_lhs_bytes = (
+        matmul.lhs.height
+        * matmul.lhs.width
+        * lowered.tensor(matmul.lhs.tensor).byte_width
+        if retained.lhs
+        else 0
+    )
+    expected_rhs_bytes = (
+        matmul.rhs.height
+        * matmul.rhs.width
+        * lowered.tensor(matmul.rhs.tensor).byte_width
+        if retained.rhs
+        else 0
+    )
+    if (
+        retained.lhs_bytes != expected_lhs_bytes
+        or retained.rhs_bytes != expected_rhs_bytes
+    ):
+        raise ScheduleContractError(f"{field}.retained_panels byte count is stale")
+
+
+def _validate_l0_contract(
+    plan: L0MatmulPlan,
+    *,
+    expected_tile: tuple[int, int, int],
+    field: str,
+) -> None:
+    if plan.tile != expected_tile:
+        raise ScheduleContractError(f"{field}.tile differs from its output/K variant")
+    if any(depth <= 0 for depth in plan.buffer_depths):
+        raise ScheduleContractError(f"{field}.buffer_depths must be positive")
+    loop = plan.k_loop
+    if loop.full_chunks * loop.chunk + loop.tail != plan.tile[2]:
+        raise ScheduleContractError(f"{field}.k_loop does not cover its tile K")
+    if loop.tail >= loop.chunk or loop.pipeline_stages not in {1, 2}:
+        raise ScheduleContractError(f"{field}.k_loop has invalid geometry")
+    if (
+        plan.estimated_traffic_bytes < 0
+        or plan.estimated_cost_cycles < 0
+        or plan.padded_compute_volume < 0
+    ):
+        raise ScheduleContractError(f"{field} contains a negative cost quantity")
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _parse_axis_partition(value: Any, *, field: str) -> AxisPartition:
+    item = _mapping(value, field)
+    _expect_keys(item, required={"big", "small", "num_big", "parts"}, field=field)
+    result = AxisPartition(
+        big=_positive_int(item.get("big"), f"{field}.big"),
+        small=_positive_int(item.get("small"), f"{field}.small"),
+        num_big=_nonnegative_int(item.get("num_big"), f"{field}.num_big"),
+        parts=_positive_int(item.get("parts"), f"{field}.parts"),
+    )
+    if result.small > result.big or result.num_big > result.parts:
+        raise ScheduleContractError(f"{field} is not a valid balanced partition")
+    return result
+
+
+def _parse_optional_loop(value: Any, *, field: str) -> VectorLoopPlan | None:
+    if value is None:
+        return None
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={"first_chunk", "trip_count", "pipeline_stages"},
+        field=field,
+    )
+    return VectorLoopPlan(
+        first_chunk=_nonnegative_int(item.get("first_chunk"), f"{field}.first_chunk"),
+        trip_count=_nonnegative_int(item.get("trip_count"), f"{field}.trip_count"),
+        pipeline_stages=_positive_int(
+            item.get("pipeline_stages"), f"{field}.pipeline_stages"
+        ),
+    )
+
+
+def _parse_optional_serial(value: Any, *, field: str) -> VectorSerialPhasePlan | None:
+    if value is None:
+        return None
+    item = _mapping(value, field)
+    _expect_keys(item, required={"present", "chunk_index", "extent"}, field=field)
+    return VectorSerialPhasePlan(
+        present=_bool(item.get("present"), f"{field}.present"),
+        chunk_index=_nonnegative_int(item.get("chunk_index"), f"{field}.chunk_index"),
+        extent=_nonnegative_int(item.get("extent"), f"{field}.extent"),
+    )
+
+
+def _mapping(value: Any, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ScheduleContractError(f"{field} must be an object")
+    return value
+
+
+def _sequence(value: Any, field: str) -> Sequence[Any]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ScheduleContractError(f"{field} must be an array")
+    return value
+
+
+def _expect_keys(
+    value: Mapping[str, Any],
+    *,
+    required: set[str],
+    field: str,
+    optional: set[str] | None = None,
+) -> None:
+    missing = required - value.keys()
+    extras = value.keys() - required - (optional or set())
+    if missing:
+        raise ScheduleContractError(f"{field} omits fields {sorted(missing)}")
+    if extras:
+        raise ScheduleContractError(f"{field} contains unknown fields {sorted(extras)}")
+
+
+def _enum(kind: type[EnumT], value: Any, field: str) -> EnumT:
+    try:
+        return kind(value)
+    except (TypeError, ValueError) as error:
+        choices = ", ".join(repr(item.value) for item in kind)
+        raise ScheduleContractError(
+            f"{field} must be one of {choices}, got {value!r}"
+        ) from error
+
+
+def _bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ScheduleContractError(f"{field} must be a boolean")
+    return value
+
+
+def _nonempty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ScheduleContractError(f"{field} must be a non-empty string")
+    return value
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ScheduleContractError(f"{field} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ScheduleContractError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _bounded_int(value: Any, field: str, bound: int) -> int:
+    result = _nonnegative_int(value, field)
+    if result >= bound:
+        raise ScheduleContractError(f"{field} contains out-of-range index {result}")
+    return result
+
+
+def _optional_index(value: Any, field: str, *, bound: int | None = None) -> int:
+    if value == -1:
+        return -1
+    result = _nonnegative_int(value, field)
+    if bound is not None and result >= bound:
+        raise ScheduleContractError(f"{field} contains out-of-range index {result}")
+    return result
+
+
+@overload
+def _int_tuple(value: Any, size: Literal[2], field: str) -> tuple[int, int]: ...
+
+
+@overload
+def _int_tuple(value: Any, size: Literal[3], field: str) -> tuple[int, int, int]: ...
+
+
+@overload
+def _int_tuple(value: Any, size: int, field: str) -> tuple[int, ...]: ...
+
+
+def _int_tuple(value: Any, size: int, field: str) -> tuple[int, ...]:
+    items = _sequence(value, field)
+    if len(items) != size:
+        raise ScheduleContractError(f"{field} must contain exactly {size} integers")
+    return tuple(_positive_int(item, field) for item in items)
+
+
+@overload
+def _nonnegative_int_tuple(
+    value: Any, size: Literal[2], field: str
+) -> tuple[int, int]: ...
+
+
+@overload
+def _nonnegative_int_tuple(value: Any, size: int, field: str) -> tuple[int, ...]: ...
+
+
+def _nonnegative_int_tuple(value: Any, size: int, field: str) -> tuple[int, ...]:
+    items = _sequence(value, field)
+    if len(items) != size:
+        raise ScheduleContractError(f"{field} must contain exactly {size} integers")
+    return tuple(_nonnegative_int(item, field) for item in items)
+
+
+def _bounded_axis(value: Any, field: str) -> int:
+    result = _nonnegative_int(value, field)
+    if result > 2:
+        raise ScheduleContractError(f"{field} must be 0, 1, or 2")
+    return result
+
+
+def _finite_number(value: Any, field: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ScheduleContractError(f"{field} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ScheduleContractError(f"{field} must be a finite number")
+    return result
+
+
+def _dtype(value: Any, field: str) -> str:
+    allowed = {"fp32", "fp16", "bf16", "int32", "int16", "int8", "bool"}
+    if value not in allowed:
+        raise ScheduleContractError(f"{field} has unsupported dtype {value!r}")
+    return str(value)

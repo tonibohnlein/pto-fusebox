@@ -39,7 +39,9 @@ def _capture_documented_example(name: str) -> NormalizedGraph:
             return torch.mm(lhs, rhs)
 
     class AttentionCore(nn.Module):
-        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        def forward(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
             return torch.mm(torch.softmax(torch.mm(q, k.t()), dim=-1), v)
 
     class TopKBoundary(nn.Module):
@@ -116,8 +118,13 @@ def _render_solver_contract(graph: NormalizedGraph) -> str:
                 f"mixed={problem['mixed_vector_semantics'][index]} "
                 f"({inputs})->({outputs})"
             )
-        lines.append(f"  required={','.join(str(item) for item in problem['required_outputs']) or '-'}")
-        lines.append("  p4=" + json.dumps(problem["p4_patterns"], sort_keys=True, separators=(",", ":")))
+        lines.append(
+            f"  required={','.join(str(item) for item in problem['required_outputs']) or '-'}"
+        )
+        lines.append(
+            "  p4="
+            + json.dumps(problem["p4_patterns"], sort_keys=True, separators=(",", ":"))
+        )
     return "\n".join(lines)
 
 
@@ -128,11 +135,15 @@ def _render_solver_contract(graph: NormalizedGraph) -> str:
 def test_documented_examples_have_exact_solver_dag(name: str) -> None:
     graph = _capture_documented_example(name)
     expected_path = Path(__file__).with_name("frontend_contracts") / f"{name}.txt"
-    assert _render_solver_contract(graph) == expected_path.read_text(encoding="utf-8").rstrip("\n")
+    assert _render_solver_contract(graph) == expected_path.read_text(
+        encoding="utf-8"
+    ).rstrip("\n")
 
 
 def test_rmsnorm_keeps_parameter_external_and_lowers_mean() -> None:
-    graph = export_and_normalize(RmsNorm(64), (torch.randn(8, 64, dtype=torch.float16),))
+    graph = export_and_normalize(
+        RmsNorm(64), (torch.randn(8, 64, dtype=torch.float16),)
+    )
 
     assert [op.kind for op in graph.ops] == [
         "cast",
@@ -148,8 +159,16 @@ def test_rmsnorm_keeps_parameter_external_and_lowers_mean() -> None:
     weight = next(value for value in graph.values if value.target == "weight")
     assert weight.role == "parameter"
     assert weight.id in graph.inputs
-    assert "1e-05" not in graph.to_json(indent=None) or "scalars" in graph.to_json(indent=None)
-    assert extract_solver_regions(graph)[0].lower(graph).problem["op_types"].count("Reduction") == 1
+    assert "1e-05" not in graph.to_json(indent=None) or "scalars" in graph.to_json(
+        indent=None
+    )
+    assert (
+        extract_solver_regions(graph)[0]
+        .lower(graph)
+        .problem["op_types"]
+        .count("Reduction")
+        == 1
+    )
 
 
 def test_exported_program_is_the_authoritative_core_api() -> None:
@@ -186,14 +205,28 @@ def test_softmax_is_generic_dag_with_exact_p4_descriptor() -> None:
 
     assert [op.kind for op in graph.ops] == ["max", "sub", "exp", "sum", "div"]
     assert [pattern.kind for pattern in graph.patterns] == ["softmax_flash"]
+    assert [
+        (binding.op, binding.value) for binding in graph.patterns[0].apply_bindings
+    ] == [("op0000", "running_max"), ("op0003", "running_sum")]
+    decoded = NormalizedGraph.from_json(graph.to_json())
+    assert decoded.patterns[0].apply_bindings == graph.patterns[0].apply_bindings
     lowered = extract_solver_regions(graph)[0].lower(graph).problem
     assert lowered["p4_patterns"] == [
-        {"kind": "softmax_flash", "ops": [0, 1, 2, 3, 4], "apply_substitutions": [0, 3]}
+        {
+            "kind": "softmax_flash",
+            "ops": [0, 1, 2, 3, 4],
+            "apply_substitutions": [
+                {"op": 0, "value": "running_max"},
+                {"op": 3, "value": "running_sum"},
+            ],
+        }
     ]
 
 
 @pytest.mark.parametrize("rank", [2, 3])
-def test_linear_lowers_to_matmul_bias_and_preserves_transposed_weight(rank: int) -> None:
+def test_linear_lowers_to_matmul_bias_and_preserves_transposed_weight(
+    rank: int,
+) -> None:
     module = nn.Linear(16, 24, bias=True)
     shape = (5, 16) if rank == 2 else (2, 5, 16)
     graph = export_and_normalize(module, (torch.randn(*shape),))
@@ -257,7 +290,9 @@ def test_target_rejects_incoherent_matmul_geometry() -> None:
 
 def test_qk_softmax_pv_is_one_generic_cube_vector_cube_region() -> None:
     class AttentionCore(nn.Module):
-        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        def forward(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
             logits = torch.mm(q, k.t())
             probabilities = torch.softmax(logits, dim=-1)
             return torch.mm(probabilities, v)
@@ -309,7 +344,9 @@ def test_topk_is_opaque_and_splits_supported_regions() -> None:
     assert len(opaque) == 1
     assert "topk" in str(opaque[0].attributes["source_operator"])
     regions = extract_solver_regions(graph)
-    assert [[graph.op_map()[op_id].kind for op_id in region.op_ids] for region in regions] == [
+    assert [
+        [graph.op_map()[op_id].kind for op_id in region.op_ids] for region in regions
+    ] == [
         ["exp"],
         ["abs"],
     ]
@@ -327,7 +364,9 @@ def test_opaque_bypass_diamond_cannot_rejoin_across_boundary() -> None:
     assert [op.kind for op in graph.ops] == ["exp", "opaque", "abs", "add"]
     regions = extract_solver_regions(graph)
     assert [region.op_ids for region in regions] == [("op0000", "op0002"), ("op0003",)]
-    assert regions[1].diagnostics == ("boundary op0001: unsupported operator aten.sin.default",)
+    assert regions[1].diagnostics == (
+        "boundary op0001: unsupported operator aten.sin.default",
+    )
 
 
 def test_unsafe_view_and_non_matmul_transpose_are_opaque() -> None:
@@ -346,9 +385,13 @@ def test_unsafe_view_and_non_matmul_transpose_are_opaque() -> None:
 
 def test_nondefault_operator_semantics_decline_instead_of_being_dropped() -> None:
     class NonDefaultSemantics(nn.Module):
-        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def forward(
+            self, lhs: torch.Tensor, rhs: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             scaled_add = torch.add(lhs, rhs, alpha=2)
-            widened_softmax = torch.softmax(lhs.to(torch.float16), dim=-1, dtype=torch.float32)
+            widened_softmax = torch.softmax(
+                lhs.to(torch.float16), dim=-1, dtype=torch.float32
+            )
             return scaled_add, widened_softmax
 
     graph = export_and_normalize(
@@ -397,7 +440,9 @@ def test_copy_capable_views_are_opaque(operation: str) -> None:
 
     graph = export_and_normalize(CopyCapableView(), (torch.randn(3, 4),))
     reasons = [op.opaque_reason for op in graph.ops if not op.supported]
-    assert reasons[-1] == (f"aten.{operation}.default may copy storage and is not a metadata-only alias")
+    assert reasons[-1] == (
+        f"aten.{operation}.default may copy storage and is not a metadata-only alias"
+    )
 
 
 def test_duplicate_structured_outputs_preserve_order_and_pytree() -> None:
@@ -476,7 +521,6 @@ def test_internal_transpose_is_an_explicit_region_boundary() -> None:
     assert regions[1].diagnostics == (
         "boundary op0001: transpose of a region-produced value requires an explicit solver layout edge",
     )
-
 
 
 def test_non_dense_external_input_declines() -> None:
@@ -586,7 +630,9 @@ def test_normalized_schema_rejects_invalid_pattern_substitution() -> None:
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return torch.softmax(value, dim=-1)
 
-    encoded = json.loads(export_and_normalize(Softmax(), (torch.randn(4, 16),)).to_json())
+    encoded = json.loads(
+        export_and_normalize(Softmax(), (torch.randn(4, 16),)).to_json()
+    )
     encoded["patterns"][0]["ops"] = encoded["patterns"][0]["ops"][:-1]
     encoded["patterns"][0]["apply_substitutions"] = ["op0004"]
     with pytest.raises(ValueError, match="substitutions must belong"):
@@ -646,9 +692,13 @@ def test_bf16_vector_arithmetic_is_boundary_but_cast_is_admitted() -> None:
             wide = value.float()
             return (value + value).float() + wide
 
-    graph = export_and_normalize(Bf16Arithmetic(), (torch.randn(4, 32, dtype=torch.bfloat16),))
+    graph = export_and_normalize(
+        Bf16Arithmetic(), (torch.randn(4, 32, dtype=torch.bfloat16),)
+    )
     regions = extract_solver_regions(graph)
-    kinds = [[graph.op_map()[op_id].kind for op_id in region.op_ids] for region in regions]
+    kinds = [
+        [graph.op_map()[op_id].kind for op_id in region.op_ids] for region in regions
+    ]
     assert kinds == [["cast"], ["cast", "add"]]
 
 
@@ -686,7 +736,9 @@ def test_unrepresentable_torch_broadcast_declines(
 
 
 @pytest.mark.parametrize("rhs_shape", [(2, 3, 1), (4,)])
-def test_representable_single_axis_broadcast_is_admitted(rhs_shape: tuple[int, ...]) -> None:
+def test_representable_single_axis_broadcast_is_admitted(
+    rhs_shape: tuple[int, ...],
+) -> None:
     class BroadcastAdd(nn.Module):
         def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
             return lhs + rhs
@@ -744,7 +796,9 @@ def test_same_dtype_to_is_alias_unless_copy_is_requested() -> None:
 
     copy_graph = export_and_normalize(SameDtypeTo(copy=True), (torch.randn(2, 8),))
     assert not copy_graph.ops[0].supported
-    assert copy_graph.ops[0].opaque_reason == ("same-dtype to(copy=True) requires an explicit copy lowering")
+    assert copy_graph.ops[0].opaque_reason == (
+        "same-dtype to(copy=True) requires an explicit copy lowering"
+    )
     assert extract_solver_regions(copy_graph) == []
 
 
@@ -755,7 +809,9 @@ def test_same_dtype_to_copy_operator_is_not_a_metadata_alias() -> None:
 
     graph = export_and_normalize(SameDtypeToCopy(), (torch.randn(2, 8),))
     assert not graph.ops[0].supported
-    assert graph.ops[0].opaque_reason == ("same-dtype to(copy=True) requires an explicit copy lowering")
+    assert graph.ops[0].opaque_reason == (
+        "same-dtype to(copy=True) requires an explicit copy lowering"
+    )
     assert extract_solver_regions(graph) == []
 
 
@@ -773,8 +829,10 @@ def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) 
         "problem=json.loads(pathlib.Path(sys.argv[3]).read_text())\n"
         "assert problem['schema_version']=='pto_fusebox.problem.v1'\n"
         "pathlib.Path(sys.argv[4]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v1','subgraphs':[[0]],"
-        "'granularities':[[16,4,1]],'subgraph_latencies':[1.0]}))\n",
+        "'schema_version':'pto_fusebox.solution.v2','steps':[{"
+        "'kind':'vector','ops':[0],'op_order':[0],"
+        "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
+        "'latency_cycles':1.0,'plan':{}}]}))\n",
         encoding="utf-8",
     )
     solver.chmod(solver.stat().st_mode | stat.S_IXUSR)
@@ -809,15 +867,20 @@ def test_invalid_solver_subgraph_is_not_reported_as_solved(tmp_path: Path) -> No
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v1','subgraphs':[[999]],"
-        "'granularities':[[16,4,1]],'subgraph_latencies':[1.0]}))\n",
+        "'schema_version':'pto_fusebox.solution.v2','steps':[{"
+        "'kind':'vector','ops':[999],'op_order':[999],"
+        "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
+        "'latency_cycles':1.0,'plan':{}}]}))\n",
         encoding="utf-8",
     )
     solver.chmod(solver.stat().st_mode | stat.S_IXUSR)
 
     result = solve_graph(graph, solver_binary=solver)
     assert [region.status for region in result.regions] == ["infeasible"]
-    assert result.regions[0].diagnostics[-1] == "solver step 0 references an invalid subgraph"
+    assert (
+        result.regions[0].diagnostics[-1]
+        == "solver step 0 references an invalid subgraph"
+    )
 
 
 def test_missing_solver_does_not_trigger_a_build(tmp_path: Path) -> None:

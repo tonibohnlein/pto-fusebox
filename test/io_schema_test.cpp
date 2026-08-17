@@ -40,7 +40,10 @@ int main() {
     "mixed_emit_compatible": [true, false],
     "required_outputs": [2],
     "p4_patterns": [{"kind": "softmax_flash", "ops": [0, 1],
-                     "apply_substitutions": [0]}],
+                     "apply_substitutions": [{"op": 0,
+                                               "value": "running_max"},
+                                              {"op": 1,
+                                               "value": "running_sum"}]}],
     "fast_memory_capacity": 1073741824,
     "cube_freq_hz": 1850000000.0,
     "vec_dma_align_bytes": 64,
@@ -53,6 +56,11 @@ int main() {
   check("problem schema parses", problem.num_ops() == 2);
   check("P4 pattern parses", problem.p4_patterns.size() == 1);
   check("P4 substitution parses", problem.p4_patterns[0].apply_substitutions.count(0) == 1);
+  check("P4 named binding parses",
+        problem.p4_patterns[0].apply_bindings.size() == 2 &&
+            problem.p4_patterns[0].apply_bindings[0].op == 0 &&
+            problem.p4_patterns[0].apply_bindings[0].value ==
+                P4SubstitutionValue::RunningMax);
   check("mixed compatibility parses", !problem.ops[1].mixed_emit_compatible);
   check("DMA alignment parses", problem.vec_dma_align_bytes == 64);
   check("model-ahead split-K parses", !problem.allow_model_ahead_split_k);
@@ -62,7 +70,9 @@ int main() {
   Solution empty(problem, dag, {});
   const auto solution = nlohmann::json::parse(solution_json(empty));
   check("solution schema is published",
-        solution.at("schema_version") == "pto_fusebox.solution.v1");
+        solution.at("schema_version") == "pto_fusebox.solution.v2");
+  check("solution steps are nested", solution.at("steps").is_array());
+  check("empty solution has no steps", solution.at("steps").empty());
 
   std::remove(path.c_str());
   std::cout << g_pass << " passed, " << g_fail << " failed\n";
