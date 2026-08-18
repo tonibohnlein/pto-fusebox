@@ -592,6 +592,30 @@ def test_dynamic_outer_dimension_is_preserved_and_static_lowering_declines(
     assert result.solver_binary == ""
 
 
+def test_shape_derived_symbolic_scalar_is_an_explicit_boundary() -> None:
+    class ShapeScale(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value * value.shape[0]
+
+    static_graph = export_and_normalize(ShapeScale(), (torch.randn(4, 8),))
+    assert static_graph.ops[0].supported
+    assert static_graph.ops[0].attributes["scalars"] == [{"position": 1, "value": 4}]
+
+    batch = torch.export.Dim("batch", min=1, max=8)
+    dynamic_graph = export_and_normalize(
+        ShapeScale(),
+        (torch.randn(4, 8),),
+        dynamic_shapes={"value": {0: batch}},
+    )
+    assert len(dynamic_graph.ops) == 1
+    op = dynamic_graph.ops[0]
+    assert not op.supported
+    assert op.inputs == (dynamic_graph.inputs[0],)
+    assert op.opaque_reason is not None
+    assert "depends on unrepresented symbolic or metadata value" in op.opaque_reason
+    assert extract_solver_regions(dynamic_graph) == []
+
+
 def test_normalized_json_is_deterministic_and_rejects_unknown_schema() -> None:
     first = export_and_normalize(RmsNorm(16), (torch.randn(2, 16),))
     second = export_and_normalize(RmsNorm(16), (torch.randn(2, 16),))
@@ -623,6 +647,16 @@ def test_normalized_schema_rejects_malformed_dependencies_and_alias_cycles() -> 
     alias_cycle["values"][1]["alias_of"] = alias_cycle["values"][0]["id"]
     with pytest.raises(ValueError, match="alias cycle"):
         NormalizedGraph.from_dict(alias_cycle)
+
+    missing_input = json.loads(graph.to_json())
+    missing_input["inputs"] = []
+    with pytest.raises(ValueError, match="producerless value .* graph input"):
+        NormalizedGraph.from_dict(missing_input)
+
+    malformed_arity = json.loads(graph.to_json())
+    malformed_arity["ops"][1]["inputs"] = []
+    with pytest.raises(ValueError, match=r"op0001 \(abs\) expects 1 tensor input"):
+        NormalizedGraph.from_dict(malformed_arity)
 
 
 def test_normalized_schema_rejects_invalid_pattern_substitution() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -11,6 +12,22 @@ from typing import Any
 NORMALIZED_GRAPH_SCHEMA = "pto_fusebox.normalized_graph.v1"
 PROBLEM_SCHEMA = "pto_fusebox.problem.v1"
 SOLUTION_SCHEMA = "pto_fusebox.solution.v2"
+
+_UNARY_NORMALIZED_OPS = {
+    "abs",
+    "cast",
+    "exp",
+    "log",
+    "max",
+    "neg",
+    "rsqrt",
+    "sqrt",
+    "sum",
+    "transpose_view",
+    "view",
+}
+_BINARY_NORMALIZED_OPS = {"maximum", "minimum", "matmul"}
+_SCALAR_BINARY_NORMALIZED_OPS = {"add", "div", "mul", "sub"}
 
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -272,6 +289,13 @@ class NormalizedGraph:
         return {op.id: op for op in self.ops}
 
 
+def normalized_graph_sha256(graph: NormalizedGraph) -> str:
+    """Return the deterministic identity of one complete normalized graph."""
+
+    payload = graph.to_json(indent=None).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _validate_graph(graph: NormalizedGraph) -> None:
     value_ids = [value.id for value in graph.values]
     op_ids = [op.id for op in graph.ops]
@@ -324,6 +348,7 @@ def _validate_ops(graph: NormalizedGraph, known_values: set[str]) -> None:
             raise ValueError(f"supported op {op.id} cannot carry an opaque reason")
         if not op.supported and not op.opaque_reason:
             raise ValueError(f"unsupported op {op.id} must carry an opaque reason")
+        _validate_known_op_arity(op)
         for value_id in op.outputs:
             if value_id in produced_values:
                 raise ValueError(f"value {value_id} is produced by more than one op")
@@ -347,6 +372,46 @@ def _validate_interface(graph: NormalizedGraph, known_values: set[str]) -> None:
     for value_id in graph.inputs:
         if graph.value_map()[value_id].producer is not None:
             raise ValueError(f"graph input {value_id} cannot have a producer")
+    graph_inputs = set(graph.inputs)
+    for value in graph.values:
+        if value.producer is None and value.id not in graph_inputs:
+            raise ValueError(
+                f"producerless value {value.id} must be declared as a graph input"
+            )
+
+
+def _validate_known_op_arity(op: NormalizedOp) -> None:
+    if not op.supported:
+        return
+    if op.kind in _UNARY_NORMALIZED_OPS:
+        expected_inputs = 1
+    elif op.kind in _BINARY_NORMALIZED_OPS:
+        expected_inputs = 2
+    elif op.kind in _SCALAR_BINARY_NORMALIZED_OPS:
+        scalars = op.attributes.get("scalars", [])
+        if not isinstance(scalars, list):
+            raise ValueError(f"op {op.id} scalar operands must be a list")
+        positions: set[int] = set()
+        for scalar in scalars:
+            if not isinstance(scalar, Mapping):
+                raise ValueError(f"op {op.id} has a malformed scalar operand")
+            position = scalar.get("position")
+            if type(position) is not int or position not in {0, 1}:
+                raise ValueError(f"op {op.id} has an invalid scalar operand position")
+            if position in positions:
+                raise ValueError(f"op {op.id} has duplicate scalar operand positions")
+            positions.add(position)
+        expected_inputs = 2 - len(scalars)
+        if expected_inputs < 1:
+            raise ValueError(f"op {op.id} must have at least one tensor input")
+    else:
+        return
+    if len(op.inputs) != expected_inputs or len(op.outputs) != 1:
+        raise ValueError(
+            f"op {op.id} ({op.kind}) expects {expected_inputs} tensor input(s) "
+            f"and one output, got {len(op.inputs)} input(s) and "
+            f"{len(op.outputs)} output(s)"
+        )
 
 
 def _validate_patterns(graph: NormalizedGraph, known_ops: set[str]) -> None:

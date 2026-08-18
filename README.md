@@ -98,6 +98,12 @@ source = emit_pypto_region(graph, region)
 print(source.source)
 ```
 
+The current Torch reader schedules **static-shape tensor DAGs only**. It records
+symbolic tensor dimensions and their bounds for diagnostics, but any symbol
+that determines solver geometry or participates in tensor arithmetic is an
+explicit scheduling boundary. The reader does not yet specialize shape
+buckets, emit runtime dispatch, or plan dynamic physical tiles.
+
 Unsupported operations remain explicit graph boundaries. The first source
 backend emits one selected homogeneous step: materialized/pointwise vector
 replay, the versioned two-pass online-softmax schedule, or one spatial cube

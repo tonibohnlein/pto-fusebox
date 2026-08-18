@@ -13,6 +13,7 @@ from .ir import (
     NormalizedOp,
     NormalizedValue,
     ShapeDimension,
+    normalized_graph_sha256,
 )
 from .target import TargetProfile, resolve_target
 
@@ -230,6 +231,7 @@ def lower_solver_region(
             "p4_patterns": [],
             "frontend_mapping": {
                 "region_id": region.id,
+                "normalized_graph_sha256": normalized_graph_sha256(graph),
                 "solver_op_to_graph": list(solver_op_to_graph),
                 "solver_tensor_to_value": [value.id for value in ordered_values],
                 "solver_tensor_alias_of": [value.alias_of for value in ordered_values],

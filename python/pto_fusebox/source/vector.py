@@ -55,6 +55,7 @@ def emit_vector(
             "vector coordinate transforms are not implemented in source v1"
         )
     _validate_cast_roots(graph, lowered)
+    _validate_cast_semantics(graph, lowered)
     if (
         plan.reduction_split.kind is not VectorReductionSplitKind.NONE
         or plan.reduction_split.factor != 1
@@ -977,6 +978,23 @@ def _validate_cast_roots(graph: NormalizedGraph, lowered: LoweredRegion) -> None
             raise SourceEmissionError(
                 "vector source does not support a native cast chain rooted in a "
                 "reduction result"
+            )
+
+
+def _validate_cast_semantics(graph: NormalizedGraph, lowered: LoweredRegion) -> None:
+    """Reject captured casts whose Torch semantics cannot be replayed exactly."""
+
+    graph_ops = graph.op_map()
+    values = graph.value_map()
+    selected_graph_ops = {operation.graph_op_id for operation in lowered.operations}
+    for graph_op_id in selected_graph_ops:
+        graph_op = graph_ops.get(graph_op_id)
+        if graph_op is None or graph_op.kind != "cast" or len(graph_op.outputs) != 1:
+            continue
+        if values[graph_op.outputs[0]].dtype == "int8":
+            raise SourceEmissionError(
+                "vector source cannot preserve Torch float-to-INT8 truncation "
+                "through the Ascend910B native FP16 conversion path"
             )
 
 

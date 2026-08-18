@@ -8,6 +8,14 @@ The first frontend milestone is implemented. PTO-Fusebox can capture a
 boundaries, extract statically schedulable regions, lower them into a versioned
 solver problem, and invoke an already-built C++ solver.
 
+The implemented reader is currently **static-shape only for scheduling**.
+Symbolic tensor dimensions and bounds are retained in the normalized graph so
+capture remains faithful and future extensions have a stable boundary, but no
+symbolic region is lowered to the solver today. Shape-derived scalar values
+used by computation are preserved as explicit opaque boundaries rather than
+being approximated. Static specialization families, runtime dispatch, and
+dynamic physical tiles are not implemented.
+
 The first PyPTO DSL source slice is also implemented. A solved homogeneous
 region can be validated as a typed schedule and emitted as an ordinary
 `@pl.program` containing the selected grid, balanced region partition,
@@ -130,8 +138,10 @@ can reach the scheduler.
 The problem schema is intentionally narrower. It contains one supported static
 region in the existing solver's two-dimensional tensor representation plus a
 `frontend_mapping` that maps every solver tensor/op back to normalized graph
-IDs. Missing `schema_version` remains accepted for legacy benchmark inputs;
-unknown explicit versions fail closed.
+IDs and carries the canonical normalized-graph SHA-256. Source emission checks
+that digest, so a solution cannot be combined with a same-shaped graph carrying
+different operations or attributes. Missing `schema_version` remains accepted
+for legacy benchmark inputs; unknown explicit versions fail closed.
 
 A zero-valued granularity and infinite latency are internal C++ cost-search
 sentinels meaning that no feasible tile was found. They are never a valid
@@ -162,6 +172,14 @@ replay their respective homogeneous plans.
 
 ## v1 normalization and admission
 
+The v1 reader accepts a closed, static tensor-DAG subset. All tensor extents
+that determine two-dimensional solver geometry must be positive compile-time
+integers. Parameters and buffers may remain external tensors, but scalar shape
+programs, data-dependent indexing, Python control flow, mutations, and dynamic
+work counts are outside the schedulable subset. Unsupported semantics remain
+visible as opaque operations and split solver regions; they are never silently
+dropped.
+
 The implemented closed set includes casts; tensor/scalar arithmetic; exp, log,
 abs, sqrt, rsqrt and negation; last-axis sum/max/mean with `keepdim=True`;
 rank-2 matmul/mm; rank-2-or-higher linear with contiguous leading dimensions
@@ -188,7 +206,9 @@ convex solver regions. Same-dtype `to(copy=False)` is a metadata alias, while
 `copy=True` declines. Real casts are expanded at the target-lowering boundary
 into the 910B native conversion path (for example FP16 -> FP32 -> BF16 and FP32
 -> FP16 -> INT8), so every intermediate dtype and lifetime is visible to solver
-UB accounting without changing the public normalized graph.
+UB accounting without changing the public normalized graph. Source emission
+rejects Torch float-to-INT8 casts because the native multi-hop conversion does
+not yet encode direct Torch truncation; analytic scheduling remains available.
 
 The first contract suite fixes the exact normalized and solver DAG for RMSNorm,
 softmax, rank-3 linear with bias, plain matmul, generic `QK -> softmax -> PV`,
@@ -313,11 +333,19 @@ readable PyPTO DSL. The installed homogeneous slice emits one materialized or
 pointwise vector step, the `softmax_flash.v1` two-pass online schedule, or one
 uniform spatial cube matmul, using `pl.parallel`, static physical tile shapes,
 runtime `valid_shape`, `pl.range`/`pl.pipeline`, and explicit GM boundaries.
+ABI inputs use an `arg_` namespace, so captured names cannot shadow `pl` or
+generated schedule locals.
 Materialized/pointwise schedules execute `body.ops` directly and require all
 other phases to be empty. Online softmax consumes the typed stats/apply loops,
 frames, workspaces, carry-state names, and reduction-output substitutions. Its
 selection is recipe-driven and independent of program, module, model, or shape
 names.
+
+Cube source replays the outer spatial and K-window schedule, then lets PyPTO's
+`AutoTileMatmulL0` choose child-L0 `(m,n,k)`, stationarity, and buffer depths.
+The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
+optional future extension via a PyPTO schedule directive or explicit low-level
+tile loops; current source makes no exact child-L0 performance claim.
 
 Analytic support is deliberately broader than this installed renderer.
 General streamed reductions, Welford/multi-stat P4 algorithms, split
@@ -336,6 +364,10 @@ decision.
 
 ## Dynamic-shape baseline
 
+This section records future design constraints. **No dynamic-shape class below
+is currently admitted by the Torch-to-solver path.** The current implementation
+retains symbolic metadata and then declines schedule-defining symbolic regions.
+
 PyPTO supports extent-polymorphic programs, not runtime-sized hardware tiles:
 
 - tensor dimensions may be runtime values;
@@ -351,7 +383,7 @@ PyPTO supports extent-polymorphic programs, not runtime-sized hardware tiles:
 Fusebox should preserve this contract. A dynamic problem is schedulable only
 when it can be expressed as static physical work plus runtime logical extents.
 
-## Type 1: dynamic independent extent, static physical chunk
+## Planned Type 1: dynamic independent extent, static physical chunk
 
 This is the first dynamic-shape class to support:
 

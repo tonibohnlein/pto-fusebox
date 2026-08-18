@@ -48,6 +48,11 @@ class _Silu(nn.Module):
         return value * torch.reciprocal(torch.exp(value * -1.0) + 1.0)
 
 
+class _NamingCollision(nn.Module):
+    def forward(self, pl: torch.Tensor) -> torch.Tensor:
+        return torch.exp(pl)
+
+
 def _solver() -> Path:
     configured = os.environ.get("PTO_FUSEBOX_TEST_SOLVER")
     if configured:
@@ -87,6 +92,12 @@ def _solver() -> Path:
             _Silu(),
             (torch.zeros(512, 256),),
             "pto.trecip",
+        ),
+        (
+            "naming_collision",
+            _NamingCollision(),
+            (torch.zeros(64, 128),),
+            "pto.texp",
         ),
     ],
 )

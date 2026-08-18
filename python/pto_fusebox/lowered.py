@@ -68,6 +68,7 @@ class LoweredRegion:
     """Typed problem-side half of the model-to-emitter contract."""
 
     region_id: str
+    normalized_graph_sha256: str
     region_inputs: tuple[str, ...]
     region_outputs: tuple[str, ...]
     output_allocation_owners: tuple[str, ...]
@@ -109,6 +110,16 @@ def lowered_region(result: RegionSolveResult) -> LoweredRegion:
     if region_id != result.region.id:
         raise LoweredContractError(
             f"problem region id {region_id!r} does not match {result.region.id!r}"
+        )
+    graph_sha256 = frontend.get("normalized_graph_sha256")
+    if (
+        not isinstance(graph_sha256, str)
+        or len(graph_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in graph_sha256)
+    ):
+        raise LoweredContractError(
+            "problem.frontend_mapping.normalized_graph_sha256 must be a "
+            "lowercase SHA-256 digest"
         )
     mapped_ops = _string_sequence(
         frontend.get("solver_op_to_graph"),
@@ -241,6 +252,7 @@ def lowered_region(result: RegionSolveResult) -> LoweredRegion:
         )
     return LoweredRegion(
         region_id=result.region.id,
+        normalized_graph_sha256=graph_sha256,
         region_inputs=region_inputs,
         region_outputs=region_outputs,
         output_allocation_owners=output_allocation_owners,

@@ -108,6 +108,11 @@ class _ExportNormalizer:
         self.node_values: dict[Any, tuple[str, ...]] = {}
         self.input_ids: list[str] = []
         self.output_ids: list[str] = []
+        self._value_indices: dict[str, int] = {}
+        self._op_indices: dict[str, int] = {}
+        self._nodes_by_name = {
+            node.name: node for node in program.graph_module.graph.nodes
+        }
         self._value_counter = 0
         self._op_counter = 0
         self._constraints, self._symbol_names = _range_constraints(program)
@@ -159,6 +164,15 @@ class _ExportNormalizer:
         target = _target_name(node.target)
         if target in _DROPPED_METADATA:
             self.node_values[node] = ()
+            return
+        missing = self._unrepresented_dependencies((node.args, node.kwargs))
+        if missing:
+            names = ", ".join(item.name for item in missing)
+            self._opaque(
+                node,
+                f"{target} depends on unrepresented symbolic or metadata "
+                f"value(s): {names}",
+            )
             return
         if node.target is operator.getitem or target == "operator.getitem":
             self._getitem(node)
@@ -222,8 +236,16 @@ class _ExportNormalizer:
         attrs: dict[str, Any] = {"source_operator": target}
         scalar_args: list[dict[str, Any]] = []
         for index, arg in enumerate(node.args):
-            if not self._is_tensor_arg(arg) and _is_json_scalar(arg):
-                scalar_args.append({"position": index, "value": arg})
+            if self._is_tensor_arg(arg):
+                continue
+            if not _is_json_scalar(arg):
+                self._opaque(
+                    node,
+                    f"{target} has an unsupported non-tensor argument at "
+                    f"position {index}",
+                )
+                return
+            scalar_args.append({"position": index, "value": arg})
         if scalar_args:
             attrs["scalars"] = scalar_args
         self._single_output_op(node, kind, tensor_inputs, attrs)
@@ -629,7 +651,7 @@ class _ExportNormalizer:
         )
         op_id = self._add_op(
             "opaque",
-            self._tensor_inputs(node.args),
+            self._tensor_inputs((node.args, node.kwargs)),
             output_ids,
             {"source_operator": _target_name(node.target)},
             supported=False,
@@ -679,6 +701,7 @@ class _ExportNormalizer:
     ) -> str:
         value_id = f"v{self._value_counter:04d}"
         self._value_counter += 1
+        self._value_indices[value_id] = len(self.values)
         self.values.append(
             NormalizedValue(
                 id=value_id,
@@ -709,6 +732,7 @@ class _ExportNormalizer:
     ) -> str:
         op_id = f"op{self._op_counter:04d}"
         self._op_counter += 1
+        self._op_indices[op_id] = len(self.ops)
         self.ops.append(
             NormalizedOp(
                 id=op_id,
@@ -724,17 +748,14 @@ class _ExportNormalizer:
         return op_id
 
     def _set_producer(self, value_id: str, op_id: str) -> None:
-        for index, value in enumerate(self.values):
-            if value.id == value_id:
-                self.values[index] = replace(value, producer=op_id)
-                return
-        raise KeyError(value_id)
+        index = self._value_indices[value_id]
+        self.values[index] = replace(self.values[index], producer=op_id)
 
     def _value(self, value_id: str) -> NormalizedValue:
-        for value in self.values:
-            if value.id == value_id:
-                return value
-        raise KeyError(value_id)
+        return self.values[self._value_indices[value_id]]
+
+    def _op(self, op_id: str) -> NormalizedOp:
+        return self.ops[self._op_indices[op_id]]
 
     def _tensor_inputs(self, args: Any) -> tuple[str, ...]:
         result: list[str] = []
@@ -744,7 +765,21 @@ class _ExportNormalizer:
         return tuple(result)
 
     def _is_tensor_arg(self, arg: Any) -> bool:
-        return arg in self.node_values if _hashable(arg) else False
+        return bool(self.node_values.get(arg, ())) if _hashable(arg) else False
+
+    def _unrepresented_dependencies(self, args: Any) -> tuple[Any, ...]:
+        result: list[Any] = []
+        seen: set[Any] = set()
+        for item in _walk(args):
+            if (
+                _hashable(item)
+                and item in self.node_values
+                and not self.node_values[item]
+                and item not in seen
+            ):
+                seen.add(item)
+                result.append(item)
+        return tuple(result)
 
     def _flatten_output_values(self, args: Any) -> tuple[str, ...]:
         output: list[str] = []
@@ -757,10 +792,7 @@ class _ExportNormalizer:
         value = self._value(value_id)
         if value.producer is None:
             return False
-        return (
-            next(op for op in self.ops if op.id == value.producer).kind
-            == "transpose_view"
-        )
+        return self._op(value.producer).kind == "transpose_view"
 
     def _mark_mutated_outputs(self) -> None:
         specs = getattr(self.program.graph_signature, "output_specs", ())
@@ -768,27 +800,18 @@ class _ExportNormalizer:
             if "MUTATION" not in str(spec.kind):
                 continue
             name = getattr(spec.arg, "name", None)
-            fx_node = next(
-                (
-                    node
-                    for node in self.program.graph_module.graph.nodes
-                    if node.name == name
-                ),
-                None,
-            )
+            fx_node = self._nodes_by_name.get(name)
             if fx_node is None or fx_node not in self.node_values:
                 continue
             for value_id in self.node_values[fx_node]:
                 value = self._value(value_id)
                 if value.producer is None:
                     continue
-                for index, op in enumerate(self.ops):
-                    if op.id == value.producer:
-                        reason = "mutated state is an automatic scheduling boundary"
-                        self.ops[index] = replace(
-                            op, supported=False, opaque_reason=reason
-                        )
-                        self.diagnostics.append(f"{op.id}: {reason}")
+                index = self._op_indices[value.producer]
+                op = self.ops[index]
+                reason = "mutated state is an automatic scheduling boundary"
+                self.ops[index] = replace(op, supported=False, opaque_reason=reason)
+                self.diagnostics.append(f"{op.id}: {reason}")
 
 
 def _target_name(target: Any) -> str:

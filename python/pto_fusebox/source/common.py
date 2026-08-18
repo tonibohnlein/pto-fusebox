@@ -66,7 +66,7 @@ def interface(graph: NormalizedGraph, lowered: LoweredRegion) -> Interface:
         raise SourceEmissionError("source v1 supports exactly one region output")
     values = graph.value_map()
     input_arguments: dict[str, str] = {}
-    used: set[str] = {"self", "region_index"}
+    used: set[str] = {"self", "pl", "region_index"}
     for index, value_id in enumerate(lowered.region_inputs):
         try:
             value = values[value_id]
@@ -76,7 +76,7 @@ def interface(graph: NormalizedGraph, lowered: LoweredRegion) -> Interface:
             ) from error
         if value.alias_of is not None:
             raise SourceEmissionError("source v1 does not emit aliased region inputs")
-        name = unique_name(identifier(value.name or f"input_{index}"), used)
+        name = unique_name(f"arg_{identifier(value.name or f'input_{index}')}", used)
         input_arguments[value_id] = name
     output_value = lowered.region_outputs[0]
     if output_value not in values:

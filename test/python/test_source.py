@@ -23,6 +23,7 @@ from pto_fusebox import (
     scheduled_region,
     solve_graph,
 )
+from pto_fusebox.ir import normalized_graph_sha256
 from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
     VectorKernelPlan,
@@ -93,7 +94,7 @@ def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     assert "for region_index in pl.parallel(16):" in source
     assert "pl.pipeline(" not in source
     assert "region_rows = 8" in source
-    assert "pl.load(value," in source
+    assert "pl.load(arg_value," in source
     assert "[8, 1024], valid_shape=[valid_rows, valid_cols]" in source
     assert source.count("pl.load(") == 1
     assert source.count("pl.store(") == 1
@@ -433,9 +434,80 @@ def test_source_backend_rejects_non_last_axis_reduction() -> None:
     graph, result = _solved("softmax")
     first = replace(graph.ops[0], attributes={"axis": 0, "keepdim": True})
     invalid_graph = replace(graph, ops=(first, *graph.ops[1:]))
+    assert result.problem is not None
+    problem = copy.deepcopy(dict(result.problem))
+    frontend_mapping = dict(problem["frontend_mapping"])
+    frontend_mapping["normalized_graph_sha256"] = normalized_graph_sha256(invalid_graph)
+    problem["frontend_mapping"] = frontend_mapping
 
     with pytest.raises(SourceEmissionError, match="last-axis keepdim"):
-        emit_pypto_region(invalid_graph, result)
+        emit_pypto_region(invalid_graph, replace(result, problem=problem))
+
+
+def test_source_backend_binds_the_solution_to_the_exact_normalized_graph() -> None:
+    class PointwiseChain(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.exp(value * 0.5)
+
+    graph, result = _solve_module(PointwiseChain(), (torch.randn(8, 32),))
+    first = graph.ops[0]
+    assert first.kind == "mul"
+    scalar_attributes = dict(first.attributes)
+    assert scalar_attributes["scalars"] == [{"position": 1, "value": 0.5}]
+    scalar_attributes["scalars"] = [{"position": 1, "value": 0.75}]
+    changed_graphs = (
+        replace(graph, ops=(replace(first, kind="add"), *graph.ops[1:])),
+        replace(
+            graph,
+            ops=(replace(first, attributes=scalar_attributes), *graph.ops[1:]),
+        ),
+    )
+
+    for changed_graph in changed_graphs:
+        assert not can_emit_region(changed_graph, result)
+        with pytest.raises(SourceEmissionError, match="does not match the graph"):
+            emit_pypto_region(changed_graph, result)
+
+
+def test_source_backend_names_cannot_shadow_the_dsl_or_generated_locals() -> None:
+    class AdversarialNames(nn.Module):
+        def forward(
+            self,
+            pl: torch.Tensor,
+            region_row: torch.Tensor,
+            tensor_0: torch.Tensor,
+            accumulator: torch.Tensor,
+            stats_running_max: torch.Tensor,
+            auto_fuse: torch.Tensor,
+            auto_tile: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                pl
+                + region_row
+                + tensor_0
+                + accumulator
+                + stats_running_max
+                + auto_fuse
+                + auto_tile
+            )
+
+    inputs = tuple(torch.randn(8, 32) for _ in range(7))
+    graph, result = _solve_module(AdversarialNames(), inputs)
+
+    assert can_emit_region(graph, result)
+    source = emit_pypto_region(graph, result).source
+    ast.parse(source)
+    for name in (
+        "pl",
+        "region_row",
+        "tensor_0",
+        "accumulator",
+        "stats_running_max",
+        "auto_fuse",
+        "auto_tile",
+    ):
+        assert f"arg_{name}: pl.Tensor" in source
+    assert "def main(\n        self,\n        pl:" not in source
 
 
 def test_source_readiness_rejects_multi_output_region() -> None:
@@ -692,6 +764,29 @@ def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:
     with pytest.raises(
         SourceEmissionError, match="cast chain rooted in a reduction result"
     ):
+        emit_pypto_region(graph, result)
+
+
+def test_float_to_int8_is_analytic_but_not_source_ready() -> None:
+    class FloatToInt8(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.to(torch.int8)
+
+    values = torch.tensor([[1.6, -1.6, 63.99, -63.99]], dtype=torch.float32)
+    assert torch.equal(
+        values.to(torch.int8), torch.tensor([[1, -1, 63, -63]], dtype=torch.int8)
+    )
+    assert torch.equal(
+        values.to(torch.float16).to(torch.int8),
+        torch.tensor([[1, -1, 64, -64]], dtype=torch.int8),
+    )
+    graph, result = _solve_module(FloatToInt8(), (values,))
+
+    assert result.status == "solved"
+    assert result.problem is not None
+    assert result.problem["dtypes"] == ["FP32", "FP16", "INT8"]
+    assert not can_emit_region(graph, result)
+    with pytest.raises(SourceEmissionError, match="Torch float-to-INT8 truncation"):
         emit_pypto_region(graph, result)
 
 
