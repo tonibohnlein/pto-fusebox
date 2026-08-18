@@ -163,6 +163,18 @@ The suite intentionally reports a small documented baseline of model research
 failures while checking the implemented vector, cube, and mixed schedule-plan
 surface.
 
+The generated-source silicon matrix is opt-in and is not part of the default
+host suite. It covers 14 vector and 10 single-matmul cube programs, compiles
+each emitted PyPTO program once, and checks five seeded executions:
+
+```bash
+PTO_FUSEBOX_RUN_DEVICE_TESTS=1 \
+PTO_FUSEBOX_DEVICE_ID=<physical-id> \
+PTO_FUSEBOX_SOLVER=build/mlsys_mixed \
+PYTHONPATH=python:<pypto-checkout>/python \
+python -m pytest test/device/test_source_silicon.py -v
+```
+
 ## Design notes
 
 - [Torch/Hugging Face to PyPTO source generation](doc/torch_to_pypto_frontend.md)
