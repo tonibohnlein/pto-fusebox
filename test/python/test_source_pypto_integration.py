@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 from pathlib import Path
 
 import pytest
 import torch
+from examples.torch_frontend.pr2335_vector import (
+    build_examples as build_pr2335_examples,
+)
 from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
 from torch import nn
 
@@ -48,6 +52,19 @@ class _Silu(nn.Module):
         return value * torch.reciprocal(torch.exp(value * -1.0) + 1.0)
 
 
+class _LayerNorm(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        centered = value - value.mean(dim=-1, keepdim=True)
+        variance = (centered * centered).mean(dim=-1, keepdim=True)
+        normalized = centered / torch.sqrt(variance + 1.0e-5)
+        return normalized * gamma + beta
+
+
 class _NamingCollision(nn.Module):
     def forward(self, pl: torch.Tensor) -> torch.Tensor:
         return torch.exp(pl)
@@ -60,55 +77,20 @@ def _solver() -> Path:
     return Path(__file__).resolve().parents[2] / "build" / "mlsys_mixed"
 
 
-@pytest.mark.parametrize(
-    ("name", "module", "args", "expected_pto_op"),
-    [
-        (
-            "pointwise_chain",
-            _PointwiseChain(),
-            (torch.zeros(96, 320), torch.ones(96, 320)),
-            "pto.texp",
-        ),
-        (
-            "sum_of_squares",
-            _SumOfSquares(),
-            (torch.ones(128, 1024),),
-            "pto.trowsum",
-        ),
-        (
-            "matmul_with_tail",
-            _MatmulWithTail(),
-            (torch.zeros(64, 272), torch.zeros(272, 80)),
-            "pto.tmatmul.acc",
-        ),
-        (
-            "wide_softmax",
-            _WideSoftmax(),
-            (torch.zeros(32, 8192),),
-            "pto.trowmax",
-        ),
-        (
-            "silu",
-            _Silu(),
-            (torch.zeros(512, 256),),
-            "pto.trecip",
-        ),
-        (
-            "naming_collision",
-            _NamingCollision(),
-            (torch.zeros(64, 128),),
-            "pto.texp",
-        ),
-    ],
-)
-def test_generated_source_compiles_through_pypto_and_ptoas(
+def _assert_static_vector_frames(pto: str) -> None:
+    assert re.search(r"partition_tensor_view<[^>]*\?", pto) is None
+    assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
+
+
+def _compile_source(
     name: str,
     module: nn.Module,
     args: tuple[torch.Tensor, ...],
-    expected_pto_op: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    *,
+    skip_ptoas: bool,
+) -> tuple[str, int]:
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
 
@@ -119,16 +101,123 @@ def test_generated_source_compiles_through_pypto_and_ptoas(
     assert len(solved.regions) == 1
 
     source = emit_pypto_region(graph, solved.regions[0], program_name=name).source
-    program = pl.parse_program(source)
     compiled = ir.compile(
-        program,
+        pl.parse_program(source),
         output_dir=str(tmp_path / name),
         dump_passes=False,
+        skip_ptoas=skip_ptoas,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    assert len(pto_files) == 1
+    generated_cpp = list((compiled.output_dir / "ptoas").glob("*.cpp"))
+    return pto_files[0].read_text(encoding="utf-8"), len(generated_cpp)
+
+
+@pytest.mark.parametrize(
+    ("name", "module", "args", "expected_pto_op", "static_vector_frames"),
+    [
+        (
+            "pointwise_chain",
+            _PointwiseChain(),
+            (torch.zeros(96, 320), torch.ones(96, 320)),
+            "pto.texp",
+            True,
+        ),
+        (
+            "sum_of_squares",
+            _SumOfSquares(),
+            (torch.ones(128, 1024),),
+            "pto.trowsum",
+            True,
+        ),
+        (
+            "matmul_with_tail",
+            _MatmulWithTail(),
+            (torch.zeros(64, 272), torch.zeros(272, 80)),
+            "pto.tmatmul.acc",
+            False,
+        ),
+        (
+            "wide_softmax",
+            _WideSoftmax(),
+            (torch.zeros(32, 8192),),
+            "pto.trowmax",
+            True,
+        ),
+        (
+            "silu",
+            _Silu(),
+            (torch.zeros(512, 256),),
+            "pto.trecip",
+            True,
+        ),
+        (
+            "layer_norm",
+            _LayerNorm(),
+            (
+                torch.zeros(512, 256),
+                torch.ones(1, 256),
+                torch.zeros(1, 256),
+            ),
+            "pto.trowsum",
+            True,
+        ),
+        (
+            "naming_collision",
+            _NamingCollision(),
+            (torch.zeros(64, 128),),
+            "pto.texp",
+            True,
+        ),
+    ],
+)
+def test_generated_source_compiles_through_pypto_and_ptoas(
+    name: str,
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    expected_pto_op: str,
+    static_vector_frames: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pto, generated_cpp = _compile_source(
+        name,
+        module,
+        args,
+        tmp_path,
+        monkeypatch,
         skip_ptoas=False,
     )
+    assert generated_cpp == 1
+    assert expected_pto_op in pto
+    if static_vector_frames:
+        _assert_static_vector_frames(pto)
 
-    pto_files = list(compiled.output_dir.rglob("*.pto"))
-    generated_cpp = list((compiled.output_dir / "ptoas").glob("*.cpp"))
-    assert len(pto_files) == 1
-    assert len(generated_cpp) == 1
-    assert expected_pto_op in pto_files[0].read_text(encoding="utf-8")
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pr2335_softmax_512x256",
+        "pr2335_softmax_256x512",
+        "pr2335_softmax_128x1024",
+        "pr2335_softmax_32x8192",
+        "pr2335_rms_norm",
+        "pr2335_layer_norm",
+        "pr2335_silu",
+    ],
+)
+def test_pr2335_vector_surface_lowers_static_frames(
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_pr2335_examples()[name]
+    pto, _ = _compile_source(
+        name,
+        module,
+        args,
+        tmp_path,
+        monkeypatch,
+        skip_ptoas=True,
+    )
+    _assert_static_vector_frames(pto)

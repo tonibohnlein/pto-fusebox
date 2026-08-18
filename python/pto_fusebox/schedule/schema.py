@@ -31,6 +31,13 @@ class VectorCoordinateTransform(Enum):
     SINGLETON_COLUMN_TO_ROW = "singleton_column_to_row"
 
 
+class VectorSpatialPolicy(Enum):
+    """How a logical balanced partition becomes an executable tile grid."""
+
+    EXACT_BALANCED = "exact_balanced"
+    CLAMPED_OVERLAP = "clamped_overlap"
+
+
 class VectorReplayPhase(Enum):
     BODY = "body"
     STATS = "stats"
@@ -226,6 +233,7 @@ class VectorP4RecipePlan:
 class VectorKernelPlan:
     kind: VectorStreamKind
     coordinate_transform: VectorCoordinateTransform
+    spatial_policy: VectorSpatialPolicy
     work_units: int
     m_partition: AxisPartition
     n_partition: AxisPartition

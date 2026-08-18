@@ -4386,6 +4386,11 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const FlatSet<size_t> &retain_these) const {
   VectorStreamPlan plan;
   plan.coordinate_transform = prob_->vector_coordinate_transform;
+  // The cost below charges every work unit at the maximum region/strip shape.
+  // Preserve that executable contract explicitly: ragged edge work units move
+  // their origin backwards and recompute the small overlap instead of
+  // introducing runtime-shaped tiles that the model does not price.
+  plan.spatial_policy = VectorSpatialPolicy::ClampedOverlap;
   plan.physical_element_granule = vector_emit_granule_;
   plan.tensor_element_granules = vector_tensor_emit_granules_;
   plan.iteration_rows = vector_iter_H_;

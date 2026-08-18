@@ -59,6 +59,14 @@ class EmissionContext:
         return self.lowered.region_id
 
 
+@dataclass(frozen=True)
+class PartitionCoordinates:
+    """Source expressions for one region's logical origin."""
+
+    row: str
+    col: str
+
+
 def interface(graph: NormalizedGraph, lowered: LoweredRegion) -> Interface:
     """Derive names for the currently supported one-output ABI."""
 
@@ -124,53 +132,87 @@ def emit_partition_indices(
     m_partition: AxisPartition,
     n_partition: AxisPartition,
     *,
-    emit_extents: bool,
-) -> None:
-    """Emit deterministic coordinates for two solver-owned axis partitions."""
+    clamped_overlap_extents: tuple[int, int] | None = None,
+) -> PartitionCoordinates:
+    """Emit deterministic coordinates for two solver-owned axis partitions.
 
-    writer.line(indent, f"m_index = region_index // {n_partition.parts}")
-    writer.line(indent, f"n_index = region_index % {n_partition.parts}")
-    _emit_axis_partition(writer, indent, "m", m_partition, emit_extent=emit_extents)
-    _emit_axis_partition(writer, indent, "n", n_partition, emit_extent=emit_extents)
+    ``clamped_overlap_extents`` turns the balanced logical ownership into a
+    static physical replay: every work unit uses the partition's maximum tile,
+    and a ragged final origin is clamped backwards.  The resulting overlap is
+    intentional and must already be priced by the selected schedule.
+    """
+
+    if m_partition.parts > 1:
+        m_index = "region_index" if n_partition.parts == 1 else "m_index"
+        if m_index != "region_index":
+            writer.line(indent, f"m_index = region_index // {n_partition.parts}")
+    else:
+        m_index = "0"
+    if n_partition.parts > 1:
+        n_index = "region_index" if m_partition.parts == 1 else "n_index"
+        if n_index != "region_index":
+            writer.line(indent, f"n_index = region_index % {n_partition.parts}")
+    else:
+        n_index = "0"
+    m_extent = None if clamped_overlap_extents is None else clamped_overlap_extents[0]
+    n_extent = None if clamped_overlap_extents is None else clamped_overlap_extents[1]
+    row = _emit_axis_partition(
+        writer,
+        indent,
+        "m",
+        m_index,
+        m_partition,
+        clamped_overlap_extent=m_extent,
+    )
+    col = _emit_axis_partition(
+        writer,
+        indent,
+        "n",
+        n_index,
+        n_partition,
+        clamped_overlap_extent=n_extent,
+    )
+    return PartitionCoordinates(row=row, col=col)
 
 
 def _emit_axis_partition(
     writer: SourceWriter,
     indent: int,
     prefix: str,
+    index: str,
     partition: AxisPartition,
     *,
-    emit_extent: bool,
-) -> None:
+    clamped_overlap_extent: int | None,
+) -> str:
+    coordinate = "row" if prefix == "m" else "col"
+    if partition.parts == 1:
+        return "0"
     if partition.big == partition.small:
         writer.line(
             indent,
-            f"region_{'row' if prefix == 'm' else 'col'} = "
-            f"{prefix}_index * {partition.big}",
+            f"region_{coordinate} = {index} * {partition.big}",
         )
-        if emit_extent:
-            writer.line(
-                indent,
-                f"region_{'rows' if prefix == 'm' else 'cols'} = {partition.big}",
+        return f"region_{coordinate}"
+    writer.line(
+        indent,
+        f"{prefix}_big_before = pl.min({index}, {partition.num_big})",
+    )
+    offset = (
+        f"{index} * {partition.small} + {prefix}_big_before * "
+        f"{partition.big - partition.small}"
+    )
+    if clamped_overlap_extent is not None:
+        maximum_offset = clamped_overlap_extent - partition.big
+        if maximum_offset < 0:
+            raise SourceEmissionError(
+                f"clamped {prefix} partition tile exceeds its logical extent"
             )
-        return
+        offset = f"pl.min({offset}, {maximum_offset})"
     writer.line(
         indent,
-        f"{prefix}_big_before = pl.min({prefix}_index, {partition.num_big})",
+        f"region_{coordinate} = {offset}",
     )
-    writer.line(
-        indent,
-        f"region_{'row' if prefix == 'm' else 'col'} = "
-        f"{prefix}_index * {partition.small} + {prefix}_big_before * "
-        f"{partition.big - partition.small}",
-    )
-    if emit_extent:
-        writer.line(
-            indent,
-            f"region_{'rows' if prefix == 'm' else 'cols'} = {partition.small} + "
-            f"(pl.min({prefix}_index + 1, {partition.num_big}) - "
-            f"{prefix}_big_before) * {partition.big - partition.small}",
-        )
+    return f"region_{coordinate}"
 
 
 def validate_grid(

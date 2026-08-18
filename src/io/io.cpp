@@ -255,6 +255,10 @@ static json vector_stream_plan_json(const Problem& problem,
         plan.coordinate_transform == VectorCoordinateTransform::SingletonColumnToRow
             ? "singleton_column_to_row"
             : "none";
+    const char* spatial_policy =
+        plan.spatial_policy == VectorSpatialPolicy::ClampedOverlap
+            ? "clamped_overlap"
+            : "exact_balanced";
     json p4_recipe = nullptr;
     if (plan.p4_recipe && plan.p4_recipe->kind != P4PatternKind::None) {
         const bool softmax =
@@ -276,6 +280,7 @@ static json vector_stream_plan_json(const Problem& problem,
     }
     return {{"kind", vector_stream_kind_name(plan.kind)},
             {"coordinate_transform", coordinate_transform},
+            {"spatial_policy", spatial_policy},
             {"work_units", plan.work_units},
             {"m_partition", axis_partition_json(plan.m_partition)},
             {"n_partition", axis_partition_json(plan.n_partition)},

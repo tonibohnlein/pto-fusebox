@@ -52,6 +52,7 @@ from .schema import (
     VectorReductionSplitKind,
     VectorReductionSplitPlan,
     VectorReplayPhase,
+    VectorSpatialPolicy,
     VectorSerialPhasePlan,
     VectorStreamKind,
     VectorTensorFramePlan,
@@ -464,6 +465,7 @@ def _parse_vector_plan(
     required = {
         "kind",
         "coordinate_transform",
+        "spatial_policy",
         "work_units",
         "m_partition",
         "n_partition",
@@ -524,6 +526,11 @@ def _parse_vector_plan(
             VectorCoordinateTransform,
             item.get("coordinate_transform"),
             f"{field}.coordinate_transform",
+        ),
+        spatial_policy=_enum(
+            VectorSpatialPolicy,
+            item.get("spatial_policy"),
+            f"{field}.spatial_policy",
         ),
         work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
         m_partition=_parse_axis_partition(

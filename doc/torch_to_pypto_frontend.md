@@ -16,20 +16,18 @@ used by computation are preserved as explicit opaque boundaries rather than
 being approximated. Static specialization families, runtime dispatch, and
 dynamic physical tiles are not implemented.
 
-The first PyPTO DSL source slice is also implemented. A solved homogeneous
-region can be validated as a typed schedule and emitted as an ordinary
-`@pl.program` containing the selected grid, balanced region partition,
-physical vector frame, strip/K-window loops, pipeline stages, operations, and
-loads/stores. The initial closed set is materialized/pointwise vector replay,
-the versioned two-pass online-softmax schedule, and one spatial,
-output-stationary cube matmul. Unsupported schedules fail closed; the backend
-does not approximate them or ask PyPTO to plan them again.
+The first PyPTO DSL source slice validates a solved homogeneous region as a
+typed schedule and emits an ordinary `@pl.program` with its grid, logical
+ownership, physical frame, loops, pipeline stages, operations, and GM traffic.
+Vector execution replays one maximum compile-time tile per work unit and clamps
+ragged-edge origins backwards, preserving static shapes while recomputing the
+small overlap already charged by the model. The closed set is materialized or
+pointwise vector replay, versioned two-pass online softmax, and one spatial
+output-stationary cube matmul; every other schedule fails closed.
 
-Other streamed vector phases, split reductions, split-K, retained panels,
-multi-matmul DAGs, mixed schedules, multiple selected kernel steps, and whole
-graph orchestration remain source-backend milestones. Dynamic-shape classes
-are preserved in the normalized graph but remain unschedulable when they
-affect solver geometry. They are catalogued below and deliberately deferred.
+Other streamed vector phases, split reductions, advanced cube/mixed schedules,
+multiple selected steps, and whole-graph orchestration remain milestones.
+Dynamic-shape classes are retained but declined when they affect solver geometry.
 
 ## Python API
 
@@ -93,16 +91,11 @@ serialized schedule is the common contract.
 
 Reference checks use three levels:
 
-- PyPTO-lib programs establish the ordinary DSL structure (`pl.parallel` or
-  `pl.spmd`, `pl.pipeline`, row reductions/expands, and
-  `pl.matmul` followed by `pl.matmul_acc`), including
-  `models/deepseek_v4_flash_dspark/rmsnorm.py` and
-  `models/qwen3_32b/decode_4d.py`;
-- PTO-ISA and PTOAS examples establish the expected lowered data path and tile
-  constraints, including PTO-ISA's A2/A3 `tmatmul_kernel.cpp` and PTOAS's
-  `matmul_static_singlecore.pto` and `trowexpandsub_v0_roundtrip.pto`; and
-- the opt-in `test_source_pypto_integration.py` gate parses the generated DSL
-  with an independently selected PyPTO checkout and compiles it through PTOAS.
+- PyPTO-lib programs establish ordinary DSL structure, including DeepSeek
+  RMSNorm and Qwen decode examples;
+- PTO-ISA/PTOAS examples establish lowered data paths and tile constraints; and
+- opt-in source integration tests parse the DSL with an independently selected
+  PyPTO checkout and compile it through PTOAS.
 
 The integration gate is deliberately outside the default unit-test dependency
 set. Run it in the target validation environment with a built Fusebox solver,
@@ -153,7 +146,8 @@ The common launch tile is the optimizer's selected configuration and a
 diagnostic summary; the nested family plan is authoritative wherever lowering
 derives different replay frames, as it does for vector reductions.
 Vector plans additionally record phase operation order, input lifetimes,
-logical/physical tensor frames, reduction workspaces, and exact loop bounds.
+logical/physical tensor frames, the static clamped-overlap spatial replay
+policy, reduction workspaces, and exact loop bounds.
 Cube plans record propagated regions and axis bindings, execution order,
 resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
@@ -328,18 +322,14 @@ launching ready kernels and overlapping independent AIC and AIV work.
 
 ### PyPTO source backend
 
-The backend deterministically serializes the selected solution descriptor as
-readable PyPTO DSL. The installed homogeneous slice emits one materialized or
-pointwise vector step, the `softmax_flash.v1` two-pass online schedule, or one
-uniform spatial cube matmul, using `pl.parallel`, static physical tile shapes,
-runtime `valid_shape`, `pl.range`/`pl.pipeline`, and explicit GM boundaries.
-ABI inputs use an `arg_` namespace, so captured names cannot shadow `pl` or
-generated schedule locals.
-Materialized/pointwise schedules execute `body.ops` directly and require all
-other phases to be empty. Online softmax consumes the typed stats/apply loops,
-frames, workspaces, carry-state names, and reduction-output substitutions. Its
-selection is recipe-driven and independent of program, module, model, or shape
-names.
+The backend deterministically serializes the selected solution as readable
+PyPTO DSL. The installed homogeneous slice emits materialized/pointwise vector,
+`softmax_flash.v1`, or uniform spatial cube schedules with `pl.parallel`, static
+physical and valid shapes, explicit pipelines, and GM boundaries. ABI inputs
+use an `arg_` namespace, so captured names cannot shadow generated names.
+Materialized/pointwise schedules execute `body.ops`; online softmax consumes the
+typed stats/apply loops, frames, workspaces, carry state, and substitutions.
+Selection is independent of program, module, model, or shape names.
 
 Cube source replays the outer spatial and K-window schedule, then lets PyPTO's
 `AutoTileMatmulL0` choose child-L0 `(m,n,k)`, stationarity, and buffer depths.
@@ -347,15 +337,12 @@ The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Analytic support is deliberately broader than this installed renderer.
-General streamed reductions, Welford/multi-stat P4 algorithms, split
-reductions, retained cube panels, multi-matmul, split-K, multi-step, and mixed
-plans remain valid solver results but are not source-ready. P4 descriptors
-preserve named substitution roles rather than reconstructing them from
-operation numbers; each additional P4 recipe must version its carry state and
-publication semantics before source emission is enabled. Future plan classes
-will add those contracts and supported `tpush`/`tpop`/`tfree` transport without
-changing this ownership boundary.
+Analytic support is broader than the renderer. General streamed reductions,
+Welford/multi-stat P4, advanced cube, multi-step, and mixed plans remain valid
+solver results but are not source-ready. P4 descriptors preserve named roles;
+each new recipe must version its carry and publication semantics. Future plan
+classes can add those contracts and cross-core transport without changing the
+ownership boundary.
 
 The backend must not redo planning. Every emitted loop, lifetime, transfer, and
 FIFO must be traceable to the solution descriptor. It should publish the

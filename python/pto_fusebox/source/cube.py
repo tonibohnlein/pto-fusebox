@@ -147,7 +147,7 @@ def emit_cube(
         program_name, io, graph, m_partition.parts * n_partition.parts
     )
     indent = 4
-    emit_partition_indices(writer, indent, m_partition, n_partition, emit_extents=False)
+    coordinates = emit_partition_indices(writer, indent, m_partition, n_partition)
     writer.line(
         indent,
         f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_cube')}):",
@@ -156,7 +156,16 @@ def emit_cube(
     lhs_arg = io.input_arguments[lhs_value]
     rhs_arg = io.input_arguments[rhs_value]
     _emit_cube_window(
-        writer, indent, lhs_arg, rhs_arg, output_tile, chunk, "0", first=True
+        writer,
+        indent,
+        lhs_arg,
+        rhs_arg,
+        coordinates.row,
+        coordinates.col,
+        output_tile,
+        chunk,
+        "0",
+        first=True,
     )
     if full_chunks > 1:
         loop = "pl.pipeline" if stages > 1 else "pl.range"
@@ -167,6 +176,8 @@ def emit_cube(
             indent + 1,
             lhs_arg,
             rhs_arg,
+            coordinates.row,
+            coordinates.col,
             output_tile,
             chunk,
             f"k_window * {chunk}",
@@ -178,6 +189,8 @@ def emit_cube(
             indent,
             lhs_arg,
             rhs_arg,
+            coordinates.row,
+            coordinates.col,
             output_tile,
             tail,
             str(full_chunks * chunk),
@@ -186,7 +199,8 @@ def emit_cube(
         )
     writer.line(
         indent,
-        f"{io.output_argument} = pl.store(accumulator, [region_row, region_col], "
+        f"{io.output_argument} = pl.store(accumulator, "
+        f"[{coordinates.row}, {coordinates.col}], "
         f"{io.output_argument})",
     )
     writer.line(2, f"return {io.output_argument}")
@@ -198,6 +212,8 @@ def _emit_cube_window(
     indent: int,
     lhs: str,
     rhs: str,
+    row_offset: str,
+    col_offset: str,
     output_tile: list[int],
     k_extent: int,
     k_offset: str,
@@ -208,12 +224,12 @@ def _emit_cube_window(
     m_extent, n_extent = output_tile
     writer.line(
         indent,
-        f"lhs_mat{suffix} = pl.tile.load({lhs}, [region_row, {k_offset}], "
+        f"lhs_mat{suffix} = pl.tile.load({lhs}, [{row_offset}, {k_offset}], "
         f"[{m_extent}, {k_extent}], target_memory=pl.Mem.Mat)",
     )
     writer.line(
         indent,
-        f"rhs_mat{suffix} = pl.tile.load({rhs}, [{k_offset}, region_col], "
+        f"rhs_mat{suffix} = pl.tile.load({rhs}, [{k_offset}, {col_offset}], "
         f"[{k_extent}, {n_extent}], target_memory=pl.Mem.Mat)",
     )
     writer.line(

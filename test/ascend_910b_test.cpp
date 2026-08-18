@@ -3851,6 +3851,7 @@ static void test_g1_multi_reduction_stream_decline() {
     const auto region_cost = exact_softmax_sg->compute_cost(twelve_regions);
     CHECK("P4GRID: logical region count is independent of DMA-padded free tile",
           region_plan.feasible && region_plan.work_units == 12 &&
+              region_plan.spatial_policy == VectorSpatialPolicy::ClampedOverlap &&
               region_plan.m_partition.parts == 12 && region_plan.m_partition.big == 11 &&
               region_plan.m_partition.small == 10 && region_plan.m_partition.num_big == 8 &&
               region_plan.free_tile == 11 && region_plan.free_tile_alloc == 16 &&

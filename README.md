@@ -122,7 +122,11 @@ implements `can_emit_region` and actual emission, so readiness cannot accept a
 program that the renderer later rejects. The renderer is organized as separate
 API, shared-mechanics, vector, and cube modules. The online-softmax path consumes
 the solver's versioned semantic state/substitution recipe; it does not recognize
-a program or model name. Other analytically feasible streamed and mixed
+a program or model name. Vector plans also serialize their spatial replay
+policy: the current 910B model prices one maximum static tile per work unit and
+clamps ragged-edge origins backwards, so generated source preserves static tile
+shapes instead of turning known extents into runtime scalar operands. Other
+analytically feasible streamed and mixed
 schedules remain explicitly not source-ready until their complete
 state/transport contracts are serialized.
 

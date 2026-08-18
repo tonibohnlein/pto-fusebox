@@ -462,6 +462,16 @@ enum class VectorStreamKind {
     ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
 };
 
+// Spatial ownership and executable replay are related but distinct.  The
+// balanced partition records which logical elements belong to each work unit;
+// the clamped-overlap policy replays the partition's maximum physical tile at
+// every work unit and clamps its origin at a ragged edge.  That keeps tile
+// shapes compile-time static while harmlessly recomputing the overlap.
+enum class VectorSpatialPolicy {
+  ExactBalanced,
+  ClampedOverlap,
+};
+
 // Cross-core reduced-axis algorithm attached to a materialized vector plan.
 // The 910B backend currently lowers atomic ADD only, and the generic emitter
 // can slice the reduced M axis without changing semantics only for a terminal
@@ -702,6 +712,7 @@ struct VectorStreamPlan {
   bool feasible = false;
   VectorStreamKind kind = VectorStreamKind::Materialized;
   VectorCoordinateTransform coordinate_transform = VectorCoordinateTransform::None;
+  VectorSpatialPolicy spatial_policy = VectorSpatialPolicy::ClampedOverlap;
   // One logical region is one runtime work unit / SPMD block. The physical
   // UB/DMA allocation used while replaying a region may be padded or split
   // into strips, but it must never change this solver-owned launch grid.

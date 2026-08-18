@@ -13,6 +13,7 @@ from ..schedule.schema import (
     VectorPhysicalFramePlan,
     VectorReductionSplitKind,
     VectorReplayPhase,
+    VectorSpatialPolicy,
     VectorStreamKind,
     VectorWorkspaceFramePlan,
 )
@@ -53,6 +54,10 @@ def emit_vector(
     if plan.coordinate_transform is not VectorCoordinateTransform.NONE:
         raise SourceEmissionError(
             "vector coordinate transforms are not implemented in source v1"
+        )
+    if plan.spatial_policy is not VectorSpatialPolicy.CLAMPED_OVERLAP:
+        raise SourceEmissionError(
+            "vector source requires the solver-priced clamped-overlap spatial policy"
         )
     _validate_cast_roots(graph, lowered)
     _validate_cast_semantics(graph, lowered)
@@ -132,12 +137,12 @@ def emit_vector(
         program_name, io, graph, m_partition.parts * n_partition.parts
     )
     indent = 4
-    emit_partition_indices(writer, indent, m_partition, n_partition, emit_extents=True)
-    iteration_rows = (
-        str(frame.iteration_rows) if frame.reduced_axis == 2 else "region_rows"
-    )
-    iteration_cols = (
-        str(frame.iteration_cols) if frame.reduced_axis == 1 else "region_cols"
+    coordinates = emit_partition_indices(
+        writer,
+        indent,
+        m_partition,
+        n_partition,
+        clamped_overlap_extents=(output_rows, output_cols),
     )
     writer.line(
         indent,
@@ -145,6 +150,8 @@ def emit_vector(
     )
     indent += 1
 
+    strip_row = "0"
+    strip_col = "0"
     if trips > 1:
         loop = "pl.pipeline" if stages > 1 else "pl.range"
         stage = f", stage={stages}" if stages > 1 else ""
@@ -154,20 +161,18 @@ def emit_vector(
             "strip_index" if strip_grid[1] == 1 else f"strip_index // {strip_grid[1]}"
         )
         col_index = "0" if strip_grid[1] == 1 else f"strip_index % {strip_grid[1]}"
-        writer.line(indent, f"strip_row = {row_index} * {strip[0]}")
-        writer.line(indent, f"strip_col = {col_index} * {strip[1]}")
-    else:
-        writer.line(indent, "strip_row = 0")
-        writer.line(indent, "strip_col = 0")
-    writer.line(
-        indent,
-        f"valid_rows = pl.max(pl.min({iteration_rows} - strip_row, {strip[0]}), 0)",
-    )
-    writer.line(
-        indent,
-        f"valid_cols = pl.max(pl.min({iteration_cols} - strip_col, {strip[1]}), 0)",
-    )
-
+        row_offset = f"{row_index} * {strip[0]}"
+        col_offset = f"{col_index} * {strip[1]}"
+        if strip_grid[0] * strip[0] > tile[0]:
+            row_offset = f"pl.min({row_offset}, {tile[0] - strip[0]})"
+        if strip_grid[1] * strip[1] > tile[1]:
+            col_offset = f"pl.min({col_offset}, {tile[1] - strip[1]})"
+        if strip_grid[0] > 1:
+            writer.line(indent, f"strip_row = {row_offset}")
+            strip_row = "strip_row"
+        if strip_grid[1] > 1:
+            writer.line(indent, f"strip_col = {col_offset}")
+            strip_col = "strip_col"
     _emit_vector_body(
         writer,
         indent,
@@ -178,6 +183,8 @@ def emit_vector(
         frame,
         strip_rows=strip[0],
         strip_cols=strip[1],
+        row_offset=_sum_offsets(coordinates.row, strip_row),
+        col_offset=_sum_offsets(coordinates.col, strip_col),
         plan=plan,
     )
     writer.line(2, f"return {io.output_argument}")
@@ -265,7 +272,13 @@ def _emit_softmax_flash(
 
     writer = program_header(program_name, io, graph, plan.work_units)
     indent = 4
-    emit_partition_indices(writer, indent, m_partition, n_partition, emit_extents=True)
+    coordinates = emit_partition_indices(
+        writer,
+        indent,
+        m_partition,
+        n_partition,
+        clamped_overlap_extents=(output_rows, output_cols),
+    )
     writer.line(
         indent,
         f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_vector')}):",
@@ -280,7 +293,9 @@ def _emit_softmax_flash(
         input_tensor=input_tensor,
         input_argument=input_argument,
         prefix="initial",
+        row_offset=coordinates.row,
         col_offset="0",
+        valid_rows=str(plan.free_tile),
         valid_cols=str(stats_init.extent),
         old_max=None,
         old_sum=None,
@@ -310,7 +325,9 @@ def _emit_softmax_flash(
             input_tensor=input_tensor,
             input_argument=input_argument,
             prefix="stats",
+            row_offset=coordinates.row,
             col_offset="stats_col",
+            valid_rows=str(plan.free_tile),
             valid_cols=str(plan.chunk),
             old_max=stats_iter_max,
             old_sum=stats_iter_sum,
@@ -333,7 +350,9 @@ def _emit_softmax_flash(
             input_tensor=input_tensor,
             input_argument=input_argument,
             prefix="stats_tail",
+            row_offset=coordinates.row,
             col_offset=str(stats.tail.chunk_index * plan.chunk),
+            valid_rows=str(plan.free_tile),
             valid_cols=str(stats.tail.extent),
             old_max=running_max,
             old_sum=running_sum,
@@ -360,7 +379,9 @@ def _emit_softmax_flash(
             running_max=running_max,
             running_sum=running_sum,
             prefix="apply",
+            row_offset=coordinates.row,
             col_offset="apply_col",
+            valid_rows=str(plan.free_tile),
             valid_cols=str(plan.chunk),
         )
     if plan.tail:
@@ -379,7 +400,9 @@ def _emit_softmax_flash(
             running_max=running_max,
             running_sum=running_sum,
             prefix="apply_tail",
+            row_offset=coordinates.row,
             col_offset=str(apply.tail.chunk_index * plan.chunk),
+            valid_rows=str(plan.free_tile),
             valid_cols=str(apply.tail.extent),
         )
     writer.line(2, f"return {io.output_argument}")
@@ -579,7 +602,9 @@ def _emit_softmax_stats_chunk(  # noqa: PLR0913 -- explicit typed contract field
     input_tensor: int,
     input_argument: str,
     prefix: str,
+    row_offset: str,
     col_offset: str,
+    valid_rows: str,
     valid_cols: str,
     old_max: str | None,
     old_sum: str | None,
@@ -603,9 +628,8 @@ def _emit_softmax_stats_chunk(  # noqa: PLR0913 -- explicit typed contract field
     tile = f"{prefix}_input"
     writer.line(
         indent,
-        f"{tile} = pl.load({input_argument}, [region_row, {col_offset}], "
-        f"[{physical_rows}, {physical_cols}], valid_shape=[region_rows, {valid_cols}], "
-        "target_memory=pl.Mem.Vec, clamp=True)",
+        f"{tile} = "
+        f"{_static_vector_load(input_argument, row_offset, col_offset, (physical_rows, physical_cols), (valid_rows, valid_cols))}",
     )
     max_scratch = f"{prefix}_max_scratch"
     writer.line(
@@ -660,7 +684,9 @@ def _emit_softmax_apply_chunk(  # noqa: PLR0913 -- explicit typed contract field
     running_max: str,
     running_sum: str,
     prefix: str,
+    row_offset: str,
     col_offset: str,
+    valid_rows: str,
     valid_cols: str,
 ) -> None:
     frames = {frame.tensor: frame for frame in phase.tensor_frames}
@@ -672,9 +698,8 @@ def _emit_softmax_apply_chunk(  # noqa: PLR0913 -- explicit typed contract field
     tile = f"{prefix}_input"
     writer.line(
         indent,
-        f"{tile} = pl.load({input_argument}, [region_row, {col_offset}], "
-        f"[{physical_rows}, {physical_cols}], valid_shape=[region_rows, {valid_cols}], "
-        "target_memory=pl.Mem.Vec, clamp=True)",
+        f"{tile} = "
+        f"{_static_vector_load(input_argument, row_offset, col_offset, (physical_rows, physical_cols), (valid_rows, valid_cols))}",
     )
     local = {
         input_tensor: tile,
@@ -717,7 +742,7 @@ def _emit_softmax_apply_chunk(  # noqa: PLR0913 -- explicit typed contract field
     writer.line(
         indent,
         f"{context.interface.output_argument} = pl.store({result}, "
-        f"[region_row, {col_offset}], {context.interface.output_argument})",
+        f"[{row_offset}, {col_offset}], {context.interface.output_argument})",
     )
 
 
@@ -732,6 +757,8 @@ def _emit_vector_body(
     *,
     strip_rows: int,
     strip_cols: int,
+    row_offset: str,
+    col_offset: str,
     plan: VectorKernelPlan,
 ) -> None:
     graph_ops = graph.op_map()
@@ -772,16 +799,15 @@ def _emit_vector_body(
                 f"vector body frame for tensor {tensor} differs from its logical slice"
             )
         physical_rows, physical_cols = tensor_frame.physical
-        row_offset = "0" if rows == 1 else "region_row + strip_row"
-        col_offset = "0" if cols == 1 else "region_col + strip_col"
-        valid_rows = "1" if rows == 1 else "valid_rows"
-        valid_cols = "1" if cols == 1 else "valid_cols"
+        input_row_offset = "0" if rows == 1 else row_offset
+        input_col_offset = "0" if cols == 1 else col_offset
+        valid_rows = "1" if rows == 1 else str(logical_rows)
+        valid_cols = "1" if cols == 1 else str(logical_cols)
         name = f"tensor_{tensor}"
         writer.line(
             indent,
-            f"{name} = pl.load({argument}, [{row_offset}, {col_offset}], "
-            f"[{physical_rows}, {physical_cols}], valid_shape=[{valid_rows}, {valid_cols}], "
-            "target_memory=pl.Mem.Vec, clamp=True)",
+            f"{name} = "
+            f"{_static_vector_load(argument, input_row_offset, input_col_offset, (physical_rows, physical_cols), (valid_rows, valid_cols))}",
         )
         local[tensor] = name
         return name
@@ -827,7 +853,37 @@ def _emit_vector_body(
     writer.line(
         indent,
         f"{io.output_argument} = pl.store({output_tile}, "
-        f"[region_row + strip_row, region_col + strip_col], {io.output_argument})",
+        f"[{row_offset}, {col_offset}], {io.output_argument})",
+    )
+
+
+def _sum_offsets(*offsets: str) -> str:
+    """Combine coordinate expressions without materializing zero scalars."""
+
+    nonzero = [offset for offset in offsets if offset != "0"]
+    return " + ".join(nonzero) if nonzero else "0"
+
+
+def _static_vector_load(
+    argument: str,
+    row_offset: str,
+    col_offset: str,
+    physical: tuple[int, int],
+    valid: tuple[str, str],
+) -> str:
+    """Render a plan-bounded load without re-symbolizing its valid frame.
+
+    The spatial policy already keeps the logical valid frame in bounds.
+    Requesting ``clamp=True`` would make PyPTO derive runtime valid extents and
+    would therefore violate the solver's static replay contract.
+    """
+
+    physical_rows, physical_cols = physical
+    valid_rows, valid_cols = valid
+    return (
+        f"pl.load({argument}, [{row_offset}, {col_offset}], "
+        f"[{physical_rows}, {physical_cols}], valid_shape=[{valid_rows}, {valid_cols}], "
+        "target_memory=pl.Mem.Vec)"
     )
 
 

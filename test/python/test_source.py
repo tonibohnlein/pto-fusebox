@@ -25,9 +25,11 @@ from pto_fusebox import (
 )
 from pto_fusebox.ir import normalized_graph_sha256
 from pto_fusebox.schedule.schema import (
+    AxisPartition,
     CubeKernelPlan,
     VectorKernelPlan,
     VectorReplayPhase,
+    VectorSpatialPolicy,
     VectorStreamKind,
 )
 from torch import nn
@@ -93,9 +95,9 @@ def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     ast.parse(source)
     assert "for region_index in pl.parallel(16):" in source
     assert "pl.pipeline(" not in source
-    assert "region_rows = 8" in source
+    assert "region_rows" not in source
     assert "pl.load(arg_value," in source
-    assert "[8, 1024], valid_shape=[valid_rows, valid_cols]" in source
+    assert "[8, 1024], valid_shape=[8, 1024]" in source
     assert source.count("pl.load(") == 1
     assert source.count("pl.store(") == 1
     assert "pl.row_max" in source
@@ -167,7 +169,8 @@ def test_vector_reduction_uses_pinned_iteration_frame_not_output_extent() -> Non
     source = emit_pypto_region(graph, result, program_name="sum_of_squares").source
 
     assert [op.kind for op in graph.ops] == ["mul", "sum"]
-    assert "valid_cols = pl.max(pl.min(1024 - strip_col, 1024), 0)" in source
+    assert "[8, 1024], valid_shape=[8, 1024]" in source
+    assert "valid_cols" not in source
     assert "pl.row_sum" in source
     assert source.count("pl.load(") == 1
     assert source.count("pl.store(") == 1
@@ -205,9 +208,32 @@ def test_cube_emission_is_generic_over_shape_and_k_tail() -> None:
     source = emit_pypto_region(graph, result, program_name="matmul_with_tail").source
 
     assert "[region_row, 240], [16, 32]" in source
-    assert "[240, region_col], [32, 80]" in source
+    assert "[240, 0], [32, 80]" in source
+    assert "region_col =" not in source
     assert "pl.tile.matmul_acc" in source
     assert source.count("pl.store(") == 1
+
+
+def test_cube_singleton_partition_axis_uses_literal_zero_coordinate() -> None:
+    class MatmulWithSingletonMPartition(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs)
+
+    graph, result = _solve_module(
+        MatmulWithSingletonMPartition(),
+        (torch.zeros(16, 272), torch.zeros(272, 32)),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.m_partition.parts == 1
+    assert plan.n_partition.parts == 2
+
+    source = emit_pypto_region(graph, result, program_name="matmul_singleton_m").source
+
+    ast.parse(source)
+    assert "region_row =" not in source
+    assert "pl.tile.load(arg_lhs, [0, 0]" in source
+    assert "pl.store(accumulator, [0, region_col], output)" in source
 
 
 def test_source_backend_rejects_unimplemented_cube_residency() -> None:
@@ -428,6 +454,18 @@ def test_source_backend_rejects_partition_that_does_not_cover_output() -> None:
 
     with pytest.raises(SourceEmissionError, match="iteration frame"):
         emit_pypto_region(graph, replace(result, solution=solution))
+
+
+def test_source_backend_rejects_unpriced_vector_spatial_policy() -> None:
+    graph, result = _solved("softmax")
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    solution["steps"][0]["plan"]["spatial_policy"] = "exact_balanced"
+    mutated = replace(result, solution=solution)
+
+    assert not can_emit_region(graph, mutated)
+    with pytest.raises(SourceEmissionError, match="clamped-overlap spatial policy"):
+        emit_pypto_region(graph, mutated)
 
 
 def test_source_backend_rejects_non_last_axis_reduction() -> None:
@@ -682,6 +720,7 @@ def test_pr2335_vector_surface_is_source_ready(
     plan = schedule.steps[0].plan
     assert isinstance(plan, VectorKernelPlan)
     assert plan.kind.value == kind
+    assert plan.spatial_policy is VectorSpatialPolicy.CLAMPED_OVERLAP
     assert plan.work_units == work_units
     assert plan.tile == tile
     assert plan.strip == strip
@@ -698,10 +737,23 @@ def test_pr2335_vector_surface_is_source_ready(
     source = emit_pypto_region(graph, result, program_name=name).source
     ast.parse(source)
     assert "auto_fuse" not in source and "auto_tile" not in source
+    assert "valid_rows = pl." not in source
+    assert "valid_cols = pl." not in source
+    assert "region_rows = pl." not in source
+    assert "region_cols = pl." not in source
+    assert "clamp=" not in source
+    if plan.m_partition.parts == 1:
+        assert "region_row =" not in source
+    if plan.n_partition.parts == 1:
+        assert "region_col =" not in source
     if kind == "materialized":
         assert "pl.pipeline(" not in source
+        assert "strip_row =" not in source
+        assert "strip_col =" not in source
     if kind == "pointwise":
         assert "pl.pipeline(4, stage=2)" in source
+        assert "strip_row =" in source
+        assert "strip_col =" not in source
 
 
 def test_pr2335_wide_softmax_replays_the_typed_online_phases() -> None:
@@ -750,6 +802,50 @@ def test_pr2335_silu_scalar_left_division_lowers_to_reciprocal() -> None:
     ]
     assert source.count("pl.recip(") == 1
     assert "silu" not in source.lower()
+
+
+def test_pr2335_ragged_layernorm_emits_static_clamped_regions() -> None:
+    graph, result = _pr2335_solved("pr2335_layer_norm")
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.m_partition == AxisPartition(big=22, small=21, num_big=8, parts=24)
+
+    source = emit_pypto_region(graph, result, program_name="layer_norm").source
+
+    assert "m_big_before = pl.min(region_index, 8)" in source
+    assert "region_row = pl.min(region_index * 21 + m_big_before * 1, 490)" in source
+    assert "region_col =" not in source
+    assert "strip_row =" not in source
+    assert "strip_col =" not in source
+    assert "valid_shape=[22, 256]" in source
+    assert source.count("valid_shape=[1, 256]") == 2
+    assert "region_rows" not in source
+    assert "valid_rows" not in source
+
+
+def test_ragged_pointwise_clamps_region_and_strip_origins_not_shapes() -> None:
+    class RaggedPointwise(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.exp(value * 0.5) + value
+
+    graph, result = _solve_module(RaggedPointwise(), (torch.zeros(257, 65),))
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.POINTWISE
+    assert plan.m_partition == AxisPartition(big=17, small=16, num_big=1, parts=16)
+    assert plan.tile == (17, 65)
+    assert plan.strip == (9, 65)
+    assert plan.strip_grid == (2, 1)
+
+    source = emit_pypto_region(graph, result, program_name="ragged_pointwise").source
+
+    assert "region_row = pl.min(region_index * 16 + m_big_before * 1, 240)" in source
+    assert "strip_row = pl.min(strip_index * 9, 8)" in source
+    assert "region_col =" not in source
+    assert "strip_col =" not in source
+    assert "valid_shape=[9, 65]" in source
+    assert "valid_rows" not in source
+    assert "valid_cols" not in source
 
 
 def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:
@@ -812,8 +908,8 @@ def test_cast_chain_alignment_is_local_to_its_physical_shape_class() -> None:
     assert body_frames[bias_tensor].physical[0] == 8
     assert body_frames[bias_tensor].physical[1] == 1
     source = emit_pypto_region(graph, result).source
-    assert "[8, 1], valid_shape=[valid_rows, 1]" in source
-    assert "[32, 1], valid_shape=[valid_rows, 1]" not in source
+    assert "[8, 1], valid_shape=[3, 1]" in source
+    assert "[32, 1], valid_shape=[3, 1]" not in source
 
 
 def test_softmax_source_rejects_loop_or_generated_work_drift() -> None:
