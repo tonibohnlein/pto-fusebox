@@ -54,6 +54,7 @@ def emit_vector(
         raise SourceEmissionError(
             "vector coordinate transforms are not implemented in source v1"
         )
+    _validate_cast_roots(graph, lowered)
     if (
         plan.reduction_split.kind is not VectorReductionSplitKind.NONE
         or plan.reduction_split.factor != 1
@@ -75,9 +76,9 @@ def emit_vector(
         raise SourceEmissionError(
             "materialized/pointwise vector source requires zero sequential tiles"
         )
-    if plan.axis != 0:
+    if plan.kind is VectorStreamKind.MATERIALIZED and plan.axis != 0:
         raise SourceEmissionError(
-            "streamed vector phase emission is not implemented in source v1"
+            "materialized vector replay cannot carry a stream axis"
         )
 
     m_partition = plan.m_partition
@@ -957,6 +958,26 @@ def _tensor_producers(lowered: LoweredRegion) -> list[int | None]:
                 )
             producers[tensor] = operation.index
     return producers
+
+
+def _validate_cast_roots(graph: NormalizedGraph, lowered: LoweredRegion) -> None:
+    """Reject cast chains whose source physical box cannot yet be widened."""
+
+    graph_ops = graph.op_map()
+    producers = _tensor_producers(lowered)
+    for operation in lowered.operations:
+        graph_op = graph_ops.get(operation.graph_op_id)
+        if graph_op is None or graph_op.kind != "cast" or len(operation.inputs) != 1:
+            continue
+        producer = producers[operation.inputs[0]]
+        if producer is None:
+            continue
+        source_op = graph_ops.get(lowered.operation(producer).graph_op_id)
+        if source_op is not None and source_op.kind in {"sum", "max"}:
+            raise SourceEmissionError(
+                "vector source does not support a native cast chain rooted in a "
+                "reduction result"
+            )
 
 
 def _validate_vector_body_lifetimes(

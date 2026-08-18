@@ -42,7 +42,11 @@ class LayerNorm(nn.Module):
         gamma: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        mean = value.mean(dim=-1, keepdim=True)
+        # Preserve the exact PR #2335 tensor DAG: scale the wide value before
+        # reducing it, rather than scaling the thin reduction result.  The two
+        # forms are mathematically equivalent, but they have different vector
+        # primitive geometry and therefore different grounded costs.
+        mean = (value * (1.0 / 256.0)).sum(dim=-1, keepdim=True)
         centered = value - mean
         variance = (centered * centered).mean(dim=-1, keepdim=True)
         return centered / torch.sqrt(variance + LAYER_EPS) * gamma + beta

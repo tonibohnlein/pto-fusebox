@@ -144,6 +144,13 @@ class VectorTensorFramePlan:
 
 @dataclass(frozen=True)
 class VectorWorkspaceFramePlan:
+    """Allocation frame for a tile-level reduction workspace.
+
+    Row-reduction lowering pads the physical contiguous extent to at least 128
+    elements; ``logical`` remains equal to the source tensor frame. Column
+    reductions lower directly and therefore do not serialize a workspace.
+    """
+
     op: int
     source_tensor: int
     logical: tuple[int, int]

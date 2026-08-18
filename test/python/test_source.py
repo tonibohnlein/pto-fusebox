@@ -90,9 +90,9 @@ def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
 
     source = emit_pypto_region(graph, result, program_name="softmax_fused").source
     ast.parse(source)
-    assert "for region_index in pl.parallel(12):" in source
-    assert "for strip_index in pl.pipeline(2, stage=2):" in source
-    assert "region_rows = 10 +" in source
+    assert "for region_index in pl.parallel(16):" in source
+    assert "pl.pipeline(" not in source
+    assert "region_rows = 8" in source
     assert "pl.load(value," in source
     assert "[8, 1024], valid_shape=[valid_rows, valid_cols]" in source
     assert source.count("pl.load(") == 1
@@ -170,6 +170,27 @@ def test_vector_reduction_uses_pinned_iteration_frame_not_output_extent() -> Non
     assert "pl.row_sum" in source
     assert source.count("pl.load(") == 1
     assert source.count("pl.store(") == 1
+
+
+def test_narrow_row_reduction_serializes_lowered_scratch_frame() -> None:
+    class NarrowRowReduction(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.sum(value, dim=-1, keepdim=True)
+
+    graph, result = _solve_module(NarrowRowReduction(), (torch.ones(16384, 16),))
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    body = plan.phase(VectorReplayPhase.BODY)
+    assert len(body.workspaces) == 1
+    assert body.workspaces[0].logical[1] == 16
+    assert body.workspaces[0].physical[1] == 128
+
+    source = emit_pypto_region(
+        graph, result, program_name="narrow_row_reduction"
+    ).source
+    assert "pl.parallel(96)" in source
+    assert "pl.tile.create([" in source
+    assert ", 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)" in source
 
 
 def test_cube_emission_is_generic_over_shape_and_k_tail() -> None:
@@ -404,7 +425,7 @@ def test_source_backend_rejects_partition_that_does_not_cover_output() -> None:
     solution = copy.deepcopy(result.solution)
     solution["steps"][0]["plan"]["m_partition"]["big"] += 1
 
-    with pytest.raises(SourceEmissionError, match="covers .* output axis"):
+    with pytest.raises(SourceEmissionError, match="iteration frame"):
         emit_pypto_region(graph, replace(result, solution=solution))
 
 
@@ -452,21 +473,134 @@ def test_source_backend_rejects_mixed_plan_without_replanning_it() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "kind", "work_units"),
+    (
+        "name",
+        "kind",
+        "work_units",
+        "tile",
+        "strip",
+        "body_trips",
+        "body_stages",
+        "chunk",
+        "tail",
+        "full_peak_ub_bytes",
+        "chunk_peak_ub_bytes",
+        "latency_cycles",
+    ),
     [
-        ("pr2335_softmax_512x256", "materialized", 16),
-        ("pr2335_softmax_256x512", "materialized", 16),
-        ("pr2335_softmax_128x1024", "materialized", 12),
-        ("pr2335_softmax_32x8192", "softmax_flash", 32),
-        ("pr2335_rms_norm", "materialized", 24),
-        ("pr2335_layer_norm", "materialized", 32),
-        ("pr2335_silu", "materialized", 16),
+        (
+            "pr2335_softmax_512x256",
+            "materialized",
+            16,
+            (32, 256),
+            (32, 256),
+            1,
+            1,
+            0,
+            0,
+            65_664,
+            65_664,
+            15_121.378472222223,
+        ),
+        (
+            "pr2335_softmax_256x512",
+            "materialized",
+            16,
+            (16, 512),
+            (16, 512),
+            1,
+            1,
+            0,
+            0,
+            65_600,
+            65_600,
+            15_217.378472222223,
+        ),
+        (
+            "pr2335_softmax_128x1024",
+            "materialized",
+            16,
+            (8, 1024),
+            (8, 1024),
+            1,
+            1,
+            0,
+            0,
+            65_568,
+            65_568,
+            15_633.378472222223,
+        ),
+        (
+            "pr2335_softmax_32x8192",
+            "softmax_flash",
+            32,
+            (1, 8192),
+            (0, 0),
+            0,
+            1,
+            480,
+            32,
+            524_320,
+            184_576,
+            26_604.218098958336,
+        ),
+        (
+            "pr2335_rms_norm",
+            "materialized",
+            24,
+            (22, 512),
+            (22, 512),
+            1,
+            1,
+            0,
+            0,
+            147_552,
+            147_552,
+            17_580.31396484375,
+        ),
+        (
+            "pr2335_layer_norm",
+            "materialized",
+            24,
+            (22, 256),
+            (22, 256),
+            1,
+            1,
+            0,
+            0,
+            73_824,
+            73_824,
+            15_732.204915364582,
+        ),
+        (
+            "pr2335_silu",
+            "pointwise",
+            8,
+            (256, 64),
+            (64, 64),
+            4,
+            2,
+            64,
+            0,
+            196_608,
+            98_304,
+            12_664.0,
+        ),
     ],
 )
 def test_pr2335_vector_surface_is_source_ready(
     name: str,
     kind: str,
     work_units: int,
+    tile: tuple[int, int],
+    strip: tuple[int, int],
+    body_trips: int,
+    body_stages: int,
+    chunk: int,
+    tail: int,
+    full_peak_ub_bytes: int,
+    chunk_peak_ub_bytes: int,
+    latency_cycles: float,
 ) -> None:
     graph, result = _pr2335_solved(name)
     schedule = scheduled_region(result)
@@ -477,10 +611,25 @@ def test_pr2335_vector_surface_is_source_ready(
     assert isinstance(plan, VectorKernelPlan)
     assert plan.kind.value == kind
     assert plan.work_units == work_units
+    assert plan.tile == tile
+    assert plan.strip == strip
+    assert plan.chunk == chunk
+    assert plan.tail == tail
+    assert plan.full_peak_ub_bytes == full_peak_ub_bytes
+    assert plan.chunk_peak_ub_bytes == chunk_peak_ub_bytes
+    assert schedule.steps[0].latency == pytest.approx(latency_cycles)
+    body = plan.phase(VectorReplayPhase.BODY)
+    assert body.loop is not None
+    assert body.loop.trip_count == body_trips
+    assert body.loop.pipeline_stages == body_stages
 
     source = emit_pypto_region(graph, result, program_name=name).source
     ast.parse(source)
     assert "auto_fuse" not in source and "auto_tile" not in source
+    if kind == "materialized":
+        assert "pl.pipeline(" not in source
+    if kind == "pointwise":
+        assert "pl.pipeline(4, stage=2)" in source
 
 
 def test_pr2335_wide_softmax_replays_the_typed_online_phases() -> None:
@@ -519,8 +668,57 @@ def test_pr2335_silu_scalar_left_division_lowers_to_reciprocal() -> None:
     source = emit_pypto_region(graph, result, program_name="generic_pointwise").source
 
     assert [op.kind for op in graph.ops] == ["mul", "exp", "add", "div", "mul"]
+    assert result.problem is not None
+    assert result.problem["vector_primitive_families"] == [
+        "scalar_mul",
+        "exp",
+        "scalar_add",
+        "recip",
+        "mul",
+    ]
     assert source.count("pl.recip(") == 1
     assert "silu" not in source.lower()
+
+
+def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:
+    class ReductionResultCast(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.sum(dim=-1, keepdim=True).to(torch.int8)
+
+    graph, result = _solve_module(ReductionResultCast(), (torch.randn(16, 512),))
+
+    assert result.status == "solved"
+    assert not can_emit_region(graph, result)
+    with pytest.raises(
+        SourceEmissionError, match="cast chain rooted in a reduction result"
+    ):
+        emit_pypto_region(graph, result)
+
+
+def test_cast_chain_alignment_is_local_to_its_physical_shape_class() -> None:
+    class CastThenBroadcast(torch.nn.Module):
+        def forward(self, value: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            restored = value.to(torch.float16).to(torch.float32)
+            return restored + bias
+
+    graph, result = _solve_module(
+        CastThenBroadcast(),
+        (torch.randn(3, 512), torch.randn(3, 1)),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    bias_tensor = result.solver_tensor_to_value.index(graph.inputs[1])
+    body_frames = {
+        frame.tensor: frame
+        for frame in plan.phase(VectorReplayPhase.BODY).tensor_frames
+    }
+
+    assert body_frames[bias_tensor].logical[1] == 1
+    assert body_frames[bias_tensor].physical[0] == 8
+    assert body_frames[bias_tensor].physical[1] == 1
+    source = emit_pypto_region(graph, result).source
+    assert "[8, 1], valid_shape=[valid_rows, 1]" in source
+    assert "[32, 1], valid_shape=[valid_rows, 1]" not in source
 
 
 def test_softmax_source_rejects_loop_or_generated_work_drift() -> None:

@@ -36,6 +36,8 @@ static bool parse_vector_primitive_family(const std::string& name, VectorPrimiti
     else if (name == "add") *family = VectorPrimitiveFamily::Add;
     else if (name == "mul") *family = VectorPrimitiveFamily::Mul;
     else if (name == "div") *family = VectorPrimitiveFamily::Div;
+    else if (name == "cast") *family = VectorPrimitiveFamily::Cast;
+    else if (name == "recip") *family = VectorPrimitiveFamily::Recip;
     else if (name == "exp") *family = VectorPrimitiveFamily::Exp;
     else if (name == "log") *family = VectorPrimitiveFamily::Log;
     else if (name == "abs") *family = VectorPrimitiveFamily::Abs;
@@ -1025,9 +1027,14 @@ std::string solution_json(const Solution& sol) {
                 serialized_step["sequential_tiles"] = ks;
             } else if (!step.subgraph.has_matmul() && prob.num_vector_cores > 1 &&
                        prob.vec_capacity > 0) {
-                // Vector single-core k-stream: one subgraph-wide chunk along the
-                // streamed axis (the matmul-seq-k analog). Emit it per op (same value).
-                const int64_t chunk = vector_plan.streamed() ? vector_plan.chunk : 0;
+                // Only reduced-axis streaming maps to sequential tiles. A
+                // pointwise strip loop is already fully described by the
+                // vector plan's strip/grid/body fields; serializing its strip
+                // size here would give two conflicting owners for one loop.
+                const bool reduction_streamed =
+                    vector_plan.kind != VectorStreamKind::Materialized &&
+                    vector_plan.kind != VectorStreamKind::Pointwise;
+                const int64_t chunk = reduction_streamed ? vector_plan.chunk : 0;
                 serialized_step["sequential_tiles"] =
                     std::vector<int64_t>(order.size(), chunk);
             } else {

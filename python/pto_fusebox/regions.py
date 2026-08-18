@@ -183,6 +183,19 @@ def lower_solver_region(
     required_value_ids = [
         _allocation_owner(value_id, values, ops) for value_id in region.output_values
     ]
+    use_count = {value.id: 0 for value in ordered_values}
+    for op in compute_ops:
+        for value_id in op.inputs:
+            use_count[value_id] += 1
+    required_value_set = set(required_value_ids)
+    for value in ordered_values:
+        if _solver_dtype(value.dtype) != "INT8":
+            continue
+        if value.id not in required_value_set or use_count[value.id] != 0:
+            raise ValueError(
+                "Ascend910B vector scheduling supports INT8 only as an "
+                f"unconsumed returned cast result, got {value.id}"
+            )
     graph_op_indices: dict[str, list[int]] = {}
     for index, graph_op in enumerate(solver_op_to_graph):
         graph_op_indices.setdefault(graph_op, []).append(index)
@@ -430,6 +443,16 @@ def _solver_op_type(op: NormalizedOp) -> str:
 
 
 def _vector_cost(op: NormalizedOp) -> tuple[float, float]:
+    if op.kind == "div" and _has_exact_scalar(op, value=1, positions={0}):
+        return (2.0, 30.0)
+    if op.attributes.get("scalars"):
+        return {
+            "add": (1.0, 31.0),
+            "sub": (1.0, 31.0),
+            "maximum": (1.0, 23.0),
+            "minimum": (1.0, 30.0),
+            "mul": (1.0, 26.0),
+        }.get(op.kind, (0.0, 0.0))
     return {
         "add": (2.0, 24.0),
         "sub": (2.0, 24.0),
@@ -438,11 +461,11 @@ def _vector_cost(op: NormalizedOp) -> tuple[float, float]:
         "mul": (2.0, 25.0),
         "div": (4.0, 30.0),
         "exp": (2.0, 31.0),
-        "log": (2.0, 32.0),
-        "abs": (1.0, 24.0),
-        "sqrt": (1.0, 24.0),
+        "log": (2.0, 33.0),
+        "abs": (1.0, 29.0),
+        "sqrt": (2.0, 39.0),
         "rsqrt": (1.0, 24.0),
-        "neg": (1.0, 24.0),
+        "neg": (1.0, 26.0),
         "cast": (1.0, 24.0),
     }.get(op.kind, (0.0, 0.0))
 
@@ -471,6 +494,10 @@ def _vector_primitive(
         return "scalar_mul" if op.attributes.get("scalars") else "mul"
     if op.kind == "neg":
         return "scalar_mul"
+    if op.kind == "cast":
+        return "cast"
+    if op.kind == "div" and _has_exact_scalar(op, value=1, positions={0}):
+        return "recip"
     return {
         "div": "div",
         "exp": "exp",

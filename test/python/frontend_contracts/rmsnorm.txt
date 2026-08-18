@@ -32,7 +32,7 @@ region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007,op
   tensor 8=v0000 FP32[1x64] alias=- synthetic=0
   tensor 9=v0009 FP32[8x64] alias=- synthetic=0
   tensor 10=v0010 FP16[8x64] alias=- synthetic=0
-  solver_op 0 graph=op0000 Pointwise primitive=generic geometry=flat capability=elementwise mixed=cast (0)->(1)
+  solver_op 0 graph=op0000 Pointwise primitive=cast geometry=flat capability=elementwise mixed=cast (0)->(1)
   solver_op 1 graph=op0001 Pointwise primitive=mul geometry=flat capability=elementwise mixed=mul (1,1)->(2)
   solver_op 2 graph=op0002 Reduction primitive=row_sum geometry=flat capability=reduction_sum mixed=none (2)->(3)
   solver_op 3 graph=op0003 Pointwise primitive=scalar_mul geometry=flat capability=elementwise mixed=mul (3)->(4)
@@ -40,6 +40,6 @@ region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007,op
   solver_op 5 graph=op0005 Pointwise primitive=rsqrt geometry=flat capability=elementwise mixed=none (5)->(6)
   solver_op 6 graph=op0006 Pointwise primitive=mul geometry=row_expand capability=elementwise mixed=mul (1,6)->(7)
   solver_op 7 graph=op0007 Pointwise primitive=mul geometry=col_expand capability=elementwise mixed=mul (7,8)->(9)
-  solver_op 8 graph=op0008 Pointwise primitive=generic geometry=flat capability=elementwise mixed=cast (9)->(10)
+  solver_op 8 graph=op0008 Pointwise primitive=cast geometry=flat capability=elementwise mixed=cast (9)->(10)
   required=10
   p4=[]

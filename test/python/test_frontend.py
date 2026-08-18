@@ -686,6 +686,70 @@ def test_scalar_add_and_sub_use_grounded_scalar_primitive() -> None:
     assert primitives == ["scalar_add", "scalar_add", "add"]
 
 
+def test_reciprocal_and_division_keep_distinct_grounded_costs() -> None:
+    class ReciprocalAndDivision(nn.Module):
+        def forward(
+            self, lhs: torch.Tensor, rhs: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return 1 / (lhs + 3), lhs / rhs
+
+    graph = export_and_normalize(
+        ReciprocalAndDivision(),
+        (torch.randn(2, 8), torch.randn(2, 8)),
+    )
+    problems = [region.lower(graph).problem for region in extract_solver_regions(graph)]
+    primitive_costs = [
+        (primitive, slope, fixed)
+        for problem in problems
+        for primitive, slope, fixed in zip(
+            problem["vector_primitive_families"],
+            problem["vec_slopes"],
+            problem["vec_fixed_costs"],
+            strict=True,
+        )
+    ]
+
+    assert ("recip", 2.0, 30.0) in primitive_costs
+    assert ("div", 4.0, 30.0) in primitive_costs
+
+
+def test_serialized_vector_costs_match_the_grounded_primitive_table() -> None:
+    class GroundedChain(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            logged = torch.log(value)
+            absolute = torch.abs(logged)
+            rooted = torch.sqrt(absolute)
+            negated = -rooted
+            shifted = negated + 1.0
+            return shifted * 2.0
+
+    graph = export_and_normalize(GroundedChain(), (torch.rand(4, 64) + 1.0,))
+    problem = extract_solver_regions(graph)[0].lower(graph).problem
+
+    assert problem["vector_primitive_families"] == [
+        "log",
+        "abs",
+        "sqrt",
+        "scalar_mul",
+        "scalar_add",
+        "scalar_mul",
+    ]
+    assert list(
+        zip(
+            problem["vec_slopes"],
+            problem["vec_fixed_costs"],
+            strict=True,
+        )
+    ) == [
+        (2.0, 33.0),
+        (1.0, 29.0),
+        (2.0, 39.0),
+        (1.0, 26.0),
+        (1.0, 31.0),
+        (1.0, 26.0),
+    ]
+
+
 def test_bf16_vector_arithmetic_is_boundary_but_cast_is_admitted() -> None:
     class Bf16Arithmetic(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -750,6 +814,18 @@ def test_representable_single_axis_broadcast_is_admitted(
     assert len(extract_solver_regions(graph)) == 1
 
 
+def test_ambiguous_scalar_tensor_broadcast_declines() -> None:
+    class BroadcastAdd(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return lhs + rhs
+
+    graph = export_and_normalize(
+        BroadcastAdd(),
+        (torch.randn(4, 16), torch.randn(1, 1)),
+    )
+    assert extract_solver_regions(graph) == []
+
+
 @pytest.mark.parametrize(
     ("source_dtype", "target_dtype", "solver_dtypes"),
     [
@@ -772,12 +848,27 @@ def test_casts_expand_to_native_910b_chains(
     lowered = extract_solver_regions(graph)[0].lower(graph)
     assert lowered.problem["dtypes"] == solver_dtypes
     assert lowered.problem["op_types"] == ["Pointwise", "Pointwise"]
+    assert lowered.problem["vector_primitive_families"] == ["cast", "cast"]
     assert lowered.solver_op_to_graph == (graph.ops[0].id, graph.ops[0].id)
     assert lowered.problem["frontend_mapping"]["solver_tensor_synthetic"] == [
         False,
         True,
         False,
     ]
+
+
+def test_int8_is_limited_to_an_unconsumed_returned_cast_result() -> None:
+    class Int8Intermediate(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.to(torch.int8).to(torch.float32)
+
+    graph = export_and_normalize(Int8Intermediate(), (torch.randn(4, 16),))
+    region = extract_solver_regions(graph)[0]
+
+    with pytest.raises(
+        ValueError, match="INT8 only as an unconsumed returned cast result"
+    ):
+        region.lower(graph)
 
 
 def test_same_dtype_to_is_alias_unless_copy_is_requested() -> None:

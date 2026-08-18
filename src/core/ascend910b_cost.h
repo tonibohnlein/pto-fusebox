@@ -253,6 +253,20 @@ public:
   // virtual destructor is needed; the implicit copy/move carry the vptr.
 
 protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
+  struct VectorPlanCost {
+    double latency = std::numeric_limits<double>::infinity();
+    double compute = 0.0;
+    double ddr = 0.0;
+  };
+
+  // Cost one vector plan exactly as compute_cost() executes its phases.
+  // vector_stream_plan() uses the same helper to compare one-pass, strip, and
+  // online candidates, so candidate selection and final-plan pricing cannot
+  // drift apart.
+  VectorPlanCost vector_plan_cost(const VectorStreamPlan &plan,
+                                  const FlatSet<size_t> &retained_from_prev,
+                                  const FlatSet<size_t> &retain_these) const;
+
   CostResult compute_cost_impl(const TileConfig &cfg,
                                const FlatSet<size_t> &retained_from_prev,
                                const FlatSet<size_t> &retain_these,
@@ -432,6 +446,13 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int64_t vector_min_dtype_bytes_ = 4;
   int64_t vector_max_dtype_bytes_ = 4;
   int64_t vector_emit_granule_ = 1;
+  std::shared_ptr<const std::vector<int64_t>> vector_tensor_emit_granules_;
+  // The generated online-reduction state follows the physical classes of the
+  // source frame and the thin reduction result.  Keep those identities
+  // explicit so an unrelated cast class cannot impose its larger aggregate
+  // granule on reduction chunks or accumulator rows.
+  size_t vector_reduction_input_tensor_ = std::numeric_limits<size_t>::max();
+  size_t vector_reduction_output_tensor_ = std::numeric_limits<size_t>::max();
   int64_t vector_pipe_band_count_ = 2;
   int64_t vector_iter_W_ = 1;
   int64_t vector_iter_H_ = 1;
@@ -467,6 +488,10 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   struct VectorUBTransientRef {
     size_t tensor = 0;
     uint8_t skip_mask = 0;
+    // ConvertTensorToTileOps pads a row-reduction scratch tile's contiguous
+    // extent to at least 128 elements. Column reductions have no scratch;
+    // zero denotes an ordinary tensor frame.
+    int64_t minimum_physical_cols = 0;
   };
   std::vector<VectorUBBandInterval> vector_ub_band_intervals_;
   std::vector<VectorUBTransientRef> vector_ub_transient_refs_;
@@ -606,10 +631,9 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // vector / legacy subgraphs (the uniform divisor tiles cover those).
   struct SpatialTriple { int64_t parts_m, parts_n, split_k; };
   std::vector<SpatialTriple> grid_cand_;
-  // Per-axis region-extent granularity for the grid (partition_axis). Cube: 16 on
-  // both (the 16x16 MAC fractal). Vector: 1 along the free (row/height) axis and
-  // 16 (the 32-byte DMA block) along the contiguous (width) axis -- no fractal
-  // constraint, so a few-row reduction can still tile finely enough to fill C.
+  // Per-axis logical region granularity for partition_axis. Cube uses the 16x16
+  // MAC fractal. Vector uses one element on both axes; dtype-specific DMA
+  // padding belongs to its physical UB frame, not to logical work ownership.
   int64_t grid_gran_h_ = 16;
   int64_t grid_gran_w_ = 16;
 

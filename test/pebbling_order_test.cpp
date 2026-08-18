@@ -386,9 +386,11 @@ void TestVectorDiamondCombinesBoundaryAndProducedLifetimes() {
   config.parts_n = 1;
   config.split_k = 1;
   const VectorStreamPlan plan = subgraph->vector_stream_plan(config, {}, {});
-  Check("vector diamond remains one materialized replay",
-        plan.feasible && plan.kind == VectorStreamKind::Materialized &&
-            plan.input_lifetimes != nullptr);
+  Check("vector diamond remains one fused cost-selected replay",
+        plan.feasible && plan.kind == VectorStreamKind::Pointwise &&
+            plan.body.trip_count == plan.row_strips * plan.width_strips &&
+            plan.body.trip_count >= 2 && plan.body.pipeline_stages == 2 &&
+            plan.overlap_granted && plan.input_lifetimes != nullptr);
   if (!plan.input_lifetimes) return;
 
   const auto& body =

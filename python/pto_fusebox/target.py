@@ -30,7 +30,9 @@ _VECTOR_OPS = {
 class TargetProfile:
     name: str
 
-    def admission_reason(self, op: NormalizedOp, values: Mapping[str, NormalizedValue]) -> str | None:
+    def admission_reason(
+        self, op: NormalizedOp, values: Mapping[str, NormalizedValue]
+    ) -> str | None:
         """Return ``None`` when ``op`` is supported, otherwise a stable reason."""
 
         raise NotImplementedError
@@ -48,7 +50,9 @@ class TargetProfile:
 class Ascend910BTarget(TargetProfile):
     name: str = "ascend910b"
 
-    def admission_reason(self, op: NormalizedOp, values: Mapping[str, NormalizedValue]) -> str | None:
+    def admission_reason(
+        self, op: NormalizedOp, values: Mapping[str, NormalizedValue]
+    ) -> str | None:
         if not op.supported:
             return op.opaque_reason or "operator is opaque"
         if op.metadata_only:
@@ -205,11 +209,25 @@ def _matmul_admission_reason(
     lhs_geometry = _solver_geometry(values[op.inputs[0]])
     rhs_geometry = _solver_geometry(values[op.inputs[1]])
     output_geometry = _solver_geometry(values[op.outputs[0]])
-    if lhs_geometry is not None and rhs_geometry is not None and output_geometry is not None:
+    if (
+        lhs_geometry is not None
+        and rhs_geometry is not None
+        and output_geometry is not None
+    ):
         lhs_width, lhs_height = lhs_geometry
         rhs_width, rhs_height = rhs_geometry
         output_width, output_height = output_geometry
-        if min(lhs_width, lhs_height, rhs_width, rhs_height, output_width, output_height) <= 0:
+        if (
+            min(
+                lhs_width,
+                lhs_height,
+                rhs_width,
+                rhs_height,
+                output_width,
+                output_height,
+            )
+            <= 0
+        ):
             return "matmul dimensions must be positive"
         if lhs_width != rhs_height:
             return (
@@ -221,7 +239,10 @@ def _matmul_admission_reason(
                 "matmul output geometry does not match its inputs: "
                 f"expected [{lhs_height},{rhs_width}], got [{output_height},{output_width}]"
             )
-    if any(values[value_id].dtype not in {"float16", "bfloat16", "float32"} for value_id in op.inputs):
+    if any(
+        values[value_id].dtype not in {"float16", "bfloat16", "float32"}
+        for value_id in op.inputs
+    ):
         return "unsupported Ascend910B cube operand dtype"
     return None
 
@@ -261,14 +282,21 @@ def _vector_admission_reason(
     input_geometries = [_solver_geometry(values[value_id]) for value_id in op.inputs]
     if any(geometry is None for geometry in input_geometries):
         return None
+    if (
+        output_geometry[0] > 1
+        and output_geometry[1] > 1
+        and any(geometry == (1, 1) for geometry in input_geometries)
+    ):
+        return (
+            "Ascend910B requires an explicit row or column expansion for a "
+            "[1,1] tensor broadcast"
+        )
     if any(
         not _supported_broadcast(geometry, output_geometry)
         for geometry in input_geometries
         if geometry is not None
     ):
-        return (
-            "vector broadcasting must be equal, scalar, row-singleton, or column-singleton in solver geometry"
-        )
+        return "vector broadcasting must be equal, scalar, row-singleton, or column-singleton in solver geometry"
     return None
 
 
@@ -310,7 +338,9 @@ def _dense_strides(shape: tuple[object, ...]) -> tuple[int, ...] | None:
     return tuple(reversed(result))
 
 
-def _supported_broadcast(input_geometry: tuple[int, int], output_geometry: tuple[int, int]) -> bool:
+def _supported_broadcast(
+    input_geometry: tuple[int, int], output_geometry: tuple[int, int]
+) -> bool:
     width, height = input_geometry
     output_width, output_height = output_geometry
     return (

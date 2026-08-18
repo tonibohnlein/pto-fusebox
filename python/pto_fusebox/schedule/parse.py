@@ -285,9 +285,13 @@ def _validate_vector_phase_links(
                     f"{phase_field} frame for tensor {frame.tensor} exceeds its extent"
                 )
         frame_by_tensor = {frame.tensor: frame for frame in phase.tensor_frames}
-        expected_workspace_ops = {
-            op for op in phase.ops if lowered.operation(op).op_type == "Reduction"
-        }
+        # PyPTO's tensor-to-tile lowering creates a workspace only for row
+        # reductions. Column reductions lower directly to their tile op.
+        expected_workspace_ops = (
+            {op for op in phase.ops if lowered.operation(op).op_type == "Reduction"}
+            if plan.physical_frame.reduced_axis == 1
+            else set()
+        )
         if {workspace.op for workspace in phase.workspaces} != expected_workspace_ops:
             raise ScheduleContractError(
                 f"{phase_field}.workspaces do not cover exactly the phase reductions"
@@ -299,12 +303,19 @@ def _validate_vector_phase_links(
                     f"{phase_field} workspace {workspace.op} has the wrong source tensor"
                 )
             source_frame = frame_by_tensor[workspace.source_tensor]
+            # Row-reduction scratch pads its contiguous extent to at least 128
+            # elements. It intentionally differs from a narrower source frame
+            # while retaining the same logical valid shape.
+            expected_physical = (
+                source_frame.physical[0],
+                max(128, source_frame.physical[1]),
+            )
             if (
                 workspace.logical != source_frame.logical
-                or workspace.physical != source_frame.physical
+                or workspace.physical != expected_physical
             ):
                 raise ScheduleContractError(
-                    f"{phase_field} workspace {workspace.op} differs from its source frame"
+                    f"{phase_field} workspace {workspace.op} differs from its lowered scratch frame"
                 )
         for lifetime in phase.input_lifetimes:
             if lifetime.tensor not in frame_tensors:

@@ -319,10 +319,10 @@ static void test_softmax_reduction_schema() {
     std::cout << "    fused=" << fused << "  separate(sum of 4 ops)=" << separate << "\n";
     CHECK("softmax: fused << separate (ephemeral m/e/s avoid DDR round-trips)",
           fused < separate);
-    CHECK_EQ("softmax: emitted-grid phase-roofline fused vector cost", fused, 22208.7, 0.5);
+    CHECK_EQ("softmax: selected-plan phase-roofline fused vector cost", fused, 22049.0, 0.5);
     // The separated column-broadcast stage uses an eight-row physical frame;
     // the fused schedule already had the same reduction-layout framing.
-    CHECK_EQ("softmax: emitted-grid phase-roofline cut vector cost", separate, 88379.1, 0.5);
+    CHECK_EQ("softmax: selected-plan phase-roofline cut vector cost", separate, 64101.0, 0.5);
 }
 
 // --- R: few-row reduction — split the reduced axis across vector cores --------
@@ -3646,7 +3646,7 @@ static void test_streamed_reduction_sink_no_split() {
     auto r = sg->best_cost();
     std::cout << "    split=" << r.parallel_split << " cores=" << r.cores_used
               << " lat=" << r.latency << "\n";
-    CHECK_EQ("STREAMSPLIT: emitted-grid phase-roofline latency", r.latency, 60512.8, 1.0);
+    CHECK_EQ("STREAMSPLIT: selected-plan phase-roofline latency", r.latency, 81661.0, 1.0);
     // C2: no cross-core reduced-axis split for a streamed reduction (the emit can't build one).
     CHECK("STREAMSPLIT: streamed reduction sink does NOT split the reduced axis",
           r.parallel_split == 1);
@@ -4321,7 +4321,8 @@ static void test_vector_split_kernel_fill_counts_body_tasks() {
 // --- explicit single-core k-stream for pointwise (the matmul-seq-k analog) ----
 // A vector tile that overflows UB is not "always feasible" by fiat — it derives
 // an EXPLICIT chunk along the larger axis (like matmul seq-k / the reduction
-// chunk). A tile that fits is materialized (no sub-streaming).
+// chunk). A tile that fits admits a materialized candidate, but a pipelined
+// strip may still win under the same grounded cost model.
 static void test_pointwise_stream_explicit() {
     std::cout << "[PWSTREAM] pointwise derives an explicit single-core k-stream\n";
     Problem p;
@@ -4357,11 +4358,12 @@ static void test_pointwise_stream_explicit() {
     CHECK("PWSTREAM: a UB-fitting tile materializes (no stream)",
           sg->vector_stream(small).axis == 0);
     auto materialized = sg->vector_stream_plan(small);
-    CHECK("PWPLAN: materialized plan also owns its strip loop geometry",
+    CHECK("PWPLAN: a fitting tile may choose the cheaper pipelined strip",
           materialized.feasible && !materialized.streamed() &&
-              materialized.kind == VectorStreamKind::Materialized && materialized.chunk == 0 &&
-              materialized.tile_h == 128 && materialized.tile_w == 128 && materialized.body.trip_count == 8 &&
-              materialized.strip_h == 16 && materialized.strip_w == 128);
+              materialized.kind == VectorStreamKind::Pointwise && materialized.chunk == 0 &&
+              materialized.tile_h == 128 && materialized.tile_w == 128 &&
+              materialized.body.trip_count == 2 && materialized.body.pipeline_stages == 2 &&
+              materialized.strip_h == 128 && materialized.strip_w == 64);
 
     Problem tiny;
     tiny.tensors = {{8, 8}, {8, 8}};
@@ -4370,8 +4372,158 @@ static void test_pointwise_stream_explicit() {
     set_910b(tiny);
     DAG tiny_dag = DAG::build(tiny);
     auto tiny_plan = Subgraph::create(tiny, tiny_dag, {0})->vector_stream_plan(TileConfig{8, 8, 1});
-    CHECK("PWPLAN: sub-register strips remain sequential despite multiple trips",
-          tiny_plan.body.trip_count == 8 && tiny_plan.body.pipeline_stages == 1);
+    CHECK("PWPLAN: a tiny fitting tile is not subdivided",
+          tiny_plan.body.trip_count == 1 && tiny_plan.body.pipeline_stages == 1 &&
+              tiny_plan.strip_h == 8 && tiny_plan.strip_w == 8);
+}
+
+static void test_vector_grid_uses_logical_width_not_dma_padding() {
+    std::cout << "[VGRID] narrow vector width remains element-partitionable\n";
+    Problem p;
+    p.tensors = {{8, 1, DType::FP32}, {8, 1, DType::FP32}};
+    p.ops = {{OpType::Pointwise, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::Exp;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs = {1};
+    p.fast_memory_capacity = 1 << 20;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0});
+    const auto candidates = subgraph ? subgraph->enumerate_plans()
+                                     : std::vector<std::pair<TileConfig, CostResult>>{};
+    const auto eight_way = std::find_if(
+        candidates.begin(), candidates.end(), [](const auto& candidate) {
+          return candidate.first.parts_m == 1 &&
+                 candidate.first.parts_n == 8 && candidate.first.w == 1;
+        });
+    CHECK("VGRID: logical [1,8] admits eight one-column regions",
+          eight_way != candidates.end());
+    if (eight_way == candidates.end()) return;
+    const VectorStreamPlan plan = subgraph->vector_stream_plan(eight_way->first);
+    CHECK("VGRID: physical padding does not change logical work ownership",
+          plan.feasible && plan.work_units == 8 &&
+              plan.n_partition.parts == 8 && plan.n_partition.big == 1 &&
+              plan.tile_w == 1);
+}
+
+static void test_narrow_row_reduction_prices_lowered_scratch() {
+    std::cout << "[VREDUCEWS] row-reduction scratch follows lowering's 128-element frame\n";
+    Problem p;
+    p.tensors = {{16, 16384, DType::FP32}, {1, 16384, DType::FP32}};
+    p.ops = {{OpType::Reduction, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::ReductionSum;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::RowSum;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs = {1};
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    p.vec_capacity = 188416;
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible
+            ? subgraph->vector_stream_plan(best.config)
+            : VectorStreamPlan{};
+    CHECK("VREDUCEWS: narrow row reduction has a feasible schedule",
+          best.feasible && plan.feasible);
+    CHECK_EQ("VREDUCEWS: lowering-aware UB price selects two 48-core waves",
+             plan.work_units, 96);
+
+    const auto workspaces = BuildVectorWorkspaceFrames(p, plan);
+    const auto& body =
+        workspaces[vector_replay_phase_index(VectorReplayPhase::Body)];
+    CHECK("VREDUCEWS: body carries one explicit reduction workspace",
+          body.size() == 1);
+    CHECK("VREDUCEWS: workspace preserves logical source extent",
+          body.size() == 1 && body[0].logical_cols == 16);
+    CHECK("VREDUCEWS: workspace pads its contiguous extent to 128 elements",
+          body.size() == 1 && body[0].physical_cols == 128);
+}
+
+static void test_column_reduction_has_no_lowering_scratch() {
+    std::cout << "[VCOLWS] column reduction lowers without a workspace\n";
+    Problem p;
+    p.tensors = {{16384, 16, DType::FP32}, {16384, 1, DType::FP32}};
+    p.ops = {{OpType::Reduction, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::ReductionSum;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::ColSum;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs = {1};
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    p.vec_capacity = 188416;
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible
+            ? subgraph->vector_stream_plan(best.config)
+            : VectorStreamPlan{};
+    CHECK("VCOLWS: column reduction has a feasible schedule",
+          best.feasible && plan.feasible && plan.reduced_axis == 2);
+
+    const auto workspaces = BuildVectorWorkspaceFrames(p, plan);
+    const auto& body =
+        workspaces[vector_replay_phase_index(VectorReplayPhase::Body)];
+    CHECK("VCOLWS: direct column lowering serializes no workspace",
+          body.empty());
+}
+
+static void test_vector_multi_output_lifetimes_reach_phase_end() {
+    std::cout << "[VMULTIOUT] earlier live-out remains resident through sibling replay\n";
+    Problem p;
+    p.tensors = {{16, 16, DType::FP32},
+                 {16, 16, DType::FP32},
+                 {16, 16, DType::FP32}};
+    p.ops = {{OpType::Pointwise, {0}, {1}},
+             {OpType::Pointwise, {0}, {2}}};
+    for (Op& op : p.ops) {
+        op.vector_capability = VectorOpCapability::Elementwise;
+        op.vector_primitive = VectorPrimitiveFamily::Exp;
+        op.vector_geometry = VectorOpGeometry::Flat;
+    }
+    p.required_outputs = {1, 2};
+    p.fast_memory_capacity = 1 << 20;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1});
+    CHECK("VMULTIOUT: branched pointwise graph is analyzable",
+          subgraph.has_value());
+    if (!subgraph) return;
+    CHECK_EQ("VMULTIOUT: input and both outputs overlap before final stores",
+             subgraph->vector_peak_ub(TileConfig{16, 16, 1}), 3072);
+}
+
+static void test_vector_equal_cost_tiebreak_matches_standalone_planner() {
+    std::cout << "[VTIE] equal vector costs prefer fewer tasks before core fill\n";
+    Problem p;
+    p.tensors = {{64, 17, DType::FP32}, {64, 17, DType::FP32}};
+    p.ops = {{OpType::Pointwise, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::Generic;
+    p.ops[0].vector_geometry = VectorOpGeometry::Generic;
+    p.required_outputs = {1};
+    p.fast_memory_capacity = 1 << 20;
+    set_910b(p);
+    p.vec_capacity = 2048;
+    p.cube_freq_hz = 0.0;
+    p.vec_slope_pw = 0.0;
+    p.vec_op_head = 0.0;
+    p.vec_op_tail = 0.0;
+    p.kernel_fill_cost = 0;
+    p.per_task_overhead_cycles = 0;
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    CHECK("VTIE: synthetic equal-cost surface has a feasible plan", best.feasible);
+    std::cout << "    grid=" << best.config.parts_m << "x"
+              << best.config.parts_n << " tile=" << best.config.h << "x"
+              << best.config.w << " latency=" << best.latency << "\n";
+    CHECK("VTIE: one streamed task wins an exact tie with wider grids",
+          best.config.parts_m == 1 && best.config.parts_n == 1 &&
+              best.config.h == 17 && best.config.w == 64);
 }
 
 // --- source-DAG primitive work follows the emitted strip/chunk geometry ------
@@ -4409,9 +4561,10 @@ static void test_source_vector_primitive_geometry() {
         cfg.k = 1;
         cfg.parts_m = cfg.parts_n = cfg.split_k = 1;
         const auto plan = sg->vector_stream_plan(cfg);
-        CHECK("VOPS: materialized body owns eight emitted row strips",
-              plan.feasible && plan.body.trip_count == 8 &&
-                  plan.strip_h == 1 && plan.strip_w == W);
+        CHECK("VOPS: fitting body replays one materialized frame",
+              plan.feasible && plan.kind == VectorStreamKind::Materialized &&
+                  plan.body.trip_count == 1 && plan.body.pipeline_stages == 1 &&
+                  plan.strip_h == H && plan.strip_w == W);
         return sg->compute_cost(cfg).latency;
     };
 
@@ -4419,30 +4572,42 @@ static void test_source_vector_primitive_geometry() {
                                       VectorOpGeometry::Flat, false);
     const double scalar_mul = body_cost(VectorPrimitiveFamily::ScalarMul,
                                         VectorOpGeometry::Flat, false);
-    CHECK_EQ("VOPS: flat mul pays 8 * (2*8 repeats + 25 fixed)", flat_mul, 328.0);
-    CHECK_EQ("VOPS: scalar mul pays 8 * (1*8 repeats + 26 fixed)", scalar_mul, 272.0);
+    CHECK_EQ("VOPS: flat mul prices one complete materialized frame", flat_mul, 153.0);
+    CHECK_EQ("VOPS: scalar mul prices one complete materialized frame", scalar_mul, 90.0);
 
     CHECK_EQ("VOPS: abs pays PTO vabs slope/fixed per strip",
              body_cost(VectorPrimitiveFamily::Abs, VectorOpGeometry::Flat, false),
-             296.0);
+             93.0);
     CHECK_EQ("VOPS: sqrt pays PTO vsqrt slope/fixed per strip",
              body_cost(VectorPrimitiveFamily::Sqrt, VectorOpGeometry::Flat, false),
-             440.0);
+             167.0);
     CHECK_EQ("VOPS: scalar max pays PTO vmaxs slope/fixed per strip",
              body_cost(VectorPrimitiveFamily::ScalarMax, VectorOpGeometry::Flat, false),
-             248.0);
+             87.0);
     CHECK_EQ("VOPS: scalar min pays PTO vmins slope/fixed per strip",
              body_cost(VectorPrimitiveFamily::ScalarMin, VectorOpGeometry::Flat, false),
-             304.0);
+             94.0);
+
+    const double reciprocal = body_cost(VectorPrimitiveFamily::Recip,
+                                        VectorOpGeometry::Flat, false);
+    const double division = body_cost(VectorPrimitiveFamily::Div,
+                                      VectorOpGeometry::Flat, false);
+    const double cast = body_cost(VectorPrimitiveFamily::Cast,
+                                  VectorOpGeometry::Flat, false);
+    CHECK_EQ("VOPS: native cast uses its conservative TCVT proxy", cast, 88.0);
+    CHECK_EQ("VOPS: reciprocal uses the grounded trecip cost", reciprocal, 158.0);
+    CHECK_EQ("VOPS: division retains the distinct tdiv cost", division, 286.0);
+    CHECK("VOPS: reciprocal is not priced as tensor division",
+          reciprocal < division);
 
     const double flat_add = body_cost(VectorPrimitiveFamily::Add,
                                       VectorOpGeometry::Flat, true);
     const double row_sub = body_cost(VectorPrimitiveFamily::Add,
                                      VectorOpGeometry::RowExpand, true);
-    CHECK_EQ("VOPS: pointwise row expand uses raw strided binary count mode",
-             row_sub, 448.0);
-    CHECK("VOPS: row expansion is costlier than the same flat binary geometry",
-          row_sub > flat_add);
+    CHECK_EQ("VOPS: pointwise row expand uses raw strided binary cost",
+             row_sub, 152.0);
+    CHECK_EQ("VOPS: row expansion matches the same flat pointwise geometry",
+             row_sub, flat_add);
 
     auto p2_cost = [&](VectorOpGeometry geometry, VectorStreamPlan* out_plan) {
         constexpr int64_t W = 32768, H = 4;
@@ -4482,7 +4647,7 @@ static void test_source_vector_primitive_geometry() {
                                 (row_plan.apply_tail.present ? 1 : 0);
     CHECK("VOPS: P2 uses several emitted apply chunks",
           row_plan.kind == VectorStreamKind::ReductionSpanning && apply_calls > 1 &&
-              row_plan.chunk == flat_plan.chunk);
+              flat_plan.kind == VectorStreamKind::ReductionSpanning);
     CHECK("VOPS: row-expand composite overhead is paid once per P2 apply chunk",
           row_apply - flat_apply >= 19.0 * static_cast<double>(apply_calls) - 0.5);
 
@@ -4565,10 +4730,11 @@ static void test_vector_stream_short_loop_serializes() {
     CHECK("A5PLAN: near-peak UB produces a feasible streamed P2 plan",
           short_cost.feasible && short_plan.streamed() &&
               short_plan.kind == VectorStreamKind::ReductionSpanning);
-    CHECK("A5PLAN: at least one data-moving phase is serial",
-          short_plan.stats.pipeline_stages == 1 || short_plan.apply.pipeline_stages == 1);
-    CHECK("A5PLAN: serial phase withholds max(compute,DDR) overlap",
-          !short_plan.overlap_granted);
+    const bool short_overlap_implementable =
+        short_plan.stats.pipeline_stages == 2 &&
+        (short_plan.stream_passes == 1 || short_plan.apply.pipeline_stages == 2);
+    CHECK("A5PLAN: overlap follows the selected phase depths exactly",
+          short_plan.overlap_granted == short_overlap_implementable);
 
     CostResult long_cost;
     VectorStreamPlan long_plan;
@@ -4675,7 +4841,7 @@ static void test_native_cast_chain_uses_dtype_sized_pebble_bands() {
              {OpType::Pointwise, {1}, {2}}};
     for (auto& op : p.ops) {
         op.vector_capability = VectorOpCapability::Elementwise;
-        op.vector_primitive = VectorPrimitiveFamily::Generic;
+        op.vector_primitive = VectorPrimitiveFamily::Cast;
         op.vector_geometry = VectorOpGeometry::Flat;
     }
     p.required_outputs.insert(2);
@@ -4689,6 +4855,99 @@ static void test_native_cast_chain_uses_dtype_sized_pebble_bands() {
     CHECK("CASTCHAIN: native two-hop conversion is feasible", best.feasible && plan.feasible);
     CHECK("CASTCHAIN: FP32/FP16 live pair is priced as six bytes per element",
           plan.full_peak_ub_bytes == plan.tile_h * plan.tile_w * 6);
+}
+
+static void test_native_cast_chain_granule_is_class_local() {
+    std::cout << "[CASTCLASS] cast alignment does not inflate an unrelated broadcast box\n";
+    Problem p;
+    p.tensors = {{512, 3, DType::FP32},
+                 {512, 3, DType::FP16},
+                 {512, 3, DType::FP32},
+                 {1, 3, DType::FP32},
+                 {512, 3, DType::FP32}};
+    p.ops = {{OpType::Pointwise, {0}, {1}},
+             {OpType::Pointwise, {1}, {2}},
+             {OpType::Pointwise, {0, 3}, {4}}};
+    for (size_t index = 0; index < p.ops.size(); ++index) {
+        Op& op = p.ops[index];
+        op.vector_capability = VectorOpCapability::Elementwise;
+        op.vector_primitive = index < 2 ? VectorPrimitiveFamily::Cast
+                                       : VectorPrimitiveFamily::Add;
+        op.vector_geometry = index < 2 ? VectorOpGeometry::Flat
+                                       : VectorOpGeometry::ColExpand;
+    }
+    p.required_outputs = {2, 4};
+    p.fast_memory_capacity = 1 << 24;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1, 2});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible
+            ? subgraph->vector_stream_plan(best.config)
+            : VectorStreamPlan{};
+    CHECK("CASTCLASS: connected cast and broadcast graph is feasible",
+          best.feasible && plan.feasible && plan.tensor_element_granules);
+    if (!plan.tensor_element_granules) return;
+    const auto& granules = *plan.tensor_element_granules;
+    CHECK("CASTCLASS: native cast class uses its FP16-compatible granule",
+          granules.size() == p.tensors.size() && granules[0] == 16 &&
+              granules[1] == 16 && granules[2] == 16 && granules[4] == 16);
+    CHECK("CASTCLASS: differently shaped FP32 broadcast retains granule eight",
+          granules[3] == 8);
+
+    const auto frames = BuildVectorTensorFrames(p, plan);
+    const auto& body =
+        frames[vector_replay_phase_index(VectorReplayPhase::Body)];
+    const auto broadcast = std::find_if(
+        body.begin(), body.end(),
+        [](const VectorTensorFramePlan& frame) { return frame.tensor == 3; });
+    CHECK("CASTCLASS: broadcast tensor is present in the body frame",
+          broadcast != body.end());
+    CHECK("CASTCLASS: broadcast rows use FP32 alignment rather than cast alignment",
+          broadcast != body.end() && broadcast->logical_cols == 1 &&
+              broadcast->physical_rows == 8 &&
+              broadcast->physical_cols == 1);
+}
+
+static void test_reduction_state_uses_its_class_local_granule() {
+    std::cout << "[REDCLASS] reduction state ignores a wider input cast class\n";
+    Problem p;
+    p.tensors = {{32768, 17, DType::FP32},
+                 {32768, 17, DType::FP16},
+                 {32768, 17, DType::FP32},
+                 {1, 17, DType::FP32}};
+    p.ops = {{OpType::Pointwise, {0}, {1}},
+             {OpType::Pointwise, {1}, {2}},
+             {OpType::Reduction, {2}, {3}}};
+    for (size_t index = 0; index < 2; ++index) {
+        p.ops[index].vector_capability = VectorOpCapability::Elementwise;
+        p.ops[index].vector_primitive = VectorPrimitiveFamily::Cast;
+        p.ops[index].vector_geometry = VectorOpGeometry::Flat;
+    }
+    p.ops[2].vector_capability = VectorOpCapability::ReductionSum;
+    p.ops[2].vector_primitive = VectorPrimitiveFamily::RowSum;
+    p.ops[2].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs = {3};
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1, 2});
+    TileConfig config{32768, 17, 1};
+    config.parts_m = 1;
+    config.parts_n = 1;
+    config.split_k = 1;
+    const VectorStreamPlan plan =
+        subgraph ? subgraph->vector_stream_plan(config) : VectorStreamPlan{};
+    CHECK("REDCLASS: cast-fed reduction has a streamed plan",
+          plan.feasible && plan.streamed() && plan.tensor_element_granules);
+    if (!plan.tensor_element_granules) return;
+    const auto& granules = *plan.tensor_element_granules;
+    CHECK("REDCLASS: wide cast inputs use the shared FP16-compatible granule",
+          granules[0] == 16 && granules[1] == 16 && granules[2] == 16);
+    CHECK("REDCLASS: thin FP32 reduction result retains its own granule",
+          granules[3] == 8);
+    CHECK("REDCLASS: free-axis state is aligned by the result class",
+          plan.free_tile == 17 && plan.free_tile_alloc == 24);
 }
 
 static void test_singleton_column_transform_reaches_vector_plan() {
@@ -4815,6 +5074,11 @@ int main() {
     test_kernel_fill_one_per_core();
     test_vector_split_kernel_fill_counts_body_tasks();
     test_pointwise_stream_explicit();
+    test_vector_grid_uses_logical_width_not_dma_padding();
+    test_narrow_row_reduction_prices_lowered_scratch();
+    test_column_reduction_has_no_lowering_scratch();
+    test_vector_multi_output_lifetimes_reach_phase_end();
+    test_vector_equal_cost_tiebreak_matches_standalone_planner();
     test_grounded_row_reduction_formulas();
     test_grounded_column_reduction_formulas();
     test_grounded_vector_fill();
@@ -4824,6 +5088,8 @@ int main() {
     test_cost_cache_concurrent_publication();
     test_vector_capability_gates_cost_admission();
     test_native_cast_chain_uses_dtype_sized_pebble_bands();
+    test_native_cast_chain_granule_is_class_local();
+    test_reduction_state_uses_its_class_local_granule();
     test_singleton_column_transform_reaches_vector_plan();
     test_vector_band_ub();
     test_reduction_sink_gating();

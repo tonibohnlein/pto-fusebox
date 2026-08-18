@@ -184,10 +184,10 @@ axis has ≤2 extents, a grid ≤4 region shapes. `w,h` = the physical (max) ext
 | path | rows (height) | contiguous (width) | why |
 | --- | --- | --- | --- |
 | cube  | 16 | 16 | the 16×16 MAC fractal (hardware, both axes) |
-| vector | **1** | **16** | rows have no fractal constraint; width = the 32-byte `BLOCK_BYTE_SIZE` DMA block |
+| vector | **1** | **1** | logical ownership is element-granular; dtype-specific 32-byte DMA padding is applied to the physical UB frame |
 
 The 16-on-both is a *cube* requirement — `is_valid_tiling` already cube-gates the
-16 check, so sub-16 vector tiles are valid. Fine row tiling is what lets a few-row
+16 check, so sub-16 vector tiles are valid. Fine logical tiling is what lets a few-row
 reduction fill all `C` cores from the grid (a `[W, 128]` softmax tiles to `[W, 3]`,
 48 regions; the 16-fractal grid would cap at 8).
 
@@ -285,6 +285,11 @@ wave identity or affinity.
   lowerings: arithmetic/transcendentals, abs/sqrt/neg, scalar and row/column broadcast forms,
   exact part add/mul/max/min, and supported reductions. Candidate costing replays each descriptor at
   every emitted strip/chunk/task. Composite or alias-sensitive operations stay visibly `Generic`.
+- Native cast hops and reciprocal are distinct primitive families. Same-shaped values connected by
+  elementwise operations form a physical-shape class; a cast chain therefore shares the least-common
+  DMA element granule of its class, while unrelated and differently shaped broadcast values keep
+  their own dtype granule. Every hop still has dtype-sized storage and the conservative TCVT proxy.
+  Exact scalar-left `1/x` uses the PTO reciprocal cost; it is not priced as a tensor division.
 - *Pointwise:* `slope·ceil(elems/epr) + head+tail`, with startup shared only inside one actual
   back-to-back vector run. Barrier-bearing row expansion starts a new run. This charges startup per
   emitted invocation rather than fractionally scaling one whole-tensor call.
@@ -317,13 +322,25 @@ burst is descriptor-bound.) Threshold form so the dividing tiebreak still picks 
 emit-friendly tile among efficient ones.
 
 **Vector stream plan (Fix 2/A5).** A stack-local derivation per candidate owns the full pebble peak (including the
-reduction source/work pair), materialize/stream choice, materialized/pointwise strips, reduction chunks, algorithm kind,
+reduction source/work pair and the lowering-mandated 128-element minimum row-reduction scratch; column reductions have no scratch), materialize/stream choice, materialized/pointwise strips, reduction chunks, algorithm kind,
 and serial-init/rolled/tail/finalize phases. Stage 2 duplicates source-DAG transient bands while
 accumulator/assemble/online-stat bands stay persistent. Each phase has its own roofline; only a stage-2 rolled
 loop earns `max(compute,DDR)`, while barriers and sub-register/short loops use `compute+DDR`. Boundary
 input phase masks price stats-only, apply-only, and shared inputs separately (including repeated
 broadcast chunks). `CostResult` retains only cost/config metadata; AutoFuse re-derives and consumes
 the same plan for the final or explicitly forced configuration.
+
+Boundary inputs follow first-use/last-use lifetimes, while every boundary output remains live from
+its producer until the phase drain. This matches multi-output replay: an earlier live-out cannot be
+overwritten merely because a sibling branch is still being evaluated.
+
+For a homogeneous pointwise DAG, every UB-fitting grid admits a one-pass materialized candidate.
+The planner also enumerates legal one-axis power-of-two strips, prices their complete two-slot
+ping/pong allocation, and selects the cheaper plan with the same phase cost used for final pricing.
+Thus fitting in UB does not force materialization. For a matched softmax DAG, a fitting one-pass
+candidate competes with every legal online reduced-axis chunk (including its init, rolled, tail and
+apply phases); the lower-cost schedule wins. This is the scheduling policy validated by the seven
+PR #2335 vector kernels, rather than a fixed strip heuristic.
 
 **Candidate-evaluation complexity.** `create()` computes graph-only facts once: UB band intervals,
 flattened transient tensor references, and ordered op/input lists for each phase. A candidate still
@@ -335,11 +352,15 @@ enumeration.
 The local-search cache continues to retain only `CostResult`, not a stream plan.
 
 **Logical-region identity (A1/G5).** `parts_m * parts_n` is both the solver work-unit and SPMD-block
-count. Candidate generation may use the DMA granule to bound useful counts, but
-`VectorStreamPlan::{m,n}_partition` distributes the selected count over elements. `tile_h/tile_w`
+count. Vector candidate grids and `VectorStreamPlan::{m,n}_partition` both distribute the selected
+count over logical elements; dtype-specific DMA padding is applied only to UB frames. `tile_h/tile_w`
 are maximum logical extents; `free_tile_alloc` is independent UB padding. Pointwise strips and
 reduction chunks stay inside a region/task. A “wave” is only the `ceil(work_units/cores)` queue
 makespan; neither plan nor emitter invents affinities or a second launch-block count.
+
+Equal-cost homogeneous vector plans use PR #2335's deterministic ordering: fewer reduced-axis
+partials, fewer spatial work units, then larger logical height and width. Cube-specific DDR,
+extract, and tile-area tie-breaks do not override an already equal vector objective.
 
 **Internal vs sink reduction.** A reduction **sink** (output `[H,1]`) pins the
 reduced axis spatially and splits it across cores (§6). An **internal** reduction

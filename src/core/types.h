@@ -75,6 +75,8 @@ enum class VectorPrimitiveFamily : uint8_t {
     Add,
     Mul,
     Div,
+    Cast,
+    Recip,
     Exp,
     Log,
     Abs,
@@ -121,8 +123,8 @@ enum class VectorCoordinateTransform : uint8_t {
 
 // Exact source-op identity needed by a mixed algorithm recognizer. This is
 // deliberately separate from VectorPrimitiveFamily: the latter is a grounded
-// cost class, while Recip and Cast are load-bearing semantic nodes even when
-// their precise PTO instruction cost still uses the generic vector fallback.
+// cost class, while Recip and Cast are also load-bearing semantic nodes for
+// mixed-algorithm legality and emission.
 enum class MixedVectorSemantic : uint8_t { None, Neg, Exp, ScalarAdd, Recip, Mul, Cast };
 
 // Exact streamed multi-reduction algorithms implemented by the AutoFuse emit.
@@ -717,6 +719,11 @@ struct VectorStreamPlan {
   // VectorAllocatedFrame so a source backend does not rediscover padding,
   // broadcast, or thin-reduction rules.
   int64_t physical_element_granule = 1;
+  // Same-shaped elementwise values share one physical box. Native cast hops
+  // therefore use the least common DMA element granule of their connected
+  // class, while unrelated tensors retain their own dtype-sized granule. The
+  // immutable vector is shared by all candidates of one subgraph.
+  std::shared_ptr<const std::vector<int64_t>> tensor_element_granules;
   int64_t iteration_rows = 1;
   int64_t iteration_cols = 1;
   int reduced_axis = 0;  // 0 = none, 1 = width, 2 = height
