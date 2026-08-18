@@ -27,8 +27,10 @@ from pto_fusebox import (
     can_emit_region,
     emit_pypto_region,
     export_and_normalize,
+    scheduled_region,
     solve_graph,
 )
+from pto_fusebox.schedule.schema import CubeKernelPlan, VectorKernelPlan
 
 if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
     pytest.skip(
@@ -176,8 +178,12 @@ VECTOR_CASES = (
         "vector",
         RmsNorm(),
         _rms_args,
-        rtol=1.0e-3,
-        atol=1.0e-3,
+        # PR #2335 computes row_sum(x*x) before applying 1/N. The generated
+        # source is bit-identical to that hand-written formulation, whose
+        # accumulation is less accurate than Torch's mean-first reference and
+        # requires the historical 1e-2 tolerance.
+        rtol=1.0e-2,
+        atol=1.0e-2,
     ),
     SiliconCase(
         "vector_layer_norm_512x256",
@@ -239,7 +245,11 @@ def _device_id() -> int:
     return int(raw)
 
 
-def _assert_static_artifact(compiled: object, case: SiliconCase) -> None:
+def _assert_static_artifact(
+    compiled: object,
+    case: SiliconCase,
+    work_units: int,
+) -> None:
     output_dir = Path(getattr(compiled, "output_dir"))
     pto_files = list(output_dir.rglob("*.pto"))
     assert len(pto_files) == 1
@@ -253,6 +263,14 @@ def _assert_static_artifact(compiled: object, case: SiliconCase) -> None:
         assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
     else:
         assert "pto.tmatmul" in pto
+
+    orchestration_files = list((output_dir / "orchestration").glob("*.cpp"))
+    assert len(orchestration_files) == 1
+    orchestration = orchestration_files[0].read_text(encoding="utf-8")
+    assert len(re.findall(r"\brt_submit_ai[cv]_task\(", orchestration)) == 1
+    assert orchestration.count("launch_spec.set_block_num(") == 1
+    assert f"launch_spec.set_block_num({work_units});" in orchestration
+    assert "region_index" not in orchestration
 
 
 def _run_case(case: SiliconCase, tmp_path: Path) -> None:
@@ -270,6 +288,8 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     assert len(solved.regions) == 1
     region = solved.regions[0]
     assert can_emit_region(graph, region)
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, (CubeKernelPlan, VectorKernelPlan))
     emitted = emit_pypto_region(graph, region, program_name=case.name)
     assert emitted.kind.value == case.kind
     assert "auto_fuse" not in emitted.source
@@ -294,7 +314,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         output = torch.full_like(expected, torch.nan)
         if compiled is None:
             compiled = runtime.run(program, *args, output, config=config)
-            _assert_static_artifact(compiled, case)
+            _assert_static_artifact(compiled, case, plan.work_units)
         else:
             compiled(*args, output, config=config)
 

@@ -101,8 +101,10 @@ def program_header(
     io: Interface,
     graph: NormalizedGraph,
     work_units: int,
+    *,
+    kernel_name_hint: str,
 ) -> SourceWriter:
-    """Emit the common orchestration header for one homogeneous kernel."""
+    """Emit one homogeneous kernel as a single SPMD grid dispatch."""
 
     values = graph.value_map()
     output = values[io.output_value]
@@ -121,8 +123,11 @@ def program_header(
         writer.line(2, f"{argument}: {tensor_type(values[value_id])},")
     writer.line(2, f"{io.output_argument}: pl.Out[{tensor_type(output)}],")
     writer.line(1, f") -> {tensor_type(output)}:")
-    writer.line(2, "with pl.manual_scope():")
-    writer.line(3, f"for region_index in pl.parallel({work_units}):")
+    writer.line(
+        2,
+        f"for region_index in pl.spmd({work_units}, "
+        f"name_hint={literal(kernel_name_hint)}):",
+    )
     return writer
 
 

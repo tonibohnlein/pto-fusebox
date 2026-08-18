@@ -13,7 +13,6 @@ from .common import (
     SourceEmissionError,
     SourceWriter,
     emit_partition_indices,
-    literal,
     program_header,
     solver_tensor_for_value,
     static_shape,
@@ -144,15 +143,14 @@ def emit_cube(
     _validate_l0_variant(matmul, output_tile, chunk, tail, full_chunks)
 
     writer = program_header(
-        program_name, io, graph, m_partition.parts * n_partition.parts
+        program_name,
+        io,
+        graph,
+        m_partition.parts * n_partition.parts,
+        kernel_name_hint=context.region_id + "_cube",
     )
-    indent = 4
+    indent = 3
     coordinates = emit_partition_indices(writer, indent, m_partition, n_partition)
-    writer.line(
-        indent,
-        f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_cube')}):",
-    )
-    indent += 1
     lhs_arg = io.input_arguments[lhs_value]
     rhs_arg = io.input_arguments[rhs_value]
     _emit_cube_window(

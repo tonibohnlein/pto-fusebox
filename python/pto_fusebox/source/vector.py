@@ -134,9 +134,13 @@ def emit_vector(
         )
     _validate_vector_body_lifetimes(plan, body_phase.ops, lowered)
     writer = program_header(
-        program_name, io, graph, m_partition.parts * n_partition.parts
+        program_name,
+        io,
+        graph,
+        m_partition.parts * n_partition.parts,
+        kernel_name_hint=context.region_id + "_vector",
     )
-    indent = 4
+    indent = 3
     coordinates = emit_partition_indices(
         writer,
         indent,
@@ -144,12 +148,6 @@ def emit_vector(
         n_partition,
         clamped_overlap_extents=(output_rows, output_cols),
     )
-    writer.line(
-        indent,
-        f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_vector')}):",
-    )
-    indent += 1
-
     strip_row = "0"
     strip_col = "0"
     if trips > 1:
@@ -270,8 +268,14 @@ def _emit_softmax_flash(
     sum_tensor = lowered.operation(sum_op).outputs[0]
     output_tensor = solver_tensor_for_value(lowered, io.output_allocation_owner)
 
-    writer = program_header(program_name, io, graph, plan.work_units)
-    indent = 4
+    writer = program_header(
+        program_name,
+        io,
+        graph,
+        plan.work_units,
+        kernel_name_hint=context.region_id + "_vector",
+    )
+    indent = 3
     coordinates = emit_partition_indices(
         writer,
         indent,
@@ -279,12 +283,6 @@ def _emit_softmax_flash(
         n_partition,
         clamped_overlap_extents=(output_rows, output_cols),
     )
-    writer.line(
-        indent,
-        f"with pl.at(level=pl.Level.CORE_GROUP, name_hint={literal(context.region_id + '_vector')}):",
-    )
-    indent += 1
-
     running_max, running_sum = _emit_softmax_stats_chunk(
         writer,
         indent,

@@ -71,6 +71,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _assert_single_spmd_grid(source: str, work_units: int) -> None:
+    assert source.count("pl.spmd(") == 1
+    assert f"for region_index in pl.spmd({work_units}," in source
+    assert "pl.manual_scope(" not in source
+    assert "pl.parallel(" not in source
+    assert "pl.at(" not in source
+
+
 def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     graph, result = _solved("softmax")
     schedule = scheduled_region(result)
@@ -93,7 +101,7 @@ def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
 
     source = emit_pypto_region(graph, result, program_name="softmax_fused").source
     ast.parse(source)
-    assert "for region_index in pl.parallel(16):" in source
+    _assert_single_spmd_grid(source, 16)
     assert "pl.pipeline(" not in source
     assert "region_rows" not in source
     assert "pl.load(arg_value," in source
@@ -130,7 +138,7 @@ def test_cube_solution_emits_exact_spatial_and_k_window_schedule() -> None:
 
     source = emit_pypto_region(graph, result, program_name="matmul_fused").source
     ast.parse(source)
-    assert "for region_index in pl.parallel(12):" in source
+    _assert_single_spmd_grid(source, 12)
     assert "region_row = m_index * 32" in source
     assert "region_col = n_index * 64" in source
     assert "for k_window in pl.pipeline(1, 3, stage=2):" in source
@@ -192,7 +200,7 @@ def test_narrow_row_reduction_serializes_lowered_scratch_frame() -> None:
     source = emit_pypto_region(
         graph, result, program_name="narrow_row_reduction"
     ).source
-    assert "pl.parallel(96)" in source
+    _assert_single_spmd_grid(source, 96)
     assert "pl.tile.create([" in source
     assert ", 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)" in source
 
@@ -736,6 +744,7 @@ def test_pr2335_vector_surface_is_source_ready(
 
     source = emit_pypto_region(graph, result, program_name=name).source
     ast.parse(source)
+    _assert_single_spmd_grid(source, work_units)
     assert "auto_fuse" not in source and "auto_tile" not in source
     assert "valid_rows = pl." not in source
     assert "valid_cols = pl." not in source

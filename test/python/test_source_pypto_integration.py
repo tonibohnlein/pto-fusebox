@@ -17,7 +17,13 @@ import torch
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
-from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
+from pto_fusebox import (
+    emit_pypto_region,
+    export_and_normalize,
+    scheduled_region,
+    solve_graph,
+)
+from pto_fusebox.schedule.schema import CubeKernelPlan, VectorKernelPlan
 from torch import nn
 
 
@@ -82,6 +88,14 @@ def _assert_static_vector_frames(pto: str) -> None:
     assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
 
 
+def _assert_single_spmd_orchestration(source: str, work_units: int) -> None:
+    submits = re.findall(r"\brt_submit_ai[cv]_task\(", source)
+    assert len(submits) == 1
+    assert source.count("launch_spec.set_block_num(") == 1
+    assert f"launch_spec.set_block_num({work_units});" in source
+    assert "region_index" not in source
+
+
 def _compile_source(
     name: str,
     module: nn.Module,
@@ -99,6 +113,8 @@ def _compile_source(
     solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
+    plan = scheduled_region(solved.regions[0]).steps[0].plan
+    assert isinstance(plan, (CubeKernelPlan, VectorKernelPlan))
 
     source = emit_pypto_region(graph, solved.regions[0], program_name=name).source
     compiled = ir.compile(
@@ -110,6 +126,12 @@ def _compile_source(
     pto_files = list(compiled.output_dir.rglob("*.pto"))
     assert len(pto_files) == 1
     generated_cpp = list((compiled.output_dir / "ptoas").glob("*.cpp"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(orchestration_files) == 1
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"),
+        plan.work_units,
+    )
     return pto_files[0].read_text(encoding="utf-8"), len(generated_cpp)
 
 

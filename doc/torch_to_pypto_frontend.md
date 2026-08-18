@@ -19,11 +19,13 @@ dynamic physical tiles are not implemented.
 The first PyPTO DSL source slice validates a solved homogeneous region as a
 typed schedule and emits an ordinary `@pl.program` with its grid, logical
 ownership, physical frame, loops, pipeline stages, operations, and GM traffic.
-Vector execution replays one maximum compile-time tile per work unit and clamps
-ragged-edge origins backwards, preserving static shapes while recomputing the
-small overlap already charged by the model. The closed set is materialized or
-pointwise vector replay, versioned two-pass online softmax, and one spatial
-output-stationary cube matmul; every other schedule fails closed.
+Each homogeneous group is one `pl.spmd(work_units)` grid launch; its block
+index selects one solver-owned output region. Vector execution replays one
+maximum compile-time tile per work unit and clamps ragged-edge origins
+backwards, preserving static shapes while recomputing the small overlap already
+charged by the model. The closed set is materialized or pointwise vector
+replay, versioned two-pass online softmax, and one spatial output-stationary
+cube matmul; every other schedule fails closed.
 
 Other streamed vector phases, split reductions, advanced cube/mixed schedules,
 multiple selected steps, and whole-graph orchestration remain milestones.
@@ -324,9 +326,11 @@ launching ready kernels and overlapping independent AIC and AIV work.
 
 The backend deterministically serializes the selected solution as readable
 PyPTO DSL. The installed homogeneous slice emits materialized/pointwise vector,
-`softmax_flash.v1`, or uniform spatial cube schedules with `pl.parallel`, static
-physical and valid shapes, explicit pipelines, and GM boundaries. ABI inputs
-use an `arg_` namespace, so captured names cannot shadow generated names.
+`softmax_flash.v1`, or uniform spatial cube schedules as one `pl.spmd` grid,
+with static physical and valid shapes, explicit pipelines, and GM boundaries.
+It never expands the grid into a host-side loop of single-block submissions.
+ABI inputs use an `arg_` namespace, so captured names cannot shadow generated
+names.
 Materialized/pointwise schedules execute `body.ops`; online softmax consumes the
 typed stats/apply loops, frames, workspaces, carry state, and substitutions.
 Selection is independent of program, module, model, or shape names.
