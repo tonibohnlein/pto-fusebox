@@ -57,9 +57,9 @@ CUBE_MODEL_CASES = (
     ),
     CubeModelCase(
         "split_k_positive",
-        64,
-        2048,
-        64,
+        128,
+        8192,
+        128,
         "grid-level split-K positive with insufficient spatial work",
         split_k_control=True,
         source_replay_expected=False,

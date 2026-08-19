@@ -309,7 +309,7 @@ The initial validation matrix is fixed before silicon timing and covers:
 - ragged K/N (`64x272 @ 272x80`);
 - deep-K outer streaming (`32x736 @ 736x64`);
 - rectangular operand reuse (`64x512 @ 512x256`); and
-- a split-K positive (`64x2048 @ 2048x64`).
+- a split-K positive (`128x8192 @ 8192x128`, selected split 16).
 
 Model-ranking validation and source-emitter validation are separate claims.
 Only candidates accepted by the typed source backend may be timed as generated

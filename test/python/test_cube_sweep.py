@@ -61,7 +61,7 @@ def _lowered_region(
         (64, 272, 80, True),
         (32, 736, 64, True),
         (64, 512, 256, True),
-        (64, 2048, 64, False),
+        (128, 8192, 128, False),
     ),
 )
 def test_cube_model_surface_enumerates_replayable_forced_solutions(
@@ -97,9 +97,10 @@ def test_cube_model_surface_enumerates_replayable_forced_solutions(
 
 
 def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
-    _, region = _lowered_region(64, 2048, 64)
+    _, region = _lowered_region(128, 8192, 128)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
 
+    assert sweep.selected.grid.split_k == 16
     split_factors = {candidate.grid.split_k for candidate in sweep.candidates}
     assert {1, 2, 4, 8, 16}.issubset(split_factors)
     for candidate in sweep.candidates:

@@ -22,9 +22,9 @@ void check(const char* label, bool condition) {
 }
 
 Problem deep_k_problem() {
-  constexpr int64_t m = 64;
-  constexpr int64_t k = 2048;
-  constexpr int64_t n = 64;
+  constexpr int64_t m = 128;
+  constexpr int64_t k = 8192;
+  constexpr int64_t n = 128;
   Problem problem;
   problem.tensors = {{k, m, DType::FP32},
                      {n, k, DType::FP32},
@@ -69,6 +69,7 @@ int main() {
   int selected_count = 0;
   bool has_spatial = false;
   bool has_split = false;
+  int selected_split = 0;
   bool all_forced_solutions = true;
   bool all_costs_are_finite = true;
   bool split_contract_is_explicit = true;
@@ -79,6 +80,7 @@ int main() {
         candidate.at("enumerated_grid").at("split_k").get<int>();
     has_spatial = has_spatial || split == 1;
     has_split = has_split || split > 1;
+    if (candidate.at("selected").get<bool>()) selected_split = split;
     const auto& solution = candidate.at("solution");
     all_costs_are_finite =
         all_costs_are_finite &&
@@ -101,6 +103,7 @@ int main() {
   check("exactly one candidate is selected", selected_count == 1);
   check("sweep contains a no-split control", has_spatial);
   check("deep-K sweep contains split-K candidates", has_split);
+  check("deep-K sweep selects a split-K candidate", selected_split == 16);
   check("every candidate is an ordinary forced solution", all_forced_solutions);
   check("every candidate has a finite reconstructed cost", all_costs_are_finite);
   check("split-K candidates retain their merge contract",
