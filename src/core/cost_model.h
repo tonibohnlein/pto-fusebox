@@ -45,6 +45,12 @@ concept CostModel = requires(const Problem& prob, const DAG& dag,
   // Feasibility folded into cost: best tiling + latency (infeasible ⇒ infinite
   // latency). Pure function of (subgraph, machine params) — safe to memoise.
   { cm.best_cost() } -> std::same_as<CostResult>;
+
+  // Re-evaluate a concrete candidate through the same architecture-specific
+  // hierarchy used by best_cost(). Solution construction and validation tools
+  // use this entry point so a selected plan cannot silently fall back to a
+  // cheaper/coarser cost path.
+  { cm.fixed_cost(TileConfig{}) } -> std::same_as<CostResult>;
 };
 
 // ============================================================================

@@ -1,5 +1,13 @@
 """Public Torch/FX capture and PTO-Fusebox scheduling API."""
 
+from .cube_sweep import (
+    CUBE_PLAN_SWEEP_SCHEMA,
+    CubeCandidateGrid,
+    CubePlanCandidate,
+    CubePlanSweep,
+    enumerate_cube_plans,
+    region_for_cube_candidate,
+)
 from .ir import (
     NORMALIZED_GRAPH_SCHEMA,
     PROBLEM_SCHEMA,
@@ -36,6 +44,10 @@ __all__ = [
     "SOLUTION_SCHEMA",
     "Ascend910BTarget",
     "AxisPartition",
+    "CUBE_PLAN_SWEEP_SCHEMA",
+    "CubeCandidateGrid",
+    "CubePlanCandidate",
+    "CubePlanSweep",
     "EmittedPyPTOSource",
     "GraphPattern",
     "GraphPatternBinding",
@@ -55,8 +67,10 @@ __all__ = [
     "can_emit_region",
     "export_and_normalize",
     "emit_pypto_region",
+    "enumerate_cube_plans",
     "extract_solver_regions",
     "normalize_exported",
+    "region_for_cube_candidate",
     "scheduled_region",
     "solve_graph",
 ]

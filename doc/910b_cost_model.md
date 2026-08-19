@@ -289,9 +289,37 @@ Other explicitly deferred research directions are:
 - reuse-distance-aware topological ordering beyond the existing DFS and Gorder choices;
 - generalizing the bounded role-expanded representation beyond two distinct tensor roles.
 
+## 10. Candidate ranking validation
+
+`cube_plan_sweep` exposes the exact finite candidate set considered for a
+single homogeneous matmul. It reuses `enumerate_plans()` and reconstructs each
+candidate through `fixed_cost()`, the same configured hierarchical evaluator
+used by `best_cost()`. This prevents validation from accidentally pricing a
+forced candidate with the older flat cube path.
+
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v2` payload. The
+Python `enumerate_cube_plans()` adapter validates the envelope and
+`region_for_cube_candidate()` binds one candidate back to the exact lowered
+problem for source replay. The adapter never re-plans or changes a cost.
+
+The initial validation matrix is fixed before silicon timing and covers:
+
+- tiny underfill (`16x64 @ 64x32`);
+- balanced square (`256x256 @ 256x256`);
+- ragged K/N (`64x272 @ 272x80`);
+- deep-K outer streaming (`32x736 @ 736x64`);
+- rectangular operand reuse (`64x512 @ 512x256`); and
+- a split-K positive (`64x2048 @ 2048x64`).
+
+Model-ranking validation and source-emitter validation are separate claims.
+Only candidates accepted by the typed source backend may be timed as generated
+source. Analytic split-K or retained-panel winners remain model-ahead evidence
+until their explicit PyPTO algorithms exist; they must not be silently replaced
+by split=1 or reload schedules. No coefficient is fitted from these rankings.
+
 ---
 
-## 10. Source map
+## 11. Source map
 
 | concept | location |
 |---|---|
@@ -300,7 +328,8 @@ Other explicitly deferred research directions are:
 | boundary reload | `cube_request_reload` |
 | MAC/extract grounding | `CubeMacCycles`, `CubeExtractCycles` |
 | LPT scheduling | `LptMakespan`, `LptMakespanPerUnit` |
-| cube candidate cost | `Ascend910BCost::compute_cost` |
+| cube candidate cost | `Ascend910BCost::compute_cost`, `fixed_cost` |
+| fixed candidate sweep | `cube_plan_sweep`, `python/pto_fusebox/cube_sweep.py` |
 | final plan reconstruction | `cube_schedule_plan` |
 | plan data structures | `types.h` |
 | shared L0 chooser | `l0_matmul_plan.h`, `l0_matmul_plan.cpp` |

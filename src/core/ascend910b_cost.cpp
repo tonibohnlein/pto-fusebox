@@ -7440,6 +7440,17 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t>& retained_from_prev,
   return best;
 }
 
+CostResult Ascend910BCost::fixed_cost(
+    const TileConfig& cfg,
+    const FlatSet<size_t>& retained_from_prev,
+    const FlatSet<size_t>& retain_these) const {
+  if (has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost) {
+    L0PlanMemo l0_memo;
+    return compute_cost_impl(cfg, retained_from_prev, retain_these, &l0_memo);
+  }
+  return compute_cost(cfg, retained_from_prev, retain_these);
+}
+
 // Same grid as best_cost, but COLLECT every feasible (config, cost) instead of the argmin — the
 // candidate set the solver chose from. For the cost-vs-wall-time validation (dump modeled costs;
 // force one for the device emit). Not on the hot path.
@@ -7458,7 +7469,10 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
       const CostResult r = has_matmul_ && !has_vector_ && prob_->use_hierarchical_cube_cost
                                ? compute_cost_impl(cfg, {}, {}, &l0_memo)
                                : compute_cost(cfg, {}, {});
-      if (!r.feasible) continue;
+      // Some early structural checks can succeed before the hierarchical
+      // phase model rejects the candidate with an infinite latency. Such a
+      // point is not a forceable plan and must not escape as sweep evidence.
+      if (!r.feasible || !std::isfinite(r.latency)) continue;
       out.emplace_back(cfg, r);
     }
   }

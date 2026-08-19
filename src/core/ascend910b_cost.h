@@ -239,6 +239,13 @@ public:
   CostResult best_cost(const FlatSet<size_t> &retained_from_prev = {},
                        const FlatSet<size_t> &retain_these = {}) const;
 
+  // Cost a concrete candidate through the same configured hierarchy as
+  // best_cost(). In particular, homogeneous cube candidates with hierarchical
+  // L0 planning must not be reconstructed through the legacy flat path.
+  CostResult fixed_cost(const TileConfig &cfg,
+                        const FlatSet<size_t> &retained_from_prev = {},
+                        const FlatSet<size_t> &retain_these = {}) const;
+
   // Enumerate every FEASIBLE (config, cost) candidate for this subgraph (the same grid the
   // argmin best_cost picks from). Used by the cost-vs-wall-time validation: dump the plans + their
   // modeled costs, then force one for the device emit and measure its latency. Not on the solver

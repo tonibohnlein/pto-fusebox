@@ -63,7 +63,7 @@ Solution::Solution(const Problem& prob, const DAG& dag, std::vector<ScheduleStep
                 valid_retain.insert(t);
         steps_[i].retain_these = valid_retain;
 
-        step_costs_[i] = steps_[i].subgraph.compute_cost(
+        step_costs_[i] = steps_[i].subgraph.fixed_cost(
             steps_[i].config,
             currently_retained,
             steps_[i].retain_these);

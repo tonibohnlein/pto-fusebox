@@ -49,7 +49,9 @@ The primary targets are:
 
 - `solver_lib`: embeddable static library;
 - `mlsys`: standalone solver using the homogeneous 910B model;
-- `mlsys_mixed`: standalone solver using the experimental mixed model; and
+- `mlsys_mixed`: standalone solver using the experimental mixed model;
+- `cube_plan_sweep`: enumerate every finite, fixed one-matmul cube candidate
+  with its modeled cost and ordinary `solution.v2` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:
@@ -163,6 +165,22 @@ cmake --build build --parallel 2 --target ascend_910b_test
 The suite intentionally reports a small documented baseline of model research
 failures while checking the implemented vector, cube, and mixed schedule-plan
 surface.
+
+For model-versus-silicon ranking work, build `cube_plan_sweep` and feed it the
+same lowered problem JSON used by the production solver:
+
+```bash
+cmake --build build --parallel 2 --target cube_plan_sweep
+./build/cube_plan_sweep problem.json sweep.json
+```
+
+The sweep uses the production candidate grid and fixed-plan evaluator; it does
+not fit a second model in Python. Each entry records the model cost and embeds
+the exact forced solution. The predeclared device surface in
+`test/device/cube_model_cases.py` covers underfill, balanced, ragged-K,
+outer-K, rectangular-reuse, and split-K-positive shapes. Candidates beyond the
+current source backend—most notably split-K and retained panels—remain useful
+analytic evidence but fail closed instead of being approximated by source.
 
 The generated-source silicon matrix is opt-in and is not part of the default
 host suite. It covers 14 vector and 10 single-matmul cube programs, compiles

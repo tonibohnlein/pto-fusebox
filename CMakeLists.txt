@@ -52,6 +52,7 @@ file(GLOB_RECURSE LIB_SOURCES
     src/search/*.cpp
     src/io/*.cpp
     src/pipeline/solver.cpp
+    src/pipeline/cube_plan_sweep.cpp
 )
 
 add_library(solver_lib STATIC ${LIB_SOURCES})
@@ -78,6 +79,12 @@ target_link_libraries(mlsys_mixed Threads::Threads)
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 
+# Developer tool: enumerate and force every feasible one-matmul cube plan.
+# Each entry embeds an ordinary solution.v2 payload for typed/source-readiness
+# replay without adding a benchmark-only lowering path.
+add_executable(cube_plan_sweep src/pipeline/cube_plan_sweep_main.cpp)
+target_link_libraries(cube_plan_sweep solver_lib Threads::Threads)
+
 
 # --- Tests ---
 enable_testing()
@@ -90,6 +97,7 @@ set(TEST_SOURCES
     test/pebbling_order_test.cpp
     test/pairing_heap_test.cpp
     test/io_schema_test.cpp
+    test/cube_plan_sweep_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
