@@ -1709,7 +1709,8 @@ def _validate_cube_output_contract(
         variant_field = f"{field}.output_variants[{index}]"
         _validate_l0_contract(
             variant.l0_init,
-            expected_tile=(*variant.shape, init_k),
+            expected_shape=variant.shape,
+            expected_contraction=init_k,
             field=f"{variant_field}.l0_init",
         )
         if chunked:
@@ -1717,7 +1718,8 @@ def _validate_cube_output_contract(
                 raise ScheduleContractError(f"{variant_field}.l0_rolled is required")
             _validate_l0_contract(
                 variant.l0_rolled,
-                expected_tile=(*variant.shape, matmul.k_loop.chunk),
+                expected_shape=variant.shape,
+                expected_contraction=matmul.k_loop.chunk,
                 field=f"{variant_field}.l0_rolled",
             )
         elif variant.l0_rolled is not None:
@@ -1727,7 +1729,8 @@ def _validate_cube_output_contract(
                 raise ScheduleContractError(f"{variant_field}.l0_tail is required")
             _validate_l0_contract(
                 variant.l0_tail,
-                expected_tile=(*variant.shape, matmul.k_loop.tail),
+                expected_shape=variant.shape,
+                expected_contraction=matmul.k_loop.tail,
                 field=f"{variant_field}.l0_tail",
             )
         elif variant.l0_tail is not None:
@@ -1780,16 +1783,21 @@ def _validate_cube_output_contract(
 def _validate_l0_contract(
     plan: L0MatmulPlan,
     *,
-    expected_tile: tuple[int, int, int],
+    expected_shape: tuple[int, int],
+    expected_contraction: int,
     field: str,
 ) -> None:
-    if plan.tile != expected_tile:
-        raise ScheduleContractError(f"{field}.tile differs from its output/K variant")
+    if plan.tile[:2] != expected_shape:
+        raise ScheduleContractError(f"{field}.tile differs from its output variant")
     if any(depth <= 0 for depth in plan.buffer_depths):
         raise ScheduleContractError(f"{field}.buffer_depths must be positive")
     loop = plan.k_loop
-    if loop.full_chunks * loop.chunk + loop.tail != plan.tile[2]:
-        raise ScheduleContractError(f"{field}.k_loop does not cover its tile K")
+    if plan.tile[2] != loop.chunk:
+        raise ScheduleContractError(f"{field}.tile K differs from its L0 loop chunk")
+    if loop.full_chunks * loop.chunk + loop.tail != expected_contraction:
+        raise ScheduleContractError(
+            f"{field}.k_loop does not cover its requested contraction"
+        )
     if loop.tail >= loop.chunk or loop.pipeline_stages not in {1, 2}:
         raise ScheduleContractError(f"{field}.k_loop has invalid geometry")
     if (

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from ..schedule import CubeKernelPlan
 from ..schedule.schema import (
     CubeMatmulPlan,
     CubeSpatialPolicy,
     CubeSplitMergePolicy,
+    L0MatmulPlan,
 )
 from .common import (
     EmissionContext,
@@ -141,6 +144,7 @@ def emit_cube(
             "cube output tile does not match its spatial partition"
         )
     _validate_l0_variant(matmul, output_tile, chunk, tail, full_chunks)
+    _validate_lowered_l0_capacity(context, matmul)
 
     writer = program_header(
         program_name,
@@ -277,3 +281,60 @@ def _validate_l0_variant(
         expected_tail = (output_tile[0], output_tile[1], tail)
         if variant.l0_tail is None or variant.l0_tail.tile != expected_tail:
             raise SourceEmissionError("cube tail L0 tile differs from the emitted tail")
+
+
+def _validate_lowered_l0_capacity(
+    context: EmissionContext,
+    matmul: CubeMatmulPlan,
+) -> None:
+    """Reject plans whose outer K pipeline over-rotates L0 operands."""
+
+    raw_config = context.problem.get("l0_matmul_config")
+    if not isinstance(raw_config, Mapping):
+        raise SourceEmissionError("cube source requires an L0 matmul target profile")
+    l0a_capacity = raw_config.get("l0a_bytes")
+    l0b_capacity = raw_config.get("l0b_bytes")
+    box_align_m = raw_config.get("box_align_m", 1)
+    box_align_n = raw_config.get("box_align_n", 1)
+    if (
+        not isinstance(l0a_capacity, int)
+        or l0a_capacity <= 0
+        or not isinstance(l0b_capacity, int)
+        or l0b_capacity <= 0
+        or not isinstance(box_align_m, int)
+        or box_align_m <= 0
+        or not isinstance(box_align_n, int)
+        or box_align_n <= 0
+    ):
+        raise SourceEmissionError("cube source received invalid L0 target capacities")
+
+    lhs_bytes = context.lowered.tensor(matmul.lhs.tensor).byte_width
+    rhs_bytes = context.lowered.tensor(matmul.rhs.tensor).byte_width
+    variant = matmul.output_variants[0]
+
+    def align_up(value: int, alignment: int) -> int:
+        return (value + alignment - 1) // alignment * alignment
+
+    def validate_child(label: str, child: L0MatmulPlan, outer_depth: int) -> None:
+        tile = child.tile
+        depths = child.buffer_depths
+        physical_m = align_up(tile[0], box_align_m)
+        physical_n = align_up(tile[1], box_align_n)
+        l0a_bytes = physical_m * tile[2] * lhs_bytes * max(depths[0], outer_depth)
+        l0b_bytes = tile[2] * physical_n * rhs_bytes * max(depths[1], outer_depth)
+        if l0a_bytes > l0a_capacity or l0b_bytes > l0b_capacity:
+            raise SourceEmissionError(
+                f"{label} exceeds lowered L0 operand capacity: "
+                f"L0A {l0a_bytes}/{l0a_capacity} bytes, "
+                f"L0B {l0b_bytes}/{l0b_capacity} bytes"
+            )
+
+    validate_child("cube initial L0 plan", variant.l0_init, 1)
+    if variant.l0_rolled is not None:
+        validate_child(
+            "cube outer K pipeline",
+            variant.l0_rolled,
+            matmul.k_loop.pipeline_stages,
+        )
+    if variant.l0_tail is not None:
+        validate_child("cube tail L0 plan", variant.l0_tail, 1)

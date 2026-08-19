@@ -62,6 +62,8 @@ def emit_pypto_region(
 def _emission_context(
     graph: NormalizedGraph, result: RegionSolveResult
 ) -> EmissionContext:
+    if result.problem is None:
+        raise SourceEmissionError("source emission requires a lowered problem")
     schedule = scheduled_region(result)
     lowered = lowered_region(result)
     if len(schedule.steps) != 1:
@@ -77,6 +79,7 @@ def _emission_context(
         )
     return EmissionContext(
         graph=graph,
+        problem=result.problem,
         lowered=lowered,
         schedule=schedule,
         step=schedule.steps[0],

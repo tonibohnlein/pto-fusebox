@@ -49,6 +49,7 @@ class EmissionContext:
     """Validated graph, problem, schedule, and ABI for one source backend."""
 
     graph: NormalizedGraph
+    problem: Mapping[str, Any]
     lowered: LoweredRegion
     schedule: ScheduledRegion
     step: KernelStep

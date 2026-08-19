@@ -7,8 +7,9 @@ import torch
 from torch import nn
 
 from pto_fusebox import (
-    RegionSolveResult,
     NormalizedGraph,
+    RegionSolveResult,
+    SourceEmissionError,
     can_emit_region,
     emit_pypto_region,
     enumerate_cube_plans,
@@ -17,6 +18,7 @@ from pto_fusebox import (
     region_for_cube_candidate,
     scheduled_region,
 )
+from pto_fusebox.schedule import CubeKernelPlan
 
 
 class Matmul(nn.Module):
@@ -109,6 +111,43 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
             assert step["plan"]["split_merge_policy"] == "none"
         else:
             assert step["plan"]["split_merge_policy"] == "first_partial_then_atomic"
+
+    # The outer L1 window and nested L0 loop are different hierarchy levels.
+    # The selected S=16 plan covers a 160-wide L1 window with two 64-wide L0
+    # iterations plus a 32-wide L0 tail; typed parsing must preserve that
+    # decomposition rather than compare the L0 tile directly with 160.
+    selected = region_for_cube_candidate(region, sweep.selected)
+    plan = scheduled_region(selected).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    matmul = plan.matmuls[0]
+    assert matmul.k_loop.chunk == 160
+    assert matmul.output_variants[0].l0_init.tile[2] == 64
+    l0_loop = matmul.output_variants[0].l0_init.k_loop
+    assert l0_loop.full_chunks * l0_loop.chunk + l0_loop.tail == 160
+
+
+def test_balanced_surface_excludes_outer_pipeline_l0_overflow() -> None:
+    graph, region = _lowered_region(256, 256, 256)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidates = {candidate.id: candidate for candidate in sweep.candidates}
+
+    # These grids require a 40,960-byte stationary operand frame. PyPTO's
+    # stage-2 outer K loop rotates that frame twice, so the lowered 81,920-byte
+    # L0A/L0B allocation exceeds the 64-KiB hardware capacity. Keep the
+    # analytic candidates, but reject them at the exact source-readiness
+    # boundary before PyPTO compilation.
+    for candidate_id in ("p2_q4_s1", "p4_q2_s1"):
+        forced = region_for_cube_candidate(region, candidates[candidate_id])
+        assert not can_emit_region(graph, forced)
+        with pytest.raises(
+            SourceEmissionError, match="exceeds lowered L0 operand capacity"
+        ):
+            emit_pypto_region(graph, forced)
+    assert "p4_q4_s1" in candidates
+    assert sweep.selected.id == "p4_q4_s1"
+    assert can_emit_region(
+        graph, region_for_cube_candidate(region, candidates["p4_q4_s1"])
+    )
 
 
 def test_candidate_cannot_be_rebound_to_a_different_problem() -> None:
