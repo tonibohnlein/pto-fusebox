@@ -353,6 +353,67 @@ FIFO must be traceable to the solution descriptor. It should publish the
 schedule report and pseudocode beside the source so users can inspect the
 decision.
 
+## Static scheduling and dynamic orchestration boundary
+
+PTO-Fusebox initially owns **static physical schedules**, not complete serving
+orchestration. This matches PyPTO's existing compilation model: tensor extents,
+loop bounds, work counts, offsets, and `valid_shape` may be runtime values, but
+physical UB/L1/L0 tiles, allocations, pipeline depths, and engine assignments
+remain compile-time decisions.
+
+The boundary is therefore not "static shape versus dynamic shape." It is:
+
+```text
+model / serving orchestration
+  dynamic extents, chunk and window loops, cache metadata, rank dispatch,
+  opaque or external operations, data-dependent routing and sampling
+                             |
+                             v
+PTO-Fusebox scheduled regions
+  one connected affine tensor DAG, one selected fusion partition per region,
+  static physical tiles and memories, fixed pipeline protocols, runtime valid
+  extents and work counts where one plan is valid for the declared range
+                             |
+                             v
+ordinary PyPTO compiler and runtime
+  verify and lower the explicit DSL, submit ready tasks, and overlap independent
+  AIC and AIV work according to the preserved dependency graph
+```
+
+Fusebox does not globally schedule all ready kernels or choose how unrelated
+kernel grids co-reside on the device. It forms and prices individual fused
+groups and preserves their dependencies; the PyPTO runtime scheduler decides
+when ready groups execute.
+
+The source-level boundary is not always a Python function boundary. Existing
+PyPTO-lib `@pl.jit` functions commonly contain orchestration statements around
+several static `pl.at` or `pl.spmd` regions. A future whole-model frontend must
+extract the static regions while retaining the surrounding runtime program.
+The first implementation may instead emit scheduled inline functions and leave
+their callers explicit.
+
+Classify a model fragment as follows:
+
+| Fragment property | Initial Fusebox treatment |
+| --- | --- |
+| Dense pointwise, reduction, or matmul DAG with static physical geometry | Plan and emit with the vector, cube, or mixed model. |
+| Runtime outer/free extent changes only region count, offsets, or the final valid tail | Use one static physical plan with runtime logical extents (planned Type 1 below). |
+| A bounded range needs materially different physical tiles or pipelines | Compile a small static family and dispatch outside the scheduled region; defer until one-plan Type 1 works. |
+| `pl.jit.extern` or another independently implemented device operation | Preserve as an opaque call and cut the Fusebox region at its tensor interface. |
+| Block tables, slot mappings, TopK indices, or routing values select addresses or work | Preserve as a data-dependent opaque boundary until the access and cost semantics are modeled. |
+| Distributed rank loops, cache-pool management, recurrent serving state, or token-generation control | Keep in orchestration. |
+
+An opaque boundary does not imply that the operation runs on the host. Paged
+cache gathers, TopK, and routing can remain device kernels; they are opaque
+because their access graph or work cardinality is data-dependent and is not
+represented by the current dense affine model.
+
+This boundary lets Fusebox cover substantial static portions of a model before
+it can synthesize the entire model program. It also prevents dynamic metadata
+from contaminating local tile selection: cache-pool capacity may be dynamic
+while the compute performed for each fixed-size cache block remains statically
+tiled.
+
 ## Dynamic-shape baseline
 
 This section records future design constraints. **No dynamic-shape class below
@@ -490,6 +551,52 @@ dynamic physical tile that reaches allocation or tile-flattening.
    `valid_shape`.
 7. Defer Types 2-5 until the static frontend/backend and Type 1 are correct on
    device.
+
+## PyPTO-lib validation targets
+
+The following experiments ground the standalone pipeline in current Qwen and
+DeepSeek programs. They are ordered so that each experiment adds one new
+contract instead of combining every missing feature at once. Reduced fixtures
+must preserve the production contraction dimensions, operation order, dtypes,
+and boundary semantics; model or function names must never affect planning.
+
+1. **Qwen RMSNorm and LM head as separate regions.** Capture, solve, emit, and
+   compare the vector RMSNorm and cube LM-head projection independently. This
+   is the first direct application of the silicon-closed homogeneous source
+   slices to a model component.
+2. **Qwen RMSNorm to LM head.** Solve the connected `V -> C` graph, emit the
+   selected boundary, and compare it with `models/qwen3_14b/rms_lm_head.py`.
+   This is the smallest model-derived one-way mixed-source target.
+3. **DeepSeek V4-Flash MTP projection at fixed token extents.** Cover the two
+   normalizations, activation quantization, two projections, and their sum
+   without recognizing an MTP pattern. Start with concrete decode and prefill
+   token extents; later use the same case for Type-1 dynamic-token support.
+4. **Qwen layer with paged attention kept opaque.** Preserve the CANN
+   `pl.jit.extern` attention call and its cache metadata interface. Schedule
+   the QKV preprocessing and MLP sides as independent Fusebox regions and
+   verify that generated source preserves every crossing value and dependency.
+5. **Static QK to softmax to PV.** Capture the ordinary matmul, reduction, and
+   pointwise DAG and exercise generic `C -> V -> C` planning and source
+   emission. The experiment must not use an attention recognizer and initially
+   excludes paged or sparse cache addressing.
+6. **DeepSeek MoE cut at data-dependent routing.** Schedule the dense
+   normalization/router prefix and the bounded expert-local
+   matmul/SwiGLU/matmul computation separately. Keep TopK, token-to-expert
+   dispatch, variable expert counts, and distributed exchange explicit and
+   opaque.
+
+For every target, record four independent outcomes:
+
+- normalized Torch DAG fidelity and explicit opaque boundaries;
+- analytic partition, tile, memory, and latency result;
+- exact solution-to-PyPTO source replay and generated-kernel compilation; and
+- silicon correctness and performance against the corresponding hand-written
+  PyPTO-lib implementation when the target platform is calibrated.
+
+Qwen3-14B and DeepSeek V4-Flash are the initial A2/A3 performance references.
+DeepSeek V4-Pro targets A5 and is suitable for structural capture tests, but no
+performance conclusion is valid until the A5 model is independently calibrated
+and device-verified.
 
 ## Non-goals
 
