@@ -6,7 +6,7 @@
 #include "core/types.h"
 
 // Serialize every feasible candidate considered by a one-matmul cube
-// subgraph. Each candidate carries an ordinary solution.v2 payload, so model
+// subgraph. Each candidate carries an ordinary solution.v3 payload, so model
 // validation can test the production typed/source-readiness boundary without
 // a benchmark-only lowering path. Analytic model-ahead candidates may still
 // be rejected by that source boundary.

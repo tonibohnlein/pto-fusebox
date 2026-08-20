@@ -48,6 +48,40 @@ class _MatmulWithTail(nn.Module):
         return torch.mm(lhs, rhs)
 
 
+class _ChainedMatmul(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(torch.mm(lhs, middle), rhs)
+
+
+class _DiamondMatmul(nn.Module):
+    def forward(
+        self,
+        shared: torch.Tensor,
+        lhs_weight: torch.Tensor,
+        rhs_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        lhs = torch.mm(shared, lhs_weight)
+        rhs = torch.mm(shared, rhs_weight)
+        return torch.mm(lhs, rhs)
+
+
+class _FanoutMatmul(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        first_rhs: torch.Tensor,
+        second_rhs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shared = torch.mm(lhs, middle)
+        return torch.mm(shared, first_rhs), torch.mm(shared, second_rhs)
+
+
 class _WideSoftmax(nn.Module):
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return torch.softmax(value, dim=-1)
@@ -69,6 +103,16 @@ class _LayerNorm(nn.Module):
         variance = (centered * centered).mean(dim=-1, keepdim=True)
         normalized = centered / torch.sqrt(variance + 1.0e-5)
         return normalized * gamma + beta
+
+
+class _StreamedReduction(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.sum(value, dim=-1, keepdim=True)
+
+
+class _StreamedNormalize(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value / torch.sum(value, dim=-1, keepdim=True)
 
 
 class _NamingCollision(nn.Module):
@@ -160,6 +204,17 @@ def _compile_source(
             False,
         ),
         (
+            "chained_matmul",
+            _ChainedMatmul(),
+            (
+                torch.zeros(64, 128, dtype=torch.bfloat16),
+                torch.zeros(128, 96, dtype=torch.bfloat16),
+                torch.zeros(96, 80, dtype=torch.bfloat16),
+            ),
+            "pto.tinsert",
+            False,
+        ),
+        (
             "wide_softmax",
             _WideSoftmax(),
             (torch.zeros(32, 8192),),
@@ -189,6 +244,20 @@ def _compile_source(
             _NamingCollision(),
             (torch.zeros(64, 128),),
             "pto.texp",
+            True,
+        ),
+        (
+            "streamed_reduction",
+            _StreamedReduction(),
+            (torch.ones(5, 32771),),
+            "pto.trowsum",
+            True,
+        ),
+        (
+            "streamed_normalize",
+            _StreamedNormalize(),
+            (torch.ones(5, 32771),),
+            "pto.trowsum",
             True,
         ),
     ],
@@ -243,3 +312,114 @@ def test_pr2335_vector_surface_lowers_static_frames(
         skip_ptoas=True,
     )
     _assert_static_vector_frames(pto)
+
+
+def test_cut_fp32_chain_compiles_as_two_dependency_linked_spmd_kernels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    module = _ChainedMatmul()
+    args = (
+        torch.zeros(64, 128),
+        torch.zeros(128, 96),
+        torch.zeros(96, 80),
+    )
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    region = solved.regions[0]
+    schedule = scheduled_region(region)
+    assert len(schedule.steps) == 2
+
+    source = emit_pypto_region(graph, region, program_name="cut_fp32_chain").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "cut_fp32_chain"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 2
+    orchestration = next(
+        (compiled.output_dir / "orchestration").glob("*.cpp")
+    ).read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_aic_task(") == 2
+    assert "launch_spec.set_block_num(12);" in orchestration
+    assert "launch_spec.set_block_num(4);" in orchestration
+    assert "add_inout(intermediate_tensor_2)" in orchestration
+    assert "add_input(intermediate_tensor_2)" in orchestration
+
+
+def test_cut_fp32_fanout_compiles_with_two_outputs_and_one_shared_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _FanoutMatmul(), tuple(torch.zeros(64, 64) for _ in range(4))
+    )
+    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    region = solved.regions[0]
+    schedule = scheduled_region(region)
+    assert [step.solver_ops for step in schedule.steps] == [(0,), (1, 2)]
+
+    source = emit_pypto_region(graph, region, program_name="cut_fp32_fanout").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "cut_fp32_fanout"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 2
+    orchestration = next(
+        (compiled.output_dir / "orchestration").glob("*.cpp")
+    ).read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_aic_task(") == 2
+    assert "add_inout(ext_output_0)" in orchestration
+    assert "add_inout(ext_output_1)" in orchestration
+    assert "add_inout(intermediate_tensor_2)" in orchestration
+    assert "add_input(intermediate_tensor_2)" in orchestration
+
+
+@pytest.mark.parametrize(
+    ("name", "module", "args", "expected_matmuls"),
+    [
+        (
+            "retained_panel_matmul",
+            _MatmulWithTail(),
+            (
+                torch.zeros(512, 64, dtype=torch.bfloat16),
+                torch.zeros(64, 2048, dtype=torch.bfloat16),
+            ),
+            2,
+        ),
+        (
+            "diamond_matmul",
+            _DiamondMatmul(),
+            tuple(torch.zeros(32, 32, dtype=torch.bfloat16) for _ in range(3)),
+            3,
+        ),
+    ],
+)
+def test_non_split_cube_dag_source_compiles_through_pypto(
+    name: str,
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    expected_matmuls: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pto, _ = _compile_source(
+        name,
+        module,
+        args,
+        tmp_path,
+        monkeypatch,
+        skip_ptoas=True,
+    )
+    assert pto.count("pto.tmatmul ") == expected_matmuls

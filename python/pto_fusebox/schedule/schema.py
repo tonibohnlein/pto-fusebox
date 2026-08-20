@@ -427,7 +427,6 @@ class KernelStep:
     graph_ops: tuple[str, ...]
     op_order: tuple[int, ...]
     sequential_tiles: tuple[int, ...] | None
-    retained_tensors: tuple[int, ...]
     launch: LaunchPlan
     latency: float
     plan: KernelPlan

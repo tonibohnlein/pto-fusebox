@@ -6,9 +6,11 @@ from collections.abc import Mapping
 
 from ..schedule import CubeKernelPlan
 from ..schedule.schema import (
+    CubeAxisBinding,
     CubeMatmulPlan,
     CubeSpatialPolicy,
     CubeSplitMergePolicy,
+    CubeTensorRegionPlan,
     L0MatmulPlan,
 )
 from .common import (
@@ -16,6 +18,8 @@ from .common import (
     SourceEmissionError,
     SourceWriter,
     emit_partition_indices,
+    emit_return,
+    pypto_dtype,
     program_header,
     solver_tensor_for_value,
     static_shape,
@@ -28,7 +32,7 @@ def emit_cube(
     context: EmissionContext,
     program_name: str,
 ) -> str:
-    """Emit the installed single-matmul cube schedule subset."""
+    """Emit one non-split homogeneous cube schedule."""
 
     graph = context.graph
     lowered = context.lowered
@@ -37,10 +41,6 @@ def emit_cube(
     plan = step.plan
     if not isinstance(plan, CubeKernelPlan):
         raise SourceEmissionError("cube step does not carry a cube plan")
-    if step.retained_tensors:
-        raise SourceEmissionError(
-            "single-step cube source cannot carry inter-kernel retained tensors"
-        )
     if not plan.emit_compatible:
         raise SourceEmissionError("cube plan is not marked emit-compatible")
     if plan.spatial_policy is not CubeSpatialPolicy.UNIFORM:
@@ -55,11 +55,19 @@ def emit_cube(
         raise SourceEmissionError(
             "cube split-K emission is not implemented in source v1"
         )
-    if plan.resident_boundaries:
-        raise SourceEmissionError(
-            "cube resident-boundary emission is not implemented in source v1"
-        )
     matmuls = plan.matmuls
+    if (
+        len(matmuls) > 1
+        or plan.resident_boundaries
+        or any(
+            matmul.output_grid != (1, 1)
+            or matmul.retained_panels.lhs
+            or matmul.retained_panels.rhs
+            or matmul.storage_dtype != "fp32"
+            for matmul in matmuls
+        )
+    ):
+        return _emit_full_window_cube_dag(context, program_name, plan)
     if len(matmuls) != 1 or len(step.solver_ops) != 1:
         raise SourceEmissionError("cube source v1 supports exactly one matmul")
     matmul = matmuls[0]
@@ -70,10 +78,6 @@ def emit_cube(
         )
     if matmul.instance != 0 or matmul.op != solver_op:
         raise SourceEmissionError("cube request identity does not match its solver op")
-    if matmul.retained_panels.lhs or matmul.retained_panels.rhs:
-        raise SourceEmissionError(
-            "cube retained-panel emission is not implemented in source v1"
-        )
     if matmul.lhs_producer != -1 or matmul.rhs_producer != -1:
         raise SourceEmissionError("cube source v1 requires external matmul operands")
     if matmul.output_grid != (1, 1):
@@ -205,8 +209,490 @@ def emit_cube(
         f"[{coordinates.row}, {coordinates.col}], "
         f"{io.output_argument})",
     )
-    writer.line(2, f"return {io.output_argument}")
+    emit_return(writer, io)
     return writer.render()
+
+
+def _emit_full_window_cube_dag(
+    context: EmissionContext,
+    program_name: str,
+    plan: CubeKernelPlan,
+) -> str:
+    """Emit a dependency-ordered, non-split cube DAG for one spatial region.
+
+    The source spells the solver-owned outer schedule explicitly: output-tile
+    subdivision, K-window accumulation, L1 intermediates, retained boundary
+    panels, resident boundary lifetimes, and final drains. PyPTO chooses only
+    each child L0 matmul realization.
+    """
+
+    graph = context.graph
+    lowered = context.lowered
+    step = context.step
+    io = context.interface
+    if any(
+        resident.use_count < 2 or resident.first_use >= resident.last_use
+        for resident in plan.resident_boundaries
+    ):
+        raise SourceEmissionError(
+            "cube resident-boundary lifetime must span at least two requests"
+        )
+    if tuple(matmul.op for matmul in plan.matmuls) != plan.execution_order:
+        raise SourceEmissionError(
+            "cube matmul requests do not preserve the selected execution order"
+        )
+    first_occurrences = tuple(dict.fromkeys(plan.execution_order))
+    if first_occurrences != step.op_order:
+        raise SourceEmissionError(
+            "cube plan first-use order differs from the kernel-step order"
+        )
+    if tuple(step.solver_ops) != tuple(sorted(step.solver_ops)):
+        # Solver identities need not be execution ordered, but they are the
+        # complete membership set and therefore must remain canonical.
+        raise SourceEmissionError("cube solver-op membership is not canonical")
+    if step.sequential_tiles is None or len(step.sequential_tiles) != len(
+        step.solver_ops
+    ):
+        raise SourceEmissionError("cube DAG omits per-operation sequential tiles")
+    sequential_by_op = dict(zip(step.op_order, step.sequential_tiles, strict=True))
+
+    m_partition = plan.m_partition
+    n_partition = plan.n_partition
+    validate_grid(step, plan.work_units, m_partition, n_partition)
+    if m_partition.big != m_partition.small or n_partition.big != n_partition.small:
+        raise SourceEmissionError(
+            "full-window cube DAG source currently requires uniform spatial regions"
+        )
+
+    writer = program_header(
+        program_name,
+        io,
+        graph,
+        plan.work_units,
+        kernel_name_hint=context.region_id + "_cube",
+    )
+    indent = 3
+    coordinates = emit_partition_indices(writer, indent, m_partition, n_partition)
+    graph_ops = graph.op_map()
+    local: dict[int, str] = {}
+    producer_by_tensor: dict[int, int] = {}
+    resident_values: dict[int, str] = {}
+    stored_outputs: set[str] = set()
+
+    for request_index, matmul in enumerate(plan.matmuls):
+        operation = lowered.operation(matmul.op)
+        if len(operation.inputs) != 2 or len(operation.outputs) != 1:
+            raise SourceEmissionError(
+                f"cube operation {matmul.op} is not a binary single-result matmul"
+            )
+        if operation.inputs != (matmul.lhs.tensor, matmul.rhs.tensor):
+            raise SourceEmissionError(
+                f"cube request {matmul.instance} operand identities are stale"
+            )
+        if operation.outputs != (matmul.output.tensor,):
+            raise SourceEmissionError(
+                f"cube request {matmul.instance} output identity is stale"
+            )
+        graph_op = graph_ops[operation.graph_op_id]
+        if (
+            graph_op.kind != "matmul"
+            or graph_op.attributes.get("lhs_transposed")
+            or graph_op.attributes.get("rhs_transposed")
+        ):
+            raise SourceEmissionError(
+                "full-window cube DAG source requires non-transposed matmuls"
+            )
+        if matmul.instance != request_index:
+            raise SourceEmissionError(
+                "cube request instances are not dense and ordered"
+            )
+        if sequential_by_op[matmul.op] != matmul.k_loop.l1_window_k:
+            raise SourceEmissionError(
+                f"cube operation {matmul.op} sequential tile differs from its L1 window"
+            )
+        if not matmul.output_variants:
+            raise SourceEmissionError("cube DAG request omits its output-tile variants")
+        if matmul.accumulator_dtype != "fp32":
+            raise SourceEmissionError("cube DAG source requires FP32 accumulation")
+        if matmul.storage_dtype not in {"fp32", "fp16", "bf16"}:
+            raise SourceEmissionError(
+                f"cube DAG storage dtype {matmul.storage_dtype!r} is unsupported"
+            )
+        _validate_lowered_l0_capacity(context, matmul)
+
+        lhs, lhs_row, lhs_col = _cube_dag_operand(
+            writer,
+            indent,
+            context,
+            matmul.lhs,
+            matmul.lhs_producer,
+            matmul.lhs_resident_boundary,
+            matmul.instance,
+            "lhs",
+            coordinates.row,
+            coordinates.col,
+            local,
+            producer_by_tensor,
+            resident_values,
+        )
+        rhs, rhs_row, rhs_col = _cube_dag_operand(
+            writer,
+            indent,
+            context,
+            matmul.rhs,
+            matmul.rhs_producer,
+            matmul.rhs_resident_boundary,
+            matmul.instance,
+            "rhs",
+            coordinates.row,
+            coordinates.col,
+            local,
+            producer_by_tensor,
+            resident_values,
+        )
+
+        if matmul.retained_panels.lhs:
+            lhs = _emit_retained_panel(
+                writer,
+                indent,
+                lhs,
+                matmul.lhs,
+                lhs_row,
+                lhs_col,
+                matmul.instance,
+                "lhs",
+            )
+            lhs_row = lhs_col = "0"
+        if matmul.retained_panels.rhs:
+            rhs = _emit_retained_panel(
+                writer,
+                indent,
+                rhs,
+                matmul.rhs,
+                rhs_row,
+                rhs_col,
+                matmul.instance,
+                "rhs",
+            )
+            rhs_row = rhs_col = "0"
+
+        output_row, output_col = _cube_region_offsets(
+            matmul.output.height_binding,
+            matmul.output.width_binding,
+            coordinates.row,
+            coordinates.col,
+        )
+        output_targets = {
+            output_value: io.output_arguments[output_value]
+            for output_value in io.output_values
+            if solver_tensor_for_value(
+                lowered, io.output_allocation_owners[output_value]
+            )
+            == matmul.output.tensor
+        }
+        if matmul.is_sink != bool(output_targets):
+            raise SourceEmissionError(
+                f"cube request {matmul.instance} sink identity differs from the region ABI"
+            )
+        state = ""
+        if not matmul.is_sink:
+            state = f"matmul_{matmul.instance}_l1"
+            writer.line(
+                indent,
+                f"{state} = pl.create_l1("
+                f"[{matmul.output.height}, {matmul.output.width}], "
+                f"dtype={pypto_dtype(matmul.storage_dtype)})",
+            )
+
+        variants = {variant.shape: variant for variant in matmul.output_variants}
+        variant_counts = {variant.shape: 0 for variant in matmul.output_variants}
+        output_tiles_m, output_tiles_n = matmul.output_grid
+        if (
+            output_tiles_m <= 0
+            or output_tiles_n <= 0
+            or output_tiles_m != _ceil_div(matmul.output.height, matmul.output_tile[0])
+            or output_tiles_n != _ceil_div(matmul.output.width, matmul.output_tile[1])
+        ):
+            raise SourceEmissionError(
+                f"cube request {matmul.instance} output-tile grid is stale"
+            )
+        for tile_m in range(output_tiles_m):
+            local_row = tile_m * matmul.output_tile[0]
+            tile_height = min(matmul.output_tile[0], matmul.output.height - local_row)
+            for tile_n in range(output_tiles_n):
+                local_col = tile_n * matmul.output_tile[1]
+                tile_width = min(matmul.output_tile[1], matmul.output.width - local_col)
+                shape = (tile_height, tile_width)
+                variant = variants.get(shape)
+                if variant is None:
+                    raise SourceEmissionError(
+                        f"cube request {matmul.instance} omits output variant {shape}"
+                    )
+                variant_counts[shape] += 1
+                tile_index = tile_m * output_tiles_n + tile_n
+                accumulator = _emit_cube_dag_output_tile(
+                    writer,
+                    indent,
+                    matmul,
+                    lhs,
+                    rhs,
+                    lhs_row,
+                    lhs_col,
+                    rhs_row,
+                    rhs_col,
+                    local_row,
+                    local_col,
+                    tile_height,
+                    tile_width,
+                    tile_index,
+                )
+                if matmul.is_sink:
+                    for output_value, output_argument in output_targets.items():
+                        writer.line(
+                            indent,
+                            f"{output_argument} = pl.assemble("
+                            f"{output_argument}, {accumulator}, "
+                            f"[{_add_offset(output_row, local_row)}, "
+                            f"{_add_offset(output_col, local_col)}])",
+                        )
+                        stored_outputs.add(output_value)
+                else:
+                    next_state = f"matmul_{matmul.instance}_l1_{tile_index}"
+                    writer.line(
+                        indent,
+                        f"{next_state} = pl.assemble({state}, {accumulator}, "
+                        f"[{local_row}, {local_col}])",
+                    )
+                    state = next_state
+        for shape, variant in variants.items():
+            if variant_counts[shape] != variant.count:
+                raise SourceEmissionError(
+                    f"cube request {matmul.instance} output variant {shape} count is stale"
+                )
+
+        if not matmul.is_sink:
+            local[matmul.output.tensor] = state
+        producer_by_tensor[matmul.output.tensor] = matmul.instance
+
+    if set(resident_values) != set(range(len(plan.resident_boundaries))):
+        raise SourceEmissionError(
+            "cube DAG did not materialize every resident boundary"
+        )
+
+    missing = set(io.output_values) - stored_outputs
+    if missing:
+        raise SourceEmissionError(
+            "cube DAG does not drain region outputs " + ", ".join(sorted(missing))
+        )
+    emit_return(writer, io)
+    return writer.render()
+
+
+def _cube_dag_operand(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    region,
+    declared_producer: int,
+    resident_boundary: int,
+    consumer_instance: int,
+    role: str,
+    spatial_row: str,
+    spatial_col: str,
+    local: Mapping[int, str],
+    producer_by_tensor: Mapping[int, int],
+    resident_values: dict[int, str],
+) -> tuple[str, str, str]:
+    if region.tensor in local:
+        actual_producer = producer_by_tensor[region.tensor]
+        if declared_producer != actual_producer or actual_producer >= consumer_instance:
+            raise SourceEmissionError(
+                f"cube {role} producer does not precede its consumer"
+            )
+        if resident_boundary != -1:
+            raise SourceEmissionError(
+                f"cube {role} cannot be both produced and a resident boundary"
+            )
+        return local[region.tensor], "0", "0"
+    if declared_producer != -1:
+        raise SourceEmissionError(f"cube {role} producer result is unavailable")
+    tensor = context.lowered.tensor(region.tensor)
+    argument = context.interface.input_arguments.get(tensor.value_id)
+    if argument is None:
+        raise SourceEmissionError(
+            f"cube external {role} tensor {tensor.value_id!r} is not a region input"
+        )
+    row_offset, col_offset = _cube_region_offsets(
+        region.height_binding,
+        region.width_binding,
+        spatial_row,
+        spatial_col,
+    )
+    if resident_boundary < 0:
+        return argument, row_offset, col_offset
+    plan = context.step.plan
+    if not isinstance(plan, CubeKernelPlan):
+        raise SourceEmissionError("cube operand does not carry a cube plan")
+    if resident_boundary >= len(plan.resident_boundaries):
+        raise SourceEmissionError(f"cube {role} resident boundary is out of range")
+    resident = plan.resident_boundaries[resident_boundary]
+    if resident_boundary not in resident_values:
+        if resident.first_use != consumer_instance:
+            raise SourceEmissionError(
+                f"cube {role} resident boundary is used before materialization"
+            )
+        name = f"resident_{resident_boundary}_{role}"
+        writer.line(
+            indent,
+            f"{name} = pl.slice({argument}, [{region.height}, {region.width}], "
+            f"[{row_offset}, {col_offset}])",
+        )
+        resident_values[resident_boundary] = name
+    elif resident.first_use == consumer_instance:
+        raise SourceEmissionError(
+            f"cube resident boundary {resident_boundary} is materialized twice"
+        )
+    return resident_values[resident_boundary], "0", "0"
+
+
+def _emit_retained_panel(
+    writer: SourceWriter,
+    indent: int,
+    source: str,
+    region: CubeTensorRegionPlan,
+    row_offset: str,
+    col_offset: str,
+    instance: int,
+    role: str,
+) -> str:
+    name = f"matmul_{instance}_{role}_retained"
+    writer.line(
+        indent,
+        f"{name} = pl.slice({source}, [{region.height}, {region.width}], "
+        f"[{row_offset}, {col_offset}])",
+    )
+    return name
+
+
+def _emit_cube_dag_output_tile(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    matmul: CubeMatmulPlan,
+    lhs: str,
+    rhs: str,
+    lhs_row: str,
+    lhs_col: str,
+    rhs_row: str,
+    rhs_col: str,
+    output_row: int,
+    output_col: int,
+    output_height: int,
+    output_width: int,
+    tile_index: int,
+) -> str:
+    loop = matmul.k_loop
+    if (
+        loop.chunk <= 0
+        or loop.full_chunks <= 0
+        or loop.full_chunks * loop.chunk + loop.tail != matmul.contraction
+        or loop.tail >= loop.chunk
+        or loop.pipeline_stages not in {1, 2}
+    ):
+        raise SourceEmissionError(
+            f"cube request {matmul.instance} K-window descriptor is stale"
+        )
+    prefix = f"matmul_{matmul.instance}_tile_{tile_index}"
+
+    def emit_window(level: int, suffix: str, k_offset: str, k_extent: int) -> None:
+        writer.line(
+            level,
+            f"{prefix}_lhs_{suffix} = pl.slice({lhs}, "
+            f"[{output_height}, {k_extent}], "
+            f"[{_add_offset(lhs_row, output_row)}, "
+            f"{_add_expression(lhs_col, k_offset)}])",
+        )
+        writer.line(
+            level,
+            f"{prefix}_rhs_{suffix} = pl.slice({rhs}, "
+            f"[{k_extent}, {output_width}], "
+            f"[{_add_expression(rhs_row, k_offset)}, "
+            f"{_add_offset(rhs_col, output_col)}])",
+        )
+
+    emit_window(indent, "init", "0", loop.chunk)
+    accumulator = f"{prefix}_accumulator"
+    writer.line(
+        indent,
+        f"{accumulator} = pl.matmul({prefix}_lhs_init, {prefix}_rhs_init, "
+        "out_dtype=pl.FP32)",
+    )
+    if loop.full_chunks > 1:
+        iterator = "pl.pipeline" if loop.pipeline_stages > 1 else "pl.range"
+        stage = f", stage={loop.pipeline_stages}" if loop.pipeline_stages > 1 else ""
+        writer.line(
+            indent,
+            f"for {prefix}_k in {iterator}(1, {loop.full_chunks}{stage}):",
+        )
+        emit_window(
+            indent + 1,
+            "rolled",
+            f"{prefix}_k * {loop.chunk}",
+            loop.chunk,
+        )
+        writer.line(
+            indent + 1,
+            f"{accumulator} = pl.matmul_acc({accumulator}, "
+            f"{prefix}_lhs_rolled, {prefix}_rhs_rolled)",
+        )
+    if loop.tail:
+        emit_window(
+            indent,
+            "tail",
+            str(loop.full_chunks * loop.chunk),
+            loop.tail,
+        )
+        writer.line(
+            indent,
+            f"{accumulator} = pl.matmul_acc({accumulator}, "
+            f"{prefix}_lhs_tail, {prefix}_rhs_tail)",
+        )
+    return accumulator
+
+
+def _cube_region_offsets(
+    height_binding: CubeAxisBinding,
+    width_binding: CubeAxisBinding,
+    spatial_row: str,
+    spatial_col: str,
+) -> tuple[str, str]:
+    def coordinate(binding: CubeAxisBinding) -> str:
+        if binding is CubeAxisBinding.SPATIAL_M:
+            return spatial_row
+        if binding is CubeAxisBinding.SPATIAL_N:
+            return spatial_col
+        return "0"
+
+    return coordinate(height_binding), coordinate(width_binding)
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _add_offset(base: str, offset: int) -> str:
+    if offset == 0:
+        return base
+    if base == "0":
+        return str(offset)
+    return f"{base} + {offset}"
+
+
+def _add_expression(base: str, offset: str) -> str:
+    if offset == "0":
+        return base
+    if base == "0":
+        return offset
+    return f"{base} + {offset}"
 
 
 def _emit_cube_window(
@@ -310,7 +796,6 @@ def _validate_lowered_l0_capacity(
 
     lhs_bytes = context.lowered.tensor(matmul.lhs.tensor).byte_width
     rhs_bytes = context.lowered.tensor(matmul.rhs.tensor).byte_width
-    variant = matmul.output_variants[0]
 
     def align_up(value: int, alignment: int) -> int:
         return (value + alignment - 1) // alignment * alignment
@@ -329,12 +814,14 @@ def _validate_lowered_l0_capacity(
                 f"L0B {l0b_bytes}/{l0b_capacity} bytes"
             )
 
-    validate_child("cube initial L0 plan", variant.l0_init, 1)
-    if variant.l0_rolled is not None:
-        validate_child(
-            "cube outer K pipeline",
-            variant.l0_rolled,
-            matmul.k_loop.pipeline_stages,
-        )
-    if variant.l0_tail is not None:
-        validate_child("cube tail L0 plan", variant.l0_tail, 1)
+    for variant in matmul.output_variants:
+        label = f"cube output variant {variant.shape}"
+        validate_child(f"{label} initial L0 plan", variant.l0_init, 1)
+        if variant.l0_rolled is not None:
+            validate_child(
+                f"{label} outer K pipeline",
+                variant.l0_rolled,
+                matmul.k_loop.pipeline_stages,
+            )
+        if variant.l0_tail is not None:
+            validate_child(f"{label} tail L0 plan", variant.l0_tail, 1)

@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -971,11 +972,15 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v2";
+    j["schema_version"] = "pto_fusebox.solution.v3";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
+        if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
+            throw std::logic_error(
+                "solution.v3 cannot serialize cross-kernel fast-memory retention");
+        }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
         // Emit descriptors are reconstructed only for final solution steps. The
@@ -1234,9 +1239,7 @@ std::string solution_json(const Solution& sol) {
            {"transfers", transfers},
            {"fifos", fifos},
            {"dense_mlp", dense_mlp}};
-    }
-        serialized_step["retain"] =
-            std::vector<size_t>(step.retain_these.begin(), step.retain_these.end());
+        }
         serialized_step["latency_cycles"] = sol.step_latency(i);
         j["steps"].push_back(std::move(serialized_step));
     }

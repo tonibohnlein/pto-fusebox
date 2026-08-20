@@ -16,20 +16,26 @@ used by computation are preserved as explicit opaque boundaries rather than
 being approximated. Static specialization families, runtime dispatch, and
 dynamic physical tiles are not implemented.
 
-The first PyPTO DSL source slice validates a solved homogeneous region as a
-typed schedule and emits an ordinary `@pl.program` with its grid, logical
-ownership, physical frame, loops, pipeline stages, operations, and GM traffic.
-Each homogeneous group is one `pl.spmd(work_units)` grid launch; its block
-index selects one solver-owned output region. Vector execution replays one
-maximum compile-time tile per work unit and clamps ragged-edge origins
-backwards, preserving static shapes while recomputing the small overlap already
-charged by the model. The closed set is materialized or pointwise vector
-replay, versioned two-pass online softmax, and one spatial output-stationary
-cube matmul; every other schedule fails closed.
+The PyPTO DSL source backend validates a solved region as a typed schedule and
+emits an ordinary `@pl.program` with its grids, logical ownership, physical
+frames, loops, pipeline stages, operation order, and GM traffic. Each
+homogeneous group is one `pl.spmd(work_units)` launch; its block index selects
+one solver-owned output region. If the solver cuts a region into several
+homogeneous groups, the program creates explicit GM tensors for the cut edges
+and submits dependency-linked SPMD tasks in solver order.
 
-Other streamed vector phases, split reductions, advanced cube/mixed schedules,
-multiple selected steps, and whole-graph orchestration remain milestones.
-Dynamic-shape classes are retained but declined when they affect solver geometry.
+Vector execution replays one maximum compile-time tile per work unit and clamps
+ragged-edge origins backwards, preserving static shapes while recomputing the
+small overlap already charged by the model. The implemented vector set is
+materialized or pointwise replay, versioned two-pass online softmax, and
+one-reduction folded or spanning streams. Cube execution covers uniform
+non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
+produced values resident in L1, and solver-selected retained boundary panels.
+
+Welford/multi-stat vector plans, singleton-column normalization, nonuniform cube
+spatial partitions, split-K, and mixed cross-core schedules fail closed.
+Dynamic-shape classes are retained but declined when they affect solver
+geometry.
 
 ## Python API
 
@@ -70,8 +76,11 @@ caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
 arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
 typed emission context and run the same graph-aware renderer validation; the
 readiness query is not a weaker schedule-family approximation. The emitter
-currently accepts one selected homogeneous step and raises
-`SourceEmissionError` for every unimplemented algorithm.
+accepts one or more selected homogeneous steps and raises
+`SourceEmissionError` for every unimplemented algorithm or unsafe cut edge.
+`EmittedPyPTOSource.kinds` preserves the ordered engine kind of every emitted
+step; its compatibility `kind` property is populated only when all steps use
+the same engine kind.
 
 ### Source-backend structure and validation
 
@@ -79,10 +88,11 @@ The source backend is schedule-family-driven, not model- or pattern-driven.
 It selects a vector or cube emitter from the typed solver step, replays the
 solver's operation order and serialized geometry, and dispatches individual
 operations by normalized operator kind. Names such as softmax, RMSNorm,
-attention, or a source `nn.Module` class are never emission inputs. The initial
-cube family is intentionally limited to one spatial output-stationary matmul;
-that is an explicit fail-closed schedule-family boundary, not a matmul-example
-recognizer.
+attention, or a source `nn.Module` class are never emission inputs. The cube
+family is driven by the typed request DAG rather than by example or model
+names. It replays the selected topological order, propagated regions, outer-K
+windows, local produced-value lifetimes, retained boundary panels, and drains
+for non-split plans.
 
 The replay structure follows the earlier PyPTO fusion-scheduler prototype:
 one solver-owned grid, propagated regions, planned physical frames and
@@ -116,7 +126,9 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v2`: the C++ schedule response.
+- `pto_fusebox.solution.v3`: the C++ schedule response. Cross-kernel values are
+  always materialized through GM. Fast-memory residence and retained panels are
+  cube-step-local policies, not promises spanning separate launches.
 
 The normalized graph records stable topological IDs, ordered operands, exact
 normalized operator kinds, attributes, input roles, target names for parameters
@@ -143,7 +155,7 @@ sentinels meaning that no feasible tile was found. They are never a valid
 schedule. The Python bridge classifies such a response as `infeasible` and
 must not pass it to the PyPTO source backend. The solution uses one typed,
 nested step descriptor. Its common portion records launch geometry, selected
-topological order, sequential tile counts, retained tensors, and latency.
+topological order, sequential tile counts, and latency.
 The common launch tile is the optimizer's selected configuration and a
 diagnostic summary; the nested family plan is authoritative wherever lowering
 derives different replay frames, as it does for vector reductions.
@@ -155,7 +167,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v2`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v3`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -326,27 +338,31 @@ launching ready kernels and overlapping independent AIC and AIV work.
 
 The backend deterministically serializes the selected solution as readable
 PyPTO DSL. The installed homogeneous slice emits materialized/pointwise vector,
-`softmax_flash.v1`, or uniform spatial cube schedules as one `pl.spmd` grid,
-with static physical and valid shapes, explicit pipelines, and GM boundaries.
-It never expands the grid into a host-side loop of single-block submissions.
+`softmax_flash.v1`, one-reduction folded/spanning vector streams, or uniform
+non-split cube DAG schedules as one `pl.spmd` grid per selected step, with
+static physical and valid shapes, explicit pipelines, and GM boundaries. It
+never expands a grid into a host-side loop of single-block submissions.
+Several homogeneous steps are composed in one orchestration program using
+dependency-linked GM cut values; this preserves the solver partition without
+claiming cross-kernel fast-memory retention.
 ABI inputs use an `arg_` namespace, so captured names cannot shadow generated
 names.
 Materialized/pointwise schedules execute `body.ops`; online softmax consumes the
 typed stats/apply loops, frames, workspaces, carry state, and substitutions.
 Selection is independent of program, module, model, or shape names.
 
-Cube source replays the outer spatial and K-window schedule, then lets PyPTO's
+Cube source replays the selected request order, outer spatial and K-window
+schedule, L1 resident values, retained panels, and drains, then lets PyPTO's
 `AutoTileMatmulL0` choose child-L0 `(m,n,k)`, stationarity, and buffer depths.
 The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Analytic support is broader than the renderer. General streamed reductions,
-Welford/multi-stat P4, advanced cube, multi-step, and mixed plans remain valid
-solver results but are not source-ready. P4 descriptors preserve named roles;
-each new recipe must version its carry and publication semantics. Future plan
-classes can add those contracts and cross-core transport without changing the
-ownership boundary.
+Analytic support is broader than the renderer. Welford/multi-stat P4, split-K,
+and mixed plans remain valid solver results but are not source-ready. P4
+descriptors preserve named roles; each new recipe must version its carry and
+publication semantics. Future plan classes can add those contracts and
+cross-core transport without changing the ownership boundary.
 
 The backend must not redo planning. Every emitted loop, lifetime, transfer, and
 FIFO must be traceable to the solution descriptor. It should publish the
@@ -536,14 +552,16 @@ dynamic physical tile that reaches allocation or tile-flattening.
 
 ## Implementation sequence
 
-1. Silicon-close the installed materialized-vector, online-softmax, and static
-   cube source slices.
-2. Reproduce [closed PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335)'s
-   seven hand-tiled vector comparisons through standalone Torch capture,
-   Fusebox planning, and explicit generated PyPTO.
-3. Extend homogeneous source replay to the remaining serialized vector and cube
-   schedule families.
-4. Expand the generic mixed source backend from one round trip while continuing
+1. Silicon-close the expanded homogeneous source matrix: materialized and
+   streamed vector schedules, non-split cube DAGs, outer-K replay, retained
+   panels, and dependency-linked homogeneous cuts.
+2. Preserve the reproduced
+   [closed PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335)
+   vector behavior while extending source replay; do not rediscover those
+   schedules in the emitter.
+3. Add the remaining serialized homogeneous contracts: singleton-column
+   normalization, Welford/multi-stat vector replay, and split-K cube execution.
+4. Implement the generic mixed source backend from one round trip while continuing
    to reject unsupported multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.

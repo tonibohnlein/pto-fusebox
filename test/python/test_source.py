@@ -32,6 +32,8 @@ from pto_fusebox.schedule.schema import (
     VectorSpatialPolicy,
     VectorStreamKind,
 )
+from pto_fusebox.source.api import _append_spmd_statement
+from pto_fusebox.source.common import SourceWriter
 from torch import nn
 
 
@@ -79,6 +81,21 @@ def _assert_single_spmd_grid(source: str, work_units: int) -> None:
     assert "pl.at(" not in source
 
 
+def test_multi_step_composer_rejects_unmodeled_step_prologue() -> None:
+    source = """
+@pl.program
+class Step:
+    def main(self, output):
+        scratch = pl.create_tensor([8, 8], dtype=pl.FP32)
+        for region_index in pl.spmd(1):
+            output = scratch
+        return output
+"""
+
+    with pytest.raises(SourceEmissionError, match="only one SPMD loop"):
+        _append_spmd_statement(SourceWriter(), source, 0, protected={"output"})
+
+
 def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     graph, result = _solved("softmax")
     schedule = scheduled_region(result)
@@ -105,7 +122,7 @@ def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     assert "pl.pipeline(" not in source
     assert "region_rows" not in source
     assert "pl.load(arg_value," in source
-    assert "[8, 1024], valid_shape=[8, 1024]" in source
+    assert "[8, 1024], [8, 1024], target_memory=pl.Mem.Vec" in source
     assert source.count("pl.load(") == 1
     assert source.count("pl.store(") == 1
     assert "pl.row_max" in source
@@ -177,7 +194,7 @@ def test_vector_reduction_uses_pinned_iteration_frame_not_output_extent() -> Non
     source = emit_pypto_region(graph, result, program_name="sum_of_squares").source
 
     assert [op.kind for op in graph.ops] == ["mul", "sum"]
-    assert "[8, 1024], valid_shape=[8, 1024]" in source
+    assert "[8, 1024], [8, 1024], target_memory=pl.Mem.Vec" in source
     assert "valid_cols" not in source
     assert "pl.row_sum" in source
     assert source.count("pl.load(") == 1
@@ -203,6 +220,46 @@ def test_narrow_row_reduction_serializes_lowered_scratch_frame() -> None:
     _assert_single_spmd_grid(source, 96)
     assert "pl.tile.create([" in source
     assert ", 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)" in source
+
+
+def test_large_bare_reduction_replays_folded_stats_and_tail() -> None:
+    class BareReduction(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.sum(value, dim=-1, keepdim=True)
+
+    graph, result = _solve_module(BareReduction(), (torch.ones(5, 32771),))
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.REDUCTION_FOLDED
+
+    source = emit_pypto_region(graph, result, program_name="bare_reduction").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.work_units)
+    assert "for stats_chunk, (stats_state,) in pl.pipeline(" in source
+    assert "stats_next_state = pl.add(stats_state," in source
+    assert "stats_tail_state = pl.add(stats_result," in source
+    assert source.count("pl.store(") == 1
+    assert "for apply_chunk" not in source
+
+
+def test_large_normalization_replays_stats_then_spanning_apply() -> None:
+    class Normalize(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value / torch.sum(value, dim=-1, keepdim=True)
+
+    graph, result = _solve_module(Normalize(), (torch.ones(5, 32771),))
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.REDUCTION_SPANNING
+
+    source = emit_pypto_region(graph, result, program_name="normalize").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.work_units)
+    assert "for stats_chunk, (stats_state,) in pl.pipeline(" in source
+    assert "for apply_chunk in pl.pipeline(" in source
+    assert "pl.row_expand_div(" in source
+    assert source.count("output = pl.store(") == 2
+    assert "apply_tail" in source
 
 
 def test_cube_emission_is_generic_over_shape_and_k_tail() -> None:
@@ -244,7 +301,259 @@ def test_cube_singleton_partition_axis_uses_literal_zero_coordinate() -> None:
     assert "pl.store(accumulator, [0, region_col], output)" in source
 
 
-def test_source_backend_rejects_unimplemented_cube_residency() -> None:
+def test_single_bf16_matmul_uses_fp32_accumulator_and_bf16_drain() -> None:
+    class Bf16Matmul(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs)
+
+    graph, result = _solve_module(
+        Bf16Matmul(),
+        (
+            torch.zeros(64, 64, dtype=torch.bfloat16),
+            torch.ones(64, 64, dtype=torch.bfloat16),
+        ),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.matmuls[0].storage_dtype == "bf16"
+
+    source = emit_pypto_region(graph, result, program_name="bf16_matmul").source
+
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.work_units)
+    assert "out_dtype=pl.FP32" in source
+    assert "pl.assemble(output, matmul_0_tile_0_accumulator" in source
+    assert "pl.cast(" not in source
+
+
+def test_cube_chain_replays_outer_k_and_l1_intermediate_in_plan_order() -> None:
+    class ChainedMatmul(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.mm(torch.mm(lhs, middle), rhs)
+
+    graph, result = _solve_module(
+        ChainedMatmul(),
+        (
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 96, dtype=torch.bfloat16),
+            torch.zeros(96, 80, dtype=torch.bfloat16),
+        ),
+    )
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.execution_order == (0, 1)
+    assert [matmul.k_loop.full_chunks for matmul in plan.matmuls] == [4, 3]
+
+    source = emit_pypto_region(graph, result, program_name="chained_matmul").source
+
+    ast.parse(source)
+    _assert_single_spmd_grid(source, 4)
+    assert source.count("pl.create_l1(") == 1
+    assert source.count("pl.matmul(") == 2
+    assert source.count("pl.matmul_acc(") == 2
+    assert source.index("matmul_0_tile_0_accumulator") < source.index(
+        "matmul_1_tile_0_accumulator"
+    )
+    assert "pl.cast(" not in source
+    assert "pl.assemble(matmul_0_l1" in source
+    assert "pl.assemble(output, matmul_1_tile_0_accumulator" in source
+    assert source.count("pl.store(") == 0
+
+
+def test_cube_retained_panel_is_sliced_once_outside_output_tile_replay() -> None:
+    class WideMatmul(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs)
+
+    graph, result = _solve_module(
+        WideMatmul(),
+        (
+            torch.zeros(512, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 2048, dtype=torch.bfloat16),
+        ),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.matmuls[0].output_grid == (2, 1)
+    assert plan.matmuls[0].retained_panels.rhs
+
+    source = emit_pypto_region(graph, result, program_name="retained_rhs").source
+
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.work_units)
+    assert source.count("matmul_0_rhs_retained = pl.slice(") == 1
+    assert source.index("matmul_0_rhs_retained = pl.slice(") < source.index(
+        "matmul_0_tile_0_rhs_init = pl.slice(matmul_0_rhs_retained"
+    )
+    assert source.count("pl.matmul(") == 2
+    assert source.count("pl.matmul_acc(") == 2
+    assert source.count("pl.assemble(output,") == 2
+
+
+def test_general_cube_path_rejects_lowered_l0_capacity_overflow() -> None:
+    class WideMatmul(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs)
+
+    graph, result = _solve_module(
+        WideMatmul(),
+        (
+            torch.zeros(512, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 2048, dtype=torch.bfloat16),
+        ),
+    )
+    assert result.problem is not None
+    problem = copy.deepcopy(result.problem)
+    problem["l0_matmul_config"]["l0a_bytes"] = 1
+
+    with pytest.raises(SourceEmissionError, match="lowered L0 operand capacity"):
+        emit_pypto_region(graph, replace(result, problem=problem))
+
+
+def test_cube_diamond_replays_three_requests_in_selected_topological_order() -> None:
+    class DiamondMatmul(nn.Module):
+        def forward(
+            self,
+            shared: torch.Tensor,
+            lhs_weight: torch.Tensor,
+            rhs_weight: torch.Tensor,
+        ) -> torch.Tensor:
+            lhs = torch.mm(shared, lhs_weight)
+            rhs = torch.mm(shared, rhs_weight)
+            return torch.mm(lhs, rhs)
+
+    graph, result = _solve_module(
+        DiamondMatmul(),
+        tuple(torch.zeros(32, 32, dtype=torch.bfloat16) for _ in range(3)),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.execution_order == (0, 1, 2)
+
+    source = emit_pypto_region(graph, result, program_name="diamond_matmul").source
+
+    ast.parse(source)
+    assert source.count("pl.create_l1(") == 2
+    assert source.count("pl.matmul(") == 3
+    assert (
+        source.index("matmul_0_tile_0_accumulator")
+        < source.index("matmul_1_tile_0_accumulator")
+        < source.index("matmul_2_tile_0_accumulator")
+    )
+    assert "pl.slice(matmul_0_l1_0" in source
+    assert "pl.slice(matmul_1_l1_0" in source
+    assert source.count("pl.assemble(output,") == 1
+
+
+def test_two_cube_steps_materialize_one_dependency_linked_intermediate() -> None:
+    class Fp32ChainedMatmul(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.mm(torch.mm(lhs, middle), rhs)
+
+    graph, result = _solve_module(
+        Fp32ChainedMatmul(),
+        (
+            torch.zeros(64, 128),
+            torch.zeros(128, 96),
+            torch.zeros(96, 80),
+        ),
+    )
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 2
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.CUBE,
+        KernelKind.CUBE,
+    ]
+
+    emitted = emit_pypto_region(graph, result, program_name="cut_chained_matmul")
+    source = emitted.source
+
+    ast.parse(source)
+    assert emitted.kinds == (KernelKind.CUBE, KernelKind.CUBE)
+    assert emitted.kind is KernelKind.CUBE
+    assert source.count("pl.spmd(") == 2
+    assert "intermediate_tensor_2 = pl.create_tensor([64, 96], dtype=pl.FP32)" in source
+    assert "pl.store(step_0_accumulator" in source
+    assert "pl.tile.load(intermediate_tensor_2" in source
+    assert source.index("for step_0_region_index") < source.index(
+        "for step_1_region_index"
+    )
+    assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+def test_multi_step_source_rejects_a_consumer_launch_before_its_producer() -> None:
+    class Fp32ChainedMatmul(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.mm(torch.mm(lhs, middle), rhs)
+
+    graph, result = _solve_module(
+        Fp32ChainedMatmul(),
+        (
+            torch.zeros(64, 128),
+            torch.zeros(128, 96),
+            torch.zeros(96, 80),
+        ),
+    )
+    assert result.solution is not None
+    reordered = copy.deepcopy(result.solution)
+    reordered["steps"].reverse()
+
+    with pytest.raises(SourceEmissionError, match="consumed before its producer"):
+        emit_pypto_region(graph, replace(result, solution=reordered))
+
+
+def test_fanout_cube_step_uses_op_order_for_sparse_ids_and_two_outputs() -> None:
+    class Fp32Fanout(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            first_rhs: torch.Tensor,
+            second_rhs: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            shared = torch.mm(lhs, middle)
+            return torch.mm(shared, first_rhs), torch.mm(shared, second_rhs)
+
+    graph, result = _solve_module(
+        Fp32Fanout(),
+        tuple(torch.zeros(64, 64) for _ in range(4)),
+    )
+    schedule = scheduled_region(result)
+    assert [step.solver_ops for step in schedule.steps] == [(0,), (1, 2)]
+    assert schedule.steps[1].op_order == (1, 2)
+
+    emitted = emit_pypto_region(graph, result, program_name="fanout_cube")
+    source = emitted.source
+
+    ast.parse(source)
+    assert emitted.kinds == (KernelKind.CUBE, KernelKind.CUBE)
+    assert source.count("pl.spmd(") == 2
+    assert source.count("pl.create_tensor(") == 1
+    assert "step_1_resident_0_lhs = pl.slice(intermediate_tensor_2" in source
+    assert source.count("pl.matmul(") == 2
+    assert "output_0 = pl.assemble(" in source
+    assert "output_1 = pl.assemble(" in source
+    assert "return output_0, output_1" in source
+
+
+def test_source_backend_rejects_degenerate_cube_resident_lifetime() -> None:
     graph, result = _solved("matmul")
     assert result.solution is not None
     solution = copy.deepcopy(result.solution)
@@ -292,11 +601,11 @@ def test_schedule_contract_rejects_legacy_or_dropped_step_fields() -> None:
     assert result.solution is not None
 
     legacy = copy.deepcopy(result.solution)
-    legacy["schema_version"] = "pto_fusebox.solution.v1"
+    legacy["schema_version"] = "pto_fusebox.solution.v2"
     with pytest.raises(ScheduleContractError, match="solution schema"):
         scheduled_region(replace(result, solution=legacy))
 
-    for field in ("sequential_tiles", "retain"):
+    for field in ("sequential_tiles", "op_order"):
         incomplete = copy.deepcopy(result.solution)
         incomplete["steps"][0].pop(field)
         with pytest.raises(ScheduleContractError, match=f"omits fields.*{field}"):
@@ -323,6 +632,22 @@ def test_schedule_contract_rejects_vector_phase_order_or_frame_drift() -> None:
     workspace["source_tensor"] += 1
     with pytest.raises(ScheduleContractError, match="wrong source tensor"):
         scheduled_region(replace(result, solution=stale_workspace))
+
+
+def test_schedule_contract_requires_stream_phase_boundary_lifetime_coverage() -> None:
+    class Normalize(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value / torch.sum(value, dim=-1, keepdim=True)
+
+    _, result = _solve_module(Normalize(), (torch.ones(5, 32771),))
+    assert result.solution is not None
+    missing = copy.deepcopy(result.solution)
+    stats = missing["steps"][0]["plan"]["phases"][1]
+    assert stats["name"] == "stats" and stats["input_lifetimes"]
+    stats["input_lifetimes"] = []
+
+    with pytest.raises(ScheduleContractError, match="boundary-tensor uses"):
+        scheduled_region(replace(result, solution=missing))
 
 
 def test_schedule_contract_accepts_sparse_cube_resident_identity() -> None:
@@ -556,7 +881,7 @@ def test_source_backend_names_cannot_shadow_the_dsl_or_generated_locals() -> Non
     assert "def main(\n        self,\n        pl:" not in source
 
 
-def test_source_readiness_rejects_multi_output_region() -> None:
+def test_vector_source_emits_multiple_outputs_in_region_abi_order() -> None:
     class TwoOutputs(nn.Module):
         def forward(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             first = torch.exp(value)
@@ -564,9 +889,15 @@ def test_source_readiness_rejects_multi_output_region() -> None:
 
     graph, result = _solve_module(TwoOutputs(), (torch.ones(64, 128),))
 
-    assert not can_emit_region(graph, result)
-    with pytest.raises(SourceEmissionError, match="exactly one region output"):
-        emit_pypto_region(graph, result)
+    assert can_emit_region(graph, result)
+    source = emit_pypto_region(graph, result, program_name="two_outputs").source
+
+    ast.parse(source)
+    assert "output_0: pl.Out[" in source
+    assert "output_1: pl.Out[" in source
+    assert source.count("pl.store(") == 2
+    assert source.index("output_0 = pl.store") < source.index("output_1 = pl.store")
+    assert "return output_0, output_1" in source
 
 
 def test_source_readiness_rejects_transposed_matmul() -> None:
@@ -826,8 +1157,8 @@ def test_pr2335_ragged_layernorm_emits_static_clamped_regions() -> None:
     assert "region_col =" not in source
     assert "strip_row =" not in source
     assert "strip_col =" not in source
-    assert "valid_shape=[22, 256]" in source
-    assert source.count("valid_shape=[1, 256]") == 2
+    assert "[22, 256], target_memory=pl.Mem.Vec" in source
+    assert source.count("[1, 256], target_memory=pl.Mem.Vec") == 2
     assert "region_rows" not in source
     assert "valid_rows" not in source
 
@@ -852,7 +1183,7 @@ def test_ragged_pointwise_clamps_region_and_strip_origins_not_shapes() -> None:
     assert "strip_row = pl.min(strip_index * 9, 8)" in source
     assert "region_col =" not in source
     assert "strip_col =" not in source
-    assert "valid_shape=[9, 65]" in source
+    assert "[9, 65], target_memory=pl.Mem.Vec" in source
     assert "valid_rows" not in source
     assert "valid_cols" not in source
 
@@ -917,8 +1248,8 @@ def test_cast_chain_alignment_is_local_to_its_physical_shape_class() -> None:
     assert body_frames[bias_tensor].physical[0] == 8
     assert body_frames[bias_tensor].physical[1] == 1
     source = emit_pypto_region(graph, result).source
-    assert "[8, 1], valid_shape=[3, 1]" in source
-    assert "[32, 1], valid_shape=[3, 1]" not in source
+    assert "[8, 1], [3, 1], target_memory=pl.Mem.Vec" in source
+    assert "[32, 1], [3, 1], target_memory=pl.Mem.Vec" not in source
 
 
 def test_softmax_source_rejects_loop_or_generated_work_drift() -> None:

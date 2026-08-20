@@ -65,13 +65,13 @@ The problem is specified in a JSON file containing the graph topology and hardwa
 
 ### Output
 
-The current executable writes the versioned `pto_fusebox.solution.v2` schema.
+The current executable writes the versioned `pto_fusebox.solution.v3` schema.
 Each selected kernel is one nested step so its common launch contract and
 family-specific plan cannot drift through misaligned parallel arrays.
 
 ```json
 {
-  "schema_version": "pto_fusebox.solution.v2",
+  "schema_version": "pto_fusebox.solution.v3",
   "steps": [
     {
       "kind": "cube",
@@ -84,7 +84,6 @@ family-specific plan cannot drift through misaligned parallel arrays.
         "cores": 4
       },
       "sequential_tiles": [128, 0],
-      "retain": [1],
       "latency_cycles": 2048.0,
       "plan": {
         "...": "typed vector, cube, or mixed schedule descriptor"
@@ -98,9 +97,10 @@ family-specific plan cannot drift through misaligned parallel arrays.
 diagnostic summary. A derived family plan can have different physical replay
 frames—for example, a reduction's free output axis and streamed input axis.
 The nested `plan` is authoritative for intra-kernel order, lifetimes, physical
-frames, loops, memory policy, and family-specific traffic. `retain` controls
-inter-kernel persistence, and `latency_cycles` is the complete modeled latency
-of the step. The strict Python decoder rejects missing, unknown, or conflicting
+frames, loops, memory policy, and family-specific traffic. Cross-kernel values
+are explicit GM dependencies; cube-local retention remains inside the cube
+plan. `latency_cycles` is the complete modeled latency of the step. The strict
+Python decoder rejects missing, unknown, or conflicting
 fields before source emission. See `doc/torch_to_pypto_frontend.md` for the
 current typed problem/solution and PyPTO source-generation contract.
 
@@ -108,7 +108,7 @@ current typed problem/solution and PyPTO source-generation contract.
 
 This section preserves five legacy competition-format examples to demonstrate
 the core trade-offs. Their parallel-array output snippets are conceptual; the
-current executable serializes the equivalent choices as nested `solution.v2`
+current executable serializes the equivalent choices as nested `solution.v3`
 steps described above.
 
 ### Example 1: Baseline

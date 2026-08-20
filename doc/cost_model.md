@@ -395,67 +395,49 @@ membership validate acyclicity before applying.
 
 ### 8.1 Schedule Structure
 
-A solution is an ordered sequence of `ScheduleStep`:
+Internally, a solution is an ordered sequence of `ScheduleStep`:
 
 ```cpp
 struct ScheduleStep {
     Subgraph subgraph;
     TileConfig config;
-    std::set<size_t> retain_these;  // outputs to keep for next step
+    std::set<size_t> retain_these;  // legacy competition mechanism
 };
 ```
 
+The production Ascend 910B solver deliberately disables cross-kernel
+fast-memory retention: `solver.cpp` constructs every selected step with an
+empty `retain_these`, because separate kernels exchange values through GM.
+`pto_fusebox.solution.v3` therefore does not publish a retention field, and its
+serializer rejects a non-empty entering or outgoing retain set. Cube-local
+resident values and retained panels are different: they live inside one cube
+step and are serialized in its nested cube plan.
+
 ### 8.2 Total Latency
 
-Computed in the `Solution` constructor by propagating retention state:
+The active 910B path sums each selected subgraph's fixed cost with an empty
+cross-kernel retention context:
 
 ```cpp
-set<size_t> currently_retained = {};  // fast-memory contents
-
 for each step i:
-    retained_entering[i] = currently_retained;
-
     step_costs[i] = subgraph.compute_cost(
         config[i],
-        currently_retained,    // tensors available from step i-1
-        retain_these[i]        // tensors to keep for step i+1
+        {},  // no tensor enters from a previous kernel
+        {}   // no tensor remains for a later kernel
     );
-
     total_latency += step_costs[i].latency;
-    currently_retained = retain_these[i];
 ```
 
-Retention affects cost in two ways:
-1. **Producing step**: retained output skips eviction
-   (saves `tensor_size / bandwidth`).
-2. **Consuming step**: retained tensor skips loading
-   (saves `slice_size / bandwidth`, but adds `full_tensor_size`
-   to working set capacity).
+The generic `Solution` implementation still understands retention so the
+historical competition model and tests remain reproducible, but that state is
+not a source-emittable 910B schedule.
 
-### 8.3 Retention Lifetime
+### 8.3 Ordering Algorithms
 
-A retained tensor lives for exactly one step transition:
-`retain_these[k]` keeps tensors from step k into step k+1. After
-step k+1 completes, they are freed. To keep a tensor for step k+2,
-step k+1 must produce it (recomputation) and retain it again.
-
-### 8.4 Ordering Algorithms
-
-**DFS ordering** (`src/solution/ordering.cpp`): greedy topological
-sort. Picks the ready group that maximizes `retain_score` (total size
-of shared boundary tensors with the previous group). Fast: O(N log N).
-
-**Beam search ordering**: tracks fast-memory residency explicitly.
-For each candidate group, evaluates cost with different combinations
-of entering and retain sets. Keeps top-K states by total latency.
-Quality-focused but O(N^2 * beam_width).
-
-### 8.5 `steps_from_ordering()`
-
-Converts an `OrderingResult` into `ScheduleStep` objects with fallback:
-1. Try full retention context (entering + retain).
-2. If infeasible, drop retain (entering only).
-3. If still infeasible, drop both (baseline, always cached from Phase 1).
+DFS and Gorder provide interchangeable topological orders. With cross-kernel
+retention disabled, ordering does not grant a hidden fast-memory discount; all
+cut values are priced and emitted as GM traffic. Reuse-aware ordering coupled
+to eviction/reload decisions remains a separate research direction.
 
 ---
 
@@ -473,21 +455,20 @@ Phase 1 (Partition search):
   total_cost = sum of group costs
 
 Phase 2 (Solution construction):
-  OrderingResult → steps_from_ordering()
-    → Subgraph::best_cost(entering, retain)
-      → compute_cost with retention context
-    → cache in retention_map
-  Solution(steps) → propagate retention → total_latency
+  topological ordering → steps with empty cross-kernel retain sets
+    → Subgraph::best_cost({}, {})
+    → Solution(steps) → sum step latencies
 
-Phase 3 (Solution evolution):
-  Mutate solution steps → re-evaluate with retention
-    → CostCache::evaluate_with_context()
-    → total_latency from Solution constructor
+Phase 3 (retention/coupling): skipped on Ascend 910B
 ```
 
 ---
 
 ## 10. Verified Against Reference Examples
+
+This table preserves the historical competition reference surface. Its
+cross-kernel `Retain` row exercises the generic legacy model, not the active
+Ascend 910B source contract described above.
 
 | Ex | Scenario                  | Strategy              | Expected | Model |
 |----|---------------------------|-----------------------|----------|-------|

@@ -3,23 +3,50 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from ..ir import NormalizedGraph, normalized_graph_sha256
-from ..lowered import LoweredContractError, lowered_region
-from ..schedule import KernelKind, ScheduleContractError, scheduled_region
+from ..lowered import LoweredContractError, LoweredRegion, lowered_region
+from ..schedule import (
+    KernelKind,
+    KernelStep,
+    ScheduleContractError,
+    ScheduledRegion,
+    scheduled_region,
+)
 from ..solver import RegionSolveResult
-from .common import EmissionContext, SourceEmissionError, class_name, interface
+from .common import (
+    EmissionContext,
+    Interface,
+    SourceEmissionError,
+    SourceWriter,
+    class_name,
+    emit_return,
+    interface,
+    program_preamble,
+    pypto_dtype,
+    solver_tensor_for_value,
+    static_shape,
+)
 
 
 @dataclass(frozen=True)
 class EmittedPyPTOSource:
-    """One deterministic PyPTO program and the schedule step it implements."""
+    """One deterministic PyPTO program and the ordered step kinds it implements."""
 
     program_name: str
     region_id: str
-    kind: KernelKind
+    kinds: tuple[KernelKind, ...]
     source: str
+
+    @property
+    def kind(self) -> KernelKind | None:
+        """Return the uniform kind, or ``None`` for a cross-kind program."""
+
+        unique = set(self.kinds)
+        return next(iter(unique)) if len(unique) == 1 else None
 
 
 def can_emit_region(graph: NormalizedGraph, result: RegionSolveResult) -> bool:
@@ -30,8 +57,15 @@ def can_emit_region(graph: NormalizedGraph, result: RegionSolveResult) -> bool:
     """
 
     try:
-        context = _emission_context(graph, result)
-        _render(context, "FuseboxReadinessProbe")
+        lowered, schedule, region_interface = _emission_contract(graph, result)
+        _render_region(
+            graph,
+            result.problem,
+            lowered,
+            schedule,
+            region_interface,
+            "FuseboxReadinessProbe",
+        )
     except (LoweredContractError, ScheduleContractError, SourceEmissionError):
         return False
     return True
@@ -46,45 +80,322 @@ def emit_pypto_region(
     """Emit one solver-owned homogeneous schedule as ordinary PyPTO DSL."""
 
     try:
-        context = _emission_context(graph, result)
+        lowered, schedule, region_interface = _emission_contract(graph, result)
     except (LoweredContractError, ScheduleContractError) as error:
         raise SourceEmissionError(str(error)) from error
     chosen_name = class_name(program_name or f"fused_{result.region.id}")
-    source = _render(context, chosen_name)
+    source = _render_region(
+        graph,
+        result.problem,
+        lowered,
+        schedule,
+        region_interface,
+        chosen_name,
+    )
     return EmittedPyPTOSource(
         program_name=chosen_name,
-        region_id=context.region_id,
-        kind=context.step.kind,
+        region_id=lowered.region_id,
+        kinds=tuple(step.kind for step in schedule.steps),
         source=source,
     )
 
 
-def _emission_context(
+def _emission_contract(
     graph: NormalizedGraph, result: RegionSolveResult
-) -> EmissionContext:
+) -> tuple[LoweredRegion, ScheduledRegion, Interface]:
     if result.problem is None:
         raise SourceEmissionError("source emission requires a lowered problem")
     schedule = scheduled_region(result)
     lowered = lowered_region(result)
-    if len(schedule.steps) != 1:
-        raise SourceEmissionError(
-            "source v1 requires exactly one selected kernel step; "
-            f"the solver selected {len(schedule.steps)}"
-        )
     if schedule.region_id != lowered.region_id:
         raise SourceEmissionError("problem and solution region identities disagree")
     if normalized_graph_sha256(graph) != lowered.normalized_graph_sha256:
         raise SourceEmissionError(
             "supplied normalized graph does not match the graph used to solve the region"
         )
-    return EmissionContext(
-        graph=graph,
-        problem=result.problem,
-        lowered=lowered,
-        schedule=schedule,
-        step=schedule.steps[0],
-        interface=interface(graph, lowered),
+    return lowered, schedule, interface(graph, lowered)
+
+
+def _render_region(  # noqa: PLR0913
+    graph: NormalizedGraph,
+    problem: Mapping[str, Any] | None,
+    lowered: LoweredRegion,
+    schedule: ScheduledRegion,
+    region_interface: Interface,
+    program_name: str,
+) -> str:
+    if problem is None:
+        raise SourceEmissionError("source emission requires an object problem")
+    if len(schedule.steps) == 1:
+        context = EmissionContext(
+            graph=graph,
+            problem=problem,
+            lowered=lowered,
+            schedule=schedule,
+            step=schedule.steps[0],
+            interface=region_interface,
+        )
+        return _render(context, program_name)
+    return _render_steps(
+        graph,
+        problem,
+        lowered,
+        schedule,
+        region_interface,
+        program_name,
     )
+
+
+def _render_steps(  # noqa: PLR0913
+    graph: NormalizedGraph,
+    problem: Mapping[str, Any],
+    lowered: LoweredRegion,
+    schedule: ScheduledRegion,
+    region_interface: Interface,
+    program_name: str,
+) -> str:
+    """Compose cut homogeneous steps as dependency-linked SPMD launches."""
+
+    producer = _tensor_producers(lowered)
+    consumers = _tensor_consumers(lowered)
+    step_by_op = {
+        operation: step.index
+        for step in schedule.steps
+        for operation in step.solver_ops
+    }
+    if len(step_by_op) != len(lowered.operations):
+        raise SourceEmissionError("selected steps do not cover every lowered operation")
+
+    boundary_tensors: set[int] = set()
+    for tensor, producer_op in enumerate(producer):
+        if producer_op is None:
+            continue
+        producer_step = step_by_op[producer_op]
+        consumer_steps = {
+            step_by_op[consumer]
+            for consumer in consumers[tensor]
+            if step_by_op[consumer] != producer_step
+        }
+        if any(consumer_step <= producer_step for consumer_step in consumer_steps):
+            raise SourceEmissionError(
+                f"inter-step tensor {tensor} is consumed before its producer launch"
+            )
+        if consumer_steps:
+            boundary_tensors.add(tensor)
+    boundary_tensors.update(lowered.required_outputs)
+
+    values = graph.value_map()
+    tensor_variables: dict[int, str] = {}
+    for tensor_index in sorted(boundary_tensors):
+        tensor = lowered.tensor(tensor_index)
+        if tensor.synthetic or tensor.value_id not in values:
+            raise SourceEmissionError(
+                f"inter-step tensor {tensor_index} has no source-level graph value"
+            )
+        if tensor_index in lowered.required_outputs:
+            output_value = _region_output_for_tensor(
+                lowered, region_interface, tensor_index
+            )
+            tensor_variables[tensor_index] = region_interface.output_arguments[
+                output_value
+            ]
+        else:
+            tensor_variables[tensor_index] = f"intermediate_tensor_{tensor_index}"
+
+    writer = program_preamble(program_name, region_interface, graph)
+    for tensor_index in sorted(boundary_tensors):
+        if tensor_index in lowered.required_outputs:
+            continue
+        tensor = lowered.tensor(tensor_index)
+        shape = static_shape(values[tensor.value_id], field="inter-step tensor")
+        writer.line(
+            2,
+            f"{tensor_variables[tensor_index]} = pl.create_tensor("
+            f"[{shape[0]}, {shape[1]}], dtype={pypto_dtype(tensor.dtype)})",
+        )
+
+    for step in schedule.steps:
+        step_interface = _step_interface(
+            step,
+            lowered,
+            producer,
+            consumers,
+            step_by_op,
+            boundary_tensors,
+            tensor_variables,
+            region_interface,
+        )
+        context = EmissionContext(
+            graph=graph,
+            problem=problem,
+            lowered=lowered,
+            schedule=schedule,
+            step=step,
+            interface=step_interface,
+        )
+        step_source = _render(context, f"{program_name}Step{step.index}")
+        _append_spmd_statement(
+            writer,
+            step_source,
+            step.index,
+            protected=set(step_interface.input_arguments.values())
+            | set(step_interface.output_arguments.values()),
+        )
+    emit_return(writer, region_interface)
+    return writer.render()
+
+
+def _step_interface(  # noqa: PLR0913
+    step: KernelStep,
+    lowered: LoweredRegion,
+    producer: tuple[int | None, ...],
+    consumers: tuple[tuple[int, ...], ...],
+    step_by_op: dict[int, int],
+    boundary_tensors: set[int],
+    tensor_variables: dict[int, str],
+    region_interface: Interface,
+) -> Interface:
+    step_ops = set(step.solver_ops)
+    inputs: dict[str, str] = {}
+    outputs: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for operation_index in step.op_order:
+        operation = lowered.operation(operation_index)
+        for tensor_index in operation.inputs:
+            producer_op = producer[tensor_index]
+            if producer_op in step_ops:
+                continue
+            tensor = lowered.tensor(tensor_index)
+            if producer_op is None:
+                try:
+                    inputs[tensor.value_id] = region_interface.input_arguments[
+                        tensor.value_id
+                    ]
+                except KeyError as error:
+                    raise SourceEmissionError(
+                        f"step {step.index} input {tensor.value_id!r} is absent from the region ABI"
+                    ) from error
+            else:
+                inputs[tensor.value_id] = tensor_variables[tensor_index]
+        for tensor_index in operation.outputs:
+            if tensor_index not in boundary_tensors:
+                continue
+            if (
+                not any(
+                    step_by_op[consumer] != step.index
+                    for consumer in consumers[tensor_index]
+                )
+                and tensor_index not in lowered.required_outputs
+            ):
+                continue
+            tensor = lowered.tensor(tensor_index)
+            if tensor_index in lowered.required_outputs:
+                output_value = _region_output_for_tensor(
+                    lowered, region_interface, tensor_index
+                )
+                outputs[output_value] = tensor_variables[tensor_index]
+                owners[output_value] = region_interface.output_allocation_owners[
+                    output_value
+                ]
+            else:
+                outputs[tensor.value_id] = tensor_variables[tensor_index]
+                owners[tensor.value_id] = tensor.value_id
+    if not outputs:
+        raise SourceEmissionError(
+            f"step {step.index} has no materialized boundary output"
+        )
+    return Interface(inputs, outputs, owners)
+
+
+def _append_spmd_statement(
+    writer: SourceWriter,
+    source: str,
+    step_index: int,
+    *,
+    protected: set[str],
+) -> None:
+    tree = ast.parse(source)
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    if len(classes) != 1:
+        raise SourceEmissionError(
+            "one homogeneous step must emit exactly one program class"
+        )
+    functions = [node for node in classes[0].body if isinstance(node, ast.FunctionDef)]
+    if len(functions) != 1:
+        raise SourceEmissionError(
+            "one homogeneous step must emit exactly one orchestration function"
+        )
+    function = functions[0]
+    if (
+        len(function.body) != 2
+        or not isinstance(function.body[0], ast.For)
+        or not isinstance(function.body[1], ast.Return)
+    ):
+        raise SourceEmissionError(
+            "one homogeneous step must contain only one SPMD loop and its return"
+        )
+    loop = function.body[0]
+    if not (
+        isinstance(loop.iter, ast.Call)
+        and isinstance(loop.iter.func, ast.Attribute)
+        and isinstance(loop.iter.func.value, ast.Name)
+        and loop.iter.func.value.id == "pl"
+        and loop.iter.func.attr == "spmd"
+    ):
+        raise SourceEmissionError("homogeneous step loop must be a pl.spmd grid")
+    local_names = {
+        node.id
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id not in protected
+    }
+
+    class PrefixLocals(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.Name:  # noqa: N802
+            if node.id in local_names:
+                node.id = f"step_{step_index}_{node.id}"
+            return node
+
+    loop = PrefixLocals().visit(loop)
+    ast.fix_missing_locations(loop)
+    lines = ast.unparse(loop).splitlines()
+    for line in lines:
+        leading = len(line) - len(line.lstrip(" "))
+        writer.line(2 + leading // 4, line.lstrip())
+
+
+def _region_output_for_tensor(
+    lowered: LoweredRegion,
+    region_interface: Interface,
+    tensor_index: int,
+) -> str:
+    matches = [
+        output_value
+        for output_value, owner in region_interface.output_allocation_owners.items()
+        if solver_tensor_for_value(lowered, owner) == tensor_index
+    ]
+    if len(matches) != 1:
+        raise SourceEmissionError(
+            f"solver tensor {tensor_index} does not map to one region output"
+        )
+    return matches[0]
+
+
+def _tensor_producers(lowered: LoweredRegion) -> tuple[int | None, ...]:
+    producers: list[int | None] = [None] * len(lowered.tensors)
+    for operation in lowered.operations:
+        for tensor in operation.outputs:
+            producers[tensor] = operation.index
+    return tuple(producers)
+
+
+def _tensor_consumers(lowered: LoweredRegion) -> tuple[tuple[int, ...], ...]:
+    consumers: list[list[int]] = [[] for _ in lowered.tensors]
+    for operation in lowered.operations:
+        for tensor in operation.inputs:
+            consumers[tensor].append(operation.index)
+    return tuple(tuple(items) for items in consumers)
 
 
 def _render(context: EmissionContext, program_name: str) -> str:

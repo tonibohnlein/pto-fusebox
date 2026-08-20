@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed one-matmul cube candidate
-  with its modeled cost and ordinary `solution.v2` replay payload; and
+  with its modeled cost and ordinary `solution.v3` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:
@@ -106,17 +106,21 @@ that determines solver geometry or participates in tensor arithmetic is an
 explicit scheduling boundary. The reader does not yet specialize shape
 buckets, emit runtime dispatch, or plan dynamic physical tiles.
 
-Unsupported operations remain explicit graph boundaries. The first source
-backend emits one selected homogeneous step: materialized/pointwise vector
-replay, the versioned two-pass online-softmax schedule, or one spatial cube
-matmul. Other schedules raise a precise
-`SourceEmissionError` rather than being approximated. Each maximal supported
-region is one solver input DAG, not one mandatory fused kernel: the solver may
-partition it into several feasible groups and may select supported mixed
-cube/vector groups. Multi-step and mixed source emission remain follow-ups.
+Unsupported operations remain explicit graph boundaries. The source backend
+replays supported homogeneous vector and cube steps from the selected schedule.
+Vector source covers materialized/pointwise replay, versioned two-pass online
+softmax, and one-reduction folded or spanning streams. Cube source covers
+uniform non-split spatial plans, nested matmul DAGs, sequential outer-K windows,
+on-chip produced values, and solver-selected retained boundary panels. Other
+schedules raise a precise `SourceEmissionError` rather than being approximated.
+Each maximal supported region is one solver input DAG, not one mandatory fused
+kernel: when the solver selects several homogeneous steps, source emission
+materializes their cut edges through explicit GM tensors and emits the steps as
+dependency-linked `pl.spmd` launches in solver order. Mixed steps and split-K
+source remain follow-ups.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v2`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v3`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
@@ -130,8 +134,9 @@ clamps ragged-edge origins backwards, so generated source preserves static tile
 shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
-Other analytically feasible streamed and mixed schedules remain explicitly not
-source-ready until their complete state/transport contracts are serialized.
+Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
+cube spatial partitions, split-K, and mixed schedules remain explicitly not
+source-ready until their complete state or transport contracts are serialized.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
@@ -179,8 +184,9 @@ not fit a second model in Python. Each entry records the model cost and embeds
 the exact forced solution. The predeclared device surface in
 `test/device/cube_model_cases.py` covers underfill, balanced, ragged-K,
 outer-K, rectangular-reuse, and split-K-positive shapes. Candidates beyond the
-current source backend—most notably split-K and retained panels—remain useful
-analytic evidence but fail closed instead of being approximated by source.
+current source backend—most notably split-K and mixed cross-core plans—remain
+useful analytic evidence but fail closed instead of being approximated by
+source.
 
 The generated-source silicon matrix is opt-in and is not part of the default
 host suite. It covers 14 vector and 10 single-matmul cube programs, compiles

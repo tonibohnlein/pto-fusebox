@@ -93,7 +93,6 @@ def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
                 "launch",
                 "sequential_tiles",
                 "plan",
-                "retain",
                 "latency_cycles",
             },
             field=f"steps[{index}]",
@@ -135,18 +134,6 @@ def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
                 raise ScheduleContractError(
                     f"steps[{index}].sequential_tiles must align with op_order"
                 )
-        retained_tensors = tuple(
-            _bounded_int(
-                tensor,
-                f"steps[{index}].retain",
-                len(result.solver_tensor_to_value),
-            )
-            for tensor in _sequence(item.get("retain"), f"steps[{index}].retain")
-        )
-        if len(retained_tensors) != len(set(retained_tensors)):
-            raise ScheduleContractError(
-                f"steps[{index}].retain contains duplicate tensor ids"
-            )
         launch = _parse_launch(item.get("launch"), field=f"steps[{index}].launch")
         kind = _enum(KernelKind, item.get("kind"), f"steps[{index}].kind")
         plan_value = item.get("plan")
@@ -205,7 +192,6 @@ def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
                 graph_ops=tuple(graph_mapping[op] for op in solver_ops),
                 op_order=order,
                 sequential_tiles=sequential_tiles,
-                retained_tensors=retained_tensors,
                 launch=launch,
                 latency=latency,
                 plan=plan,
@@ -258,6 +244,10 @@ def _validate_vector_phase_links(
 
     step_set = set(step_ops)
     step_positions = {op: position for position, op in enumerate(step_order)}
+    producer_by_tensor: dict[int, int] = {}
+    for operation in lowered.operations:
+        for tensor in operation.outputs:
+            producer_by_tensor[tensor] = operation.index
     for phase in plan.phases:
         phase_field = f"{field}.phases[{phase.name.value}]"
         if not set(phase.ops).issubset(step_set):
@@ -352,6 +342,22 @@ def _validate_vector_phase_links(
                     f"{phase_field} lifetime tensor {lifetime.tensor} has stale "
                     "first/last use positions"
                 )
+        expected_boundary_uses = {
+            (op, argument)
+            for op in phase.ops
+            for argument, tensor in enumerate(lowered.operation(op).inputs)
+            if tensor not in producer_by_tensor
+        }
+        actual_boundary_uses = {
+            (use.op, use.arg)
+            for lifetime in phase.input_lifetimes
+            for use in lifetime.uses
+        }
+        if actual_boundary_uses != expected_boundary_uses:
+            raise ScheduleContractError(
+                f"{phase_field} input lifetimes do not cover exactly the "
+                "boundary-tensor uses"
+            )
     _validate_vector_p4_contract(plan, lowered=lowered, field=field)
 
 

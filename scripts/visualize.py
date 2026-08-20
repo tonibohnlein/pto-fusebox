@@ -151,7 +151,7 @@ def build_instance_dot(problem: JsonObject) -> str:
 
 def _tensor_roles(
     problem: JsonObject, solution: JsonObject
-) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
+) -> tuple[dict[int, list[str]], dict[int, list[int]]]:
     tensor_count = len(problem["widths"])
     producer: dict[int, int] = {}
     consumers: dict[int, list[int]] = {tensor: [] for tensor in range(tensor_count)}
@@ -168,20 +168,12 @@ def _tensor_roles(
         for op in ops:
             op_steps.setdefault(op, []).append(step)
 
-    retained: dict[int, list[int]] = {}
-    for step, item in enumerate(steps):
-        tensors = item.get("retain", [])
-        for tensor in tensors:
-            retained.setdefault(tensor, []).append(step)
-
     roles: dict[int, list[str]] = {}
     required = set(problem.get("required_outputs", []))
     for tensor in range(tensor_count):
         tensor_roles: list[str] = []
-        if tensor in retained:
-            tensor_roles.append(f"retained {','.join(map(str, retained[tensor]))}")
         prod = producer.get(tensor)
-        prod_steps = set(op_steps.get(prod, []))
+        prod_steps = set() if prod is None else set(op_steps.get(prod, []))
         consumer_steps = {
             step for op in consumers[tensor] for step in op_steps.get(op, [])
         }

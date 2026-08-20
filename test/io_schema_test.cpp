@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 
@@ -70,9 +71,24 @@ int main() {
   Solution empty(problem, dag, {});
   const auto solution = nlohmann::json::parse(solution_json(empty));
   check("solution schema is published",
-        solution.at("schema_version") == "pto_fusebox.solution.v2");
+        solution.at("schema_version") == "pto_fusebox.solution.v3");
   check("solution steps are nested", solution.at("steps").is_array());
   check("empty solution has no steps", solution.at("steps").empty());
+
+  auto producer = Subgraph::create(problem, dag, {0});
+  check("retention serializer control subgraph creates", producer.has_value());
+  if (producer) {
+    const auto cost = producer->best_cost();
+    Solution retained(problem, dag,
+                      {{*producer, cost.config, FlatSet<size_t>{1}}});
+    bool rejected = false;
+    try {
+      static_cast<void>(solution_json(retained));
+    } catch (const std::logic_error&) {
+      rejected = true;
+    }
+    check("solution schema rejects cross-kernel retention", rejected);
+  }
 
   std::remove(path.c_str());
   std::cout << g_pass << " passed, " << g_fail << " failed\n";

@@ -63,7 +63,9 @@ def _lowered_region(
         (64, 272, 80, True),
         (32, 736, 64, True),
         (64, 512, 256, True),
-        (128, 8192, 128, False),
+        # The selected plan is split-K and remains source-model-ahead, while
+        # non-split candidates for the same problem are valid source replays.
+        (128, 8192, 128, True),
     ),
 )
 def test_cube_model_surface_enumerates_replayable_forced_solutions(

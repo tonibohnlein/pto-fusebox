@@ -66,8 +66,10 @@ its last use, and the candidate is infeasible when that policy exceeds L1 capaci
 sweep charges:
 
 1. every produced region live from its producer through its last requesting consumer;
-2. the current operation's boundary-operand K strip;
-3. retained tensors supplied by the outer solver.
+2. the current operation's boundary-operand K strip.
+
+The active Ascend 910B solver passes no cross-kernel retained tensors into this sweep. Cube-local
+resident boundary values and retained panels are represented inside the cube plan itself.
 
 An internally produced operand is already a live region and is not charged again as a boundary
 strip. A boundary root output is not charged to L1 because its accumulator drains through L0C to GM.
@@ -297,7 +299,7 @@ candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
 
-Each sweep entry embeds an ordinary `pto_fusebox.solution.v2` payload. The
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v3` payload. The
 Python `enumerate_cube_plans()` adapter validates the envelope and
 `region_for_cube_candidate()` binds one candidate back to the exact lowered
 problem for source replay. The adapter never re-plans or changes a cost.
@@ -313,9 +315,10 @@ The initial validation matrix is fixed before silicon timing and covers:
 
 Model-ranking validation and source-emitter validation are separate claims.
 Only candidates accepted by the typed source backend may be timed as generated
-source. Analytic split-K or retained-panel winners remain model-ahead evidence
-until their explicit PyPTO algorithms exist; they must not be silently replaced
-by split=1 or reload schedules. No coefficient is fitted from these rankings.
+source. The source backend replays retained panels for non-split plans; analytic
+split-K winners remain model-ahead evidence until their explicit PyPTO
+algorithm exists and must not be silently replaced by split=1. No coefficient
+is fitted from these rankings.
 
 ---
 

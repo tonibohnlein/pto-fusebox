@@ -24,6 +24,7 @@ from .common import (
     SourceWriter,
     ceil_div,
     emit_partition_indices,
+    emit_return,
     literal,
     program_header,
     pypto_dtype,
@@ -47,10 +48,6 @@ def emit_vector(
     plan = step.plan
     if not isinstance(plan, VectorKernelPlan):
         raise SourceEmissionError("vector step does not carry a vector plan")
-    if step.retained_tensors:
-        raise SourceEmissionError(
-            "single-step vector source cannot carry inter-kernel retained tensors"
-        )
     if plan.coordinate_transform is not VectorCoordinateTransform.NONE:
         raise SourceEmissionError(
             "vector coordinate transforms are not implemented in source v1"
@@ -70,6 +67,11 @@ def emit_vector(
         )
     if plan.kind is VectorStreamKind.SOFTMAX_FLASH:
         return _emit_softmax_flash(context, program_name, plan)
+    if plan.kind in {
+        VectorStreamKind.REDUCTION_FOLDED,
+        VectorStreamKind.REDUCTION_SPANNING,
+    }:
+        return _emit_streamed_reduction(context, program_name, plan)
     if plan.kind not in {
         VectorStreamKind.MATERIALIZED,
         VectorStreamKind.POINTWISE,
@@ -90,9 +92,16 @@ def emit_vector(
     m_partition = plan.m_partition
     n_partition = plan.n_partition
     validate_grid(step, plan.work_units, m_partition, n_partition)
-    output_rows, output_cols = static_shape(
-        graph.value_map()[io.output_value], field="vector output"
-    )
+    output_shapes = {
+        value_id: static_shape(graph.value_map()[value_id], field="vector output")
+        for value_id in io.output_values
+    }
+    unique_output_shapes = set(output_shapes.values())
+    if len(unique_output_shapes) != 1:
+        raise SourceEmissionError(
+            "one vector step requires all region outputs to share its iteration frame"
+        )
+    output_rows, output_cols = next(iter(unique_output_shapes))
     validate_partition_extent(m_partition, output_rows, "vector.m_partition")
     validate_partition_extent(n_partition, output_cols, "vector.n_partition")
     tile = list(plan.tile)
@@ -185,8 +194,493 @@ def emit_vector(
         col_offset=_sum_offsets(coordinates.col, strip_col),
         plan=plan,
     )
-    writer.line(2, f"return {io.output_argument}")
+    emit_return(writer, io)
     return writer.render()
+
+
+def _emit_streamed_reduction(
+    context: EmissionContext,
+    program_name: str,
+    plan: VectorKernelPlan,
+) -> str:
+    """Replay a one-reduction stream from its typed phase contract.
+
+    The implementation is intentionally semantic-pattern agnostic: the
+    serialized phase operation lists decide which pointwise cone runs before
+    the reduction, after the reduction, and in the optional second wide pass.
+    Only the reduction merge itself is synthesized because it is the
+    loop-carried operation introduced by the schedule rather than an op in the
+    source DAG.
+    """
+
+    graph = context.graph
+    lowered = context.lowered
+    step = context.step
+    io = context.interface
+    if plan.axis != 1 or plan.physical_frame.reduced_axis != 1:
+        raise SourceEmissionError(
+            "streamed reduction source currently supports the last axis only"
+        )
+    if plan.chunk <= 0 or plan.full_chunks <= 0:
+        raise SourceEmissionError("streamed reduction has incomplete chunk geometry")
+    if plan.full_chunks * plan.chunk + plan.tail != plan.extent:
+        raise SourceEmissionError("streamed reduction chunks do not cover the extent")
+    if step.sequential_tiles is None or tuple(step.sequential_tiles) != (
+        plan.chunk,
+    ) * len(step.solver_ops):
+        raise SourceEmissionError(
+            "streamed reduction sequential tiles differ from its chunk"
+        )
+    expected_passes = 2 if plan.kind is VectorStreamKind.REDUCTION_SPANNING else 1
+    if plan.stream_passes != expected_passes:
+        raise SourceEmissionError("streamed reduction pass count is inconsistent")
+
+    stats = plan.phase(VectorReplayPhase.STATS)
+    apply = plan.phase(VectorReplayPhase.APPLY)
+    finalize = plan.phase(VectorReplayPhase.FINALIZE)
+    reduction_ops = [
+        op
+        for op in stats.ops
+        if graph.op_map()[lowered.operation(op).graph_op_id].kind in {"sum", "max"}
+    ]
+    if len(reduction_ops) != 1:
+        raise SourceEmissionError(
+            "streamed reduction stats phase must contain exactly one reduction"
+        )
+    reduction_op = reduction_ops[0]
+    reduction_kind = graph.op_map()[lowered.operation(reduction_op).graph_op_id].kind
+    reduction_tensor = lowered.operation(reduction_op).outputs[0]
+    _validate_reduction_stream_loops(plan, stats, apply, finalize)
+
+    m_partition = plan.m_partition
+    n_partition = plan.n_partition
+    validate_grid(step, plan.work_units, m_partition, n_partition)
+    validate_partition_extent(
+        m_partition,
+        plan.physical_frame.iteration_rows,
+        "vector.m_partition",
+    )
+    expected_n_extent = plan.extent if expected_passes == 2 else 1
+    validate_partition_extent(n_partition, expected_n_extent, "vector.n_partition")
+    if n_partition.parts != 1:
+        raise SourceEmissionError(
+            "streamed last-axis reduction requires one reduced-axis partition"
+        )
+    if plan.tile != (
+        m_partition.big,
+        plan.physical_frame.iteration_cols,
+    ):
+        raise SourceEmissionError(
+            "streamed reduction tile differs from its iteration frame"
+        )
+
+    writer = program_header(
+        program_name,
+        io,
+        graph,
+        plan.work_units,
+        kernel_name_hint=context.region_id + "_vector",
+    )
+    indent = 3
+    coordinates = emit_partition_indices(
+        writer,
+        indent,
+        m_partition,
+        n_partition,
+        clamped_overlap_extents=(
+            plan.physical_frame.iteration_rows,
+            expected_n_extent,
+        ),
+    )
+
+    initial = _emit_reduction_phase_chunk(
+        writer,
+        indent,
+        context,
+        stats,
+        prefix="stats_initial",
+        row_offset=coordinates.row,
+        col_offset="0",
+        valid_cols=plan.chunk,
+        frame_cols=plan.chunk,
+    )
+    running_state = initial[reduction_tensor]
+    if stats.loop is None:
+        raise SourceEmissionError("streamed reduction stats phase omits its loop")
+    if stats.loop.trip_count:
+        _emit_loop_header(
+            writer,
+            indent,
+            "stats_chunk",
+            stats.loop,
+            iter_values=("stats_state",),
+            init_values=(running_state,),
+        )
+        loop_indent = indent + 1
+        writer.line(loop_indent, f"stats_col = stats_chunk * {plan.chunk}")
+        chunk_values = _emit_reduction_phase_chunk(
+            writer,
+            loop_indent,
+            context,
+            stats,
+            prefix="stats",
+            row_offset=coordinates.row,
+            col_offset="stats_col",
+            valid_cols=plan.chunk,
+            frame_cols=plan.chunk,
+        )
+        merged = _emit_reduction_merge(
+            writer,
+            loop_indent,
+            reduction_kind,
+            "stats_state",
+            chunk_values[reduction_tensor],
+            "stats_next_state",
+        )
+        writer.line(loop_indent, f"stats_result = pl.yield_({merged})")
+        running_state = "stats_result"
+    if plan.tail:
+        if stats.tail is None or not stats.tail.present:
+            raise SourceEmissionError("streamed reduction stats phase omits its tail")
+        tail_values = _emit_reduction_phase_chunk(
+            writer,
+            indent,
+            context,
+            stats,
+            prefix="stats_tail",
+            row_offset=coordinates.row,
+            col_offset=str(plan.full_chunks * plan.chunk),
+            valid_cols=plan.tail,
+            frame_cols=plan.chunk,
+        )
+        running_state = _emit_reduction_merge(
+            writer,
+            indent,
+            reduction_kind,
+            running_state,
+            tail_values[reduction_tensor],
+            "stats_tail_state",
+        )
+
+    thin_values = {reduction_tensor: running_state}
+    if finalize.ops:
+        thin_values = _emit_reduction_phase_chunk(
+            writer,
+            indent,
+            context,
+            finalize,
+            prefix="finalize",
+            row_offset=coordinates.row,
+            col_offset="0",
+            valid_cols=1,
+            frame_cols=1,
+            initial_values=thin_values,
+        )
+
+    stored: set[str] = set()
+    for output_value in io.output_values:
+        owner = solver_tensor_for_value(
+            lowered, io.output_allocation_owners[output_value]
+        )
+        if owner not in thin_values:
+            continue
+        _emit_output_store(
+            writer,
+            indent,
+            io,
+            output_value,
+            thin_values[owner],
+            coordinates.row,
+            "0",
+        )
+        stored.add(output_value)
+
+    if expected_passes == 2:
+        if apply.loop is None:
+            raise SourceEmissionError("spanning reduction apply phase omits its loop")
+        if apply.loop.trip_count:
+            _emit_loop_header(writer, indent, "apply_chunk", apply.loop)
+            loop_indent = indent + 1
+            writer.line(loop_indent, f"apply_col = apply_chunk * {plan.chunk}")
+            apply_values = _emit_reduction_phase_chunk(
+                writer,
+                loop_indent,
+                context,
+                apply,
+                prefix="apply",
+                row_offset=coordinates.row,
+                col_offset="apply_col",
+                valid_cols=plan.chunk,
+                frame_cols=plan.chunk,
+                initial_values={reduction_tensor: running_state},
+            )
+            _emit_streamed_outputs(
+                writer,
+                loop_indent,
+                io,
+                lowered,
+                apply_values,
+                coordinates.row,
+                "apply_col",
+                stored,
+                produced_tensors={
+                    output
+                    for op in apply.ops
+                    for output in lowered.operation(op).outputs
+                },
+            )
+        if plan.tail:
+            if apply.tail is None or not apply.tail.present:
+                raise SourceEmissionError(
+                    "spanning reduction apply phase omits its tail"
+                )
+            apply_values = _emit_reduction_phase_chunk(
+                writer,
+                indent,
+                context,
+                apply,
+                prefix="apply_tail",
+                row_offset=coordinates.row,
+                col_offset=str(plan.full_chunks * plan.chunk),
+                valid_cols=plan.tail,
+                frame_cols=plan.chunk,
+                initial_values={reduction_tensor: running_state},
+            )
+            _emit_streamed_outputs(
+                writer,
+                indent,
+                io,
+                lowered,
+                apply_values,
+                coordinates.row,
+                str(plan.full_chunks * plan.chunk),
+                stored,
+                produced_tensors={
+                    output
+                    for op in apply.ops
+                    for output in lowered.operation(op).outputs
+                },
+            )
+
+    missing = set(io.output_values) - stored
+    if missing:
+        raise SourceEmissionError(
+            "streamed reduction does not produce region outputs "
+            + ", ".join(sorted(missing))
+        )
+    emit_return(writer, io)
+    return writer.render()
+
+
+def _validate_reduction_stream_loops(
+    plan: VectorKernelPlan,
+    stats: VectorPhasePlan,
+    apply: VectorPhasePlan,
+    finalize: VectorPhasePlan,
+) -> None:
+    if stats.init is None or not stats.init.present:
+        raise SourceEmissionError("streamed reduction stats initialization is absent")
+    if stats.init.chunk_index != 0 or stats.init.extent != plan.chunk:
+        raise SourceEmissionError("streamed reduction stats initialization is stale")
+    if stats.loop is None or (
+        stats.loop.first_chunk,
+        stats.loop.trip_count,
+    ) != (1, plan.full_chunks - 1):
+        raise SourceEmissionError("streamed reduction stats loop is inconsistent")
+    if stats.loop.pipeline_stages not in {1, 2}:
+        raise SourceEmissionError(
+            "streamed reduction stats pipeline depth is unsupported"
+        )
+    if plan.tail:
+        if (
+            stats.tail is None
+            or not stats.tail.present
+            or stats.tail.chunk_index != plan.full_chunks
+            or stats.tail.extent != plan.tail
+        ):
+            raise SourceEmissionError("streamed reduction stats tail is inconsistent")
+    elif stats.tail is not None and stats.tail.present:
+        raise SourceEmissionError("streamed reduction has a spurious stats tail")
+
+    if plan.kind is VectorStreamKind.REDUCTION_SPANNING:
+        if apply.loop is None or (
+            apply.loop.first_chunk,
+            apply.loop.trip_count,
+        ) != (0, plan.full_chunks):
+            raise SourceEmissionError("spanning reduction apply loop is inconsistent")
+        if apply.loop.pipeline_stages not in {1, 2}:
+            raise SourceEmissionError(
+                "spanning reduction apply pipeline depth is unsupported"
+            )
+        if plan.tail:
+            if (
+                apply.tail is None
+                or not apply.tail.present
+                or apply.tail.chunk_index != plan.full_chunks
+                or apply.tail.extent != plan.tail
+            ):
+                raise SourceEmissionError(
+                    "spanning reduction apply tail is inconsistent"
+                )
+        elif apply.tail is not None and apply.tail.present:
+            raise SourceEmissionError("spanning reduction has a spurious apply tail")
+        if finalize.ops or (finalize.serial is not None and finalize.serial.present):
+            raise SourceEmissionError("spanning reduction cannot carry a finalize cone")
+    elif apply.ops or (apply.loop is not None and apply.loop.trip_count):
+        raise SourceEmissionError("folded reduction cannot carry an apply cone")
+
+
+def _emit_reduction_phase_chunk(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    phase: VectorPhasePlan,
+    *,
+    prefix: str,
+    row_offset: str,
+    col_offset: str,
+    valid_cols: int,
+    frame_cols: int,
+    initial_values: Mapping[int, str] | None = None,
+) -> dict[int, str]:
+    """Emit one phase chunk in the solver-provided operation order."""
+
+    lowered = context.lowered
+    plan = context.step.plan
+    if not isinstance(plan, VectorKernelPlan):
+        raise SourceEmissionError("stream phase does not carry a vector plan")
+    graph_ops = context.graph.op_map()
+    producers = _tensor_producers(lowered)
+    frames = {frame.tensor: frame for frame in phase.tensor_frames}
+    workspaces = {workspace.op: workspace for workspace in phase.workspaces}
+    local = dict(initial_values or {})
+
+    def ensure_loaded(tensor_index: int) -> str:
+        if tensor_index in local:
+            return local[tensor_index]
+        if producers[tensor_index] is not None:
+            raise SourceEmissionError(
+                f"stream phase uses solver tensor {tensor_index} before its producer"
+            )
+        tensor = lowered.tensor(tensor_index)
+        argument = context.interface.input_arguments.get(tensor.value_id)
+        if argument is None:
+            raise SourceEmissionError(
+                f"stream phase input {tensor.value_id!r} is not a region argument"
+            )
+        try:
+            frame = frames[tensor_index]
+        except KeyError as error:
+            raise SourceEmissionError(
+                f"stream phase omits frame for input tensor {tensor_index}"
+            ) from error
+        expected_rows = 1 if tensor.height == 1 else plan.free_tile
+        expected_cols = 1 if tensor.width == 1 else frame_cols
+        if frame.logical != (expected_rows, expected_cols):
+            raise SourceEmissionError(
+                f"stream phase frame for tensor {tensor_index} differs from its role"
+            )
+        valid_rows = 1 if tensor.height == 1 else plan.free_tile
+        cols = 1 if tensor.width == 1 else valid_cols
+        input_row = "0" if tensor.height == 1 else row_offset
+        input_col = "0" if tensor.width == 1 else col_offset
+        name = f"{prefix}_tensor_{tensor_index}"
+        writer.line(
+            indent,
+            f"{name} = {_static_vector_load(argument, input_row, input_col, frame.physical, (str(valid_rows), str(cols)))}",
+        )
+        local[tensor_index] = name
+        return name
+
+    for solver_op in phase.ops:
+        operation = lowered.operation(solver_op)
+        if len(operation.outputs) != 1:
+            raise SourceEmissionError(
+                f"stream phase op {solver_op} must have exactly one output"
+            )
+        operands = [ensure_loaded(tensor) for tensor in operation.inputs]
+        output = operation.outputs[0]
+        expression = _vector_expression(
+            writer,
+            indent,
+            graph_ops[operation.graph_op_id],
+            operands,
+            list(operation.inputs),
+            output,
+            lowered,
+            plan.free_tile,
+            frame_cols,
+            solver_op,
+            workspaces.get(solver_op),
+        )
+        name = f"{prefix}_tensor_{output}"
+        writer.line(indent, f"{name} = {expression}")
+        local[output] = name
+    return local
+
+
+def _emit_reduction_merge(
+    writer: SourceWriter,
+    indent: int,
+    kind: str,
+    previous: str,
+    current: str,
+    name: str,
+) -> str:
+    operation = "add" if kind == "sum" else "maximum"
+    writer.line(indent, f"{name} = pl.{operation}({previous}, {current})")
+    return name
+
+
+def _emit_output_store(
+    writer: SourceWriter,
+    indent: int,
+    io: Interface,
+    output_value: str,
+    tile: str,
+    row_offset: str,
+    col_offset: str,
+) -> None:
+    argument = io.output_arguments[output_value]
+    writer.line(
+        indent,
+        f"{argument} = pl.store({tile}, [{row_offset}, {col_offset}], {argument})",
+    )
+
+
+def _emit_streamed_outputs(
+    writer: SourceWriter,
+    indent: int,
+    io: Interface,
+    lowered: LoweredRegion,
+    local: Mapping[int, str],
+    row_offset: str,
+    col_offset: str,
+    stored: set[str],
+    *,
+    produced_tensors: set[int],
+) -> None:
+    for output_value in io.output_values:
+        owner = solver_tensor_for_value(
+            lowered, io.output_allocation_owners[output_value]
+        )
+        if owner not in produced_tensors:
+            continue
+        tile = local.get(owner)
+        if tile is None:
+            continue
+        _emit_output_store(
+            writer,
+            indent,
+            io,
+            output_value,
+            tile,
+            row_offset,
+            col_offset,
+        )
+        # A streamed output is written on every chunk; the set records that its
+        # production contract was found, not that only one store is emitted.
+        stored.add(output_value)
 
 
 def _emit_softmax_flash(
@@ -403,7 +897,7 @@ def _emit_softmax_flash(
             valid_rows=str(plan.free_tile),
             valid_cols=str(apply.tail.extent),
         )
-    writer.line(2, f"return {io.output_argument}")
+    emit_return(writer, io)
     return writer.render()
 
 
@@ -582,7 +1076,8 @@ def _emit_loop_header(
     carried = ""
     init = ""
     if iter_values:
-        carried = f", ({', '.join(iter_values)})"
+        trailing_comma = "," if len(iter_values) == 1 else ""
+        carried = f", ({', '.join(iter_values)}{trailing_comma})"
         init = f", init_values=({', '.join(init_values)},)"
     stop = loop.first_chunk + loop.trip_count
     writer.line(
@@ -841,18 +1336,21 @@ def _emit_vector_body(
         local[output] = f"tensor_{output}"
         writer.line(indent, f"{local[output]} = {expression}")
 
-    output_tensor = solver_tensor_for_value(lowered, io.output_allocation_owner)
-    try:
-        output_tile = local[output_tensor]
-    except KeyError as error:
-        raise SourceEmissionError(
-            "region output is not produced by the selected step"
-        ) from error
-    writer.line(
-        indent,
-        f"{io.output_argument} = pl.store({output_tile}, "
-        f"[{row_offset}, {col_offset}], {io.output_argument})",
-    )
+    for output_value in io.output_values:
+        owner = io.output_allocation_owners[output_value]
+        output_tensor = solver_tensor_for_value(lowered, owner)
+        try:
+            output_tile = local[output_tensor]
+        except KeyError as error:
+            raise SourceEmissionError(
+                f"region output {output_value!r} is not produced by the selected step"
+            ) from error
+        output_argument = io.output_arguments[output_value]
+        writer.line(
+            indent,
+            f"{output_argument} = pl.store({output_tile}, "
+            f"[{row_offset}, {col_offset}], {output_argument})",
+        )
 
 
 def _sum_offsets(*offsets: str) -> str:
@@ -880,7 +1378,7 @@ def _static_vector_load(
     valid_rows, valid_cols = valid
     return (
         f"pl.load({argument}, [{row_offset}, {col_offset}], "
-        f"[{physical_rows}, {physical_cols}], valid_shape=[{valid_rows}, {valid_cols}], "
+        f"[{physical_rows}, {physical_cols}], [{valid_rows}, {valid_cols}], "
         "target_memory=pl.Mem.Vec)"
     )
 
