@@ -251,7 +251,8 @@ The parallel split is sink-only because the cross-core merge (atomic-add / DDR
 reduction) is clean only at the boundary output. The cube and vector parallel
 splits are **analogous**:
 
-**Cube split-K** (single sink matmul). `S | kfrac` (`kfrac = output_K/16`). On a
+**Cube split-K** (the unique sink matmul of a homogeneous cube DAG). `S | kfrac`
+(`kfrac = output_K/16`). On a
 grid, LPT-consistent request evaluation shrinks every `ParallelK` region and
 creates `P·Q·S` work units. A split whose concrete K loops cannot ping-pong is
 legal but pays serialized compute+DDR. The model compares the existing PyPTO

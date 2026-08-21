@@ -1006,8 +1006,10 @@ std::string solution_json(const Solution& sol) {
 
         json serialized_step;
         serialized_step["ops"] = step.subgraph.ops();
+        const int64_t launch_k =
+            cube_plan.feasible ? cube_plan.config.k : cfg.k;
         serialized_step["launch"] =
-            {{"tile", {cfg.w, cfg.h, cfg.k}},
+            {{"tile", {cfg.w, cfg.h, launch_k}},
              {"parts", {cfg.parts_m, cfg.parts_n}},
              {"split", cost.parallel_split},
              {"cores", cost.cores_used}};
@@ -1024,8 +1026,23 @@ std::string solution_json(const Solution& sol) {
             // Per-op single-core k-tile, in execution order (cube-910B only). An
             // op's seq_k = its full K means it ran the contraction in one pass.
             const auto& prob = step.subgraph.problem();
-            if (step.subgraph.has_matmul() && prob.num_cube_cores > 1 &&
-                prob.l1_capacity > 0) {
+            if (cube_plan.feasible) {
+                std::vector<int64_t> ks;
+                for (auto op : order) {
+                    const auto request = std::find_if(
+                        cube_plan.matmuls.begin(), cube_plan.matmuls.end(),
+                        [op](const CubeMatmulSchedule& matmul) {
+                            return matmul.op == op;
+                        });
+                    if (request == cube_plan.matmuls.end()) {
+                        throw std::logic_error(
+                            "cube plan omits an operation from its execution order");
+                    }
+                    ks.push_back(request->k_loop.l1_window_k);
+                }
+                serialized_step["sequential_tiles"] = ks;
+            } else if (step.subgraph.has_matmul() && prob.num_cube_cores > 1 &&
+                       prob.l1_capacity > 0) {
                 std::vector<int64_t> pk;
                 step.subgraph.cube_peak_l1(cfg, &pk);  // L1-fit per-op (single core)
                 const int64_t sink = step.subgraph.sink_matmul_op();

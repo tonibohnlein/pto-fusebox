@@ -5,7 +5,7 @@
 #include "core/dag.h"
 #include "core/types.h"
 
-// Serialize every feasible candidate considered by a one-matmul cube
+// Serialize every feasible candidate considered by one homogeneous cube
 // subgraph. Each candidate carries an ordinary solution.v4 payload, so model
 // validation can test the production typed/source-readiness boundary without
 // a benchmark-only lowering path. Analytic model-ahead candidates may still

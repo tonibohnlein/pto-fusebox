@@ -1640,7 +1640,7 @@ def _validate_cube_contract(
             if producer_index < 0:
                 continue
             producer = plan.matmuls[producer_index]
-            if producer.output != operand:
+            if not _cube_regions_address_same_value(producer.output, operand):
                 raise ScheduleContractError(
                     f"{matmul_field} {role.value} region differs from producer "
                     f"{producer_index}'s output region"
@@ -1861,6 +1861,25 @@ def _validate_cube_output_contract(
         or retained.rhs_bytes != expected_rhs_bytes
     ):
         raise ScheduleContractError(f"{field}.retained_panels byte count is stale")
+
+
+def _cube_regions_address_same_value(
+    producer: CubeTensorRegionPlan,
+    consumer: CubeTensorRegionPlan,
+) -> bool:
+    """Return whether two propagated regions name the same per-task L1 value."""
+
+    def same_axis(left: CubeAxisBinding, right: CubeAxisBinding) -> bool:
+        full_bindings = {CubeAxisBinding.FULL, CubeAxisBinding.SEQUENTIAL_K}
+        return left is right or {left, right}.issubset(full_bindings)
+
+    return (
+        producer.tensor == consumer.tensor
+        and producer.height == consumer.height
+        and producer.width == consumer.width
+        and same_axis(producer.height_binding, consumer.height_binding)
+        and same_axis(producer.width_binding, consumer.width_binding)
+    )
 
 
 def _validate_l0_contract(

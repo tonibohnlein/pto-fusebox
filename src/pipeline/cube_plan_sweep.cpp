@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -32,16 +33,19 @@ bool same_grid(const TileConfig& left, const TileConfig& right,
 }  // namespace
 
 std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
-  if (problem.num_ops() != 1 ||
-      problem.ops.front().type != OpType::MatMul) {
+  if (problem.num_ops() == 0 ||
+      std::any_of(problem.ops.begin(), problem.ops.end(),
+                  [](const Op& op) { return op.type != OpType::MatMul; })) {
     throw std::invalid_argument(
-        "cube plan sweep requires exactly one MatMul operation");
+        "cube plan sweep requires a non-empty homogeneous MatMul DAG");
   }
 
-  auto subgraph = Subgraph::create(problem, dag, {0});
+  std::vector<size_t> operations(problem.num_ops());
+  std::iota(operations.begin(), operations.end(), 0);
+  auto subgraph = Subgraph::create(problem, dag, operations);
   if (!subgraph || !subgraph->has_matmul() || subgraph->has_vector()) {
     throw std::invalid_argument(
-        "cube plan sweep could not construct a homogeneous matmul subgraph");
+        "cube plan sweep could not construct a homogeneous MatMul DAG");
   }
 
   auto candidates = subgraph->enumerate_plans();

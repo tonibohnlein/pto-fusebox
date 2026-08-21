@@ -189,7 +189,7 @@ class _ExportNormalizer:
         if target == "aten.mean.dim":
             self._mean(node)
             return
-        if target in {"aten.mm.default", "aten.matmul.default"}:
+        if target in {"aten.mm.default", "aten.mm.dtype", "aten.matmul.default"}:
             self._matmul(node, target)
             return
         if target == "aten.linear.default":
@@ -583,6 +583,7 @@ class _ExportNormalizer:
             users = list(node.users)
             allowed_user = len(users) == 1 and _target_name(users[0].target) in {
                 "aten.mm.default",
+                "aten.mm.dtype",
                 "aten.matmul.default",
             }
             if len(source.shape) != 2 or permutation != [1, 0] or not allowed_user:

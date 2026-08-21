@@ -79,7 +79,7 @@ target_link_libraries(mlsys_mixed Threads::Threads)
 add_executable(symmetry_app src/pipeline/symmetry_app.cpp)
 target_link_libraries(symmetry_app solver_lib Threads::Threads)
 
-# Developer tool: enumerate and force every feasible one-matmul cube plan.
+# Developer tool: enumerate and force every feasible homogeneous cube-DAG plan.
 # Each entry embeds an ordinary solution.v4 payload for typed/source-readiness
 # replay without adding a benchmark-only lowering path.
 add_executable(cube_plan_sweep src/pipeline/cube_plan_sweep_main.cpp)

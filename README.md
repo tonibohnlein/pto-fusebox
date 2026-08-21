@@ -50,7 +50,7 @@ The primary targets are:
 - `solver_lib`: embeddable static library;
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
-- `cube_plan_sweep`: enumerate every finite, fixed one-matmul cube candidate
+- `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
   with its modeled cost and ordinary `solution.v4` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
@@ -117,8 +117,10 @@ schedules raise a precise `SourceEmissionError` rather than being approximated.
 Each maximal supported region is one solver input DAG, not one mandatory fused
 kernel: when the solver selects several homogeneous steps, source emission
 materializes their cut edges through explicit GM tensors and emits the steps as
-dependency-linked `pl.spmd` launches in solver order. Mixed steps and split
-cube DAGs with resident operands remain follow-ups.
+dependency-linked `pl.spmd` launches in solver order. A split cube DAG may
+split only its unique sink: upstream matmuls replay their serial K plans inside
+each share, while resident inputs and retained panels stay local to that share.
+Multiple split accumulators, multiple outputs, and mixed steps fail closed.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
@@ -139,7 +141,7 @@ shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
 Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
-cube spatial partitions, split cube DAGs, and mixed schedules remain explicitly
+cube spatial partitions, and mixed schedules remain explicitly
 not source-ready until their complete state or transport contracts are serialized.
 Single-sink split-K is source-ready through the model-selected
 `FirstPartialThenAtomic` or `AivZeroSeedThenAtomic` PyPTO mechanism.
@@ -190,9 +192,8 @@ not fit a second model in Python. Each entry records the model cost and embeds
 the exact forced solution. The predeclared device surface in
 `test/device/cube_model_cases.py` covers underfill, balanced, ragged-K,
 outer-K, rectangular-reuse, and split-K-positive shapes. Candidates beyond the
-current source backend—most notably split cube DAGs and mixed cross-core plans—remain
-useful analytic evidence but fail closed instead of being approximated by
-source.
+current source backend—most notably mixed cross-core plans—remain useful
+analytic evidence but fail closed instead of being approximated by source.
 
 The generated-source silicon matrix is opt-in and is not part of the default
 host suite. It covers 14 vector and 10 single-matmul cube programs, compiles

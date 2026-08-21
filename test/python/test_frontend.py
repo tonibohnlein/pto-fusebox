@@ -29,6 +29,17 @@ class RmsNorm(nn.Module):
         return (wide * torch.rsqrt(variance + 1e-5) * self.weight).to(value.dtype)
 
 
+class Bf16ChainWithFp32Sink(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        intermediate = torch.mm(lhs, middle)
+        return torch.mm(intermediate, rhs, out_dtype=torch.float32)
+
+
 def _capture_documented_example(name: str) -> NormalizedGraph:
     class Softmax(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -176,6 +187,22 @@ def test_exported_program_is_the_authoritative_core_api() -> None:
     direct = normalize_exported(program)
     convenience = export_and_normalize(RmsNorm(16), (torch.randn(2, 16),))
     assert direct.to_json() == convenience.to_json()
+
+
+def test_matmul_out_dtype_normalizes_as_an_ordinary_cube_operation() -> None:
+    graph = export_and_normalize(
+        Bf16ChainWithFp32Sink(),
+        (
+            torch.empty(16, 64, dtype=torch.bfloat16, device="meta"),
+            torch.empty(64, 2048, dtype=torch.bfloat16, device="meta"),
+            torch.empty(2048, 16, dtype=torch.bfloat16, device="meta"),
+        ),
+    )
+
+    assert [op.kind for op in graph.ops] == ["matmul", "matmul"]
+    assert graph.ops[1].attributes["source_operator"] == "aten.mm.dtype"
+    assert graph.value_map()[graph.ops[0].outputs[0]].dtype == "bfloat16"
+    assert graph.value_map()[graph.ops[1].outputs[0]].dtype == "float32"
 
 
 def test_buffer_is_named_external_state_without_embedding_payload() -> None:

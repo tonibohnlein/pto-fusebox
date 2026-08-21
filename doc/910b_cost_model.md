@@ -308,7 +308,7 @@ Other explicitly deferred research directions are:
 ## 10. Candidate ranking validation
 
 `cube_plan_sweep` exposes the exact finite candidate set considered for a
-single homogeneous matmul. It reuses `enumerate_plans()` and reconstructs each
+homogeneous cube DAG. It reuses `enumerate_plans()` and reconstructs each
 candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
@@ -330,10 +330,12 @@ The initial validation matrix is fixed before silicon timing and covers:
 Model-ranking validation and source-emitter validation are separate claims.
 Only candidates accepted by the typed source backend may be timed as generated
 source. The source backend replays retained panels for non-split plans and
-emits a single-sink split plan as two dependency-linked PyPTO `pl.spmd` tasks.
-It consumes the selected merge descriptor without replanning. Split cube DAGs
-with resident boundaries or multiple matmuls still fail closed; no winner is
-silently replaced by split=1. No coefficient is fitted from these rankings.
+emits a unique-sink split plan as two dependency-linked PyPTO `pl.spmd` tasks.
+Each split share replays the same upstream request order, resident operands,
+retained panels, and serial outer-K windows before draining the sink. Multiple
+split sinks, ambiguous accumulators, and multi-output split groups fail closed;
+no winner is silently replaced by split=1. No coefficient is fitted from these
+rankings.
 
 ---
 

@@ -33,9 +33,9 @@ non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
 Welford/multi-stat vector plans, singleton-column normalization, nonuniform cube
-spatial partitions, split cube DAGs, and mixed cross-core schedules fail closed.
-Single-sink split-K is emitted through the selected dependency-linked PyPTO task
-protocol.
+spatial partitions, and mixed cross-core schedules fail closed. A uniform cube
+DAG may split only its unique sink through the selected dependency-linked PyPTO
+task protocol.
 Dynamic-shape classes are retained but declined when they affect solver
 geometry.
 
@@ -357,14 +357,18 @@ typed stats/apply loops, frames, workspaces, carry state, and substitutions.
 Selection is independent of program, module, model, or shape names.
 
 Cube source replays the selected request order, outer spatial and K-window
-schedule, L1 resident values, retained panels, and drains, then lets PyPTO's
+schedule, L1 resident values, retained panels, and drains. In a split-K cube
+DAG, only the unique sink is divided; every share replays upstream matmuls in
+the selected order and accumulates the sink's disjoint K interval. Multiple
+split sinks, ambiguous accumulators, and multi-output split groups fail closed.
+The general non-split path then lets PyPTO's
 `AutoTileMatmulL0` choose child-L0 `(m,n,k)`, stationarity, and buffer depths.
 The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Analytic support is broader than the renderer. Welford/multi-stat P4, split
-cube DAGs, and mixed plans remain valid solver results but are not source-ready. P4
+Analytic support is broader than the renderer. Welford/multi-stat P4 and mixed
+plans remain valid solver results but are not source-ready. P4
 descriptors preserve named roles; each new recipe must version its carry and
 publication semantics. Future plan classes can add those contracts and
 cross-core transport without changing the ownership boundary.
@@ -564,9 +568,9 @@ dynamic physical tile that reaches allocation or tile-flattening.
    [closed PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335)
    vector behavior while extending source replay; do not rediscover those
    schedules in the emitter.
-3. Extend the single-sink split-K source contract to cube DAGs with resident
-   operands and per-share outer-K windows while rejecting ambiguous multi-root
-   merges.
+3. Silicon-close single-sink split-K cube DAG source with resident operands,
+   retained panels, and per-share outer-K windows; continue rejecting
+   ambiguous multi-root merges.
 4. Implement the generic mixed source backend from one round trip while continuing
    to reject unsupported multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value

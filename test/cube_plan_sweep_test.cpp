@@ -52,6 +52,19 @@ Problem deep_k_problem() {
   return problem;
 }
 
+Problem split_dag_problem() {
+  Problem problem = deep_k_problem();
+  problem.tensors = {{64, 16, DType::BF16},
+                     {2048, 64, DType::BF16},
+                     {2048, 16, DType::BF16},
+                     {16, 2048, DType::BF16},
+                     {16, 16, DType::FP32}};
+  problem.ops = {{OpType::MatMul, {0, 1}, {2}},
+                 {OpType::MatMul, {2, 3}, {4}}};
+  problem.required_outputs = {4};
+  return problem;
+}
+
 }  // namespace
 
 int main() {
@@ -144,6 +157,33 @@ int main() {
                 "first_partial_then_atomic" &&
             selected_policy(no_vector_cores) ==
                 "first_partial_then_atomic");
+
+  const Problem dag_problem = split_dag_problem();
+  const auto dag_sweep = nlohmann::json::parse(
+      cube_plan_sweep_json(dag_problem, DAG::build(dag_problem)));
+  bool has_replayable_split_dag = false;
+  for (const auto& candidate : dag_sweep.at("candidates")) {
+    if (candidate.at("enumerated_grid").at("split_k").get<int>() <= 1) {
+      continue;
+    }
+    const auto& plan = candidate.at("solution").at("steps").front().at("plan");
+    if (!plan.at("emit_compatible").get<bool>()) continue;
+    const auto& upstream = plan.at("matmuls").at(0);
+    const auto& sink = plan.at("matmuls").at(1);
+    has_replayable_split_dag =
+        plan.at("matmuls").size() == 2 && !upstream.at("is_sink").get<bool>() &&
+        sink.at("is_sink").get<bool>() &&
+        upstream.at("effective_contraction") == upstream.at("contraction") &&
+        sink.at("effective_contraction").get<int64_t>() *
+                plan.at("split_k").get<int64_t>() ==
+            sink.at("contraction").get<int64_t>() &&
+        upstream.at("final_drain").at("target_l1").get<bool>() &&
+        !upstream.at("final_drain").at("atomic").get<bool>() &&
+        sink.at("final_drain").at("atomic").get<bool>();
+    if (has_replayable_split_dag) break;
+  }
+  check("homogeneous cube DAG sweep carries a unique split sink",
+        has_replayable_split_dag);
 
   std::cout << passed << " passed, " << failed << " failed\n";
   return failed == 0 ? 0 : 1;

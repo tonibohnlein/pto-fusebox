@@ -78,7 +78,7 @@ def enumerate_cube_plans(
     *,
     sweep_binary: str | os.PathLike[str] | None = None,
 ) -> CubePlanSweep:
-    """Enumerate every feasible cube plan for one lowered matmul region.
+    """Enumerate every feasible cube plan for one lowered homogeneous cube region.
 
     The C++ sweep executable reuses the production model and serializes each
     fixed candidate as ``solution.v4``. This function validates that envelope;

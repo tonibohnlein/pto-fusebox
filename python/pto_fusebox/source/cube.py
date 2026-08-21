@@ -52,7 +52,7 @@ def emit_cube(
     if step.split != plan.split_k:
         raise SourceEmissionError("cube launch split differs from its plan")
     if plan.split_k > 1:
-        return _emit_split_cube_single_sink(context, program_name, plan)
+        return _emit_split_cube_dag(context, program_name, plan)
     if plan.split_merge_policy is not CubeSplitMergePolicy.NONE:
         raise SourceEmissionError("non-split cube plan carries a merge policy")
     matmuls = plan.matmuls
@@ -64,6 +64,10 @@ def emit_cube(
             or matmul.retained_panels.lhs
             or matmul.retained_panels.rhs
             or matmul.storage_dtype != "fp32"
+            or any(
+                variant.l0_init.tile[2] != matmul.k_loop.chunk
+                for variant in matmul.output_variants
+            )
             for matmul in matmuls
         )
     ):
@@ -213,36 +217,21 @@ def emit_cube(
     return writer.render()
 
 
-def _emit_split_cube_single_sink(
+def _emit_split_cube_dag(
     context: EmissionContext,
     program_name: str,
     plan: CubeKernelPlan,
 ) -> str:
-    """Emit one sink matmul using a solver-selected PyPTO split-K protocol."""
+    """Emit a cube DAG whose unique sink uses a solver-selected split-K protocol."""
 
     graph = context.graph
     lowered = context.lowered
     step = context.step
     io = context.interface
-    if len(plan.matmuls) != 1 or len(step.solver_ops) != 1:
-        raise SourceEmissionError(
-            "split-K source initially supports exactly one sink matmul"
-        )
-    if plan.resident_boundaries:
-        raise SourceEmissionError(
-            "split-K source initially rejects resident cube boundaries"
-        )
-    matmul = plan.matmuls[0]
-    if (
-        not matmul.is_sink
-        or matmul.lhs_producer != -1
-        or matmul.rhs_producer != -1
-        or matmul.retained_panels.lhs
-        or matmul.retained_panels.rhs
-    ):
-        raise SourceEmissionError(
-            "split-K source initially requires one external-input sink"
-        )
+    sinks = tuple(matmul for matmul in plan.matmuls if matmul.is_sink)
+    if len(sinks) != 1:
+        raise SourceEmissionError("split-K source requires exactly one sink matmul")
+    matmul = sinks[0]
     if len(io.output_values) != 1:
         raise SourceEmissionError("split-K source requires exactly one output")
     if matmul.accumulator_dtype != "fp32" or matmul.storage_dtype != "fp32":
@@ -256,37 +245,33 @@ def _emit_split_cube_single_sink(
         or plan.n_partition.big != plan.n_partition.small
     ):
         raise SourceEmissionError("split-K source requires uniform region extents")
-    if plan.execution_order != (matmul.op,) or step.op_order != (matmul.op,):
-        raise SourceEmissionError("split-K source requires one ordered sink request")
-    if step.sequential_tiles != (matmul.k_loop.l1_window_k,):
+    if not plan.matmuls or plan.matmuls[-1] is not matmul:
+        raise SourceEmissionError("split-K sink must be the final cube request")
+    split_requests = tuple(
+        request
+        for request in plan.matmuls
+        if request.effective_contraction != request.contraction
+    )
+    if split_requests != (matmul,):
         raise SourceEmissionError(
-            "split-K sequential tile differs from its sink K window"
+            "split-K source requires exactly one split accumulator at the sink"
         )
+    if matmul.effective_contraction * plan.split_k != matmul.contraction:
+        raise SourceEmissionError("split-K sink shares do not cover its contraction")
+    if not matmul.final_drain.atomic or any(
+        request.final_drain.atomic for request in plan.matmuls if request is not matmul
+    ):
+        raise SourceEmissionError(
+            "split-K source requires one atomic sink drain and serial upstream drains"
+        )
+    if (
+        matmul.output.height_binding is CubeAxisBinding.PARALLEL_K
+        or matmul.output.width_binding is CubeAxisBinding.PARALLEL_K
+    ):
+        raise SourceEmissionError("split-K sink output cannot be partitioned along K")
     if plan.work_units != plan.spatial_tiles * plan.split_k:
         raise SourceEmissionError("split-K work count differs from grid times split")
     validate_grid(step, plan.spatial_tiles, plan.m_partition, plan.n_partition)
-    _validate_lowered_l0_capacity(context, matmul)
-
-    operation = lowered.operation(matmul.op)
-    graph_op = graph.op_map()[operation.graph_op_id]
-    if (
-        graph_op.kind != "matmul"
-        or graph_op.attributes.get("lhs_transposed")
-        or graph_op.attributes.get("rhs_transposed")
-        or len(operation.inputs) != 2
-        or len(operation.outputs) != 1
-    ):
-        raise SourceEmissionError(
-            "split-K source requires one non-transposed binary matmul"
-        )
-    if operation.inputs != (matmul.lhs.tensor, matmul.rhs.tensor):
-        raise SourceEmissionError("split-K operand identities are stale")
-    if operation.outputs != (matmul.output.tensor,):
-        raise SourceEmissionError("split-K output identity is stale")
-    lhs_value = lowered.tensor(operation.inputs[0]).value_id
-    rhs_value = lowered.tensor(operation.inputs[1]).value_id
-    if lhs_value not in io.input_arguments or rhs_value not in io.input_arguments:
-        raise SourceEmissionError("split-K operands must be region inputs")
     output_value = io.output_values[0]
     if (
         solver_tensor_for_value(lowered, io.output_allocation_owners[output_value])
@@ -298,16 +283,8 @@ def _emit_split_cube_single_sink(
     )
     validate_partition_extent(plan.m_partition, output_rows, "cube.m_partition")
     validate_partition_extent(plan.n_partition, output_cols, "cube.n_partition")
-    lhs_shape = static_shape(graph.value_map()[lhs_value], field="split-K lhs")
-    rhs_shape = static_shape(graph.value_map()[rhs_value], field="split-K rhs")
-    if (
-        lhs_shape[1] != rhs_shape[0]
-        or lhs_shape[1] != matmul.effective_contraction * plan.split_k
-        or matmul.contraction != lhs_shape[1]
-    ):
-        raise SourceEmissionError(
-            "split-K shares do not cover the full contraction exactly"
-        )
+    for request in plan.matmuls:
+        _validate_lowered_l0_capacity(context, request)
 
     writer = program_preamble(program_name, io, graph)
     if plan.split_merge_policy is CubeSplitMergePolicy.FIRST_PARTIAL_THEN_ATOMIC:
@@ -327,7 +304,15 @@ def _emit_split_cube_single_sink(
             f"name_hint={context.region_id + '_cube_first'!r}) as first_partial_task:",
         )
         writer.line(3, "region_index = pl.tile.get_block_idx()")
-        _emit_split_cube_share(writer, 3, context, plan, matmul, "0", atomic=False)
+        _emit_cube_dag_body(
+            writer,
+            3,
+            context,
+            plan,
+            split_index="0",
+            atomic_sink=False,
+            split_sink=matmul,
+        )
         writer.line(
             2,
             f"with pl.spmd({descriptor.atomic_work_units}, "
@@ -337,8 +322,14 @@ def _emit_split_cube_single_sink(
         writer.line(3, "split_work_index = pl.tile.get_block_idx()")
         writer.line(3, f"region_index = split_work_index // {plan.split_k - 1}")
         writer.line(3, f"split_index = split_work_index % {plan.split_k - 1} + 1")
-        _emit_split_cube_share(
-            writer, 3, context, plan, matmul, "split_index", atomic=True
+        _emit_cube_dag_body(
+            writer,
+            3,
+            context,
+            plan,
+            split_index="split_index",
+            atomic_sink=True,
+            split_sink=matmul,
         )
     elif plan.split_merge_policy is CubeSplitMergePolicy.AIV_ZERO_SEED_THEN_ATOMIC:
         descriptor = plan.aiv_zero_seed_then_atomic
@@ -368,8 +359,14 @@ def _emit_split_cube_single_sink(
         writer.line(3, "split_work_index = pl.tile.get_block_idx()")
         writer.line(3, f"region_index = split_work_index // {plan.split_k}")
         writer.line(3, f"split_index = split_work_index % {plan.split_k}")
-        _emit_split_cube_share(
-            writer, 3, context, plan, matmul, "split_index", atomic=True
+        _emit_cube_dag_body(
+            writer,
+            3,
+            context,
+            plan,
+            split_index="split_index",
+            atomic_sink=True,
+            split_sink=matmul,
         )
     else:
         raise SourceEmissionError("split-K plan carries no supported merge policy")
@@ -408,90 +405,6 @@ def _emit_split_cube_zero_seed(
                 f"[{_add_offset(output_row, local_row)}, "
                 f"{_add_offset(output_col, local_col)}])",
             )
-
-
-def _emit_split_cube_share(  # noqa: PLR0913
-    writer: SourceWriter,
-    indent: int,
-    context: EmissionContext,
-    plan: CubeKernelPlan,
-    matmul: CubeMatmulPlan,
-    split_index: str,
-    *,
-    atomic: bool,
-) -> None:
-    coordinates = emit_partition_indices(
-        writer, indent, plan.m_partition, plan.n_partition
-    )
-    parallel_k_offset = f"{split_index} * {matmul.effective_contraction}"
-    lhs_arg = context.interface.input_arguments[
-        context.lowered.tensor(matmul.lhs.tensor).value_id
-    ]
-    rhs_arg = context.interface.input_arguments[
-        context.lowered.tensor(matmul.rhs.tensor).value_id
-    ]
-    lhs_row, lhs_col = _cube_region_offsets(
-        matmul.lhs.height_binding,
-        matmul.lhs.width_binding,
-        coordinates.row,
-        coordinates.col,
-        parallel_k_offset,
-    )
-    rhs_row, rhs_col = _cube_region_offsets(
-        matmul.rhs.height_binding,
-        matmul.rhs.width_binding,
-        coordinates.row,
-        coordinates.col,
-        parallel_k_offset,
-    )
-    output_row, output_col = _cube_region_offsets(
-        matmul.output.height_binding,
-        matmul.output.width_binding,
-        coordinates.row,
-        coordinates.col,
-    )
-    output_argument = context.interface.output_argument
-    variants = {variant.shape: variant for variant in matmul.output_variants}
-    variant_counts = {shape: 0 for shape in variants}
-    tiles_m, tiles_n = matmul.output_grid
-    for tile_m in range(tiles_m):
-        local_row = tile_m * matmul.output_tile[0]
-        tile_height = min(matmul.output_tile[0], matmul.output.height - local_row)
-        for tile_n in range(tiles_n):
-            local_col = tile_n * matmul.output_tile[1]
-            tile_width = min(matmul.output_tile[1], matmul.output.width - local_col)
-            shape = (tile_height, tile_width)
-            if shape not in variants:
-                raise SourceEmissionError(f"split-K sink omits output variant {shape}")
-            variant_counts[shape] += 1
-            tile_index = tile_m * tiles_n + tile_n
-            accumulator = _emit_split_cube_output_tile(
-                writer,
-                indent,
-                matmul,
-                variants[shape],
-                lhs_arg,
-                rhs_arg,
-                lhs_row,
-                lhs_col,
-                rhs_row,
-                rhs_col,
-                local_row,
-                local_col,
-                tile_height,
-                tile_width,
-                tile_index,
-            )
-            atomic_suffix = ", atomic=pl.AtomicType.Add" if atomic else ""
-            writer.line(
-                indent,
-                f"{output_argument} = pl.assemble({output_argument}, {accumulator}, "
-                f"[{_add_offset(output_row, local_row)}, "
-                f"{_add_offset(output_col, local_col)}]{atomic_suffix})",
-            )
-    for shape, variant in variants.items():
-        if variant_counts[shape] != variant.count:
-            raise SourceEmissionError(f"split-K output variant {shape} count is stale")
 
 
 def _emit_split_cube_output_tile(  # noqa: PLR0913
@@ -633,6 +546,38 @@ def _emit_full_window_cube_dag(
     each child L0 matmul realization.
     """
 
+    writer = program_header(
+        program_name,
+        context.interface,
+        context.graph,
+        plan.work_units,
+        kernel_name_hint=context.region_id + "_cube",
+    )
+    _emit_cube_dag_body(
+        writer,
+        3,
+        context,
+        plan,
+        split_index="0",
+        atomic_sink=False,
+        split_sink=None,
+    )
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
+def _emit_cube_dag_body(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    plan: CubeKernelPlan,
+    *,
+    split_index: str,
+    atomic_sink: bool,
+    split_sink: CubeMatmulPlan | None,
+) -> None:
+    """Replay one spatial region and one optional split share of a cube DAG."""
+
     graph = context.graph
     lowered = context.lowered
     step = context.step
@@ -665,20 +610,12 @@ def _emit_full_window_cube_dag(
 
     m_partition = plan.m_partition
     n_partition = plan.n_partition
-    validate_grid(step, plan.work_units, m_partition, n_partition)
+    validate_grid(step, plan.spatial_tiles, m_partition, n_partition)
     if m_partition.big != m_partition.small or n_partition.big != n_partition.small:
         raise SourceEmissionError(
             "full-window cube DAG source currently requires uniform spatial regions"
         )
 
-    writer = program_header(
-        program_name,
-        io,
-        graph,
-        plan.work_units,
-        kernel_name_hint=context.region_id + "_cube",
-    )
-    indent = 3
     coordinates = emit_partition_indices(writer, indent, m_partition, n_partition)
     graph_ops = graph.op_map()
     local: dict[int, str] = {}
@@ -741,6 +678,7 @@ def _emit_full_window_cube_dag(
             local,
             producer_by_tensor,
             resident_values,
+            split_index,
         )
         rhs, rhs_row, rhs_col = _cube_dag_operand(
             writer,
@@ -756,6 +694,7 @@ def _emit_full_window_cube_dag(
             local,
             producer_by_tensor,
             resident_values,
+            split_index,
         )
 
         if matmul.retained_panels.lhs:
@@ -783,11 +722,11 @@ def _emit_full_window_cube_dag(
             )
             rhs_row = rhs_col = "0"
 
-        output_row, output_col = _cube_region_offsets(
-            matmul.output.height_binding,
-            matmul.output.width_binding,
+        output_row, output_col = _cube_tensor_region_offsets(
+            matmul.output,
             coordinates.row,
             coordinates.col,
+            split_index,
         )
         output_targets = {
             output_value: io.output_arguments[output_value]
@@ -837,30 +776,51 @@ def _emit_full_window_cube_dag(
                     )
                 variant_counts[shape] += 1
                 tile_index = tile_m * output_tiles_n + tile_n
-                accumulator = _emit_cube_dag_output_tile(
-                    writer,
-                    indent,
-                    matmul,
-                    lhs,
-                    rhs,
-                    lhs_row,
-                    lhs_col,
-                    rhs_row,
-                    rhs_col,
-                    local_row,
-                    local_col,
-                    tile_height,
-                    tile_width,
-                    tile_index,
-                )
+                if matmul is split_sink:
+                    accumulator = _emit_split_cube_output_tile(
+                        writer,
+                        indent,
+                        matmul,
+                        variant,
+                        lhs,
+                        rhs,
+                        lhs_row,
+                        lhs_col,
+                        rhs_row,
+                        rhs_col,
+                        local_row,
+                        local_col,
+                        tile_height,
+                        tile_width,
+                        tile_index,
+                    )
+                else:
+                    accumulator = _emit_cube_dag_output_tile(
+                        writer,
+                        indent,
+                        matmul,
+                        lhs,
+                        rhs,
+                        lhs_row,
+                        lhs_col,
+                        rhs_row,
+                        rhs_col,
+                        local_row,
+                        local_col,
+                        tile_height,
+                        tile_width,
+                        tile_index,
+                    )
                 if matmul.is_sink:
+                    atomic_suffix = ", atomic=pl.AtomicType.Add" if atomic_sink else ""
                     for output_value, output_argument in output_targets.items():
                         writer.line(
                             indent,
                             f"{output_argument} = pl.assemble("
                             f"{output_argument}, {accumulator}, "
                             f"[{_add_offset(output_row, local_row)}, "
-                            f"{_add_offset(output_col, local_col)}])",
+                            f"{_add_offset(output_col, local_col)}]"
+                            f"{atomic_suffix})",
                         )
                         stored_outputs.add(output_value)
                 else:
@@ -891,8 +851,6 @@ def _emit_full_window_cube_dag(
         raise SourceEmissionError(
             "cube DAG does not drain region outputs " + ", ".join(sorted(missing))
         )
-    emit_return(writer, io)
-    return writer.render()
 
 
 def _cube_dag_operand(  # noqa: PLR0913
@@ -909,6 +867,7 @@ def _cube_dag_operand(  # noqa: PLR0913
     local: Mapping[int, str],
     producer_by_tensor: Mapping[int, int],
     resident_values: dict[int, str],
+    split_index: str,
 ) -> tuple[str, str, str]:
     if region.tensor in local:
         actual_producer = producer_by_tensor[region.tensor]
@@ -929,11 +888,11 @@ def _cube_dag_operand(  # noqa: PLR0913
         raise SourceEmissionError(
             f"cube external {role} tensor {tensor.value_id!r} is not a region input"
         )
-    row_offset, col_offset = _cube_region_offsets(
-        region.height_binding,
-        region.width_binding,
+    row_offset, col_offset = _cube_tensor_region_offsets(
+        region,
         spatial_row,
         spatial_col,
+        split_index,
     )
     if resident_boundary < 0:
         return argument, row_offset, col_offset
@@ -960,6 +919,39 @@ def _cube_dag_operand(  # noqa: PLR0913
             f"cube resident boundary {resident_boundary} is materialized twice"
         )
     return resident_values[resident_boundary], "0", "0"
+
+
+def _cube_tensor_region_offsets(
+    region: CubeTensorRegionPlan,
+    spatial_row: str,
+    spatial_col: str,
+    split_index: str,
+) -> tuple[str, str]:
+    """Return offsets for one concrete per-spatial/per-split tensor region."""
+
+    parallel_axes = sum(
+        binding is CubeAxisBinding.PARALLEL_K
+        for binding in (region.height_binding, region.width_binding)
+    )
+    if parallel_axes > 1:
+        raise SourceEmissionError(
+            "cube tensor region cannot bind both axes to parallel K"
+        )
+    parallel_extent = (
+        region.height
+        if region.height_binding is CubeAxisBinding.PARALLEL_K
+        else region.width
+    )
+    parallel_offset = (
+        "0" if parallel_axes == 0 else f"{split_index} * {parallel_extent}"
+    )
+    return _cube_region_offsets(
+        region.height_binding,
+        region.width_binding,
+        spatial_row,
+        spatial_col,
+        parallel_offset,
+    )
 
 
 def _emit_retained_panel(

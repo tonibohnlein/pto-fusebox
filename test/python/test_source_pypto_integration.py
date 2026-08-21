@@ -20,8 +20,12 @@ from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from pto_fusebox import (
+    RegionSolveResult,
     emit_pypto_region,
+    enumerate_cube_plans,
     export_and_normalize,
+    extract_solver_regions,
+    region_for_cube_candidate,
     scheduled_region,
     solve_graph,
 )
@@ -53,6 +57,17 @@ class _MatmulWithTail(nn.Module):
 class _DeepKMatmul(nn.Module):
     def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         return torch.mm(lhs, rhs)
+
+
+class _SplitCubeChain(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        intermediate = torch.mm(lhs, middle)
+        return torch.mm(intermediate, rhs, out_dtype=torch.float32)
 
 
 class _ChainedMatmul(nn.Module):
@@ -432,6 +447,118 @@ def test_deep_k_split_protocol_lowers_as_two_dependency_linked_tasks(
         assert "pto.tstore" in first_pto and "atomic_add" not in first_pto
         assert "atomicType = #pto<atomic_type atomic_add>" in atomic_pto
     assert "for (region_index" not in orchestration
+
+
+def test_deep_k_no_split_candidate_compiles_through_pypto_and_ptoas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _DeepKMatmul(),
+        (torch.zeros(128, 8192), torch.zeros(8192, 128)),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    unsolved = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+    sweep = enumerate_cube_plans(
+        unsolved,
+        sweep_binary=_solver().parent / "cube_plan_sweep",
+    )
+    no_split = next(
+        candidate for candidate in sweep.candidates if candidate.id == "p1_q1_s1"
+    )
+    region = region_for_cube_candidate(unsolved, no_split)
+    typed = scheduled_region(region).steps[0]
+    assert isinstance(typed.plan, CubeKernelPlan)
+    assert typed.launch.tile_k == typed.plan.matmuls[0].k_loop.l1_window_k == 512
+
+    source = emit_pypto_region(graph, region, program_name="deep_k_no_split").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "deep_k_no_split"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    generated_cpp = list((compiled.output_dir / "ptoas").glob("*.cpp"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == len(generated_cpp) == len(orchestration_files) == 1
+    pto = pto_files[0].read_text(encoding="utf-8")
+    orchestration = orchestration_files[0].read_text(encoding="utf-8")
+    assert "atomic_add" not in pto
+    assert orchestration.count("rt_submit_aic_task(") == 1
+    assert "launch_spec.set_block_num(1);" in orchestration
+    assert "set_dependencies(" not in orchestration
+
+
+def test_split_cube_dag_lowers_upstream_and_sink_into_each_atomic_share(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _SplitCubeChain(),
+        (
+            torch.empty(16, 64, dtype=torch.bfloat16, device="meta"),
+            torch.empty(64, 2048, dtype=torch.bfloat16, device="meta"),
+            torch.empty(2048, 16, dtype=torch.bfloat16, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    unsolved = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+    sweep = enumerate_cube_plans(
+        unsolved,
+        sweep_binary=_solver().parent / "cube_plan_sweep",
+    )
+    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    region = region_for_cube_candidate(unsolved, candidate)
+    source = emit_pypto_region(graph, region, program_name="split_cube_chain").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "split_cube_chain"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    assert len(pto_files) == 2
+    pto_by_name = {path.stem: path.read_text(encoding="utf-8") for path in pto_files}
+    atomic = pto_by_name["region0000_cube_atomic_all"]
+    assert atomic.count("pto.tmatmul") >= 2
+    assert "atomicType = #pto<atomic_type atomic_add>" in atomic
+    orchestration = next(
+        (compiled.output_dir / "orchestration").glob("*.cpp")
+    ).read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_aiv_task(") == 1
+    assert orchestration.count("rt_submit_aic_task(") == 1
+    assert orchestration.count("set_dependencies(") == 1
+    assert "launch_spec.set_block_num(1);" in orchestration
+    assert "launch_spec.set_block_num(2);" in orchestration
 
 
 def test_cut_fp32_chain_compiles_as_two_dependency_linked_spmd_kernels(

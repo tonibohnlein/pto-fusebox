@@ -29,6 +29,43 @@ class Matmul(nn.Module):
         return torch.mm(lhs, rhs)
 
 
+class SplitCubeChain(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        intermediate = torch.mm(lhs, middle)
+        return torch.mm(intermediate, rhs, out_dtype=torch.float32)
+
+
+class SplitCubeChainWithTwoOutputs(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        middle: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        intermediate = torch.mm(lhs, middle)
+        output = torch.mm(intermediate, rhs, out_dtype=torch.float32)
+        return intermediate, output
+
+
+class SplitCubeChainWithResidentRhs(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        shared_rhs: torch.Tensor,
+        third_rhs: torch.Tensor,
+        sink_rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(lhs, shared_rhs)
+        second = torch.mm(first, shared_rhs)
+        third = torch.mm(second, third_rhs)
+        return torch.mm(third, sink_rhs, out_dtype=torch.float32)
+
+
 def _sweep_binary() -> Path:
     path = Path(__file__).parents[2] / "build" / "cube_plan_sweep"
     if not path.is_file():
@@ -56,6 +93,31 @@ def _lowered_region(
         diagnostics=regions[0].diagnostics,
     )
     return graph, result
+
+
+def _lowered_split_chain(
+    *, m: int = 16, inner: int = 2048, n: int = 16
+) -> tuple[NormalizedGraph, RegionSolveResult]:
+    graph = export_and_normalize(
+        SplitCubeChain(),
+        (
+            torch.empty(m, 64, dtype=torch.bfloat16, device="meta"),
+            torch.empty(64, inner, dtype=torch.bfloat16, device="meta"),
+            torch.empty(inner, n, dtype=torch.bfloat16, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    return graph, RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
 
 
 @pytest.mark.parametrize(
@@ -102,7 +164,7 @@ def test_cube_model_surface_enumerates_replayable_forced_solutions(
 
 
 def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
-    _, region = _lowered_region(128, 8192, 128)
+    graph, region = _lowered_region(128, 8192, 128)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
 
     assert sweep.selected.grid.split_k == 16
@@ -125,6 +187,19 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
                 policy == "aiv_zero_seed_then_atomic"
             )
 
+    no_split = next(
+        candidate for candidate in sweep.candidates if candidate.id == "p1_q1_s1"
+    )
+    forced = region_for_cube_candidate(region, no_split)
+    typed = scheduled_region(forced).steps[0]
+    plan = typed.plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert typed.launch.tile_k == plan.matmuls[0].k_loop.l1_window_k == 512
+    assert can_emit_region(graph, forced)
+    source = emit_pypto_region(graph, forced, program_name="deep_k_no_split").source
+    assert "pl.spmd(1," in source
+    assert "atomic=pl.AtomicType.Add" not in source
+
     # The outer L1 window and nested L0 loop are different hierarchy levels.
     # The selected S=16 plan covers a 160-wide L1 window with two 64-wide L0
     # iterations plus a 32-wide L0 tail; typed parsing must preserve that
@@ -137,6 +212,165 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     assert matmul.output_variants[0].l0_init.tile[2] == 64
     l0_loop = matmul.output_variants[0].l0_init.k_loop
     assert l0_loop.full_chunks * l0_loop.chunk + l0_loop.tail == 160
+
+
+def test_split_cube_dag_replays_upstream_then_unique_atomic_sink() -> None:
+    graph, region = _lowered_split_chain()
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    forced = region_for_cube_candidate(region, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.execution_order == (0, 1)
+    assert [matmul.is_sink for matmul in plan.matmuls] == [False, True]
+    assert plan.matmuls[0].effective_contraction == plan.matmuls[0].contraction
+    assert (
+        plan.matmuls[1].effective_contraction * plan.split_k
+        == plan.matmuls[1].contraction
+    )
+    assert can_emit_region(graph, forced)
+
+    source = emit_pypto_region(graph, forced, program_name="split_cube_chain").source
+
+    assert source.count("pl.spmd(") == 2
+    assert source.count("pl.create_l1(") == 1
+    assert source.index("matmul_0_tile_0_accumulator") < source.index(
+        "matmul_1_tile_0_accumulator"
+    )
+    assert "[0, split_index * 1024]" in source
+    assert "[split_index * 1024, 0]" in source
+    assert source.count("atomic=pl.AtomicType.Add") == 1
+    assert "pl.assemble(matmul_0_l1" in source
+
+    assert forced.solution is not None
+    solution = copy.deepcopy(forced.solution)
+    descriptor = solution["steps"][0]["plan"]
+    descriptor["split_merge_policy"] = "first_partial_then_atomic"
+    descriptor["first_partial_then_atomic"] = {
+        "present": True,
+        "first_work_units": 1,
+        "atomic_work_units": 1,
+        "synchronization_cycles": descriptor["aiv_zero_seed_then_atomic"][
+            "synchronization_cycles"
+        ],
+    }
+    descriptor["aiv_zero_seed_then_atomic"] = {
+        "present": False,
+        "seed_work_units": 0,
+        "atomic_work_units": 0,
+        "seed_bytes": 0,
+        "synchronization_cycles": 0.0,
+    }
+    first_partial = emit_pypto_region(
+        graph,
+        replace(forced, solution=solution),
+        program_name="split_cube_chain_first_partial",
+    ).source
+    assert first_partial.count("pl.spmd(") == 2
+    assert first_partial.count("pl.create_l1(") == 2
+    assert first_partial.count("atomic=pl.AtomicType.Add") == 1
+    assert "pl.full(" not in first_partial
+
+
+def test_split_cube_dag_retains_a_boundary_panel_inside_each_share() -> None:
+    graph, region = _lowered_split_chain(m=512, n=512)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s8")
+    forced = region_for_cube_candidate(region, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.matmuls[1].retained_panels.rhs
+    assert can_emit_region(graph, forced)
+
+    source = emit_pypto_region(graph, forced, program_name="split_retained_rhs").source
+
+    retained = "matmul_1_rhs_retained = pl.slice("
+    first_output_tile = "matmul_1_tile_0_rhs_init_0 = pl.slice("
+    assert source.count(retained) == 1
+    assert source.index(retained) < source.index(first_output_tile)
+    assert "split_index * 256" in source
+
+
+def test_split_cube_dag_materializes_a_resident_operand_once_per_share() -> None:
+    arguments = tuple(
+        torch.empty(64, 64, dtype=torch.bfloat16, device="meta") for _ in range(4)
+    )
+    graph = export_and_normalize(SplitCubeChainWithResidentRhs(), arguments)
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    region = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    forced = region_for_cube_candidate(region, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert len(plan.resident_boundaries) == 1
+    assert plan.resident_boundaries[0].use_count == 2
+    assert can_emit_region(graph, forced)
+
+    source = emit_pypto_region(graph, forced, program_name="split_resident_rhs").source
+
+    resident = "resident_0_rhs = pl.slice("
+    assert source.count(resident) == 1
+    assert "matmul_0_tile_0_rhs_init = pl.slice(resident_0_rhs" in source
+    assert "matmul_1_tile_0_rhs_init = pl.slice(resident_0_rhs" in source
+    assert source.count("atomic=pl.AtomicType.Add") == 1
+
+
+def test_split_cube_dag_rejects_a_second_split_accumulator() -> None:
+    graph, region = _lowered_split_chain()
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    forced = region_for_cube_candidate(region, candidate)
+    assert forced.solution is not None
+    solution = copy.deepcopy(forced.solution)
+    matmuls = solution["steps"][0]["plan"]["matmuls"]
+    duplicate = copy.deepcopy(matmuls[1])
+    duplicate["instance"] = 1
+    duplicate["is_sink"] = False
+    duplicate["final_drain"]["target_l1"] = True
+    duplicate["final_drain"]["atomic"] = False
+    matmuls[1]["instance"] = 2
+    matmuls.insert(1, duplicate)
+    solution["steps"][0]["plan"]["execution_order"] = [0, 1, 1]
+
+    with pytest.raises(SourceEmissionError, match="exactly one split accumulator"):
+        emit_pypto_region(graph, replace(forced, solution=solution))
+
+
+def test_cube_sweep_rejects_a_multi_output_split_group() -> None:
+    graph = export_and_normalize(
+        SplitCubeChainWithTwoOutputs(),
+        (
+            torch.empty(16, 64, dtype=torch.bfloat16, device="meta"),
+            torch.empty(64, 2048, dtype=torch.bfloat16, device="meta"),
+            torch.empty(2048, 16, dtype=torch.bfloat16, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    region = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+
+    with pytest.raises(RuntimeError, match="homogeneous MatMul DAG"):
+        enumerate_cube_plans(region, sweep_binary=_sweep_binary())
 
 
 def test_deep_k_split_source_uses_one_dependency_between_parallel_phases() -> None:
