@@ -21,6 +21,7 @@ from .common import (
     EmissionContext,
     SourceEmissionError,
     SourceWriter,
+    broadcast_operands,
     emit_return,
     literal,
     program_preamble,
@@ -721,6 +722,13 @@ def _emit_vector_stage(  # noqa: PLR0913
         expression = _tensor_vector_expression(
             graph_op,
             operands,
+            input_shapes=[
+                (
+                    context.lowered.tensor(tensor).height,
+                    context.lowered.tensor(tensor).width,
+                )
+                for tensor in operation.inputs
+            ],
             output_dtype=context.lowered.tensor(output).dtype,
         )
         name = f"vector_{output}"
@@ -769,6 +777,7 @@ def _tensor_vector_expression(
     op: NormalizedOp,
     operands: list[str],
     *,
+    input_shapes: list[tuple[int, int]],
     output_dtype: str,
 ) -> str:
     unary = {"exp", "log", "abs", "sqrt", "rsqrt", "neg"}
@@ -797,7 +806,25 @@ def _tensor_vector_expression(
     if op.kind not in binary:
         raise SourceEmissionError(f"mixed vector source does not implement {op.kind!r}")
     if len(operands) == 2:
-        return f"pl.tensor.{binary[op.kind]}({operands[0]}, {operands[1]})"
+        if input_shapes[0] == input_shapes[1]:
+            return f"pl.tensor.{binary[op.kind]}({operands[0]}, {operands[1]})"
+        wide_index, thin_index, geometry = broadcast_operands(input_shapes)
+        if op.kind in {"sub", "div"} and wide_index != 0:
+            raise SourceEmissionError(
+                f"mixed vector op {op.id} uses unsupported reverse broadcast {op.kind}"
+            )
+        operation = {
+            "add": "add",
+            "sub": "sub",
+            "mul": "mul",
+            "div": "div",
+            "maximum": "max",
+            "minimum": "min",
+        }[op.kind]
+        return (
+            f"pl.tensor.{geometry}_expand_{operation}"
+            f"({operands[wide_index]}, {operands[thin_index]})"
+        )
     if len(operands) != 1:
         raise SourceEmissionError(f"mixed vector op {op.id} has unsupported arity")
     position, scalar = scalar_operand(op)

@@ -352,6 +352,9 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     else:
         assert "pto.tpush_to_aic" not in pto
         assert "pto.tpop_from_aiv" not in pto
+    if name == "mixed_c2v":
+        assert "pto.tcolexpandadd" in pto
+        assert "pto.tadd" not in pto
 
 
 @pytest.mark.parametrize(

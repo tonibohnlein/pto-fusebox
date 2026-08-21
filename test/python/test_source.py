@@ -1048,7 +1048,8 @@ def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in source
     assert "pl.range(1, init_values=(output,))" in source
     assert source.count("pl.tensor.matmul(") == 1
-    assert "pl.tensor.add(" in source
+    assert "pl.tensor.col_expand_add(" in source
+    assert "pl.tensor.add(" not in source
     assert source.count("pl.tensor.assemble(") == 1
 
 

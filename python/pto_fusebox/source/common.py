@@ -17,6 +17,30 @@ class SourceEmissionError(ValueError):
     """Raised when a valid analytic schedule is outside the source backend."""
 
 
+def broadcast_operands(shapes: Sequence[tuple[int, int]]) -> tuple[int, int, str]:
+    """Classify one supported rank-two singleton broadcast.
+
+    Returns the wide operand index, thin operand index, and PyPTO expansion
+    geometry (``row`` for ``[M, 1]`` and ``col`` for ``[1, N]``).  Keeping this
+    classifier shared makes homogeneous and mixed vector replay choose the same
+    operation for the same tensor shapes.
+    """
+
+    if len(shapes) != 2:
+        raise SourceEmissionError(
+            f"vector broadcast requires two operands, got {len(shapes)}"
+        )
+    for wide in (0, 1):
+        thin = 1 - wide
+        wide_rows, wide_cols = shapes[wide]
+        thin_rows, thin_cols = shapes[thin]
+        if thin_rows == wide_rows and thin_cols == 1 and wide_cols > 1:
+            return wide, thin, "row"
+        if thin_rows == 1 and thin_cols == wide_cols and wide_rows > 1:
+            return wide, thin, "col"
+    raise SourceEmissionError(f"unsupported vector broadcast geometry {shapes}")
+
+
 class SourceWriter:
     """Small deterministic indentation-aware source builder."""
 

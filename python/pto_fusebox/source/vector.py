@@ -22,6 +22,7 @@ from .common import (
     Interface,
     SourceEmissionError,
     SourceWriter,
+    broadcast_operands,
     ceil_div,
     emit_partition_indices,
     emit_return,
@@ -1460,7 +1461,7 @@ def _vector_expression(  # noqa: PLR0913 -- arguments are explicit contract fiel
     ]
     if shapes[0] == shapes[1]:
         return f"pl.{op.kind}({operands[0]}, {operands[1]})"
-    wide_index, thin_index, geometry = _broadcast_operands(shapes)
+    wide_index, thin_index, geometry = broadcast_operands(shapes)
     if op.kind in {"sub", "div"} and wide_index != 0:
         raise SourceEmissionError(f"reverse broadcast {op.kind} is not implemented")
     operation = {
@@ -1472,18 +1473,6 @@ def _vector_expression(  # noqa: PLR0913 -- arguments are explicit contract fiel
         "minimum": "min",
     }[op.kind]
     return f"pl.{geometry}_expand_{operation}({operands[wide_index]}, {operands[thin_index]})"
-
-
-def _broadcast_operands(shapes: list[tuple[int, int]]) -> tuple[int, int, str]:
-    for wide in (0, 1):
-        thin = 1 - wide
-        wide_rows, wide_cols = shapes[wide]
-        thin_rows, thin_cols = shapes[thin]
-        if thin_rows == wide_rows and thin_cols == 1 and wide_cols > 1:
-            return wide, thin, "row"
-        if thin_rows == 1 and thin_cols == wide_cols and wide_rows > 1:
-            return wide, thin, "col"
-    raise SourceEmissionError(f"unsupported vector broadcast geometry {shapes}")
 
 
 def _tensor_producers(lowered: LoweredRegion) -> list[int | None]:
