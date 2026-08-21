@@ -27,6 +27,9 @@ from pto_fusebox.ir import normalized_graph_sha256
 from pto_fusebox.schedule.schema import (
     AxisPartition,
     CubeKernelPlan,
+    MixedAlgorithm,
+    MixedCrossCoreProtocol,
+    MixedKernelPlan,
     VectorKernelPlan,
     VectorReplayPhase,
     VectorSpatialPolicy,
@@ -60,6 +63,37 @@ def _solve_module(module: nn.Module, args: tuple[torch.Tensor, ...]):
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     return graph, solved.regions[0]
+
+
+class _C2VEpilogue(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(value, weight) + bias
+
+
+class _DenseSwiGlu(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        gate = torch.mm(value, gate_weight, out_dtype=torch.float32)
+        up = torch.mm(value, up_weight, out_dtype=torch.float32)
+        activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
+            torch.bfloat16
+        )
+        return torch.mm(activation, down_weight, out_dtype=torch.float32)
+
+
+class _V2COnly(nn.Module):
+    def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.exp(value), weight)
 
 
 @cache
@@ -931,9 +965,130 @@ def test_source_readiness_rejects_transposed_matmul() -> None:
         emit_pypto_region(graph, result)
 
 
-def test_source_backend_rejects_mixed_plan_without_replanning_it() -> None:
+def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     graph, result = _solved("attention_core")
-    with pytest.raises(SourceEmissionError, match="mixed PyPTO source emission"):
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.algorithm is MixedAlgorithm.GENERIC
+    assert step.plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(graph, result, program_name="attention_mixed").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" in source
+    assert "pl.pipeline(1, stage=3" in source
+    assert source.count("pl.tensor.matmul(") == 2
+    assert "b_trans=True" in source
+    assert "pl.tensor.row_max(" in source
+    assert "pl.tensor.row_sum(" in source
+    assert "pl.tensor.assemble(" in source
+    assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+def test_mixed_typed_contract_rejects_stale_fifo_geometry() -> None:
+    _, result = _solved("attention_core")
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    solution["steps"][0]["plan"]["fifos"][0]["slot_bytes"] += 4
+
+    with pytest.raises(
+        ScheduleContractError, match="differs from its transfer geometry"
+    ):
+        scheduled_region(replace(result, solution=solution))
+
+
+def test_mixed_typed_contract_rejects_stale_protocol_bundle() -> None:
+    _, result = _solved("attention_core")
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    solution["steps"][0]["plan"]["protocol_producer_bundle"] = [1]
+
+    with pytest.raises(
+        ScheduleContractError, match="inconsistent single-round-trip protocol"
+    ):
+        scheduled_region(replace(result, solution=solution))
+
+
+def test_mixed_source_rejects_shared_fifo_over_capacity() -> None:
+    graph, result = _solved("attention_core")
+    assert result.problem is not None
+    problem = dict(result.problem)
+    problem["vec_capacity"] = 130_000
+    stale = replace(result, problem=problem)
+
+    assert not can_emit_region(graph, stale)
+    with pytest.raises(
+        SourceEmissionError, match="shared FIFO and vector stage exceed Vec capacity"
+    ):
+        emit_pypto_region(graph, stale)
+
+
+def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
+    graph, result = _solve_module(
+        _C2VEpilogue(),
+        (
+            torch.zeros(32, 64),
+            torch.zeros(64, 32),
+            torch.zeros(1, 32),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(graph, result, program_name="c2v_epilogue").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in source
+    assert "pl.range(1, init_values=(output,))" in source
+    assert source.count("pl.tensor.matmul(") == 1
+    assert "pl.tensor.add(" in source
+    assert source.count("pl.tensor.assemble(") == 1
+
+
+def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> None:
+    graph, result = _solve_module(
+        _DenseSwiGlu(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP
+    assert step.op_order[:2] == (1, 0)
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(graph, result, program_name="dense_swiglu").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" in source
+    assert "pl.pipeline(0, 128, 64, stage=3" in source
+    assert source.count("pl.tensor.matmul(") == 3
+    assert source.count("pl.tensor.matmul_acc(") == 1
+    assert "pl.tensor.recip(" in source
+    assert 'target_type=pl.BF16, mode="round"' in source
+
+
+def test_source_backend_rejects_unimplemented_one_way_v2c() -> None:
+    graph, result = _solve_module(
+        _V2COnly(),
+        (torch.zeros(32, 64), torch.zeros(64, 32)),
+    )
+
+    assert not can_emit_region(graph, result)
+    with pytest.raises(SourceEmissionError, match="one-way C->V topology"):
         emit_pypto_region(graph, result)
 
 

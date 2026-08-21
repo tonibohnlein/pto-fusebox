@@ -32,10 +32,14 @@ one-reduction folded or spanning streams. Cube execution covers uniform
 non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
-Welford/multi-stat vector plans, singleton-column normalization, nonuniform cube
-spatial partitions, and mixed cross-core schedules fail closed. A uniform cube
-DAG may split only its unique sink through the selected dependency-linked PyPTO
-task protocol.
+Mixed source covers generic one-way `C -> V`, generic `C -> V -> C`, and dense
+`C,C -> V -> C` schedules. It replays the serialized stages and tensor DAG
+through one `pl.spmd` grid with `pl.split(UP_DOWN)`; PyPTO inserts the concrete
+push/pop/free pipeline. One-way `V -> C`, deeper round trips, and mixed
+multi-step composition fail closed. Welford/multi-stat vector plans,
+singleton-column normalization, and nonuniform cube spatial partitions remain
+outside source readiness. A uniform cube DAG may split only its unique sink
+through the selected dependency-linked PyPTO task protocol.
 Dynamic-shape classes are retained but declined when they affect solver
 geometry.
 
@@ -78,8 +82,9 @@ caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
 arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
 typed emission context and run the same graph-aware renderer validation; the
 readiness query is not a weaker schedule-family approximation. The emitter
-accepts one or more selected homogeneous steps and raises
-`SourceEmissionError` for every unimplemented algorithm or unsafe cut edge.
+accepts one or more selected homogeneous steps or one supported mixed step and
+raises `SourceEmissionError` for every unimplemented algorithm or unsafe cut
+edge.
 `EmittedPyPTOSource.kinds` preserves the ordered engine kind of every emitted
 step; its compatibility `kind` property is populated only when all steps use
 the same engine kind.
@@ -87,14 +92,16 @@ the same engine kind.
 ### Source-backend structure and validation
 
 The source backend is schedule-family-driven, not model- or pattern-driven.
-It selects a vector or cube emitter from the typed solver step, replays the
-solver's operation order and serialized geometry, and dispatches individual
-operations by normalized operator kind. Names such as softmax, RMSNorm,
-attention, or a source `nn.Module` class are never emission inputs. The cube
-family is driven by the typed request DAG rather than by example or model
-names. It replays the selected topological order, propagated regions, outer-K
-windows, local produced-value lifetimes, retained boundary panels, and drains
-for non-split plans.
+It selects a vector, cube, or mixed emitter from the typed solver step, replays
+the solver's operation order and serialized geometry, and dispatches
+individual operations by normalized operator kind. Names such as softmax,
+RMSNorm, attention, SwiGLU, or a source `nn.Module` class are never emission
+inputs. The cube and mixed families are driven by typed request/stage DAGs
+rather than by example or model names. Cube replay preserves the selected
+topological order, propagated regions, outer-K windows, local produced-value
+lifetimes, retained boundary panels, and drains. Mixed replay preserves the
+selected engine stages, propagated crossing frames, cube K windows, generic
+vector DAG, group loop, and pipeline depth.
 
 The replay structure follows the earlier PyPTO fusion-scheduler prototype:
 one solver-owned grid, propagated regions, planned physical frames and
@@ -177,8 +184,8 @@ single `EmissionContext`, so neither readiness nor rendering reconstructs an
 ABI from a partial view. Unknown, missing, or internally inconsistent fields
 fail closed. The source package is split by responsibility: `source/api.py`
 owns context construction and dispatch, `source/common.py` owns typed
-ABI/naming/partition mechanics, and `source/vector.py` and `source/cube.py`
-replay their respective homogeneous plans.
+ABI/naming/partition mechanics, and `source/vector.py`, `source/cube.py`, and
+`source/mixed.py` replay their respective plans.
 
 ## v1 normalization and admission
 
@@ -239,13 +246,14 @@ in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate tensor/tile
 PyPTO source from its own selected schedule. Split cube DAGs, multi-reduction
 streaming, non-uniform cube-DAG grids, one-way `V -> C`, complete
 `C -> V -> C`, and deeper serial mixed topologies therefore remain eligible
-even when no legacy emitter path exists. Solution metadata records the stages,
+even when no source emitter path exists. Solution metadata records the stages,
 directional transfers, and protocol for every analytic mixed plan. Plans with
 a complete stage-local geometry, vector stream, cube-window, and FIFO contract
-also set their internal `source_codegen_ready=true` contract-completeness bit;
-that mixed-plan field does not by itself claim support in the installed Python
-source backend. Broader analytic winners remain valid research results but are
-not presented as source-emittable. `regions_solved` therefore reports analytic
+also set their internal `source_codegen_ready=true` contract-completeness bit.
+The Python backend separately admits only generic `C -> V`, generic
+`C -> V -> C`, and dense `C,C -> V -> C` today. Broader analytic winners remain
+valid research results but are not presented as source-emittable.
+`regions_solved` therefore reports analytic
 solver success separately from `whole_graph_codegen_ready`, which additionally
 requires no opaque graph boundaries and a successful exact
 `can_emit_region(graph, region)` check for every selected step.
@@ -367,8 +375,18 @@ The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
+Mixed source validates every logical transfer/FIFO descriptor, emits the
+crossing values in that order, and passes the common slot count to
+`pl.split(UP_DOWN)`. PyPTO's `SkewCrossCorePipeline` owns the physical
+initialize/push/pop/free lowering and may coalesce compatible logical
+directions into one bidirectional pipe. The opt-in integration tests therefore
+check the lowered directions, slot size/count, and AIC/AIV functions; exact
+logical-to-physical multi-pipe parity remains part of silicon closure rather
+than an unverified source claim.
+
 Analytic support is broader than the renderer. Welford/multi-stat P4 and mixed
-plans remain valid solver results but are not source-ready. P4
+plans outside the three admitted stage patterns remain valid solver results but
+are not source-ready. P4
 descriptors preserve named roles; each new recipe must version its carry and
 publication semantics. Future plan classes can add those contracts and
 cross-core transport without changing the ownership boundary.
@@ -571,8 +589,9 @@ dynamic physical tile that reaches allocation or tile-flattening.
 3. Silicon-close single-sink split-K cube DAG source with resident operands,
    retained panels, and per-share outer-K windows; continue rejecting
    ambiguous multi-root merges.
-4. Implement the generic mixed source backend from one round trip while continuing
-   to reject unsupported multi-round-trip groups before emission.
+4. Silicon-close generic `C -> V`, generic `C -> V -> C`, and dense
+   `C,C -> V -> C` source replay while continuing to reject unsupported
+   multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
 6. Add Type-1 dynamic outer chunks with a static physical tile and runtime

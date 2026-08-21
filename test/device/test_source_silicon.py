@@ -1,12 +1,12 @@
-"""Opt-in silicon coverage for Fusebox-generated homogeneous PyPTO source.
+"""Opt-in silicon coverage for Fusebox-generated PyPTO source.
 
 The default host suite does not collect ``test/device``. Run this file against
 an explicit PyPTO checkout and physical device by setting
 ``PTO_FUSEBOX_RUN_DEVICE_TESTS=1`` and ``PTO_FUSEBOX_DEVICE_ID``.
 
 The matrix is deliberately preselected. It spans the currently source-ready
-vector algorithms and the single-matmul cube emitter without searching device
-results for favorable shapes or tolerances.
+vector algorithms, single-matmul cube emitter, and initial mixed pipelines
+without searching device results for favorable shapes or tolerances.
 """
 
 from __future__ import annotations
@@ -30,7 +30,11 @@ from pto_fusebox import (
     scheduled_region,
     solve_graph,
 )
-from pto_fusebox.schedule.schema import CubeKernelPlan, VectorKernelPlan
+from pto_fusebox.schedule.schema import (
+    CubeKernelPlan,
+    MixedKernelPlan,
+    VectorKernelPlan,
+)
 
 if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
     pytest.skip(
@@ -84,6 +88,44 @@ class Matmul(nn.Module):
         return torch.mm(lhs, rhs)
 
 
+class C2VEpilogue(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(value, weight) + bias
+
+
+class AttentionCore(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        scores = torch.mm(query, key.t())
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.mm(probabilities, value)
+
+
+class DenseSwiGlu(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        gate = torch.mm(value, gate_weight, out_dtype=torch.float32)
+        up = torch.mm(value, up_weight, out_dtype=torch.float32)
+        activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
+            torch.bfloat16
+        )
+        return torch.mm(activation, down_weight, out_dtype=torch.float32)
+
+
 def _generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
@@ -96,6 +138,19 @@ def _random_args(
         generator = _generator(seed)
         return tuple(
             torch.randn(shape, generator=generator, dtype=torch.float32) * scale
+            for shape in shapes
+        )
+
+    return make
+
+
+def _random_bf16_args(*shapes: tuple[int, int], scale: float = 0.25) -> ArgsFactory:
+    def make(seed: int) -> tuple[torch.Tensor, ...]:
+        generator = _generator(seed)
+        return tuple(
+            (torch.randn(shape, generator=generator, dtype=torch.float32) * scale).to(
+                torch.bfloat16
+            )
             for shape in shapes
         )
 
@@ -226,6 +281,34 @@ MATMUL_CASES = tuple(
 )
 
 
+MIXED_CASES = (
+    SiliconCase(
+        "mixed_c2v_epilogue_32x64x32",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((32, 64), (64, 32), (1, 32), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    ),
+    SiliconCase(
+        "mixed_qk_softmax_pv_96x64x128",
+        "mixed",
+        AttentionCore(),
+        _random_args((96, 64), (64, 64), (64, 128), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    ),
+    SiliconCase(
+        "mixed_dense_swiglu_128x64x128x64",
+        "mixed",
+        DenseSwiGlu(),
+        _random_bf16_args((128, 64), (64, 128), (64, 128), (128, 64)),
+        rtol=2.0e-2,
+        atol=2.0e-2,
+    ),
+)
+
+
 def _solver() -> Path:
     configured = os.environ.get("PTO_FUSEBOX_SOLVER")
     path = (
@@ -254,20 +337,30 @@ def _assert_static_artifact(
     pto_files = list(output_dir.rglob("*.pto"))
     assert len(pto_files) == 1
     pto = pto_files[0].read_text(encoding="utf-8")
-    assert "pto.tpush" not in pto
-    assert "pto.tpop" not in pto
-    assert "pto.tfree" not in pto
+    if case.kind == "mixed":
+        assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
+        assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
+        assert "pto.tpush_to_aiv" in pto
+        assert "pto.tpop_from_aic" in pto
+        assert "pto.tfree_from_aic" in pto
+    else:
+        assert "pto.tpush" not in pto
+        assert "pto.tpop" not in pto
+        assert "pto.tfree" not in pto
     if case.kind == "vector":
         assert "pto.tmatmul" not in pto
         assert re.search(r"partition_tensor_view<[^>]*\?", pto) is None
         assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
-    else:
+    elif case.kind == "cube":
         assert "pto.tmatmul" in pto
 
     orchestration_files = list((output_dir / "orchestration").glob("*.cpp"))
     assert len(orchestration_files) == 1
     orchestration = orchestration_files[0].read_text(encoding="utf-8")
-    assert len(re.findall(r"\brt_submit_ai[cv]_task\(", orchestration)) == 1
+    if case.kind == "mixed":
+        assert orchestration.count("rt_submit_task(") == 1
+    else:
+        assert len(re.findall(r"\brt_submit_ai[cv]_task\(", orchestration)) == 1
     assert orchestration.count("launch_spec.set_block_num(") == 1
     assert f"launch_spec.set_block_num({work_units});" in orchestration
     assert "region_index" not in orchestration
@@ -289,7 +382,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     region = solved.regions[0]
     assert can_emit_region(graph, region)
     plan = scheduled_region(region).steps[0].plan
-    assert isinstance(plan, (CubeKernelPlan, VectorKernelPlan))
+    assert isinstance(plan, (CubeKernelPlan, MixedKernelPlan, VectorKernelPlan))
     emitted = emit_pypto_region(graph, region, program_name=case.name)
     assert emitted.kind.value == case.kind
     assert "auto_fuse" not in emitted.source
@@ -334,4 +427,9 @@ def test_generated_vector_source_on_silicon(case: SiliconCase, tmp_path: Path) -
 
 @pytest.mark.parametrize("case", MATMUL_CASES, ids=lambda case: case.name)
 def test_generated_matmul_source_on_silicon(case: SiliconCase, tmp_path: Path) -> None:
+    _run_case(case, tmp_path)
+
+
+@pytest.mark.parametrize("case", MIXED_CASES, ids=lambda case: case.name)
+def test_generated_mixed_source_on_silicon(case: SiliconCase, tmp_path: Path) -> None:
     _run_case(case, tmp_path)

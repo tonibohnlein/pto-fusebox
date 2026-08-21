@@ -77,7 +77,7 @@ def emit_pypto_region(
     *,
     program_name: str | None = None,
 ) -> EmittedPyPTOSource:
-    """Emit one solver-owned homogeneous schedule as ordinary PyPTO DSL."""
+    """Emit one solver-owned schedule as ordinary PyPTO DSL."""
 
     try:
         lowered, schedule, region_interface = _emission_contract(graph, result)
@@ -400,14 +400,17 @@ def _tensor_consumers(lowered: LoweredRegion) -> tuple[tuple[int, ...], ...]:
 
 def _render(context: EmissionContext, program_name: str) -> str:
     from .cube import emit_cube
+    from .mixed import emit_mixed
     from .vector import emit_vector
 
     if context.step.kind is KernelKind.VECTOR:
         source = emit_vector(context, program_name)
     elif context.step.kind is KernelKind.CUBE:
         source = emit_cube(context, program_name)
+    elif context.step.kind is KernelKind.MIXED:
+        source = emit_mixed(context, program_name)
     else:
-        raise SourceEmissionError("mixed PyPTO source emission is not implemented yet")
+        raise SourceEmissionError(f"unknown kernel kind {context.step.kind.value!r}")
     tree = ast.parse(source)
     if _has_automatic_scheduling_tag(tree):
         raise SourceEmissionError("generated source must encode the plan directly")

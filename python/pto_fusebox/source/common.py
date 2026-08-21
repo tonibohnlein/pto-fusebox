@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import keyword
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ..ir import NormalizedGraph, NormalizedValue, ShapeDimension
+from ..ir import NormalizedGraph, NormalizedOp, NormalizedValue, ShapeDimension
 from ..lowered import LoweredRegion
 from ..schedule import AxisPartition, KernelStep, ScheduledRegion
 
@@ -417,6 +417,24 @@ def ceil_div(value: int, divisor: int) -> int:
     """Return the integer ceiling of ``value / divisor``."""
 
     return (value + divisor - 1) // divisor
+
+
+def scalar_operand(op: NormalizedOp) -> tuple[int, int | float]:
+    """Return the unique normalized scalar operand position and value."""
+
+    scalars = op.attributes.get("scalars")
+    if not isinstance(scalars, Sequence) or len(scalars) != 1:
+        raise SourceEmissionError(f"{op.id} does not carry exactly one scalar operand")
+    scalar = scalars[0]
+    if not isinstance(scalar, Mapping):
+        raise SourceEmissionError(f"{op.id} has a malformed scalar operand")
+    position = scalar.get("position")
+    if not isinstance(position, int) or isinstance(position, bool):
+        raise SourceEmissionError(f"{op.id} has an invalid scalar operand position")
+    value = scalar.get("value")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise SourceEmissionError(f"{op.id} has a non-numeric scalar")
+    return position, value
 
 
 def literal(value: Any) -> str:

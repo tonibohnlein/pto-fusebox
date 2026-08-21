@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 from ..ir import NormalizedGraph, NormalizedOp
 from ..lowered import LoweredRegion
@@ -28,6 +28,7 @@ from .common import (
     literal,
     program_header,
     pypto_dtype,
+    scalar_operand,
     solver_tensor_for_value,
     static_shape,
     validate_grid,
@@ -1440,7 +1441,7 @@ def _vector_expression(  # noqa: PLR0913 -- arguments are explicit contract fiel
     if op.kind not in {"add", "sub", "mul", "div", "maximum", "minimum"}:
         raise SourceEmissionError(f"vector source v1 does not implement {op.kind!r}")
     if len(operands) == 1:
-        position, scalar = _single_scalar(op)
+        position, scalar = scalar_operand(op)
         if op.kind == "div" and position == 0 and scalar == 1:
             return f"pl.recip({operands[0]})"
         if position != 1:
@@ -1483,22 +1484,6 @@ def _broadcast_operands(shapes: list[tuple[int, int]]) -> tuple[int, int, str]:
         if thin_rows == 1 and thin_cols == wide_cols and wide_rows > 1:
             return wide, thin, "col"
     raise SourceEmissionError(f"unsupported vector broadcast geometry {shapes}")
-
-
-def _single_scalar(op: NormalizedOp) -> tuple[int, int | float]:
-    scalars = op.attributes.get("scalars")
-    if not isinstance(scalars, Sequence) or len(scalars) != 1:
-        raise SourceEmissionError(f"{op.id} does not carry exactly one scalar operand")
-    scalar = scalars[0]
-    if not isinstance(scalar, Mapping):
-        raise SourceEmissionError(f"{op.id} has a malformed scalar operand")
-    position = scalar.get("position")
-    if not isinstance(position, int) or isinstance(position, bool):
-        raise SourceEmissionError(f"{op.id} has an invalid scalar operand position")
-    value = scalar.get("value")
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise SourceEmissionError(f"{op.id} has a non-numeric scalar")
-    return position, value
 
 
 def _tensor_producers(lowered: LoweredRegion) -> list[int | None]:

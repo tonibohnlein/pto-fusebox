@@ -61,6 +61,48 @@ class CubeSplitMergePolicy(Enum):
     AIV_ZERO_SEED_THEN_ATOMIC = "aiv_zero_seed_then_atomic"
 
 
+class MixedEngine(Enum):
+    CUBE = "cube"
+    VECTOR = "vector"
+
+
+class MixedPipelineMode(Enum):
+    SERIAL = "serial"
+    ONE_WAY = "one_way"
+    SINGLE_ROUND_TRIP_SKEW = "single_round_trip_skew"
+    MULTI_ROUND_TRIP_SEQUENTIAL = "multi_round_trip_sequential"
+
+
+class MixedCrossCoreProtocol(Enum):
+    UNSUPPORTED = "unsupported"
+    ONE_WAY = "one_way"
+    SINGLE_ROUND_TRIP_BUNDLE = "single_round_trip_bundle"
+
+
+class MixedPipelineAxis(Enum):
+    SPATIAL_REGION = "spatial_region"
+    VECTOR_WIDTH_CHUNK = "vector_width_chunk"
+    VECTOR_HEIGHT_CHUNK = "vector_height_chunk"
+    ATTENTION_KEY_CHUNK = "attention_key_chunk"
+    INTERMEDIATE_FEATURE_CHUNK = "intermediate_feature_chunk"
+
+
+class MixedAlgorithm(Enum):
+    GENERIC = "generic"
+    DENSE_SWIGLU_MLP = "dense_swiglu_mlp"
+
+
+class MixedVectorSplit(Enum):
+    NONE = "none"
+    ROWS = "rows"
+    COLUMNS = "columns"
+
+
+class MixedTransferDirection(Enum):
+    CUBE_TO_VECTOR = "cube_to_vector"
+    VECTOR_TO_CUBE = "vector_to_cube"
+
+
 class CubeAxisBinding(Enum):
     FULL = "full"
     SPATIAL_M = "spatial_m"
@@ -421,10 +463,103 @@ class CubeKernelPlan:
 
 
 @dataclass(frozen=True)
-class MixedKernelPlan:
-    """Marker for a mixed schedule, which the homogeneous source backend rejects."""
+class MixedStagePlan:
+    topology_stage: int
+    engine: MixedEngine
+    ops: tuple[int, ...]
+    valid_rows: int
+    valid_cols: int
+    cube_window_k: tuple[int, ...]
+    vector_stream: VectorKernelPlan | None
 
+
+@dataclass(frozen=True)
+class MixedTransferPlan:
+    tensor: int
+    producer_stage: int
+    consumer_stage: int
+    producer_engine: MixedEngine
+    consumer_engine: MixedEngine
+
+
+@dataclass(frozen=True)
+class MixedFifoPlan:
+    tensor: int
+    direction: MixedTransferDirection
+    valid_rows: int
+    valid_cols: int
+    slot_bytes: int
+    slot_count: int
+    reserved_bytes: int
+    pipe_id: int
+    bundle: int
+
+
+@dataclass(frozen=True)
+class MixedDenseMlpPlan:
+    input_extent: int
+    intermediate_extent: int
+    intermediate_chunk: int
+    intermediate_chunks: int
+    output_extent: int
+    gate_window_k: int
+    up_window_k: int
+    persistent_accumulator_bytes: int
+    first_chunk_initializes: bool
+    later_chunks_accumulate: bool
+
+
+@dataclass(frozen=True)
+class MixedKernelPlan:
+    """Solver-owned cross-engine topology, geometry, loop, and FIFO contract."""
+
+    emit_compatible: bool
     source_codegen_ready: bool
+    algorithm: MixedAlgorithm
+    protocol: MixedCrossCoreProtocol
+    mode: MixedPipelineMode
+    m_partition: AxisPartition
+    n_partition: AxisPartition
+    spatial_tiles: int
+    split_k: int
+    work_units: int
+    group_capacity: int
+    cube_window_k: int
+    vector_stage_kind: VectorStreamKind
+    vector_stage_peak_ub_bytes: int
+    vector_split: MixedVectorSplit
+    vector_lanes: int
+    pipeline_axis: MixedPipelineAxis
+    pipeline_extent: int
+    pipeline_chunk: int
+    items_per_spatial_tile: int
+    active_groups: int
+    min_trips_per_group: int
+    max_trips_per_group: int
+    pipeline_stages: int
+    requested_skew_depth: int
+    model_overlap_granted: bool
+    overlap_implementable: bool
+    pipeline_fill_absorbed: bool
+    max_alternations: int
+    output_engines_uniform: bool
+    protocol_producer_stages: tuple[int, ...]
+    protocol_peer_stage: int | None
+    protocol_sink_stage: int | None
+    protocol_producer_bundle: tuple[int, ...]
+    protocol_reply_bundle: tuple[int, ...]
+    protocol_skew_compatible: bool
+    topology_stages: tuple[MixedStagePlan, ...]
+    stages: tuple[MixedStagePlan, ...]
+    transfers: tuple[MixedTransferPlan, ...]
+    fifos: tuple[MixedFifoPlan, ...]
+    dense_mlp: MixedDenseMlpPlan | None
+
+    @property
+    def pipeline_work_items(self) -> int:
+        """Return the exact logical item count implied by the serialized loop."""
+
+        return self.spatial_tiles * self.items_per_spatial_tile
 
 
 KernelPlan = VectorKernelPlan | CubeKernelPlan | MixedKernelPlan

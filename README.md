@@ -107,7 +107,7 @@ explicit scheduling boundary. The reader does not yet specialize shape
 buckets, emit runtime dispatch, or plan dynamic physical tiles.
 
 Unsupported operations remain explicit graph boundaries. The source backend
-replays supported homogeneous vector and cube steps from the selected schedule.
+replays supported vector, cube, and mixed steps from the selected schedule.
 Vector source covers materialized/pointwise replay, versioned two-pass online
 softmax, and one-reduction folded or spanning streams. Cube source covers
 uniform non-split spatial plans, nested matmul DAGs, sequential outer-K windows,
@@ -120,7 +120,11 @@ materializes their cut edges through explicit GM tensors and emits the steps as
 dependency-linked `pl.spmd` launches in solver order. A split cube DAG may
 split only its unique sink: upstream matmuls replay their serial K plans inside
 each share, while resident inputs and retained panels stay local to that share.
-Multiple split accumulators, multiple outputs, and mixed steps fail closed.
+Multiple split accumulators and multiple-output split groups fail closed.
+Mixed source initially covers generic one-way `C -> V`, generic
+`C -> V -> C`, and dense `C,C -> V -> C` plans through PyPTO's public
+`pl.split(UP_DOWN)` mechanism. One-way `V -> C`, deeper round trips, and mixed
+multi-step composition still fail closed.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
@@ -132,7 +136,7 @@ and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
 implements `can_emit_region` and actual emission, so readiness cannot accept a
 program that the renderer later rejects. The renderer is organized as separate
-API, shared-mechanics, vector, and cube modules. The online-softmax path consumes
+API, shared-mechanics, vector, cube, and mixed modules. The online-softmax path consumes
 the solver's versioned semantic state/substitution recipe; it does not recognize
 a program or model name. Vector plans also serialize their spatial replay
 policy: the current 910B model prices one maximum static tile per work unit and
@@ -141,8 +145,8 @@ shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
 Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
-cube spatial partitions, and mixed schedules remain explicitly
-not source-ready until their complete state or transport contracts are serialized.
+cube spatial partitions, and mixed schedules outside the three admitted stage
+patterns remain explicitly outside source readiness.
 Single-sink split-K is source-ready through the model-selected
 `FirstPartialThenAtomic` or `AivZeroSeedThenAtomic` PyPTO mechanism.
 
@@ -192,7 +196,7 @@ not fit a second model in Python. Each entry records the model cost and embeds
 the exact forced solution. The predeclared device surface in
 `test/device/cube_model_cases.py` covers underfill, balanced, ragged-K,
 outer-K, rectangular-reuse, and split-K-positive shapes. Candidates beyond the
-current source backend—most notably mixed cross-core plans—remain useful
+current source backend—including deeper mixed cross-core plans—remain useful
 analytic evidence but fail closed instead of being approximated by source.
 
 The generated-source silicon matrix is opt-in and is not part of the default

@@ -34,7 +34,18 @@ from .schema import (
     L0PhaseCostPlan,
     L0Stationarity,
     LaunchPlan,
+    MixedAlgorithm,
+    MixedCrossCoreProtocol,
+    MixedDenseMlpPlan,
+    MixedEngine,
+    MixedFifoPlan,
     MixedKernelPlan,
+    MixedPipelineAxis,
+    MixedPipelineMode,
+    MixedStagePlan,
+    MixedTransferDirection,
+    MixedTransferPlan,
+    MixedVectorSplit,
     ScheduleContractError,
     ScheduledRegion,
     VectorCoordinateTransform,
@@ -175,12 +186,20 @@ def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
                 field=f"steps[{index}].plan",
             )
         else:
-            mixed = _mapping(plan_value, f"steps[{index}].plan")
-            plan = MixedKernelPlan(
-                source_codegen_ready=_bool(
-                    mixed.get("source_codegen_ready"),
-                    f"steps[{index}].plan.source_codegen_ready",
-                )
+            plan = _parse_mixed_plan(
+                plan_value,
+                field=f"steps[{index}].plan",
+                op_bound=len(graph_mapping),
+                tensor_bound=len(result.solver_tensor_to_value),
+            )
+            _validate_mixed_contract(
+                plan,
+                lowered=lowered,
+                step_ops=solver_ops,
+                step_order=order,
+                sequential_tiles=sequential_tiles,
+                launch=launch,
+                field=f"steps[{index}].plan",
             )
         latency = _finite_number(
             item.get("latency_cycles"), f"steps[{index}].latency_cycles"
@@ -932,6 +951,649 @@ def _parse_primitive_work(value: Any, *, field: str) -> VectorPrimitiveWorkPlan:
             item.get("stream_starts"), f"{field}.stream_starts"
         ),
     )
+
+
+def _parse_mixed_plan(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> MixedKernelPlan:
+    item = _mapping(value, field)
+    required = {
+        "emit_compatible",
+        "source_codegen_ready",
+        "algorithm",
+        "protocol",
+        "mode",
+        "m_partition",
+        "n_partition",
+        "spatial_tiles",
+        "split_k",
+        "work_units",
+        "group_capacity",
+        "cube_window_k",
+        "vector_stage_kind",
+        "vector_stage_peak_ub_bytes",
+        "vector_split",
+        "vector_lanes",
+        "pipeline_axis",
+        "pipeline_extent",
+        "pipeline_chunk",
+        "items_per_spatial_tile",
+        "active_groups",
+        "min_trips_per_group",
+        "max_trips_per_group",
+        "pipeline_stages",
+        "requested_skew_depth",
+        "model_overlap_granted",
+        "overlap_implementable",
+        "pipeline_fill_absorbed",
+        "max_alternations",
+        "output_engines_uniform",
+        "protocol_producer_stages",
+        "protocol_peer_stage",
+        "protocol_sink_stage",
+        "protocol_producer_bundle",
+        "protocol_reply_bundle",
+        "protocol_skew_compatible",
+        "topology_stages",
+        "stages",
+        "transfers",
+        "fifos",
+        "dense_mlp",
+    }
+    _expect_keys(item, required=required, field=field)
+    raw_stages = _sequence(item.get("stages"), f"{field}.stages")
+    stages = tuple(
+        _parse_mixed_stage(
+            stage,
+            field=f"{field}.stages[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, stage in enumerate(raw_stages)
+    )
+    topology_stages = tuple(
+        _parse_mixed_stage(
+            stage,
+            field=f"{field}.topology_stages[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+            topology_only=True,
+        )
+        for index, stage in enumerate(
+            _sequence(item.get("topology_stages"), f"{field}.topology_stages")
+        )
+    )
+    transfers = tuple(
+        _parse_mixed_transfer(
+            transfer,
+            field=f"{field}.transfers[{index}]",
+            tensor_bound=tensor_bound,
+            stage_bound=len(stages),
+        )
+        for index, transfer in enumerate(
+            _sequence(item.get("transfers"), f"{field}.transfers")
+        )
+    )
+    return MixedKernelPlan(
+        emit_compatible=_bool(item.get("emit_compatible"), f"{field}.emit_compatible"),
+        source_codegen_ready=_bool(
+            item.get("source_codegen_ready"), f"{field}.source_codegen_ready"
+        ),
+        algorithm=_enum(MixedAlgorithm, item.get("algorithm"), f"{field}.algorithm"),
+        protocol=_enum(
+            MixedCrossCoreProtocol, item.get("protocol"), f"{field}.protocol"
+        ),
+        mode=_enum(MixedPipelineMode, item.get("mode"), f"{field}.mode"),
+        m_partition=_parse_axis_partition(
+            item.get("m_partition"), field=f"{field}.m_partition"
+        ),
+        n_partition=_parse_axis_partition(
+            item.get("n_partition"), field=f"{field}.n_partition"
+        ),
+        spatial_tiles=_positive_int(
+            item.get("spatial_tiles"), f"{field}.spatial_tiles"
+        ),
+        split_k=_positive_int(item.get("split_k"), f"{field}.split_k"),
+        work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
+        group_capacity=_positive_int(
+            item.get("group_capacity"), f"{field}.group_capacity"
+        ),
+        cube_window_k=_nonnegative_int(
+            item.get("cube_window_k"), f"{field}.cube_window_k"
+        ),
+        vector_stage_kind=_enum(
+            VectorStreamKind,
+            item.get("vector_stage_kind"),
+            f"{field}.vector_stage_kind",
+        ),
+        vector_stage_peak_ub_bytes=_nonnegative_int(
+            item.get("vector_stage_peak_ub_bytes"),
+            f"{field}.vector_stage_peak_ub_bytes",
+        ),
+        vector_split=_enum(
+            MixedVectorSplit, item.get("vector_split"), f"{field}.vector_split"
+        ),
+        vector_lanes=_positive_int(item.get("vector_lanes"), f"{field}.vector_lanes"),
+        pipeline_axis=_enum(
+            MixedPipelineAxis, item.get("pipeline_axis"), f"{field}.pipeline_axis"
+        ),
+        pipeline_extent=_positive_int(
+            item.get("pipeline_extent"), f"{field}.pipeline_extent"
+        ),
+        pipeline_chunk=_positive_int(
+            item.get("pipeline_chunk"), f"{field}.pipeline_chunk"
+        ),
+        items_per_spatial_tile=_positive_int(
+            item.get("items_per_spatial_tile"), f"{field}.items_per_spatial_tile"
+        ),
+        active_groups=_positive_int(
+            item.get("active_groups"), f"{field}.active_groups"
+        ),
+        min_trips_per_group=_positive_int(
+            item.get("min_trips_per_group"), f"{field}.min_trips_per_group"
+        ),
+        max_trips_per_group=_positive_int(
+            item.get("max_trips_per_group"), f"{field}.max_trips_per_group"
+        ),
+        pipeline_stages=_positive_int(
+            item.get("pipeline_stages"), f"{field}.pipeline_stages"
+        ),
+        requested_skew_depth=_nonnegative_int(
+            item.get("requested_skew_depth"), f"{field}.requested_skew_depth"
+        ),
+        model_overlap_granted=_bool(
+            item.get("model_overlap_granted"), f"{field}.model_overlap_granted"
+        ),
+        overlap_implementable=_bool(
+            item.get("overlap_implementable"), f"{field}.overlap_implementable"
+        ),
+        pipeline_fill_absorbed=_bool(
+            item.get("pipeline_fill_absorbed"), f"{field}.pipeline_fill_absorbed"
+        ),
+        max_alternations=_nonnegative_int(
+            item.get("max_alternations"), f"{field}.max_alternations"
+        ),
+        output_engines_uniform=_bool(
+            item.get("output_engines_uniform"), f"{field}.output_engines_uniform"
+        ),
+        protocol_producer_stages=_mixed_indices(
+            item.get("protocol_producer_stages"),
+            len(stages),
+            f"{field}.protocol_producer_stages",
+        ),
+        protocol_peer_stage=_nullable_mixed_index(
+            item.get("protocol_peer_stage"), len(stages), f"{field}.protocol_peer_stage"
+        ),
+        protocol_sink_stage=_nullable_mixed_index(
+            item.get("protocol_sink_stage"), len(stages), f"{field}.protocol_sink_stage"
+        ),
+        protocol_producer_bundle=_mixed_indices(
+            item.get("protocol_producer_bundle"),
+            len(transfers),
+            f"{field}.protocol_producer_bundle",
+        ),
+        protocol_reply_bundle=_mixed_indices(
+            item.get("protocol_reply_bundle"),
+            len(transfers),
+            f"{field}.protocol_reply_bundle",
+        ),
+        protocol_skew_compatible=_bool(
+            item.get("protocol_skew_compatible"), f"{field}.protocol_skew_compatible"
+        ),
+        topology_stages=topology_stages,
+        stages=stages,
+        transfers=transfers,
+        fifos=tuple(
+            _parse_mixed_fifo(
+                fifo,
+                field=f"{field}.fifos[{index}]",
+                tensor_bound=tensor_bound,
+            )
+            for index, fifo in enumerate(_sequence(item.get("fifos"), f"{field}.fifos"))
+        ),
+        dense_mlp=_parse_mixed_dense_mlp(
+            item.get("dense_mlp"), field=f"{field}.dense_mlp"
+        ),
+    )
+
+
+def _parse_mixed_stage(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+    topology_only: bool = False,
+) -> MixedStagePlan:
+    item = _mapping(value, field)
+    if topology_only:
+        _expect_keys(item, required={"engine", "ops"}, field=field)
+        return MixedStagePlan(
+            topology_stage=-1,
+            engine=_enum(MixedEngine, item.get("engine"), f"{field}.engine"),
+            ops=_mixed_indices(item.get("ops"), op_bound, f"{field}.ops"),
+            valid_rows=0,
+            valid_cols=0,
+            cube_window_k=(),
+            vector_stream=None,
+        )
+    _expect_keys(
+        item,
+        required={
+            "topology_stage",
+            "engine",
+            "ops",
+            "valid_rows",
+            "valid_cols",
+            "cube_window_k",
+            "vector_stream",
+        },
+        field=field,
+    )
+    stream = item.get("vector_stream")
+    return MixedStagePlan(
+        topology_stage=_nonnegative_int(
+            item.get("topology_stage"), f"{field}.topology_stage"
+        ),
+        engine=_enum(MixedEngine, item.get("engine"), f"{field}.engine"),
+        ops=_mixed_indices(item.get("ops"), op_bound, f"{field}.ops"),
+        valid_rows=_positive_int(item.get("valid_rows"), f"{field}.valid_rows"),
+        valid_cols=_positive_int(item.get("valid_cols"), f"{field}.valid_cols"),
+        cube_window_k=tuple(
+            _positive_int(chunk, f"{field}.cube_window_k")
+            for chunk in _sequence(item.get("cube_window_k"), f"{field}.cube_window_k")
+        ),
+        vector_stream=(
+            None
+            if stream is None
+            else _parse_vector_plan(
+                stream,
+                field=f"{field}.vector_stream",
+                op_bound=op_bound,
+                tensor_bound=tensor_bound,
+            )
+        ),
+    )
+
+
+def _parse_mixed_transfer(
+    value: Any,
+    *,
+    field: str,
+    tensor_bound: int,
+    stage_bound: int,
+) -> MixedTransferPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "tensor",
+            "producer_stage",
+            "consumer_stage",
+            "producer_engine",
+            "consumer_engine",
+        },
+        field=field,
+    )
+    return MixedTransferPlan(
+        tensor=_bounded_int(item.get("tensor"), f"{field}.tensor", tensor_bound),
+        producer_stage=_bounded_int(
+            item.get("producer_stage"), f"{field}.producer_stage", stage_bound
+        ),
+        consumer_stage=_bounded_int(
+            item.get("consumer_stage"), f"{field}.consumer_stage", stage_bound
+        ),
+        producer_engine=_enum(
+            MixedEngine, item.get("producer_engine"), f"{field}.producer_engine"
+        ),
+        consumer_engine=_enum(
+            MixedEngine, item.get("consumer_engine"), f"{field}.consumer_engine"
+        ),
+    )
+
+
+def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifoPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "tensor",
+            "direction",
+            "valid_rows",
+            "valid_cols",
+            "slot_bytes",
+            "slot_count",
+            "reserved_bytes",
+            "pipe_id",
+            "bundle",
+        },
+        field=field,
+    )
+    return MixedFifoPlan(
+        tensor=_bounded_int(item.get("tensor"), f"{field}.tensor", tensor_bound),
+        direction=_enum(
+            MixedTransferDirection, item.get("direction"), f"{field}.direction"
+        ),
+        valid_rows=_positive_int(item.get("valid_rows"), f"{field}.valid_rows"),
+        valid_cols=_positive_int(item.get("valid_cols"), f"{field}.valid_cols"),
+        slot_bytes=_positive_int(item.get("slot_bytes"), f"{field}.slot_bytes"),
+        slot_count=_positive_int(item.get("slot_count"), f"{field}.slot_count"),
+        reserved_bytes=_positive_int(
+            item.get("reserved_bytes"), f"{field}.reserved_bytes"
+        ),
+        pipe_id=_nonnegative_int(item.get("pipe_id"), f"{field}.pipe_id"),
+        bundle=_optional_index(item.get("bundle"), f"{field}.bundle"),
+    )
+
+
+def _parse_mixed_dense_mlp(value: Any, *, field: str) -> MixedDenseMlpPlan | None:
+    if value is None:
+        return None
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "input_extent",
+            "intermediate_extent",
+            "intermediate_chunk",
+            "intermediate_chunks",
+            "output_extent",
+            "gate_window_k",
+            "up_window_k",
+            "persistent_accumulator_bytes",
+            "first_chunk_initializes",
+            "later_chunks_accumulate",
+        },
+        field=field,
+    )
+    return MixedDenseMlpPlan(
+        input_extent=_positive_int(item.get("input_extent"), f"{field}.input_extent"),
+        intermediate_extent=_positive_int(
+            item.get("intermediate_extent"), f"{field}.intermediate_extent"
+        ),
+        intermediate_chunk=_positive_int(
+            item.get("intermediate_chunk"), f"{field}.intermediate_chunk"
+        ),
+        intermediate_chunks=_positive_int(
+            item.get("intermediate_chunks"), f"{field}.intermediate_chunks"
+        ),
+        output_extent=_positive_int(
+            item.get("output_extent"), f"{field}.output_extent"
+        ),
+        gate_window_k=_positive_int(
+            item.get("gate_window_k"), f"{field}.gate_window_k"
+        ),
+        up_window_k=_positive_int(item.get("up_window_k"), f"{field}.up_window_k"),
+        persistent_accumulator_bytes=_positive_int(
+            item.get("persistent_accumulator_bytes"),
+            f"{field}.persistent_accumulator_bytes",
+        ),
+        first_chunk_initializes=_bool(
+            item.get("first_chunk_initializes"), f"{field}.first_chunk_initializes"
+        ),
+        later_chunks_accumulate=_bool(
+            item.get("later_chunks_accumulate"), f"{field}.later_chunks_accumulate"
+        ),
+    )
+
+
+def _mixed_indices(value: Any, bound: int, field: str) -> tuple[int, ...]:
+    indices = tuple(
+        _bounded_int(index, field, bound) for index in _sequence(value, field)
+    )
+    if len(set(indices)) != len(indices):
+        raise ScheduleContractError(f"{field} contains duplicate indices")
+    return indices
+
+
+def _nullable_mixed_index(value: Any, bound: int, field: str) -> int | None:
+    if value is None:
+        return None
+    return _bounded_int(value, field, bound)
+
+
+def _validate_mixed_contract(  # noqa: PLR0913
+    plan: MixedKernelPlan,
+    *,
+    lowered: LoweredRegion,
+    step_ops: tuple[int, ...],
+    step_order: tuple[int, ...],
+    sequential_tiles: tuple[int, ...] | None,
+    launch: LaunchPlan,
+    field: str,
+) -> None:
+    if not plan.emit_compatible or not plan.source_codegen_ready:
+        return
+    if plan.split_k != 1 or launch.split != 1:
+        raise ScheduleContractError(f"{field} source-ready mixed replay cannot split K")
+    if (
+        launch.parts_m != plan.m_partition.parts
+        or launch.parts_n != plan.n_partition.parts
+        or plan.spatial_tiles != plan.m_partition.parts * plan.n_partition.parts
+    ):
+        raise ScheduleContractError(f"{field} launch grid differs from its partitions")
+    if (
+        plan.work_units != plan.spatial_tiles
+        or plan.active_groups > plan.group_capacity
+    ):
+        raise ScheduleContractError(f"{field} has inconsistent mixed work-unit counts")
+    if plan.min_trips_per_group != plan.max_trips_per_group:
+        raise ScheduleContractError(
+            f"{field} source-ready mixed replay requires a uniform group loop"
+        )
+    loop_items = plan.pipeline_extent // plan.pipeline_chunk
+    expected_loop_items = (
+        plan.pipeline_work_items
+        if plan.pipeline_axis is MixedPipelineAxis.SPATIAL_REGION
+        else plan.items_per_spatial_tile
+    )
+    if (
+        plan.pipeline_extent % plan.pipeline_chunk != 0
+        or loop_items != expected_loop_items
+    ):
+        raise ScheduleContractError(
+            f"{field} pipeline extent does not cover its work items"
+        )
+    if plan.active_groups * plan.max_trips_per_group != plan.pipeline_work_items:
+        raise ScheduleContractError(
+            f"{field} active groups do not cover its work items"
+        )
+    if len(plan.stages) != len(plan.topology_stages) or not plan.stages:
+        raise ScheduleContractError(f"{field} stage descriptors are incomplete")
+    if tuple(stage.topology_stage for stage in plan.stages) != tuple(
+        range(len(plan.stages))
+    ):
+        raise ScheduleContractError(f"{field}.stages are not densely indexed")
+    for index, (stage, topology) in enumerate(
+        zip(plan.stages, plan.topology_stages, strict=True)
+    ):
+        stage_field = f"{field}.stages[{index}]"
+        if stage.engine is not topology.engine or stage.ops != topology.ops:
+            raise ScheduleContractError(
+                f"{stage_field} differs from its immutable topology stage"
+            )
+        if not stage.ops:
+            raise ScheduleContractError(f"{stage_field}.ops must not be empty")
+        if stage.engine is MixedEngine.CUBE:
+            if stage.vector_stream is not None or len(stage.cube_window_k) != len(
+                stage.ops
+            ):
+                raise ScheduleContractError(
+                    f"{stage_field} has an incomplete cube-window contract"
+                )
+            for op, window in zip(stage.ops, stage.cube_window_k, strict=True):
+                if lowered.operation(op).op_type != "MatMul" or window <= 0:
+                    raise ScheduleContractError(
+                        f"{stage_field} does not describe cube matmul work"
+                    )
+        else:
+            if stage.cube_window_k or stage.vector_stream is None:
+                raise ScheduleContractError(
+                    f"{stage_field} has an incomplete vector-stream contract"
+                )
+            if any(lowered.operation(op).op_type == "MatMul" for op in stage.ops):
+                raise ScheduleContractError(
+                    f"{stage_field} contains cube work in a vector stage"
+                )
+            if plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP:
+                _validate_vector_phase_links(
+                    stage.vector_stream,
+                    lowered=lowered,
+                    step_ops=stage.ops,
+                    step_order=stage.ops,
+                    field=f"{stage_field}.vector_stream",
+                )
+            if stage.vector_stream.kind is not plan.vector_stage_kind:
+                raise ScheduleContractError(
+                    f"{stage_field} stream kind differs from the mixed plan"
+                )
+            if (
+                stage.vector_stream.full_peak_ub_bytes
+                != plan.vector_stage_peak_ub_bytes
+            ):
+                raise ScheduleContractError(
+                    f"{stage_field} Vec peak differs from the mixed plan"
+                )
+    flattened_ops = tuple(op for stage in plan.stages for op in stage.ops)
+    if (
+        len(flattened_ops) != len(set(flattened_ops))
+        or set(flattened_ops) != set(step_ops)
+        or (
+            plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP
+            and flattened_ops != step_order
+        )
+    ):
+        raise ScheduleContractError(
+            f"{field}.stages do not preserve the selected operation order"
+        )
+    if sequential_tiles is None:
+        raise ScheduleContractError(f"{field} omits per-operation sequential tiles")
+    sequential_by_op = dict(zip(step_order, sequential_tiles, strict=True))
+    for stage in plan.stages:
+        if stage.engine is MixedEngine.CUBE:
+            for op, window in zip(stage.ops, stage.cube_window_k, strict=True):
+                if sequential_by_op[op] != window:
+                    raise ScheduleContractError(
+                        f"{field} cube window differs from sequential tile for op {op}"
+                    )
+        elif any(sequential_by_op[op] != 0 for op in stage.ops):
+            raise ScheduleContractError(
+                f"{field} vector operations must have zero sequential tiles"
+            )
+
+    if len(plan.transfers) != len(plan.fifos):
+        raise ScheduleContractError(f"{field} FIFO records do not cover every transfer")
+    producer_by_tensor: dict[int, int] = {}
+    for operation in lowered.operations:
+        for tensor in operation.outputs:
+            producer_by_tensor[tensor] = operation.index
+    for index, (transfer, fifo) in enumerate(
+        zip(plan.transfers, plan.fifos, strict=True)
+    ):
+        transfer_field = f"{field}.transfers[{index}]"
+        producer = plan.stages[transfer.producer_stage]
+        consumer = plan.stages[transfer.consumer_stage]
+        if (
+            transfer.producer_stage >= transfer.consumer_stage
+            or transfer.producer_engine is not producer.engine
+            or transfer.consumer_engine is not consumer.engine
+            or transfer.producer_engine is transfer.consumer_engine
+        ):
+            raise ScheduleContractError(
+                f"{transfer_field} does not connect two ordered unlike stages"
+            )
+        if producer_by_tensor.get(transfer.tensor) not in producer.ops or not any(
+            transfer.tensor in lowered.operation(op).inputs for op in consumer.ops
+        ):
+            raise ScheduleContractError(
+                f"{transfer_field}.tensor is not the declared stage boundary"
+            )
+        direction = (
+            MixedTransferDirection.CUBE_TO_VECTOR
+            if producer.engine is MixedEngine.CUBE
+            else MixedTransferDirection.VECTOR_TO_CUBE
+        )
+        tensor = lowered.tensor(fifo.tensor)
+        if (
+            fifo.tensor != transfer.tensor
+            or fifo.direction is not direction
+            or fifo.pipe_id != index
+            or fifo.slot_bytes != fifo.valid_rows * fifo.valid_cols * tensor.byte_width
+            or fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count
+        ):
+            raise ScheduleContractError(
+                f"{field}.fifos[{index}] differs from its transfer geometry"
+            )
+
+    if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
+        if (
+            plan.mode is not MixedPipelineMode.ONE_WAY
+            or len(plan.transfers) != 1
+            or plan.max_alternations != 1
+            or plan.protocol_producer_stages != (plan.transfers[0].producer_stage,)
+            or plan.protocol_peer_stage != plan.transfers[0].consumer_stage
+            or plan.protocol_producer_bundle != (0,)
+            or plan.protocol_reply_bundle
+            or plan.protocol_sink_stage is not None
+            or plan.protocol_skew_compatible
+            or plan.fifos[0].bundle != -1
+        ):
+            raise ScheduleContractError(f"{field} has an inconsistent one-way protocol")
+    elif plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
+        producer_bundle = tuple(
+            index
+            for index, fifo in enumerate(plan.fifos)
+            if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+        )
+        reply_bundle = tuple(
+            index
+            for index, fifo in enumerate(plan.fifos)
+            if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+        )
+        producer_stages = tuple(
+            plan.transfers[index].producer_stage for index in producer_bundle
+        )
+        peer_stages = {
+            plan.transfers[index].consumer_stage for index in producer_bundle
+        }
+        sink_stages = {plan.transfers[index].consumer_stage for index in reply_bundle}
+        if (
+            plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
+            or not producer_bundle
+            or len(reply_bundle) != 1
+            or plan.protocol_producer_bundle != producer_bundle
+            or plan.protocol_reply_bundle != reply_bundle
+            or plan.protocol_producer_stages != producer_stages
+            or peer_stages != {plan.protocol_peer_stage}
+            or plan.transfers[reply_bundle[0]].producer_stage
+            != plan.protocol_peer_stage
+            or sink_stages != {plan.protocol_sink_stage}
+            or not plan.protocol_skew_compatible
+            or any(plan.fifos[index].bundle != 0 for index in producer_bundle)
+            or any(plan.fifos[index].bundle != 1 for index in reply_bundle)
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent single-round-trip protocol"
+            )
+    else:
+        raise ScheduleContractError(f"{field} source-ready protocol is unsupported")
+
+    if plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP:
+        dense = plan.dense_mlp
+        if (
+            dense is None
+            or dense.intermediate_chunks * dense.intermediate_chunk
+            != dense.intermediate_extent
+            or not dense.first_chunk_initializes
+            or not dense.later_chunks_accumulate
+        ):
+            raise ScheduleContractError(f"{field}.dense_mlp is incomplete")
+    elif plan.dense_mlp is not None:
+        raise ScheduleContractError(f"{field} generic plan carries dense-MLP state")
 
 
 def _parse_cube_plan(

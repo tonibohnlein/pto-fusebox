@@ -174,9 +174,9 @@ def test_attention_solver_selects_complete_cube_vector_cube_group() -> None:
 
     assert result.successful
     assert result.regions_solved
-    assert not result.whole_graph_codegen_ready
+    assert result.whole_graph_codegen_ready
     region = result.regions[0]
-    assert not can_emit_region(graph, region)
+    assert can_emit_region(graph, region)
     assert region.solution is not None
     assert region.solution["steps"][0]["ops"] == list(
         range(len(region.solver_op_to_graph))

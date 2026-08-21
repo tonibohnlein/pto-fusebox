@@ -29,7 +29,11 @@ from pto_fusebox import (
     scheduled_region,
     solve_graph,
 )
-from pto_fusebox.schedule.schema import CubeKernelPlan, VectorKernelPlan
+from pto_fusebox.schedule.schema import (
+    CubeKernelPlan,
+    MixedKernelPlan,
+    VectorKernelPlan,
+)
 from torch import nn
 
 
@@ -142,6 +146,44 @@ class _NamingCollision(nn.Module):
         return torch.exp(pl)
 
 
+class _C2VEpilogue(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(value, weight) + bias
+
+
+class _AttentionCore(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        scores = torch.mm(query, key.t())
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.mm(probabilities, value)
+
+
+class _DenseSwiGlu(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        gate = torch.mm(value, gate_weight, out_dtype=torch.float32)
+        up = torch.mm(value, up_weight, out_dtype=torch.float32)
+        activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
+            torch.bfloat16
+        )
+        return torch.mm(activation, down_weight, out_dtype=torch.float32)
+
+
 def _solver() -> Path:
     configured = os.environ.get("PTO_FUSEBOX_TEST_SOLVER")
     if configured:
@@ -199,6 +241,117 @@ def _compile_source(
         plan.work_units,
     )
     return pto_files[0].read_text(encoding="utf-8"), len(generated_cpp)
+
+
+def _compile_mixed_source(
+    name: str,
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, str, MixedKernelPlan]:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    assert solved.regions_solved == 1
+    assert len(solved.regions) == 1
+    plan = scheduled_region(solved.regions[0]).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+
+    source = emit_pypto_region(graph, solved.regions[0], program_name=name).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / name),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    orchestration = orchestration_files[0].read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_task(") == 1
+    assert orchestration.count("launch_spec.set_block_num(") == 1
+    assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
+    assert "for (region_index" not in orchestration
+    return source, pto_files[0].read_text(encoding="utf-8"), plan
+
+
+@pytest.mark.parametrize(
+    ("name", "module", "args", "dir_mask", "slot_size", "slot_count"),
+    [
+        (
+            "mixed_c2v",
+            _C2VEpilogue(),
+            (
+                torch.zeros(32, 64),
+                torch.zeros(64, 32),
+                torch.zeros(1, 32),
+            ),
+            1,
+            4096,
+            8,
+        ),
+        (
+            "mixed_attention",
+            _AttentionCore(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 128),
+            ),
+            3,
+            24576,
+            4,
+        ),
+        (
+            "mixed_dense_swiglu",
+            _DenseSwiGlu(),
+            (
+                torch.zeros(128, 64, dtype=torch.bfloat16),
+                torch.zeros(64, 128, dtype=torch.bfloat16),
+                torch.zeros(64, 128, dtype=torch.bfloat16),
+                torch.zeros(128, 64, dtype=torch.bfloat16),
+            ),
+            3,
+            4096,
+            4,
+        ),
+    ],
+)
+def test_mixed_source_lowers_through_the_pypto_split_pipeline(
+    name: str,
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    dir_mask: int,
+    slot_size: int,
+    slot_count: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, pto, _ = _compile_mixed_source(name, module, args, tmp_path, monkeypatch)
+
+    assert "pl.split(pl.SplitMode.UP_DOWN" in source
+    assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
+    assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
+    pipe = (
+        f"{{dir_mask = {dir_mask}, slot_size = {slot_size}, slot_num = {slot_count}}}"
+    )
+    assert f"pto.aic_initialize_pipe {pipe}" in pto
+    assert f"pto.aiv_initialize_pipe {pipe}" in pto
+    assert "pto.tpush_to_aiv" in pto
+    assert "pto.tpop_from_aic" in pto
+    assert "pto.tfree_from_aic" in pto
+    if dir_mask == 3:
+        assert "pto.tpush_to_aic" in pto
+        assert "pto.tpop_from_aiv" in pto
+        assert "pto.tfree_from_aiv" in pto
+    else:
+        assert "pto.tpush_to_aic" not in pto
+        assert "pto.tpop_from_aiv" not in pto
 
 
 @pytest.mark.parametrize(
