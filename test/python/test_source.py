@@ -600,7 +600,7 @@ def test_schedule_contract_rejects_legacy_or_dropped_step_fields() -> None:
     _, result = _solved("softmax")
     assert result.solution is not None
 
-    legacy = copy.deepcopy(result.solution)
+    legacy = dict(copy.deepcopy(result.solution))
     legacy["schema_version"] = "pto_fusebox.solution.v2"
     with pytest.raises(ScheduleContractError, match="solution schema"):
         scheduled_region(replace(result, solution=legacy))

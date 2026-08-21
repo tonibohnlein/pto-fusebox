@@ -348,8 +348,11 @@ def test_cut_fp32_chain_compiles_as_two_dependency_linked_spmd_kernels(
     assert orchestration.count("rt_submit_aic_task(") == 2
     assert "launch_spec.set_block_num(12);" in orchestration
     assert "launch_spec.set_block_num(4);" in orchestration
-    assert "add_inout(intermediate_tensor_2)" in orchestration
+    assert "add_output(intermediate_tensor_2)" in orchestration
     assert "add_input(intermediate_tensor_2)" in orchestration
+    assert "add_output(ext_output)" in orchestration
+    assert "add_inout(intermediate_tensor_2)" not in orchestration
+    assert "add_inout(ext_output)" not in orchestration
 
 
 def test_cut_fp32_fanout_compiles_with_two_outputs_and_one_shared_dependency(
@@ -380,10 +383,13 @@ def test_cut_fp32_fanout_compiles_with_two_outputs_and_one_shared_dependency(
         (compiled.output_dir / "orchestration").glob("*.cpp")
     ).read_text(encoding="utf-8")
     assert orchestration.count("rt_submit_aic_task(") == 2
-    assert "add_inout(ext_output_0)" in orchestration
-    assert "add_inout(ext_output_1)" in orchestration
-    assert "add_inout(intermediate_tensor_2)" in orchestration
+    assert "add_output(ext_output_0)" in orchestration
+    assert "add_output(ext_output_1)" in orchestration
+    assert "add_output(intermediate_tensor_2)" in orchestration
     assert "add_input(intermediate_tensor_2)" in orchestration
+    assert "add_inout(intermediate_tensor_2)" not in orchestration
+    assert "add_inout(ext_output_0)" not in orchestration
+    assert "add_inout(ext_output_1)" not in orchestration
 
 
 @pytest.mark.parametrize(
