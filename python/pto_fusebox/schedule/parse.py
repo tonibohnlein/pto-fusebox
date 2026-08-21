@@ -12,6 +12,7 @@ from ..lowered import LoweredRegion, lowered_region
 from ..solver import RegionSolveResult
 from .schema import (
     AxisPartition,
+    CubeAivZeroSeedThenAtomicPlan,
     CubeAxisBinding,
     CubeFinalDrainPlan,
     CubeFirstPartialThenAtomicPlan,
@@ -954,6 +955,7 @@ def _parse_cube_plan(
             "peak_l1_bytes",
             "split_merge_policy",
             "first_partial_then_atomic",
+            "aiv_zero_seed_then_atomic",
             "model_overlap_granted",
             "overlap_implementable",
             "execution_order",
@@ -1003,6 +1005,21 @@ def _parse_cube_plan(
         },
         field=f"{field}.first_partial_then_atomic",
     )
+    zero_seed = _mapping(
+        item.get("aiv_zero_seed_then_atomic"),
+        f"{field}.aiv_zero_seed_then_atomic",
+    )
+    _expect_keys(
+        zero_seed,
+        required={
+            "present",
+            "seed_work_units",
+            "atomic_work_units",
+            "seed_bytes",
+            "synchronization_cycles",
+        },
+        field=f"{field}.aiv_zero_seed_then_atomic",
+    )
     result = CubeKernelPlan(
         emit_compatible=_bool(item.get("emit_compatible"), f"{field}.emit_compatible"),
         spatial_policy=_enum(
@@ -1042,6 +1059,28 @@ def _parse_cube_plan(
             synchronization_cycles=_finite_number(
                 split.get("synchronization_cycles"),
                 f"{field}.first_partial_then_atomic.synchronization_cycles",
+            ),
+        ),
+        aiv_zero_seed_then_atomic=CubeAivZeroSeedThenAtomicPlan(
+            present=_bool(
+                zero_seed.get("present"),
+                f"{field}.aiv_zero_seed_then_atomic.present",
+            ),
+            seed_work_units=_nonnegative_int(
+                zero_seed.get("seed_work_units"),
+                f"{field}.aiv_zero_seed_then_atomic.seed_work_units",
+            ),
+            atomic_work_units=_nonnegative_int(
+                zero_seed.get("atomic_work_units"),
+                f"{field}.aiv_zero_seed_then_atomic.atomic_work_units",
+            ),
+            seed_bytes=_nonnegative_int(
+                zero_seed.get("seed_bytes"),
+                f"{field}.aiv_zero_seed_then_atomic.seed_bytes",
+            ),
+            synchronization_cycles=_finite_number(
+                zero_seed.get("synchronization_cycles"),
+                f"{field}.aiv_zero_seed_then_atomic.synchronization_cycles",
             ),
         ),
         model_overlap_granted=_bool(
@@ -1439,27 +1478,65 @@ def _validate_cube_contract(
         raise ScheduleContractError(f"{field} uses more cores than work units")
 
     split = plan.first_partial_then_atomic
+    zero_seed = plan.aiv_zero_seed_then_atomic
     if split.synchronization_cycles < 0:
         raise ScheduleContractError(
             f"{field}.first_partial_then_atomic has negative synchronization cost"
         )
+    if zero_seed.synchronization_cycles < 0:
+        raise ScheduleContractError(
+            f"{field}.aiv_zero_seed_then_atomic has negative synchronization cost"
+        )
+    split_empty = (
+        not split.present
+        and split.first_work_units == 0
+        and split.atomic_work_units == 0
+        and split.synchronization_cycles == 0
+    )
+    zero_seed_empty = (
+        not zero_seed.present
+        and zero_seed.seed_work_units == 0
+        and zero_seed.atomic_work_units == 0
+        and zero_seed.seed_bytes == 0
+        and zero_seed.synchronization_cycles == 0
+    )
     if plan.split_k == 1:
         if (
             plan.split_merge_policy is not CubeSplitMergePolicy.NONE
-            or split.present
-            or split.first_work_units != 0
-            or split.atomic_work_units != 0
-            or split.synchronization_cycles != 0
+            or not split_empty
+            or not zero_seed_empty
         ):
             raise ScheduleContractError(f"{field} has split-merge work for split_k=1")
-    elif (
-        plan.split_merge_policy is not CubeSplitMergePolicy.FIRST_PARTIAL_THEN_ATOMIC
-        or not split.present
-        or split.first_work_units != spatial_tiles
-        or split.atomic_work_units != spatial_tiles * (plan.split_k - 1)
-    ):
+    elif plan.split_merge_policy is CubeSplitMergePolicy.FIRST_PARTIAL_THEN_ATOMIC:
+        if (
+            not split.present
+            or split.first_work_units != spatial_tiles
+            or split.atomic_work_units != spatial_tiles * (plan.split_k - 1)
+            or not zero_seed_empty
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent FirstPartialThenAtomic descriptor"
+            )
+    elif plan.split_merge_policy is CubeSplitMergePolicy.AIV_ZERO_SEED_THEN_ATOMIC:
+        sinks = tuple(matmul for matmul in plan.matmuls if matmul.is_sink)
+        expected_seed_bytes = spatial_tiles * sum(
+            matmul.final_drain.bytes for matmul in sinks
+        )
+        if (
+            not split_empty
+            or not zero_seed.present
+            or zero_seed.seed_work_units != spatial_tiles
+            or zero_seed.atomic_work_units != plan.work_units
+            or len(sinks) != 1
+            or zero_seed.seed_bytes != expected_seed_bytes
+            or zero_seed.seed_bytes <= 0
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent AivZeroSeedThenAtomic descriptor"
+            )
+    else:
         raise ScheduleContractError(
-            f"{field} has an inconsistent FirstPartialThenAtomic descriptor"
+            f"{field} has no supported merge policy for split_k>1"
         )
 
     step_set = set(step_ops)

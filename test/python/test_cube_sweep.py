@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from torch import nn
 from pto_fusebox import (
     NormalizedGraph,
     RegionSolveResult,
+    ScheduleContractError,
     SourceEmissionError,
     can_emit_region,
     emit_pypto_region,
@@ -63,8 +66,7 @@ def _lowered_region(
         (64, 272, 80, True),
         (32, 736, 64, True),
         (64, 512, 256, True),
-        # The selected plan is split-K and remains source-model-ahead, while
-        # non-split candidates for the same problem are valid source replays.
+        # The selected plan is split-K and is now a source-ready replay.
         (128, 8192, 128, True),
     ),
 )
@@ -96,7 +98,6 @@ def test_cube_model_surface_enumerates_replayable_forced_solutions(
             assert "auto_fuse" not in source
         if candidate.grid.split_k > 1:
             assert candidate.uses_model_ahead_split_k
-            assert not can_emit_region(graph, forced)
     assert bool(source_ready) is source_replay_expected
 
 
@@ -112,7 +113,17 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
         if candidate.grid.split_k == 1:
             assert step["plan"]["split_merge_policy"] == "none"
         else:
-            assert step["plan"]["split_merge_policy"] == "first_partial_then_atomic"
+            policy = step["plan"]["split_merge_policy"]
+            assert policy in {
+                "first_partial_then_atomic",
+                "aiv_zero_seed_then_atomic",
+            }
+            assert step["plan"]["first_partial_then_atomic"]["present"] is (
+                policy == "first_partial_then_atomic"
+            )
+            assert step["plan"]["aiv_zero_seed_then_atomic"]["present"] is (
+                policy == "aiv_zero_seed_then_atomic"
+            )
 
     # The outer L1 window and nested L0 loop are different hierarchy levels.
     # The selected S=16 plan covers a 160-wide L1 window with two 64-wide L0
@@ -126,6 +137,77 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     assert matmul.output_variants[0].l0_init.tile[2] == 64
     l0_loop = matmul.output_variants[0].l0_init.k_loop
     assert l0_loop.full_chunks * l0_loop.chunk + l0_loop.tail == 160
+
+
+def test_deep_k_split_source_uses_one_dependency_between_parallel_phases() -> None:
+    graph, region = _lowered_region(128, 8192, 128)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    selected = region_for_cube_candidate(region, sweep.selected)
+
+    source = emit_pypto_region(graph, selected, program_name="deep_k_zero_seed").source
+    assert "with pl.spmd(1," in source
+    assert "as zero_seed_task:" in source
+    assert "with pl.spmd(16," in source
+    assert "deps=[zero_seed_task]" in source
+    assert "split_index = split_work_index % 16" in source
+    assert "pl.full([128, 128], dtype=pl.FP32, value=0.0)" in source
+    assert source.count("atomic=pl.AtomicType.Add") == 1
+    assert "split_index * 512" in source
+    assert "while " not in source and "pl.system" not in source
+
+    # Exercise the alternative policy against the identical typed child plan.
+    assert selected.solution is not None
+    solution = copy.deepcopy(selected.solution)
+    plan = solution["steps"][0]["plan"]
+    spatial = plan["spatial_tiles"]
+    split = plan["split_k"]
+    plan["split_merge_policy"] = "first_partial_then_atomic"
+    plan["first_partial_then_atomic"] = {
+        "present": True,
+        "first_work_units": spatial,
+        "atomic_work_units": spatial * (split - 1),
+        "synchronization_cycles": plan["aiv_zero_seed_then_atomic"][
+            "synchronization_cycles"
+        ],
+    }
+    plan["aiv_zero_seed_then_atomic"] = {
+        "present": False,
+        "seed_work_units": 0,
+        "atomic_work_units": 0,
+        "seed_bytes": 0,
+        "synchronization_cycles": 0.0,
+    }
+    first_partial = replace(selected, solution=solution)
+    first_source = emit_pypto_region(
+        graph, first_partial, program_name="deep_k_first_partial"
+    ).source
+    assert "as first_partial_task:" in first_source
+    assert "deps=[first_partial_task]" in first_source
+    assert "split_index = split_work_index % 15 + 1" in first_source
+    assert "pl.full(" not in first_source
+    assert first_source.count("atomic=pl.AtomicType.Add") == 1
+
+
+def test_deep_k_split_contract_rejects_malformed_policy_descriptors() -> None:
+    _, region = _lowered_region(128, 8192, 128)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    selected = region_for_cube_candidate(region, sweep.selected)
+    assert selected.solution is not None
+
+    wrong_count = copy.deepcopy(selected.solution)
+    wrong_count["steps"][0]["plan"]["aiv_zero_seed_then_atomic"][
+        "atomic_work_units"
+    ] += 1
+
+    both_present = copy.deepcopy(selected.solution)
+    both_present["steps"][0]["plan"]["first_partial_then_atomic"]["present"] = True
+
+    wrong_policy = copy.deepcopy(selected.solution)
+    wrong_policy["steps"][0]["plan"]["split_merge_policy"] = "first_partial_then_atomic"
+
+    for malformed in (wrong_count, both_present, wrong_policy):
+        with pytest.raises(ScheduleContractError, match="inconsistent"):
+            scheduled_region(replace(selected, solution=malformed))
 
 
 def test_balanced_surface_excludes_outer_pipeline_l0_overflow() -> None:

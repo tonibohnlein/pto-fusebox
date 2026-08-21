@@ -242,10 +242,11 @@ struct Problem {
     // (verified to rank the three device-swept sizes correctly). Wants a tighter op-sim-vs-wall
     // clock-anchored calibration. 0 => off. Vector-only for now.
     int64_t per_task_overhead_cycles = 0;
-    // Additional ordered-phase synchronization cost for cube split-K's
-    // FirstPartialThenAtomic merge. The phase walls themselves are always
-    // serialized; this is only the boundary overhead between them. Zero keeps
-    // the term explicit without inventing an ungrounded device constant.
+    // Additional ordered-task synchronization cost for either cube split-K
+    // merge: AIC first-partial -> AIC atomic-rest, or AIV zero-seed -> AIC
+    // atomic-all. The task walls themselves are always serialized; this is only
+    // their dependency-boundary overhead. Zero keeps the term explicit without
+    // inventing an ungrounded device constant.
     int64_t cube_split_sync_cycles = 0;
     // Double-buffering is ALWAYS assumed on 910B but does NOT reserve half the
     // pool: the two ping-pong buffers together ARE the L1/UB, so feasibility uses
@@ -933,19 +934,33 @@ struct CubeMatmulSchedule {
 enum class CubeSplitMergePolicy {
     None,
     FirstPartialThenAtomic,
+    AivZeroSeedThenAtomic,
 };
 
-// Split-K is emitted as two ordered AIC phases. The first phase assigns K share
-// zero to every spatial output region and publishes it with an ordinary store.
-// Only after that phase completes may the remaining shares atomic-add into the
-// initialized output. This removes the former AIV zero-fill kernel and records
-// the dependency that the cost model must serialize.
+// FirstPartialThenAtomic emits two ordered AIC phases. The first phase assigns
+// K share zero to every spatial output region and publishes it with an ordinary
+// store. Only after that phase completes may the remaining shares atomic-add
+// into the initialized output. The alternative AivZeroSeedThenAtomic policy
+// emits an ordered AIV seed phase followed by one AIC atomic phase.
 struct CubeFirstPartialThenAtomicPlan {
   bool present = false;
   int64_t first_work_units = 0;
   int64_t atomic_work_units = 0;
   // Explicit model hook for the phase boundary. It defaults to zero until a
   // device experiment isolates synchronization from the two launch walls.
+  double synchronization_cycles = 0.0;
+};
+
+// Alternative split-K merge using the ordinary PyPTO AIV-seed + dependent
+// AIC-atomic pattern. One vector work unit owns each spatial output region and
+// zeroes all of its output subtiles. After that complete SPMD dispatch, every K
+// share is runnable in one atomic AIC dispatch. The dependency is a runtime
+// TaskId edge; workers never spin on a device flag.
+struct CubeAivZeroSeedThenAtomicPlan {
+  bool present = false;
+  int64_t seed_work_units = 0;
+  int64_t atomic_work_units = 0;
+  int64_t seed_bytes = 0;
   double synchronization_cycles = 0.0;
 };
 
@@ -977,6 +992,7 @@ struct CubeSchedulePlan {
     int64_t peak_l1_bytes = 0;
     CubeSplitMergePolicy split_merge_policy = CubeSplitMergePolicy::None;
     CubeFirstPartialThenAtomicPlan first_partial_then_atomic;
+    CubeAivZeroSeedThenAtomicPlan aiv_zero_seed_then_atomic;
     // The cost and emitter both derive this from the concrete per-request K
     // loops. Both fields are retained so validation can fail loudly if a future
     // model change grants overlap that the reconstructed loop cannot realize.
@@ -1223,6 +1239,7 @@ struct CostResult {
     // tests visualize the chosen strategy and the eventual emit act on it.
     int parallel_split = 1;      // cores ganged per spatial tile: matmul split-K S /
                                  // reduction split S. 1 = pure spatial parallelism.
+    CubeSplitMergePolicy cube_split_merge_policy = CubeSplitMergePolicy::None;
     int cores_used = 1;          // effective cores busy (<= total unit cores)
     bool compute_bound = false;  // latency limited by compute (vs the shared DDR floor)
     double ddr_traffic = 0.0;    // DDR bytes/BW for this tile (reload + merge). Secondary

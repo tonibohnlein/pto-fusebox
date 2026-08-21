@@ -2399,7 +2399,8 @@ static void test_cube_schedule_fanout() {
       cfg.parts_n = 2;
       cfg.split_k = 1;
       auto cost = sg->compute_cost(cfg);
-      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      auto plan = sg->cube_schedule_plan(
+          cfg, {}, {}, cost.parallel_split, cost.cube_split_merge_policy);
       CHECK("CUBEPLAN/fanout: fixed multi-root candidate is feasible",
             cost.feasible && plan.feasible && plan.emit_compatible && plan.split_k == 1 &&
                 plan.work_units == 4);
@@ -2449,7 +2450,7 @@ static void test_shared_boundary_pebbling() {
       cfg.parts_n = 2;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       CHECK("CUBERES/shared-lhs: fixed plan is feasible",
             cost.feasible && plan.feasible && plan.emit_compatible &&
                 plan.matmuls.size() == 2);
@@ -2499,7 +2500,7 @@ static void test_shared_boundary_pebbling() {
       cfg.parts_n = 2;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       const CubeResidentBoundaryPlan* lhs_a = nullptr;
       const CubeResidentBoundaryPlan* rhs_b = nullptr;
       for (const CubeResidentBoundaryPlan& resident : plan.resident_boundaries) {
@@ -2559,7 +2560,7 @@ static void test_shared_boundary_pebbling() {
       cfg.parts_n = 2;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       bool saw_lhs = false;
       bool saw_rhs = false;
       for (const CubeResidentBoundaryPlan& resident :
@@ -2635,7 +2636,7 @@ static void test_shared_boundary_pebbling() {
       cfg.parts_n = 2;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       size_t producer_instances = 0;
       size_t lhs_t_consumers = 0;
       size_t rhs_t_consumers = 0;
@@ -2855,7 +2856,8 @@ static void test_cube_schedule_plan() {
         cfg.parts_n = 4;
         cfg.split_k = 1;
         auto cost = sg->compute_cost(cfg);
-        auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+        auto plan = sg->cube_schedule_plan(
+            cfg, {}, {}, cost.parallel_split, cost.cube_split_merge_policy);
         std::vector<int64_t> windows;
         const int64_t peak = sg->cube_peak_l1(cfg, &windows);
         CHECK("CUBEPLAN/lone: fixed candidate and plan are feasible",
@@ -2907,7 +2909,7 @@ static void test_cube_schedule_plan() {
       cfg.parts_n = 1;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       const auto& mm = plan.matmuls[0];
       CHECK("CUBEPLAN/retain: repeated LHS is retained once across N subtiles",
             cost.feasible && plan.feasible && plan.emit_compatible &&
@@ -2937,7 +2939,7 @@ static void test_cube_schedule_plan() {
       bool analytic_no_retention = false;
       if (analytic_sg) {
         const auto analytic_plan =
-            analytic_sg->cube_schedule_plan(cfg, {}, {}, 1);
+            analytic_sg->cube_schedule_plan(cfg);
         analytic_no_retention =
             !analytic_plan.matmuls.empty() &&
             !analytic_plan.matmuls[0].retained_panels.present();
@@ -2964,7 +2966,7 @@ static void test_cube_schedule_plan() {
       cfg.parts_n = 1;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       const auto& mm = plan.matmuls[0];
       CHECK("CUBEPLAN/retain-rhs: repeated RHS is retained once across M subtiles",
             cost.feasible && plan.feasible && plan.emit_compatible &&
@@ -3012,7 +3014,7 @@ static void test_cube_schedule_plan() {
       cfg.parts_n = 4;
       cfg.split_k = 1;
       const auto cost = sg->compute_cost(cfg);
-      const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+      const auto plan = sg->cube_schedule_plan(cfg);
       CHECK("CUBEPLAN/clamp: exact plan records eight maximum-shape overlap tasks",
             cost.feasible && std::isfinite(cost.latency) && plan.feasible && plan.emit_compatible &&
                 plan.spatial_policy == CubeSpatialPolicy::ClampedOverlap && plan.work_units == 8 &&
@@ -3029,7 +3031,7 @@ static void test_cube_schedule_plan() {
       exact_e12.parts_n = 3;
       exact_e12.split_k = 1;
       const auto exact_e12_cost = sg->compute_cost(exact_e12);
-      const auto exact_e12_plan = sg->cube_schedule_plan(exact_e12, {}, {}, 1);
+      const auto exact_e12_plan = sg->cube_schedule_plan(exact_e12);
       CHECK("CUBEPLAN/clamp: exact comparison plan is feasible",
             exact_e12_cost.feasible && std::isfinite(exact_e12_cost.latency) &&
                 exact_e12_plan.feasible && exact_e12_plan.emit_compatible &&
@@ -3140,7 +3142,7 @@ static void test_cube_schedule_plan() {
       clipped.parts_n = 17;
       clipped.split_k = 1;
       const auto clipped_cost = exact->compute_cost(clipped);
-      const auto clipped_plan = exact->cube_schedule_plan(clipped, {}, {}, 1);
+      const auto clipped_plan = exact->cube_schedule_plan(clipped);
       CHECK("CUBEPLAN/subfractal: aligned clipped grid uses clamped overlap",
             clipped_cost.feasible && std::isfinite(clipped_cost.latency) &&
                 clipped_plan.feasible && clipped_plan.emit_compatible &&
@@ -3166,7 +3168,8 @@ static void test_cube_schedule_plan() {
       cfg.parts_n = 1;
       cfg.split_k = 1;
       auto cost = sg->compute_cost(cfg);
-      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      auto plan = sg->cube_schedule_plan(
+          cfg, {}, {}, cost.parallel_split, cost.cube_split_merge_policy);
       const auto& mm = plan.matmuls[0];
       const int64_t output_bytes = 256LL * 256 * 4;
       double expected_drain = 0.0;
@@ -3234,7 +3237,11 @@ static void test_cube_schedule_plan() {
       cfg.parts_n = 1;
       cfg.split_k = 2;
       auto cost = sg->compute_cost(cfg);
-      auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+      auto plan = sg->cube_schedule_plan(
+          cfg, {}, {}, cost.parallel_split, cost.cube_split_merge_policy);
+      auto zero_plan = sg->cube_schedule_plan(
+          cfg, {}, {}, cost.parallel_split,
+          CubeSplitMergePolicy::AivZeroSeedThenAtomic);
       CHECK("CUBEPLAN/lone-split-window: cost and reconstructed plan agree",
             cost.feasible && cost.parallel_split == 2 && cost.config.k == 32 && plan.feasible &&
                 plan.config.k == 32 && plan.matmuls.size() == 1 && plan.matmuls[0].k_loop.l1_window_k == 32 &&
@@ -3246,6 +3253,19 @@ static void test_cube_schedule_plan() {
                     plan.spatial_tiles &&
                 plan.first_partial_then_atomic.atomic_work_units ==
                     plan.spatial_tiles * (plan.split_k - 1));
+      CHECK("CUBEPLAN/lone-split-window: AIV zero seed is an explicit alternative",
+            zero_plan.feasible && zero_plan.emit_compatible &&
+                zero_plan.split_merge_policy ==
+                    CubeSplitMergePolicy::AivZeroSeedThenAtomic &&
+                !zero_plan.first_partial_then_atomic.present &&
+                zero_plan.aiv_zero_seed_then_atomic.present &&
+                zero_plan.aiv_zero_seed_then_atomic.seed_work_units ==
+                    zero_plan.spatial_tiles &&
+                zero_plan.aiv_zero_seed_then_atomic.atomic_work_units ==
+                    zero_plan.work_units &&
+                zero_plan.aiv_zero_seed_then_atomic.seed_bytes ==
+                    zero_plan.spatial_tiles *
+                        zero_plan.matmuls[0].final_drain.bytes);
 
       auto sync_problem = p;
       sync_problem.cube_split_sync_cycles = 137;
@@ -3274,7 +3294,9 @@ static void test_cube_schedule_plan() {
         CHECK("CUBEPLAN/chain: subgraph is structurally accepted", static_cast<bool>(sg));
         if (!sg) return;
         auto cost = sg->best_cost();
-        auto plan = sg->cube_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+        auto plan = sg->cube_schedule_plan(
+            cost.config, {}, {}, cost.parallel_split,
+            cost.cube_split_merge_policy);
         CHECK("CUBEPLAN/chain: plan follows the solver pebbling order",
               plan.feasible && plan.execution_order.size() == 2 &&
                   plan.execution_order[0] == 0 && plan.execution_order[1] == 1 &&
@@ -3337,7 +3359,7 @@ static void test_cube_schedule_plan() {
         cfg.parts_n = 4;
         cfg.split_k = 1;
         const auto cost = sg->compute_cost(cfg);
-        const auto plan = sg->cube_schedule_plan(cfg, {}, {}, 1);
+        const auto plan = sg->cube_schedule_plan(cfg);
         CHECK("CUBEPLAN/dtype: BF16 chain has a buildable FP32-Acc/BF16-Mat handoff",
               cost.feasible && plan.feasible && plan.emit_compatible && plan.matmuls.size() == 2 &&
                   plan.matmuls[0].accumulator_dtype == DType::FP32 &&
@@ -3361,7 +3383,7 @@ static void test_cube_schedule_plan() {
         cfg.parts_n = 4;
         cfg.split_k = 1;
         const auto cost = fp32_sg->compute_cost(cfg);
-        const auto plan = fp32_sg->cube_schedule_plan(cfg, {}, {}, 1);
+        const auto plan = fp32_sg->cube_schedule_plan(cfg);
         CHECK("CUBEPLAN/dtype: same-type FP32 internal L1 carry is not buildable",
               !std::isfinite(cost.latency) && (!plan.feasible || !plan.emit_compatible));
       }
@@ -3383,7 +3405,8 @@ static void test_cube_schedule_plan() {
         cfg.parts_n = 1;
         cfg.split_k = 2;
         auto cost = sg->compute_cost(cfg);
-        auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+        auto plan = sg->cube_schedule_plan(
+            cfg, {}, {}, cost.parallel_split, cost.cube_split_merge_policy);
         CHECK("CUBEPLAN/roofline-gap: serial loop receives no overlap credit",
               cost.feasible && cost.parallel_split == 2 && plan.feasible && !plan.model_overlap_granted &&
                   !plan.overlap_implementable && plan.matmuls.size() == 1 &&
@@ -3418,7 +3441,9 @@ static void test_cube_schedule_plan() {
           cfg.parts_n = 2;
           cfg.split_k = 5;
           auto cost = sg->compute_cost(cfg);
-          auto plan = sg->cube_schedule_plan(cfg, {}, {}, cost.parallel_split);
+          auto plan = sg->cube_schedule_plan(
+              cfg, {}, {}, cost.parallel_split,
+              cost.cube_split_merge_policy);
           CHECK("CUBEPLAN/rhs: fixed tree candidate and best search are feasible",
                 cost.feasible && sg->best_cost().feasible && plan.feasible && plan.emit_compatible);
           CHECK("CUBEPLAN/rhs: plan is postorder with explicit root dependencies",

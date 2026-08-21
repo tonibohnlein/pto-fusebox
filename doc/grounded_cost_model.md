@@ -254,8 +254,10 @@ splits are **analogous**:
 **Cube split-K** (single sink matmul). `S | kfrac` (`kfrac = output_K/16`). On a
 grid, LPT-consistent request evaluation shrinks every `ParallelK` region and
 creates `P·Q·S` work units. A split whose concrete K loops cannot ping-pong is
-legal but pays serialized compute+DDR. With SetAtomicAdd, merge traffic is the S
-partial writes; without it, add a serial DDR read-back + sum (∝ S).
+legal but pays serialized compute+DDR. The model compares the existing PyPTO
+`FirstPartialThenAtomic` and `AivZeroSeedThenAtomic` mechanisms. Both use
+SetAtomicAdd for the atomic phase; they differ in whether share zero publishes
+normally or a dependency-linked AIV task zero-seeds the output first.
 
 **Vector reduced-axis split** (reduction **sink**). The `[H,1]`/`[1,W]` partials
 reduce across cores. `S` lets `P_spatial · S` fill the cores when the non-reduced

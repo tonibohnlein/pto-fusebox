@@ -43,6 +43,7 @@ Problem deep_k_problem() {
   problem.bw_l0c_gm = 70.0;
   problem.bw_l1_l0a = 441.0;
   problem.bw_l1_l0b = 220.5;
+  problem.bw_ub_gm = 188.46;
   problem.hbm_aggregate_gibps = 900.0;
   problem.l0_tile_m = 128;
   problem.l0_tile_n = 256;
@@ -88,15 +89,23 @@ int main() {
         std::isfinite(solution.at("steps").front().at("latency_cycles").get<double>());
     all_forced_solutions =
         all_forced_solutions &&
-        solution.at("schema_version") == "pto_fusebox.solution.v3" &&
+        solution.at("schema_version") == "pto_fusebox.solution.v4" &&
         solution.at("steps").size() == 1 &&
         solution.at("steps").front().at("launch").at("split") == split;
     if (split > 1) {
+      const auto& plan = solution.at("steps").front().at("plan");
+      const std::string policy = plan.at("split_merge_policy").get<std::string>();
+      const bool policy_contract =
+          (policy == "first_partial_then_atomic" &&
+           plan.at("first_partial_then_atomic").at("present") == true &&
+           plan.at("aiv_zero_seed_then_atomic").at("present") == false) ||
+          (policy == "aiv_zero_seed_then_atomic" &&
+           plan.at("first_partial_then_atomic").at("present") == false &&
+           plan.at("aiv_zero_seed_then_atomic").at("present") == true);
       split_contract_is_explicit =
           split_contract_is_explicit &&
           candidate.at("model").at("uses_model_ahead_split_k") == true &&
-          solution.at("steps").front().at("plan").at("split_merge_policy") ==
-              "first_partial_then_atomic";
+          policy_contract;
     }
   }
   check("candidate ids are unique", ids.size() == sweep.at("candidates").size());
@@ -108,6 +117,33 @@ int main() {
   check("every candidate has a finite reconstructed cost", all_costs_are_finite);
   check("split-K candidates retain their merge contract",
         split_contract_is_explicit);
+
+  const auto selected_policy = [](const Problem& policy_problem) {
+    const DAG policy_dag = DAG::build(policy_problem);
+    const auto policy_sweep =
+        nlohmann::json::parse(cube_plan_sweep_json(policy_problem, policy_dag));
+    for (const auto& candidate : policy_sweep.at("candidates")) {
+      if (candidate.at("selected").get<bool>()) {
+        return candidate.at("solution")
+            .at("steps")
+            .front()
+            .at("plan")
+            .at("split_merge_policy")
+            .get<std::string>();
+      }
+    }
+    return std::string{};
+  };
+  Problem expensive_vector_seed = problem;
+  expensive_vector_seed.per_task_overhead_cycles = 100000;
+  Problem no_vector_cores = problem;
+  no_vector_cores.num_vector_cores = 0;
+  check("policy selection includes AIV seed-task overhead",
+        selected_policy(problem) == "aiv_zero_seed_then_atomic" &&
+            selected_policy(expensive_vector_seed) ==
+                "first_partial_then_atomic" &&
+            selected_policy(no_vector_cores) ==
+                "first_partial_then_atomic");
 
   std::cout << passed << " passed, " << failed << " failed\n";
   return failed == 0 ? 0 : 1;

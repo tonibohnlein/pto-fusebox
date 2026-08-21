@@ -284,7 +284,7 @@ void TestCompileTimeSelectionDrivesCubeRequestOrder() {
   config.parts_m = 2;
   config.parts_n = 2;
   config.split_k = 1;
-  const CubeSchedulePlan plan = subgraph->cube_schedule_plan(config, {}, {}, 1);
+  const CubeSchedulePlan plan = subgraph->cube_schedule_plan(config);
   Check("selected cube request order remains emit-compatible",
         plan.feasible && plan.emit_compatible && plan.matmuls.size() == 3);
   if (plan.matmuls.size() != 3) return;

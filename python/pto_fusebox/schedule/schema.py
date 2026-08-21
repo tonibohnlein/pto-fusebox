@@ -58,6 +58,7 @@ class CubeSpatialPolicy(Enum):
 class CubeSplitMergePolicy(Enum):
     NONE = "none"
     FIRST_PARTIAL_THEN_ATOMIC = "first_partial_then_atomic"
+    AIV_ZERO_SEED_THEN_ATOMIC = "aiv_zero_seed_then_atomic"
 
 
 class CubeAxisBinding(Enum):
@@ -391,6 +392,15 @@ class CubeFirstPartialThenAtomicPlan:
 
 
 @dataclass(frozen=True)
+class CubeAivZeroSeedThenAtomicPlan:
+    present: bool
+    seed_work_units: int
+    atomic_work_units: int
+    seed_bytes: int
+    synchronization_cycles: float
+
+
+@dataclass(frozen=True)
 class CubeKernelPlan:
     emit_compatible: bool
     spatial_policy: CubeSpatialPolicy
@@ -402,6 +412,7 @@ class CubeKernelPlan:
     peak_l1_bytes: int
     split_merge_policy: CubeSplitMergePolicy
     first_partial_then_atomic: CubeFirstPartialThenAtomicPlan
+    aiv_zero_seed_then_atomic: CubeAivZeroSeedThenAtomicPlan
     model_overlap_granted: bool
     overlap_implementable: bool
     execution_order: tuple[int, ...]

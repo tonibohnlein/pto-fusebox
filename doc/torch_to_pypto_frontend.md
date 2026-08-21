@@ -33,7 +33,9 @@ non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
 Welford/multi-stat vector plans, singleton-column normalization, nonuniform cube
-spatial partitions, split-K, and mixed cross-core schedules fail closed.
+spatial partitions, split cube DAGs, and mixed cross-core schedules fail closed.
+Single-sink split-K is emitted through the selected dependency-linked PyPTO task
+protocol.
 Dynamic-shape classes are retained but declined when they affect solver
 geometry.
 
@@ -126,7 +128,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v3`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v4`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -167,7 +169,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v3`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v4`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -234,7 +236,7 @@ existing `mlsys_mixed` build when one is available.
 The standalone target admits the complete analytic schedule surface. It does
 not restrict partition search to schedules supported by the historical
 in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate tensor/tile
-PyPTO source from its own selected schedule. Analytic split-K, multi-reduction
+PyPTO source from its own selected schedule. Split cube DAGs, multi-reduction
 streaming, non-uniform cube-DAG grids, one-way `V -> C`, complete
 `C -> V -> C`, and deeper serial mixed topologies therefore remain eligible
 even when no legacy emitter path exists. Solution metadata records the stages,
@@ -338,13 +340,16 @@ launching ready kernels and overlapping independent AIC and AIV work.
 
 The backend deterministically serializes the selected solution as readable
 PyPTO DSL. The installed homogeneous slice emits materialized/pointwise vector,
-`softmax_flash.v1`, one-reduction folded/spanning vector streams, or uniform
-non-split cube DAG schedules as one `pl.spmd` grid per selected step, with
+`softmax_flash.v1`, one-reduction folded/spanning vector streams, uniform
+non-split cube DAG schedules, or single-sink split-K as explicit `pl.spmd`
+tasks, with
 static physical and valid shapes, explicit pipelines, and GM boundaries. It
 never expands a grid into a host-side loop of single-block submissions.
 Several homogeneous steps are composed in one orchestration program using
 dependency-linked GM cut values; this preserves the solver partition without
 claiming cross-kernel fast-memory retention.
+Single-sink split-K currently requires a one-step solution because its internal
+two-task dependency is not yet representable by the multi-step composer.
 ABI inputs use an `arg_` namespace, so captured names cannot shadow generated
 names.
 Materialized/pointwise schedules execute `body.ops`; online softmax consumes the
@@ -358,8 +363,8 @@ The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Analytic support is broader than the renderer. Welford/multi-stat P4, split-K,
-and mixed plans remain valid solver results but are not source-ready. P4
+Analytic support is broader than the renderer. Welford/multi-stat P4, split
+cube DAGs, and mixed plans remain valid solver results but are not source-ready. P4
 descriptors preserve named roles; each new recipe must version its carry and
 publication semantics. Future plan classes can add those contracts and
 cross-core transport without changing the ownership boundary.
@@ -559,8 +564,9 @@ dynamic physical tile that reaches allocation or tile-flattening.
    [closed PyPTO PR #2335](https://github.com/hw-native-sys/pypto/pull/2335)
    vector behavior while extending source replay; do not rediscover those
    schedules in the emitter.
-3. Add the remaining serialized homogeneous contracts: singleton-column
-   normalization, Welford/multi-stat vector replay, and split-K cube execution.
+3. Extend the single-sink split-K source contract to cube DAGs with resident
+   operands and per-share outer-K windows while rejecting ambiguous multi-root
+   merges.
 4. Implement the generic mixed source backend from one round trip while continuing
    to reject unsupported multi-round-trip groups before emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value

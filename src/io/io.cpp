@@ -347,6 +347,7 @@ static const char* cube_split_merge_policy_name(CubeSplitMergePolicy policy) {
     switch (policy) {
         case CubeSplitMergePolicy::None: return "none";
         case CubeSplitMergePolicy::FirstPartialThenAtomic: return "first_partial_then_atomic";
+        case CubeSplitMergePolicy::AivZeroSeedThenAtomic: return "aiv_zero_seed_then_atomic";
     }
     return "unknown";
 }
@@ -972,14 +973,14 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v3";
+    j["schema_version"] = "pto_fusebox.solution.v4";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
             throw std::logic_error(
-                "solution.v3 cannot serialize cross-kernel fast-memory retention");
+                "solution.v4 cannot serialize cross-kernel fast-memory retention");
         }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
@@ -994,7 +995,7 @@ std::string solution_json(const Solution& sol) {
             step.subgraph.has_matmul() && !step.subgraph.is_mixed()
                 ? step.subgraph.cube_schedule_plan(
                       cfg, sol.retained_entering(i), step.retain_these,
-                      cost.parallel_split)
+                      cost.parallel_split, cost.cube_split_merge_policy)
                 : CubeSchedulePlan{};
         const MixedSchedulePlan mixed_plan =
             step.subgraph.is_mixed()
@@ -1134,6 +1135,12 @@ std::string solution_json(const Solution& sol) {
              {"first_work_units", cube_plan.first_partial_then_atomic.first_work_units},
              {"atomic_work_units", cube_plan.first_partial_then_atomic.atomic_work_units},
              {"synchronization_cycles", cube_plan.first_partial_then_atomic.synchronization_cycles}}},
+           {"aiv_zero_seed_then_atomic",
+            {{"present", cube_plan.aiv_zero_seed_then_atomic.present},
+             {"seed_work_units", cube_plan.aiv_zero_seed_then_atomic.seed_work_units},
+             {"atomic_work_units", cube_plan.aiv_zero_seed_then_atomic.atomic_work_units},
+             {"seed_bytes", cube_plan.aiv_zero_seed_then_atomic.seed_bytes},
+             {"synchronization_cycles", cube_plan.aiv_zero_seed_then_atomic.synchronization_cycles}}},
            {"model_overlap_granted", cube_plan.model_overlap_granted},
            {"overlap_implementable", cube_plan.overlap_implementable},
            {"execution_order", cube_plan.execution_order},

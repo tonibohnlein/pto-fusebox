@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed one-matmul cube candidate
-  with its modeled cost and ordinary `solution.v3` replay payload; and
+  with its modeled cost and ordinary `solution.v4` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:
@@ -111,16 +111,20 @@ replays supported homogeneous vector and cube steps from the selected schedule.
 Vector source covers materialized/pointwise replay, versioned two-pass online
 softmax, and one-reduction folded or spanning streams. Cube source covers
 uniform non-split spatial plans, nested matmul DAGs, sequential outer-K windows,
-on-chip produced values, and solver-selected retained boundary panels. Other
+on-chip produced values, solver-selected retained boundary panels, and
+single-sink split-K through dependency-linked PyPTO tasks. Other
 schedules raise a precise `SourceEmissionError` rather than being approximated.
 Each maximal supported region is one solver input DAG, not one mandatory fused
 kernel: when the solver selects several homogeneous steps, source emission
 materializes their cut edges through explicit GM tensors and emits the steps as
-dependency-linked `pl.spmd` launches in solver order. Mixed steps and split-K
-source remain follow-ups.
+dependency-linked `pl.spmd` launches in solver order. Mixed steps and split
+cube DAGs with resident operands remain follow-ups.
+The initial split-K task bundle must be the region's only selected step; the
+multi-step composer fails closed rather than splicing its internal dependency
+into a larger launch sequence.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v3`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v4`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
@@ -135,8 +139,10 @@ shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
 Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
-cube spatial partitions, split-K, and mixed schedules remain explicitly not
-source-ready until their complete state or transport contracts are serialized.
+cube spatial partitions, split cube DAGs, and mixed schedules remain explicitly
+not source-ready until their complete state or transport contracts are serialized.
+Single-sink split-K is source-ready through the model-selected
+`FirstPartialThenAtomic` or `AivZeroSeedThenAtomic` PyPTO mechanism.
 
 Runnable capture examples include the basic positive contracts plus
 shape-reduced Torch forms of DeepSeek V4-Pro RMSNorm/MTP projection and the
@@ -184,7 +190,7 @@ not fit a second model in Python. Each entry records the model cost and embeds
 the exact forced solution. The predeclared device surface in
 `test/device/cube_model_cases.py` covers underfill, balanced, ragged-K,
 outer-K, rectangular-reuse, and split-K-positive shapes. Candidates beyond the
-current source backend—most notably split-K and mixed cross-core plans—remain
+current source backend—most notably split cube DAGs and mixed cross-core plans—remain
 useful analytic evidence but fail closed instead of being approximated by
 source.
 

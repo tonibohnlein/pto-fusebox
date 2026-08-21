@@ -171,8 +171,16 @@ public:
   CubeSchedulePlan cube_schedule_plan(
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev = {},
-      const FlatSet<size_t> &retain_these = {},
-      int64_t parallel_split = 1) const;
+      const FlatSet<size_t> &retain_these = {}) const;
+
+  // Reconstruct one selected split schedule. The merge policy is mandatory:
+  // split count alone does not identify the algorithm selected by the model.
+  CubeSchedulePlan cube_schedule_plan(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these,
+      int64_t parallel_split,
+      CubeSplitMergePolicy split_merge_policy) const;
 
   // Solver-owned mixed algorithm for one fixed candidate. Candidate-invariant
   // stage/transfer topology is shared from create(); only scalar grid and loop
@@ -284,7 +292,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const FlatSet<size_t> &retained_from_prev,
       const FlatSet<size_t> &retain_these,
       int64_t parallel_split,
-      L0PlanMemo *l0_memo) const;
+      L0PlanMemo *l0_memo,
+      CubeSplitMergePolicy split_merge_policy) const;
 
   // Hot mixed candidate derivation. It leaves MixedSchedulePlan::topology empty
   // so every enumerated configuration avoids a shared_ptr reference-count

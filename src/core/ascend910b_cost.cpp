@@ -3548,9 +3548,21 @@ int64_t Ascend910BCost::cube_peak_l1(const TileConfig &cfg,
 CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
     const TileConfig &cfg,
     const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these) const {
+  return derive_cube_schedule_plan(
+      cfg, retained_from_prev, retain_these, 1, nullptr,
+      CubeSplitMergePolicy::None);
+}
+
+CubeSchedulePlan Ascend910BCost::cube_schedule_plan(
+    const TileConfig &cfg,
+    const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these,
-    int64_t parallel_split) const {
-  return derive_cube_schedule_plan(cfg, retained_from_prev, retain_these, parallel_split, nullptr);
+    int64_t parallel_split,
+    CubeSplitMergePolicy split_merge_policy) const {
+  return derive_cube_schedule_plan(cfg, retained_from_prev, retain_these,
+                                   parallel_split, nullptr,
+                                   split_merge_policy);
 }
 
 CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
@@ -3558,7 +3570,8 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these,
     int64_t parallel_split,
-    L0PlanMemo *l0_memo) const {
+    L0PlanMemo *l0_memo,
+    CubeSplitMergePolicy split_merge_policy) const {
   CubeSchedulePlan plan;
   plan.config = cfg;
   const int64_t split = std::max<int64_t>(1, parallel_split);
@@ -3611,16 +3624,30 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
   plan.peak_l1_bytes = prob_->use_hierarchical_cube_cost ? 0 : peak;
-  plan.split_merge_policy =
-      split > 1 ? CubeSplitMergePolicy::FirstPartialThenAtomic
-                : CubeSplitMergePolicy::None;
-  plan.first_partial_then_atomic.present = split > 1;
+  if (split <= 1) {
+    plan.split_merge_policy = CubeSplitMergePolicy::None;
+  } else {
+    plan.split_merge_policy = split_merge_policy;
+  }
+  const bool first_partial =
+      plan.split_merge_policy == CubeSplitMergePolicy::FirstPartialThenAtomic;
+  const bool aiv_seed =
+      plan.split_merge_policy == CubeSplitMergePolicy::AivZeroSeedThenAtomic;
+  if (split > 1 && !first_partial && !aiv_seed) return CubeSchedulePlan{};
+  plan.first_partial_then_atomic.present = first_partial;
   plan.first_partial_then_atomic.first_work_units =
-      split > 1 ? plan.spatial_tiles : 0;
+      first_partial ? plan.spatial_tiles : 0;
   plan.first_partial_then_atomic.atomic_work_units =
-      split > 1 ? plan.spatial_tiles * (split - 1) : 0;
+      first_partial ? plan.spatial_tiles * (split - 1) : 0;
   plan.first_partial_then_atomic.synchronization_cycles =
-      split > 1 ? static_cast<double>(prob_->cube_split_sync_cycles) : 0.0;
+      first_partial ? static_cast<double>(prob_->cube_split_sync_cycles) : 0.0;
+  plan.aiv_zero_seed_then_atomic.present = aiv_seed;
+  plan.aiv_zero_seed_then_atomic.seed_work_units =
+      aiv_seed ? plan.spatial_tiles : 0;
+  plan.aiv_zero_seed_then_atomic.atomic_work_units =
+      aiv_seed ? plan.work_units : 0;
+  plan.aiv_zero_seed_then_atomic.synchronization_cycles =
+      aiv_seed ? static_cast<double>(prob_->cube_split_sync_cycles) : 0.0;
   plan.model_overlap_granted = false;
   plan.overlap_implementable = false;
 
@@ -3938,6 +3965,20 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     }
     plan.matmuls.push_back(mm);
     plan.execution_order.push_back(node.op);
+  }
+
+  if (aiv_seed) {
+    int64_t root_count = 0;
+    for (const CubeMatmulSchedule& mm : plan.matmuls) {
+      if (!mm.is_sink) continue;
+      ++root_count;
+      plan.aiv_zero_seed_then_atomic.seed_bytes +=
+          plan.spatial_tiles * mm.final_drain.bytes;
+    }
+    if (root_count != 1 ||
+        plan.aiv_zero_seed_then_atomic.seed_bytes <= 0) {
+      plan.emit_compatible = false;
+    }
   }
 
   bool has_streamed_boundary = false;
@@ -5413,6 +5454,19 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
       struct SplitEval {
         double lat, compute, ddr, active, l1l0;
         int64_t extra_fill_rounds = 0;
+        CubeSplitMergePolicy policy = CubeSplitMergePolicy::None;
+        int64_t vector_tasks = 0;
+      };
+      auto complete_split_latency = [&](const SplitEval& eval, int64_t split) {
+        const int64_t body_tasks =
+            static_cast<int64_t>(num_tiles) * std::max<int64_t>(1, split);
+        const int64_t body_rounds =
+            (body_tasks + n_cores - 1) / n_cores;
+        return eval.lat +
+               static_cast<double>(body_rounds + eval.extra_fill_rounds) *
+                   static_cast<double>(prob_->kernel_fill_cost) +
+               static_cast<double>(eval.vector_tasks) *
+                   static_cast<double>(prob_->per_task_overhead_cycles);
       };
       auto eval_S = [&](int64_t S) -> SplitEval {
         S = std::max<int64_t>(1, S);
@@ -5470,8 +5524,9 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
           return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
         }
         if (prob_->use_hierarchical_cube_cost && (uniform_grid || clamped_overlap_grid)) {
-          const CubeSchedulePlan schedule =
-              derive_cube_schedule_plan(cfg, retained_from_prev, retain_these, S, l0_memo);
+          const CubeSchedulePlan schedule = derive_cube_schedule_plan(
+              cfg, retained_from_prev, retain_these, S, l0_memo,
+              CubeSplitMergePolicy::FirstPartialThenAtomic);
           if (!schedule.feasible || !schedule.emit_compatible) {
             return {std::numeric_limits<double>::infinity(), 0.0, 0.0, activeS, 0.0, 0};
           }
@@ -5539,15 +5594,87 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
               (unitsS + n_cores - 1) / n_cores;
           const int64_t extra_rounds =
               first_rounds + atomic_rounds - pooled_rounds;
-          return {first.wall + atomic.wall + synchronization,
-                  first.compute + atomic.compute,
-                  first.ddr + atomic.ddr,
-                  std::max(
-                      static_cast<double>(
-                          std::min<int64_t>(first_units, n_cores)),
-                      static_cast<double>(
-                          std::min<int64_t>(atomic_units, n_cores))),
-                  first.l1_l0 + atomic.l1_l0, extra_rounds};
+          SplitEval best{
+              first.wall + atomic.wall + synchronization,
+              first.compute + atomic.compute,
+              first.ddr + atomic.ddr,
+              std::max(
+                  static_cast<double>(
+                      std::min<int64_t>(first_units, n_cores)),
+                  static_cast<double>(
+                      std::min<int64_t>(atomic_units, n_cores))),
+              first.l1_l0 + atomic.l1_l0,
+              extra_rounds,
+              S > 1 ? CubeSplitMergePolicy::FirstPartialThenAtomic
+                    : CubeSplitMergePolicy::None};
+
+          // PyPTO also exposes the production AIV-seed protocol used by
+          // pypto-lib: one vector task zeroes every spatial output region, and
+          // one dependent AIC task runs all K shares with atomic-add drains.
+          // Price it as an alternative rather than hard-coding either merge.
+          if (S > 1 && prob_->num_vector_cores > 0) {
+            const CubeSchedulePlan zero_schedule = derive_cube_schedule_plan(
+                cfg, retained_from_prev, retain_these, S, l0_memo,
+                CubeSplitMergePolicy::AivZeroSeedThenAtomic);
+            if (zero_schedule.feasible && zero_schedule.emit_compatible &&
+                zero_schedule.aiv_zero_seed_then_atomic.present) {
+              const auto& seed =
+                  zero_schedule.aiv_zero_seed_then_atomic;
+              double seed_unit_compute = 0.0;
+              for (const CubeMatmulSchedule& mm : zero_schedule.matmuls) {
+                if (!mm.is_sink) continue;
+                for (const CubeOutputTileVariant& variant :
+                     mm.output_variants) {
+                  seed_unit_compute +=
+                      static_cast<double>(variant.count) *
+                      GroundedVectorFillCycles(variant.height,
+                                               variant.width);
+                }
+              }
+              const double seed_compute = WaveComputeCycles(
+                  seed_unit_compute *
+                      static_cast<double>(seed.seed_work_units),
+                  seed.seed_work_units, prob_->num_vector_cores);
+              if (seed.seed_bytes % seed.seed_work_units != 0) {
+                return best;
+              }
+              const int64_t seed_bytes_per_work =
+                  seed.seed_bytes / seed.seed_work_units;
+              const int64_t full_seed_waves =
+                  seed.seed_work_units / prob_->num_vector_cores;
+              const int64_t tail_seed_work =
+                  seed.seed_work_units % prob_->num_vector_cores;
+              auto seed_store_wave = [&](int64_t active) {
+                if (active <= 0) return 0.0;
+                return static_cast<double>(seed_bytes_per_work * active) *
+                       bc.ub_out /
+                       par(static_cast<double>(active), prob_->bw_ub_gm);
+              };
+              const double seed_ddr =
+                  static_cast<double>(full_seed_waves) *
+                      seed_store_wave(prob_->num_vector_cores) +
+                  seed_store_wave(tail_seed_work);
+              const CubeMatmulPhaseCost all_atomic =
+                  phase_cost(seed.atomic_work_units);
+              const SplitEval zero{
+                  seed_compute + seed_ddr + all_atomic.wall +
+                      seed.synchronization_cycles,
+                  seed_compute + all_atomic.compute,
+                  seed_ddr + all_atomic.ddr,
+                  static_cast<double>(std::min<int64_t>(
+                      seed.atomic_work_units, n_cores)),
+                  all_atomic.l1_l0,
+                  (seed.seed_work_units + prob_->num_vector_cores - 1) /
+                      prob_->num_vector_cores,
+                  CubeSplitMergePolicy::AivZeroSeedThenAtomic,
+                  seed.seed_work_units};
+              if (complete_split_latency(zero, S) <
+                  complete_split_latency(best, S)) {
+                best = zero;
+              }
+            }
+          }
+          return best;
         }
 
         double computeS = 0.0;
@@ -5913,14 +6040,27 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
           for (int64_t S : all_divisors(kfrac)) {
             if (S < 2) continue;
             const SplitEval e = eval_S(S);
-            if (e.lat < chosen.lat) { chosen = e; chosen_S = S; }
+            if (complete_split_latency(e, S) <
+                complete_split_latency(chosen, chosen_S)) {
+              chosen = e;
+              chosen_S = S;
+            }
           }
         }
       }
       result.uses_model_ahead_split_k = (chosen_S > 1);
 
-      result.latency = chosen.lat;
+      result.latency =
+          chosen.lat +
+          static_cast<double>(chosen.vector_tasks) *
+              static_cast<double>(prob_->per_task_overhead_cycles);
       result.parallel_split = (int)chosen_S;
+      result.cube_split_merge_policy =
+          chosen_S <= 1
+              ? CubeSplitMergePolicy::None
+              : (chosen.policy == CubeSplitMergePolicy::None
+                     ? CubeSplitMergePolicy::FirstPartialThenAtomic
+                     : chosen.policy);
       result.cores_used = (int)chosen.active;
       result.compute_bound = chosen.compute >= chosen.ddr;
       result.ddr_traffic = chosen.ddr;

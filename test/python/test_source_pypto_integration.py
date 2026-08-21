@@ -7,9 +7,11 @@ The standalone source backend intentionally does not depend on PyPTO.  Set
 
 from __future__ import annotations
 
+import copy
 import importlib
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,11 @@ class _SumOfSquares(nn.Module):
 
 
 class _MatmulWithTail(nn.Module):
+    def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        return torch.mm(lhs, rhs)
+
+
+class _DeepKMatmul(nn.Module):
     def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         return torch.mm(lhs, rhs)
 
@@ -312,6 +319,119 @@ def test_pr2335_vector_surface_lowers_static_frames(
         skip_ptoas=True,
     )
     _assert_static_vector_frames(pto)
+
+
+@pytest.mark.parametrize(
+    "policy", ["aiv_zero_seed_then_atomic", "first_partial_then_atomic"]
+)
+def test_deep_k_split_protocol_lowers_as_two_dependency_linked_tasks(
+    policy: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _DeepKMatmul(),
+        (torch.zeros(128, 8192), torch.zeros(8192, 128)),
+    )
+    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    region = solved.regions[0]
+    assert region.solution is not None
+    solution = copy.deepcopy(region.solution)
+    plan = solution["steps"][0]["plan"]
+    assert plan["split_k"] > 1
+    spatial = plan["spatial_tiles"]
+    split = plan["split_k"]
+    synchronization = max(
+        plan["first_partial_then_atomic"]["synchronization_cycles"],
+        plan["aiv_zero_seed_then_atomic"]["synchronization_cycles"],
+    )
+    if policy == "first_partial_then_atomic":
+        plan["split_merge_policy"] = policy
+        plan["first_partial_then_atomic"] = {
+            "present": True,
+            "first_work_units": spatial,
+            "atomic_work_units": spatial * (split - 1),
+            "synchronization_cycles": synchronization,
+        }
+        plan["aiv_zero_seed_then_atomic"] = {
+            "present": False,
+            "seed_work_units": 0,
+            "atomic_work_units": 0,
+            "seed_bytes": 0,
+            "synchronization_cycles": 0.0,
+        }
+    else:
+        sink = next(matmul for matmul in plan["matmuls"] if matmul["is_sink"])
+        plan["split_merge_policy"] = policy
+        plan["first_partial_then_atomic"] = {
+            "present": False,
+            "first_work_units": 0,
+            "atomic_work_units": 0,
+            "synchronization_cycles": 0.0,
+        }
+        plan["aiv_zero_seed_then_atomic"] = {
+            "present": True,
+            "seed_work_units": spatial,
+            "atomic_work_units": spatial * split,
+            "seed_bytes": spatial * sink["final_drain"]["bytes"],
+            "synchronization_cycles": synchronization,
+        }
+    region = replace(region, solution=solution)
+    typed = scheduled_region(region).steps[0]
+    assert isinstance(typed.plan, CubeKernelPlan)
+    source = emit_pypto_region(graph, region, program_name=f"deep_k_{policy}").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / policy),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 2
+    assert len(orchestration_files) == 1
+    orchestration = orchestration_files[0].read_text(encoding="utf-8")
+    submissions = re.findall(r"\brt_submit_(ai[cv])_task\(", orchestration)
+    block_counts = [
+        int(value)
+        for value in re.findall(
+            r"launch_spec\.set_block_num\(([0-9]+)\)", orchestration
+        )
+    ]
+    assert orchestration.count("set_dependencies(") == 1
+    dependency_position = orchestration.index("set_dependencies(")
+    second_submit_position = orchestration.find("rt_submit_", dependency_position)
+    assert second_submit_position > dependency_position
+    pto_by_name = {path.stem: path.read_text(encoding="utf-8") for path in pto_files}
+    effective_k = plan["matmuls"][0]["effective_contraction"]
+    assert effective_k * split == 8192
+    assert {share * effective_k for share in range(split)} == set(
+        range(0, 8192, effective_k)
+    )
+    assert f"split_index * {effective_k}" in source
+    if policy == "aiv_zero_seed_then_atomic":
+        assert typed.plan.aiv_zero_seed_then_atomic.present
+        assert "deps=[zero_seed_task]" in source
+        assert submissions == ["aiv", "aic"]
+        assert block_counts == [spatial, spatial * split]
+        seed_pto = pto_by_name["region0000_cube_zero_seed"]
+        atomic_pto = pto_by_name["region0000_cube_atomic_all"]
+        assert "pto.texpands" in seed_pto and "pto.tstore" in seed_pto
+        assert "atomic_add" not in seed_pto
+        assert "atomicType = #pto<atomic_type atomic_add>" in atomic_pto
+    else:
+        assert typed.plan.first_partial_then_atomic.present
+        assert "deps=[first_partial_task]" in source
+        assert submissions == ["aic", "aic"]
+        assert block_counts == [spatial, spatial * (split - 1)]
+        first_pto = pto_by_name["region0000_cube_first"]
+        atomic_pto = pto_by_name["region0000_cube_atomic_rest"]
+        assert "pto.tstore" in first_pto and "atomic_add" not in first_pto
+        assert "atomicType = #pto<atomic_type atomic_add>" in atomic_pto
+    assert "for (region_index" not in orchestration
 
 
 def test_cut_fp32_chain_compiles_as_two_dependency_linked_spmd_kernels(

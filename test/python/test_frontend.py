@@ -954,7 +954,7 @@ def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) 
         "problem=json.loads(pathlib.Path(sys.argv[3]).read_text())\n"
         "assert problem['schema_version']=='pto_fusebox.problem.v1'\n"
         "pathlib.Path(sys.argv[4]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v3','steps':[{"
+        "'schema_version':'pto_fusebox.solution.v4','steps':[{"
         "'kind':'vector','ops':[0],'op_order':[0],"
         "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
         "'latency_cycles':1.0,'plan':{}}]}))\n",
@@ -992,7 +992,7 @@ def test_invalid_solver_subgraph_is_not_reported_as_solved(tmp_path: Path) -> No
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v3','steps':[{"
+        "'schema_version':'pto_fusebox.solution.v4','steps':[{"
         "'kind':'vector','ops':[999],'op_order':[999],"
         "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
         "'latency_cycles':1.0,'plan':{}}]}))\n",

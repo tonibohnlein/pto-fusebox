@@ -8,6 +8,7 @@ from ..schedule import CubeKernelPlan
 from ..schedule.schema import (
     CubeAxisBinding,
     CubeMatmulPlan,
+    CubeOutputTileVariant,
     CubeSpatialPolicy,
     CubeSplitMergePolicy,
     CubeTensorRegionPlan,
@@ -21,6 +22,7 @@ from .common import (
     emit_return,
     pypto_dtype,
     program_header,
+    program_preamble,
     solver_tensor_for_value,
     static_shape,
     validate_grid,
@@ -32,7 +34,7 @@ def emit_cube(
     context: EmissionContext,
     program_name: str,
 ) -> str:
-    """Emit one non-split homogeneous cube schedule."""
+    """Emit one homogeneous cube schedule."""
 
     graph = context.graph
     lowered = context.lowered
@@ -47,14 +49,12 @@ def emit_cube(
         raise SourceEmissionError(
             "cube source v1 supports only uniform spatial partitions"
         )
-    if (
-        step.split != 1
-        or plan.split_k != 1
-        or plan.split_merge_policy is not CubeSplitMergePolicy.NONE
-    ):
-        raise SourceEmissionError(
-            "cube split-K emission is not implemented in source v1"
-        )
+    if step.split != plan.split_k:
+        raise SourceEmissionError("cube launch split differs from its plan")
+    if plan.split_k > 1:
+        return _emit_split_cube_single_sink(context, program_name, plan)
+    if plan.split_merge_policy is not CubeSplitMergePolicy.NONE:
+        raise SourceEmissionError("non-split cube plan carries a merge policy")
     matmuls = plan.matmuls
     if (
         len(matmuls) > 1
@@ -211,6 +211,413 @@ def emit_cube(
     )
     emit_return(writer, io)
     return writer.render()
+
+
+def _emit_split_cube_single_sink(
+    context: EmissionContext,
+    program_name: str,
+    plan: CubeKernelPlan,
+) -> str:
+    """Emit one sink matmul using a solver-selected PyPTO split-K protocol."""
+
+    graph = context.graph
+    lowered = context.lowered
+    step = context.step
+    io = context.interface
+    if len(plan.matmuls) != 1 or len(step.solver_ops) != 1:
+        raise SourceEmissionError(
+            "split-K source initially supports exactly one sink matmul"
+        )
+    if plan.resident_boundaries:
+        raise SourceEmissionError(
+            "split-K source initially rejects resident cube boundaries"
+        )
+    matmul = plan.matmuls[0]
+    if (
+        not matmul.is_sink
+        or matmul.lhs_producer != -1
+        or matmul.rhs_producer != -1
+        or matmul.retained_panels.lhs
+        or matmul.retained_panels.rhs
+    ):
+        raise SourceEmissionError(
+            "split-K source initially requires one external-input sink"
+        )
+    if len(io.output_values) != 1:
+        raise SourceEmissionError("split-K source requires exactly one output")
+    if matmul.accumulator_dtype != "fp32" or matmul.storage_dtype != "fp32":
+        raise SourceEmissionError(
+            "split-K source currently requires FP32 accumulation and storage"
+        )
+    if plan.spatial_policy is not CubeSpatialPolicy.UNIFORM:
+        raise SourceEmissionError("split-K source requires a uniform spatial grid")
+    if (
+        plan.m_partition.big != plan.m_partition.small
+        or plan.n_partition.big != plan.n_partition.small
+    ):
+        raise SourceEmissionError("split-K source requires uniform region extents")
+    if plan.execution_order != (matmul.op,) or step.op_order != (matmul.op,):
+        raise SourceEmissionError("split-K source requires one ordered sink request")
+    if step.sequential_tiles != (matmul.k_loop.l1_window_k,):
+        raise SourceEmissionError(
+            "split-K sequential tile differs from its sink K window"
+        )
+    if plan.work_units != plan.spatial_tiles * plan.split_k:
+        raise SourceEmissionError("split-K work count differs from grid times split")
+    validate_grid(step, plan.spatial_tiles, plan.m_partition, plan.n_partition)
+    _validate_lowered_l0_capacity(context, matmul)
+
+    operation = lowered.operation(matmul.op)
+    graph_op = graph.op_map()[operation.graph_op_id]
+    if (
+        graph_op.kind != "matmul"
+        or graph_op.attributes.get("lhs_transposed")
+        or graph_op.attributes.get("rhs_transposed")
+        or len(operation.inputs) != 2
+        or len(operation.outputs) != 1
+    ):
+        raise SourceEmissionError(
+            "split-K source requires one non-transposed binary matmul"
+        )
+    if operation.inputs != (matmul.lhs.tensor, matmul.rhs.tensor):
+        raise SourceEmissionError("split-K operand identities are stale")
+    if operation.outputs != (matmul.output.tensor,):
+        raise SourceEmissionError("split-K output identity is stale")
+    lhs_value = lowered.tensor(operation.inputs[0]).value_id
+    rhs_value = lowered.tensor(operation.inputs[1]).value_id
+    if lhs_value not in io.input_arguments or rhs_value not in io.input_arguments:
+        raise SourceEmissionError("split-K operands must be region inputs")
+    output_value = io.output_values[0]
+    if (
+        solver_tensor_for_value(lowered, io.output_allocation_owners[output_value])
+        != matmul.output.tensor
+    ):
+        raise SourceEmissionError("split-K sink differs from the region output")
+    output_rows, output_cols = static_shape(
+        graph.value_map()[output_value], field="split-K output"
+    )
+    validate_partition_extent(plan.m_partition, output_rows, "cube.m_partition")
+    validate_partition_extent(plan.n_partition, output_cols, "cube.n_partition")
+    lhs_shape = static_shape(graph.value_map()[lhs_value], field="split-K lhs")
+    rhs_shape = static_shape(graph.value_map()[rhs_value], field="split-K rhs")
+    if (
+        lhs_shape[1] != rhs_shape[0]
+        or lhs_shape[1] != matmul.effective_contraction * plan.split_k
+        or matmul.contraction != lhs_shape[1]
+    ):
+        raise SourceEmissionError(
+            "split-K shares do not cover the full contraction exactly"
+        )
+
+    writer = program_preamble(program_name, io, graph)
+    if plan.split_merge_policy is CubeSplitMergePolicy.FIRST_PARTIAL_THEN_ATOMIC:
+        descriptor = plan.first_partial_then_atomic
+        if (
+            not descriptor.present
+            or descriptor.first_work_units != plan.spatial_tiles
+            or descriptor.atomic_work_units != plan.spatial_tiles * (plan.split_k - 1)
+            or plan.aiv_zero_seed_then_atomic.present
+        ):
+            raise SourceEmissionError(
+                "FirstPartialThenAtomic source descriptor is inconsistent"
+            )
+        writer.line(
+            2,
+            f"with pl.spmd({descriptor.first_work_units}, "
+            f"name_hint={context.region_id + '_cube_first'!r}) as first_partial_task:",
+        )
+        writer.line(3, "region_index = pl.tile.get_block_idx()")
+        _emit_split_cube_share(writer, 3, context, plan, matmul, "0", atomic=False)
+        writer.line(
+            2,
+            f"with pl.spmd({descriptor.atomic_work_units}, "
+            f"name_hint={context.region_id + '_cube_atomic_rest'!r}, "
+            "deps=[first_partial_task]) as atomic_rest_task:",
+        )
+        writer.line(3, "split_work_index = pl.tile.get_block_idx()")
+        writer.line(3, f"region_index = split_work_index // {plan.split_k - 1}")
+        writer.line(3, f"split_index = split_work_index % {plan.split_k - 1} + 1")
+        _emit_split_cube_share(
+            writer, 3, context, plan, matmul, "split_index", atomic=True
+        )
+    elif plan.split_merge_policy is CubeSplitMergePolicy.AIV_ZERO_SEED_THEN_ATOMIC:
+        descriptor = plan.aiv_zero_seed_then_atomic
+        if (
+            not descriptor.present
+            or descriptor.seed_work_units != plan.spatial_tiles
+            or descriptor.atomic_work_units != plan.work_units
+            or descriptor.seed_bytes != plan.spatial_tiles * matmul.final_drain.bytes
+            or plan.first_partial_then_atomic.present
+        ):
+            raise SourceEmissionError(
+                "AivZeroSeedThenAtomic source descriptor is inconsistent"
+            )
+        writer.line(
+            2,
+            f"with pl.spmd({descriptor.seed_work_units}, "
+            f"name_hint={context.region_id + '_cube_zero_seed'!r}) as zero_seed_task:",
+        )
+        writer.line(3, "region_index = pl.tile.get_block_idx()")
+        _emit_split_cube_zero_seed(writer, 3, context, plan, matmul)
+        writer.line(
+            2,
+            f"with pl.spmd({descriptor.atomic_work_units}, "
+            f"name_hint={context.region_id + '_cube_atomic_all'!r}, "
+            "deps=[zero_seed_task]) as atomic_all_task:",
+        )
+        writer.line(3, "split_work_index = pl.tile.get_block_idx()")
+        writer.line(3, f"region_index = split_work_index // {plan.split_k}")
+        writer.line(3, f"split_index = split_work_index % {plan.split_k}")
+        _emit_split_cube_share(
+            writer, 3, context, plan, matmul, "split_index", atomic=True
+        )
+    else:
+        raise SourceEmissionError("split-K plan carries no supported merge policy")
+    emit_return(writer, io)
+    return writer.render()
+
+
+def _emit_split_cube_zero_seed(
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    plan: CubeKernelPlan,
+    matmul: CubeMatmulPlan,
+) -> None:
+    coordinates = emit_partition_indices(
+        writer, indent, plan.m_partition, plan.n_partition
+    )
+    output_row, output_col = _cube_region_offsets(
+        matmul.output.height_binding,
+        matmul.output.width_binding,
+        coordinates.row,
+        coordinates.col,
+    )
+    output_argument = context.interface.output_argument
+    tiles_m, tiles_n = matmul.output_grid
+    for tile_m in range(tiles_m):
+        local_row = tile_m * matmul.output_tile[0]
+        tile_height = min(matmul.output_tile[0], matmul.output.height - local_row)
+        for tile_n in range(tiles_n):
+            local_col = tile_n * matmul.output_tile[1]
+            tile_width = min(matmul.output_tile[1], matmul.output.width - local_col)
+            writer.line(
+                indent,
+                f"{output_argument} = pl.assemble({output_argument}, "
+                f"pl.full([{tile_height}, {tile_width}], dtype=pl.FP32, value=0.0), "
+                f"[{_add_offset(output_row, local_row)}, "
+                f"{_add_offset(output_col, local_col)}])",
+            )
+
+
+def _emit_split_cube_share(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    plan: CubeKernelPlan,
+    matmul: CubeMatmulPlan,
+    split_index: str,
+    *,
+    atomic: bool,
+) -> None:
+    coordinates = emit_partition_indices(
+        writer, indent, plan.m_partition, plan.n_partition
+    )
+    parallel_k_offset = f"{split_index} * {matmul.effective_contraction}"
+    lhs_arg = context.interface.input_arguments[
+        context.lowered.tensor(matmul.lhs.tensor).value_id
+    ]
+    rhs_arg = context.interface.input_arguments[
+        context.lowered.tensor(matmul.rhs.tensor).value_id
+    ]
+    lhs_row, lhs_col = _cube_region_offsets(
+        matmul.lhs.height_binding,
+        matmul.lhs.width_binding,
+        coordinates.row,
+        coordinates.col,
+        parallel_k_offset,
+    )
+    rhs_row, rhs_col = _cube_region_offsets(
+        matmul.rhs.height_binding,
+        matmul.rhs.width_binding,
+        coordinates.row,
+        coordinates.col,
+        parallel_k_offset,
+    )
+    output_row, output_col = _cube_region_offsets(
+        matmul.output.height_binding,
+        matmul.output.width_binding,
+        coordinates.row,
+        coordinates.col,
+    )
+    output_argument = context.interface.output_argument
+    variants = {variant.shape: variant for variant in matmul.output_variants}
+    variant_counts = {shape: 0 for shape in variants}
+    tiles_m, tiles_n = matmul.output_grid
+    for tile_m in range(tiles_m):
+        local_row = tile_m * matmul.output_tile[0]
+        tile_height = min(matmul.output_tile[0], matmul.output.height - local_row)
+        for tile_n in range(tiles_n):
+            local_col = tile_n * matmul.output_tile[1]
+            tile_width = min(matmul.output_tile[1], matmul.output.width - local_col)
+            shape = (tile_height, tile_width)
+            if shape not in variants:
+                raise SourceEmissionError(f"split-K sink omits output variant {shape}")
+            variant_counts[shape] += 1
+            tile_index = tile_m * tiles_n + tile_n
+            accumulator = _emit_split_cube_output_tile(
+                writer,
+                indent,
+                matmul,
+                variants[shape],
+                lhs_arg,
+                rhs_arg,
+                lhs_row,
+                lhs_col,
+                rhs_row,
+                rhs_col,
+                local_row,
+                local_col,
+                tile_height,
+                tile_width,
+                tile_index,
+            )
+            atomic_suffix = ", atomic=pl.AtomicType.Add" if atomic else ""
+            writer.line(
+                indent,
+                f"{output_argument} = pl.assemble({output_argument}, {accumulator}, "
+                f"[{_add_offset(output_row, local_row)}, "
+                f"{_add_offset(output_col, local_col)}]{atomic_suffix})",
+            )
+    for shape, variant in variants.items():
+        if variant_counts[shape] != variant.count:
+            raise SourceEmissionError(f"split-K output variant {shape} count is stale")
+
+
+def _emit_split_cube_output_tile(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    matmul: CubeMatmulPlan,
+    variant: CubeOutputTileVariant,
+    lhs: str,
+    rhs: str,
+    lhs_row: str,
+    lhs_col: str,
+    rhs_row: str,
+    rhs_col: str,
+    output_row: int,
+    output_col: int,
+    output_height: int,
+    output_width: int,
+    tile_index: int,
+) -> str:
+    """Replay the serialized child-K loop inside every outer L1 window."""
+
+    outer = matmul.k_loop
+    if (
+        outer.chunk <= 0
+        or outer.full_chunks <= 0
+        or outer.full_chunks * outer.chunk + outer.tail != matmul.effective_contraction
+        or outer.tail >= outer.chunk
+        or outer.pipeline_stages not in {1, 2}
+    ):
+        raise SourceEmissionError(
+            f"split-K request {matmul.instance} outer K loop is stale"
+        )
+    prefix = f"matmul_{matmul.instance}_tile_{tile_index}"
+    accumulator = f"{prefix}_accumulator"
+
+    def emit_outer_window(
+        level: int,
+        suffix: str,
+        outer_offset: str,
+        outer_extent: int,
+        child,
+        *,
+        first_outer: bool,
+    ) -> None:
+        child_loop = child.k_loop
+        if (
+            child_loop.chunk <= 0
+            or child_loop.full_chunks <= 0
+            or child_loop.full_chunks * child_loop.chunk + child_loop.tail
+            != outer_extent
+            or child_loop.tail >= child_loop.chunk
+            or child_loop.pipeline_stages not in {1, 2}
+        ):
+            raise SourceEmissionError(
+                f"split-K request {matmul.instance} child K loop is stale"
+            )
+
+        def emit_child(child_index: int, child_extent: int) -> None:
+            child_offset = child_index * child_loop.chunk
+            k_offset = _add_expression(outer_offset, str(child_offset))
+            child_suffix = f"{suffix}_{child_index}"
+            writer.line(
+                level,
+                f"{prefix}_lhs_{child_suffix} = pl.slice({lhs}, "
+                f"[{output_height}, {child_extent}], "
+                f"[{_add_offset(lhs_row, output_row)}, "
+                f"{_add_expression(lhs_col, k_offset)}])",
+            )
+            writer.line(
+                level,
+                f"{prefix}_rhs_{child_suffix} = pl.slice({rhs}, "
+                f"[{child_extent}, {output_width}], "
+                f"[{_add_expression(rhs_row, k_offset)}, "
+                f"{_add_offset(rhs_col, output_col)}])",
+            )
+            if first_outer and child_index == 0:
+                writer.line(
+                    level,
+                    f"{accumulator} = pl.matmul({prefix}_lhs_{child_suffix}, "
+                    f"{prefix}_rhs_{child_suffix}, out_dtype=pl.FP32)",
+                )
+            else:
+                writer.line(
+                    level,
+                    f"{accumulator} = pl.matmul_acc({accumulator}, "
+                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix})",
+                )
+
+        for child_index in range(child_loop.full_chunks):
+            emit_child(child_index, child_loop.chunk)
+        if child_loop.tail:
+            emit_child(child_loop.full_chunks, child_loop.tail)
+
+    emit_outer_window(
+        indent,
+        "init",
+        "0",
+        outer.chunk,
+        variant.l0_init,
+        first_outer=True,
+    )
+    if outer.full_chunks > 1:
+        iterator = "pl.pipeline" if outer.pipeline_stages > 1 else "pl.range"
+        stage = f", stage={outer.pipeline_stages}" if outer.pipeline_stages > 1 else ""
+        writer.line(
+            indent,
+            f"for {prefix}_outer_k in {iterator}(1, {outer.full_chunks}{stage}):",
+        )
+        emit_outer_window(
+            indent + 1,
+            "rolled",
+            f"{prefix}_outer_k * {outer.chunk}",
+            outer.chunk,
+            variant.l0_rolled,
+            first_outer=False,
+        )
+    if outer.tail:
+        emit_outer_window(
+            indent,
+            "tail",
+            str(outer.full_chunks * outer.chunk),
+            outer.tail,
+            variant.l0_tail,
+            first_outer=False,
+        )
+    return accumulator
 
 
 def _emit_full_window_cube_dag(
@@ -594,7 +1001,7 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
     if (
         loop.chunk <= 0
         or loop.full_chunks <= 0
-        or loop.full_chunks * loop.chunk + loop.tail != matmul.contraction
+        or loop.full_chunks * loop.chunk + loop.tail != matmul.effective_contraction
         or loop.tail >= loop.chunk
         or loop.pipeline_stages not in {1, 2}
     ):
@@ -664,12 +1071,15 @@ def _cube_region_offsets(
     width_binding: CubeAxisBinding,
     spatial_row: str,
     spatial_col: str,
+    parallel_k: str = "0",
 ) -> tuple[str, str]:
     def coordinate(binding: CubeAxisBinding) -> str:
         if binding is CubeAxisBinding.SPATIAL_M:
             return spatial_row
         if binding is CubeAxisBinding.SPATIAL_N:
             return spatial_col
+        if binding is CubeAxisBinding.PARALLEL_K:
+            return parallel_k
         return "0"
 
     return coordinate(height_binding), coordinate(width_binding)

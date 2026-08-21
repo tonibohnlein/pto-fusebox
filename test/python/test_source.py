@@ -96,6 +96,22 @@ class Step:
         _append_spmd_statement(SourceWriter(), source, 0, protected={"output"})
 
 
+def test_multi_step_composer_rejects_split_task_bundle() -> None:
+    source = """
+@pl.program
+class Step:
+    def main(self, output):
+        with pl.spmd(1) as first_task:
+            output = output
+        with pl.spmd(15, deps=[first_task]) as atomic_task:
+            output = output
+        return output
+"""
+
+    with pytest.raises(SourceEmissionError, match="only one SPMD loop"):
+        _append_spmd_statement(SourceWriter(), source, 0, protected={"output"})
+
+
 def test_vector_solution_is_a_complete_typed_emission_contract() -> None:
     graph, result = _solved("softmax")
     schedule = scheduled_region(result)
@@ -601,7 +617,7 @@ def test_schedule_contract_rejects_legacy_or_dropped_step_fields() -> None:
     assert result.solution is not None
 
     legacy = dict(copy.deepcopy(result.solution))
-    legacy["schema_version"] = "pto_fusebox.solution.v2"
+    legacy["schema_version"] = "pto_fusebox.solution.v3"
     with pytest.raises(ScheduleContractError, match="solution schema"):
         scheduled_region(replace(result, solution=legacy))
 

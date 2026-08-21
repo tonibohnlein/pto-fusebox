@@ -152,15 +152,28 @@ final        = one Acc->L1/GM drain
 ```
 
 Only an actual stage-2 rolled phase receives `max`; first/tail/final work is additive. Up to four
-ragged output variants carry exact counts. Split-K uses two ordered AIC phases:
+ragged output variants carry exact counts. Split-K compares two existing PyPTO execution
+mechanisms for the same `P*Q*S` partial products:
 
 ```
-first     = wall(spatial_tiles, share=0, normal store)
-atomic    = wall(spatial_tiles * (S-1), shares=1..S-1, atomic add)
-split     = first + atomic + cube_split_sync_cycles
+FirstPartialThenAtomic =
+    wall(P*Q, share=0, normal store)
+  + wall(P*Q*(S-1), shares=1..S-1, atomic add)
+  + cube_split_sync_cycles
+
+AivZeroSeedThenAtomic =
+    AIV_zero_fill_and_store(P*Q)
+  + wall(P*Q*S, shares=0..S-1, atomic add)
+  + cube_split_sync_cycles
 ```
 
-The two launch walls are always additive. Each contributes its own kernel-fill waves.
+Both protocols are two dependency-linked SPMD tasks. Their walls are additive, while all work
+units inside the second task remain mutually parallel. Each task contributes its own kernel-fill
+waves; neither protocol uses device-side flag spinning.
+Concurrent FP32 atomic additions are tolerance-correct but not bitwise deterministic. The
+first-partial protocol fixes share zero as the initial value; the zero-seed protocol permits all
+`S` partials to arrive in runtime order. Silicon stability therefore checks bounded numerical
+variation and no unwritten output rather than requiring one output signature.
 `cube_split_sync_cycles` is a separate zero-default boundary term reserved for later silicon
 calibration; it never substitutes for phase serialization.
 
@@ -173,7 +186,7 @@ Two mechanisms must remain distinct:
 | mechanism | scope | merge |
 |---|---|---|
 | sequential K streaming | every matmul request instance | persistent local accumulator |
-| parallel split-K | the single supported root only | first partial normal-store + remaining atomic-add GM stores |
+| parallel split-K | the single supported root only | model-selected first-partial or AIV-zero-seed protocol; both merge with atomic-add GM stores |
 
 Sequential K changes memory feasibility and overlap but not mathematical work. Parallel split-K
 creates `parts_m × parts_n × S` independent work units, shrinks the root K request, and multiplies
@@ -198,7 +211,8 @@ and returns:
 - L1 K window, emitted chunk, rolled trips, tail, and pipeline stage;
 - output/L0C variants with shared-backend init/rolled/tail child plans;
 - one explicit final Acc→L1/GM drain;
-- the `FirstPartialThenAtomic` launch sizes, synchronization hook, and overlap/buildability flags.
+- both split-merge launch descriptors, the selected policy, synchronization hook, and
+  overlap/buildability flags.
 
 The plan is intentionally absent from `CostResult`, which is stored in the local-search cache. The
 topology is built once per subgraph; O(nodes) candidate derivations remain stack-local. This keeps
@@ -299,7 +313,7 @@ candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
 
-Each sweep entry embeds an ordinary `pto_fusebox.solution.v3` payload. The
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v4` payload. The
 Python `enumerate_cube_plans()` adapter validates the envelope and
 `region_for_cube_candidate()` binds one candidate back to the exact lowered
 problem for source replay. The adapter never re-plans or changes a cost.
@@ -315,10 +329,11 @@ The initial validation matrix is fixed before silicon timing and covers:
 
 Model-ranking validation and source-emitter validation are separate claims.
 Only candidates accepted by the typed source backend may be timed as generated
-source. The source backend replays retained panels for non-split plans; analytic
-split-K winners remain model-ahead evidence until their explicit PyPTO
-algorithm exists and must not be silently replaced by split=1. No coefficient
-is fitted from these rankings.
+source. The source backend replays retained panels for non-split plans and
+emits a single-sink split plan as two dependency-linked PyPTO `pl.spmd` tasks.
+It consumes the selected merge descriptor without replanning. Split cube DAGs
+with resident boundaries or multiple matmuls still fail closed; no winner is
+silently replaced by split=1. No coefficient is fitted from these rankings.
 
 ---
 
