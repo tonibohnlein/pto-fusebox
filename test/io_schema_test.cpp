@@ -71,7 +71,7 @@ int main() {
   Solution empty(problem, dag, {});
   const auto solution = nlohmann::json::parse(solution_json(empty));
   check("solution schema is published",
-        solution.at("schema_version") == "pto_fusebox.solution.v4");
+        solution.at("schema_version") == "pto_fusebox.solution.v5");
   check("solution steps are nested", solution.at("steps").is_array());
   check("empty solution has no steps", solution.at("steps").empty());
 

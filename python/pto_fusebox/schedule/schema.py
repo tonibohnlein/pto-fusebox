@@ -525,6 +525,7 @@ class MixedKernelPlan:
     work_units: int
     group_capacity: int
     cube_window_k: int
+    cube_stage_peak_l1_bytes: int
     vector_stage_kind: VectorStreamKind
     vector_stage_peak_ub_bytes: int
     vector_split: MixedVectorSplit

@@ -1207,6 +1207,9 @@ struct MixedSchedulePlan {
   // populated only when reconstructing a winning/forced plan, not retained
   // in the hot CostResult cache.
   int64_t cube_window_k = 0;
+  // Peak cube-side L1 operand/resident footprint before V2C consumer rings.
+  // Source readiness combines this with every V2C FIFO reservation.
+  int64_t cube_stage_peak_l1_bytes = 0;
   VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
   int64_t vector_stage_peak_ub_bytes = 0;
   MixedVectorSplit vector_split = MixedVectorSplit::None;

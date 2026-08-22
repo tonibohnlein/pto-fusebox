@@ -974,6 +974,7 @@ def _parse_mixed_plan(
         "work_units",
         "group_capacity",
         "cube_window_k",
+        "cube_stage_peak_l1_bytes",
         "vector_stage_kind",
         "vector_stage_peak_ub_bytes",
         "vector_split",
@@ -1064,6 +1065,10 @@ def _parse_mixed_plan(
         ),
         cube_window_k=_nonnegative_int(
             item.get("cube_window_k"), f"{field}.cube_window_k"
+        ),
+        cube_stage_peak_l1_bytes=_nonnegative_int(
+            item.get("cube_stage_peak_l1_bytes"),
+            f"{field}.cube_stage_peak_l1_bytes",
         ),
         vector_stage_kind=_enum(
             VectorStreamKind,
@@ -1368,6 +1373,10 @@ def _validate_mixed_contract(  # noqa: PLR0913
 ) -> None:
     if not plan.emit_compatible or not plan.source_codegen_ready:
         return
+    if plan.cube_stage_peak_l1_bytes <= 0:
+        raise ScheduleContractError(
+            f"{field}.cube_stage_peak_l1_bytes must be positive for source replay"
+        )
     if plan.split_k != 1 or launch.split != 1:
         raise ScheduleContractError(f"{field} source-ready mixed replay cannot split K")
     if (

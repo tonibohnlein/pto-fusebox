@@ -1401,6 +1401,7 @@ static void test_mixed_schedule_plan() {
       CHECK("MIXPLAN: connected vector ops dock as one round-trip peer stage",
             plan.feasible && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
                 plan.mode == MixedPipelineMode::SingleRoundTripSkew &&
+                plan.cube_stage_peak_l1_bytes > 0 &&
                 plan.topology->protocol.skew_pass_compatible && plan.topology->stages.size() == 3 &&
                 plan.topology->stages[1].engine == MixedEngine::Vector &&
                 plan.topology->stages[1].ops == std::vector<size_t>({1, 2}) &&
@@ -1873,6 +1874,7 @@ static void test_mixed_schedule_plan() {
                 plan.stages[2].vector_stream.feasible);
       CHECK("MIXPLAN: dense MLP owns the feature loop and FIFO bundles",
             plan.dense_mlp.present && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                plan.cube_stage_peak_l1_bytes == 12288 &&
                 plan.topology->protocol.skew_pass_compatible &&
                 plan.topology->protocol.producer_stages == std::vector<size_t>({0, 1}) &&
                 plan.topology->protocol.peer_stage == 2 && plan.topology->protocol.sink_stage == 3 &&
@@ -1887,6 +1889,16 @@ static void test_mixed_schedule_plan() {
       CHECK("MIXPLAN: dense MLP cost is finite and grants only realizable overlap",
             cost.feasible && std::isfinite(cost.latency) && plan.model_overlap_granted &&
                 plan.model_overlap_granted == plan.overlap_implementable);
+
+      Problem tight_l1 = p;
+      tight_l1.l1_capacity = 14 * 1024;
+      DAG tight_l1_dag = DAG::build(tight_l1);
+      auto tight_l1_mixed =
+          Ascend910BMixed::create(tight_l1, tight_l1_dag,
+                                 {0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+      CHECK("MIXPLAN: cube peak and V2C ring must fit L1 together",
+            tight_l1_mixed &&
+                !tight_l1_mixed->mixed_schedule_plan(cfg).feasible);
     }
 
     Problem escaped = p;

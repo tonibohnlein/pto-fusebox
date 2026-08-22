@@ -83,9 +83,6 @@ def _validate_common(context: EmissionContext, plan: MixedKernelPlan) -> None:
         )
     if not plan.fifos:
         raise SourceEmissionError("mixed source requires at least one FIFO")
-    slot_counts = {fifo.slot_count for fifo in plan.fifos}
-    if len(slot_counts) != 1:
-        raise SourceEmissionError("mixed FIFOs require one shared slot count")
     vec_capacity = context.problem.get("vec_capacity")
     if (
         not isinstance(vec_capacity, int)
@@ -93,12 +90,34 @@ def _validate_common(context: EmissionContext, plan: MixedKernelPlan) -> None:
         or vec_capacity <= 0
     ):
         raise SourceEmissionError("mixed source requires a positive Vec capacity")
-    physical_fifo_bytes = max(fifo.reserved_bytes for fifo in plan.fifos)
-    required_vec_bytes = physical_fifo_bytes + plan.vector_stage_peak_ub_bytes
+    c2v_fifo_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+    )
+    required_vec_bytes = c2v_fifo_bytes + plan.vector_stage_peak_ub_bytes
     if required_vec_bytes > vec_capacity:
         raise SourceEmissionError(
-            "mixed shared FIFO and vector stage exceed Vec capacity: "
+            "mixed C2V FIFO rings and vector stage exceed Vec capacity: "
             f"{required_vec_bytes} > {vec_capacity} bytes"
+        )
+    l1_capacity = context.problem.get("l1_capacity")
+    if (
+        not isinstance(l1_capacity, int)
+        or isinstance(l1_capacity, bool)
+        or l1_capacity <= 0
+    ):
+        raise SourceEmissionError("mixed source requires a positive L1 capacity")
+    v2c_fifo_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    )
+    required_l1_bytes = plan.cube_stage_peak_l1_bytes + v2c_fifo_bytes
+    if required_l1_bytes > l1_capacity:
+        raise SourceEmissionError(
+            "mixed cube stage and V2C FIFO rings exceed L1 capacity: "
+            f"{required_l1_bytes} > {l1_capacity} bytes"
         )
 
 
@@ -107,14 +126,28 @@ def _mixed_header(
     program_name: str,
     plan: MixedKernelPlan,
 ) -> SourceWriter:
-    slot_count = plan.fifos[0].slot_count
+    optimizations = ["pl.split(pl.SplitMode.UP_DOWN)"]
+    for index, fifo in enumerate(plan.fifos):
+        pipe_id = fifo.pipe_id if fifo.pipe_id >= 0 else index
+        bundle = fifo.bundle if fifo.bundle >= 0 else index
+        direction = (
+            "pl.CrossCoreDirection.CUBE_TO_VECTOR"
+            if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+            else "pl.CrossCoreDirection.VECTOR_TO_CUBE"
+        )
+        optimizations.append(
+            "pl.cross_core_pipe("
+            f"tensor_id={fifo.tensor}, direction={direction}, "
+            f"valid_shape=[{fifo.valid_rows}, {fifo.valid_cols}], "
+            f"slot_size_bytes={fifo.slot_bytes}, slot_num={fifo.slot_count}, "
+            f"pipe_id={pipe_id}, bundle={bundle})"
+        )
     writer = program_preamble(program_name, context.interface, context.graph)
     writer.line(
         2,
         f"for region_index in pl.spmd({plan.active_groups}, "
         f"name_hint={literal(context.region_id + '_mixed')}, "
-        "optimizations=[pl.split(pl.SplitMode.UP_DOWN, "
-        f"slot_num={slot_count})]):",
+        f"optimizations=[{', '.join(optimizations)}]):",
     )
     return writer
 

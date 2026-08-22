@@ -313,7 +313,7 @@ candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
 
-Each sweep entry embeds an ordinary `pto_fusebox.solution.v4` payload. The
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v5` payload. The
 Python `enumerate_cube_plans()` adapter validates the envelope and
 `region_for_cube_candidate()` binds one candidate back to the exact lowered
 problem for source replay. The adapter never re-plans or changes a cost.

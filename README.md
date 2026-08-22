@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
-  with its modeled cost and ordinary `solution.v4` replay payload; and
+  with its modeled cost and ordinary `solution.v5` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:
@@ -125,12 +125,14 @@ Mixed source initially covers generic one-way `C -> V`, generic
 `C -> V -> C`, and dense `C,C -> V -> C` plans through PyPTO's public
 `pl.split(UP_DOWN)` mechanism. One-way `V -> C`, deeper round trips, and mixed
 multi-step composition still fail closed.
+Mixed source readiness combines the serialized cube-stage L1 peak with V2C
+ring reservations and the vector-stage Vec peak with C2V ring reservations.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v4`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v5`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path

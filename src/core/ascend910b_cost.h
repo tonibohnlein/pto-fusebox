@@ -347,6 +347,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
     bool feasible = false;
     int64_t gate_window_k = 0;
     int64_t up_window_k = 0;
+    int64_t cube_peak_l1_bytes = 0;
     int64_t vector_peak_ub_bytes = 0;
     int64_t fifo_reserved_bytes = 0;
   };

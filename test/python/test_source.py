@@ -30,6 +30,7 @@ from pto_fusebox.schedule.schema import (
     MixedAlgorithm,
     MixedCrossCoreProtocol,
     MixedKernelPlan,
+    MixedTransferDirection,
     VectorKernelPlan,
     VectorReplayPhase,
     VectorSpatialPolicy,
@@ -978,7 +979,10 @@ def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     source = emit_pypto_region(graph, result, program_name="attention_mixed").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" in source
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
+    assert source.count("pl.cross_core_pipe(") == 2
+    assert "direction=pl.CrossCoreDirection.CUBE_TO_VECTOR" in source
+    assert "direction=pl.CrossCoreDirection.VECTOR_TO_CUBE" in source
     assert "pl.pipeline(1, stage=3" in source
     assert source.count("pl.tensor.matmul(") == 2
     assert "b_trans=True" in source
@@ -1000,6 +1004,18 @@ def test_mixed_typed_contract_rejects_stale_fifo_geometry() -> None:
         scheduled_region(replace(result, solution=solution))
 
 
+def test_mixed_typed_contract_rejects_missing_cube_l1_peak() -> None:
+    _, result = _solved("attention_core")
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    solution["steps"][0]["plan"]["cube_stage_peak_l1_bytes"] = 0
+
+    with pytest.raises(
+        ScheduleContractError, match="cube_stage_peak_l1_bytes must be positive"
+    ):
+        scheduled_region(replace(result, solution=solution))
+
+
 def test_mixed_typed_contract_rejects_stale_protocol_bundle() -> None:
     _, result = _solved("attention_core")
     assert result.solution is not None
@@ -1012,7 +1028,7 @@ def test_mixed_typed_contract_rejects_stale_protocol_bundle() -> None:
         scheduled_region(replace(result, solution=solution))
 
 
-def test_mixed_source_rejects_shared_fifo_over_capacity() -> None:
+def test_mixed_source_rejects_planned_fifo_rings_over_capacity() -> None:
     graph, result = _solved("attention_core")
     assert result.problem is not None
     problem = dict(result.problem)
@@ -1021,7 +1037,30 @@ def test_mixed_source_rejects_shared_fifo_over_capacity() -> None:
 
     assert not can_emit_region(graph, stale)
     with pytest.raises(
-        SourceEmissionError, match="shared FIFO and vector stage exceed Vec capacity"
+        SourceEmissionError, match="C2V FIFO rings and vector stage exceed Vec capacity"
+    ):
+        emit_pypto_region(graph, stale)
+
+
+def test_mixed_source_rejects_cube_peak_plus_v2c_rings_over_l1_capacity() -> None:
+    graph, result = _solved("attention_core")
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    v2c_fifo_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    )
+    assert plan.cube_stage_peak_l1_bytes > 0
+    assert v2c_fifo_bytes > 0
+    assert result.problem is not None
+    problem = dict(result.problem)
+    problem["l1_capacity"] = plan.cube_stage_peak_l1_bytes + v2c_fifo_bytes - 1
+    stale = replace(result, problem=problem)
+
+    assert not can_emit_region(graph, stale)
+    with pytest.raises(
+        SourceEmissionError, match="cube stage and V2C FIFO rings exceed L1 capacity"
     ):
         emit_pypto_region(graph, stale)
 
@@ -1045,7 +1084,9 @@ def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     source = emit_pypto_region(graph, result, program_name="c2v_epilogue").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in source
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
+    assert source.count("pl.cross_core_pipe(") == 1
+    assert "direction=pl.CrossCoreDirection.CUBE_TO_VECTOR" in source
     assert "pl.range(1, init_values=(output,))" in source
     assert source.count("pl.tensor.matmul(") == 1
     assert "pl.tensor.col_expand_add(" in source
@@ -1074,7 +1115,10 @@ def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> N
     source = emit_pypto_region(graph, result, program_name="dense_swiglu").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" in source
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
+    assert source.count("pl.cross_core_pipe(") == 3
+    assert source.count("direction=pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
+    assert source.count("direction=pl.CrossCoreDirection.VECTOR_TO_CUBE") == 1
     assert "pl.pipeline(0, 128, 64, stage=3" in source
     assert source.count("pl.tensor.matmul(") == 3
     assert source.count("pl.tensor.matmul_acc(") == 1

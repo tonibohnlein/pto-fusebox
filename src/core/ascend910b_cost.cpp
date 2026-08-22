@@ -5016,19 +5016,24 @@ Ascend910BCost::DenseMlpResources Ascend910BCost::derive_dense_mlp_resources(con
   if (down_two_stage_bytes > l1_capacity || std::max(projection_acc_bytes, down_acc_bytes) > cube_capacity) {
     return resources;
   }
+  resources.cube_peak_l1_bytes =
+      std::max(2 * resources.gate_window_k * (mp.big + cfg.k) * operand_bytes,
+               down_two_stage_bytes);
 
   constexpr int64_t kFifoSlots = 4;
   const int64_t gate_slot = mp.big * cfg.k * 4;
   const int64_t up_slot = mp.big * cfg.k * 4;
   const int64_t activation_slot = mp.big * cfg.k * operand_bytes;
-  resources.fifo_reserved_bytes = kFifoSlots * (gate_slot + up_slot + activation_slot);
+  const int64_t c2v_fifo_reserved_bytes = kFifoSlots * (gate_slot + up_slot);
+  const int64_t v2c_fifo_reserved_bytes = kFifoSlots * activation_slot;
+  resources.fifo_reserved_bytes = c2v_fifo_reserved_bytes + v2c_fifo_reserved_bytes;
   // Each AIV lane owns half the rows.  Four FP32 bands cover the exact peak:
   // gate + up plus the current and next values of the unary sigmoid chain.
   const int64_t lane_rows = mp.big / 2;
   const int64_t vector_live_bytes = lane_rows * cfg.k * 4 * 4;
   resources.vector_peak_ub_bytes = resources.fifo_reserved_bytes + vector_live_bytes;
-  resources.feasible =
-      resources.fifo_reserved_bytes <= vec_capacity && resources.vector_peak_ub_bytes <= vec_capacity;
+  resources.feasible = c2v_fifo_reserved_bytes + vector_live_bytes <= vec_capacity &&
+                       resources.cube_peak_l1_bytes + v2c_fifo_reserved_bytes <= l1_capacity;
   return resources;
 }
 
@@ -5051,7 +5056,9 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
   //     reduction). A held vector→vector intermediate is a UB band; a crossing tile
   //     popped from the ring is a transient; cube ops are skipped.
   // The crossing's DDR roundtrip is paid in compute_cost, not in feasibility.
-  if (derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr) == INT64_MAX) {
+  const int64_t cube_peak_l1_bytes =
+      derive_exec(cfg, output_K_, retained_from_prev, retain_these, nullptr);
+  if (cube_peak_l1_bytes == INT64_MAX) {
     return false;
   }
 
@@ -5112,16 +5119,25 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
   }
 
   const int64_t slot_count = one_way ? 8 : 4;
-  int64_t fifo_reserved = 0;
+  int64_t c2v_fifo_reserved = 0;
+  int64_t v2c_fifo_reserved = 0;
   for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
     const auto [rows, cols] = MixedTensorRegion(
         prob_->tensors[transfer.tensor], mp, np, /*spatial_m=*/true,
         /*spatial_n=*/!single_round_trip);
     if (rows <= 0 || cols <= 0) return false;
-    fifo_reserved += rows * cols * dtype_bytes(prob_->tensors[transfer.tensor].dtype) * slot_count;
+    const int64_t reserved =
+        rows * cols * dtype_bytes(prob_->tensors[transfer.tensor].dtype) * slot_count;
+    if (transfer.producer_engine == MixedEngine::Cube) {
+      c2v_fifo_reserved += reserved;
+    } else {
+      v2c_fifo_reserved += reserved;
+    }
   }
-  return fifo_reserved <= prob_->vec_capacity &&
-         lane_plan.full_peak_ub_bytes <= prob_->vec_capacity - fifo_reserved;
+  return c2v_fifo_reserved <= prob_->vec_capacity &&
+         lane_plan.full_peak_ub_bytes <= prob_->vec_capacity - c2v_fifo_reserved &&
+         v2c_fifo_reserved <= prob_->l1_capacity &&
+         cube_peak_l1_bytes <= prob_->l1_capacity - v2c_fifo_reserved;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -6605,6 +6621,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
   if (plan.feasible) {
     if (plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
       const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
+      const DenseMlpResources resources = derive_dense_mlp_resources(cfg);
+      plan.cube_stage_peak_l1_bytes = resources.cube_peak_l1_bytes;
       plan.stages.reserve(mixed_topology_->stages.size());
       for (size_t stage_idx = 0; stage_idx < mixed_topology_->stages.size(); ++stage_idx) {
         const MixedStageTopology& topology_stage = mixed_topology_->stages[stage_idx];
@@ -6655,7 +6673,12 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
     const int vector_to_cube_operand = vector_to_cube_operand_index();
     const bool vector_to_cube = vector_to_cube_operand >= 0;
     std::vector<int64_t> pernode_k;
-    derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pernode_k);
+    plan.cube_stage_peak_l1_bytes =
+        derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pernode_k);
+    if (plan.cube_stage_peak_l1_bytes == INT64_MAX) {
+      plan.feasible = false;
+      return plan;
+    }
     if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < pernode_k.size() &&
         pernode_k[static_cast<size_t>(sink_mm_op_)] > 0) {
       plan.cube_window_k = pernode_k[static_cast<size_t>(sink_mm_op_)];

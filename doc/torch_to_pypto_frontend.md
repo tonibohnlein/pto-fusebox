@@ -135,7 +135,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v4`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v5`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -176,7 +176,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v4`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v5`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -375,14 +375,18 @@ The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Mixed source validates every logical transfer/FIFO descriptor, emits the
-crossing values in that order, and passes the common slot count to
-`pl.split(UP_DOWN)`. PyPTO's `SkewCrossCorePipeline` owns the physical
-initialize/push/pop/free lowering and may coalesce compatible logical
-directions into one bidirectional pipe. The opt-in integration tests therefore
-check the lowered directions, slot size/count, and AIC/AIV functions; exact
-logical-to-physical multi-pipe parity remains part of silicon closure rather
-than an unverified source claim.
+Mixed source validates every logical transfer/FIFO descriptor and emits one
+public `pl.cross_core_pipe(...)` schedule entry for each crossing, in solver
+order. Each entry carries its unidirectional pipe ID, protocol bundle, logical
+frame, slot bytes, and ring depth. PyPTO's `ExpandMixedKernel` and
+`SkewCrossCorePipeline` still own the AIC/AIV split and the physical
+initialize/push/pop/free lowering; the external emitter does not hand-code
+either core program. Opt-in integration tests require exact descriptor-to-pipe
+parity, including distinct IDs for same-shaped sources and separate C2V/V2C
+rings. Source readiness charges the serialized cube-stage L1 peak together
+with every V2C consumer ring, and the vector-stage peak together with every
+C2V consumer ring; neither direction can hide its physical FIFO reservation.
+No attention or SwiGLU recognizer is involved in this transport contract.
 
 Analytic support is broader than the renderer. Welford/multi-stat P4 and mixed
 plans outside the three admitted stage patterns remain valid solver results but

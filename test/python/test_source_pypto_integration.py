@@ -204,6 +204,16 @@ def _assert_single_spmd_orchestration(source: str, work_units: int) -> None:
     assert "region_index" not in source
 
 
+def _pto_pipe_ids(pto: str, op_name: str) -> set[int]:
+    lines = [line for line in pto.splitlines() if f"pto.{op_name}" in line]
+    ids: set[int] = set()
+    for line in lines:
+        match = re.search(r"\bid = (-?[0-9]+)", line)
+        assert match is not None, line
+        ids.add(int(match.group(1)))
+    return ids
+
+
 def _compile_source(
     name: str,
     module: nn.Module,
@@ -281,7 +291,7 @@ def _compile_mixed_source(
 
 
 @pytest.mark.parametrize(
-    ("name", "module", "args", "dir_mask", "slot_size", "slot_count"),
+    ("name", "module", "args"),
     [
         (
             "mixed_c2v",
@@ -291,9 +301,6 @@ def _compile_mixed_source(
                 torch.zeros(64, 32),
                 torch.zeros(1, 32),
             ),
-            1,
-            4096,
-            8,
         ),
         (
             "mixed_attention",
@@ -303,9 +310,6 @@ def _compile_mixed_source(
                 torch.zeros(64, 64),
                 torch.zeros(64, 128),
             ),
-            3,
-            24576,
-            4,
         ),
         (
             "mixed_dense_swiglu",
@@ -316,9 +320,6 @@ def _compile_mixed_source(
                 torch.zeros(64, 128, dtype=torch.bfloat16),
                 torch.zeros(128, 64, dtype=torch.bfloat16),
             ),
-            3,
-            4096,
-            4,
         ),
     ],
 )
@@ -326,35 +327,73 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     name: str,
     module: nn.Module,
     args: tuple[torch.Tensor, ...],
-    dir_mask: int,
-    slot_size: int,
-    slot_count: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source, pto, _ = _compile_mixed_source(name, module, args, tmp_path, monkeypatch)
+    source, pto, plan = _compile_mixed_source(name, module, args, tmp_path, monkeypatch)
 
     assert "pl.split(pl.SplitMode.UP_DOWN" in source
+    assert source.count("pl.cross_core_pipe(") == len(plan.fifos)
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
-    pipe = (
-        f"{{dir_mask = {dir_mask}, slot_size = {slot_size}, slot_num = {slot_count}}}"
-    )
-    assert f"pto.aic_initialize_pipe {pipe}" in pto
-    assert f"pto.aiv_initialize_pipe {pipe}" in pto
-    assert "pto.tpush_to_aiv" in pto
-    assert "pto.tpop_from_aic" in pto
-    assert "pto.tfree_from_aic" in pto
-    if dir_mask == 3:
-        assert "pto.tpush_to_aic" in pto
-        assert "pto.tpop_from_aiv" in pto
-        assert "pto.tfree_from_aiv" in pto
-    else:
-        assert "pto.tpush_to_aic" not in pto
-        assert "pto.tpop_from_aiv" not in pto
+    assert pto.count("pto.aic_initialize_pipe") == len(plan.fifos)
+    assert pto.count("pto.aiv_initialize_pipe") == len(plan.fifos)
+    assert "dir_mask = 3" not in pto
+    for index, fifo in enumerate(plan.fifos):
+        pipe_id = fifo.pipe_id if fifo.pipe_id >= 0 else index
+        dir_mask = 1 if fifo.direction.value == "cube_to_vector" else 2
+        pipe = (
+            f"{{id = {pipe_id}, dir_mask = {dir_mask}, "
+            f"slot_size = {fifo.slot_bytes}, slot_num = {fifo.slot_count}}}"
+        )
+        assert f"pto.aic_initialize_pipe {pipe}" in pto
+        assert f"pto.aiv_initialize_pipe {pipe}" in pto
+    c2v_ids = {
+        fifo.pipe_id if fifo.pipe_id >= 0 else index
+        for index, fifo in enumerate(plan.fifos)
+        if fifo.direction.value == "cube_to_vector"
+    }
+    v2c_ids = {
+        fifo.pipe_id if fifo.pipe_id >= 0 else index
+        for index, fifo in enumerate(plan.fifos)
+        if fifo.direction.value == "vector_to_cube"
+    }
+    assert _pto_pipe_ids(pto, "tpush_to_aiv") == c2v_ids
+    assert _pto_pipe_ids(pto, "tpop_from_aic") == c2v_ids
+    assert _pto_pipe_ids(pto, "tfree_from_aic") == c2v_ids
+    assert _pto_pipe_ids(pto, "tpush_to_aic") == v2c_ids
+    assert _pto_pipe_ids(pto, "tpop_from_aiv") == v2c_ids
+    assert _pto_pipe_ids(pto, "tfree_from_aiv") == v2c_ids
     if name == "mixed_c2v":
         assert "pto.tcolexpandadd" in pto
         assert "pto.tadd" not in pto
+
+
+def test_mixed_source_public_pipe_ids_fail_closed_when_collapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _, _ = _compile_mixed_source(
+        "mixed_dense_swiglu_collapsed",
+        _DenseSwiGlu(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+        ),
+        tmp_path,
+        monkeypatch,
+    )
+    parser_diagnostics = importlib.import_module("pypto.language.parser.diagnostics")
+    pl = importlib.import_module("pypto.language")
+    collapsed = source.replace("pipe_id=1, bundle=0", "pipe_id=0, bundle=0", 1)
+    assert collapsed != source
+    with pytest.raises(
+        parser_diagnostics.ParserSyntaxError,
+        match="Duplicate pl.cross_core_pipe pipe_id=0",
+    ):
+        pl.parse_program(collapsed)
 
 
 @pytest.mark.parametrize(
