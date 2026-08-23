@@ -366,7 +366,7 @@ def _validate_vector_phase_links(
             (op, argument)
             for op in phase.ops
             for argument, tensor in enumerate(lowered.operation(op).inputs)
-            if tensor not in producer_by_tensor
+            if producer_by_tensor.get(tensor) not in step_set
         }
         actual_boundary_uses = {
             (use.op, use.arg)
@@ -1268,6 +1268,8 @@ def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifo
         required={
             "tensor",
             "direction",
+            "spatial_m",
+            "spatial_n",
             "valid_rows",
             "valid_cols",
             "slot_bytes",
@@ -1283,6 +1285,8 @@ def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifo
         direction=_enum(
             MixedTransferDirection, item.get("direction"), f"{field}.direction"
         ),
+        spatial_m=_bool(item.get("spatial_m"), f"{field}.spatial_m"),
+        spatial_n=_bool(item.get("spatial_n"), f"{field}.spatial_n"),
         valid_rows=_positive_int(item.get("valid_rows"), f"{field}.valid_rows"),
         valid_cols=_positive_int(item.get("valid_cols"), f"{field}.valid_cols"),
         slot_bytes=_positive_int(item.get("slot_bytes"), f"{field}.slot_bytes"),
@@ -1417,6 +1421,7 @@ def _validate_mixed_contract(  # noqa: PLR0913
         range(len(plan.stages))
     ):
         raise ScheduleContractError(f"{field}.stages are not densely indexed")
+    vector_stage_peaks: list[int] = []
     for index, (stage, topology) in enumerate(
         zip(plan.stages, plan.topology_stages, strict=True)
     ):
@@ -1456,17 +1461,29 @@ def _validate_mixed_contract(  # noqa: PLR0913
                     step_order=stage.ops,
                     field=f"{stage_field}.vector_stream",
                 )
-            if stage.vector_stream.kind is not plan.vector_stage_kind:
+            vector_stage_peaks.append(stage.vector_stream.full_peak_ub_bytes)
+            if stage.vector_stream.full_peak_ub_bytes > plan.vector_stage_peak_ub_bytes:
                 raise ScheduleContractError(
-                    f"{stage_field} stream kind differs from the mixed plan"
+                    f"{stage_field} Vec peak exceeds the mixed plan"
                 )
-            if (
-                stage.vector_stream.full_peak_ub_bytes
-                != plan.vector_stage_peak_ub_bytes
-            ):
-                raise ScheduleContractError(
-                    f"{stage_field} Vec peak differs from the mixed plan"
-                )
+    if (
+        not vector_stage_peaks
+        or max(vector_stage_peaks) != plan.vector_stage_peak_ub_bytes
+    ):
+        raise ScheduleContractError(
+            f"{field} aggregate Vec peak differs from its vector stages"
+        )
+    if (
+        next(
+            stage.vector_stream.kind
+            for stage in plan.stages
+            if stage.vector_stream is not None
+        )
+        is not plan.vector_stage_kind
+    ):
+        raise ScheduleContractError(
+            f"{field} first vector-stage kind differs from its compatibility summary"
+        )
     flattened_ops = tuple(op for stage in plan.stages for op in stage.ops)
     if (
         len(flattened_ops) != len(set(flattened_ops))
@@ -1527,10 +1544,15 @@ def _validate_mixed_contract(  # noqa: PLR0913
             else MixedTransferDirection.VECTOR_TO_CUBE
         )
         tensor = lowered.tensor(fifo.tensor)
+        spatial_frame = plan.pipeline_axis is MixedPipelineAxis.SPATIAL_REGION
+        expected_rows = plan.m_partition.big if fifo.spatial_m else tensor.height
+        expected_cols = plan.n_partition.big if fifo.spatial_n else tensor.width
         if (
             fifo.tensor != transfer.tensor
             or fifo.direction is not direction
             or fifo.pipe_id != index
+            or (spatial_frame and fifo.valid_rows != expected_rows)
+            or (spatial_frame and fifo.valid_cols != expected_cols)
             or fifo.slot_bytes != fifo.valid_rows * fifo.valid_cols * tensor.byte_width
             or fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count
         ):
@@ -1553,16 +1575,17 @@ def _validate_mixed_contract(  # noqa: PLR0913
         ):
             raise ScheduleContractError(f"{field} has an inconsistent one-way protocol")
     elif plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
-        producer_bundle = tuple(
-            index
-            for index, fifo in enumerate(plan.fifos)
-            if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
-        )
-        reply_bundle = tuple(
-            index
-            for index, fifo in enumerate(plan.fifos)
-            if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
-        )
+        producer_bundle = plan.protocol_producer_bundle
+        reply_bundle = plan.protocol_reply_bundle
+        if (
+            not producer_bundle
+            or len(reply_bundle) != 1
+            or sorted((*producer_bundle, *reply_bundle))
+            != list(range(len(plan.transfers)))
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent single-round-trip protocol"
+            )
         producer_stages = tuple(
             plan.transfers[index].producer_stage for index in producer_bundle
         )
@@ -1572,10 +1595,6 @@ def _validate_mixed_contract(  # noqa: PLR0913
         sink_stages = {plan.transfers[index].consumer_stage for index in reply_bundle}
         if (
             plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
-            or not producer_bundle
-            or len(reply_bundle) != 1
-            or plan.protocol_producer_bundle != producer_bundle
-            or plan.protocol_reply_bundle != reply_bundle
             or plan.protocol_producer_stages != producer_stages
             or peer_stages != {plan.protocol_peer_stage}
             or plan.transfers[reply_bundle[0]].producer_stage
@@ -1587,6 +1606,45 @@ def _validate_mixed_contract(  # noqa: PLR0913
         ):
             raise ScheduleContractError(
                 f"{field} has an inconsistent single-round-trip protocol"
+            )
+    elif plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL:
+        expected_engines = (
+            MixedEngine.CUBE,
+            MixedEngine.VECTOR,
+            MixedEngine.CUBE,
+            MixedEngine.VECTOR,
+        )
+        if (
+            plan.mode is not MixedPipelineMode.MULTI_ROUND_TRIP_SEQUENTIAL
+            or plan.algorithm is not MixedAlgorithm.GENERIC
+            or tuple(stage.engine for stage in plan.stages) != expected_engines
+            or len(plan.transfers) != 3
+            or any(
+                transfer.producer_stage != index or transfer.consumer_stage != index + 1
+                for index, transfer in enumerate(plan.transfers)
+            )
+            or tuple(fifo.direction for fifo in plan.fifos)
+            != (
+                MixedTransferDirection.CUBE_TO_VECTOR,
+                MixedTransferDirection.VECTOR_TO_CUBE,
+                MixedTransferDirection.CUBE_TO_VECTOR,
+            )
+            or plan.max_alternations != 3
+            or plan.protocol_producer_stages
+            or plan.protocol_peer_stage is not None
+            or plan.protocol_sink_stage is not None
+            or plan.protocol_producer_bundle
+            or plan.protocol_reply_bundle
+            or plan.protocol_skew_compatible
+            or any(fifo.bundle != -1 for fifo in plan.fifos)
+            or plan.pipeline_stages != 1
+            or plan.requested_skew_depth != 0
+            or plan.model_overlap_granted
+            or plan.overlap_implementable
+            or plan.pipeline_fill_absorbed
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent sequential multi-round-trip protocol"
             )
     else:
         raise ScheduleContractError(f"{field} source-ready protocol is unsupported")

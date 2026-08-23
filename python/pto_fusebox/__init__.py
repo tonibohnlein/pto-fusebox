@@ -1,5 +1,7 @@
 """Public Torch/FX capture and PTO-Fusebox scheduling API."""
 
+from .bindings import InputBindingError, bind_emitted_inputs
+
 from .cube_sweep import (
     CUBE_PLAN_SWEEP_SCHEMA,
     CubeCandidateGrid,
@@ -51,6 +53,7 @@ __all__ = [
     "EmittedPyPTOSource",
     "GraphPattern",
     "GraphPatternBinding",
+    "InputBindingError",
     "KernelKind",
     "KernelStep",
     "NormalizedGraph",
@@ -65,6 +68,7 @@ __all__ = [
     "SourceEmissionError",
     "TargetProfile",
     "can_emit_region",
+    "bind_emitted_inputs",
     "export_and_normalize",
     "emit_pypto_region",
     "enumerate_cube_plans",

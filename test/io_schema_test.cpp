@@ -48,6 +48,7 @@ int main() {
     "fast_memory_capacity": 1073741824,
     "cube_freq_hz": 1850000000.0,
     "vec_dma_align_bytes": 64,
+    "require_source_codegen": true,
     "allow_model_ahead_split_k": false,
     "allow_model_ahead_multi_reduction_stream": false
   })JSON";
@@ -64,6 +65,7 @@ int main() {
                 P4SubstitutionValue::RunningMax);
   check("mixed compatibility parses", !problem.ops[1].mixed_emit_compatible);
   check("DMA alignment parses", problem.vec_dma_align_bytes == 64);
+  check("external source policy parses", problem.require_source_codegen);
   check("model-ahead split-K parses", !problem.allow_model_ahead_split_k);
   check("model-ahead P4 parses", !problem.allow_model_ahead_multi_reduction_stream);
 
@@ -71,7 +73,7 @@ int main() {
   Solution empty(problem, dag, {});
   const auto solution = nlohmann::json::parse(solution_json(empty));
   check("solution schema is published",
-        solution.at("schema_version") == "pto_fusebox.solution.v5");
+        solution.at("schema_version") == "pto_fusebox.solution.v6");
   check("solution steps are nested", solution.at("steps").is_array());
   check("empty solution has no steps", solution.at("steps").empty());
 

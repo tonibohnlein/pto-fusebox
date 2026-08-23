@@ -8,6 +8,11 @@ latency. AutoFuse then consumes a solver-owned schedule plan for the selected co
 A homogeneous subgraph is either pure cube (`MatMul`) or pure vector (pointwise/reduction). This is
 the production default. `Problem::fuse_cube_vector` enables the same base model's mixed-plan path at
 runtime; the research `Ascend910BMixed` convenience opts in unconditionally.
+`Problem::require_source_codegen` keeps analytic admission unchanged by default,
+but when set requires the selected mixed tile to satisfy the standalone PyPTO
+source topology, stage-kind, and physical FIFO capacity contract. It is
+separate from `require_buildable_mixed`, which targets the historical
+in-compiler AutoFuse lowering.
 
 ---
 
@@ -313,7 +318,7 @@ candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
 
-Each sweep entry embeds an ordinary `pto_fusebox.solution.v5` payload. The
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v6` payload. The
 Python `enumerate_cube_plans()` adapter validates the envelope and
 `region_for_cube_candidate()` binds one candidate back to the exact lowered
 problem for source replay. The adapter never re-plans or changes a cost.

@@ -353,6 +353,7 @@ def test_qk_softmax_pv_is_one_generic_cube_vector_cube_region() -> None:
     ]
     assert lowered["fuse_cube_vector"] is True
     assert lowered["require_buildable_mixed"] is False
+    assert lowered["require_source_codegen"] is False
     assert lowered["allow_model_ahead_split_k"] is True
     assert lowered["allow_model_ahead_multi_reduction_stream"] is True
     assert lowered["allow_model_ahead_mixed_multi_roundtrip"] is True
@@ -967,7 +968,9 @@ def test_same_dtype_to_copy_operator_is_not_a_metadata_alias() -> None:
     assert extract_solver_regions(graph) == []
 
 
-def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) -> None:
+def test_solve_graph_declines_nonemittable_source_retry_and_preserves_mappings(
+    tmp_path: Path,
+) -> None:
     class Pointwise(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return torch.exp(value)
@@ -980,8 +983,12 @@ def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) 
         "assert sys.argv[1:3]==['--threads','2']\n"
         "problem=json.loads(pathlib.Path(sys.argv[3]).read_text())\n"
         "assert problem['schema_version']=='pto_fusebox.problem.v1'\n"
+        "attempt=pathlib.Path(__file__).with_suffix('.attempt')\n"
+        "count=int(attempt.read_text()) if attempt.exists() else 0\n"
+        "assert problem['require_source_codegen'] is (count == 1)\n"
+        "attempt.write_text(str(count + 1))\n"
         "pathlib.Path(sys.argv[4]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v5','steps':[{"
+        "'schema_version':'pto_fusebox.solution.v6','steps':[{"
         "'kind':'vector','ops':[0],'op_order':[0],"
         "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
         "'latency_cycles':1.0,'plan':{}}]}))\n",
@@ -989,13 +996,24 @@ def test_solve_graph_uses_versioned_json_and_preserves_mappings(tmp_path: Path) 
     )
     solver.chmod(solver.stat().st_mode | stat.S_IXUSR)
 
-    result = solve_graph(graph, solver_binary=solver, solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=solver,
+        solver_workers=2,
+        require_source_codegen=True,
+    )
 
-    assert result.successful
+    assert not result.successful
+    assert result.regions[0].status == "infeasible"
+    assert result.regions[0].diagnostics[-1] == (
+        "source-constrained solver result is not PyPTO-emittable"
+    )
     assert result.regions[0].solver_op_to_graph == (graph.ops[0].id,)
     problem = result.regions[0].problem
     assert problem is not None
     assert problem["frontend_mapping"]["region_id"] == "region0000"
+    assert problem["require_source_codegen"] is True
+    assert solver.with_suffix(".attempt").read_text(encoding="utf-8") == "2"
 
 
 def test_solve_graph_rejects_nonpositive_worker_count(tmp_path: Path) -> None:
@@ -1019,7 +1037,7 @@ def test_invalid_solver_subgraph_is_not_reported_as_solved(tmp_path: Path) -> No
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
-        "'schema_version':'pto_fusebox.solution.v5','steps':[{"
+        "'schema_version':'pto_fusebox.solution.v6','steps':[{"
         "'kind':'vector','ops':[999],'op_order':[999],"
         "'launch':{'tile':[16,4,1],'parts':[1,1],'split':1,'cores':1},"
         "'latency_cycles':1.0,'plan':{}}]}))\n",

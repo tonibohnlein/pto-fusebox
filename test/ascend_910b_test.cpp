@@ -1307,9 +1307,10 @@ static void test_mixed_pipeline_stages() {
         CHECK("MIXSTAGE: c->v->c one-trip grid cannot absorb fill",
               !fr.pipeline_fill_absorbed);
     }
-    // c->v->c->v : a depth-3 multi-round-trip. Analytic mode keeps the topology
-    // but prices it sequentially; buildable mode rejects it until whole-FIFO
-    // skew exists.
+    // c->v->c->v : a depth-3 multi-round-trip. Standalone source mode carries
+    // the complete FIFO contract, while the analytic model prices the ordered
+    // stage sum without granting skew overlap. Historical in-compiler
+    // buildable mode remains a clean cut.
     {
         Problem p;
         p.tensors = {sq, sq, sq, sq, sq, sq, sq};
@@ -1324,15 +1325,47 @@ static void test_mixed_pipeline_stages() {
             const CostResult cost = analytic->best_cost();
             const MixedSchedulePlan plan =
                 analytic->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split);
-            CHECK("MIXSTAGE: depth-3 plan is finite but receives no skew overlap",
+        CHECK("MIXSTAGE: pointwise depth-3 plan is source-ready and receives no skew overlap",
                   cost.feasible && plan.feasible &&
                       plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
-                      !plan.emit_compatible && !plan.model_overlap_granted &&
+                      plan.protocol ==
+                          MixedCrossCoreProtocol::MultiRoundTripSequential &&
+                      plan.emit_compatible && plan.source_codegen_ready &&
+                      plan.stages.size() == 4 && plan.fifos.size() == 3 &&
+                      plan.fifos[0].spatial_m && !plan.fifos[0].spatial_n &&
+                      plan.fifos[1].spatial_m && !plan.fifos[1].spatial_n &&
+                      plan.fifos[2].spatial_m && plan.fifos[2].spatial_n &&
+                      !plan.model_overlap_granted &&
                       !plan.overlap_implementable && !cost.pipeline_fill_absorbed);
         }
         p.allow_model_ahead_mixed_multi_roundtrip = false;
         CHECK("MIXSTAGE: buildable c->v->c->v is cut until whole-FIFO skew",
               !Ascend910BMixed::create(p, dag, {0, 1, 2, 3}));
+    }
+    // Same four engines, but the first vector reply is the second matmul RHS.
+    // Numeric square extents cannot reveal this distinction, so the explicit
+    // axis bits are the regression oracle.
+    {
+        Problem p;
+        p.tensors = {sq, sq, sq, sq, sq, sq, sq};
+        p.ops = {{OT::MatMul, {0, 1}, {2}}, {OT::Pointwise, {2}, {3}},
+                 {OT::MatMul, {4, 3}, {5}}, {OT::Pointwise, {5}, {6}}};
+        p.fast_memory_capacity = 1 << 26;
+        set_910b(p);
+        DAG dag = DAG::build(p);
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+        CHECK("MIXSTAGE: RHS-reply c->v->c->v builds", (bool)mixed);
+        if (mixed) {
+            const CostResult cost = mixed->best_cost();
+            const MixedSchedulePlan plan =
+                mixed->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+            CHECK("MIXSTAGE: RHS reply propagates N rather than M through both first pipes",
+                  cost.feasible && plan.feasible && plan.source_codegen_ready &&
+                      plan.fifos.size() == 3 &&
+                      !plan.fifos[0].spatial_m && plan.fifos[0].spatial_n &&
+                      !plan.fifos[1].spatial_m && plan.fifos[1].spatial_n &&
+                      plan.fifos[2].spatial_m && plan.fifos[2].spatial_n);
+        }
     }
 }
 
@@ -1474,8 +1507,8 @@ static void test_mixed_schedule_plan() {
   }
 
   // Standalone analytic planning admits the symmetric one-way V->C topology.
-  // Its selected plan must expose a directional FIFO descriptor for the
-  // source backend instead of relying on the historical C->V-only emitter.
+  // Its selected plan exposes a directional FIFO descriptor analytically, but
+  // the standalone source backend still fails closed on this orientation.
   {
     Problem p;
     p.tensors = {sq, sq, sq, sq};
@@ -1489,9 +1522,9 @@ static void test_mixed_schedule_plan() {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
           cost.config, {}, {}, cost.parallel_split);
-      CHECK("MIXPLAN: analytic V->C exports its complete source-backend contract",
+      CHECK("MIXPLAN: analytic V->C retains its descriptor without claiming source readiness",
             cost.feasible && plan.feasible && plan.emit_compatible &&
-                plan.source_codegen_ready && plan.split_k == 1 &&
+                !plan.source_codegen_ready && plan.split_k == 1 &&
                 plan.work_units == plan.spatial_tiles &&
                 plan.loop.work_items == plan.spatial_tiles &&
                 plan.protocol == MixedCrossCoreProtocol::OneWay &&
@@ -1525,8 +1558,8 @@ static void test_mixed_schedule_plan() {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
           cost.config, {}, {}, cost.parallel_split);
-      CHECK("MIXPLAN: RHS V->C exports K-by-N stage and FIFO geometry",
-            cost.feasible && plan.feasible && plan.source_codegen_ready &&
+      CHECK("MIXPLAN: analytic RHS V->C exports K-by-N stage and FIFO geometry",
+            cost.feasible && plan.feasible && !plan.source_codegen_ready &&
                 plan.split_k == 1 && plan.stages.size() == 2 &&
                 plan.stages[0].valid_rows * plan.vector_lanes == 64 &&
                 plan.stages[0].valid_cols == plan.n_partition.big &&
@@ -2182,9 +2215,9 @@ static void test_mixed_flash_attention() {
         const CostResult partial_cost = softmax_pv->best_cost();
         const MixedSchedulePlan partial_plan = softmax_pv->mixed_schedule_plan(
             partial_cost.config, {}, {}, partial_cost.parallel_split);
-        CHECK("MIXFA: softmax->PV exports its V->C source-backend contract",
+        CHECK("MIXFA: softmax->PV remains analytic until one-way V->C source exists",
               partial_cost.feasible && partial_plan.feasible &&
-                  partial_plan.source_codegen_ready &&
+                  !partial_plan.source_codegen_ready &&
                   partial_plan.split_k == 1 &&
                   partial_plan.protocol == MixedCrossCoreProtocol::OneWay &&
                   partial_plan.stages.size() == 2 &&
@@ -2202,9 +2235,11 @@ static void test_mixed_flash_attention() {
                   partial_plan.fifos[0].valid_cols == S);
     }
 
-    // Full attention-shaped C->V->C->V is retained only in analytic mode. The
-    // current cross-core pass cannot skew all three FIFO crossings together, so
-    // the mixed plan is explicitly sequential rather than receiving a max.
+    // Full attention-shaped C->V->C->V is classified as the generic sequential
+    // source protocol. This particular production-width shape remains
+    // infeasible because one unified output grid cannot also express its
+    // required key-chunk loop; smaller capacity-fitting static instances are
+    // source-ready and covered by the cross-layer tests.
     p.allow_model_ahead_multi_reduction_stream = true;
     auto full = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4, 5, 6});
     CHECK("MIXFA: full C->V->C->V topology is representable in analytic mode", (bool)full);

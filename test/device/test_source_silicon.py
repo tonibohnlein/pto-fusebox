@@ -21,9 +21,15 @@ from pathlib import Path
 import pytest
 import torch
 from examples.torch_frontend.pr2335_vector import LayerNorm, RmsNorm, Silu, Softmax
+from examples.torch_frontend.static_mixed import (
+    StaticAttentionCore,
+    StaticAttentionResidual,
+    StaticDenseSwiGlu,
+)
 from torch import nn
 
 from pto_fusebox import (
+    bind_emitted_inputs,
     can_emit_region,
     emit_pypto_region,
     export_and_normalize,
@@ -98,34 +104,6 @@ class C2VEpilogue(nn.Module):
         return torch.mm(value, weight) + bias
 
 
-class AttentionCore(nn.Module):
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        scores = torch.mm(query, key.t())
-        probabilities = torch.softmax(scores, dim=-1)
-        return torch.mm(probabilities, value)
-
-
-class DenseSwiGlu(nn.Module):
-    def forward(
-        self,
-        value: torch.Tensor,
-        gate_weight: torch.Tensor,
-        up_weight: torch.Tensor,
-        down_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        gate = torch.mm(value, gate_weight, out_dtype=torch.float32)
-        up = torch.mm(value, up_weight, out_dtype=torch.float32)
-        activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
-            torch.bfloat16
-        )
-        return torch.mm(activation, down_weight, out_dtype=torch.float32)
-
-
 def _generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
@@ -155,6 +133,22 @@ def _random_bf16_args(*shapes: tuple[int, int], scale: float = 0.25) -> ArgsFact
         )
 
     return make
+
+
+def _static_dense_swiglu() -> StaticDenseSwiGlu:
+    module = StaticDenseSwiGlu(hidden_size=64, intermediate_size=128)
+    generator = _generator(0)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.copy_(
+                torch.randn(
+                    parameter.shape,
+                    generator=generator,
+                    dtype=torch.float32,
+                ).to(torch.bfloat16)
+                * 0.25
+            )
+    return module
 
 
 def _rms_args(seed: int) -> tuple[torch.Tensor, ...]:
@@ -293,7 +287,7 @@ MIXED_CASES = (
     SiliconCase(
         "mixed_qk_softmax_pv_96x64x128",
         "mixed",
-        AttentionCore(),
+        StaticAttentionCore(),
         _random_args((96, 64), (64, 64), (64, 128), scale=0.1),
         rtol=1.0e-4,
         atol=1.0e-4,
@@ -301,10 +295,24 @@ MIXED_CASES = (
     SiliconCase(
         "mixed_dense_swiglu_128x64x128x64",
         "mixed",
-        DenseSwiGlu(),
-        _random_bf16_args((128, 64), (64, 128), (64, 128), (128, 64)),
+        _static_dense_swiglu(),
+        _random_bf16_args((128, 64)),
         rtol=2.0e-2,
         atol=2.0e-2,
+    ),
+    SiliconCase(
+        "mixed_qk_softmax_pv_residual_96x64x128",
+        "mixed",
+        StaticAttentionResidual(),
+        _random_args(
+            (96, 64),
+            (64, 64),
+            (64, 128),
+            (96, 128),
+            scale=0.1,
+        ),
+        rtol=1.0e-4,
+        atol=1.0e-4,
     ),
 )
 
@@ -325,6 +333,7 @@ def _device_id() -> int:
     raw = os.environ.get("PTO_FUSEBOX_DEVICE_ID")
     if raw is None:
         pytest.fail("PTO_FUSEBOX_DEVICE_ID must name one physical device")
+    assert raw is not None
     return int(raw)
 
 
@@ -376,6 +385,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         graph,
         solver_binary=_solver(),
         solver_workers=int(os.environ.get("PTO_FUSEBOX_SOLVER_WORKERS", "2")),
+        require_source_codegen=True,
     )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
@@ -384,6 +394,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, (CubeKernelPlan, MixedKernelPlan, VectorKernelPlan))
     emitted = emit_pypto_region(graph, region, program_name=case.name)
+    assert emitted.kind is not None
     assert emitted.kind.value == case.kind
     assert "auto_fuse" not in emitted.source
     assert "auto_tile" not in emitted.source
@@ -402,14 +413,15 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     compiled = None
     for seed in range(seed_count):
         args = case.make_args(seed)
+        runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():
             expected = case.module(*args)
         output = torch.full_like(expected, torch.nan)
         if compiled is None:
-            compiled = runtime.run(program, *args, output, config=config)
+            compiled = runtime.run(program, *runtime_args, output, config=config)
             _assert_static_artifact(compiled, case, plan.work_units)
         else:
-            compiled(*args, output, config=config)
+            compiled(*runtime_args, output, config=config)
 
         assert torch.isfinite(output).all(), (
             f"{case.name} seed {seed} left invalid output"

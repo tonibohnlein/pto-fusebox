@@ -8,7 +8,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -73,12 +73,16 @@ def solve_graph(
     target: str | TargetProfile = "ascend910b",
     solver_binary: str | os.PathLike[str] | None = None,
     solver_workers: int | None = None,
+    require_source_codegen: bool = False,
 ) -> SolveResult:
     """Partition, lower, and solve every supported region in ``graph``.
 
     This function never builds PTO-Fusebox. A solver executable must already
     exist or be supplied explicitly, keeping compilation and graph capture as
-    separate, reproducible steps.
+    separate, reproducible steps. Set ``require_source_codegen`` when the
+    selected schedule will be rendered as standalone PyPTO DSL. The analytic
+    winner is retained when it is already source-ready; otherwise the region is
+    solved again with the stricter source-realization constraint.
     """
 
     if solver_workers is not None and solver_workers <= 0:
@@ -93,7 +97,8 @@ def solve_graph(
     declined_by_region: dict[str, RegionSolveResult] = {}
     for region in regions:
         try:
-            lowered_by_region[region.id] = region.lower(graph, profile)
+            lowered = region.lower(graph, profile)
+            lowered_by_region[region.id] = lowered
         except ValueError as error:
             declined_by_region[region.id] = RegionSolveResult(
                 region=region,
@@ -105,17 +110,43 @@ def solve_graph(
                 diagnostics=(*region.diagnostics, str(error)),
             )
     executable = _resolve_solver_binary(solver_binary) if lowered_by_region else None
-    region_results = [
-        declined_by_region[region.id]
-        if region.id in declined_by_region
-        else _solve_region(
+    region_results: list[RegionSolveResult] = []
+    for region in regions:
+        if region.id in declined_by_region:
+            region_results.append(declined_by_region[region.id])
+            continue
+        lowered = lowered_by_region[region.id]
+        solved = _solve_region(
             executable,
             region,
-            lowered_by_region[region.id],
+            lowered,
             solver_workers=solver_workers,
         )
-        for region in regions
-    ]
+        if require_source_codegen and solved.status == "solved":
+            # The standalone source backend is intentionally a refinement of
+            # analytic planning.  Do not perturb an already-realizable winner:
+            # retry only when the selected analytic schedule cannot be emitted.
+            from .source import can_emit_region
+
+            if not can_emit_region(graph, solved):
+                problem = dict(lowered.problem)
+                problem["require_source_codegen"] = True
+                solved = _solve_region(
+                    executable,
+                    region,
+                    replace(lowered, problem=problem),
+                    solver_workers=solver_workers,
+                )
+                if solved.status == "solved" and not can_emit_region(graph, solved):
+                    solved = replace(
+                        solved,
+                        status="infeasible",
+                        diagnostics=(
+                            *solved.diagnostics,
+                            "source-constrained solver result is not PyPTO-emittable",
+                        ),
+                    )
+        region_results.append(solved)
     return SolveResult(
         graph=graph,
         target=profile.name,

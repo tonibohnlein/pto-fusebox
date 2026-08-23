@@ -458,6 +458,8 @@ static const char* mixed_cross_core_protocol_name(MixedCrossCoreProtocol protoco
       return "one_way";
     case MixedCrossCoreProtocol::SingleRoundTripBundle:
       return "single_round_trip_bundle";
+    case MixedCrossCoreProtocol::MultiRoundTripSequential:
+      return "multi_round_trip_sequential";
   }
   return "unknown";
 }
@@ -928,6 +930,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("require_buildable_mixed")) {
       p.require_buildable_mixed = j["require_buildable_mixed"].get<bool>();
     }
+    if (j.contains("require_source_codegen")) {
+      p.require_source_codegen = j["require_source_codegen"].get<bool>();
+    }
     if (j.contains("allow_model_ahead_split_k")) {
       p.allow_model_ahead_split_k = j["allow_model_ahead_split_k"].get<bool>();
     }
@@ -973,14 +978,14 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v5";
+    j["schema_version"] = "pto_fusebox.solution.v6";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
             throw std::logic_error(
-                "solution.v5 cannot serialize cross-kernel fast-memory retention");
+                "solution.v6 cannot serialize cross-kernel fast-memory retention");
         }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
@@ -1196,6 +1201,8 @@ std::string solution_json(const Solution& sol) {
       for (const auto& fifo : mixed_plan.fifos) {
         fifos.push_back({{"tensor", fifo.tensor},
                          {"direction", mixed_transfer_direction_name(fifo.direction)},
+                         {"spatial_m", fifo.spatial_m},
+                         {"spatial_n", fifo.spatial_n},
                          {"valid_rows", fifo.valid_rows},
                          {"valid_cols", fifo.valid_cols},
                          {"slot_bytes", fifo.slot_bytes},

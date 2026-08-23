@@ -1043,6 +1043,31 @@ MixedCrossCoreProtocolTopology ClassifyMixedCrossCoreProtocol(const MixedSchedul
     return protocol;
   }
 
+  // PyPTO preserves a hand-ordered loop with more than one round trip by
+  // demoting it to an ordinary sequential loop.  Admit the first external
+  // source contract only for one linear C->V->C->V chain: each crossing joins
+  // adjacent stages and no bundled branch can make FIFO ownership ambiguous.
+  const bool linear_cvcv =
+      topology.stages.size() == 4 && topology.transfers.size() == 3 &&
+      topology.stages[0].engine == MixedEngine::Cube &&
+      topology.stages[1].engine == MixedEngine::Vector &&
+      topology.stages[2].engine == MixedEngine::Cube &&
+      topology.stages[3].engine == MixedEngine::Vector;
+  if (linear_cvcv) {
+    bool ordered = true;
+    for (size_t index = 0; index < topology.transfers.size(); ++index) {
+      const MixedTransferTopology& transfer = topology.transfers[index];
+      ordered &= transfer.producer_stage == index &&
+                 transfer.consumer_stage == index + 1 &&
+                 transfer.producer_engine == topology.stages[index].engine &&
+                 transfer.consumer_engine == topology.stages[index + 1].engine;
+    }
+    if (ordered) {
+      protocol.kind = MixedCrossCoreProtocol::MultiRoundTripSequential;
+      return protocol;
+    }
+  }
+
   // SkewCrossCorePipeline admits one ordered producer bundle followed by one
   // reverse-direction reply. Find the unique peer stage around which all
   // cross-engine transfers have that shape. Adjacent same-engine operations
@@ -1115,6 +1140,59 @@ std::pair<int64_t, int64_t> MixedTensorRegion(const Tensor& tensor,
   const int64_t rows = spatial_m ? m_partition.big : tensor.height;
   const int64_t cols = spatial_n ? n_partition.big : tensor.width;
   return {rows, cols};
+}
+
+std::pair<bool, bool> MixedTransferSpatialAxes(
+    const Problem& prob, const MixedScheduleTopology& topology,
+    const MixedTransferTopology& transfer) {
+  auto matmul_operand_axes = [&](const MixedTransferTopology& candidate) {
+    const MixedStageTopology& consumer =
+        topology.stages[candidate.consumer_stage];
+    for (size_t op_index : consumer.ops) {
+      const Op& op = prob.ops[op_index];
+      if (op.type != OpType::MatMul) continue;
+      for (size_t operand = 0; operand < op.inputs.size(); ++operand) {
+        if (op.inputs[operand] == candidate.tensor) {
+          return operand == 0 ? std::make_pair(true, false)
+                              : std::make_pair(false, true);
+        }
+      }
+    }
+    return std::make_pair(false, false);
+  };
+  if (transfer.producer_engine == MixedEngine::Vector) {
+    // A vector reply consumed as a matmul LHS follows output M and keeps K
+    // whole; a RHS follows output N and keeps K whole.
+    return matmul_operand_axes(transfer);
+  }
+
+  // A cube result entering a row reduction keeps its reduced width whole.
+  // Otherwise the consumer is an elementwise vector stage and both result axes
+  // follow the unified output grid.
+  const MixedStageTopology& consumer = topology.stages[transfer.consumer_stage];
+  for (size_t op_index : consumer.ops) {
+    const Op& op = prob.ops[op_index];
+    if (op.type != OpType::Reduction || op.inputs.empty() ||
+        op.inputs.front() != transfer.tensor) {
+      continue;
+    }
+    const Tensor& input = prob.tensors[op.inputs.front()];
+    const Tensor& output = prob.tensors[op.output()];
+    if (input.height == output.height && output.width == 1) return {true, false};
+    if (input.width == output.width && output.height == 1) return {false, true};
+    return {false, false};
+  }
+  // A pointwise vector stage preserves the axes required by its V->C reply.
+  // Propagate that role back to the incoming C->V frame so both sides replay
+  // one coherent region even when the reply is the sink matmul RHS.
+  for (const MixedTransferTopology& outgoing : topology.transfers) {
+    if (outgoing.producer_stage == transfer.consumer_stage &&
+        outgoing.producer_engine == MixedEngine::Vector &&
+        outgoing.consumer_engine == MixedEngine::Cube) {
+      return matmul_operand_axes(outgoing);
+    }
+  }
+  return {true, true};
 }
 
 }  // namespace
@@ -2536,6 +2614,9 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     }
     topology->protocol = ClassifyMixedCrossCoreProtocol(*topology);
     const bool one_way_chain = topology->protocol.kind == MixedCrossCoreProtocol::OneWay;
+    const bool sequential_multi_round_trip =
+        topology->protocol.kind ==
+        MixedCrossCoreProtocol::MultiRoundTripSequential;
     if (one_way_chain) {
       topology->mode = MixedPipelineMode::OneWay;
     } else if (topology->protocol.kind == MixedCrossCoreProtocol::SingleRoundTripBundle) {
@@ -2551,7 +2632,8 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // bundled topology classified for exact algorithms, but do not grant it a
     // generic stage cost until every producer stage and lifetime is modeled.
     topology->emit_compatible =
-        topology->output_engines_uniform && (one_way_chain || generic_single_round_trip);
+        topology->output_engines_uniform &&
+        (one_way_chain || generic_single_round_trip || sequential_multi_round_trip);
 
     // Recognize the first production round-trip algorithm without teaching the
     // generic mixed stage model any source-language names:
@@ -5062,16 +5144,27 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
     return false;
   }
 
-  // Analytic mixed studies may still use the homogeneous streaming planner.
-  // Production v0 is stricter: its AIV body materializes one explicit row-half
-  // and ExpandMixedKernel reserves eight full crossing slots in Vec memory.
-  // Admitting a merely streamable full tile here would price an algorithm the
-  // emitter does not build and can overflow MemoryReuse after expansion.
+  // Source readiness is an additional constraint on the analytic surface, not
+  // an alternate feasibility model.  Requiring source code must never admit a
+  // group that ordinary analytic planning rejected: doing so can change the
+  // partition search by introducing cheaper partial mixed cuts.  Preserve the
+  // historical compiler path, whose exact lowering contract predates the
+  // standalone source backend.
   if (!prob_->require_buildable_mixed) {
     const TileConfig vector_cfg = vector_to_cube_stage_config(cfg);
-    return vector_stream(vector_cfg, retained_from_prev, retain_these).chunk > 0;
+    if (vector_stream(vector_cfg, retained_from_prev, retain_these).chunk <= 0) {
+      return false;
+    }
+    if (!prob_->require_source_codegen) {
+      return true;
+    }
   }
-  if (!mixed_topology_ || !mixed_topology_->compiler_emit_compatible) {
+  if (!mixed_topology_) return false;
+  const bool exact_protocol =
+      prob_->require_buildable_mixed
+          ? mixed_topology_->compiler_emit_compatible
+          : mixed_topology_->emit_compatible;
+  if (!exact_protocol) {
     return false;
   }
   const bool one_way =
@@ -5083,7 +5176,28 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
       mixed_topology_->protocol.producer_bundle_transfers.size() == 1 &&
       mixed_topology_->protocol.reply_bundle_transfers.size() == 1 &&
       mixed_topology_->transfers.size() == 2;
-  if (!one_way && !single_round_trip) return false;
+  const bool sequential_multi_round_trip =
+      mixed_topology_->algorithm == MixedAlgorithmKind::Generic &&
+      mixed_topology_->protocol.kind ==
+          MixedCrossCoreProtocol::MultiRoundTripSequential &&
+      mixed_topology_->stages.size() == 4 &&
+      mixed_topology_->transfers.size() == 3;
+  if (!one_way && !single_round_trip && !sequential_multi_round_trip) return false;
+  if (prob_->require_source_codegen) {
+    const bool standalone_one_way =
+        one_way && mixed_topology_->stages.size() == 2 &&
+        mixed_topology_->stages[0].engine == MixedEngine::Cube &&
+        mixed_topology_->stages[1].engine == MixedEngine::Vector;
+    const bool standalone_single_round_trip =
+        single_round_trip && mixed_topology_->stages.size() == 3 &&
+        mixed_topology_->stages[0].engine == MixedEngine::Cube &&
+        mixed_topology_->stages[1].engine == MixedEngine::Vector &&
+        mixed_topology_->stages[2].engine == MixedEngine::Cube;
+    if (!standalone_one_way && !standalone_single_round_trip &&
+        !sequential_multi_round_trip) {
+      return false;
+    }
+  }
   const int64_t parts_m = cfg.parts_m > 0
                               ? cfg.parts_m
                               : std::max<int64_t>(1, out_H_ / std::max<int64_t>(1, cfg.h));
@@ -5096,35 +5210,68 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
     return false;
   }
 
-  const size_t vector_input_tensor =
-      single_round_trip
-          ? mixed_topology_->transfers[
-                mixed_topology_->protocol.producer_bundle_transfers.front()].tensor
-          : mixed_topology_->transfers.front().tensor;
-  const auto [vector_rows, vector_cols] = MixedTensorRegion(
-      prob_->tensors[vector_input_tensor], mp, np, /*spatial_m=*/true,
-      /*spatial_n=*/!single_round_trip);
-  if (vector_rows != mp.big || vector_cols <= 0) return false;
-
-  TileConfig lane_cfg = cfg;
-  lane_cfg.h = vector_rows / 2;
-  lane_cfg.w = vector_cols;
-  lane_cfg.parts_m = 0;
-  lane_cfg.parts_n = 0;
-  lane_cfg.split_k = 1;
-  const VectorStreamPlan lane_plan =
-      vector_stream_plan(lane_cfg, retained_from_prev, retain_these);
-  if (!lane_plan.feasible || lane_plan.kind != VectorStreamKind::Materialized) {
-    return false;
+  int64_t vector_stage_peak = 0;
+  for (size_t stage_index = 0; stage_index < mixed_topology_->stages.size();
+       ++stage_index) {
+    const MixedStageTopology& stage = mixed_topology_->stages[stage_index];
+    if (stage.engine != MixedEngine::Vector) continue;
+    int64_t rows = mp.big;
+    int64_t cols = np.big;
+    for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
+      if (transfer.producer_stage != stage_index) continue;
+      bool spatial_m = true;
+      bool spatial_n = !single_round_trip;
+      if (transfer.producer_engine == MixedEngine::Vector ||
+          sequential_multi_round_trip) {
+        std::tie(spatial_m, spatial_n) = MixedTransferSpatialAxes(
+            *prob_, *mixed_topology_, transfer);
+      } else if (single_round_trip) {
+        std::tie(spatial_m, spatial_n) = MixedTransferSpatialAxes(
+            *prob_, *mixed_topology_, transfer);
+      }
+      std::tie(rows, cols) = MixedTensorRegion(
+          prob_->tensors[transfer.tensor], mp, np, spatial_m, spatial_n);
+      break;
+    }
+    if (rows < 2 || rows % 2 != 0 || cols <= 0) return false;
+    TileConfig lane_cfg = cfg;
+    lane_cfg.h = rows / 2;
+    lane_cfg.w = cols;
+    lane_cfg.parts_m = 0;
+    lane_cfg.parts_n = 0;
+    lane_cfg.split_k = 1;
+    auto stage_cost = Ascend910BCost::create(
+        *prob_, *dag_, stage.ops, /*allow_mixed=*/false);
+    if (!stage_cost) return false;
+    const VectorStreamPlan lane_plan = stage_cost->vector_stream_plan(lane_cfg);
+    if (!lane_plan.feasible ||
+        (lane_plan.kind != VectorStreamKind::Materialized &&
+         lane_plan.kind != VectorStreamKind::Pointwise)) {
+      return false;
+    }
+    if (prob_->require_source_codegen && single_round_trip &&
+        stage_index == 1 &&
+        lane_plan.kind != VectorStreamKind::Materialized) {
+      return false;
+    }
+    vector_stage_peak =
+        std::max(vector_stage_peak, lane_plan.full_peak_ub_bytes);
   }
+  if (vector_stage_peak <= 0) return false;
 
   const int64_t slot_count = one_way ? 8 : 4;
   int64_t c2v_fifo_reserved = 0;
   int64_t v2c_fifo_reserved = 0;
   for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
+    bool spatial_m = true;
+    bool spatial_n = !single_round_trip;
+    if (transfer.producer_engine == MixedEngine::Vector ||
+        sequential_multi_round_trip || single_round_trip) {
+      std::tie(spatial_m, spatial_n) = MixedTransferSpatialAxes(
+          *prob_, *mixed_topology_, transfer);
+    }
     const auto [rows, cols] = MixedTensorRegion(
-        prob_->tensors[transfer.tensor], mp, np, /*spatial_m=*/true,
-        /*spatial_n=*/!single_round_trip);
+        prob_->tensors[transfer.tensor], mp, np, spatial_m, spatial_n);
     if (rows <= 0 || cols <= 0) return false;
     const int64_t reserved =
         rows * cols * dtype_bytes(prob_->tensors[transfer.tensor].dtype) * slot_count;
@@ -5135,7 +5282,7 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
     }
   }
   return c2v_fifo_reserved <= prob_->vec_capacity &&
-         lane_plan.full_peak_ub_bytes <= prob_->vec_capacity - c2v_fifo_reserved &&
+         vector_stage_peak <= prob_->vec_capacity - c2v_fifo_reserved &&
          v2c_fifo_reserved <= prob_->l1_capacity &&
          cube_peak_l1_bytes <= prob_->l1_capacity - v2c_fifo_reserved;
 }
@@ -6470,8 +6617,10 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     auto add_fifo = [&](size_t tensor, MixedTransferDirection direction, int pipe_id, int bundle) {
       const Tensor& value = prob_->tensors[tensor];
       const int64_t slot_bytes = plan.m_partition.big * cfg.k * dtype_bytes(value.dtype);
-      plan.fifos.push_back({tensor, direction, plan.m_partition.big, cfg.k, slot_bytes, kFifoSlots,
-                            slot_bytes * kFifoSlots, pipe_id, bundle});
+      plan.fifos.push_back({tensor, direction, /*spatial_m=*/true,
+                            /*spatial_n=*/false, plan.m_partition.big, cfg.k,
+                            slot_bytes, kFifoSlots, slot_bytes * kFifoSlots,
+                            pipe_id, bundle});
     };
     add_fifo(mlp.gate_tensor, MixedTransferDirection::CubeToVector,
              /*pipe_id=*/0, /*bundle=*/0);
@@ -6544,12 +6693,16 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   const bool single_round_trip =
       plan.algorithm == MixedAlgorithmKind::Generic &&
       plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle;
+  const bool sequential_multi_round_trip =
+      plan.algorithm == MixedAlgorithmKind::Generic &&
+      plan.protocol == MixedCrossCoreProtocol::MultiRoundTripSequential;
   const bool vector_to_cube = vector_to_cube_operand >= 0;
   plan.loop.pipeline_stages = single_round_trip ? 3 : 1;
   plan.loop.requested_skew_depth = single_round_trip ? 2 : 0;
 
   plan.overlap_implementable =
-      plan.emit_compatible && plan.loop.min_trips_per_group >= 2 &&
+      plan.emit_compatible && !sequential_multi_round_trip &&
+      plan.loop.min_trips_per_group >= 2 &&
       plan.loop.min_trips_per_group == plan.loop.max_trips_per_group;
   plan.model_overlap_granted = plan.overlap_implementable;
   plan.pipeline_fill_absorbed =
@@ -6567,7 +6720,10 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
       const Tensor& tensor = prob_->tensors[transfer.tensor];
       bool spatial_m = true;
       bool spatial_n = !single_round_trip;
-      if (vector_to_cube) {
+      if (sequential_multi_round_trip) {
+        std::tie(spatial_m, spatial_n) = MixedTransferSpatialAxes(
+            *prob_, *mixed_topology_, transfer);
+      } else if (vector_to_cube) {
         spatial_m = vector_to_cube_operand == 0;
         spatial_n = vector_to_cube_operand == 1;
       } else if (!single_round_trip &&
@@ -6604,7 +6760,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
            transfer.producer_engine == MixedEngine::Cube
                ? MixedTransferDirection::CubeToVector
                : MixedTransferDirection::VectorToCube,
-           rows, cols, slot_bytes, slot_count, slot_bytes * slot_count,
+           spatial_m, spatial_n, rows, cols, slot_bytes, slot_count,
+           slot_bytes * slot_count,
            static_cast<int>(transfer_index), bundle});
     }
   }
@@ -6670,6 +6827,9 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
     const bool single_round_trip =
         plan.algorithm == MixedAlgorithmKind::Generic &&
         plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle;
+    const bool sequential_multi_round_trip =
+        plan.algorithm == MixedAlgorithmKind::Generic &&
+        plan.protocol == MixedCrossCoreProtocol::MultiRoundTripSequential;
     const int vector_to_cube_operand = vector_to_cube_operand_index();
     const bool vector_to_cube = vector_to_cube_operand >= 0;
     std::vector<int64_t> pernode_k;
@@ -6696,17 +6856,25 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         stage.ops = topology_stage.ops;
 
         size_t region_tensor = prob_->ops[topology_stage.ops.back()].output();
-        for (const MixedTransferTopology& transfer :
-             mixed_topology_->transfers) {
-          if (transfer.producer_stage == stage_index) {
-            region_tensor = transfer.tensor;
+        size_t outgoing_transfer = std::numeric_limits<size_t>::max();
+        for (size_t transfer_index = 0;
+             transfer_index < mixed_topology_->transfers.size(); ++transfer_index) {
+          if (mixed_topology_->transfers[transfer_index].producer_stage ==
+              stage_index) {
+            region_tensor = mixed_topology_->transfers[transfer_index].tensor;
+            outgoing_transfer = transfer_index;
             break;
           }
         }
         bool spatial_m = true;
         bool spatial_n =
             !single_round_trip || stage_index + 1 == mixed_topology_->stages.size();
-        if (vector_to_cube && stage_index == 0) {
+        if (sequential_multi_round_trip &&
+            outgoing_transfer != std::numeric_limits<size_t>::max()) {
+          std::tie(spatial_m, spatial_n) = MixedTransferSpatialAxes(
+              *prob_, *mixed_topology_,
+              mixed_topology_->transfers[outgoing_transfer]);
+        } else if (vector_to_cube && stage_index == 0) {
           spatial_m = vector_to_cube_operand == 0;
           spatial_n = vector_to_cube_operand == 1;
         } else if (!single_round_trip && stage_index > 0) {
@@ -6750,16 +6918,83 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
           lane_cfg.parts_m = 0;
           lane_cfg.parts_n = 0;
           lane_cfg.split_k = 1;
-          stage.vector_stream =
-              vector_stream_plan(lane_cfg, retained_from_prev, retain_these);
-          plan.vector_stage_kind = stage.vector_stream.kind;
+          // Serialize each vector component from its own homogeneous model.
+          // Cross-engine inputs are therefore real stage boundaries in its
+          // lifetime contract instead of being hidden by the enclosing mixed
+          // subgraph's global producer map.
+          auto stage_cost = Ascend910BCost::create(
+              *prob_, *dag_, topology_stage.ops, /*allow_mixed=*/false);
+          if (!stage_cost) {
+            plan.feasible = false;
+            return plan;
+          }
+          stage.vector_stream = stage_cost->vector_stream_plan(lane_cfg);
+          if (plan.vector_stage_peak_ub_bytes == 0) {
+            // v6 keeps this compatibility summary as the first vector-stage
+            // kind; each stage carries its authoritative stream descriptor.
+            plan.vector_stage_kind = stage.vector_stream.kind;
+          }
           plan.vector_stage_peak_ub_bytes =
-              stage.vector_stream.full_peak_ub_bytes;
+              std::max(plan.vector_stage_peak_ub_bytes,
+                       stage.vector_stream.full_peak_ub_bytes);
         }
         plan.stages.push_back(std::move(stage));
       }
+      auto in_memory_vector = [](const MixedStagePlan& stage) {
+        return stage.engine == MixedEngine::Vector &&
+               (stage.vector_stream.kind == VectorStreamKind::Materialized ||
+                stage.vector_stream.kind == VectorStreamKind::Pointwise);
+      };
+      bool standalone_source_protocol = false;
+      if (plan.protocol == MixedCrossCoreProtocol::OneWay &&
+          plan.stages.size() == 2) {
+        standalone_source_protocol =
+            plan.stages[0].engine == MixedEngine::Cube &&
+            plan.stages[0].ops.size() == 1 &&
+            in_memory_vector(plan.stages[1]);
+      } else if (plan.protocol ==
+                     MixedCrossCoreProtocol::SingleRoundTripBundle &&
+                 plan.stages.size() == 3) {
+        standalone_source_protocol =
+            plan.stages[0].engine == MixedEngine::Cube &&
+            plan.stages[0].ops.size() == 1 &&
+            plan.stages[1].engine == MixedEngine::Vector &&
+            plan.stages[1].vector_stream.kind ==
+                VectorStreamKind::Materialized &&
+            plan.stages[2].engine == MixedEngine::Cube &&
+            plan.stages[2].ops.size() == 1;
+      } else if (plan.protocol ==
+                     MixedCrossCoreProtocol::MultiRoundTripSequential &&
+                 plan.stages.size() == 4) {
+        standalone_source_protocol =
+            plan.stages[0].engine == MixedEngine::Cube &&
+            plan.stages[0].ops.size() == 1 &&
+            in_memory_vector(plan.stages[1]) &&
+            plan.stages[2].engine == MixedEngine::Cube &&
+            plan.stages[2].ops.size() == 1 &&
+            in_memory_vector(plan.stages[3]);
+      }
+      int64_t c2v_fifo_reserved = 0;
+      int64_t v2c_fifo_reserved = 0;
+      for (const MixedFifoPlan& fifo : plan.fifos) {
+        if (fifo.direction == MixedTransferDirection::CubeToVector) {
+          c2v_fifo_reserved += fifo.reserved_bytes;
+        } else {
+          v2c_fifo_reserved += fifo.reserved_bytes;
+        }
+      }
+      const bool source_capacity_ready =
+          c2v_fifo_reserved <= prob_->vec_capacity &&
+          plan.vector_stage_peak_ub_bytes <=
+              prob_->vec_capacity - c2v_fifo_reserved &&
+          v2c_fifo_reserved <= prob_->l1_capacity &&
+          plan.cube_stage_peak_l1_bytes <=
+              prob_->l1_capacity - v2c_fifo_reserved;
       plan.source_codegen_ready =
-          plan.emit_compatible && plan.split_k == 1 &&
+          plan.emit_compatible &&
+          (prob_->require_buildable_mixed ||
+           (standalone_source_protocol && source_capacity_ready)) &&
+          plan.split_k == 1 &&
           plan.stages.size() == mixed_topology_->stages.size() &&
           plan.fifos.size() == mixed_topology_->transfers.size() &&
           !has_unrepresentable_vector_to_cube_multi_role() &&
@@ -7414,7 +7649,9 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
     // per-group schedule itself has successor items.
     const bool overlap_ok = schedule.overlap_implementable && !two_stage;
     double wall = 0.0;
-    if (!schedule.emit_compatible) {
+    if (!schedule.emit_compatible ||
+        schedule.protocol ==
+            MixedCrossCoreProtocol::MultiRoundTripSequential) {
       // Multi-message/multi-round-trip FIFO patterns are demoted by the
       // current PyPTO pass. Price the serial stage sum, never the skewed max.
       // pto-isa shows real serialization can be 1.0-1.34x worse because it also

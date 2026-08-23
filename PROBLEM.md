@@ -65,13 +65,13 @@ The problem is specified in a JSON file containing the graph topology and hardwa
 
 ### Output
 
-The current executable writes the versioned `pto_fusebox.solution.v5` schema.
+The current executable writes the versioned `pto_fusebox.solution.v6` schema.
 Each selected kernel is one nested step so its common launch contract and
 family-specific plan cannot drift through misaligned parallel arrays.
 
 ```json
 {
-  "schema_version": "pto_fusebox.solution.v5",
+  "schema_version": "pto_fusebox.solution.v6",
   "steps": [
     {
       "kind": "cube",
@@ -108,7 +108,7 @@ current typed problem/solution and PyPTO source-generation contract.
 
 This section preserves five legacy competition-format examples to demonstrate
 the core trade-offs. Their parallel-array output snippets are conceptual; the
-current executable serializes the equivalent choices as nested `solution.v5`
+current executable serializes the equivalent choices as nested `solution.v6`
 steps described above.
 
 ### Example 1: Baseline

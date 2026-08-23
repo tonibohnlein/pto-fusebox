@@ -77,6 +77,7 @@ class MixedCrossCoreProtocol(Enum):
     UNSUPPORTED = "unsupported"
     ONE_WAY = "one_way"
     SINGLE_ROUND_TRIP_BUNDLE = "single_round_trip_bundle"
+    MULTI_ROUND_TRIP_SEQUENTIAL = "multi_round_trip_sequential"
 
 
 class MixedPipelineAxis(Enum):
@@ -486,6 +487,8 @@ class MixedTransferPlan:
 class MixedFifoPlan:
     tensor: int
     direction: MixedTransferDirection
+    spatial_m: bool
+    spatial_n: bool
     valid_rows: int
     valid_cols: int
     slot_bytes: int

@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
-  with its modeled cost and ordinary `solution.v5` replay payload; and
+  with its modeled cost and ordinary `solution.v6` replay payload; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:
@@ -93,6 +93,7 @@ result = solve_graph(
     graph,
     solver_binary="build/mlsys_mixed",
     solver_workers=2,
+    require_source_codegen=True,
 )
 region = result.regions[0]
 assert can_emit_region(graph, region)
@@ -122,17 +123,33 @@ split only its unique sink: upstream matmuls replay their serial K plans inside
 each share, while resident inputs and retained panels stay local to that share.
 Multiple split accumulators and multiple-output split groups fail closed.
 Mixed source initially covers generic one-way `C -> V`, generic
-`C -> V -> C`, and dense `C,C -> V -> C` plans through PyPTO's public
-`pl.split(UP_DOWN)` mechanism. One-way `V -> C`, deeper round trips, and mixed
-multi-step composition still fail closed.
+`C -> V -> C`, dense `C,C -> V -> C`, and one linear `C -> V -> C -> V`
+plan through PyPTO's public `pl.split(UP_DOWN)` mechanism. The four-stage form
+is deliberately sequential: its three FIFO crossings replay in topological
+order and receive no skew-overlap credit. One-way `V -> C`, branched/deeper
+round trips, and mixed multi-step composition still fail closed.
 Mixed source readiness combines the serialized cube-stage L1 peak with V2C
 ring reservations and the vector-stage Vec peak with C2V ring reservations.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
 
+The public explicit-pipe contract is silicon-closed for the current one-way
+`C -> V`, generic `C -> V -> C`, and dense `C,C -> V -> C` source families.
+The new sequential `C -> V -> C -> V` source contract is host/integration
+tested and awaits focused silicon closure.
+An earlier reported residual in the generic attention case was retracted: the
+device harness passed `(query, key, value)` positionally to an emitted
+`(key, query, value)` ABI. Generated source now publishes its ordered normalized
+input value IDs, and the checked-in device harness binds tensors through those
+IDs. Dense SwiGLU transport is also closed; its strict Torch comparison can
+still differ on a few elements because the vector transcendental result is
+rounded to BF16 before the V2C reply. Generated and independently hand-written
+PyPTO sources are bit-identical for that case, so this is a numerical oracle
+caveat rather than a FIFO or source-emission defect.
+
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v5`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v6`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
@@ -147,7 +164,7 @@ shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
 Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
-cube spatial partitions, and mixed schedules outside the three admitted stage
+cube spatial partitions, and mixed schedules outside the admitted stage
 patterns remain explicitly outside source readiness.
 Single-sink split-K is source-ready through the model-selected
 `FirstPartialThenAtomic` or `AivZeroSeedThenAtomic` PyPTO mechanism.
@@ -164,10 +181,14 @@ python -m examples.torch_frontend.basic
 python -m examples.torch_frontend.deepseek_v4
 python -m examples.torch_frontend.qwen3
 python -m examples.torch_frontend.pr2335_vector
+python -m examples.torch_frontend.static_mixed
 ```
 
 Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`
-to also submit its supported regions to an existing solver build. The model
+to also submit its supported regions to an existing solver build. Add
+`--emit-source` with `--solver` to constrain selection to the external source
+contract and print the selected PyPTO DSL. Plain solver runs keep the broader
+analytic search surface. The model
 examples preserve the relevant tensor algebra from `pypto-lib`; their shapes
 and, where documented in the source, dtypes are reduced for practical local
 execution. Every example matmul still satisfies `[M,K] @ [K,N] -> [M,N]`, and

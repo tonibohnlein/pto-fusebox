@@ -7,7 +7,13 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import torch
-from pto_fusebox import export_and_normalize, extract_solver_regions, solve_graph
+from pto_fusebox import (
+    can_emit_region,
+    emit_pypto_region,
+    export_and_normalize,
+    extract_solver_regions,
+    solve_graph,
+)
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
@@ -30,7 +36,14 @@ def run_examples(examples: Mapping[str, Example]) -> None:
         default=2,
         help="solver search workers (default: 2)",
     )
+    parser.add_argument(
+        "--emit-source",
+        action="store_true",
+        help="print generated PyPTO DSL for every source-ready solved region",
+    )
     args = parser.parse_args()
+    if args.emit_source and args.solver is None:
+        parser.error("--emit-source requires --solver")
 
     selected = examples if args.case is None else {args.case: examples[args.case]}
     for name, (module, example_args) in selected.items():
@@ -58,6 +71,7 @@ def run_examples(examples: Mapping[str, Example]) -> None:
                 graph,
                 solver_binary=args.solver,
                 solver_workers=args.solver_workers,
+                require_source_codegen=args.emit_source,
             )
             op_by_id = graph.op_map()
             for region in result.regions:
@@ -77,3 +91,14 @@ def run_examples(examples: Mapping[str, Example]) -> None:
                     print(
                         f"    step {index}: {kinds}; tile={tile}; latency={latency:.1f}"
                     )
+                if args.emit_source:
+                    if not can_emit_region(graph, region):
+                        print("    PyPTO source: unavailable for the selected schedule")
+                    else:
+                        emitted = emit_pypto_region(
+                            graph,
+                            region,
+                            program_name=f"{name}_{region.region.id}",
+                        )
+                        print("    PyPTO source:")
+                        print(emitted.source, end="")

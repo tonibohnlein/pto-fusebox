@@ -13,7 +13,11 @@ from examples.torch_frontend.basic import build_examples
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
+from examples.torch_frontend.static_mixed import (
+    build_examples as build_static_mixed_examples,
+)
 from pto_fusebox import (
+    bind_emitted_inputs,
     KernelKind,
     ScheduleContractError,
     SourceEmissionError,
@@ -30,6 +34,7 @@ from pto_fusebox.schedule.schema import (
     MixedAlgorithm,
     MixedCrossCoreProtocol,
     MixedKernelPlan,
+    MixedPipelineMode,
     MixedTransferDirection,
     VectorKernelPlan,
     VectorReplayPhase,
@@ -52,15 +57,30 @@ def _solver() -> Path:
 def _solved(name: str):
     module, args = build_examples()[name]
     graph = export_and_normalize(module, args)
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     assert solved.regions_solved
     assert len(solved.regions) == 1
     return graph, solved.regions[0]
 
 
-def _solve_module(module: nn.Module, args: tuple[torch.Tensor, ...]):
+def _solve_module(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    *,
+    require_source_codegen: bool = True,
+):
     graph = export_and_normalize(module, args)
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=require_source_codegen,
+    )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     return graph, solved.regions[0]
@@ -95,6 +115,51 @@ class _DenseSwiGlu(nn.Module):
 class _V2COnly(nn.Module):
     def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.mm(torch.exp(value), weight)
+
+
+class _AttentionResidual(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        probabilities = torch.softmax(torch.mm(query, key.t()), dim=-1)
+        return torch.mm(probabilities, value) + residual
+
+
+class _RhsRoundTripPointwise(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        first_lhs: torch.Tensor,
+        first_rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        reply = torch.exp(torch.mm(first_lhs, first_rhs))
+        return torch.exp(torch.mm(lhs, reply))
+
+
+class _AttentionRowReduction(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        probabilities = torch.softmax(torch.mm(query, key.t()), dim=-1)
+        return torch.sum(torch.mm(probabilities, value), dim=-1, keepdim=True)
+
+
+class _ColumnReductionRhs(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        first_lhs: torch.Tensor,
+        first_rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        reply = torch.sum(torch.mm(first_lhs, first_rhs), dim=0, keepdim=True)
+        return torch.exp(torch.mm(lhs, reply))
 
 
 @cache
@@ -651,10 +716,11 @@ def test_schedule_contract_rejects_legacy_or_dropped_step_fields() -> None:
     _, result = _solved("softmax")
     assert result.solution is not None
 
-    legacy = dict(copy.deepcopy(result.solution))
-    legacy["schema_version"] = "pto_fusebox.solution.v3"
-    with pytest.raises(ScheduleContractError, match="solution schema"):
-        scheduled_region(replace(result, solution=legacy))
+    for schema in ("pto_fusebox.solution.v3", "pto_fusebox.solution.v5"):
+        legacy = dict(copy.deepcopy(result.solution))
+        legacy["schema_version"] = schema
+        with pytest.raises(ScheduleContractError, match="solution schema"):
+            scheduled_region(replace(result, solution=legacy))
 
     for field in ("sequential_tiles", "op_order"):
         incomplete = copy.deepcopy(result.solution)
@@ -959,6 +1025,7 @@ def test_source_readiness_rejects_transposed_matmul() -> None:
     graph, result = _solve_module(
         TransposedMatmul(),
         (torch.ones(64, 96), torch.ones(128, 96)),
+        require_source_codegen=False,
     )
 
     assert not can_emit_region(graph, result)
@@ -990,6 +1057,45 @@ def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     assert "pl.tensor.row_sum(" in source
     assert "pl.tensor.assemble(" in source
     assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+def test_emitted_abi_reorders_torch_inputs_by_normalized_value_id() -> None:
+    module, args = build_examples()["attention_core"]
+    graph, result = _solve_module(module, args)
+    emitted = emit_pypto_region(graph, result, program_name="attention_abi")
+
+    names = graph.value_map()
+    assert tuple(names[value_id].name for value_id in emitted.input_value_ids) == (
+        "key",
+        "query",
+        "value",
+    )
+    bound = bind_emitted_inputs(module, graph, emitted, args)
+    assert all(
+        actual is expected
+        for actual, expected in zip(bound, (args[1], args[0], args[2]), strict=True)
+    )
+
+
+def test_emitted_abi_binds_lifted_parameters_by_normalized_value_id() -> None:
+    module, args = build_static_mixed_examples()["pypto_lib_static_dense_swiglu"]
+    graph, result = _solve_module(module, args)
+    emitted = emit_pypto_region(graph, result, program_name="dense_swiglu_abi")
+    bound = bind_emitted_inputs(module, graph, emitted, args)
+
+    expected_by_target = {
+        "gate_weight": module.gate_weight,
+        "up_weight": module.up_weight,
+        "down_weight": module.down_weight,
+    }
+    values = graph.value_map()
+    for value_id, tensor in zip(emitted.input_value_ids, bound, strict=True):
+        value = values[value_id]
+        if value.role == "user_input":
+            assert tensor is args[0]
+        else:
+            assert value.target is not None
+            assert tensor is expected_by_target[value.target]
 
 
 def test_mixed_typed_contract_rejects_stale_fifo_geometry() -> None:
@@ -1126,14 +1232,128 @@ def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> N
     assert 'target_type=pl.BF16, mode="round"' in source
 
 
+def test_multi_round_trip_attention_epilogue_emits_one_ordered_generic_loop() -> None:
+    graph, result = _solve_module(
+        _AttentionResidual(),
+        (
+            torch.zeros(96, 64),
+            torch.zeros(64, 64),
+            torch.zeros(64, 128),
+            torch.zeros(96, 128),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.algorithm is MixedAlgorithm.GENERIC
+    assert step.plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL
+    assert step.plan.mode is MixedPipelineMode.MULTI_ROUND_TRIP_SEQUENTIAL
+    assert not step.plan.model_overlap_granted
+    assert not step.plan.overlap_implementable
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(graph, result, program_name="attention_residual").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert source.count("pl.cross_core_pipe(") == 3
+    assert source.count("direction=pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
+    assert source.count("direction=pl.CrossCoreDirection.VECTOR_TO_CUBE") == 1
+    assert "for mixed_trip, (output_iter,) in pl.range(" in source
+    assert "pl.pipeline(" not in source
+    assert source.count("pl.tensor.matmul(") == 2
+    assert "pl.tensor.row_max(" in source
+    assert "pl.tensor.row_sum(" in source
+    assert "pl.tensor.add(" in source
+    assert source.index("first_cube_acc_first") < source.index("vector_3")
+    assert source.index("vector_7") < source.index("second_cube_acc_first")
+    assert source.index("second_cube_acc_first") < source.index("vector_11")
+
+
+@pytest.mark.parametrize(
+    ("module", "args", "expected_axes"),
+    [
+        (
+            _RhsRoundTripPointwise(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 32),
+            ),
+            ((False, True), (False, True), (True, True)),
+        ),
+    ],
+)
+def test_multi_round_trip_replays_transfer_specific_axes(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    expected_axes: tuple[tuple[bool, bool], ...],
+) -> None:
+    graph, result = _solve_module(module, args)
+    step = scheduled_region(result).steps[0]
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert tuple((fifo.spatial_m, fifo.spatial_n) for fifo in step.plan.fifos) == (
+        expected_axes
+    )
+    assert can_emit_region(graph, result)
+    source = emit_pypto_region(graph, result, program_name="axis_replay").source
+    ast.parse(source)
+    assert source.count("pl.cross_core_pipe(") == 3
+
+
+def test_multi_round_trip_final_row_reduction_fails_closed() -> None:
+    module = _AttentionRowReduction()
+    args = (
+        torch.zeros(96, 64),
+        torch.zeros(64, 64),
+        torch.zeros(64, 128),
+    )
+    graph, analytic = _solve_module(module, args, require_source_codegen=False)
+    analytic_schedule = scheduled_region(analytic)
+    assert [step.kind for step in analytic_schedule.steps] == [
+        KernelKind.MIXED,
+        KernelKind.VECTOR,
+    ]
+    assert not can_emit_region(graph, analytic)
+
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert not solved.regions_solved
+    assert solved.regions[0].diagnostics[-1] == (
+        "source-constrained solver result is not PyPTO-emittable"
+    )
+
+
+def test_column_reduction_round_trip_stops_at_the_static_frontend_boundary() -> None:
+    graph = export_and_normalize(
+        _ColumnReductionRhs(),
+        (
+            torch.zeros(96, 1),
+            torch.zeros(64, 64),
+            torch.zeros(64, 32),
+        ),
+    )
+    assert any(
+        not op.supported
+        and op.opaque_reason
+        == "only last-axis reductions with keepdim=True are supported"
+        for op in graph.ops
+    )
+
+
 def test_source_backend_rejects_unimplemented_one_way_v2c() -> None:
     graph, result = _solve_module(
         _V2COnly(),
         (torch.zeros(32, 64), torch.zeros(64, 32)),
+        require_source_codegen=False,
     )
 
     assert not can_emit_region(graph, result)
-    with pytest.raises(SourceEmissionError, match="one-way C->V topology"):
+    with pytest.raises(SourceEmissionError, match="not source-codegen ready"):
         emit_pypto_region(graph, result)
 
 
@@ -1409,7 +1629,11 @@ def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return value.sum(dim=-1, keepdim=True).to(torch.int8)
 
-    graph, result = _solve_module(ReductionResultCast(), (torch.randn(16, 512),))
+    graph, result = _solve_module(
+        ReductionResultCast(),
+        (torch.randn(16, 512),),
+        require_source_codegen=False,
+    )
 
     assert result.status == "solved"
     assert not can_emit_region(graph, result)
@@ -1432,7 +1656,9 @@ def test_float_to_int8_is_analytic_but_not_source_ready() -> None:
         values.to(torch.float16).to(torch.int8),
         torch.tensor([[1, -1, 64, -64]], dtype=torch.int8),
     )
-    graph, result = _solve_module(FloatToInt8(), (values,))
+    graph, result = _solve_module(
+        FloatToInt8(), (values,), require_source_codegen=False
+    )
 
     assert result.status == "solved"
     assert result.problem is not None

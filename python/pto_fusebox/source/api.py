@@ -34,11 +34,19 @@ from .common import (
 
 @dataclass(frozen=True)
 class EmittedPyPTOSource:
-    """One deterministic PyPTO program and the ordered step kinds it implements."""
+    """One deterministic PyPTO program and its normalized region ABI.
+
+    ``input_value_ids`` is in the exact order used by the generated ``main``
+    signature.  Runtime and device harnesses must bind tensors through these
+    stable normalized value IDs instead of assuming that Torch positional
+    input order survives solver lowering.
+    """
 
     program_name: str
     region_id: str
     kinds: tuple[KernelKind, ...]
+    input_value_ids: tuple[str, ...]
+    output_value_ids: tuple[str, ...]
     source: str
 
     @property
@@ -96,6 +104,8 @@ def emit_pypto_region(
         program_name=chosen_name,
         region_id=lowered.region_id,
         kinds=tuple(step.kind for step in schedule.steps),
+        input_value_ids=tuple(region_interface.input_arguments),
+        output_value_ids=tuple(region_interface.output_arguments),
         source=source,
     )
 

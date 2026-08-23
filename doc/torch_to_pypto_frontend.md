@@ -32,11 +32,13 @@ one-reduction folded or spanning streams. Cube execution covers uniform
 non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
-Mixed source covers generic one-way `C -> V`, generic `C -> V -> C`, and dense
-`C,C -> V -> C` schedules. It replays the serialized stages and tensor DAG
-through one `pl.spmd` grid with `pl.split(UP_DOWN)`; PyPTO inserts the concrete
-push/pop/free pipeline. One-way `V -> C`, deeper round trips, and mixed
-multi-step composition fail closed. Welford/multi-stat vector plans,
+Mixed source covers generic one-way `C -> V`, generic `C -> V -> C`, dense
+`C,C -> V -> C`, and linear `C -> V -> C -> V` schedules. It replays the
+serialized stages and tensor DAG through one `pl.spmd` grid with
+`pl.split(UP_DOWN)`; PyPTO inserts the concrete push/pop/free pipeline. The
+four-stage form is an ordinary ordered loop and receives no skew-overlap
+credit. One-way `V -> C`, branched/deeper round trips, and mixed multi-step
+composition fail closed. Welford/multi-stat vector plans,
 singleton-column normalization, and nonuniform cube spatial partitions remain
 outside source readiness. A uniform cube DAG may split only its unique sink
 through the selected dependency-linked PyPTO task protocol.
@@ -60,6 +62,7 @@ result = solve_graph(
     target="ascend910b",
     solver_binary="build/mlsys_mixed",
     solver_workers=2,
+    require_source_codegen=True,
 )
 source = emit_pypto_region(graph, result.regions[0], program_name="FusedRegion")
 print(source.source)
@@ -78,7 +81,11 @@ The core entry points are:
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
 wrapper around `torch.export.export`. `solve_graph` never builds the solver. A
 caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
-`scheduled_region` rejects incomplete or internally inconsistent solution
+The optional `require_source_codegen=True` flag retains an analytically selected
+schedule when it is already source-ready. Otherwise it retries candidate
+selection under the external PyPTO source topology, stage-kind, and physical
+FIFO capacity contract. Leave it false for analytic studies. `scheduled_region`
+rejects incomplete or internally inconsistent solution
 arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
 typed emission context and run the same graph-aware renderer validation; the
 readiness query is not a weaker schedule-family approximation. The emitter
@@ -135,7 +142,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v5`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v6`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -176,7 +183,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v5`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v6`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -240,7 +247,8 @@ matmul contraction and output shape, require every `M`, `N`, and `K` to span at
 least one legal cube tile, and run every complete supported region through an
 existing `mlsys_mixed` build when one is available.
 
-The standalone target admits the complete analytic schedule surface. It does
+The standalone target admits the complete analytic schedule surface by
+default. It does
 not restrict partition search to schedules supported by the historical
 in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate tensor/tile
 PyPTO source from its own selected schedule. Split cube DAGs, multi-reduction
@@ -250,8 +258,14 @@ even when no source emitter path exists. Solution metadata records the stages,
 directional transfers, and protocol for every analytic mixed plan. Plans with
 a complete stage-local geometry, vector stream, cube-window, and FIFO contract
 also set their internal `source_codegen_ready=true` contract-completeness bit.
-The Python backend separately admits only generic `C -> V`, generic
-`C -> V -> C`, and dense `C,C -> V -> C` today. Broader analytic winners remain
+When the caller requests `require_source_codegen=True`, the analytic winner is
+checked first. Only a non-emittable winner triggers a second solve filtered by
+the external-source constraints, so source planning cannot perturb an already
+realizable analytic schedule and a cheaper analytic-only tile cannot hide a
+realizable source-ready alternative.
+The Python backend separately admits generic `C -> V`, generic
+`C -> V -> C`, dense `C,C -> V -> C`, and linear sequential
+`C -> V -> C -> V` today. Broader analytic winners remain
 valid research results but are not presented as source-emittable.
 `regions_solved` therefore reports analytic
 solver success separately from `whole_graph_codegen_ready`, which additionally
@@ -388,8 +402,28 @@ with every V2C consumer ring, and the vector-stage peak together with every
 C2V consumer ring; neither direction can hide its physical FIFO reservation.
 No attention or SwiGLU recognizer is involved in this transport contract.
 
+### Mixed-source silicon status
+
+The explicit cross-core descriptor path is silicon-closed for the current
+`C -> V`, generic `C -> V -> C`, and dense `C,C -> V -> C` families. The new
+sequential `C -> V -> C -> V` contract is host/integration tested but still
+requires focused silicon closure. Two
+numerical findings must remain distinct from that transport result:
+
+- The old generic-attention "lane-0 residual" is retracted. The campaign
+  harness bound Torch inputs by position even though the emitted signature had
+  deterministically reordered `query` and `key`. `EmittedPyPTOSource` now
+  carries `input_value_ids` in signature order, and device execution binds
+  tensors by normalized value ID.
+- Dense SwiGLU can differ from a direct Torch reference on a few elements after
+  its FP32 vector transcendental is rounded to a BF16 V2C payload. A one-way
+  discriminator sees the same one-BF16-ULP difference before transport, while
+  generated and hand-written PyPTO outputs are bit-identical. This is recorded
+  as an acceptance-oracle caveat, not a mixed FIFO defect; the tolerance is not
+  silently weakened.
+
 Analytic support is broader than the renderer. Welford/multi-stat P4 and mixed
-plans outside the three admitted stage patterns remain valid solver results but
+plans outside the admitted stage patterns remain valid solver results but
 are not source-ready. P4
 descriptors preserve named roles; each new recipe must version its carry and
 publication semantics. Future plan classes can add those contracts and
@@ -593,9 +627,9 @@ dynamic physical tile that reaches allocation or tile-flattening.
 3. Silicon-close single-sink split-K cube DAG source with resident operands,
    retained panels, and per-share outer-K windows; continue rejecting
    ambiguous multi-root merges.
-4. Silicon-close generic `C -> V`, generic `C -> V -> C`, and dense
-   `C,C -> V -> C` source replay while continuing to reject unsupported
-   multi-round-trip groups before emission.
+4. Silicon-close the new sequential `C -> V -> C -> V` source replay while
+   continuing to reject branched or deeper multi-round-trip groups before
+   emission.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
 6. Add Type-1 dynamic outer chunks with a static physical tile and runtime
@@ -630,6 +664,9 @@ and boundary semantics; model or function names must never affect planning.
    pointwise DAG and exercise generic `C -> V -> C` planning and source
    emission. The experiment must not use an attention recognizer and initially
    excludes paged or sparse cache addressing.
+   `examples/torch_frontend/static_mixed.py` now exercises this complete
+   capture -> solve -> source path together with the dense SwiGLU core from the
+   next target, using reduced but legal static dimensions.
 6. **DeepSeek MoE cut at data-dependent routing.** Schedule the dense
    normalization/router prefix and the bounded expert-local
    matmul/SwiGLU/matmul computation separately. Keep TopK, token-to-expert

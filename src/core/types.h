@@ -346,6 +346,13 @@ struct Problem {
     // keep it false while studying broader mixed schedules.
     bool require_buildable_mixed = false;
 
+    // External PyPTO-source policy. This leaves the analytic mixed model broad
+    // by default, but when requested it filters candidate tiles through the
+    // public-source topology, stage-kind, and physical FIFO capacity contract.
+    // It is separate from require_buildable_mixed, which targets the older
+    // in-compiler AutoFuse lowering surface.
+    bool require_source_codegen = false;
+
     // Analytic/research permission for a mixed topology whose FIFO contains
     // more than one round trip (for example full C->V->C->V attention). The
     // existing PyPTO skew pass demotes it to sequential, so the model prices a
@@ -1019,15 +1026,23 @@ enum class MixedPipelineMode {
     MultiRoundTripSequential
 };
 
-// Descriptor-level protocols shared by the mixed planner and PyPTO's
-// SkewCrossCorePipeline contract.  SingleRoundTripBundle is:
+// Descriptor-level protocols shared by the mixed planner and PyPTO's public
+// cross-core pipe contract. SingleRoundTripBundle is:
 //
 //   producer_bundle[0..N] -> one peer stage -> one reply -> sink stage
 //
-// where every producer bundle transfer has the same direction.  Adjacent
-// same-engine operations have already been collapsed into one stage; the two
-// physical AIV lanes are represented by MixedVectorSplit, not by two stages.
-enum class MixedCrossCoreProtocol { Unsupported, OneWay, SingleRoundTripBundle };
+// where every producer bundle transfer has the same direction.
+// MultiRoundTripSequential is initially the exact linear C->V->C->V chain; it
+// preserves all three FIFO descriptors but deliberately receives no skew
+// overlap. Adjacent same-engine operations have already been collapsed into
+// one stage; the two physical AIV lanes are represented by MixedVectorSplit,
+// not by two stages.
+enum class MixedCrossCoreProtocol {
+  Unsupported,
+  OneWay,
+  SingleRoundTripBundle,
+  MultiRoundTripSequential
+};
 
 enum class MixedPipelineAxis {
   SpatialRegion,
@@ -1129,6 +1144,11 @@ struct MixedScheduleTopology {
 struct MixedFifoPlan {
   size_t tensor = std::numeric_limits<size_t>::max();
   MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
+  // Bind a spatial-region FIFO frame to the unified output grid without
+  // inferring axis identity from equal numeric extents. Protocol-local loops
+  // such as dense feature chunks retain their own serialized frame geometry.
+  bool spatial_m = false;
+  bool spatial_n = false;
   int64_t valid_rows = 0;
   int64_t valid_cols = 0;
   int64_t slot_bytes = 0;

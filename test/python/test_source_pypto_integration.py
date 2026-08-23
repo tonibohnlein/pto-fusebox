@@ -168,6 +168,29 @@ class _AttentionCore(nn.Module):
         return torch.mm(probabilities, value)
 
 
+class _AttentionResidual(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        probabilities = torch.softmax(torch.mm(query, key.t()), dim=-1)
+        return torch.mm(probabilities, value) + residual
+
+
+class _RhsRoundTripPointwise(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        first_lhs: torch.Tensor,
+        first_rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        reply = torch.exp(torch.mm(first_lhs, first_rhs))
+        return torch.exp(torch.mm(lhs, reply))
+
+
 class _DenseSwiGlu(nn.Module):
     def forward(
         self,
@@ -228,7 +251,12 @@ def _compile_source(
 
     monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
     graph = export_and_normalize(module, args)
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     plan = scheduled_region(solved.regions[0]).steps[0].plan
@@ -265,7 +293,12 @@ def _compile_mixed_source(
 
     monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
     graph = export_and_normalize(module, args)
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     plan = scheduled_region(solved.regions[0]).steps[0].plan
@@ -321,6 +354,25 @@ def _compile_mixed_source(
                 torch.zeros(128, 64, dtype=torch.bfloat16),
             ),
         ),
+        (
+            "mixed_attention_residual",
+            _AttentionResidual(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 128),
+                torch.zeros(96, 128),
+            ),
+        ),
+        (
+            "mixed_rhs_round_trip_pointwise",
+            _RhsRoundTripPointwise(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 32),
+            ),
+        ),
     ],
 )
 def test_mixed_source_lowers_through_the_pypto_split_pipeline(
@@ -367,6 +419,37 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     if name == "mixed_c2v":
         assert "pto.tcolexpandadd" in pto
         assert "pto.tadd" not in pto
+
+
+def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, pto, plan = _compile_mixed_source(
+        "mixed_attention_residual_two_trips",
+        _AttentionResidual(),
+        (
+            torch.zeros(3072, 64),
+            torch.zeros(32, 64),
+            torch.zeros(32, 64),
+            torch.zeros(3072, 64),
+        ),
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert plan.protocol.value == "multi_round_trip_sequential"
+    assert plan.max_trips_per_group == 2
+    assert "pl.range(2, init_values=" in source
+    assert "pl.pipeline(" not in source
+    # PyPTO outlines one ordered loop per core kind.  It must not convert this
+    # unsupported second round trip into a skewed cross-core pipeline.
+    assert pto.count("scf.for") == 2
+    assert "scf.pipeline" not in pto
+    assert _pto_pipe_ids(pto, "tpush_to_aiv") == {0, 2}
+    assert _pto_pipe_ids(pto, "tpop_from_aic") == {0, 2}
+    assert _pto_pipe_ids(pto, "tpush_to_aic") == {1}
+    assert _pto_pipe_ids(pto, "tpop_from_aiv") == {1}
 
 
 def test_mixed_source_public_pipe_ids_fail_closed_when_collapsed(
@@ -546,7 +629,12 @@ def test_deep_k_split_protocol_lowers_as_two_dependency_linked_tasks(
         _DeepKMatmul(),
         (torch.zeros(128, 8192), torch.zeros(8192, 128)),
     )
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     region = solved.regions[0]
     assert region.solution is not None
     solution = copy.deepcopy(region.solution)
@@ -770,7 +858,12 @@ def test_cut_fp32_chain_compiles_as_two_dependency_linked_spmd_kernels(
         torch.zeros(96, 80),
     )
     graph = export_and_normalize(module, args)
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     region = solved.regions[0]
     schedule = scheduled_region(region)
     assert len(schedule.steps) == 2
@@ -807,7 +900,12 @@ def test_cut_fp32_fanout_compiles_with_two_outputs_and_one_shared_dependency(
     graph = export_and_normalize(
         _FanoutMatmul(), tuple(torch.zeros(64, 64) for _ in range(4))
     )
-    solved = solve_graph(graph, solver_binary=_solver(), solver_workers=2)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     region = solved.regions[0]
     schedule = scheduled_region(region)
     assert [step.solver_ops for step in schedule.steps] == [(0,), (1, 2)]

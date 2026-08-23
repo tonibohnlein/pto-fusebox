@@ -151,6 +151,10 @@ class Ascend910BTarget(TargetProfile):
             # not the narrower set of schedules replayable by the historical
             # in-compiler AutoFuse emitter.
             "require_buildable_mixed": False,
+            # Analytic solves remain broader by default. solve_graph can set
+            # this when its selected plan must be realizable by the external
+            # PyPTO DSL source backend.
+            "require_source_codegen": False,
             "allow_model_ahead_mixed_multi_roundtrip": True,
             "require_uniform_cube_dag_grid": False,
             "use_hierarchical_cube_cost": True,

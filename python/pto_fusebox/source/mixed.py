@@ -46,6 +46,8 @@ def emit_mixed(context: EmissionContext, program_name: str) -> str:
         return _emit_dense_swiglu(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
         return _emit_single_round_trip(context, program_name, plan)
+    if plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL:
+        return _emit_multi_round_trip_sequential(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
         return _emit_one_way_c2v(context, program_name, plan)
     raise SourceEmissionError(
@@ -175,7 +177,7 @@ def _emit_one_way_c2v(
             "mixed plan is not the supported one-way C->V topology"
         )
     vector_stage = plan.stages[1]
-    _require_materialized_vector_stage(vector_stage)
+    _require_in_memory_vector_stage(vector_stage)
     crossing = plan.transfers[0].tensor
     cube_op = plan.stages[0].ops[0]
     if context.lowered.operation(cube_op).outputs != (crossing,):
@@ -328,6 +330,148 @@ def _emit_single_round_trip(
         col_offset=col,
         local=local,
         prefix="sink",
+    )
+    writer.line(
+        4,
+        f"next_output = pl.tensor.assemble(output_iter, {result}, [{row}, {col}])",
+    )
+    writer.line(4, f"{output} = pl.yield_(next_output)")
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
+def _emit_multi_round_trip_sequential(
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+) -> str:
+    """Replay one linear C->V->C->V plan without claiming skew overlap."""
+
+    if (
+        plan.algorithm is not MixedAlgorithm.GENERIC
+        or plan.mode is not MixedPipelineMode.MULTI_ROUND_TRIP_SEQUENTIAL
+        or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
+        or plan.pipeline_stages != 1
+        or plan.requested_skew_depth != 0
+        or plan.model_overlap_granted
+        or plan.overlap_implementable
+        or len(plan.stages) != 4
+        or tuple(stage.engine for stage in plan.stages)
+        != (
+            MixedEngine.CUBE,
+            MixedEngine.VECTOR,
+            MixedEngine.CUBE,
+            MixedEngine.VECTOR,
+        )
+        or any(len(plan.stages[index].ops) != 1 for index in (0, 2))
+        or len(plan.transfers) != 3
+        or any(
+            transfer.producer_stage != index or transfer.consumer_stage != index + 1
+            for index, transfer in enumerate(plan.transfers)
+        )
+        or tuple(fifo.direction for fifo in plan.fifos)
+        != (
+            MixedTransferDirection.CUBE_TO_VECTOR,
+            MixedTransferDirection.VECTOR_TO_CUBE,
+            MixedTransferDirection.CUBE_TO_VECTOR,
+        )
+        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+    ):
+        raise SourceEmissionError(
+            "mixed plan is not the supported sequential C->V->C->V topology"
+        )
+    first_vector = plan.stages[1]
+    final_vector = plan.stages[3]
+    _require_in_memory_vector_stage(first_vector)
+    _require_in_memory_vector_stage(final_vector)
+    first_cube = plan.stages[0].ops[0]
+    second_cube = plan.stages[2].ops[0]
+    first_crossing, reply_crossing, final_crossing = (
+        transfer.tensor for transfer in plan.transfers
+    )
+    if (
+        context.lowered.operation(first_cube).outputs != (first_crossing,)
+        or reply_crossing not in context.lowered.operation(second_cube).inputs
+        or context.lowered.operation(second_cube).outputs != (final_crossing,)
+    ):
+        raise SourceEmissionError(
+            "sequential multi-round-trip transfers do not connect their stages"
+        )
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    if context.lowered.operation(final_vector.ops[-1]).outputs != (output_tensor,):
+        raise SourceEmissionError(
+            "sequential multi-round-trip vector tail does not produce the output"
+        )
+
+    writer = _mixed_header(context, program_name, plan)
+    output = context.interface.output_argument
+    writer.line(
+        3,
+        f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
+        f"init_values=({output},)):",
+    )
+    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    first_rows = plan.fifos[0].valid_rows
+    first_cols = plan.fifos[0].valid_cols
+    first_row = row if plan.fifos[0].spatial_m else "0"
+    first_col = col if plan.fifos[0].spatial_n else "0"
+    local = {
+        first_crossing: _emit_matmul_tile(
+            writer,
+            4,
+            context,
+            first_cube,
+            plan.stages[0].cube_window_k[0],
+            rows=first_rows,
+            cols=first_cols,
+            row_offset=first_row,
+            col_offset=first_col,
+            local={},
+            prefix="first_cube",
+        )
+    }
+    local[reply_crossing] = _emit_vector_stage(
+        writer,
+        4,
+        context,
+        first_vector,
+        local,
+        frame_rows=first_rows,
+        frame_cols=first_cols,
+        row_offset=first_row,
+        col_offset=first_col,
+        allow_external=True,
+    )
+    final_rows = plan.fifos[2].valid_rows
+    final_cols = plan.fifos[2].valid_cols
+    final_row = row if plan.fifos[2].spatial_m else "0"
+    final_col = col if plan.fifos[2].spatial_n else "0"
+    local[final_crossing] = _emit_matmul_tile(
+        writer,
+        4,
+        context,
+        second_cube,
+        plan.stages[2].cube_window_k[0],
+        rows=final_rows,
+        cols=final_cols,
+        row_offset=final_row,
+        col_offset=final_col,
+        local=local,
+        prefix="second_cube",
+    )
+    result = _emit_vector_stage(
+        writer,
+        4,
+        context,
+        final_vector,
+        local,
+        frame_rows=final_rows,
+        frame_cols=final_cols,
+        row_offset=final_row,
+        col_offset=final_col,
+        allow_external=True,
     )
     writer.line(
         4,
@@ -495,6 +639,18 @@ def _require_materialized_vector_stage(stage: MixedStagePlan) -> None:
         or stage.vector_stream.kind is not VectorStreamKind.MATERIALIZED
     ):
         raise SourceEmissionError("mixed vector stage is not materialized")
+
+
+def _require_in_memory_vector_stage(stage: MixedStagePlan) -> None:
+    if (
+        stage.engine is not MixedEngine.VECTOR
+        or stage.vector_stream is None
+        or stage.vector_stream.kind
+        not in {VectorStreamKind.MATERIALIZED, VectorStreamKind.POINTWISE}
+    ):
+        raise SourceEmissionError(
+            "mixed vector stage is not an in-memory materialized/pointwise replay"
+        )
 
 
 def _emit_spatial_coordinates(
