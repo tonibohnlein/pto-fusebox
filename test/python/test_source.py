@@ -33,6 +33,7 @@ from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
     MixedAlgorithm,
     MixedCrossCoreProtocol,
+    MixedEngine,
     MixedKernelPlan,
     MixedPipelineMode,
     MixedTransferDirection,
@@ -115,6 +116,23 @@ class _DenseSwiGlu(nn.Module):
 class _V2COnly(nn.Module):
     def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.mm(torch.exp(value), weight)
+
+
+class _V2COnlyRhs(nn.Module):
+    def forward(
+        self, lhs: torch.Tensor, value: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.mm(lhs, torch.exp(value + bias))
+
+
+class _V2CSharedLhs(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.exp(value), value)
+
+
+class _V2CSharedRhs(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(value, torch.exp(value))
 
 
 class _AttentionResidual(nn.Module):
@@ -1345,16 +1363,76 @@ def test_column_reduction_round_trip_stops_at_the_static_frontend_boundary() -> 
     )
 
 
-def test_source_backend_rejects_unimplemented_one_way_v2c() -> None:
-    graph, result = _solve_module(
-        _V2COnly(),
-        (torch.zeros(32, 64), torch.zeros(64, 32)),
-        require_source_codegen=False,
-    )
+@pytest.mark.parametrize(
+    ("module", "args", "expected_axes"),
+    [
+        (
+            _V2COnly(),
+            (torch.zeros(96, 64), torch.zeros(64, 128)),
+            (True, False),
+        ),
+        (
+            _V2COnlyRhs(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 128),
+                torch.zeros(1, 128),
+            ),
+            (False, True),
+        ),
+    ],
+)
+def test_one_way_v2c_emits_vector_producer_and_matmul_consumer(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    expected_axes: tuple[bool, bool],
+) -> None:
+    graph, result = _solve_module(module, args)
+    step = scheduled_region(result).steps[0]
 
-    assert not can_emit_region(graph, result)
-    with pytest.raises(SourceEmissionError, match="not source-codegen ready"):
-        emit_pypto_region(graph, result)
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+    assert tuple(stage.engine for stage in step.plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+    )
+    assert len(step.plan.fifos) == 1
+    fifo = step.plan.fifos[0]
+    assert fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    assert (fifo.spatial_m, fifo.spatial_n) == expected_axes
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(graph, result, program_name="v2c_one_way").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
+    assert source.count("pl.cross_core_pipe(") == 1
+    assert "direction=pl.CrossCoreDirection.VECTOR_TO_CUBE" in source
+    assert "pl.tensor.exp(" in source
+    if not expected_axes[0]:
+        assert "pl.tensor.col_expand_add(" in source
+    assert source.count("pl.tensor.matmul(") == 1
+    assert source.index("pl.tensor.exp(") < source.index("pl.tensor.matmul(")
+    assert source.count("pl.tensor.assemble(") == 1
+
+
+@pytest.mark.parametrize(
+    ("module", "external_role"),
+    [(_V2CSharedLhs(), "rhs"), (_V2CSharedRhs(), "lhs")],
+)
+def test_one_way_v2c_reloads_shared_boundary_operand_from_gm(
+    module: nn.Module,
+    external_role: str,
+) -> None:
+    graph, result = _solve_module(module, (torch.zeros(64, 64),))
+    step = scheduled_region(result).steps[0]
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert len(step.plan.fifos) == 1
+
+    source = emit_pypto_region(graph, result, program_name="v2c_shared").source
+    assert source.count("pl.cross_core_pipe(") == 1
+    assert f"sink_{external_role}_first_tile = pl.tensor.slice(arg_value" in source
 
 
 @pytest.mark.parametrize(

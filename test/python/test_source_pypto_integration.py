@@ -156,6 +156,28 @@ class _C2VEpilogue(nn.Module):
         return torch.mm(value, weight) + bias
 
 
+class _V2COnly(nn.Module):
+    def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.exp(value), weight)
+
+
+class _V2COnlyRhs(nn.Module):
+    def forward(
+        self, lhs: torch.Tensor, value: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.mm(lhs, torch.exp(value + bias))
+
+
+class _V2CSharedLhs(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.exp(value), value)
+
+
+class _V2CSharedRhs(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(value, torch.exp(value))
+
+
 class _AttentionCore(nn.Module):
     def forward(
         self,
@@ -334,6 +356,30 @@ def _compile_mixed_source(
                 torch.zeros(64, 32),
                 torch.zeros(1, 32),
             ),
+        ),
+        (
+            "mixed_v2c_lhs",
+            _V2COnly(),
+            (torch.zeros(96, 64), torch.zeros(64, 128)),
+        ),
+        (
+            "mixed_v2c_rhs",
+            _V2COnlyRhs(),
+            (
+                torch.zeros(96, 64),
+                torch.zeros(64, 128),
+                torch.zeros(1, 128),
+            ),
+        ),
+        (
+            "mixed_v2c_shared_lhs",
+            _V2CSharedLhs(),
+            (torch.zeros(64, 64),),
+        ),
+        (
+            "mixed_v2c_shared_rhs",
+            _V2CSharedRhs(),
+            (torch.zeros(64, 64),),
         ),
         (
             "mixed_attention",

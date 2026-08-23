@@ -49,7 +49,7 @@ def emit_mixed(context: EmissionContext, program_name: str) -> str:
     if plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL:
         return _emit_multi_round_trip_sequential(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
-        return _emit_one_way_c2v(context, program_name, plan)
+        return _emit_one_way(context, program_name, plan)
     raise SourceEmissionError(
         f"mixed source does not implement protocol {plan.protocol.value!r}"
     )
@@ -154,6 +154,21 @@ def _mixed_header(
     return writer
 
 
+def _emit_one_way(
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+) -> str:
+    engines = tuple(stage.engine for stage in plan.stages)
+    if engines == (MixedEngine.CUBE, MixedEngine.VECTOR):
+        return _emit_one_way_c2v(context, program_name, plan)
+    if engines == (MixedEngine.VECTOR, MixedEngine.CUBE):
+        return _emit_one_way_v2c(context, program_name, plan)
+    raise SourceEmissionError(
+        "mixed plan is not a supported directional one-way topology"
+    )
+
+
 def _emit_one_way_c2v(
     context: EmissionContext,
     program_name: str,
@@ -226,6 +241,101 @@ def _emit_one_way_c2v(
         row_offset=row,
         col_offset=col,
         allow_external=True,
+    )
+    writer.line(
+        4,
+        f"next_output = pl.tensor.assemble(output_iter, {result}, [{row}, {col}])",
+    )
+    writer.line(4, f"{output} = pl.yield_(next_output)")
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
+def _emit_one_way_v2c(
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+) -> str:
+    if (
+        plan.algorithm is not MixedAlgorithm.GENERIC
+        or plan.mode is not MixedPipelineMode.ONE_WAY
+        or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
+        or plan.pipeline_stages != 1
+        or len(plan.stages) != 2
+        or tuple(stage.engine for stage in plan.stages)
+        != (MixedEngine.VECTOR, MixedEngine.CUBE)
+        or len(plan.stages[1].ops) != 1
+        or len(plan.transfers) != 1
+        or len(plan.fifos) != 1
+        or plan.fifos[0].direction is not MixedTransferDirection.VECTOR_TO_CUBE
+        or plan.fifos[0].slot_count != 8
+        or plan.fifos[0].spatial_m == plan.fifos[0].spatial_n
+    ):
+        raise SourceEmissionError(
+            "mixed plan is not the supported one-way V->C topology"
+        )
+    vector_stage = plan.stages[0]
+    cube_stage = plan.stages[1]
+    _require_in_memory_vector_stage(vector_stage)
+    crossing = plan.transfers[0].tensor
+    sink_op = cube_stage.ops[0]
+    sink = context.lowered.operation(sink_op)
+    if (
+        context.lowered.operation(vector_stage.ops[-1]).outputs != (crossing,)
+        or sink.inputs.count(crossing) != 1
+    ):
+        raise SourceEmissionError("V->C transfer is not one sink matmul operand")
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    if sink.outputs != (output_tensor,):
+        raise SourceEmissionError("V->C cube stage does not produce the region output")
+    fifo = plan.fifos[0]
+    if (
+        vector_stage.valid_rows * plan.vector_lanes != fifo.valid_rows
+        or vector_stage.valid_cols != fifo.valid_cols
+    ):
+        raise SourceEmissionError("V->C vector stage and FIFO frames disagree")
+
+    writer = _mixed_header(context, program_name, plan)
+    output = context.interface.output_argument
+    writer.line(
+        3,
+        f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
+        f"init_values=({output},)):",
+    )
+    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    vector_row = row if fifo.spatial_m else "0"
+    vector_col = col if fifo.spatial_n else "0"
+    vector_local: dict[int, str] = {}
+    crossing_value = _emit_vector_stage(
+        writer,
+        4,
+        context,
+        vector_stage,
+        vector_local,
+        frame_rows=fifo.valid_rows,
+        frame_cols=fifo.valid_cols,
+        row_offset=vector_row,
+        col_offset=vector_col,
+        allow_external=True,
+    )
+    # Only the declared crossing is local to the cube stage. External values
+    # loaded while replaying the vector DAG remain GM operands unless the typed
+    # plan gives them their own cross-core FIFO.
+    cube_local = {crossing: crossing_value}
+    result = _emit_matmul_tile(
+        writer,
+        4,
+        context,
+        sink_op,
+        cube_stage.cube_window_k[0],
+        rows=plan.m_partition.big,
+        cols=plan.n_partition.big,
+        row_offset=row,
+        col_offset=col,
+        local=cube_local,
+        prefix="sink",
     )
     writer.line(
         4,
@@ -845,12 +955,28 @@ def _emit_matrix_operand(  # noqa: PLR0913
     transposed: bool,
     local: Mapping[int, str],
 ) -> str:
+    if role not in {"lhs", "rhs"}:
+        raise SourceEmissionError(f"unknown matmul operand role {role!r}")
     if tensor in local:
         if transposed:
             raise SourceEmissionError(
                 "mixed local matmul operands cannot be transposed"
             )
-        return local[tensor]
+        descriptor = context.lowered.tensor(tensor)
+        complete_contraction = (
+            role == "lhs" and cols == descriptor.width and col_offset == "0"
+        ) or (role == "rhs" and rows == descriptor.height and row_offset == "0")
+        if complete_contraction:
+            return local[tensor]
+        local_row = "0" if role == "lhs" else row_offset
+        local_col = col_offset if role == "lhs" else "0"
+        name = f"{prefix}_tile"
+        writer.line(
+            indent,
+            f"{name} = pl.tensor.slice({local[tensor]}, [{rows}, {cols}], "
+            f"[{local_row}, {local_col}])",
+        )
+        return name
     argument = _argument_for_tensor(context, tensor)
     slice_rows, slice_cols = rows, cols
     slice_row, slice_col = row_offset, col_offset
@@ -863,8 +989,6 @@ def _emit_matrix_operand(  # noqa: PLR0913
         f"{name} = pl.tensor.slice({argument}, [{slice_rows}, {slice_cols}], "
         f"[{slice_row}, {slice_col}])",
     )
-    if role not in {"lhs", "rhs"}:
-        raise SourceEmissionError(f"unknown matmul operand role {role!r}")
     return name
 
 

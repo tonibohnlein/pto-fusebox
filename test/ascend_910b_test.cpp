@@ -1506,9 +1506,8 @@ static void test_mixed_schedule_plan() {
     }
   }
 
-  // Standalone analytic planning admits the symmetric one-way V->C topology.
-  // Its selected plan exposes a directional FIFO descriptor analytically, but
-  // the standalone source backend still fails closed on this orientation.
+  // Standalone source replay admits the symmetric one-way V->C topology. The
+  // vector producer owns the sink matmul's LHS frame and one directional FIFO.
   {
     Problem p;
     p.tensors = {sq, sq, sq, sq};
@@ -1522,9 +1521,9 @@ static void test_mixed_schedule_plan() {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
           cost.config, {}, {}, cost.parallel_split);
-      CHECK("MIXPLAN: analytic V->C retains its descriptor without claiming source readiness",
+      CHECK("MIXPLAN: LHS V->C is source-ready with its directional descriptor",
             cost.feasible && plan.feasible && plan.emit_compatible &&
-                !plan.source_codegen_ready && plan.split_k == 1 &&
+                plan.source_codegen_ready && plan.split_k == 1 &&
                 plan.work_units == plan.spatial_tiles &&
                 plan.loop.work_items == plan.spatial_tiles &&
                 plan.protocol == MixedCrossCoreProtocol::OneWay &&
@@ -1535,6 +1534,8 @@ static void test_mixed_schedule_plan() {
                 plan.fifos.size() == 1 &&
                 plan.fifos[0].direction ==
                     MixedTransferDirection::VectorToCube &&
+                plan.fifos[0].spatial_m &&
+                !plan.fifos[0].spatial_n &&
                 plan.fifos[0].valid_rows > 0 &&
                 plan.fifos[0].valid_cols > 0 &&
                 plan.fifos[0].slot_bytes ==
@@ -1558,8 +1559,8 @@ static void test_mixed_schedule_plan() {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
           cost.config, {}, {}, cost.parallel_split);
-      CHECK("MIXPLAN: analytic RHS V->C exports K-by-N stage and FIFO geometry",
-            cost.feasible && plan.feasible && !plan.source_codegen_ready &&
+      CHECK("MIXPLAN: RHS V->C is source-ready with K-by-N FIFO geometry",
+            cost.feasible && plan.feasible && plan.source_codegen_ready &&
                 plan.split_k == 1 && plan.stages.size() == 2 &&
                 plan.stages[0].valid_rows * plan.vector_lanes == 64 &&
                 plan.stages[0].valid_cols == plan.n_partition.big &&
@@ -1567,7 +1568,9 @@ static void test_mixed_schedule_plan() {
                 plan.fifos[0].valid_rows == 64 &&
                 plan.fifos[0].valid_cols == plan.n_partition.big &&
                 plan.fifos[0].direction ==
-                    MixedTransferDirection::VectorToCube);
+                    MixedTransferDirection::VectorToCube &&
+                !plan.fifos[0].spatial_m &&
+                plan.fifos[0].spatial_n);
     }
   }
 
@@ -2215,7 +2218,7 @@ static void test_mixed_flash_attention() {
         const CostResult partial_cost = softmax_pv->best_cost();
         const MixedSchedulePlan partial_plan = softmax_pv->mixed_schedule_plan(
             partial_cost.config, {}, {}, partial_cost.parallel_split);
-        CHECK("MIXFA: softmax->PV remains analytic until one-way V->C source exists",
+        CHECK("MIXFA: streamed softmax->PV remains analytic until streaming V->C source exists",
               partial_cost.feasible && partial_plan.feasible &&
                   !partial_plan.source_codegen_ready &&
                   partial_plan.split_k == 1 &&

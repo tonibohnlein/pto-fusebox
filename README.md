@@ -122,31 +122,46 @@ dependency-linked `pl.spmd` launches in solver order. A split cube DAG may
 split only its unique sink: upstream matmuls replay their serial K plans inside
 each share, while resident inputs and retained panels stay local to that share.
 Multiple split accumulators and multiple-output split groups fail closed.
-Mixed source initially covers generic one-way `C -> V`, generic
-`C -> V -> C`, dense `C,C -> V -> C`, and one linear `C -> V -> C -> V`
-plan through PyPTO's public `pl.split(UP_DOWN)` mechanism. The four-stage form
-is deliberately sequential: its three FIFO crossings replay in topological
-order and receive no skew-overlap credit. One-way `V -> C`, branched/deeper
-round trips, and mixed multi-step composition still fail closed.
+Mixed source initially covers generic one-way `C -> V`, generic one-way
+`V -> C` with an in-memory vector producer, generic `C -> V -> C`, dense
+`C,C -> V -> C`, and one linear `C -> V -> C -> V` plan through PyPTO's
+public `pl.split(UP_DOWN)` mechanism. The four-stage form is deliberately
+sequential: its three FIFO crossings replay in topological order and receive no
+skew-overlap credit. Streaming `V -> C`, branched/deeper round trips, and mixed
+multi-step composition still fail closed.
 Mixed source readiness combines the serialized cube-stage L1 peak with V2C
 ring reservations and the vector-stage Vec peak with C2V ring reservations.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
 
-The public explicit-pipe contract is silicon-closed for the current one-way
-`C -> V`, generic `C -> V -> C`, and dense `C,C -> V -> C` source families.
-The new sequential `C -> V -> C -> V` source contract is host/integration
-tested and awaits focused silicon closure.
+The public explicit-pipe contract is silicon-closed for one-way `C -> V`,
+generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
+`C -> V -> C -> V` source families. Static PyPTO-lib-style attention, dense
+SwiGLU, attention-plus-residual, and a rectangular RHS-fed CVCV discriminator
+all pass on silicon. The CVCV cases preserve three independent pipe IDs and
+their serialized transfer axes through final PTO without acquiring skew or
+overlap credit.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized
 input value IDs, and the checked-in device harness binds tensors through those
-IDs. Dense SwiGLU transport is also closed; its strict Torch comparison can
-still differ on a few elements because the vector transcendental result is
-rounded to BF16 before the V2C reply. Generated and independently hand-written
-PyPTO sources are bit-identical for that case, so this is a numerical oracle
+IDs. Dense SwiGLU transport is also closed: generated and independently
+hand-written PyPTO sources are bit-identical. In the closure fixture the direct
+Torch comparison has zero tolerance misses and one of 8192 outputs differs by
+one BF16 ULP, so BF16 narrowing remains an explicitly reported numerical-oracle
 caveat rather than a FIFO or source-emission defect.
+
+Generic one-way `V -> C` now passes model, typed-plan, source, and real PyPTO
+lowering tests for both LHS and RHS matmul operands; focused silicon closure is
+still pending. These are separate single-role cases; one produced tensor used
+as both operands remains analytic-only until the plan defines replication and
+FIFO ownership. The next mixed-source work is deliberately ordered: close that
+new direction on device, generalize sequential replay to arbitrary linear
+alternating engine chains, allow mixed steps in dependency-linked multi-step
+source, and address branched mixed graphs only after those linear contracts
+close. Branched replay needs an explicit fan-out, lifetime, and FIFO-ownership
+contract and must not be inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
 `pto_fusebox.solution.v6`: C++ owns the selected launch, order, loops, physical

@@ -316,7 +316,7 @@ def test_analytic_success_is_distinct_from_source_codegen_readiness() -> None:
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
-def test_vector_to_cube_pipeline_is_admitted_analytically() -> None:
+def test_vector_to_cube_pipeline_is_source_ready() -> None:
     class VectorToCube(nn.Module):
         def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             return torch.mm(torch.exp(value), weight)
@@ -327,13 +327,18 @@ def test_vector_to_cube_pipeline_is_admitted_analytically() -> None:
     )
     assert [op.kind for op in graph.ops] == ["exp", "matmul"]
 
-    result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
     assert result.successful
     region = result.regions[0]
     assert region.solution is not None
     assert region.solution["steps"][0]["ops"] == [0, 1]
     schedule = region.solution["steps"][0]["plan"]
-    assert schedule["source_codegen_ready"] is False
+    assert schedule["source_codegen_ready"] is True
     assert schedule["split_k"] == 1
     assert schedule["work_units"] == schedule["spatial_tiles"]
     assert schedule["pipeline_extent"] == schedule["spatial_tiles"]
@@ -356,28 +361,43 @@ def test_vector_to_cube_pipeline_is_admitted_analytically() -> None:
     ]
     assert len(schedule["fifos"]) == 1
     assert schedule["fifos"][0]["direction"] == "vector_to_cube"
+    assert schedule["fifos"][0]["spatial_m"] is True
+    assert schedule["fifos"][0]["spatial_n"] is False
+    assert result.whole_graph_codegen_ready
+    assert can_emit_region(graph, region)
 
 
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
-def test_vector_to_cube_rhs_pipeline_has_analytic_k_by_n_geometry() -> None:
+def test_vector_to_cube_rhs_pipeline_has_source_ready_k_by_n_geometry() -> None:
     class VectorToCubeRhs(nn.Module):
-        def forward(self, lhs: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-            return torch.mm(lhs, torch.exp(value))
+        def forward(
+            self, lhs: torch.Tensor, value: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            return torch.mm(lhs, torch.exp(value + bias))
 
     graph = export_and_normalize(
         VectorToCubeRhs(),
-        (torch.zeros(96, 64), torch.zeros(64, 128)),
+        (
+            torch.zeros(96, 64),
+            torch.zeros(64, 128),
+            torch.zeros(1, 128),
+        ),
     )
-    result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
 
     assert result.successful
     region = result.regions[0]
     assert region.solution is not None
-    assert region.solution["steps"][0]["ops"] == [0, 1]
+    assert region.solution["steps"][0]["ops"] == [0, 1, 2]
     schedule = region.solution["steps"][0]["plan"]
-    assert schedule["source_codegen_ready"] is False
+    assert schedule["source_codegen_ready"] is True
     assert schedule["split_k"] == 1
     assert [stage["engine"] for stage in schedule["stages"]] == ["vector", "cube"]
     vector_stage = schedule["stages"][0]
@@ -387,6 +407,10 @@ def test_vector_to_cube_rhs_pipeline_has_analytic_k_by_n_geometry() -> None:
     assert fifo["valid_rows"] == 64
     assert fifo["valid_cols"] == schedule["n_partition"]["big"]
     assert fifo["direction"] == "vector_to_cube"
+    assert fifo["spatial_m"] is False
+    assert fifo["spatial_n"] is True
+    assert result.whole_graph_codegen_ready
+    assert can_emit_region(graph, region)
 
 
 @pytest.mark.skipif(

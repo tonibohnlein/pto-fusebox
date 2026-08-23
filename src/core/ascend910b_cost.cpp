@@ -5186,8 +5186,11 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
   if (prob_->require_source_codegen) {
     const bool standalone_one_way =
         one_way && mixed_topology_->stages.size() == 2 &&
-        mixed_topology_->stages[0].engine == MixedEngine::Cube &&
-        mixed_topology_->stages[1].engine == MixedEngine::Vector;
+        ((mixed_topology_->stages[0].engine == MixedEngine::Cube &&
+          mixed_topology_->stages[1].engine == MixedEngine::Vector) ||
+         (mixed_topology_->stages[0].engine == MixedEngine::Vector &&
+          mixed_topology_->stages[1].engine == MixedEngine::Cube &&
+          vector_to_cube_operand_index() >= 0));
     const bool standalone_single_round_trip =
         single_round_trip && mixed_topology_->stages.size() == 3 &&
         mixed_topology_->stages[0].engine == MixedEngine::Cube &&
@@ -6948,10 +6951,16 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
       bool standalone_source_protocol = false;
       if (plan.protocol == MixedCrossCoreProtocol::OneWay &&
           plan.stages.size() == 2) {
-        standalone_source_protocol =
+        const bool cube_to_vector =
             plan.stages[0].engine == MixedEngine::Cube &&
             plan.stages[0].ops.size() == 1 &&
             in_memory_vector(plan.stages[1]);
+        const bool vector_to_cube =
+            in_memory_vector(plan.stages[0]) &&
+            plan.stages[1].engine == MixedEngine::Cube &&
+            plan.stages[1].ops.size() == 1 &&
+            vector_to_cube_operand >= 0;
+        standalone_source_protocol = cube_to_vector || vector_to_cube;
       } else if (plan.protocol ==
                      MixedCrossCoreProtocol::SingleRoundTripBundle &&
                  plan.stages.size() == 3) {
