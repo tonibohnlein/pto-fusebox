@@ -1504,6 +1504,45 @@ def test_one_way_v2c_dual_role_uses_one_complete_fifo_panel() -> None:
     assert "pl.tensor.matmul(vector_1, vector_1" in source
 
 
+def test_one_way_v2c_dual_role_rejects_partitioned_source_contract() -> None:
+    graph, result = _solve_module(
+        _V2CDualRole(), (torch.zeros(64, 64),), require_source_codegen=True
+    )
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    step = solution["steps"][0]
+    plan = step["plan"]
+
+    partition = {"big": 32, "small": 32, "num_big": 0, "parts": 2}
+    plan["m_partition"] = partition
+    plan["n_partition"] = copy.deepcopy(partition)
+    plan["cube_stage_peak_l1_bytes"] = 8192
+    plan["spatial_tiles"] = 4
+    plan["work_units"] = 4
+    plan["active_groups"] = 4
+    plan["pipeline_extent"] = 4
+    step["launch"]["parts"] = [2, 2]
+    step["launch"]["tile"] = [32, 32, 64]
+    step["launch"]["cores"] = 12
+    fifo = plan["fifos"][0]
+    fifo["valid_rows"] = 32
+    fifo["valid_cols"] = 32
+    fifo["slot_bytes"] = 4096
+    fifo["reserved_bytes"] = 32768
+
+    mutated = replace(result, solution=solution)
+    mutated_plan = scheduled_region(mutated).steps[0].plan
+    assert isinstance(mutated_plan, MixedKernelPlan)
+    assert mutated_plan.m_partition.parts == 2
+    assert mutated_plan.n_partition.parts == 2
+    assert not can_emit_region(graph, mutated)
+    with pytest.raises(
+        SourceEmissionError,
+        match="dual-role FIFO requires one complete square spatial region",
+    ):
+        emit_pypto_region(graph, mutated)
+
+
 @pytest.mark.parametrize(
     (
         "name",
