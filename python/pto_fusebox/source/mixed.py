@@ -15,6 +15,7 @@ from ..schedule.schema import (
     MixedStagePlan,
     MixedTransferDirection,
     MixedVectorSplit,
+    VectorReplayPhase,
     VectorStreamKind,
 )
 from .common import (
@@ -28,6 +29,12 @@ from .common import (
     pypto_dtype,
     scalar_operand,
     solver_tensor_for_value,
+)
+from .vector import (
+    _softmax_semantic_ops,
+    _validate_softmax_frames,
+    _validate_softmax_generated_work,
+    _validate_softmax_loops,
 )
 
 
@@ -269,28 +276,45 @@ def _emit_one_way_v2c(
         or len(plan.fifos) != 1
         or plan.fifos[0].direction is not MixedTransferDirection.VECTOR_TO_CUBE
         or plan.fifos[0].slot_count != 8
-        or plan.fifos[0].spatial_m == plan.fifos[0].spatial_n
     ):
         raise SourceEmissionError(
             "mixed plan is not the supported one-way V->C topology"
         )
     vector_stage = plan.stages[0]
     cube_stage = plan.stages[1]
-    _require_in_memory_vector_stage(vector_stage)
+    stream = vector_stage.vector_stream
+    if stream is None:
+        raise SourceEmissionError("V->C vector stage omits its stream plan")
     crossing = plan.transfers[0].tensor
     sink_op = cube_stage.ops[0]
     sink = context.lowered.operation(sink_op)
-    if (
-        context.lowered.operation(vector_stage.ops[-1]).outputs != (crossing,)
-        or sink.inputs.count(crossing) != 1
-    ):
-        raise SourceEmissionError("V->C transfer is not one sink matmul operand")
+    if context.lowered.operation(vector_stage.ops[-1]).outputs != (
+        crossing,
+    ) or sink.inputs.count(crossing) not in {1, 2}:
+        raise SourceEmissionError("V->C transfer is not a sink matmul operand")
     output_tensor = solver_tensor_for_value(
         context.lowered, context.interface.output_allocation_owner
     )
     if sink.outputs != (output_tensor,):
         raise SourceEmissionError("V->C cube stage does not produce the region output")
     fifo = plan.fifos[0]
+    if stream.kind is VectorStreamKind.SOFTMAX_FLASH:
+        return _emit_streaming_softmax_v2c(
+            context, program_name, plan, vector_stage, cube_stage, crossing
+        )
+    _require_in_memory_vector_stage(vector_stage)
+    crossing_roles = sink.inputs.count(crossing)
+    if crossing_roles == 1 and fifo.spatial_m == fifo.spatial_n:
+        raise SourceEmissionError("V->C single-role FIFO has ambiguous spatial axes")
+    if crossing_roles == 2 and (
+        not fifo.spatial_m
+        or not fifo.spatial_n
+        or plan.m_partition.parts != 1
+        or plan.n_partition.parts != 1
+    ):
+        raise SourceEmissionError(
+            "V->C dual-role FIFO requires one complete square spatial region"
+        )
     if (
         vector_stage.valid_rows * plan.vector_lanes != fifo.valid_rows
         or vector_stage.valid_cols != fifo.valid_cols
@@ -344,6 +368,400 @@ def _emit_one_way_v2c(
     writer.line(4, f"{output} = pl.yield_(next_output)")
     emit_return(writer, context.interface)
     return writer.render()
+
+
+def _emit_streaming_softmax_v2c(  # noqa: PLR0915 -- typed phase replay.
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+    vector_stage: MixedStagePlan,
+    cube_stage: MixedStagePlan,
+    crossing: int,
+) -> str:
+    """Publish online-softmax apply chunks directly into one sink matmul.
+
+    The homogeneous vector plan remains authoritative for both passes. The
+    mixed contract only replaces the APPLY store with one V->C publication per
+    chunk and accumulates those disjoint K contributions on AIC.
+    """
+
+    stream = vector_stage.vector_stream
+    if stream is None or stream.kind is not VectorStreamKind.SOFTMAX_FLASH:
+        raise SourceEmissionError("streaming V->C requires a softmax_flash plan")
+    recipe = stream.p4_recipe
+    if recipe is None or recipe.version != "softmax_flash.v1":
+        raise SourceEmissionError("streaming V->C requires softmax_flash recipe v1")
+    if recipe.state != ("running_max", "running_sum"):
+        raise SourceEmissionError("streaming V->C has an unknown softmax state")
+    if stream.axis != 1 or stream.stream_passes != 2:
+        raise SourceEmissionError("streaming V->C requires a two-pass last-axis stream")
+    if stream.full_chunks * stream.chunk + stream.tail != stream.extent:
+        raise SourceEmissionError("streaming V->C chunks do not cover the contraction")
+    _validate_softmax_loops(
+        stream,
+        stream.phase(VectorReplayPhase.STATS),
+        stream.phase(VectorReplayPhase.APPLY),
+    )
+    _validate_softmax_generated_work(stream)
+    _validate_softmax_frames(
+        stream,
+        context.lowered,
+        stream.phase(VectorReplayPhase.STATS),
+        stream.phase(VectorReplayPhase.APPLY),
+    )
+    max_op, sum_op = _softmax_semantic_ops(context, stream)
+    sink_op = cube_stage.ops[0]
+    sink = context.lowered.operation(sink_op)
+    fifo = plan.fifos[0]
+    if (
+        sink.inputs[0] != crossing
+        or sink.inputs.count(crossing) != 1
+        or len(cube_stage.cube_window_k) != 1
+        or cube_stage.cube_window_k[0] != stream.chunk
+        or fifo.valid_rows != vector_stage.valid_rows * plan.vector_lanes
+        or fifo.valid_cols != stream.chunk
+        or fifo.spatial_m is not True
+        or fifo.spatial_n is not False
+    ):
+        raise SourceEmissionError(
+            "streaming V->C softmax and sink K-publication contracts disagree"
+        )
+    input_tensor = recipe.input_tensor
+    input_argument = _argument_for_tensor(context, input_tensor)
+    max_tensor = context.lowered.operation(max_op).outputs[0]
+    sum_tensor = context.lowered.operation(sum_op).outputs[0]
+    stats = stream.phase(VectorReplayPhase.STATS)
+    apply = stream.phase(VectorReplayPhase.APPLY)
+    if stats.init is None or stats.loop is None or apply.loop is None:
+        raise SourceEmissionError("streaming V->C softmax phase loops are incomplete")
+
+    writer = _mixed_header(context, program_name, plan)
+    output = context.interface.output_argument
+    writer.line(
+        3,
+        f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
+        f"init_values=({output},)):",
+    )
+    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    running_max, running_sum = _emit_tensor_softmax_stats_chunk(
+        writer,
+        4,
+        input_argument=input_argument,
+        prefix="initial",
+        rows=fifo.valid_rows,
+        cols=stream.chunk,
+        row_offset=row,
+        col_offset="0",
+        valid_cols=stream.chunk,
+        old_max=None,
+        old_sum=None,
+    )
+    if stats.loop.trip_count:
+        stats_loop = "pl.pipeline" if stats.loop.pipeline_stages > 1 else "pl.range"
+        stats_stage = (
+            f", stage={stats.loop.pipeline_stages}"
+            if stats.loop.pipeline_stages > 1
+            else ""
+        )
+        stop = stats.loop.first_chunk + stats.loop.trip_count
+        writer.line(
+            4,
+            "for stats_chunk, (stats_max, stats_sum) in "
+            f"{stats_loop}({stats.loop.first_chunk}, {stop}{stats_stage}, "
+            f"init_values=({running_max}, {running_sum},)):",
+        )
+        writer.line(5, f"stats_col = stats_chunk * {stream.chunk}")
+        next_max, next_sum = _emit_tensor_softmax_stats_chunk(
+            writer,
+            5,
+            input_argument=input_argument,
+            prefix="stats",
+            rows=fifo.valid_rows,
+            cols=stream.chunk,
+            row_offset=row,
+            col_offset="stats_col",
+            valid_cols=stream.chunk,
+            old_max="stats_max",
+            old_sum="stats_sum",
+        )
+        writer.line(
+            5,
+            f"stats_result_max, stats_result_sum = pl.yield_({next_max}, {next_sum})",
+        )
+        running_max, running_sum = "stats_result_max", "stats_result_sum"
+    if stream.tail:
+        if stats.tail is None or not stats.tail.present:
+            raise SourceEmissionError("streaming V->C softmax omits its stats tail")
+        tail_max, tail_sum = _emit_tensor_softmax_stats_chunk(
+            writer,
+            4,
+            input_argument=input_argument,
+            prefix="stats_tail",
+            rows=fifo.valid_rows,
+            cols=stream.chunk,
+            row_offset=row,
+            col_offset=str(stream.full_chunks * stream.chunk),
+            valid_cols=stream.tail,
+            old_max=running_max,
+            old_sum=running_sum,
+        )
+        writer.line(4, f"{running_max} = {tail_max}")
+        writer.line(4, f"{running_sum} = {tail_sum}")
+
+    output_dtype = pypto_dtype(context.lowered.tensor(sink.outputs[0]).dtype)
+    writer.line(
+        4,
+        f"sink_acc_init = pl.tensor.create([{plan.m_partition.big}, "
+        f"{plan.n_partition.big}], dtype={output_dtype}, layout=pl.TensorLayout.ND)",
+    )
+    apply_loop = "pl.pipeline" if apply.loop.pipeline_stages > 1 else "pl.range"
+    apply_stage = (
+        f", stage={apply.loop.pipeline_stages}"
+        if apply.loop.pipeline_stages > 1
+        else ""
+    )
+    apply_stop = apply.loop.first_chunk + apply.loop.trip_count
+    writer.line(
+        4,
+        "for apply_chunk, (sink_acc,) in "
+        f"{apply_loop}({apply.loop.first_chunk}, {apply_stop}{apply_stage}, "
+        "init_values=(sink_acc_init,)):",
+    )
+    writer.line(5, f"apply_col = apply_chunk * {stream.chunk}")
+    apply_valid_cols: str | int = stream.chunk
+    probability = _emit_tensor_softmax_apply_chunk(
+        writer,
+        5,
+        context,
+        apply,
+        input_tensor=input_tensor,
+        input_argument=input_argument,
+        max_tensor=max_tensor,
+        sum_tensor=sum_tensor,
+        output_tensor=crossing,
+        running_max=running_max,
+        running_sum=running_sum,
+        prefix="apply",
+        row_offset=row,
+        col_offset="apply_col",
+        rows=fifo.valid_rows,
+        cols=stream.chunk,
+        valid_cols=apply_valid_cols,
+    )
+    rhs = _emit_streaming_sink_rhs(
+        writer,
+        5,
+        context,
+        sink.inputs[1],
+        rows=stream.chunk,
+        valid_rows=apply_valid_cols,
+        cols=plan.n_partition.big,
+        row_offset="apply_col",
+        col_offset=col,
+        prefix="sink_rhs",
+    )
+    writer.line(5, "if apply_chunk == 0:")
+    writer.line(
+        6,
+        f"sink_first = pl.tensor.matmul({probability}, {rhs}, a_trans=False, "
+        f"b_trans=False, c_matrix_nz=False, out_dtype={output_dtype})",
+    )
+    writer.line(6, "sink_next = pl.yield_(sink_first)")
+    writer.line(5, "else:")
+    writer.line(
+        6,
+        f"sink_later = pl.tensor.matmul_acc(sink_acc, {probability}, {rhs}, "
+        "a_trans=False, b_trans=False)",
+    )
+    writer.line(6, "sink_next = pl.yield_(sink_later)")
+    writer.line(5, "sink_acc_next = pl.yield_(sink_next)")
+    accumulator = "sink_acc_next"
+    if stream.tail:
+        if apply.tail is None or not apply.tail.present:
+            raise SourceEmissionError("streaming V->C softmax omits its apply tail")
+        tail_col = apply.tail.chunk_index * stream.chunk
+        probability = _emit_tensor_softmax_apply_chunk(
+            writer,
+            4,
+            context,
+            apply,
+            input_tensor=input_tensor,
+            input_argument=input_argument,
+            max_tensor=max_tensor,
+            sum_tensor=sum_tensor,
+            output_tensor=crossing,
+            running_max=running_max,
+            running_sum=running_sum,
+            prefix="apply_tail",
+            row_offset=row,
+            col_offset=str(tail_col),
+            rows=fifo.valid_rows,
+            cols=stream.chunk,
+            valid_cols=apply.tail.extent,
+        )
+        rhs = _emit_streaming_sink_rhs(
+            writer,
+            4,
+            context,
+            sink.inputs[1],
+            rows=stream.chunk,
+            valid_rows=apply.tail.extent,
+            cols=plan.n_partition.big,
+            row_offset=str(tail_col),
+            col_offset=col,
+            prefix="sink_rhs_tail",
+        )
+        writer.line(
+            4,
+            f"sink_tail = pl.tensor.matmul_acc({accumulator}, {probability}, {rhs}, "
+            "a_trans=False, b_trans=False)",
+        )
+        accumulator = "sink_tail"
+    writer.line(
+        4,
+        f"next_output = pl.tensor.assemble(output_iter, {accumulator}, [{row}, {col}])",
+    )
+    writer.line(4, f"{output} = pl.yield_(next_output)")
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
+def _emit_tensor_softmax_stats_chunk(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    *,
+    input_argument: str,
+    prefix: str,
+    rows: int,
+    cols: int,
+    row_offset: str,
+    col_offset: str,
+    valid_cols: str | int,
+    old_max: str | None,
+    old_sum: str | None,
+) -> tuple[str, str]:
+    tile = f"{prefix}_input"
+    writer.line(
+        indent,
+        f"{tile} = pl.tensor.slice({input_argument}, [{rows}, {cols}], "
+        f"[{row_offset}, {col_offset}], valid_shape=[{rows}, {valid_cols}], "
+        "pad_value=pl.PadValue.min)",
+    )
+    local_max = f"{prefix}_local_max"
+    writer.line(indent, f"{local_max} = pl.tensor.row_max({tile})")
+    next_max = local_max
+    if old_max is not None:
+        next_max = f"{prefix}_next_max"
+        writer.line(indent, f"{next_max} = pl.tensor.maximum({old_max}, {local_max})")
+    shifted = f"{prefix}_shifted"
+    exponent = f"{prefix}_exponent"
+    writer.line(indent, f"{shifted} = pl.tensor.row_expand_sub({tile}, {next_max})")
+    writer.line(indent, f"{exponent} = pl.tensor.exp({shifted})")
+    local_sum = f"{prefix}_local_sum"
+    writer.line(indent, f"{local_sum} = pl.tensor.row_sum({exponent})")
+    next_sum = local_sum
+    if old_sum is not None:
+        if old_max is None:
+            raise SourceEmissionError("streaming softmax update omits old maximum")
+        delta = f"{prefix}_delta"
+        correction = f"{prefix}_correction"
+        scaled_sum = f"{prefix}_scaled_sum"
+        next_sum = f"{prefix}_next_sum"
+        writer.line(indent, f"{delta} = pl.tensor.sub({old_max}, {next_max})")
+        writer.line(indent, f"{correction} = pl.tensor.exp({delta})")
+        writer.line(indent, f"{scaled_sum} = pl.tensor.mul({old_sum}, {correction})")
+        writer.line(indent, f"{next_sum} = pl.tensor.add({scaled_sum}, {local_sum})")
+    return next_max, next_sum
+
+
+def _emit_tensor_softmax_apply_chunk(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    phase,
+    *,
+    input_tensor: int,
+    input_argument: str,
+    max_tensor: int,
+    sum_tensor: int,
+    output_tensor: int,
+    running_max: str,
+    running_sum: str,
+    prefix: str,
+    row_offset: str,
+    col_offset: str,
+    rows: int,
+    cols: int,
+    valid_cols: str | int,
+) -> str:
+    if len(phase.ops) != 3:
+        raise SourceEmissionError("streaming softmax apply phase is incomplete")
+    tile = f"{prefix}_input"
+    writer.line(
+        indent,
+        f"{tile} = pl.tensor.slice({input_argument}, [{rows}, {cols}], "
+        f"[{row_offset}, {col_offset}], valid_shape=[{rows}, {valid_cols}], "
+        "pad_value=pl.PadValue.min)",
+    )
+    local: dict[int, str] = {
+        input_tensor: tile,
+        max_tensor: running_max,
+        sum_tensor: running_sum,
+    }
+    graph_ops = context.graph.op_map()
+    for solver_op in phase.ops:
+        operation = context.lowered.operation(solver_op)
+        try:
+            operands = [local[tensor] for tensor in operation.inputs]
+        except KeyError as error:
+            raise SourceEmissionError(
+                "streaming softmax apply uses an unavailable tensor"
+            ) from error
+        output = operation.outputs[0]
+        expression = _tensor_vector_expression(
+            graph_ops[operation.graph_op_id],
+            operands,
+            input_shapes=[
+                (
+                    context.lowered.tensor(tensor).height,
+                    context.lowered.tensor(tensor).width,
+                )
+                for tensor in operation.inputs
+            ],
+            output_dtype=context.lowered.tensor(output).dtype,
+        )
+        name = f"{prefix}_tensor_{output}"
+        writer.line(indent, f"{name} = {expression}")
+        local[output] = name
+    try:
+        return local[output_tensor]
+    except KeyError as error:
+        raise SourceEmissionError(
+            "streaming softmax apply does not produce the FIFO tensor"
+        ) from error
+
+
+def _emit_streaming_sink_rhs(
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    tensor: int,
+    *,
+    rows: int,
+    valid_rows: str | int,
+    cols: int,
+    row_offset: str,
+    col_offset: str,
+    prefix: str,
+) -> str:
+    argument = _argument_for_tensor(context, tensor)
+    writer.line(
+        indent,
+        f"{prefix} = pl.tensor.slice({argument}, [{rows}, {cols}], "
+        f"[{row_offset}, {col_offset}], valid_shape=[{valid_rows}, {cols}], "
+        "pad_value=pl.PadValue.zero)",
+    )
+    return prefix
 
 
 def _emit_single_round_trip(

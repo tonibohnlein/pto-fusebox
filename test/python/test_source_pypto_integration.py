@@ -178,6 +178,17 @@ class _V2CSharedRhs(nn.Module):
         return torch.mm(value, torch.exp(value))
 
 
+class _StreamingSoftmaxPv(nn.Module):
+    def forward(self, scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.softmax(scores, dim=-1), value)
+
+
+class _V2CDualRole(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        produced = torch.exp(value)
+        return torch.mm(produced, produced)
+
+
 class _AttentionCore(nn.Module):
     def forward(
         self,
@@ -379,6 +390,16 @@ def _compile_mixed_source(
         (
             "mixed_v2c_shared_rhs",
             _V2CSharedRhs(),
+            (torch.zeros(64, 64),),
+        ),
+        (
+            "mixed_streaming_softmax_pv",
+            _StreamingSoftmaxPv(),
+            (torch.zeros(16, 4096), torch.zeros(4096, 64)),
+        ),
+        (
+            "mixed_v2c_dual_role",
+            _V2CDualRole(),
             (torch.zeros(64, 64),),
         ),
         (

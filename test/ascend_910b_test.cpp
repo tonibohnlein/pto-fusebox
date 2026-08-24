@@ -1485,9 +1485,9 @@ static void test_mixed_schedule_plan() {
     }
   }
 
-  // One produced value in both matmul roles needs two differently bound
-  // operand panels. Keep it analytically visible, but do not claim one FIFO is
-  // a complete source contract.
+  // One produced value may serve both matmul roles when one complete square
+  // panel is shared by a single spatial region. Partitioned roles need two
+  // distinct operand views and are rejected until replication is modeled.
   {
     Problem p;
     p.tensors = {sq, sq, sq};
@@ -1498,11 +1498,19 @@ static void test_mixed_schedule_plan() {
     auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
     CHECK("MIXPLAN: multi-role V->C remains analytically visible", (bool)mixed);
     if (mixed) {
-      const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
-          cost.config, {}, {}, cost.parallel_split);
-      CHECK("MIXPLAN: one FIFO cannot claim both matmul operand roles",
-            cost.feasible && plan.feasible && !plan.source_codegen_ready);
+          TileConfig{128, 128, 128, 1, 1, 1}, {}, {}, 1);
+      CHECK("MIXPLAN: one complete FIFO panel can serve both matmul roles",
+            plan.feasible && plan.source_codegen_ready &&
+                plan.m_partition.parts == 1 && plan.n_partition.parts == 1 &&
+                plan.fifos.size() == 1 && plan.fifos[0].spatial_m &&
+                plan.fifos[0].spatial_n && plan.fifos[0].valid_rows == 128 &&
+                plan.fifos[0].valid_cols == 128);
+      const auto partitioned = mixed->mixed_schedule_plan(
+          TileConfig{64, 64, 128, 2, 2, 1}, {}, {}, 1);
+      CHECK("MIXPLAN: partitioned multi-role V->C is rejected analytically",
+            !partitioned.feasible && !partitioned.source_codegen_ready &&
+                partitioned.fifos.empty());
     }
   }
 
@@ -2001,6 +2009,36 @@ static void test_mixed_schedule_plan() {
     const TileConfig square_cfg{32, 32, 64, 2, 2, 1};
     CHECK_EQ("MIXPLAN: multi-role boundary still pays its vector-engine load",
              fixed_ddr(shared, square_cfg), fixed_ddr(distinct, square_cfg));
+
+    // Exact source replay is different: a complete-square produced value used
+    // in both matmul roles arrives through one FIFO-owned L1 panel. It still
+    // has two role-specific L1->L0 extracts, but only one incoming panel. A
+    // distinct external RHS needs a second GM->L1 panel.
+    auto exact_source_ddr = [&](Problem p) {
+      p.require_source_codegen = true;
+      p.kernel_fill_cost = 0;
+      p.bw_gm_l1 = 1.0;
+      p.bw_gm_ub = p.bw_l0c_gm = p.bw_ub_gm = 1.0e12;
+      p.hbm_aggregate_gibps = 1.0e12;
+      DAG dag = DAG::build(p);
+      auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+      return mixed
+                 ? mixed->compute_cost(TileConfig{64, 64, 64, 1, 1, 1})
+                       .ddr_traffic
+                 : -1.0;
+    };
+    Problem dual_role;
+    dual_role.tensors = {{64, 64}, {64, 64}, {64, 64}};
+    dual_role.ops = {{OpType::Pointwise, {0}, {1}},
+                     {OpType::MatMul, {1, 1}, {2}}};
+    dual_role.fast_memory_capacity = 1 << 26;
+    set_910b(dual_role, 0);
+    const double shared_source = exact_source_ddr(dual_role);
+    const double distinct_source = exact_source_ddr(distinct);
+    CHECK("MIXPLAN: exact source dual-role traffic remains feasible",
+          shared_source > 0.0 && distinct_source > 0.0);
+    CHECK_EQ("MIXPLAN: one shared FIFO panel replaces two distinct input panels",
+             distinct_source, 2.0 * shared_source, 1e-9);
   }
 }
 
@@ -2218,9 +2256,9 @@ static void test_mixed_flash_attention() {
         const CostResult partial_cost = softmax_pv->best_cost();
         const MixedSchedulePlan partial_plan = softmax_pv->mixed_schedule_plan(
             partial_cost.config, {}, {}, partial_cost.parallel_split);
-        CHECK("MIXFA: streamed softmax->PV remains analytic until streaming V->C source exists",
+        CHECK("MIXFA: streamed softmax->PV publishes its exact apply chunk",
               partial_cost.feasible && partial_plan.feasible &&
-                  !partial_plan.source_codegen_ready &&
+                  partial_plan.source_codegen_ready &&
                   partial_plan.split_k == 1 &&
                   partial_plan.protocol == MixedCrossCoreProtocol::OneWay &&
                   partial_plan.stages.size() == 2 &&
@@ -2235,7 +2273,87 @@ static void test_mixed_flash_attention() {
                   partial_plan.fifos.size() == 1 &&
                   partial_plan.fifos[0].direction ==
                       MixedTransferDirection::VectorToCube &&
-                  partial_plan.fifos[0].valid_cols == S);
+                  partial_plan.fifos[0].valid_cols ==
+                      partial_plan.stages[0].vector_stream.chunk &&
+                  partial_plan.stages[1].cube_window_k.size() == 1 &&
+                  partial_plan.stages[1].cube_window_k[0] ==
+                      partial_plan.stages[0].vector_stream.chunk);
+    }
+
+    Problem source_p = p;
+    source_p.tensors[0] = {d, 16};
+    source_p.tensors[1] = {4096, d};
+    source_p.tensors[2] = {4096, 16};
+    source_p.tensors[3] = {1, 16};
+    source_p.tensors[4] = {4096, 16};
+    source_p.tensors[5] = {1, 16};
+    source_p.tensors[6] = {4096, 16};
+    source_p.tensors[7] = {d, 4096};
+    source_p.tensors[8] = {d, 16};
+    source_p.tensors[9] = {d, 16};
+    source_p.require_source_codegen = true;
+    DAG source_dag = DAG::build(source_p);
+    auto source_softmax_pv = Ascend910BMixed::create(
+        source_p, source_dag, {1, 2, 3, 4, 5});
+    CHECK("MIXFA: source-constrained softmax->PV remains admissible",
+          (bool)source_softmax_pv);
+    if (source_softmax_pv) {
+        const CostResult source_cost = source_softmax_pv->best_cost();
+        const MixedSchedulePlan source_plan =
+            source_softmax_pv->mixed_schedule_plan(
+                source_cost.config, {}, {}, source_cost.parallel_split);
+        CHECK("MIXFA: source-constrained softmax->PV has a feasible winner",
+              source_cost.feasible);
+        CHECK("MIXFA: source-constrained softmax->PV is source ready",
+              source_plan.source_codegen_ready);
+        CHECK("MIXFA: source-constrained plan keeps its two typed stages",
+              source_plan.stages.size() == 2 &&
+                  source_plan.stages[0].vector_stream.kind ==
+                      VectorStreamKind::SoftmaxFlash);
+        CHECK("MIXFA: source-constrained plan reserves its publication chunk",
+              source_plan.fifos.size() == 1 &&
+                  source_plan.fifos[0].valid_cols ==
+                      source_plan.stages[0].vector_stream.chunk);
+        if (source_cost.feasible && source_plan.stages.size() == 2) {
+            const int64_t rhs_panels = std::max<int64_t>(
+                1, source_plan.stages[0].vector_stream.apply.pipeline_stages);
+            const int64_t expected_cube_peak =
+                source_plan.stages[0].vector_stream.chunk *
+                source_plan.n_partition.big *
+                dtype_bytes(source_p.tensors[7].dtype) * rhs_panels;
+            CHECK("MIXFA: source-constrained UB peak is the streamed chunk peak",
+                  source_plan.vector_stage_peak_ub_bytes ==
+                      source_plan.stages[0]
+                          .vector_stream.chunk_peak_ub_bytes);
+            CHECK("MIXFA: source-constrained cube peak owns every pipelined RHS panel",
+                  rhs_panels == 2 &&
+                      source_plan.cube_stage_peak_l1_bytes ==
+                          expected_cube_peak);
+            Problem tight_source = source_p;
+            tight_source.l1_capacity =
+                source_plan.fifos[0].reserved_bytes + expected_cube_peak - 1;
+            DAG tight_source_dag = DAG::build(tight_source);
+            auto tight_source_mixed = Ascend910BMixed::create(
+                tight_source, tight_source_dag, {1, 2, 3, 4, 5});
+            CHECK("MIXFA: source-constrained L1 rejects one byte below pipe plus RHS peak",
+                  tight_source_mixed &&
+                      !tight_source_mixed->compute_cost(source_cost.config)
+                           .feasible);
+            auto homogeneous_softmax = Ascend910BCost::create(
+                source_p, source_dag, {1, 2, 3, 4}, /*allow_mixed=*/false);
+            const double phase_compute =
+                homogeneous_softmax
+                    ? homogeneous_softmax->vector_plan_compute_cycles(
+                          TileConfig{
+                              source_plan.stages[0].valid_cols,
+                              source_plan.stages[0].valid_rows,
+                              source_plan.stages[0].valid_cols})
+                    : 0.0;
+            CHECK("MIXFA: mixed source cost covers homogeneous two-pass phase compute",
+                  homogeneous_softmax && phase_compute > 0.0 &&
+                      source_cost.latency >=
+                          phase_compute * source_plan.loop.max_trips_per_group);
+        }
     }
 
     // Full attention-shaped C->V->C->V is classified as the generic sequential

@@ -135,6 +135,17 @@ class _V2CSharedRhs(nn.Module):
         return torch.mm(value, torch.exp(value))
 
 
+class _StreamingSoftmaxPv(nn.Module):
+    def forward(self, scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.softmax(scores, dim=-1), value)
+
+
+class _V2CDualRole(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        produced = torch.exp(value)
+        return torch.mm(produced, produced)
+
+
 class _AttentionResidual(nn.Module):
     def forward(
         self,
@@ -1433,6 +1444,64 @@ def test_one_way_v2c_reloads_shared_boundary_operand_from_gm(
     source = emit_pypto_region(graph, result, program_name="v2c_shared").source
     assert source.count("pl.cross_core_pipe(") == 1
     assert f"sink_{external_role}_first_tile = pl.tensor.slice(arg_value" in source
+
+
+def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
+    graph, result = _solve_module(
+        _StreamingSoftmaxPv(),
+        (torch.zeros(16, 4096), torch.zeros(4096, 64)),
+    )
+    step = scheduled_region(result).steps[0]
+    assert isinstance(step.plan, MixedKernelPlan)
+    plan = step.plan
+    stream = plan.stages[0].vector_stream
+    assert stream is not None
+    assert stream.kind is VectorStreamKind.SOFTMAX_FLASH
+    assert plan.source_codegen_ready
+    assert plan.fifos[0].valid_cols == stream.chunk
+    assert plan.stages[1].cube_window_k == (stream.chunk,)
+
+    source = emit_pypto_region(
+        graph, result, program_name="streaming_softmax_pv"
+    ).source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.active_groups)
+    assert source.count("pl.cross_core_pipe(") == 1
+    assert f"valid_shape=[16, {stream.chunk}]" in source
+    assert "for stats_chunk" in source
+    assert "for apply_chunk" in source
+    apply_phase = stream.phase(VectorReplayPhase.APPLY)
+    assert apply_phase.loop is not None
+    assert apply_phase.tail is not None
+    assert (
+        f"for apply_chunk, (sink_acc,) in pl.pipeline("
+        f"{apply_phase.loop.first_chunk}, "
+        f"{apply_phase.loop.first_chunk + apply_phase.loop.trip_count}, "
+        f"stage={apply_phase.loop.pipeline_stages}"
+    ) in source
+    assert source.count("pl.tensor.matmul(") == 1
+    assert source.count("pl.tensor.matmul_acc(") == 2
+    assert "apply_tail" in source
+    assert f"valid_shape=[16, {apply_phase.tail.extent}]" in source
+
+
+def test_one_way_v2c_dual_role_uses_one_complete_fifo_panel() -> None:
+    graph, result = _solve_module(
+        _V2CDualRole(), (torch.zeros(64, 64),), require_source_codegen=True
+    )
+    step = scheduled_region(result).steps[0]
+    assert isinstance(step.plan, MixedKernelPlan)
+    plan = step.plan
+    assert plan.m_partition.parts == 1
+    assert plan.n_partition.parts == 1
+    assert len(plan.fifos) == 1
+    assert plan.fifos[0].spatial_m
+    assert plan.fifos[0].spatial_n
+
+    source = emit_pypto_region(graph, result, program_name="v2c_dual_role").source
+    ast.parse(source)
+    assert source.count("pl.cross_core_pipe(") == 1
+    assert "pl.tensor.matmul(vector_1, vector_1" in source
 
 
 @pytest.mark.parametrize(

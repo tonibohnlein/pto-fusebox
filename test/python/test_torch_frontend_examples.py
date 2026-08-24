@@ -428,9 +428,9 @@ def test_softmax_to_pv_serializes_the_complete_flash_stream() -> None:
     result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
 
     assert result.regions_solved
-    assert not result.whole_graph_codegen_ready
+    assert result.whole_graph_codegen_ready
     region = result.regions[0]
-    assert not can_emit_region(graph, region)
+    assert can_emit_region(graph, region)
     assert region.solution is not None
     assert region.solution["steps"][0]["ops"] == list(range(6))
     schedule = region.solution["steps"][0]["plan"]
@@ -444,23 +444,38 @@ def test_softmax_to_pv_serializes_the_complete_flash_stream() -> None:
     phases = {phase["name"]: phase for phase in stream["phases"]}
     assert phases["stats"]["loop"]["trip_count"] > 0
     assert phases["apply"]["loop"]["trip_count"] > 0
+    fifo = schedule["fifos"][0]
+    assert fifo["valid_cols"] == stream["chunk"]
+    assert schedule["stages"][1]["cube_window_k"] == [stream["chunk"]]
 
 
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
-def test_multi_role_vector_to_cube_is_not_source_codegen_ready() -> None:
+def test_multi_role_vector_to_cube_uses_one_complete_fifo_panel() -> None:
     class MultiRole(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             produced = torch.exp(value)
             return torch.mm(produced, produced)
 
     graph = export_and_normalize(MultiRole(), (torch.zeros(64, 64),))
-    result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
 
     assert result.regions_solved
-    assert not result.whole_graph_codegen_ready
-    assert not can_emit_region(graph, result.regions[0])
+    assert result.whole_graph_codegen_ready
+    region = result.regions[0]
+    assert can_emit_region(graph, region)
+    assert region.solution is not None
+    schedule = region.solution["steps"][0]["plan"]
+    assert schedule["m_partition"]["parts"] == 1
+    assert schedule["n_partition"]["parts"] == 1
+    assert schedule["fifos"][0]["spatial_m"] is True
+    assert schedule["fifos"][0]["spatial_n"] is True
 
 
 @pytest.mark.skipif(

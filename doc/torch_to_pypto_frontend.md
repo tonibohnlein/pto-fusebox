@@ -33,12 +33,16 @@ non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
 Mixed source covers generic one-way `C -> V`, generic one-way `V -> C` with an
-in-memory vector producer, generic `C -> V -> C`, dense `C,C -> V -> C`, and
-linear `C -> V -> C -> V` schedules. It replays the serialized stages and
-tensor DAG through one `pl.spmd` grid with `pl.split(UP_DOWN)`; PyPTO inserts
+in-memory or online-softmax vector producer, generic `C -> V -> C`, dense
+`C,C -> V -> C`, and linear `C -> V -> C -> V` schedules. It replays the
+serialized stages and tensor DAG through one `pl.spmd` grid with
+`pl.split(UP_DOWN)`; PyPTO inserts
 the concrete push/pop/free pipeline. The four-stage form is an ordinary ordered
-loop and receives no skew-overlap credit. Streaming `V -> C`, branched/deeper
-round trips, and mixed multi-step composition fail closed. Welford/multi-stat
+loop and receives no skew-overlap credit. Online softmax-to-PV publishes
+normalized K chunks into the sink's matching accumulation windows. One complete
+square panel may serve both sink operands without replication; partitioned
+dual-role values, branched/deeper round trips, and mixed multi-step composition
+fail closed. Welford/multi-stat
 vector plans, singleton-column normalization, and nonuniform cube spatial
 partitions remain outside source readiness. A uniform cube DAG may split only
 its unique sink through the selected dependency-linked PyPTO task protocol.
@@ -251,8 +255,8 @@ The standalone target admits the complete analytic schedule surface by
 default. It does not restrict partition search to schedules supported by the
 historical in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate
 tensor/tile PyPTO source from its own selected schedule. Split cube DAGs,
-multi-reduction streaming, non-uniform cube-DAG grids, streaming `V -> C`, and
-deeper serial mixed topologies therefore remain eligible even when no source
+multi-reduction streaming, non-uniform cube-DAG grids, and deeper serial mixed
+topologies therefore remain eligible even when no source
 emitter path exists. Solution metadata records the stages, directional
 transfers, and protocol for every analytic mixed plan. Plans with a complete
 stage-local geometry, vector stream, cube-window, and FIFO contract also set
@@ -263,7 +267,8 @@ the external-source constraints, so source planning cannot perturb an already
 realizable analytic schedule and a cheaper analytic-only tile cannot hide a
 realizable source-ready alternative.
 The Python backend separately admits generic one-way `C -> V`, generic one-way
-`V -> C` with an in-memory vector producer, generic `C -> V -> C`, dense
+`V -> C` with an in-memory or online-softmax vector producer, generic
+`C -> V -> C`, dense
 `C,C -> V -> C`, and linear sequential `C -> V -> C -> V` today. Broader
 analytic winners remain valid research results but are not presented as
 source-emittable.
@@ -419,10 +424,11 @@ Generic one-way `V -> C` passes the model, typed-plan, source, and real PyPTO
 lowering contracts for both a produced LHS (`M`-owned FIFO) and produced RHS
 (`N`-owned FIFO). It uses the same public explicit-pipe descriptor as the
 silicon-closed families; focused numerical and stability closure on device is
-still pending. These are separate single-role cases; one produced tensor used
-as both matmul operands remains analytic-only until the plan defines
-replication and FIFO ownership. Streaming vector producers remain analytic-only
-until their chunked publication and cube-consumption contract is serialized.
+still pending. Online softmax-to-PV serializes chunked publication and matching
+cube K windows. A complete square value may serve both sink operands from one
+FIFO-owned L1 ring; partitioned dual-role values are rejected until the plan
+defines replication and per-role FIFO ownership. Both new paths lower
+through real PyPTO and await focused silicon closure.
 
 Two ABI/numerical findings must remain distinct from that transport result:
 
@@ -634,17 +640,23 @@ dynamic physical tile that reaches allocation or tile-flattening.
 
 The homogeneous vector/cube matrix, single-sink cube-DAG split-K, explicit
 mixed pipes, and the first sequential CVCV source contract are silicon-closed.
+Generic one-way V2C is source-ready for materialized LHS/RHS producers, online
+softmax-to-PV K streaming, and one complete-square value used in both matmul
+roles. The last two paths have real PyPTO lowering coverage but still require
+focused silicon closure.
 The next source capabilities are ordered by contract complexity:
 
-1. Silicon-close generic one-way `V -> C` source replay for both LHS and RHS
-   matmul operands. Reuse the existing directional pipe and
-   `spatial_m/spatial_n` contract; do not add an operation or model recognizer.
+1. Silicon-close online softmax-to-PV and complete-square dual-role V2C replay.
+   Keep partitioned dual-role cases rejected until an explicit replication
+   policy exists.
 2. Replace the fixed four-stage sequential replay with a generic renderer over
    a serialized linear alternating engine chain. Keep deeper chains sequential
    until the model explicitly grants a realizable overlap schedule.
 3. Allow a mixed step to participate in dependency-linked multi-step source,
    preserving GM cuts, task order, and the mixed step's internal SPMD/pipe
-   contract.
+   contract. PyPTO already supports dependency-linked `pl.spmd` tasks; this is
+   a Fusebox task-bundle and ownership-contract gap, not a missing PyPTO
+   execution primitive.
 4. Add branched mixed graphs only after defining fan-out replication versus
    retention, per-consumer FIFO ownership, lifetimes, and backpressure in the
    serialized plan. Continue failing closed until that contract exists.

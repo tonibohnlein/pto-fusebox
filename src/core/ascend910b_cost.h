@@ -223,6 +223,12 @@ public:
                                       const FlatSet<size_t> &retained_from_prev = {},
                                       const FlatSet<size_t> &retain_these = {}) const;
 
+  // Reuse the homogeneous phase model when a mixed source schedule embeds one
+  // lane-local vector configuration. Traffic stays owned by the enclosing
+  // mixed model, which replaces the homogeneous GM output with an explicit
+  // FIFO transfer.
+  double vector_plan_compute_cycles(const TileConfig& cfg) const;
+
   // Compatibility view: axis 0 + chunk INT64_MAX means materialized; chunk 0
   // means infeasible, matching the historical API.
   struct VecStream { int axis = 0; int64_t chunk = 0; };
@@ -305,10 +311,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const FlatSet<size_t> &retain_these,
       int64_t parallel_split) const;
 
-  // Analytic one-way V->C contract in which the vector stage produces one
-  // sink-matmul operand. Returns 0 for LHS ([spatial-M, full-K]), 1 for RHS
-  // ([full-K, spatial-N]), and -1 when the topology is not this contract.
-  int vector_to_cube_operand_index() const;
+  // Analytic one-way V->C contract in which the vector stage produces one or
+  // both sink-matmul operands. Bit 0 denotes LHS ([spatial-M, full-K]); bit 1
+  // denotes RHS ([full-K, spatial-N]); zero is not this contract.
+  int vector_to_cube_operand_mask() const;
+  VectorStreamPlan vector_to_cube_stream_plan(const TileConfig& sink_cfg,
+                                               int64_t vector_lanes) const;
   bool has_unrepresentable_vector_to_cube_multi_role() const;
   TileConfig vector_to_cube_stage_config(const TileConfig& sink_cfg) const;
 

@@ -123,12 +123,17 @@ split only its unique sink: upstream matmuls replay their serial K plans inside
 each share, while resident inputs and retained panels stay local to that share.
 Multiple split accumulators and multiple-output split groups fail closed.
 Mixed source initially covers generic one-way `C -> V`, generic one-way
-`V -> C` with an in-memory vector producer, generic `C -> V -> C`, dense
+`V -> C` with an in-memory or online-softmax vector producer, generic
+`C -> V -> C`, dense
 `C,C -> V -> C`, and one linear `C -> V -> C -> V` plan through PyPTO's
 public `pl.split(UP_DOWN)` mechanism. The four-stage form is deliberately
 sequential: its three FIFO crossings replay in topological order and receive no
-skew-overlap credit. Streaming `V -> C`, branched/deeper round trips, and mixed
-multi-step composition still fail closed.
+skew-overlap credit. Online softmax-to-PV replays the serialized statistics and
+apply phases, publishes each normalized K chunk through one V2C pipe, and
+accumulates the sink matmul over the same K windows. A complete square produced
+panel may also serve both operands of a single-region sink matmul through one
+FIFO-owned L1 ring. Partitioned dual-role values, branched/deeper round trips,
+and mixed multi-step composition still fail closed.
 Mixed source readiness combines the serialized cube-stage L1 peak with V2C
 ring reservations and the vector-stage Vec peak with C2V ring reservations.
 The initial split-K task bundle must be the region's only selected step; the
@@ -153,15 +158,15 @@ one BF16 ULP, so BF16 narrowing remains an explicitly reported numerical-oracle
 caveat rather than a FIFO or source-emission defect.
 
 Generic one-way `V -> C` now passes model, typed-plan, source, and real PyPTO
-lowering tests for both LHS and RHS matmul operands; focused silicon closure is
-still pending. These are separate single-role cases; one produced tensor used
-as both operands remains analytic-only until the plan defines replication and
-FIFO ownership. The next mixed-source work is deliberately ordered: close that
-new direction on device, generalize sequential replay to arbitrary linear
-alternating engine chains, allow mixed steps in dependency-linked multi-step
-source, and address branched mixed graphs only after those linear contracts
-close. Branched replay needs an explicit fan-out, lifetime, and FIFO-ownership
-contract and must not be inferred by the emitter.
+lowering tests for LHS, RHS, online-softmax-to-PV, and the complete-square
+dual-role case; focused silicon closure of the latter two is still pending.
+Partitioned dual-role schedules are rejected until the plan defines replication
+and FIFO ownership. PyPTO already supports multiple dependency-
+linked `pl.spmd` tasks, so deeper composition does not require a new PyPTO
+primitive. Fusebox still needs an ordered mixed task-bundle contract that
+preserves GM cuts, task dependencies, internal pipes, and result ownership.
+Branched replay additionally needs explicit fan-out, lifetime, and per-consumer
+FIFO ownership and must not be inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
 `pto_fusebox.solution.v6`: C++ owns the selected launch, order, loops, physical

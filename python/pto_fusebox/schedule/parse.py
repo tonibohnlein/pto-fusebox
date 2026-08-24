@@ -1377,7 +1377,26 @@ def _validate_mixed_contract(  # noqa: PLR0913
 ) -> None:
     if not plan.emit_compatible or not plan.source_codegen_ready:
         return
-    if plan.cube_stage_peak_l1_bytes <= 0:
+    fifo_owned_dual_role = False
+    if (
+        plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+        and len(plan.stages) == 2
+        and len(plan.fifos) == 1
+        and plan.m_partition.parts == 1
+        and plan.n_partition.parts == 1
+        and plan.stages[0].engine is MixedEngine.VECTOR
+        and plan.stages[1].engine is MixedEngine.CUBE
+        and len(plan.stages[1].ops) == 1
+        and plan.fifos[0].direction is MixedTransferDirection.VECTOR_TO_CUBE
+        and plan.fifos[0].spatial_m
+        and plan.fifos[0].spatial_n
+    ):
+        sink = lowered.operations[plan.stages[1].ops[0]]
+        fifo_owned_dual_role = sink.op_type == "MatMul" and sink.inputs == (
+            plan.fifos[0].tensor,
+            plan.fifos[0].tensor,
+        )
+    if plan.cube_stage_peak_l1_bytes <= 0 and not fifo_owned_dual_role:
         raise ScheduleContractError(
             f"{field}.cube_stage_peak_l1_bytes must be positive for source replay"
         )
@@ -1461,8 +1480,13 @@ def _validate_mixed_contract(  # noqa: PLR0913
                     step_order=stage.ops,
                     field=f"{stage_field}.vector_stream",
                 )
-            vector_stage_peaks.append(stage.vector_stream.full_peak_ub_bytes)
-            if stage.vector_stream.full_peak_ub_bytes > plan.vector_stage_peak_ub_bytes:
+            realized_peak = (
+                stage.vector_stream.chunk_peak_ub_bytes
+                if stage.vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
+                else stage.vector_stream.full_peak_ub_bytes
+            )
+            vector_stage_peaks.append(realized_peak)
+            if realized_peak > plan.vector_stage_peak_ub_bytes:
                 raise ScheduleContractError(
                     f"{stage_field} Vec peak exceeds the mixed plan"
                 )
@@ -1547,6 +1571,15 @@ def _validate_mixed_contract(  # noqa: PLR0913
         spatial_frame = plan.pipeline_axis is MixedPipelineAxis.SPATIAL_REGION
         expected_rows = plan.m_partition.big if fifo.spatial_m else tensor.height
         expected_cols = plan.n_partition.big if fifo.spatial_n else tensor.width
+        if (
+            direction is MixedTransferDirection.VECTOR_TO_CUBE
+            and producer.vector_stream is not None
+            and producer.vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
+            and fifo.spatial_m
+            and not fifo.spatial_n
+            and producer.vector_stream.extent == tensor.width
+        ):
+            expected_cols = producer.vector_stream.chunk
         if (
             fifo.tensor != transfer.tensor
             or fifo.direction is not direction
