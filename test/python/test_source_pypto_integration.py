@@ -265,8 +265,9 @@ def _pto_pipe_ids(pto: str, op_name: str) -> set[int]:
     ids: set[int] = set()
     for line in lines:
         match = re.search(r"\bid = (-?[0-9]+)", line)
-        assert match is not None, line
-        ids.add(int(match.group(1)))
+        # PyPTO's automatic pipe is the implicit default channel and therefore
+        # carries no public id= attribute. Explicit low-level pipes still do.
+        ids.add(int(match.group(1)) if match is not None else 0)
     return ids
 
 
@@ -452,37 +453,36 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     source, pto, plan = _compile_mixed_source(name, module, args, tmp_path, monkeypatch)
 
     assert "pl.split(pl.SplitMode.UP_DOWN" in source
-    assert source.count("pl.cross_core_pipe(") == len(plan.fifos)
+    slot_counts = {fifo.slot_count for fifo in plan.fifos}
+    assert len(slot_counts) == 1
+    (slot_count,) = slot_counts
+    assert source.count("pl.cross_core_slot(") == 1
+    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
+    assert "pl.cross_core_pipe" not in source
+    assert "CrossCoreDirection" not in source
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
-    assert pto.count("pto.aic_initialize_pipe") == len(plan.fifos)
-    assert pto.count("pto.aiv_initialize_pipe") == len(plan.fifos)
-    assert "dir_mask = 3" not in pto
-    for index, fifo in enumerate(plan.fifos):
-        pipe_id = fifo.pipe_id if fifo.pipe_id >= 0 else index
-        dir_mask = 1 if fifo.direction.value == "cube_to_vector" else 2
-        pipe = (
-            f"{{id = {pipe_id}, dir_mask = {dir_mask}, "
-            f"slot_size = {fifo.slot_bytes}, slot_num = {fifo.slot_count}}}"
+    assert pto.count("pto.aic_initialize_pipe") == 1
+    assert pto.count("pto.aiv_initialize_pipe") == 1
+    expected_dir_mask = 0
+    if any(fifo.direction.value == "cube_to_vector" for fifo in plan.fifos):
+        expected_dir_mask |= 1
+    if any(fifo.direction.value == "vector_to_cube" for fifo in plan.fifos):
+        expected_dir_mask |= 2
+    assert f"dir_mask = {expected_dir_mask}" in pto
+    assert f"slot_num = {slot_count}" in pto
+    if expected_dir_mask & 1:
+        assert _pto_pipe_ids(pto, "tpush_to_aiv")
+        assert _pto_pipe_ids(pto, "tpush_to_aiv") == _pto_pipe_ids(pto, "tpop_from_aic")
+        assert _pto_pipe_ids(pto, "tpop_from_aic") == _pto_pipe_ids(
+            pto, "tfree_from_aic"
         )
-        assert f"pto.aic_initialize_pipe {pipe}" in pto
-        assert f"pto.aiv_initialize_pipe {pipe}" in pto
-    c2v_ids = {
-        fifo.pipe_id if fifo.pipe_id >= 0 else index
-        for index, fifo in enumerate(plan.fifos)
-        if fifo.direction.value == "cube_to_vector"
-    }
-    v2c_ids = {
-        fifo.pipe_id if fifo.pipe_id >= 0 else index
-        for index, fifo in enumerate(plan.fifos)
-        if fifo.direction.value == "vector_to_cube"
-    }
-    assert _pto_pipe_ids(pto, "tpush_to_aiv") == c2v_ids
-    assert _pto_pipe_ids(pto, "tpop_from_aic") == c2v_ids
-    assert _pto_pipe_ids(pto, "tfree_from_aic") == c2v_ids
-    assert _pto_pipe_ids(pto, "tpush_to_aic") == v2c_ids
-    assert _pto_pipe_ids(pto, "tpop_from_aiv") == v2c_ids
-    assert _pto_pipe_ids(pto, "tfree_from_aiv") == v2c_ids
+    if expected_dir_mask & 2:
+        assert _pto_pipe_ids(pto, "tpush_to_aic")
+        assert _pto_pipe_ids(pto, "tpush_to_aic") == _pto_pipe_ids(pto, "tpop_from_aiv")
+        assert _pto_pipe_ids(pto, "tpop_from_aiv") == _pto_pipe_ids(
+            pto, "tfree_from_aiv"
+        )
     if name == "mixed_c2v":
         assert "pto.tcolexpandadd" in pto
         assert "pto.tadd" not in pto
@@ -513,37 +513,40 @@ def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(
     # unsupported second round trip into a skewed cross-core pipeline.
     assert pto.count("scf.for") == 2
     assert "scf.pipeline" not in pto
-    assert _pto_pipe_ids(pto, "tpush_to_aiv") == {0, 2}
-    assert _pto_pipe_ids(pto, "tpop_from_aic") == {0, 2}
-    assert _pto_pipe_ids(pto, "tpush_to_aic") == {1}
-    assert _pto_pipe_ids(pto, "tpop_from_aiv") == {1}
+    assert _pto_pipe_ids(pto, "tpush_to_aiv") == _pto_pipe_ids(pto, "tpop_from_aic")
+    assert _pto_pipe_ids(pto, "tpush_to_aic") == _pto_pipe_ids(pto, "tpop_from_aiv")
 
 
-def test_mixed_source_public_pipe_ids_fail_closed_when_collapsed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, _, _ = _compile_mixed_source(
-        "mixed_dense_swiglu_collapsed",
-        _DenseSwiGlu(),
+def test_mixed_source_rejects_duplicate_pypto_slot_optimization() -> None:
+    graph = export_and_normalize(
+        _C2VEpilogue(),
         (
-            torch.zeros(128, 64, dtype=torch.bfloat16),
-            torch.zeros(64, 128, dtype=torch.bfloat16),
-            torch.zeros(64, 128, dtype=torch.bfloat16),
-            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(32, 64),
+            torch.zeros(64, 32),
+            torch.zeros(1, 32),
         ),
-        tmp_path,
-        monkeypatch,
     )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    source = emit_pypto_region(
+        graph, solved.regions[0], program_name="mixed_duplicate_slot"
+    ).source
     parser_diagnostics = importlib.import_module("pypto.language.parser.diagnostics")
     pl = importlib.import_module("pypto.language")
-    collapsed = source.replace("pipe_id=1, bundle=0", "pipe_id=0, bundle=0", 1)
-    assert collapsed != source
+    slot = re.search(r"pl\.cross_core_slot\(slot_num=[0-9]+\)", source)
+    assert slot is not None
+    duplicated = source.replace(slot.group(0), f"{slot.group(0)}, {slot.group(0)}", 1)
+    assert duplicated != source
     with pytest.raises(
         parser_diagnostics.ParserSyntaxError,
-        match="Duplicate pl.cross_core_pipe pipe_id=0",
+        match="Duplicate 'pl.cross_core_slot",
     ):
-        pl.parse_program(collapsed)
+        pl.parse_program(duplicated)
 
 
 @pytest.mark.parametrize(

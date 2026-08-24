@@ -126,7 +126,12 @@ Mixed source initially covers generic one-way `C -> V`, generic one-way
 `V -> C` with an in-memory or online-softmax vector producer, generic
 `C -> V -> C`, dense
 `C,C -> V -> C`, and one linear `C -> V -> C -> V` plan through PyPTO's
-public `pl.split(UP_DOWN)` mechanism. The four-stage form is deliberately
+public `pl.split(UP_DOWN)` mechanism. Fusebox retains its logical FIFO
+descriptors for planning, validation, and costing, while generated source uses
+the current PyPTO `main` contract: one `pl.cross_core_slot(slot_num=N)` ring
+depth per mixed scope and compiler-inferred crossing directions. Plans that
+require different per-pipe depths fail closed at source readiness. The
+four-stage form is deliberately
 sequential: its three FIFO crossings replay in topological order and receive no
 skew-overlap credit. Online softmax-to-PV replays the serialized statistics and
 apply phases, publishes each normalized K chunk through one V2C pipe, and
@@ -140,13 +145,17 @@ The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
 
-The public explicit-pipe contract is silicon-closed for one-way `C -> V`,
-generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
-`C -> V -> C -> V` source families. Static PyPTO-lib-style attention, dense
-SwiGLU, attention-plus-residual, and a rectangular RHS-fed CVCV discriminator
-all pass on silicon. The CVCV cases preserve three independent pipe IDs and
-their serialized transfer axes through final PTO without acquiring skew or
-overlap credit.
+The earlier fork-only explicit-pipe contract was silicon-closed for one-way
+`C -> V`, generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
+`C -> V -> C -> V` source families. It is historical validation evidence, not
+the compatibility target. PTO Fusebox now targets upstream PyPTO `main` and
+emits only its public automatic-pipe contract. On the current upstream-main
+host matrix, every mixed family except dense `C,C -> V -> C` lowers through
+real PTOAS without a Fusebox-specific PyPTO API. The dense case exposes a
+general nested-accumulator join defect in PyPTO's memory-reuse lowering; with
+the corresponding generic PyPTO regression and fix applied, all 38 opt-in
+source-integration cases pass. Current-main silicon revalidation is still
+required before replacing the historical device evidence.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized
@@ -157,9 +166,10 @@ Torch comparison has zero tolerance misses and one of 8192 outputs differs by
 one BF16 ULP, so BF16 narrowing remains an explicitly reported numerical-oracle
 caveat rather than a FIFO or source-emission defect.
 
-Generic one-way `V -> C` now passes model, typed-plan, source, and real PyPTO
-lowering tests for LHS, RHS, online-softmax-to-PV, and the complete-square
-dual-role case; focused silicon closure of the latter two is still pending.
+Generic one-way `V -> C` passes model and typed-plan checks for LHS, RHS,
+online-softmax-to-PV, and the complete-square dual-role case. Source and silicon
+status are evaluated against upstream PyPTO `main`, rather than inherited from
+the historical explicit-pipe fork.
 Partitioned dual-role schedules are rejected until the plan defines replication
 and FIFO ownership. PyPTO already supports multiple dependency-
 linked `pl.spmd` tasks, so deeper composition does not require a new PyPTO

@@ -87,6 +87,17 @@ def _solve_module(
     return graph, solved.regions[0]
 
 
+def _assert_pypto_main_mixed_scope(source: str, plan: MixedKernelPlan) -> None:
+    slot_counts = {fifo.slot_count for fifo in plan.fifos}
+    assert len(slot_counts) == 1
+    (slot_count,) = slot_counts
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
+    assert source.count("pl.cross_core_slot(") == 1
+    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
+    assert "pl.cross_core_pipe" not in source
+    assert "CrossCoreDirection" not in source
+
+
 class _C2VEpilogue(nn.Module):
     def forward(
         self,
@@ -1075,10 +1086,7 @@ def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     source = emit_pypto_region(graph, result, program_name="attention_mixed").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
-    assert source.count("pl.cross_core_pipe(") == 2
-    assert "direction=pl.CrossCoreDirection.CUBE_TO_VECTOR" in source
-    assert "direction=pl.CrossCoreDirection.VECTOR_TO_CUBE" in source
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert "pl.pipeline(1, stage=3" in source
     assert source.count("pl.tensor.matmul(") == 2
     assert "b_trans=True" in source
@@ -1219,9 +1227,7 @@ def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     source = emit_pypto_region(graph, result, program_name="c2v_epilogue").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
-    assert source.count("pl.cross_core_pipe(") == 1
-    assert "direction=pl.CrossCoreDirection.CUBE_TO_VECTOR" in source
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert "pl.range(1, init_values=(output,))" in source
     assert source.count("pl.tensor.matmul(") == 1
     assert "pl.tensor.col_expand_add(" in source
@@ -1250,10 +1256,7 @@ def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> N
     source = emit_pypto_region(graph, result, program_name="dense_swiglu").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
-    assert source.count("pl.cross_core_pipe(") == 3
-    assert source.count("direction=pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
-    assert source.count("direction=pl.CrossCoreDirection.VECTOR_TO_CUBE") == 1
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert "pl.pipeline(0, 128, 64, stage=3" in source
     assert source.count("pl.tensor.matmul(") == 3
     assert source.count("pl.tensor.matmul_acc(") == 1
@@ -1285,9 +1288,7 @@ def test_multi_round_trip_attention_epilogue_emits_one_ordered_generic_loop() ->
     source = emit_pypto_region(graph, result, program_name="attention_residual").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert source.count("pl.cross_core_pipe(") == 3
-    assert source.count("direction=pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
-    assert source.count("direction=pl.CrossCoreDirection.VECTOR_TO_CUBE") == 1
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert "for mixed_trip, (output_iter,) in pl.range(" in source
     assert "pl.pipeline(" not in source
     assert source.count("pl.tensor.matmul(") == 2
@@ -1327,7 +1328,7 @@ def test_multi_round_trip_replays_transfer_specific_axes(
     assert can_emit_region(graph, result)
     source = emit_pypto_region(graph, result, program_name="axis_replay").source
     ast.parse(source)
-    assert source.count("pl.cross_core_pipe(") == 3
+    _assert_pypto_main_mixed_scope(source, step.plan)
 
 
 def test_multi_round_trip_final_row_reduction_fails_closed() -> None:
@@ -1417,9 +1418,7 @@ def test_one_way_v2c_emits_vector_producer_and_matmul_consumer(
     source = emit_pypto_region(graph, result, program_name="v2c_one_way").source
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
-    assert "pl.split(pl.SplitMode.UP_DOWN)" in source
-    assert source.count("pl.cross_core_pipe(") == 1
-    assert "direction=pl.CrossCoreDirection.VECTOR_TO_CUBE" in source
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert "pl.tensor.exp(" in source
     if not expected_axes[0]:
         assert "pl.tensor.col_expand_add(" in source
@@ -1442,7 +1441,7 @@ def test_one_way_v2c_reloads_shared_boundary_operand_from_gm(
     assert len(step.plan.fifos) == 1
 
     source = emit_pypto_region(graph, result, program_name="v2c_shared").source
-    assert source.count("pl.cross_core_pipe(") == 1
+    _assert_pypto_main_mixed_scope(source, step.plan)
     assert f"sink_{external_role}_first_tile = pl.tensor.slice(arg_value" in source
 
 
@@ -1466,8 +1465,7 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     ).source
     ast.parse(source)
     _assert_single_spmd_grid(source, plan.active_groups)
-    assert source.count("pl.cross_core_pipe(") == 1
-    assert f"valid_shape=[16, {stream.chunk}]" in source
+    _assert_pypto_main_mixed_scope(source, plan)
     assert "for stats_chunk" in source
     assert "for apply_chunk" in source
     apply_phase = stream.phase(VectorReplayPhase.APPLY)
@@ -1500,7 +1498,7 @@ def test_one_way_v2c_dual_role_uses_one_complete_fifo_panel() -> None:
 
     source = emit_pypto_region(graph, result, program_name="v2c_dual_role").source
     ast.parse(source)
-    assert source.count("pl.cross_core_pipe(") == 1
+    _assert_pypto_main_mixed_scope(source, plan)
     assert "pl.tensor.matmul(vector_1, vector_1" in source
 
 

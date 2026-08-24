@@ -135,22 +135,17 @@ def _mixed_header(
     program_name: str,
     plan: MixedKernelPlan,
 ) -> SourceWriter:
-    optimizations = ["pl.split(pl.SplitMode.UP_DOWN)"]
-    for index, fifo in enumerate(plan.fifos):
-        pipe_id = fifo.pipe_id if fifo.pipe_id >= 0 else index
-        bundle = fifo.bundle if fifo.bundle >= 0 else index
-        direction = (
-            "pl.CrossCoreDirection.CUBE_TO_VECTOR"
-            if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
-            else "pl.CrossCoreDirection.VECTOR_TO_CUBE"
+    slot_counts = {fifo.slot_count for fifo in plan.fifos}
+    if len(slot_counts) != 1:
+        raise SourceEmissionError(
+            "PyPTO supports one cross-core slot count per mixed scope, "
+            f"but the plan requires {sorted(slot_counts)}"
         )
-        optimizations.append(
-            "pl.cross_core_pipe("
-            f"tensor_id={fifo.tensor}, direction={direction}, "
-            f"valid_shape=[{fifo.valid_rows}, {fifo.valid_cols}], "
-            f"slot_size_bytes={fifo.slot_bytes}, slot_num={fifo.slot_count}, "
-            f"pipe_id={pipe_id}, bundle={bundle})"
-        )
+    slot_count = next(iter(slot_counts))
+    optimizations = [
+        "pl.split(pl.SplitMode.UP_DOWN)",
+        f"pl.cross_core_slot(slot_num={slot_count})",
+    ]
     writer = program_preamble(program_name, context.interface, context.graph)
     writer.line(
         2,

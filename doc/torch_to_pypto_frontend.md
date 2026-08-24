@@ -394,41 +394,41 @@ The ordinary DSL cannot pin that complete design point. Exact L0 replay is an
 optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
-Mixed source validates every logical transfer/FIFO descriptor and emits one
-public `pl.cross_core_pipe(...)` schedule entry for each crossing, in solver
-order. Each entry carries its unidirectional pipe ID, protocol bundle, logical
-frame, slot bytes, and ring depth. PyPTO's `ExpandMixedKernel` and
-`SkewCrossCorePipeline` still own the AIC/AIV split and the physical
+Mixed source validates every logical transfer/FIFO descriptor in solver order.
+Generated source targets upstream PyPTO `main`: it emits
+`pl.split(pl.SplitMode.UP_DOWN)` and one
+`pl.cross_core_slot(slot_num=N)` entry for the enclosing scope, while ordinary
+tensor def-use expresses each crossing. PyPTO's `ExpandMixedKernel` and
+`SkewCrossCorePipeline` own the AIC/AIV split and the physical
 initialize/push/pop/free lowering; the external emitter does not hand-code
-either core program. Opt-in integration tests require exact descriptor-to-pipe
-parity, including distinct IDs for same-shaped sources and separate C2V/V2C
-rings. Source readiness charges the serialized cube-stage L1 peak together
+either core program. Because the public API has one scope-level ring depth,
+source readiness rejects a plan whose logical pipes require different slot
+counts. Source readiness charges the serialized cube-stage L1 peak together
 with every V2C consumer ring, and the vector-stage peak together with every
 C2V consumer ring; neither direction can hide its physical FIFO reservation.
 No attention or SwiGLU recognizer is involved in this transport contract.
 
 ### Mixed-source silicon status
 
-The explicit cross-core descriptor path is silicon-closed for one-way
-`C -> V`, generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
-`C -> V -> C -> V`. The closure matrix includes static PyPTO-lib-style
-attention, dense SwiGLU, attention followed by a residual epilogue, and a
-rectangular non-attention CVCV graph whose vector reply feeds the second
-matmul's RHS. Across the new matrix, 40/40 seeded executions and 200/200
-repeated CVCV launches pass on two devices. The RHS discriminator preserves
-FIFO axes `(N-only, N-only, M+N)` and pipe IDs `0,1,2` through final PTO. The
-sequential CVCV plan retains `pipeline_stages=1`, grants no overlap, and emits
-no skewed pipeline.
+The historical fork-only explicit-descriptor path was silicon-closed for
+one-way `C -> V`, generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
+`C -> V -> C -> V`. That evidence established the model and generic replay but
+is not treated as closure for upstream PyPTO `main`. The main-compatible source
+surface is checked independently because PyPTO now owns automatic physical
+pipe construction. The current upstream-main host matrix lowers every mixed
+family except dense `C,C -> V -> C` through real PTOAS. The remaining case
+exposes a general nested-accumulator join defect in PyPTO's memory-reuse pass,
+not a missing Fusebox transport API. With the generic PyPTO regression and fix
+applied, the complete 38-case opt-in source-integration surface passes; a
+current-main silicon campaign remains pending.
 
-Generic one-way `V -> C` passes the model, typed-plan, source, and real PyPTO
-lowering contracts for both a produced LHS (`M`-owned FIFO) and produced RHS
-(`N`-owned FIFO). It uses the same public explicit-pipe descriptor as the
-silicon-closed families; focused numerical and stability closure on device is
-still pending. Online softmax-to-PV serializes chunked publication and matching
+Generic one-way `V -> C` passes the model and typed-plan contracts for both a
+produced LHS (`M`-owned FIFO) and produced RHS (`N`-owned FIFO). Online
+softmax-to-PV serializes chunked publication and matching
 cube K windows. A complete square value may serve both sink operands from one
 FIFO-owned L1 ring; partitioned dual-role values are rejected until the plan
-defines replication and per-role FIFO ownership. Both new paths lower
-through real PyPTO and await focused silicon closure.
+defines replication and per-role FIFO ownership. Lowering and device closure
+are assessed specifically against the pinned upstream-main revision.
 
 Two ABI/numerical findings must remain distinct from that transport result:
 

@@ -22,8 +22,10 @@ from pto_fusebox import (
     emit_pypto_region,
     export_and_normalize,
     extract_solver_regions,
+    scheduled_region,
     solve_graph,
 )
+from pto_fusebox.schedule.schema import MixedKernelPlan
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
@@ -265,15 +267,15 @@ def test_attention_solver_selects_complete_cube_vector_cube_group() -> None:
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
 @pytest.mark.parametrize(
-    ("name", "pipe_count"),
+    "name",
     [
-        ("pypto_lib_static_attention", 2),
-        ("pypto_lib_static_dense_swiglu", 3),
-        ("pypto_lib_static_attention_residual", 3),
+        "pypto_lib_static_attention",
+        "pypto_lib_static_dense_swiglu",
+        "pypto_lib_static_attention_residual",
     ],
 )
 def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
-    name: str, pipe_count: int
+    name: str,
 ) -> None:
     module, args = build_static_mixed_examples()[name]
     graph = export_and_normalize(module, args)
@@ -294,8 +296,15 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     # should replace their selected schedules.
     assert region.problem["require_source_codegen"] is False
     assert can_emit_region(graph, region)
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    slot_counts = {fifo.slot_count for fifo in plan.fifos}
+    assert len(slot_counts) == 1
+    (slot_count,) = slot_counts
     source = emit_pypto_region(graph, region, program_name=name).source
-    assert source.count("pl.cross_core_pipe(") == pipe_count
+    assert source.count("pl.cross_core_slot(") == 1
+    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
+    assert "pl.cross_core_pipe" not in source
     assert "auto_fuse" not in source and "auto_tile" not in source
 
 
