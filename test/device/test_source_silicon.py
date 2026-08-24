@@ -11,6 +11,7 @@ without searching device results for favorable shapes or tolerances.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import re
@@ -39,7 +40,10 @@ from pto_fusebox import (
 from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
     MixedKernelPlan,
+    MixedTransferDirection,
+    VectorReplayPhase,
     VectorKernelPlan,
+    VectorStreamKind,
 )
 
 if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
@@ -62,6 +66,7 @@ class SiliconCase:
     make_args: ArgsFactory
     rtol: float = 1.0e-4
     atol: float = 1.0e-4
+    mixed_contract: str | None = None
 
 
 class PointwiseChain(nn.Module):
@@ -102,6 +107,32 @@ class C2VEpilogue(nn.Module):
         bias: torch.Tensor,
     ) -> torch.Tensor:
         return torch.mm(value, weight) + bias
+
+
+class V2CLhs(nn.Module):
+    def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.exp(value), weight)
+
+
+class V2CRhs(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        value: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(lhs, torch.exp(value + bias))
+
+
+class StreamingSoftmaxPv(nn.Module):
+    def forward(self, scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return torch.mm(torch.softmax(scores, dim=-1), value)
+
+
+class V2CDualRole(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        produced = torch.exp(value)
+        return torch.mm(produced, produced)
 
 
 def _generator(seed: int) -> torch.Generator:
@@ -285,6 +316,34 @@ MIXED_CASES = (
         atol=1.0e-4,
     ),
     SiliconCase(
+        "mixed_v2c_lhs_96x64x128",
+        "mixed",
+        V2CLhs(),
+        _random_args((96, 64), (64, 128), scale=0.1),
+        mixed_contract="v2c_lhs",
+    ),
+    SiliconCase(
+        "mixed_v2c_rhs_96x64x128",
+        "mixed",
+        V2CRhs(),
+        _random_args((96, 64), (64, 128), (1, 128), scale=0.1),
+        mixed_contract="v2c_rhs",
+    ),
+    SiliconCase(
+        "mixed_v2c_streaming_softmax_pv_16x4096x64",
+        "mixed",
+        StreamingSoftmaxPv(),
+        _random_args((16, 4096), (4096, 64), scale=0.1),
+        mixed_contract="v2c_streaming_softmax_pv",
+    ),
+    SiliconCase(
+        "mixed_v2c_dual_role_64x64",
+        "mixed",
+        V2CDualRole(),
+        _random_args((64, 64), scale=0.1),
+        mixed_contract="v2c_dual_role",
+    ),
+    SiliconCase(
         "mixed_qk_softmax_pv_96x64x128",
         "mixed",
         StaticAttentionCore(),
@@ -340,18 +399,26 @@ def _device_id() -> int:
 def _assert_static_artifact(
     compiled: object,
     case: SiliconCase,
-    work_units: int,
+    plan: CubeKernelPlan | MixedKernelPlan | VectorKernelPlan,
 ) -> None:
+    work_units = plan.work_units
     output_dir = Path(getattr(compiled, "output_dir"))
     pto_files = list(output_dir.rglob("*.pto"))
     assert len(pto_files) == 1
     pto = pto_files[0].read_text(encoding="utf-8")
     if case.kind == "mixed":
+        assert isinstance(plan, MixedKernelPlan)
         assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
         assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
-        assert "pto.tpush_to_aiv" in pto
-        assert "pto.tpop_from_aic" in pto
-        assert "pto.tfree_from_aic" in pto
+        directions = {fifo.direction for fifo in plan.fifos}
+        if MixedTransferDirection.CUBE_TO_VECTOR in directions:
+            assert "pto.tpush_to_aiv" in pto
+            assert "pto.tpop_from_aic" in pto
+            assert "pto.tfree_from_aic" in pto
+        if MixedTransferDirection.VECTOR_TO_CUBE in directions:
+            assert "pto.tpush_to_aic" in pto
+            assert "pto.tpop_from_aiv" in pto
+            assert "pto.tfree_from_aiv" in pto
     else:
         assert "pto.tpush" not in pto
         assert "pto.tpop" not in pto
@@ -373,6 +440,78 @@ def _assert_static_artifact(
     assert orchestration.count("launch_spec.set_block_num(") == 1
     assert f"launch_spec.set_block_num({work_units});" in orchestration
     assert "region_index" not in orchestration
+
+
+def _assert_v2c_contract(
+    case: SiliconCase,
+    plan: CubeKernelPlan | MixedKernelPlan | VectorKernelPlan,
+    source: str,
+) -> None:
+    if case.mixed_contract is None:
+        return
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.source_codegen_ready
+    assert len(plan.fifos) == 1
+    fifo = plan.fifos[0]
+    assert fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    assert fifo.slot_count == 8
+    assert fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count
+    assert len(plan.stages) == 2
+    assert plan.stages[0].vector_stream is not None
+
+    if case.mixed_contract == "v2c_lhs":
+        assert fifo.spatial_m and not fifo.spatial_n
+    elif case.mixed_contract == "v2c_rhs":
+        assert not fifo.spatial_m and fifo.spatial_n
+    elif case.mixed_contract == "v2c_streaming_softmax_pv":
+        stream = plan.stages[0].vector_stream
+        assert stream.kind is VectorStreamKind.SOFTMAX_FLASH
+        assert fifo.spatial_m and not fifo.spatial_n
+        assert fifo.valid_cols == stream.chunk
+        assert plan.stages[1].cube_window_k == (stream.chunk,)
+        apply = stream.phase(VectorReplayPhase.APPLY)
+        assert apply.loop is not None
+        assert apply.loop.pipeline_stages == 2
+        assert apply.tail is not None and apply.tail.present
+        elements_per_slot = fifo.valid_rows * fifo.valid_cols
+        assert elements_per_slot > 0
+        assert fifo.slot_bytes % elements_per_slot == 0
+        element_bytes = fifo.slot_bytes // elements_per_slot
+        assert plan.cube_stage_peak_l1_bytes == (
+            stream.chunk
+            * plan.n_partition.big
+            * element_bytes
+            * apply.loop.pipeline_stages
+        )
+        assert "for stats_chunk" in source
+        assert "for apply_chunk" in source
+        assert source.count("pl.tensor.matmul(") == 1
+        assert source.count("pl.tensor.matmul_acc(") == 2
+    elif case.mixed_contract == "v2c_dual_role":
+        assert fifo.spatial_m and fifo.spatial_n
+        assert plan.m_partition.parts == 1
+        assert plan.n_partition.parts == 1
+        assert re.search(r"pl\.tensor\.matmul\(([^,]+), \1,", source)
+    else:
+        pytest.fail(f"unknown mixed contract: {case.mixed_contract}")
+
+
+def _output_signature(output: torch.Tensor) -> str:
+    payload = output.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _assert_numerics(
+    case: SiliconCase,
+    seed: int,
+    output: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    assert torch.isfinite(output).all(), f"{case.name} seed {seed} left invalid output"
+    assert torch.allclose(output, expected, rtol=case.rtol, atol=case.atol), (
+        f"{case.name} seed {seed}: max abs error "
+        f"{torch.max(torch.abs(output - expected)).item():.6g}"
+    )
 
 
 def _run_case(case: SiliconCase, tmp_path: Path) -> None:
@@ -398,6 +537,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     assert emitted.kind.value == case.kind
     assert "auto_fuse" not in emitted.source
     assert "auto_tile" not in emitted.source
+    _assert_v2c_contract(case, plan, emitted.source)
 
     program = pl.parse_program(emitted.source)
     config = runtime.RunConfig(
@@ -419,16 +559,28 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         output = torch.full_like(expected, torch.nan)
         if compiled is None:
             compiled = runtime.run(program, *runtime_args, output, config=config)
-            _assert_static_artifact(compiled, case, plan.work_units)
+            _assert_static_artifact(compiled, case, plan)
         else:
             compiled(*runtime_args, output, config=config)
+        _assert_numerics(case, seed, output, expected)
 
-        assert torch.isfinite(output).all(), (
-            f"{case.name} seed {seed} left invalid output"
-        )
-        assert torch.allclose(output, expected, rtol=case.rtol, atol=case.atol), (
-            f"{case.name} seed {seed}: max abs error "
-            f"{torch.max(torch.abs(output - expected)).item():.6g}"
+    repeat_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_REPEATS", "1"))
+    assert repeat_count > 0
+    if repeat_count > 1:
+        assert compiled is not None
+        args = case.make_args(0)
+        runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
+        with torch.no_grad():
+            expected = case.module(*args)
+        signatures: set[str] = set()
+        for repeat in range(repeat_count):
+            output = torch.full_like(expected, torch.nan)
+            compiled(*runtime_args, output, config=config)
+            _assert_numerics(case, repeat, output, expected)
+            signatures.add(_output_signature(output))
+        assert len(signatures) == 1, (
+            f"{case.name} produced {len(signatures)} signatures across "
+            f"{repeat_count} identical launches"
         )
 
 
