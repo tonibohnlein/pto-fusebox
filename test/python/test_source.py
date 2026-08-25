@@ -17,6 +17,8 @@ from examples.torch_frontend.static_mixed import (
     build_examples as build_static_mixed_examples,
 )
 from pto_fusebox import (
+    PyPTORuntimeValidShapeArgument,
+    RuntimeValidShapeSpec,
     bind_emitted_inputs,
     emit_pypto_callable,
     KernelKind,
@@ -43,7 +45,7 @@ from pto_fusebox.schedule.schema import (
     VectorSpatialPolicy,
     VectorStreamKind,
 )
-from pto_fusebox.source.api import _append_spmd_statement
+from pto_fusebox.source.api import _append_spmd_statement, _program_as_inline_callable
 from pto_fusebox.source.common import SourceWriter
 from torch import nn
 
@@ -1058,7 +1060,7 @@ def test_vector_source_emits_multiple_outputs_in_region_abi_order() -> None:
     assert "return output_0, output_1" in source
 
 
-def test_source_readiness_rejects_transposed_matmul() -> None:
+def test_source_readiness_emits_a_zero_copy_transposed_matmul_operand() -> None:
     class TransposedMatmul(nn.Module):
         def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
             return torch.mm(lhs, rhs.t())
@@ -1069,9 +1071,11 @@ def test_source_readiness_rejects_transposed_matmul() -> None:
         require_source_codegen=False,
     )
 
-    assert not can_emit_region(graph, result)
-    with pytest.raises(SourceEmissionError, match="non-transposed matmul"):
-        emit_pypto_region(graph, result)
+    assert can_emit_region(graph, result)
+    source = emit_pypto_region(graph, result, program_name="transposed_matmul").source
+    assert "pl.tile.transpose_view(rhs_mat_natural" in source
+    assert "pl.tile.move(rhs_mat" in source
+    assert "pl.create_tensor" not in source
 
 
 def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
@@ -1202,6 +1206,112 @@ def test_callable_source_preserves_a_multi_step_task_graph() -> None:
     assert emitted.source.index("for step_0_region_index") < emitted.source.index(
         "for step_1_region_index"
     )
+
+
+def test_callable_extraction_rejects_unexpected_program_members() -> None:
+    source = """\
+import pypto.language as pl
+
+@pl.program
+class UnexpectedMember:
+    marker = 1
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, value: pl.Tensor[[8, 32], pl.FP32]) -> pl.Tensor[[8, 32], pl.FP32]:
+        return value
+"""
+
+    with pytest.raises(
+        SourceEmissionError, match="program class contains unexpected members: Assign"
+    ):
+        _program_as_inline_callable(source, "generated")
+
+
+def test_callable_runtime_valid_shape_keeps_physical_frame_static() -> None:
+    module, args = build_pr2335_examples()["pr2335_rms_norm"]
+    graph, result = _solve_module(module, args)
+    emitted = emit_pypto_callable(
+        graph,
+        result,
+        function_name="generated_rms_norm_chunk",
+        runtime_valid_shape=RuntimeValidShapeSpec(),
+    )
+
+    assert emitted.runtime_valid_shapes == (
+        PyPTORuntimeValidShapeArgument(name="valid_rows", axis=0, physical_extent=512),
+    )
+    tree = ast.parse(emitted.source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+    assert [argument.arg for argument in function.args.args] == [
+        "arg_value",
+        "arg_gamma",
+        "valid_rows",
+        "output",
+    ]
+    runtime_annotation = function.args.args[2].annotation
+    assert runtime_annotation is not None
+    assert ast.unparse(runtime_annotation) == "pl.Scalar[pl.INDEX]"
+    assert "pl.Tensor[[512, 512], pl.FP32]" in emitted.source
+    assert "pl.Out[pl.Tensor[[512, 512], pl.FP32]]" in emitted.source
+
+    loads = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pl"
+        and node.func.attr == "load"
+    ]
+    wide_loads = [
+        node
+        for node in loads
+        if isinstance(node.args[0], ast.Name) and node.args[0].id == "arg_value"
+    ]
+    broadcast_loads = [
+        node
+        for node in loads
+        if isinstance(node.args[0], ast.Name) and node.args[0].id == "arg_gamma"
+    ]
+    assert wide_loads and broadcast_loads
+    assert all(
+        ast.unparse(node.args[3].elts[0]).startswith("pl.max(pl.min(valid_rows - ")
+        for node in wide_loads
+        if isinstance(node.args[3], ast.List)
+    )
+    assert all(
+        ast.unparse(node.args[3].elts[0]) == "1"
+        for node in broadcast_loads
+        if isinstance(node.args[3], ast.List)
+    )
+
+
+def test_callable_runtime_valid_shape_rejects_schedule_defining_variation() -> None:
+    vector_module, vector_args = build_pr2335_examples()["pr2335_rms_norm"]
+    vector_graph, vector_result = _solve_module(vector_module, vector_args)
+    with pytest.raises(SourceEmissionError, match="only outer/free axis 0"):
+        emit_pypto_callable(
+            vector_graph,
+            vector_result,
+            runtime_valid_shape=RuntimeValidShapeSpec(axis=1),
+        )
+    with pytest.raises(
+        SourceEmissionError, match="collides with a generated function identifier"
+    ):
+        emit_pypto_callable(
+            vector_graph,
+            vector_result,
+            runtime_valid_shape=RuntimeValidShapeSpec(argument_name="region_index"),
+        )
+
+    mixed_module, mixed_args = build_examples()["attention_core"]
+    mixed_graph, mixed_result = _solve_module(mixed_module, mixed_args)
+    with pytest.raises(SourceEmissionError, match="one homogeneous vector step"):
+        emit_pypto_callable(
+            mixed_graph,
+            mixed_result,
+            runtime_valid_shape=RuntimeValidShapeSpec(),
+        )
 
 
 def test_emitted_abi_binds_lifted_parameters_by_normalized_value_id() -> None:

@@ -7,6 +7,7 @@ The standalone source backend intentionally does not depend on PyPTO.  Set
 
 from __future__ import annotations
 
+import ast
 import copy
 import importlib
 import os
@@ -19,8 +20,11 @@ import torch
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
+from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
 from pto_fusebox import (
+    EmittedPyPTOCallable,
     RegionSolveResult,
+    RuntimeValidShapeSpec,
     emit_pypto_callable,
     emit_pypto_region,
     enumerate_cube_plans,
@@ -107,6 +111,281 @@ def test_callable_region_expands_inside_native_orchestration(
     _assert_single_spmd_orchestration(
         orchestration_files[0].read_text(encoding="utf-8"), 8
     )
+
+
+def _compile_callable_in_native_orchestration(
+    emitted: EmittedPyPTOCallable,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    name: str,
+) -> tuple[list[str], str]:
+    """Import a generated callable from an independent native PyPTO program."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    tree = ast.parse(emitted.source)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert len(functions) == 1
+    function = functions[0]
+    assert all(argument.annotation is not None for argument in function.args.args)
+    assert function.returns is not None
+    assert len(emitted.output_arguments) == 1
+
+    module_name = re.sub(r"\W", "_", f"generated_{name}_{tmp_path.name}")
+    (tmp_path / f"{module_name}.py").write_text(emitted.source, encoding="utf-8")
+    parameter_lines: list[str] = []
+    for argument in function.args.args:
+        assert argument.annotation is not None
+        parameter_lines.append(
+            f"        {argument.arg}: {ast.unparse(argument.annotation)},"
+        )
+    parameters = "\n".join(parameter_lines)
+    argument_names = ", ".join(argument.arg for argument in function.args.args)
+    output_name = emitted.output_arguments[0].name
+    caller = (
+        f"from {module_name} import {emitted.function_name}\n"
+        + "import pypto.language as pl\n\n\n"
+        + "@pl.program\n"
+        + f"class Native{name.title().replace('_', '')}:\n"
+        + "    @pl.function(type=pl.FunctionType.Orchestration)\n"
+        + "    def main(\n"
+        + "        self,\n"
+        + parameters
+        + "\n"
+        + f"    ) -> {ast.unparse(function.returns)}:\n"
+        + f"        {output_name} = {emitted.function_name}({argument_names})\n"
+        + f"        return {output_name}\n"
+    )
+    caller_path = tmp_path / f"native_{name}.py"
+    caller_path.write_text(caller, encoding="utf-8")
+
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / f"compiled_{name}"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto = [
+        path.read_text(encoding="utf-8") for path in compiled.output_dir.rglob("*.pto")
+    ]
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(orchestration_files) == 1
+    return pto, orchestration_files[0].read_text(encoding="utf-8")
+
+
+def test_callable_multi_step_cube_preserves_ordered_gm_cut_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = export_and_normalize(
+        _ChainedMatmul(),
+        (
+            torch.zeros(64, 128),
+            torch.zeros(128, 96),
+            torch.zeros(96, 80),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    emitted = emit_pypto_callable(
+        graph, solved.regions[0], function_name="generated_cube_chain"
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="cube_chain"
+    )
+    assert len(pto) == 2
+    assert orchestration.count("rt_submit_aic_task(") == 2
+    assert "params_t0.add_output(intermediate_tensor_2);" in orchestration
+    assert "params_t1.add_input(intermediate_tensor_2);" in orchestration
+    assert orchestration.index("rt_submit_aic_task(0") < orchestration.index(
+        "rt_submit_aic_task(1"
+    )
+
+
+def test_callable_split_k_preserves_two_phase_dependency_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = export_and_normalize(
+        _DeepKMatmul(),
+        (torch.zeros(128, 8192), torch.zeros(8192, 128)),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    region = solved.regions[0]
+    typed = scheduled_region(region).steps[0]
+    assert isinstance(typed.plan, CubeKernelPlan)
+    assert typed.plan.split_k > 1
+    emitted = emit_pypto_callable(
+        graph, region, function_name="generated_split_k_matmul"
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="split_k"
+    )
+    assert len(pto) == 2
+    assert orchestration.count("rt_submit_") == 2
+    assert orchestration.count("set_dependencies(") == 1
+    assert any("atomic_add" in source for source in pto)
+
+
+def test_callable_mixed_attention_preserves_one_split_spmd_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = export_and_normalize(
+        _AttentionCore(),
+        (
+            torch.zeros(96, 64),
+            torch.zeros(64, 64),
+            torch.zeros(64, 128),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    region = solved.regions[0]
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    emitted = emit_pypto_callable(graph, region, function_name="generated_attention")
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="mixed_attention"
+    )
+    assert len(pto) == 1
+    assert "pto.kernel_kind = #pto.kernel_kind<cube>" in pto[0]
+    assert "pto.kernel_kind = #pto.kernel_kind<vector>" in pto[0]
+    assert orchestration.count("rt_submit_task(") == 1
+    assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
+
+
+def test_callable_dense_swiglu_preserves_the_generic_mixed_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = export_and_normalize(
+        _DenseSwiGlu(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    region = solved.regions[0]
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    emitted = emit_pypto_callable(graph, region, function_name="generated_dense_swiglu")
+
+    try:
+        pto, orchestration = _compile_callable_in_native_orchestration(
+            emitted, tmp_path, monkeypatch, name="dense_swiglu"
+        )
+    except RuntimeError as error:
+        if "MemoryReuse cannot reconcile divergent L0C accumulator buffers" in str(
+            error
+        ):
+            pytest.xfail(
+                "recent PyPTO main still lacks the nested-accumulator join repair"
+            )
+        raise
+    assert len(pto) == 1
+    assert pto[0].count("pto.tpush_to_aiv") >= 2
+    assert "pto.tpush_to_aic" in pto[0]
+    assert orchestration.count("rt_submit_task(") == 1
+    assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
+
+
+def test_callable_runtime_valid_shape_lowers_without_dynamic_physical_tiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_pr2335_examples()["pr2335_rms_norm"]
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_rms_norm_chunk",
+        runtime_valid_shape=RuntimeValidShapeSpec(),
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="runtime_valid_rms"
+    )
+    assert len(pto) == 1
+    assert re.search(r"valid_row = %\d+", pto[0])
+    assert "v_row=?" in pto[0]
+    assert "rows=?" not in pto[0]
+    assert "outs(%output" in pto[0]
+    assert "!pto.partition_tensor_view<?x512xf32>" in pto[0]
+    assert orchestration.count("rt_submit_aiv_task(") == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "runtime_rows", "expected_submit"),
+    [
+        ("qwen3_rms_norm_chunk", True, "rt_submit_aiv_task("),
+        ("qwen3_lm_head_chunk", False, "rt_submit_aic_task("),
+    ],
+)
+def test_callable_qwen_static_components_lower_inside_native_orchestration(
+    name: str,
+    runtime_rows: bool,
+    expected_submit: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_qwen_examples()[name]
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name=f"generated_{name}",
+        runtime_valid_shape=RuntimeValidShapeSpec() if runtime_rows else None,
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name=name
+    )
+    assert len(pto) == 1
+    assert orchestration.count(expected_submit) == 1
+    if name == "qwen3_lm_head_chunk":
+        assert "pto.tmatmul" in pto[0]
+        assert re.search(r"loc=right, dtype=bf16, rows=80, cols=64", pto[0])
 
 
 class _SumOfSquares(nn.Module):
@@ -511,7 +790,19 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source, pto, plan = _compile_mixed_source(name, module, args, tmp_path, monkeypatch)
+    try:
+        source, pto, plan = _compile_mixed_source(
+            name, module, args, tmp_path, monkeypatch
+        )
+    except RuntimeError as error:
+        if name == "mixed_dense_swiglu" and (
+            "MemoryReuse cannot reconcile divergent L0C accumulator buffers"
+            in str(error)
+        ):
+            pytest.xfail(
+                "recent PyPTO main still lacks the nested-accumulator join repair"
+            )
+        raise
 
     assert "pl.split(pl.SplitMode.UP_DOWN" in source
     slot_counts = {fifo.slot_count for fifo in plan.fifos}

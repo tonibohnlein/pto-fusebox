@@ -18,7 +18,10 @@ from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from pto_fusebox import (
+    KernelKind,
+    RuntimeValidShapeSpec,
     can_emit_region,
+    emit_pypto_callable,
     emit_pypto_region,
     export_and_normalize,
     extract_solver_regions,
@@ -103,6 +106,16 @@ def test_basic_examples_export_as_expected(
                 "matmul",
                 "add",
             ],
+        ),
+        (
+            build_qwen_examples,
+            "qwen3_rms_norm_chunk",
+            ["mul", "sum", "mul", "add", "rsqrt", "mul", "mul", "cast"],
+        ),
+        (
+            build_qwen_examples,
+            "qwen3_lm_head_chunk",
+            ["transpose_view", "matmul"],
         ),
         (
             build_qwen_examples,
@@ -306,6 +319,86 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert f"pl.cross_core_slot(slot_num={slot_count})" in source
     assert "pl.cross_core_pipe" not in source
     assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+@pytest.mark.parametrize(
+    ("builder", "name", "expected_kind", "runtime_rows"),
+    [
+        (build_pr2335_examples, "pr2335_rms_norm", KernelKind.VECTOR, True),
+        (build_qwen_examples, "qwen3_rms_norm_chunk", KernelKind.VECTOR, True),
+        (build_qwen_examples, "qwen3_lm_head_chunk", KernelKind.CUBE, False),
+        (
+            build_static_mixed_examples,
+            "pypto_lib_static_attention",
+            KernelKind.MIXED,
+            False,
+        ),
+        (
+            build_static_mixed_examples,
+            "pypto_lib_static_dense_swiglu",
+            KernelKind.MIXED,
+            False,
+        ),
+    ],
+)
+def test_pypto_lib_comparison_regions_emit_stable_callable_abis(
+    builder,
+    name: str,
+    expected_kind: KernelKind,
+    runtime_rows: bool,
+) -> None:
+    module, args = builder()[name]
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert result.successful
+    assert result.whole_graph_codegen_ready
+    assert len(result.regions) == 1
+    emitted = emit_pypto_callable(
+        graph,
+        result.regions[0],
+        function_name=f"generated_{name}",
+        runtime_valid_shape=RuntimeValidShapeSpec() if runtime_rows else None,
+    )
+    assert emitted.kind is expected_kind
+    assert emitted.input_value_ids
+    assert emitted.output_value_ids == graph.outputs
+    assert "@pl.inline" in emitted.source
+    assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
+    if runtime_rows:
+        assert len(emitted.runtime_valid_shapes) == 1
+        assert emitted.runtime_valid_shapes[0].axis == 0
+    else:
+        assert emitted.runtime_valid_shapes == ()
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_qwen_lm_head_replays_the_transposed_weight_without_copying_it() -> None:
+    module, args = build_qwen_examples()["qwen3_lm_head_chunk"]
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    emitted = emit_pypto_callable(
+        graph, result.regions[0], function_name="generated_qwen_lm_head"
+    )
+
+    assert emitted.kind is KernelKind.CUBE
+    assert "pl.tile.transpose_view(" in emitted.source
+    assert "pl.create_tensor" not in emitted.source
 
 
 @pytest.mark.skipif(

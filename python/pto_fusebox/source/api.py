@@ -14,6 +14,7 @@ from ..schedule import (
     KernelStep,
     ScheduleContractError,
     ScheduledRegion,
+    VectorKernelPlan,
     scheduled_region,
 )
 from ..solver import RegionSolveResult
@@ -39,6 +40,28 @@ class PyPTOABIArgument:
 
     value_id: str
     name: str
+
+
+@dataclass(frozen=True)
+class RuntimeValidShapeSpec:
+    """Request one runtime logical extent over a static physical frame.
+
+    The first source contract supports only the outer/free axis of one
+    homogeneous vector region.  The solver still plans the full concrete
+    shape; native PyPTO orchestration supplies the active prefix at runtime.
+    """
+
+    axis: int = 0
+    argument_name: str = "valid_rows"
+
+
+@dataclass(frozen=True)
+class PyPTORuntimeValidShapeArgument:
+    """One scalar ABI argument bounding a statically planned tensor axis."""
+
+    name: str
+    axis: int
+    physical_extent: int
 
 
 @dataclass(frozen=True)
@@ -79,6 +102,7 @@ class EmittedPyPTOCallable:
     region_id: str
     kinds: tuple[KernelKind, ...]
     input_arguments: tuple[PyPTOABIArgument, ...]
+    runtime_valid_shapes: tuple[PyPTORuntimeValidShapeArgument, ...]
     output_arguments: tuple[PyPTOABIArgument, ...]
     source: str
 
@@ -160,6 +184,7 @@ def emit_pypto_callable(
     result: RegionSolveResult,
     *,
     function_name: str | None = None,
+    runtime_valid_shape: RuntimeValidShapeSpec | None = None,
 ) -> EmittedPyPTOCallable:
     """Emit one solver-owned schedule as a callable PyPTO inline fragment.
 
@@ -182,6 +207,17 @@ def emit_pypto_callable(
         class_name(chosen_name),
     )
     source = _program_as_inline_callable(program_source, chosen_name)
+    runtime_arguments: tuple[PyPTORuntimeValidShapeArgument, ...] = ()
+    if runtime_valid_shape is not None:
+        source, runtime_argument = _add_runtime_valid_shape(
+            source,
+            graph,
+            lowered,
+            schedule,
+            region_interface,
+            runtime_valid_shape,
+        )
+        runtime_arguments = (runtime_argument,)
     return EmittedPyPTOCallable(
         function_name=chosen_name,
         region_id=lowered.region_id,
@@ -190,6 +226,7 @@ def emit_pypto_callable(
             PyPTOABIArgument(value_id, argument)
             for value_id, argument in region_interface.input_arguments.items()
         ),
+        runtime_valid_shapes=runtime_arguments,
         output_arguments=tuple(
             PyPTOABIArgument(value_id, argument)
             for value_id, argument in region_interface.output_arguments.items()
@@ -550,10 +587,17 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     if len(classes) != 1:
         raise SourceEmissionError("generated source must contain exactly one program")
-    functions = [node for node in classes[0].body if isinstance(node, ast.FunctionDef)]
+    program = classes[0]
+    functions = [node for node in program.body if isinstance(node, ast.FunctionDef)]
     if len(functions) != 1 or functions[0].name != "main":
         raise SourceEmissionError(
             "generated program must contain exactly one main orchestration function"
+        )
+    unexpected = [node for node in program.body if node is not functions[0]]
+    if unexpected:
+        kinds = ", ".join(type(node).__name__ for node in unexpected)
+        raise SourceEmissionError(
+            "generated program class contains unexpected members: " + kinds
         )
     function = functions[0]
     if not function.args.args or function.args.args[0].arg != "self":
@@ -577,3 +621,189 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
     if _has_automatic_scheduling_tag(module):
         raise SourceEmissionError("callable source must encode the plan directly")
     return rendered
+
+
+def _add_runtime_valid_shape(  # noqa: PLR0913 -- explicit ABI contract inputs.
+    source: str,
+    graph: NormalizedGraph,
+    lowered: LoweredRegion,
+    schedule: ScheduledRegion,
+    region_interface: Interface,
+    spec: RuntimeValidShapeSpec,
+) -> tuple[str, PyPTORuntimeValidShapeArgument]:
+    """Make one vector free-axis valid extent a runtime scalar.
+
+    Physical tensor types, tiles, allocations, grids, and pipelines remain
+    byte-for-byte those selected for the concrete solver problem.  Only direct
+    GM loads of non-broadcast operands receive a clamped runtime valid extent;
+    PyPTO propagates that logical shape through vector operations and stores.
+    """
+
+    if spec.axis != 0:
+        raise SourceEmissionError(
+            "runtime valid_shape currently supports only outer/free axis 0"
+        )
+    if identifier(spec.argument_name) != spec.argument_name:
+        raise SourceEmissionError(
+            "runtime valid_shape argument must be a valid Python identifier"
+        )
+    if len(schedule.steps) != 1 or schedule.steps[0].kind is not KernelKind.VECTOR:
+        raise SourceEmissionError(
+            "runtime valid_shape currently requires one homogeneous vector step"
+        )
+    if not isinstance(schedule.steps[0].plan, VectorKernelPlan):
+        raise SourceEmissionError("runtime valid_shape requires a vector plan")
+
+    values = graph.value_map()
+    output_extents = {
+        static_shape(values[value_id], field="runtime-valid output")[spec.axis]
+        for value_id in region_interface.output_values
+    }
+    if len(output_extents) != 1:
+        raise SourceEmissionError(
+            "runtime valid_shape requires outputs with one common physical extent"
+        )
+    (physical_extent,) = output_extents
+    dynamic_inputs: set[str] = set()
+    for value_id, argument in region_interface.input_arguments.items():
+        shape = static_shape(values[value_id], field="runtime-valid input")
+        extent = shape[spec.axis]
+        if extent == physical_extent:
+            dynamic_inputs.add(argument)
+        elif extent != 1:
+            raise SourceEmissionError(
+                "runtime valid_shape input extent must match the output frame or be broadcast"
+            )
+    if not dynamic_inputs:
+        raise SourceEmissionError(
+            "runtime valid_shape has no non-broadcast input on its selected axis"
+        )
+    if spec.argument_name in {
+        *region_interface.input_arguments.values(),
+        *region_interface.output_arguments.values(),
+    }:
+        raise SourceEmissionError(
+            "runtime valid_shape argument collides with tensor ABI"
+        )
+
+    tree = ast.parse(source)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    if len(functions) != 1:
+        raise SourceEmissionError("callable source must contain exactly one function")
+    function = functions[0]
+    existing_identifiers = {argument.arg for argument in function.args.args} | {
+        node.id for node in ast.walk(function) if isinstance(node, ast.Name)
+    }
+    if spec.argument_name in existing_identifiers:
+        raise SourceEmissionError(
+            "runtime valid_shape argument collides with a generated function identifier"
+        )
+    output_names = set(region_interface.output_arguments.values())
+    output_positions = [
+        index
+        for index, argument in enumerate(function.args.args)
+        if argument.arg in output_names
+    ]
+    if len(output_positions) != len(output_names):
+        raise SourceEmissionError(
+            "callable output ABI differs from its region interface"
+        )
+    insert_at = min(output_positions)
+    function.args.args.insert(
+        insert_at,
+        ast.arg(
+            arg=spec.argument_name,
+            annotation=ast.Subscript(
+                value=ast.Attribute(
+                    value=ast.Name(id="pl", ctx=ast.Load()),
+                    attr="Scalar",
+                    ctx=ast.Load(),
+                ),
+                slice=ast.Attribute(
+                    value=ast.Name(id="pl", ctx=ast.Load()),
+                    attr="INDEX",
+                    ctx=ast.Load(),
+                ),
+                ctx=ast.Load(),
+            ),
+        ),
+    )
+
+    rewritten = 0
+
+    class RuntimeValidLoadRewriter(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:  # noqa: N802
+            nonlocal rewritten
+            self.generic_visit(node)
+            if not _is_pl_call(node, "load") or len(node.args) < 4:
+                return node
+            source_argument = node.args[0]
+            if not (
+                isinstance(source_argument, ast.Name)
+                and source_argument.id in dynamic_inputs
+            ):
+                return node
+            offsets = node.args[1]
+            valid_shape = node.args[3]
+            if not (
+                isinstance(offsets, (ast.List, ast.Tuple))
+                and isinstance(valid_shape, (ast.List, ast.Tuple))
+                and len(offsets.elts) == 2
+                and len(valid_shape.elts) == 2
+            ):
+                raise SourceEmissionError(
+                    "runtime valid_shape requires rank-two positional pl.load geometry"
+                )
+            original_valid = valid_shape.elts[spec.axis]
+            offset = offsets.elts[spec.axis]
+            valid_shape.elts[spec.axis] = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="pl", ctx=ast.Load()),
+                    attr="max",
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="pl", ctx=ast.Load()),
+                            attr="min",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            ast.BinOp(
+                                left=ast.Name(id=spec.argument_name, ctx=ast.Load()),
+                                op=ast.Sub(),
+                                right=offset,
+                            ),
+                            original_valid,
+                        ],
+                        keywords=[],
+                    ),
+                    ast.Constant(value=0),
+                ],
+                keywords=[],
+            )
+            rewritten += 1
+            return node
+
+    RuntimeValidLoadRewriter().visit(function)
+    if rewritten == 0:
+        raise SourceEmissionError("runtime valid_shape did not reach any vector load")
+    ast.fix_missing_locations(tree)
+    return (
+        ast.unparse(tree) + "\n",
+        PyPTORuntimeValidShapeArgument(
+            name=spec.argument_name,
+            axis=spec.axis,
+            physical_extent=physical_extent,
+        ),
+    )
+
+
+def _is_pl_call(node: ast.Call, name: str) -> bool:
+    return (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pl"
+        and node.func.attr == name
+    )

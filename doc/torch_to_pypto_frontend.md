@@ -62,7 +62,12 @@ python -m pip install -e ".[torch]"
 ```
 
 ```python
-from pto_fusebox import emit_pypto_callable, export_and_normalize, solve_graph
+from pto_fusebox import (
+    RuntimeValidShapeSpec,
+    emit_pypto_callable,
+    export_and_normalize,
+    solve_graph,
+)
 
 graph = export_and_normalize(module, example_args, dynamic_shapes=constraints)
 result = solve_graph(
@@ -73,7 +78,10 @@ result = solve_graph(
     require_source_codegen=True,
 )
 source = emit_pypto_callable(
-    graph, result.regions[0], function_name="fused_region"
+    graph,
+    result.regions[0],
+    function_name="fused_region",
+    runtime_valid_shape=RuntimeValidShapeSpec(),  # optional vector free-axis ABI
 )
 print(source.source)
 ```
@@ -111,6 +119,14 @@ normalized value ID and generated Python name for every ABI argument. The
 callable is an inline orchestration fragment rather than an `InCore` shortcut:
 calling it expands the exact solver-selected SPMD task graph, so multi-step,
 split-K, and mixed schedules retain their launch and dependency structure.
+`runtime_valid_shape=RuntimeValidShapeSpec()` adds a named
+`valid_rows: pl.Scalar[pl.INDEX]` argument to a single homogeneous vector
+callable. The tensor annotations and every physical tile remain the concrete
+shapes priced by the solver. Only non-broadcast GM loads receive
+`max(min(valid_rows - row_offset, planned_valid_rows), 0)`; PyPTO propagates
+that logical shape through the vector DAG and its stores. Axis 1, cube or mixed
+steps, and multi-step regions fail closed because those cases can change a
+schedule-defining contraction or crossing geometry.
 
 Native orchestration imports and calls the generated function normally:
 
@@ -120,11 +136,19 @@ from generated_region import fused_region
 @pl.program
 class Model:
     @pl.function(type=pl.FunctionType.Orchestration)
-    def main(self, x: InputType, output: pl.Out[OutputType]) -> OutputType:
+    def main(
+        self,
+        x: InputType,
+        valid_rows: pl.Scalar[pl.INDEX],
+        output: pl.Out[OutputType],
+    ) -> OutputType:
         # Runtime loops, metadata, and dispatch remain here.
-        output = fused_region(x, output)
+        output = fused_region(x, valid_rows, output)
         return output
 ```
+
+The example runner accepts `--emit-callable` to print this importable form;
+`--emit-source` retains the standalone `@pl.program` form.
 
 ### Source-backend structure and validation
 
@@ -716,10 +740,13 @@ contract instead of combining every missing feature at once. Reduced fixtures
 must preserve the production contraction dimensions, operation order, dtypes,
 and boundary semantics; model or function names must never affect planning.
 
-1. **Qwen RMSNorm and LM head as separate regions.** Capture, solve, emit, and
-   compare the vector RMSNorm and cube LM-head projection independently. This
-   is the first direct application of the silicon-closed homogeneous source
-   slices to a model component.
+1. **Qwen RMSNorm and LM head as separate regions.** The reduced
+   `qwen3_rms_norm_chunk` and `qwen3_lm_head_chunk` fixtures now capture, solve,
+   and emit independent callable vector and cube regions. The RMSNorm callable
+   carries the first runtime-valid-row ABI. The LM-head callable preserves the
+   production `[VOCAB, HIDDEN]` weight layout through a zero-copy
+   `pl.tile.transpose_view`. Silicon comparison with
+   `models/qwen3_14b/rms_lm_head.py` remains outstanding.
 2. **Qwen RMSNorm to LM head.** Solve the connected `V -> C` graph, emit the
    selected boundary, and compare it with `models/qwen3_14b/rms_lm_head.py`.
    This is the smallest model-derived one-way mixed-source target.
@@ -735,9 +762,11 @@ and boundary semantics; model or function names must never affect planning.
    pointwise DAG and exercise generic `C -> V -> C` planning and source
    emission. The experiment must not use an attention recognizer and initially
    excludes paged or sparse cache addressing.
-   `examples/torch_frontend/static_mixed.py` now exercises this complete
-   capture -> solve -> source path together with the dense SwiGLU core from the
-   next target, using reduced but legal static dimensions.
+   `examples/torch_frontend/static_mixed.py` exercises this complete capture ->
+   solve -> callable-source path together with the dense SwiGLU core from the
+   next target, using reduced but legal static dimensions. Both are compiled
+   as imports inside independent native PyPTO orchestration by the opt-in
+   integration suite.
 6. **DeepSeek MoE cut at data-dependent routing.** Schedule the dense
    normalization/router prefix and the bounded expert-local
    matmul/SwiGLU/matmul computation separately. Keep TopK, token-to-expert

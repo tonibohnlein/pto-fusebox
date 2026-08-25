@@ -102,12 +102,10 @@ def emit_cube(
         )
 
     graph_op = graph.op_map()[lowered.operation(solver_op).graph_op_id]
-    if (
-        graph_op.kind != "matmul"
-        or graph_op.attributes.get("lhs_transposed")
-        or graph_op.attributes.get("rhs_transposed")
-    ):
-        raise SourceEmissionError("cube source v1 requires a non-transposed matmul")
+    if graph_op.kind != "matmul":
+        raise SourceEmissionError("cube source v1 requires a matmul")
+    lhs_transposed = graph_op.attributes.get("lhs_transposed") is True
+    rhs_transposed = graph_op.attributes.get("rhs_transposed") is True
     lowered_op = lowered.operation(solver_op)
     op_inputs = list(lowered_op.inputs)
     op_outputs = list(lowered_op.outputs)
@@ -118,10 +116,8 @@ def emit_cube(
     )
     validate_partition_extent(m_partition, output_rows, "cube.m_partition")
     validate_partition_extent(n_partition, output_cols, "cube.n_partition")
-    lhs_value = lowered.tensor(op_inputs[0]).value_id
-    rhs_value = lowered.tensor(op_inputs[1]).value_id
-    if lhs_value not in io.input_arguments or rhs_value not in io.input_arguments:
-        raise SourceEmissionError("cube operands must be direct region inputs")
+    lhs_arg = _argument_for_cube_tensor(context, op_inputs[0])
+    rhs_arg = _argument_for_cube_tensor(context, op_inputs[1])
     if solver_tensor_for_value(lowered, io.output_allocation_owner) != op_outputs[0]:
         raise SourceEmissionError("cube matmul result must be the region output")
 
@@ -163,8 +159,6 @@ def emit_cube(
     )
     indent = 3
     coordinates = emit_partition_indices(writer, indent, m_partition, n_partition)
-    lhs_arg = io.input_arguments[lhs_value]
-    rhs_arg = io.input_arguments[rhs_value]
     _emit_cube_window(
         writer,
         indent,
@@ -176,6 +170,8 @@ def emit_cube(
         chunk,
         "0",
         first=True,
+        lhs_transposed=lhs_transposed,
+        rhs_transposed=rhs_transposed,
     )
     if full_chunks > 1:
         loop = "pl.pipeline" if stages > 1 else "pl.range"
@@ -192,6 +188,8 @@ def emit_cube(
             chunk,
             f"k_window * {chunk}",
             first=False,
+            lhs_transposed=lhs_transposed,
+            rhs_transposed=rhs_transposed,
         )
     if tail:
         _emit_cube_window(
@@ -206,6 +204,8 @@ def emit_cube(
             str(full_chunks * chunk),
             first=False,
             suffix="_tail",
+            lhs_transposed=lhs_transposed,
+            rhs_transposed=rhs_transposed,
         )
     writer.line(
         indent,
@@ -1109,26 +1109,48 @@ def _emit_cube_window(
     k_offset: str,
     *,
     first: bool,
+    lhs_transposed: bool,
+    rhs_transposed: bool,
     suffix: str = "",
 ) -> None:
     m_extent, n_extent = output_tile
+    lhs_shape = (k_extent, m_extent) if lhs_transposed else (m_extent, k_extent)
+    lhs_offset = (k_offset, row_offset) if lhs_transposed else (row_offset, k_offset)
+    rhs_shape = (n_extent, k_extent) if rhs_transposed else (k_extent, n_extent)
+    rhs_offset = (col_offset, k_offset) if rhs_transposed else (k_offset, col_offset)
     writer.line(
         indent,
-        f"lhs_mat{suffix} = pl.tile.load({lhs}, [{row_offset}, {k_offset}], "
-        f"[{m_extent}, {k_extent}], target_memory=pl.Mem.Mat)",
+        f"lhs_mat_natural{suffix} = pl.tile.load({lhs}, "
+        f"[{lhs_offset[0]}, {lhs_offset[1]}], "
+        f"[{lhs_shape[0]}, {lhs_shape[1]}], target_memory=pl.Mem.Mat)",
     )
     writer.line(
         indent,
-        f"rhs_mat{suffix} = pl.tile.load({rhs}, [{k_offset}, {col_offset}], "
-        f"[{k_extent}, {n_extent}], target_memory=pl.Mem.Mat)",
+        f"rhs_mat_natural{suffix} = pl.tile.load({rhs}, "
+        f"[{rhs_offset[0]}, {rhs_offset[1]}], "
+        f"[{rhs_shape[0]}, {rhs_shape[1]}], target_memory=pl.Mem.Mat)",
+    )
+    lhs_mat = f"lhs_mat_natural{suffix}"
+    rhs_mat = f"rhs_mat_natural{suffix}"
+    if lhs_transposed:
+        lhs_mat = f"lhs_mat{suffix}"
+        writer.line(
+            indent,
+            f"{lhs_mat} = pl.tile.transpose_view(lhs_mat_natural{suffix})",
+        )
+    if rhs_transposed:
+        rhs_mat = f"rhs_mat{suffix}"
+        writer.line(
+            indent,
+            f"{rhs_mat} = pl.tile.transpose_view(rhs_mat_natural{suffix})",
+        )
+    writer.line(
+        indent,
+        f"lhs_left{suffix} = pl.tile.move({lhs_mat}, target_memory=pl.Mem.Left)",
     )
     writer.line(
         indent,
-        f"lhs_left{suffix} = pl.tile.move(lhs_mat{suffix}, target_memory=pl.Mem.Left)",
-    )
-    writer.line(
-        indent,
-        f"rhs_right{suffix} = pl.tile.move(rhs_mat{suffix}, target_memory=pl.Mem.Right)",
+        f"rhs_right{suffix} = pl.tile.move({rhs_mat}, target_memory=pl.Mem.Right)",
     )
     if first:
         writer.line(
@@ -1140,6 +1162,19 @@ def _emit_cube_window(
             indent,
             f"accumulator = pl.tile.matmul_acc(accumulator, lhs_left{suffix}, rhs_right{suffix})",
         )
+
+
+def _argument_for_cube_tensor(context: EmissionContext, tensor: int) -> str:
+    descriptor = context.lowered.tensor(tensor)
+    value_id = (
+        descriptor.alias_of if descriptor.alias_of is not None else descriptor.value_id
+    )
+    try:
+        return context.interface.input_arguments[value_id]
+    except KeyError as error:
+        raise SourceEmissionError(
+            f"cube external tensor {tensor} ({value_id}) is not a region input"
+        ) from error
 
 
 def _validate_l0_variant(
