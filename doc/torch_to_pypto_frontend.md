@@ -119,6 +119,11 @@ normalized value ID and generated Python name for every ABI argument. The
 callable is an inline orchestration fragment rather than an `InCore` shortcut:
 calling it expands the exact solver-selected SPMD task graph, so multi-step,
 split-K, and mixed schedules retain their launch and dependency structure.
+Callable extraction requires exactly one generated program class containing
+one `main` function and no other class members. Unexpected members, multiple
+generated functions, and runtime argument names that collide with generated
+identifiers fail closed instead of being silently dropped or shadowed.
+
 `runtime_valid_shape=RuntimeValidShapeSpec()` adds a named
 `valid_rows: pl.Scalar[pl.INDEX]` argument to a single homogeneous vector
 callable. The tensor annotations and every physical tile remain the concrete
@@ -710,7 +715,7 @@ Generic one-way V2C is source-ready for materialized LHS/RHS producers, online
 softmax-to-PV K streaming, and one complete-square value used in both matmul
 roles. The last two paths have real PyPTO lowering coverage but still require
 focused silicon closure.
-The next source capabilities are ordered by contract complexity:
+The remaining source capabilities are ordered by contract complexity:
 
 1. Silicon-close online softmax-to-PV and complete-square dual-role V2C replay.
    Keep partitioned dual-role cases rejected until an explicit replication
@@ -728,9 +733,13 @@ The next source capabilities are ordered by contract complexity:
    serialized plan. Continue failing closed until that contract exists.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
-6. Integrate generated static kernels into native PyPTO orchestration through
-   stable named ABIs, beginning with a fixed physical chunk and runtime
-   `valid_shape`. Keep Types 2-5 in orchestration and outside Fusebox planning.
+6. Ground and compose the new callable ABI. A single homogeneous vector step
+   can now receive a runtime logical row extent over one fixed planned physical
+   frame; cube, mixed, multi-step, and non-row variation fail closed. Next,
+   compare the generated Qwen RMSNorm/LM-head, attention, and dense-SwiGLU
+   callables with same-shape PyPTO-lib-derived controls and compose independently
+   emitted regions under native PyPTO orchestration. Keep Types 2-5 in
+   orchestration and outside Fusebox planning.
 
 ## PyPTO-lib validation targets
 
@@ -780,6 +789,16 @@ For every target, record four independent outcomes:
 - exact solution-to-PyPTO source replay and generated-kernel compilation; and
 - silicon correctness and performance against the corresponding hand-written
   PyPTO-lib implementation when the target platform is calibrated.
+
+Performance comparisons use identical reduced shapes, dtypes, layouts,
+operation order, narrowing points, runtime/compiler revisions, and
+input/output residency. The hand-written control is frozen before silicon and
+must not copy generated source or solver-selected tile sizes. Generated and
+control arms run in a balanced paired order on the same devices. Full
+production functions with different shapes or a larger fused scope are
+reported separately and are not used to form a speed ratio. Consequently,
+reduced-region results characterize schedule quality for matching static work;
+they are not end-to-end model performance claims.
 
 Qwen3-14B and DeepSeek V4-Flash are the initial A2/A3 performance references.
 DeepSeek V4-Pro targets A5 and is suitable for structural capture tests, but no

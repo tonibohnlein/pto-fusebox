@@ -83,7 +83,7 @@ python -m pip install -e ".[torch]"
 ```python
 from pto_fusebox import (
     can_emit_region,
-    emit_pypto_region,
+    emit_pypto_callable,
     export_and_normalize,
     solve_graph,
 )
@@ -97,15 +97,33 @@ result = solve_graph(
 )
 region = result.regions[0]
 assert can_emit_region(graph, region)
-source = emit_pypto_region(graph, region)
-print(source.source)
+callable_source = emit_pypto_callable(
+    graph,
+    region,
+    function_name="fused_region",
+)
+print(callable_source.source)
 ```
 
 The current Torch reader schedules **static-shape tensor DAGs only**. It records
 symbolic tensor dimensions and their bounds for diagnostics, but any symbol
 that determines solver geometry or participates in tensor arithmetic is an
 explicit scheduling boundary. The reader does not yet specialize shape
-buckets, emit runtime dispatch, or plan dynamic physical tiles.
+buckets, emit runtime dispatch, or plan dynamic physical tiles. Native PyPTO
+orchestration owns that dynamic behavior. For an eligible single-step vector
+region, import `RuntimeValidShapeSpec` and pass
+`runtime_valid_shape=RuntimeValidShapeSpec()` to
+`emit_pypto_callable`. This adds one runtime logical-row scalar while retaining the
+solver's fixed tensor annotations, physical tiles, grid, and memory plan.
+Cube, mixed, multi-step, and non-row dynamic geometry still fail closed.
+
+`emit_pypto_callable` is the integration-oriented API: it returns one
+module-level `@pl.inline` function with stable named tensor and output
+arguments, ordered normalized value IDs for binding, and optional runtime
+logical-shape metadata. Native PyPTO orchestration imports that function and
+owns loops, metadata, dispatch, and dependencies outside the static region.
+`emit_pypto_region` remains available when a standalone generated
+`@pl.program` is more convenient.
 
 Unsupported operations remain explicit graph boundaries. The source backend
 replays supported vector, cube, and mixed steps from the selected schedule.
@@ -150,12 +168,13 @@ The earlier fork-only explicit-pipe contract was silicon-closed for one-way
 `C -> V -> C -> V` source families. It is historical validation evidence, not
 the compatibility target. PTO Fusebox now targets upstream PyPTO `main` and
 emits only its public automatic-pipe contract. On the current upstream-main
-host matrix, every mixed family except dense `C,C -> V -> C` lowers through
-real PTOAS without a Fusebox-specific PyPTO API. The dense case exposes a
-general nested-accumulator join defect in PyPTO's memory-reuse lowering; with
-the corresponding generic PyPTO regression and fix applied, all 38 opt-in
-source-integration cases pass. Current-main silicon revalidation is still
-required before replacing the historical device evidence.
+host matrix, the callable integration surface covers multi-step cube,
+single-sink split-K, mixed attention, and dense SwiGLU inside independent
+native orchestration. The dense case still exposes a general
+nested-accumulator join defect in PyPTO's memory-reuse lowering until the
+corresponding generic PyPTO repair is present. Current-main runtime-valid and
+PyPTO-lib comparison silicon revalidation is in progress; historical evidence
+is not presented as current-main closure.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized
@@ -217,8 +236,9 @@ python -m examples.torch_frontend.static_mixed
 Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`
 to also submit its supported regions to an existing solver build. Add
 `--emit-source` with `--solver` to constrain selection to the external source
-contract and print the selected PyPTO DSL. Plain solver runs keep the broader
-analytic search surface. The model
+contract and print a standalone PyPTO program. Use `--emit-callable` instead to
+print the importable `@pl.inline` form intended for native PyPTO orchestration.
+Plain solver runs keep the broader analytic search surface. The model
 examples preserve the relevant tensor algebra from `pypto-lib`; their shapes
 and, where documented in the source, dtypes are reduced for practical local
 execution. Every example matmul still satisfies `[M,K] @ [K,N] -> [M,N]`, and
@@ -253,8 +273,9 @@ current source backend—including deeper mixed cross-core plans—remain useful
 analytic evidence but fail closed instead of being approximated by source.
 
 The generated-source silicon matrix is opt-in and is not part of the default
-host suite. It covers 14 vector and 10 single-matmul cube programs, compiles
-each emitted PyPTO program once, and checks five seeded executions:
+host suite. Its reusable base matrix covers 14 vector and 10 single-matmul cube
+programs, compiles each emitted PyPTO program once, and checks five seeded
+executions:
 
 ```bash
 PTO_FUSEBOX_RUN_DEVICE_TESTS=1 \
@@ -264,11 +285,18 @@ PYTHONPATH=python:<pypto-checkout>/python \
 python -m pytest test/device/test_source_silicon.py -v
 ```
 
+The opt-in source-integration suite separately exercises callable expansion
+inside native PyPTO orchestration, including multi-step cube, split-K, mixed
+attention, dense SwiGLU, Qwen RMSNorm/LM-head components, and runtime-valid
+vector lowering. Those tests establish source and compiler contracts; focused
+two-device campaigns establish silicon correctness, stability, and
+like-for-like performance.
+
 ## Design notes
 
 - [Torch/Hugging Face to PyPTO source generation](doc/torch_to_pypto_frontend.md)
-  records the proposed PTO-Fusebox-owned external frontend, source backend, and
-  staged dynamic-shape scope.
+  documents the implemented external frontend, callable source backend, native
+  orchestration boundary, and staged static-region validation targets.
 
 ## Repository layout
 
