@@ -18,6 +18,7 @@ from examples.torch_frontend.static_mixed import (
 )
 from pto_fusebox import (
     bind_emitted_inputs,
+    emit_pypto_callable,
     KernelKind,
     ScheduleContractError,
     SourceEmissionError,
@@ -1111,6 +1112,95 @@ def test_emitted_abi_reorders_torch_inputs_by_normalized_value_id() -> None:
     assert all(
         actual is expected
         for actual, expected in zip(bound, (args[1], args[0], args[2]), strict=True)
+    )
+
+
+def test_callable_source_exposes_the_stable_named_region_abi() -> None:
+    module, args = build_examples()["attention_core"]
+    graph, result = _solve_module(module, args)
+    emitted = emit_pypto_callable(
+        graph, result, function_name="generated_attention_core"
+    )
+
+    assert emitted.function_name == "generated_attention_core"
+    assert emitted.kind is KernelKind.MIXED
+    assert tuple(argument.name for argument in emitted.input_arguments) == (
+        "arg_key",
+        "arg_query",
+        "arg_value",
+    )
+    assert tuple(argument.name for argument in emitted.output_arguments) == ("output",)
+    assert tuple(
+        graph.value_map()[value_id].name for value_id in emitted.input_value_ids
+    ) == ("key", "query", "value")
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            bind_emitted_inputs(module, graph, emitted, args),
+            (args[1], args[0], args[2]),
+            strict=True,
+        )
+    )
+
+    tree = ast.parse(emitted.source)
+    assert not any(isinstance(node, ast.ClassDef) for node in tree.body)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert len(functions) == 1
+    function = functions[0]
+    assert function.name == emitted.function_name
+    assert [argument.arg for argument in function.args.args] == [
+        "arg_key",
+        "arg_query",
+        "arg_value",
+        "output",
+    ]
+    assert ast.unparse(function.decorator_list[0]) == "pl.inline"
+    assert "pl.spmd(" in emitted.source
+    assert "pl.split(pl.SplitMode.UP_DOWN)" in emitted.source
+    assert "@pl.program" not in emitted.source
+    assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
+
+    standalone_tree = ast.parse(
+        emit_pypto_region(graph, result, program_name="generated_attention_core").source
+    )
+    standalone_class = next(
+        node for node in standalone_tree.body if isinstance(node, ast.ClassDef)
+    )
+    standalone_main = next(
+        node for node in standalone_class.body if isinstance(node, ast.FunctionDef)
+    )
+    assert ast.dump(ast.Module(body=function.body, type_ignores=[])) == ast.dump(
+        ast.Module(body=standalone_main.body, type_ignores=[])
+    )
+
+
+def test_callable_source_preserves_a_multi_step_task_graph() -> None:
+    class Fp32ChainedMatmul(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.mm(torch.mm(lhs, middle), rhs)
+
+    graph, result = _solve_module(
+        Fp32ChainedMatmul(),
+        (
+            torch.zeros(64, 128),
+            torch.zeros(128, 96),
+            torch.zeros(96, 80),
+        ),
+    )
+    emitted = emit_pypto_callable(
+        graph, result, function_name="generated_chained_matmul"
+    )
+
+    assert emitted.kinds == (KernelKind.CUBE, KernelKind.CUBE)
+    assert emitted.source.count("pl.spmd(") == 2
+    assert "intermediate_tensor_2 = pl.create_tensor" in emitted.source
+    assert emitted.source.index("for step_0_region_index") < emitted.source.index(
+        "for step_1_region_index"
     )
 
 

@@ -13,12 +13,16 @@ Symbolic tensor dimensions and bounds are retained in the normalized graph so
 capture remains faithful and future extensions have a stable boundary, but no
 symbolic region is lowered to the solver today. Shape-derived scalar values
 used by computation are preserved as explicit opaque boundaries rather than
-being approximated. Static specialization families, runtime dispatch, and
-dynamic physical tiles are not implemented.
+being approximated. PTO-Fusebox does not synthesize dynamic orchestration:
+native PyPTO orchestration remains responsible for runtime loops, metadata,
+dispatch, and logical extents, while Fusebox generates the callable static
+kernels used by that orchestration.
 
 The PyPTO DSL source backend validates a solved region as a typed schedule and
-emits an ordinary `@pl.program` with its grids, logical ownership, physical
-frames, loops, pipeline stages, operation order, and GM traffic. Each
+can emit either an ordinary standalone `@pl.program` or a module-level
+`@pl.inline` callable for native orchestration. Both forms contain the same
+grids, logical ownership, physical frames, loops, pipeline stages, operation
+order, and GM traffic. Each
 homogeneous group is one `pl.spmd(work_units)` launch; its block index selects
 one solver-owned output region. If the solver cuts a region into several
 homogeneous groups, the program creates explicit GM tensors for the cut edges
@@ -58,7 +62,7 @@ python -m pip install -e ".[torch]"
 ```
 
 ```python
-from pto_fusebox import emit_pypto_region, export_and_normalize, solve_graph
+from pto_fusebox import emit_pypto_callable, export_and_normalize, solve_graph
 
 graph = export_and_normalize(module, example_args, dynamic_shapes=constraints)
 result = solve_graph(
@@ -68,7 +72,9 @@ result = solve_graph(
     solver_workers=2,
     require_source_codegen=True,
 )
-source = emit_pypto_region(graph, result.regions[0], program_name="FusedRegion")
+source = emit_pypto_callable(
+    graph, result.regions[0], function_name="fused_region"
+)
 print(source.source)
 ```
 
@@ -79,7 +85,8 @@ The core entry points are:
 - `extract_solver_regions(graph, target) -> list[SolverRegion]`;
 - `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`;
 - `scheduled_region(result) -> ScheduledRegion`;
-- `can_emit_region(graph, result) -> bool`; and
+- `can_emit_region(graph, result) -> bool`;
+- `emit_pypto_callable(graph, result, ...) -> EmittedPyPTOCallable`; and
 - `emit_pypto_region(graph, result, ...) -> EmittedPyPTOSource`.
 
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
@@ -99,6 +106,25 @@ edge.
 `EmittedPyPTOSource.kinds` preserves the ordered engine kind of every emitted
 step; its compatibility `kind` property is populated only when all steps use
 the same engine kind.
+`EmittedPyPTOCallable.input_arguments` and `output_arguments` expose the stable
+normalized value ID and generated Python name for every ABI argument. The
+callable is an inline orchestration fragment rather than an `InCore` shortcut:
+calling it expands the exact solver-selected SPMD task graph, so multi-step,
+split-K, and mixed schedules retain their launch and dependency structure.
+
+Native orchestration imports and calls the generated function normally:
+
+```python
+from generated_region import fused_region
+
+@pl.program
+class Model:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: InputType, output: pl.Out[OutputType]) -> OutputType:
+        # Runtime loops, metadata, and dispatch remain here.
+        output = fused_region(x, output)
+        return output
+```
 
 ### Source-backend structure and validation
 
@@ -279,10 +305,10 @@ requires no opaque graph boundaries and a successful exact
 
 ## Goal and ownership
 
-PTO-Fusebox should own the complete source-to-source scheduling path:
+PTO-Fusebox owns the static source-to-source scheduling path:
 
 ```text
-PyTorch/Hugging Face module + configuration + shape constraints
+PyTorch/Hugging Face static tensor function + concrete physical shapes
         |
         v
 torch.export / FX graph capture
@@ -297,8 +323,29 @@ PTO-Fusebox AutoFuse + AutoTile planning
 PTO-Fusebox PyPTO DSL source backend
         |
         v
-ordinary PyPTO compiler and runtime
+callable static PyPTO kernel with a stable named ABI
+        |
+        v
+native PyPTO orchestration + ordinary PyPTO compiler and runtime
 ```
+
+The way forward is deliberately hybrid:
+
+- keep native PyPTO orchestration;
+- generate callable static PyPTO kernels with stable named ABIs;
+- use Fusebox for every vector, cube, or mixed static region;
+- treat `valid_shape` as a runtime parameter over a statically planned physical
+  frame; and
+- compare generated kernels against the corresponding hand-written PyPTO-lib
+  implementations.
+
+Torch functions are therefore tensor-algorithm specifications for static call
+sites, not a second orchestration language. Existing PyPTO orchestration keeps
+ownership of runtime dimensions, loops, cache metadata, indirect accesses,
+dispatch, state, and output placement. A generated kernel may accept a runtime
+logical extent through its tensor view or named scalar ABI, but its physical
+tiles, allocations, grid, pipeline, and engine assignment are fixed by the
+serialized Fusebox solution.
 
 No compiler-integrated AutoFuse pass is required for this path. The generated
 PyPTO source will contain the selected fusion boundaries, grid, propagated
@@ -455,26 +502,26 @@ FIFO must be traceable to the solution descriptor. It should publish the
 schedule report and pseudocode beside the source so users can inspect the
 decision.
 
-## Static scheduling and dynamic orchestration boundary
+## Native orchestration and static scheduling boundary
 
-PTO-Fusebox initially owns **static physical schedules**, not complete serving
-orchestration. This matches PyPTO's existing compilation model: tensor extents,
-loop bounds, work counts, offsets, and `valid_shape` may be runtime values, but
-physical UB/L1/L0 tiles, allocations, pipeline depths, and engine assignments
-remain compile-time decisions.
+PTO-Fusebox owns **static physical schedules**, not serving orchestration. This
+matches PyPTO's existing compilation model: tensor extents, loop bounds, work
+counts, offsets, and `valid_shape` may be runtime values, but physical
+UB/L1/L0 tiles, allocations, pipeline depths, and engine assignments remain
+compile-time decisions.
 
 The boundary is therefore not "static shape versus dynamic shape." It is:
 
 ```text
-model / serving orchestration
+native PyPTO model / serving orchestration
   dynamic extents, chunk and window loops, cache metadata, rank dispatch,
   opaque or external operations, data-dependent routing and sampling
                              |
                              v
-PTO-Fusebox scheduled regions
-  one connected affine tensor DAG, one selected fusion partition per region,
-  static physical tiles and memories, fixed pipeline protocols, runtime valid
-  extents and work counts where one plan is valid for the declared range
+generated PTO-Fusebox kernel call
+  stable named ABI, one connected affine tensor DAG, one selected fusion
+  partition, static physical tiles and memories, fixed pipeline protocols,
+  runtime logical valid extents over that fixed physical frame
                              |
                              v
 ordinary PyPTO compiler and runtime
@@ -487,20 +534,20 @@ kernel grids co-reside on the device. It forms and prices individual fused
 groups and preserves their dependencies; the PyPTO runtime scheduler decides
 when ready groups execute.
 
-The source-level boundary is not always a Python function boundary. Existing
+The source-level boundary is not always an existing Python function boundary.
 PyPTO-lib `@pl.jit` functions commonly contain orchestration statements around
-several static `pl.at` or `pl.spmd` regions. A future whole-model frontend must
-extract the static regions while retaining the surrounding runtime program.
-The first implementation may instead emit scheduled inline functions and leave
-their callers explicit.
+several static `pl.at` or `pl.spmd` regions. Integration identifies those
+static call sites, gives each one an explicit named ABI, and replaces only its
+implementation with generated source. The surrounding PyPTO caller remains
+explicit and authoritative.
 
 Classify a model fragment as follows:
 
 | Fragment property | Initial Fusebox treatment |
 | --- | --- |
 | Dense pointwise, reduction, or matmul DAG with static physical geometry | Plan and emit with the vector, cube, or mixed model. |
-| Runtime outer/free extent changes only region count, offsets, or the final valid tail | Use one static physical plan with runtime logical extents (planned Type 1 below). |
-| A bounded range needs materially different physical tiles or pipelines | Compile a small static family and dispatch outside the scheduled region; defer until one-plan Type 1 works. |
+| Runtime outer/free extent changes only region count, offsets, or the final valid tail | Native orchestration calls one static physical plan with a runtime logical `valid_shape`. |
+| A bounded range needs materially different physical tiles or pipelines | Native orchestration may select among explicitly generated static kernels; Fusebox plans each member independently. |
 | `pl.jit.extern` or another independently implemented device operation | Preserve as an opaque call and cut the Fusebox region at its tensor interface. |
 | Block tables, slot mappings, TopK indices, or routing values select addresses or work | Preserve as a data-dependent opaque boundary until the access and cost semantics are modeled. |
 | Distributed rank loops, cache-pool management, recurrent serving state, or token-generation control | Keep in orchestration. |
@@ -510,17 +557,18 @@ cache gathers, TopK, and routing can remain device kernels; they are opaque
 because their access graph or work cardinality is data-dependent and is not
 represented by the current dense affine model.
 
-This boundary lets Fusebox cover substantial static portions of a model before
-it can synthesize the entire model program. It also prevents dynamic metadata
-from contaminating local tile selection: cache-pool capacity may be dynamic
-while the compute performed for each fixed-size cache block remains statically
-tiled.
+This boundary lets Fusebox cover substantial static portions of a model without
+synthesizing the model program. It also prevents dynamic metadata from
+contaminating local tile selection: cache-pool capacity may be dynamic while
+the compute performed for each fixed-size cache block remains statically tiled.
 
 ## Dynamic-shape baseline
 
-This section records future design constraints. **No dynamic-shape class below
-is currently admitted by the Torch-to-solver path.** The current implementation
-retains symbolic metadata and then declines schedule-defining symbolic regions.
+This section classifies dynamic behavior that native PyPTO orchestration may
+place around generated kernels. It is not a Fusebox orchestration roadmap.
+**No dynamic-shape class below is currently admitted by the Torch-to-solver
+path.** The current implementation retains symbolic metadata and then declines
+schedule-defining symbolic regions.
 
 PyPTO supports extent-polymorphic programs, not runtime-sized hardware tiles:
 
@@ -534,21 +582,22 @@ PyPTO supports extent-polymorphic programs, not runtime-sized hardware tiles:
 - dynamic outputs are supplied explicitly rather than automatically allocated
   by the current runtime helper.
 
-Fusebox should preserve this contract. A dynamic problem is schedulable only
-when it can be expressed as static physical work plus runtime logical extents.
+The callable-kernel ABI must preserve this contract. Fusebox receives only the
+static physical work; native orchestration owns the runtime logical extents.
 
-## Planned Type 1: dynamic independent extent, static physical chunk
+## Native-orchestration case: dynamic extent, static physical chunk
 
-This is the first dynamic-shape class to support:
+This is the first integration case, but it does not make the Fusebox solver
+dynamic:
 
 ```text
 runtime:       M, number of regions, offsets, final valid extent
 compile time:  CHUNK, physical tiles, grid policy, pipeline depth, allocation
 ```
 
-For fixed `CHUNK`, Fusebox plans the per-chunk DAG as a static problem. Runtime
-`M` changes only the number of independent regions and the logical size of the
-last region:
+Native PyPTO orchestration fixes `CHUNK` and calls a generated kernel. Fusebox
+plans the per-chunk DAG as a static problem. Runtime `M` changes only the number
+of calls and the logical size of the last region:
 
 ```python
 m = pl.tensor.dim(x, 0)
@@ -558,7 +607,7 @@ for m0 in pl.range(0, m, CHUNK):
     # Statically planned DAG over physical [CHUNK, D].
 ```
 
-Initial admission requires:
+The static kernel contract requires:
 
 - the dynamic dimension is an outer/free axis whose chunks are independent;
 - all physical tile extents and memory footprints are static;
@@ -566,63 +615,56 @@ Initial admission requires:
 - the tail fits the same physical frame through `valid_shape`; and
 - no data-dependent address or branch changes the per-chunk DAG.
 
-Capacity is checked for a full chunk. Runtime work is
-`ceildiv(M, CHUNK)` regions plus the normal clamped-tail accounting. The planner
-must apply the existing wave model rather than serially multiplying a per-region
-latency when regions execute concurrently.
-
-The programmer may fix `CHUNK`, or Fusebox may enumerate a small static set for
-a representative extent, bounded range, or supplied shape distribution. The
-generated program remains extent-polymorphic. Emit multiple variants only when
-different static tiles, grids, or pipelines are materially better in different
-shape regimes.
+Capacity is checked for a full chunk. Fusebox does not price the surrounding
+runtime loop or choose its trip count. If native orchestration needs several
+physical variants, each variant is a separate concrete Fusebox input and the
+orchestration owns selection among their stable ABIs.
 
 Existing examples include dynamic-token RMSNorm, `hc_head` with a clamped final
 token tile, Qwen RMSNorm/LM-head with a dynamically trimmed cube result, and
 `hc_post` with a runtime-derived SPMD work count.
 
-## Deferred dynamic classes
+## Native-orchestration dynamic classes
 
-The following patterns exist in PyPTO and pypto-lib, but are not part of the
-first frontend milestone.
+The following patterns exist in PyPTO and PyPTO-lib. They remain native
+orchestration responsibilities rather than Fusebox scheduling milestones.
 
 ### Type 2: bounded active prefix
 
 A statically bounded tensor has a runtime active length. The program processes
 the prefix and may skip or deterministically fill the inactive suffix. DeepSeek
-`hc_post_prefill` follows this form. It needs separate active/inactive region
-accounting, but not runtime-sized physical tiles.
+`hc_post_prefill` follows this form. Native orchestration owns the
+active/inactive work; any invoked Fusebox kernel retains a static frame.
 
 ### Type 3: ragged packed batch
 
 Each request has its own runtime chunk length and tail. Total work is a sum over
 per-request extents rather than `ceildiv` of one global extent. Qwen prefill
-uses `chunk_lens`, `chunk_offsets`, and per-request `valid_shape` this way. A
-future model must represent the distribution of ragged work across waves.
+uses `chunk_lens`, `chunk_offsets`, and per-request `valid_shape` this way.
+Fusebox plans only the concrete static kernel called for each chunk.
 
 ### Type 4: dynamic recurrence length
 
 A runtime reduction or stream length controls how often a fixed physical chunk
 updates loop-carried state. Examples are paged attention's online-softmax
-tuple, Welford statistics, and a persistent cube accumulator. Supporting this
-requires an explicit recurrence state, initialization, update, finalization,
-memory-lifetime, and cost contract. It cannot be treated as independent Type-1
-regions.
+tuple, Welford statistics, and a persistent cube accumulator. Native
+orchestration owns the recurrence state and call sequence. A Fusebox region may
+implement one statically shaped initialization, update, or finalization call,
+but does not merge the dynamic recurrence into its local schedule.
 
 ### Type 5: runtime configuration selecting a static physical family
 
 Some logical dimensions, such as attention head size or cache block size,
-change the required physical kernel. Fusebox may plan a bounded family of
-static variants and emit a small host dispatcher. This is specialization, not
-a runtime-sized tile, and should be added only when one physical plan is not
-competitive over the required range.
+change the required physical kernel. Native orchestration may dispatch among a
+bounded family whose members Fusebox planned independently. Fusebox does not
+emit that dispatcher or model it as a runtime-sized tile.
 
 ### Dynamic GM capacity and metadata
 
 KV-cache rows, block-table sizes, and output extents may be runtime dimensions
-while local work remains statically tiled. These dimensions can remain symbolic
-in the boundary schema when they do not change the local schedule. They become
-one of the types above when they affect work count, tails, or recurrence length.
+while local work remains statically tiled. They remain in the orchestration
+ABI and affect offsets, work counts, tails, or recurrence there; they do not
+enter the Fusebox problem unless concretized as one physical kernel shape.
 
 ### Indirect and data-dependent access
 
@@ -662,9 +704,9 @@ The next source capabilities are ordered by contract complexity:
    serialized plan. Continue failing closed until that contract exists.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
-6. Add Type-1 dynamic outer chunks with a static physical tile and runtime
-   `valid_shape`; defer Types 2-5 until the static frontend/backend and Type 1
-   are correct on device.
+6. Integrate generated static kernels into native PyPTO orchestration through
+   stable named ABIs, beginning with a fixed physical chunk and runtime
+   `valid_shape`. Keep Types 2-5 in orchestration and outside Fusebox planning.
 
 ## PyPTO-lib validation targets
 
@@ -718,6 +760,7 @@ and device-verified.
 ## Non-goals
 
 - translating arbitrary Python control flow;
+- generating or reproducing native PyPTO orchestration from Torch;
 - recognizing model names or hard-coding FlashAttention or SwiGLU algorithms;
 - choosing quantization precision for the model author;
 - replacing the PyPTO compiler, verifier, PTOAS, or runtime scheduler;

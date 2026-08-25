@@ -24,12 +24,21 @@ from .common import (
     SourceWriter,
     class_name,
     emit_return,
+    identifier,
     interface,
     program_preamble,
     pypto_dtype,
     solver_tensor_for_value,
     static_shape,
 )
+
+
+@dataclass(frozen=True)
+class PyPTOABIArgument:
+    """One stable normalized-value-to-PyPTO-name ABI binding."""
+
+    value_id: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,42 @@ class EmittedPyPTOSource:
     @property
     def kind(self) -> KernelKind | None:
         """Return the uniform kind, or ``None`` for a cross-kind program."""
+
+        unique = set(self.kinds)
+        return next(iter(unique)) if len(unique) == 1 else None
+
+
+@dataclass(frozen=True)
+class EmittedPyPTOCallable:
+    """One callable static schedule for use by native PyPTO orchestration.
+
+    The source defines a module-level ``@pl.inline`` function.  Calling it from
+    a native orchestration function expands the exact solver-owned SPMD task
+    graph at that call site; it does not invoke a second scheduler.
+    """
+
+    function_name: str
+    region_id: str
+    kinds: tuple[KernelKind, ...]
+    input_arguments: tuple[PyPTOABIArgument, ...]
+    output_arguments: tuple[PyPTOABIArgument, ...]
+    source: str
+
+    @property
+    def input_value_ids(self) -> tuple[str, ...]:
+        """Return normalized input IDs in callable signature order."""
+
+        return tuple(argument.value_id for argument in self.input_arguments)
+
+    @property
+    def output_value_ids(self) -> tuple[str, ...]:
+        """Return normalized output IDs in callable signature order."""
+
+        return tuple(argument.value_id for argument in self.output_arguments)
+
+    @property
+    def kind(self) -> KernelKind | None:
+        """Return the uniform kind, or ``None`` for a cross-kind callable."""
 
         unique = set(self.kinds)
         return next(iter(unique)) if len(unique) == 1 else None
@@ -106,6 +151,49 @@ def emit_pypto_region(
         kinds=tuple(step.kind for step in schedule.steps),
         input_value_ids=tuple(region_interface.input_arguments),
         output_value_ids=tuple(region_interface.output_arguments),
+        source=source,
+    )
+
+
+def emit_pypto_callable(
+    graph: NormalizedGraph,
+    result: RegionSolveResult,
+    *,
+    function_name: str | None = None,
+) -> EmittedPyPTOCallable:
+    """Emit one solver-owned schedule as a callable PyPTO inline fragment.
+
+    Native PyPTO orchestration remains responsible for runtime control flow and
+    output allocation.  The callable expands only the selected static task
+    graph, including every SPMD launch and dependency carried by the schedule.
+    """
+
+    try:
+        lowered, schedule, region_interface = _emission_contract(graph, result)
+    except (LoweredContractError, ScheduleContractError) as error:
+        raise SourceEmissionError(str(error)) from error
+    chosen_name = identifier(function_name or f"fused_{result.region.id}")
+    program_source = _render_region(
+        graph,
+        result.problem,
+        lowered,
+        schedule,
+        region_interface,
+        class_name(chosen_name),
+    )
+    source = _program_as_inline_callable(program_source, chosen_name)
+    return EmittedPyPTOCallable(
+        function_name=chosen_name,
+        region_id=lowered.region_id,
+        kinds=tuple(step.kind for step in schedule.steps),
+        input_arguments=tuple(
+            PyPTOABIArgument(value_id, argument)
+            for value_id, argument in region_interface.input_arguments.items()
+        ),
+        output_arguments=tuple(
+            PyPTOABIArgument(value_id, argument)
+            for value_id, argument in region_interface.output_arguments.items()
+        ),
         source=source,
     )
 
@@ -453,3 +541,39 @@ def _has_automatic_scheduling_tag(tree: ast.AST) -> bool:
                     }:
                         return True
     return False
+
+
+def _program_as_inline_callable(source: str, function_name: str) -> str:
+    """Convert one generated orchestration program into an inline callable."""
+
+    tree = ast.parse(source)
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    if len(classes) != 1:
+        raise SourceEmissionError("generated source must contain exactly one program")
+    functions = [node for node in classes[0].body if isinstance(node, ast.FunctionDef)]
+    if len(functions) != 1 or functions[0].name != "main":
+        raise SourceEmissionError(
+            "generated program must contain exactly one main orchestration function"
+        )
+    function = functions[0]
+    if not function.args.args or function.args.args[0].arg != "self":
+        raise SourceEmissionError("generated main function must start with self")
+    function.name = function_name
+    function.args.args = function.args.args[1:]
+    function.decorator_list = [
+        ast.Attribute(
+            value=ast.Name(id="pl", ctx=ast.Load()),
+            attr="inline",
+            ctx=ast.Load(),
+        )
+    ]
+    module = ast.Module(
+        body=[node for node in tree.body if not isinstance(node, ast.ClassDef)]
+        + [function],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    rendered = ast.unparse(module) + "\n"
+    if _has_automatic_scheduling_tag(module):
+        raise SourceEmissionError("callable source must encode the plan directly")
+    return rendered

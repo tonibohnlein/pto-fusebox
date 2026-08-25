@@ -21,6 +21,7 @@ from examples.torch_frontend.pr2335_vector import (
 )
 from pto_fusebox import (
     RegionSolveResult,
+    emit_pypto_callable,
     emit_pypto_region,
     enumerate_cube_plans,
     export_and_normalize,
@@ -46,6 +47,66 @@ pytestmark = pytest.mark.skipif(
 class _PointwiseChain(nn.Module):
     def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         return torch.maximum(torch.exp(lhs * 0.5) + rhs, rhs)
+
+
+def test_callable_region_expands_inside_native_orchestration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated callable contributes its exact SPMD task to a native program."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    module = _PointwiseChain()
+    args = (torch.zeros(96, 320), torch.ones(96, 320))
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_pointwise",
+    )
+    module_name = re.sub(r"\W", "_", f"generated_{tmp_path.name}")
+    (tmp_path / f"{module_name}.py").write_text(emitted.source, encoding="utf-8")
+    caller = (
+        f"from {module_name} import generated_pointwise\n"
+        + "import pypto.language as pl\n\n\n"
+        + "@pl.program\n"
+        + "class NativeOrchestration:\n"
+        + "    @pl.function(type=pl.FunctionType.Orchestration)\n"
+        + "    def main(\n"
+        + "        self,\n"
+        + "        arg_lhs: pl.Tensor[[96, 320], pl.FP32],\n"
+        + "        arg_rhs: pl.Tensor[[96, 320], pl.FP32],\n"
+        + "        output: pl.Out[pl.Tensor[[96, 320], pl.FP32]],\n"
+        + "    ) -> pl.Tensor[[96, 320], pl.FP32]:\n"
+        + "        output = generated_pointwise(arg_lhs, arg_rhs, output)\n"
+        + "        return output\n"
+    )
+    caller_path = tmp_path / "native_orchestration.py"
+    caller_path.write_text(caller, encoding="utf-8")
+
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / "callable_pointwise"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"), 8
+    )
 
 
 class _SumOfSquares(nn.Module):

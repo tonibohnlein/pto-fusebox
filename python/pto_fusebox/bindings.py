@@ -11,7 +11,7 @@ from torch import nn
 from .ir import NormalizedGraph
 
 if TYPE_CHECKING:
-    from .source import EmittedPyPTOSource
+    from .source import EmittedPyPTOCallable, EmittedPyPTOSource
 
 
 class InputBindingError(ValueError):
@@ -21,15 +21,15 @@ class InputBindingError(ValueError):
 def bind_emitted_inputs(
     module: nn.Module,
     graph: NormalizedGraph,
-    emitted: EmittedPyPTOSource,
+    emitted: EmittedPyPTOSource | EmittedPyPTOCallable,
     user_inputs: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, ...]:
-    """Return tensors in the exact order of the emitted ``main`` signature.
+    """Return tensors in the exact order of the emitted region signature.
 
     Torch positional arguments, lifted parameters, and lifted buffers are first
     associated with stable normalized value IDs.  The result is then ordered by
-    :attr:`EmittedPyPTOSource.input_value_ids`.  This avoids assuming that
-    solver lowering preserves the original Torch argument order.
+    the emitted object's ``input_value_ids``.  This avoids assuming that solver
+    lowering preserves the original Torch argument order.
 
     Constant tensors that are not module parameters or buffers remain outside
     this initial binding contract and fail closed.
