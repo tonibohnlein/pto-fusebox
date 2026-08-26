@@ -5,6 +5,11 @@ decode implementations.  The MLP follows the gate/up/SiLU/down ordering in
 Qwen and DeepSeek dense or expert MLPs.  Shapes are reduced for repeatable
 local capture while retaining legal 910B cube dimensions, dtypes, and operation
 order.  Neither graph carries a model-name or algorithm recognizer hint.
+
+The two C2V epilogues deliberately use the same two-op DAG at different
+shapes.  The small case has one mixed item.  The streamed case has 24 spatial
+items but uses 12 1-AIC + 2-AIV groups, giving each group two successor items
+for the cross-core stage-2 pipeline.
 """
 
 from __future__ import annotations
@@ -27,6 +32,18 @@ class StaticAttentionCore(nn.Module):
         scores = torch.mm(query, key.t())
         probabilities = torch.softmax(scores, dim=-1)
         return torch.mm(probabilities, value)
+
+
+class StaticC2VEpilogue(nn.Module):
+    """One Cube matmul followed by a broadcast Vector epilogue."""
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(value, weight) + bias
 
 
 class StaticAttentionResidual(nn.Module):
@@ -82,6 +99,30 @@ def build_examples() -> dict[str, Example]:
         swiglu.up_weight.normal_(std=0.25)
         swiglu.down_weight.normal_(std=0.25)
     return {
+        "mixed_c2v_single_item": (
+            StaticC2VEpilogue(),
+            (
+                torch.randn(32, 64) * 0.1,
+                torch.randn(64, 32) * 0.1,
+                torch.randn(1, 32) * 0.1,
+            ),
+        ),
+        "mixed_c2v_streamed_groups": (
+            StaticC2VEpilogue(),
+            (
+                torch.randn(384, 64) * 0.1,
+                torch.randn(64, 256) * 0.1,
+                torch.randn(1, 256) * 0.1,
+            ),
+        ),
+        "mixed_cvc_streamed_groups": (
+            StaticAttentionCore(),
+            (
+                torch.randn(384, 64) * 0.1,
+                torch.randn(64, 64) * 0.1,
+                torch.randn(64, 128) * 0.1,
+            ),
+        ),
         "pypto_lib_static_attention": (
             StaticAttentionCore(),
             (

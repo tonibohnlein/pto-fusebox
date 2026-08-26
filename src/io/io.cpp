@@ -1006,7 +1006,7 @@ std::string solution_json(const Solution& sol) {
             step.subgraph.is_mixed()
                 ? step.subgraph.mixed_schedule_plan(
                       cfg, sol.retained_entering(i), step.retain_these,
-                      cost.parallel_split)
+                      cost.parallel_split, cost.mixed_active_groups)
                 : MixedSchedulePlan{};
 
         json serialized_step;

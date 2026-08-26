@@ -180,7 +180,9 @@ def _emit_one_way_c2v(
         plan.algorithm is not MixedAlgorithm.GENERIC
         or plan.mode is not MixedPipelineMode.ONE_WAY
         or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
-        or plan.pipeline_stages != 1
+        or plan.pipeline_stages not in {1, 2}
+        or (plan.pipeline_stages == 2) is not plan.overlap_implementable
+        or plan.requested_skew_depth != plan.pipeline_stages - 1
         or len(plan.stages) != 2
         or tuple(stage.engine for stage in plan.stages)
         != (MixedEngine.CUBE, MixedEngine.VECTOR)
@@ -211,9 +213,11 @@ def _emit_one_way_c2v(
     writer = _mixed_header(context, program_name, plan)
     output = context.interface.output_argument
     trips = plan.max_trips_per_group
+    trip_loop = "pl.pipeline" if plan.pipeline_stages == 2 else "pl.range"
+    trip_stage = ", stage=2" if plan.pipeline_stages == 2 else ""
     writer.line(
         3,
-        f"for mixed_trip, (output_iter,) in pl.range({trips}, "
+        f"for mixed_trip, (output_iter,) in {trip_loop}({trips}{trip_stage}, "
         f"init_values=({output},)):",
     )
     row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
@@ -262,7 +266,9 @@ def _emit_one_way_v2c(
         plan.algorithm is not MixedAlgorithm.GENERIC
         or plan.mode is not MixedPipelineMode.ONE_WAY
         or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
-        or plan.pipeline_stages != 1
+        or plan.pipeline_stages not in {1, 2}
+        or (plan.pipeline_stages == 2) is not plan.overlap_implementable
+        or plan.requested_skew_depth != plan.pipeline_stages - 1
         or len(plan.stages) != 2
         or tuple(stage.engine for stage in plan.stages)
         != (MixedEngine.VECTOR, MixedEngine.CUBE)
@@ -318,9 +324,12 @@ def _emit_one_way_v2c(
 
     writer = _mixed_header(context, program_name, plan)
     output = context.interface.output_argument
+    trip_loop = "pl.pipeline" if plan.pipeline_stages == 2 else "pl.range"
+    trip_stage = ", stage=2" if plan.pipeline_stages == 2 else ""
     writer.line(
         3,
-        f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
+        f"for mixed_trip, (output_iter,) in {trip_loop}"
+        f"({plan.max_trips_per_group}{trip_stage}, "
         f"init_values=({output},)):",
     )
     row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")

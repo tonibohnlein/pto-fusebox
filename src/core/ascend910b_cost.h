@@ -190,7 +190,8 @@ public:
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev = {},
       const FlatSet<size_t> &retain_these = {},
-      int64_t parallel_split = 1) const;
+      int64_t parallel_split = 1,
+      int64_t active_groups = 0) const;
 
   // Vector (UB) pebble peak — the dynamic on-chip working set of a vector
   // subgraph, the analog of cube_peak_l1 for the cube. Each tensor's tile
@@ -309,7 +310,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev,
       const FlatSet<size_t> &retain_these,
-      int64_t parallel_split) const;
+      int64_t parallel_split,
+      int64_t active_groups) const;
 
   // Analytic one-way V->C contract in which the vector stage produces one or
   // both sink-matmul operands. Bit 0 denotes LHS ([spatial-M, full-K]); bit 1
@@ -324,6 +326,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev,
       const FlatSet<size_t> &retain_these) const;
+
+  CostResult compute_mixed_cost_for_groups(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these,
+      int64_t active_groups) const;
 
   CostResult compute_dense_mlp_cost(const TileConfig& cfg, const MixedSchedulePlan& schedule) const;
 

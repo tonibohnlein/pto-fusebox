@@ -661,6 +661,8 @@ def _compile_mixed_source(
     args: tuple[torch.Tensor, ...],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    forced_active_groups: int | None = None,
 ) -> tuple[str, str, MixedKernelPlan]:
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
@@ -675,10 +677,32 @@ def _compile_mixed_source(
     )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
-    plan = scheduled_region(solved.regions[0]).steps[0].plan
+    region = solved.regions[0]
+    if forced_active_groups is not None:
+        assert region.solution is not None
+        solution = copy.deepcopy(region.solution)
+        step = solution["steps"][0]
+        descriptor = step["plan"]
+        assert descriptor["protocol"] == "one_way"
+        spatial_tiles = descriptor["spatial_tiles"]
+        assert spatial_tiles % forced_active_groups == 0
+        trips = spatial_tiles // forced_active_groups
+        assert trips >= 2
+        descriptor["active_groups"] = forced_active_groups
+        descriptor["min_trips_per_group"] = trips
+        descriptor["max_trips_per_group"] = trips
+        descriptor["pipeline_stages"] = 2
+        descriptor["requested_skew_depth"] = 1
+        descriptor["model_overlap_granted"] = True
+        descriptor["overlap_implementable"] = True
+        step["launch"]["cores"] = forced_active_groups * (
+            1 + descriptor["vector_lanes"]
+        )
+        region = replace(region, solution=solution)
+    plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
 
-    source = emit_pypto_region(graph, solved.regions[0], program_name=name).source
+    source = emit_pypto_region(graph, region, program_name=name).source
     compiled = ir.compile(
         pl.parse_program(source),
         output_dir=str(tmp_path / name),
@@ -697,6 +721,28 @@ def _compile_mixed_source(
     return source, pto_files[0].read_text(encoding="utf-8"), plan
 
 
+def test_nonstreaming_v2c_stage_two_lowers_through_pypto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, pto, plan = _compile_mixed_source(
+        "mixed_v2c_stage_two",
+        _V2COnly(),
+        (torch.zeros(96, 64), torch.zeros(64, 128)),
+        tmp_path,
+        monkeypatch,
+        forced_active_groups=2,
+    )
+    assert plan.spatial_tiles == 4
+    assert plan.active_groups == 2
+    assert plan.max_trips_per_group == 2
+    assert plan.pipeline_stages == 2
+    assert "pl.pipeline(2, stage=2" in source
+    assert "pto.tpush_to_aic" in pto
+    assert "pto.tpop_from_aiv" in pto
+    assert "pto.tfree_from_aiv" in pto
+
+
 @pytest.mark.parametrize(
     ("name", "module", "args"),
     [
@@ -707,6 +753,15 @@ def _compile_mixed_source(
                 torch.zeros(32, 64),
                 torch.zeros(64, 32),
                 torch.zeros(1, 32),
+            ),
+        ),
+        (
+            "mixed_c2v_streamed_groups",
+            _C2VEpilogue(),
+            (
+                torch.zeros(384, 64),
+                torch.zeros(64, 256),
+                torch.zeros(1, 256),
             ),
         ),
         (
@@ -748,6 +803,15 @@ def _compile_mixed_source(
             _AttentionCore(),
             (
                 torch.zeros(96, 64),
+                torch.zeros(64, 64),
+                torch.zeros(64, 128),
+            ),
+        ),
+        (
+            "mixed_attention_streamed_groups",
+            _AttentionCore(),
+            (
+                torch.zeros(384, 64),
                 torch.zeros(64, 64),
                 torch.zeros(64, 128),
             ),
@@ -838,6 +902,22 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
     if name == "mixed_c2v":
         assert "pto.tcolexpandadd" in pto
         assert "pto.tadd" not in pto
+    if name == "mixed_c2v_streamed_groups":
+        assert plan.spatial_tiles == 24
+        assert plan.active_groups == 12
+        assert plan.max_trips_per_group == 2
+        assert plan.pipeline_stages == 2
+        assert plan.requested_skew_depth == 1
+        assert plan.overlap_implementable
+        assert "pl.pipeline(2, stage=2" in source
+    if name == "mixed_attention_streamed_groups":
+        assert plan.spatial_tiles == 16
+        assert plan.active_groups == 8
+        assert plan.max_trips_per_group == 2
+        assert plan.pipeline_stages == 3
+        assert plan.requested_skew_depth == 2
+        assert plan.overlap_implementable
+        assert "pl.pipeline(2, stage=3" in source
 
 
 def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(

@@ -1413,6 +1413,11 @@ def _validate_mixed_contract(  # noqa: PLR0913
         or plan.active_groups > plan.group_capacity
     ):
         raise ScheduleContractError(f"{field} has inconsistent mixed work-unit counts")
+    expected_launch_cores = plan.active_groups * (1 + plan.vector_lanes)
+    if launch.cores != expected_launch_cores:
+        raise ScheduleContractError(
+            f"{field} launch cores differ from its mixed group participation"
+        )
     if plan.min_trips_per_group != plan.max_trips_per_group:
         raise ScheduleContractError(
             f"{field} source-ready mixed replay requires a uniform group loop"
@@ -1436,6 +1441,40 @@ def _validate_mixed_contract(  # noqa: PLR0913
         )
     if len(plan.stages) != len(plan.topology_stages) or not plan.stages:
         raise ScheduleContractError(f"{field} stage descriptors are incomplete")
+    phase_local_vector_pipeline = (
+        plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+        and plan.stages[0].engine is MixedEngine.VECTOR
+        and plan.stages[0].vector_stream is not None
+        and plan.stages[0].vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
+    )
+    successor_overlap = plan.max_trips_per_group >= 2
+    if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
+        expected_overlap = successor_overlap and not phase_local_vector_pipeline
+        expected_stages = 2 if expected_overlap else 1
+        if (
+            plan.model_overlap_granted != expected_overlap
+            or plan.overlap_implementable != expected_overlap
+            or plan.pipeline_fill_absorbed
+            or plan.pipeline_stages != expected_stages
+            or plan.requested_skew_depth != expected_stages - 1
+        ):
+            raise ScheduleContractError(
+                f"{field} one-way pipeline depth differs from its successor loop"
+            )
+    if plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
+        expected_fill_absorbed = (
+            successor_overlap and plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP
+        )
+        if (
+            plan.pipeline_stages != 3
+            or plan.requested_skew_depth != 2
+            or plan.model_overlap_granted != successor_overlap
+            or plan.overlap_implementable != successor_overlap
+            or plan.pipeline_fill_absorbed != expected_fill_absorbed
+        ):
+            raise ScheduleContractError(
+                f"{field} round-trip pipeline differs from its successor loop"
+            )
     if tuple(stage.topology_stage for stage in plan.stages) != tuple(
         range(len(plan.stages))
     ):

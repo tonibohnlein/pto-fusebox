@@ -14,6 +14,7 @@ from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from examples.torch_frontend.static_mixed import (
+    StaticAttentionCore,
     build_examples as build_static_mixed_examples,
 )
 from pto_fusebox import (
@@ -1435,6 +1436,199 @@ def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     assert source.count("pl.tensor.assemble(") == 1
 
 
+def test_one_way_c2v_can_stream_successor_items_on_fewer_mixed_groups() -> None:
+    graph = export_and_normalize(
+        _C2VEpilogue(),
+        (
+            torch.zeros(384, 64),
+            torch.zeros(64, 256),
+            torch.zeros(1, 256),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    result = solved.regions[0]
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+    assert step.plan.active_groups < min(
+        step.plan.spatial_tiles, step.plan.group_capacity
+    )
+    assert step.plan.max_trips_per_group >= 2
+    assert step.plan.pipeline_stages == 2
+    assert step.plan.requested_skew_depth == 1
+    assert step.plan.model_overlap_granted
+    assert step.plan.overlap_implementable
+
+    source = emit_pypto_region(graph, result, program_name="c2v_streamed").source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    assert (
+        f"pl.pipeline({step.plan.max_trips_per_group}, stage=2, init_values=(output,))"
+    ) in source
+
+
+@pytest.mark.parametrize(
+    ("active_groups", "trips", "pipeline_stages"),
+    [(24, 1, 1), (6, 4, 2)],
+)
+def test_one_way_c2v_replays_frozen_group_count_controls(
+    active_groups: int,
+    trips: int,
+    pipeline_stages: int,
+) -> None:
+    graph = export_and_normalize(
+        _C2VEpilogue(),
+        (
+            torch.zeros(384, 64),
+            torch.zeros(64, 256),
+            torch.zeros(1, 256),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    result = solved.regions[0]
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    step = solution["steps"][0]
+    plan = step["plan"]
+    assert plan["spatial_tiles"] == 24
+    assert plan["protocol"] == "one_way"
+    plan["active_groups"] = active_groups
+    plan["min_trips_per_group"] = trips
+    plan["max_trips_per_group"] = trips
+    plan["pipeline_stages"] = pipeline_stages
+    plan["requested_skew_depth"] = pipeline_stages - 1
+    plan["model_overlap_granted"] = trips >= 2
+    plan["overlap_implementable"] = trips >= 2
+    step["launch"]["cores"] = active_groups * 3
+
+    forced = replace(result, solution=solution)
+    forced_plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(forced_plan, MixedKernelPlan)
+    assert can_emit_region(graph, forced)
+    source = emit_pypto_region(
+        graph,
+        forced,
+        program_name=f"c2v_groups_{active_groups}",
+    ).source
+    _assert_single_spmd_grid(source, active_groups)
+    if pipeline_stages == 2:
+        assert f"pl.pipeline({trips}, stage=2" in source
+    else:
+        assert "pl.pipeline(" not in source
+        assert f"pl.range({trips}, init_values=(output,))" in source
+
+    inconsistent = copy.deepcopy(solution)
+    inconsistent_plan = inconsistent["steps"][0]["plan"]
+    inconsistent_overlap = trips < 2
+    inconsistent_plan["model_overlap_granted"] = inconsistent_overlap
+    inconsistent_plan["overlap_implementable"] = inconsistent_overlap
+    inconsistent_plan["pipeline_stages"] = 2 if inconsistent_overlap else 1
+    inconsistent_plan["requested_skew_depth"] = 1 if inconsistent_overlap else 0
+    with pytest.raises(
+        ScheduleContractError,
+        match="one-way pipeline depth differs from its successor loop",
+    ):
+        scheduled_region(replace(result, solution=inconsistent))
+
+
+@pytest.mark.parametrize(("active_groups", "trips"), [(16, 1), (4, 4)])
+def test_cvc_replays_frozen_group_count_controls(
+    active_groups: int,
+    trips: int,
+) -> None:
+    graph = export_and_normalize(
+        StaticAttentionCore(),
+        (
+            torch.zeros(384, 64),
+            torch.zeros(64, 64),
+            torch.zeros(64, 128),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    result = solved.regions[0]
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    step = solution["steps"][0]
+    plan = step["plan"]
+    assert plan["spatial_tiles"] == 16
+    assert plan["protocol"] == "single_round_trip_bundle"
+    plan["active_groups"] = active_groups
+    plan["min_trips_per_group"] = trips
+    plan["max_trips_per_group"] = trips
+    plan["model_overlap_granted"] = trips >= 2
+    plan["overlap_implementable"] = trips >= 2
+    plan["pipeline_fill_absorbed"] = trips >= 2
+    step["launch"]["cores"] = active_groups * 3
+
+    forced = replace(result, solution=solution)
+    forced_plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(forced_plan, MixedKernelPlan)
+    assert can_emit_region(graph, forced)
+    source = emit_pypto_region(
+        graph,
+        forced,
+        program_name=f"cvc_groups_{active_groups}",
+    ).source
+    _assert_single_spmd_grid(source, active_groups)
+    assert f"pl.pipeline({trips}, stage=3" in source
+
+    inconsistent = copy.deepcopy(solution)
+    inconsistent_plan = inconsistent["steps"][0]["plan"]
+    inconsistent_overlap = trips < 2
+    inconsistent_plan["model_overlap_granted"] = inconsistent_overlap
+    inconsistent_plan["overlap_implementable"] = inconsistent_overlap
+    inconsistent_plan["pipeline_fill_absorbed"] = inconsistent_overlap
+    with pytest.raises(
+        ScheduleContractError,
+        match="round-trip pipeline differs from its successor loop",
+    ):
+        scheduled_region(replace(result, solution=inconsistent))
+
+
+def test_mixed_plan_rejects_launch_participation_drift() -> None:
+    graph = export_and_normalize(
+        _C2VEpilogue(),
+        (
+            torch.zeros(32, 64),
+            torch.zeros(64, 32),
+            torch.zeros(1, 32),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    result = solved.regions[0]
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    solution["steps"][0]["launch"]["cores"] -= 1
+    with pytest.raises(
+        ScheduleContractError,
+        match="launch cores differ from its mixed group participation",
+    ):
+        scheduled_region(replace(result, solution=solution))
+
+
 def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> None:
     graph, result = _solve_module(
         _DenseSwiGlu(),
@@ -1627,6 +1821,38 @@ def test_one_way_v2c_emits_vector_producer_and_matmul_consumer(
     assert source.count("pl.tensor.assemble(") == 1
 
 
+def test_one_way_v2c_replays_a_frozen_stage_two_group_loop() -> None:
+    graph, result = _solve_module(
+        _V2COnly(),
+        (torch.zeros(96, 64), torch.zeros(64, 128)),
+    )
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    step = solution["steps"][0]
+    plan = step["plan"]
+    assert plan["spatial_tiles"] == 4
+    plan["active_groups"] = 2
+    plan["min_trips_per_group"] = 2
+    plan["max_trips_per_group"] = 2
+    plan["pipeline_stages"] = 2
+    plan["requested_skew_depth"] = 1
+    plan["model_overlap_granted"] = True
+    plan["overlap_implementable"] = True
+    step["launch"]["cores"] = 6
+
+    forced = replace(result, solution=solution)
+    forced_plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(forced_plan, MixedKernelPlan)
+    assert can_emit_region(graph, forced)
+    source = emit_pypto_region(
+        graph,
+        forced,
+        program_name="v2c_stage_two",
+    ).source
+    _assert_single_spmd_grid(source, 2)
+    assert "pl.pipeline(2, stage=2" in source
+
+
 @pytest.mark.parametrize(
     ("module", "external_role"),
     [(_V2CSharedLhs(), "rhs"), (_V2CSharedRhs(), "lhs")],
@@ -1681,6 +1907,29 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     assert source.count("pl.tensor.matmul_acc(") == 2
     assert "apply_tail" in source
     assert f"valid_shape=[16, {apply_phase.tail.extent}]" in source
+
+
+def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:
+    graph, result = _solve_module(
+        _StreamingSoftmaxPv(),
+        (torch.zeros(768, 4096), torch.zeros(4096, 64)),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.spatial_tiles == 48
+    assert plan.active_groups == 24
+    assert plan.max_trips_per_group == 2
+    assert plan.pipeline_stages == 1
+    assert not plan.model_overlap_granted
+    assert not plan.overlap_implementable
+
+    source = emit_pypto_region(
+        graph,
+        result,
+        program_name="streaming_softmax_pv_phase_local",
+    ).source
+    assert "pl.range(2, init_values=(output,))" in source
+    assert "for apply_chunk, (sink_acc,) in pl.pipeline(" in source
 
 
 def test_one_way_v2c_dual_role_uses_one_complete_fifo_panel() -> None:

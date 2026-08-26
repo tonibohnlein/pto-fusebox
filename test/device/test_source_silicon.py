@@ -11,12 +11,13 @@ without searching device results for favorable shapes or tolerances.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from examples.torch_frontend.static_mixed import (
 from torch import nn
 
 from pto_fusebox import (
+    RegionSolveResult,
     bind_emitted_inputs,
     can_emit_region,
     emit_pypto_region,
@@ -67,6 +69,7 @@ class SiliconCase:
     rtol: float = 1.0e-4
     atol: float = 1.0e-4
     mixed_contract: str | None = None
+    forced_mixed_groups: int | None = None
 
 
 class PointwiseChain(nn.Module):
@@ -316,11 +319,28 @@ MIXED_CASES = (
         atol=1.0e-4,
     ),
     SiliconCase(
+        "mixed_c2v_streamed_groups_384x64x256",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((384, 64), (64, 256), (1, 256), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="c2v_streamed_groups",
+    ),
+    SiliconCase(
         "mixed_v2c_lhs_96x64x128",
         "mixed",
         V2CLhs(),
         _random_args((96, 64), (64, 128), scale=0.1),
         mixed_contract="v2c_lhs",
+    ),
+    SiliconCase(
+        "mixed_v2c_lhs_stage2_96x64x128",
+        "mixed",
+        V2CLhs(),
+        _random_args((96, 64), (64, 128), scale=0.1),
+        mixed_contract="v2c_lhs_streamed_groups",
+        forced_mixed_groups=2,
     ),
     SiliconCase(
         "mixed_v2c_rhs_96x64x128",
@@ -350,6 +370,15 @@ MIXED_CASES = (
         _random_args((96, 64), (64, 64), (64, 128), scale=0.1),
         rtol=1.0e-4,
         atol=1.0e-4,
+    ),
+    SiliconCase(
+        "mixed_qk_softmax_pv_streamed_groups_384x64x128",
+        "mixed",
+        StaticAttentionCore(),
+        _random_args((384, 64), (64, 64), (64, 128), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="cvc_streamed_groups",
     ),
     SiliconCase(
         "mixed_dense_swiglu_128x64x128x64",
@@ -401,7 +430,9 @@ def _assert_static_artifact(
     case: SiliconCase,
     plan: CubeKernelPlan | MixedKernelPlan | VectorKernelPlan,
 ) -> None:
-    work_units = plan.work_units
+    work_units = (
+        plan.active_groups if isinstance(plan, MixedKernelPlan) else plan.work_units
+    )
     output_dir = Path(getattr(compiled, "output_dir"))
     pto_files = list(output_dir.rglob("*.pto"))
     assert len(pto_files) == 1
@@ -442,7 +473,7 @@ def _assert_static_artifact(
     assert "region_index" not in orchestration
 
 
-def _assert_v2c_contract(
+def _assert_mixed_contract(
     case: SiliconCase,
     plan: CubeKernelPlan | MixedKernelPlan | VectorKernelPlan,
     source: str,
@@ -451,15 +482,43 @@ def _assert_v2c_contract(
         return
     assert isinstance(plan, MixedKernelPlan)
     assert plan.source_codegen_ready
+    if case.mixed_contract == "cvc_streamed_groups":
+        assert len(plan.fifos) == 2
+        assert plan.spatial_tiles == 16
+        assert plan.active_groups == 8
+        assert plan.max_trips_per_group == 2
+        assert plan.pipeline_stages == 3
+        assert plan.requested_skew_depth == 2
+        assert plan.overlap_implementable
+        assert "pl.pipeline(2, stage=3" in source
+        return
     assert len(plan.fifos) == 1
     fifo = plan.fifos[0]
+    if case.mixed_contract == "c2v_streamed_groups":
+        assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+        assert plan.spatial_tiles == 24
+        assert plan.active_groups == 12
+        assert plan.max_trips_per_group == 2
+        assert plan.pipeline_stages == 2
+        assert plan.requested_skew_depth == 1
+        assert plan.overlap_implementable
+        assert "pl.pipeline(2, stage=2" in source
+        return
+    if case.mixed_contract == "v2c_lhs_streamed_groups":
+        assert plan.spatial_tiles == 4
+        assert plan.active_groups == 2
+        assert plan.max_trips_per_group == 2
+        assert plan.pipeline_stages == 2
+        assert plan.requested_skew_depth == 1
+        assert plan.overlap_implementable
+        assert "pl.pipeline(2, stage=2" in source
     assert fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
     assert fifo.slot_count == 8
     assert fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count
     assert len(plan.stages) == 2
     assert plan.stages[0].vector_stream is not None
 
-    if case.mixed_contract == "v2c_lhs":
+    if case.mixed_contract in {"v2c_lhs", "v2c_lhs_streamed_groups"}:
         assert fifo.spatial_m and not fifo.spatial_n
     elif case.mixed_contract == "v2c_rhs":
         assert not fifo.spatial_m and fifo.spatial_n
@@ -514,6 +573,30 @@ def _assert_numerics(
     )
 
 
+def _force_one_way_mixed_groups(
+    result: RegionSolveResult,
+    active_groups: int,
+) -> RegionSolveResult:
+    assert result.solution is not None
+    solution = copy.deepcopy(result.solution)
+    step = solution["steps"][0]
+    plan = step["plan"]
+    assert plan["protocol"] == "one_way"
+    spatial_tiles = plan["spatial_tiles"]
+    assert spatial_tiles % active_groups == 0
+    trips = spatial_tiles // active_groups
+    assert trips >= 2
+    plan["active_groups"] = active_groups
+    plan["min_trips_per_group"] = trips
+    plan["max_trips_per_group"] = trips
+    plan["pipeline_stages"] = 2
+    plan["requested_skew_depth"] = 1
+    plan["model_overlap_granted"] = True
+    plan["overlap_implementable"] = True
+    step["launch"]["cores"] = active_groups * (1 + plan["vector_lanes"])
+    return replace(result, solution=solution)
+
+
 def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     pl = importlib.import_module("pypto.language")
     runtime = importlib.import_module("pypto.runtime")
@@ -529,6 +612,11 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     region = solved.regions[0]
+    if case.forced_mixed_groups is not None:
+        region = _force_one_way_mixed_groups(
+            region,
+            case.forced_mixed_groups,
+        )
     assert can_emit_region(graph, region)
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, (CubeKernelPlan, MixedKernelPlan, VectorKernelPlan))
@@ -537,7 +625,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     assert emitted.kind.value == case.kind
     assert "auto_fuse" not in emitted.source
     assert "auto_tile" not in emitted.source
-    _assert_v2c_contract(case, plan, emitted.source)
+    _assert_mixed_contract(case, plan, emitted.source)
 
     program = pl.parse_program(emitted.source)
     config = runtime.RunConfig(

@@ -6630,7 +6630,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     const TileConfig &cfg,
     const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these,
-    int64_t parallel_split) const {
+    int64_t parallel_split,
+    int64_t active_groups) const {
   MixedSchedulePlan plan;
   plan.config = cfg;
   if (!(has_matmul_ && has_vector_) || !mixed_topology_) return plan;
@@ -6673,7 +6674,9 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
 
   if (plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
     const DenseMlpResources resources = derive_dense_mlp_resources(cfg);
-    if (!resources.feasible || split != 1 || plan.spatial_tiles > plan.group_capacity) {
+    if (!resources.feasible || split != 1 ||
+        plan.spatial_tiles > plan.group_capacity ||
+        (active_groups > 0 && active_groups != plan.spatial_tiles)) {
       plan.feasible = false;
       return plan;
     }
@@ -6757,16 +6760,24 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     plan.vector_lanes = 2;
   }
 
-  // This reproduces the legacy assignment exactly: use every available group
-  // before issuing a second item to any group. It intentionally exposes the
-  // current fidelity gap -- two global tiles on two groups are not two
-  // successor items in one group's inner pipeline.
+  // A spatial tile is one complete cross-engine pipeline item.  The selected
+  // number of 1-AIC + 2-AIV groups is independent of the tile grid: assigning
+  // several tiles to one group creates the successor items required for
+  // cross-core skew.  A zero override preserves the historical maximum-group
+  // mapping for direct plan inspection; compute_mixed_cost() evaluates every
+  // uniform group count and records its winner in CostResult.
   plan.loop.axis = MixedPipelineAxis::SpatialRegion;
   plan.loop.extent = plan.spatial_tiles;
   plan.loop.chunk = 1;
   plan.loop.items_per_spatial_tile = 1;
   plan.loop.work_items = plan.spatial_tiles;
-  plan.loop.active_groups = std::min(plan.spatial_tiles, plan.group_capacity);
+  const int64_t max_groups = std::min(plan.spatial_tiles, plan.group_capacity);
+  if (active_groups < 0 || active_groups > max_groups ||
+      (active_groups > 0 && plan.loop.work_items % active_groups != 0)) {
+    plan.feasible = false;
+    return plan;
+  }
+  plan.loop.active_groups = active_groups > 0 ? active_groups : max_groups;
   plan.loop.min_trips_per_group =
       plan.loop.work_items / std::max<int64_t>(1, plan.loop.active_groups);
   plan.loop.max_trips_per_group =
@@ -6781,14 +6792,28 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   const bool sequential_multi_round_trip =
       plan.algorithm == MixedAlgorithmKind::Generic &&
       plan.protocol == MixedCrossCoreProtocol::MultiRoundTripSequential;
+  const bool one_way =
+      plan.algorithm == MixedAlgorithmKind::Generic &&
+      plan.protocol == MixedCrossCoreProtocol::OneWay;
   const bool vector_to_cube = vector_to_cube_mask != 0;
-  plan.loop.pipeline_stages = single_round_trip ? 3 : 1;
-  plan.loop.requested_skew_depth = single_round_trip ? 2 : 0;
-
-  plan.overlap_implementable =
+  const VectorStreamPlan vector_to_cube_stream =
+      vector_to_cube_mask == 1
+          ? vector_to_cube_stream_plan(cfg, plan.vector_lanes)
+          : VectorStreamPlan{};
+  const bool phase_local_vector_pipeline =
+      vector_to_cube_stream.feasible &&
+      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const bool uniform_successors =
       plan.emit_compatible && !sequential_multi_round_trip &&
+      !phase_local_vector_pipeline &&
       plan.loop.min_trips_per_group >= 2 &&
       plan.loop.min_trips_per_group == plan.loop.max_trips_per_group;
+  plan.loop.pipeline_stages =
+      single_round_trip ? 3 : (one_way && uniform_successors ? 2 : 1);
+  plan.loop.requested_skew_depth =
+      single_round_trip ? 2 : (one_way && uniform_successors ? 1 : 0);
+
+  plan.overlap_implementable = uniform_successors;
   plan.model_overlap_granted = plan.overlap_implementable;
   plan.pipeline_fill_absorbed =
       mixed_topology_->sink_runs_early_stage && plan.model_overlap_granted;
@@ -6868,9 +6893,10 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
     const TileConfig &cfg,
     const FlatSet<size_t> &retained_from_prev,
     const FlatSet<size_t> &retain_these,
-    int64_t parallel_split) const {
+    int64_t parallel_split,
+    int64_t active_groups) const {
   MixedSchedulePlan plan = derive_mixed_schedule_plan(
-      cfg, retained_from_prev, retain_these, parallel_split);
+      cfg, retained_from_prev, retain_these, parallel_split, active_groups);
   if (plan.feasible) {
     if (plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
       const MixedDenseMlpTopology& mlp = mixed_topology_->dense_mlp;
@@ -7246,6 +7272,7 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
   result.l1l0_extract = static_cast<double>(chunks) * (2.0 * gate_extract + down_extract);
   result.compute_bound = std::max(cube_compute, vector_compute) >= result.ddr_traffic;
   result.parallel_split = 1;
+  result.mixed_active_groups = static_cast<int>(groups);
   result.cores_used = static_cast<int>(groups * (1 + schedule.vector_lanes));
   result.num_spatial_tiles = static_cast<int>(schedule.spatial_tiles);
   result.num_k_passes = static_cast<int>(chunks);
@@ -7256,6 +7283,65 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
 CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
                                               const FlatSet<size_t>& retained_from_prev,
                                               const FlatSet<size_t>& retain_these) const {
+  const MixedSchedulePlan maximal = derive_mixed_schedule_plan(
+      cfg, retained_from_prev, retain_these, /*parallel_split=*/1,
+      /*active_groups=*/0);
+  if (!maximal.feasible) {
+    CostResult infeasible;
+    infeasible.config = cfg;
+    return infeasible;
+  }
+  if (maximal.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
+    return compute_dense_mlp_cost(cfg, maximal);
+  }
+
+  const int vector_to_cube_mask = vector_to_cube_operand_mask();
+  const VectorStreamPlan vector_to_cube_stream =
+      vector_to_cube_mask != 0
+          ? vector_to_cube_stream_plan(cfg, maximal.vector_lanes)
+          : VectorStreamPlan{};
+  const bool streamed_vector_to_cube =
+      vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
+      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const bool group_tunable =
+      !streamed_vector_to_cube &&
+      (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
+       maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle);
+  if (!group_tunable) {
+    return compute_mixed_cost_for_groups(
+        cfg, retained_from_prev, retain_these,
+        maximal.loop.active_groups);
+  }
+
+  // Active mixed groups are a schedule decision, not an alias for the spatial
+  // grid.  Enumerate every group count that assigns the same number of complete
+  // cross-engine items to each group.  This lets a larger tile grid use fewer
+  // 1-AIC + 2-AIV groups when the additional successor trips amortize launch
+  // overhead and enable a real FIFO-skewed pipeline.
+  CostResult best;
+  const int64_t max_groups = std::min(
+      maximal.loop.work_items, maximal.group_capacity);
+  for (int64_t groups = 1; groups <= max_groups; ++groups) {
+    if (maximal.loop.work_items % groups != 0) continue;
+    CostResult candidate = compute_mixed_cost_for_groups(
+        cfg, retained_from_prev, retain_these, groups);
+    if (!candidate.feasible) continue;
+    const double tolerance =
+        1e-9 * std::max(1.0, std::min(best.latency, candidate.latency));
+    const bool take =
+        !best.feasible || candidate.latency < best.latency - tolerance ||
+        (std::abs(candidate.latency - best.latency) <= tolerance &&
+         candidate.mixed_active_groups > best.mixed_active_groups);
+    if (take) best = candidate;
+  }
+  return best;
+}
+
+CostResult Ascend910BCost::compute_mixed_cost_for_groups(
+    const TileConfig& cfg,
+    const FlatSet<size_t>& retained_from_prev,
+    const FlatSet<size_t>& retain_these,
+    int64_t active_groups) const {
   // ===== MIXED cube+vector kernel — 910B DDR-streamed, latency hidden =====
   // Cube ops run on the cube pool and vector ops on the vector pool CONCURRENTLY.
   // A cube↔vector intermediate cannot stay on chip (910B has no direct Acc→Vec
@@ -7271,7 +7357,8 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
   CostResult result;
   result.config = cfg;
   const MixedSchedulePlan schedule =
-      derive_mixed_schedule_plan(cfg, retained_from_prev, retain_these, 1);
+      derive_mixed_schedule_plan(cfg, retained_from_prev, retain_these,
+                                 /*parallel_split=*/1, active_groups);
   // Mixed kernels need BOTH on-chip pools (L1/L0c for the cube stage, UB for the
   // vector stage) — fits_on_chip dispatches to mixed_fits_on_chip here. A large
   // shared tile that overflows UB is infeasible to fuse even when the separate
@@ -7280,6 +7367,8 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
   if (schedule.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
     return compute_dense_mlp_cost(cfg, schedule);
   }
+  result.mixed_active_groups =
+      static_cast<int>(schedule.loop.active_groups);
   const int vector_to_cube_mask = vector_to_cube_operand_mask();
   const bool vector_to_cube = vector_to_cube_mask != 0;
   const VectorStreamPlan vector_to_cube_stream =

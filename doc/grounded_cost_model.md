@@ -393,9 +393,9 @@ one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpC
 3-stage: wall = max( cube_stage, vec_stage, ddr_lat )     # fill absorbed (output unit busy from t=0)
 serial:  wall = max( cube_stage + vec_stage, ddr_lat )    # unsupported FIFO topology; no skewed max
 
-lat       = wall + rounds · kernel_fill_cost              # per-LAUNCH fill — added to BOTH shapes
-rounds    = ceil(num_tiles / num_cube_cores)              # unit-rounds over the grid
-eff_units = min(num_tiles, num_cube_cores)                # atomic resource = 1 cube : 2 vector unit
+lat       = wall + kernel_fill_cost + groups · task_cost  # one launch; block overhead follows groups
+trips     = num_tiles / groups                            # uniform successor items per mixed group
+groups    = selected divisor of num_tiles, at most 24     # each group = 1 cube : 2 vector cores
 ```
 
 Grounded by pto-isa **`mixed_tile_study`** (7 experiments; the study is the *evidence*, this
@@ -420,12 +420,16 @@ an imbalanced fusion pays only one tiny non-bottleneck tile. In `v→c→v`/`c�
 busy from `t=0`, making fill zero. Detection is structural: the sink unit must have an early-stage
 op independent of the opposite unit. Counting sink-unit ops is wrong: `c→v→v` still idles initially.
 
-Absorption also requires **`num_tiles >= 2`**: one tile has no successor to skew and the measured
-overlap factor is zero, so its cross-term becomes `cube_stage + vec_stage`. This matters for
-low-batch flash decode. *Mid-band caveat:* `one_*_tile` does not shrink while `rounds == 1`, slightly
-over-crediting compute-bound partial overlap. More fundamentally, total tiles are not per-group
-trips; `MixedSchedulePlan` must choose active groups and a real inner loop. Full attention needs a
-key-chunk axis distinct from its query grid.
+Absorption requires **at least two successor items on every active group**. One tile per group has
+nothing to skew and the measured overlap factor is zero, so its cross-term becomes
+`cube_stage + vec_stage`. The generic planner therefore evaluates every uniform divisor of the
+spatial item count up to the 24-group hardware capacity. For example, 24 items may run as 24 groups
+with one serial item each or 12 groups with two cross-core-pipelined items each. The selected group
+count is serialized and the source emitter uses it for both `pl.spmd(groups)` and the inner
+`pl.pipeline(trips, stage=2)` C→V/V→C loop. This matters for low-batch flash decode and other
+underfilled grids. Full attention additionally needs a key-chunk axis distinct from its query grid;
+streaming softmax→PV already carries that phase-local axis and is not reinterpreted as a spatial
+successor loop.
 
 **Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
 pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed

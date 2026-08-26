@@ -151,6 +151,12 @@ def test_model_examples_form_one_supported_region(
 @pytest.mark.parametrize(
     ("name", "expected_kinds"),
     [
+        ("mixed_c2v_single_item", ["matmul", "add"]),
+        ("mixed_c2v_streamed_groups", ["matmul", "add"]),
+        (
+            "mixed_cvc_streamed_groups",
+            ["transpose_view", "matmul", "max", "sub", "exp", "sum", "div", "matmul"],
+        ),
         (
             "pypto_lib_static_attention",
             ["transpose_view", "matmul", "max", "sub", "exp", "sum", "div", "matmul"],
@@ -282,6 +288,9 @@ def test_attention_solver_selects_complete_cube_vector_cube_group() -> None:
 @pytest.mark.parametrize(
     "name",
     [
+        "mixed_c2v_single_item",
+        "mixed_c2v_streamed_groups",
+        "mixed_cvc_streamed_groups",
         "pypto_lib_static_attention",
         "pypto_lib_static_dense_swiglu",
         "pypto_lib_static_attention_residual",
@@ -304,10 +313,13 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert len(result.regions) == 1
     region = result.regions[0]
     assert region.problem is not None
-    # Source planning refines the analytic result instead of perturbing it: all
-    # three natural winners are already source-ready, so no constrained retry
-    # should replace their selected schedules.
-    assert region.problem["require_source_codegen"] is False
+    # The larger C2V example deliberately exercises the source-constrained
+    # mixed planner: its unconstrained winner overcommits the C2V FIFO ring,
+    # while the retried winner is the emitted 12-group x 2-trip schedule.  The
+    # remaining examples are source-ready without replacing their winner.
+    assert region.problem["require_source_codegen"] is (
+        name == "mixed_c2v_streamed_groups"
+    )
     assert can_emit_region(graph, region)
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
@@ -319,6 +331,69 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert f"pl.cross_core_slot(slot_num={slot_count})" in source
     assert "pl.cross_core_pipe" not in source
     assert "auto_fuse" not in source and "auto_tile" not in source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_mixed_examples_discriminate_single_item_from_cross_core_streaming() -> None:
+    plans: dict[str, MixedKernelPlan] = {}
+    sources: dict[str, str] = {}
+    for name in ("mixed_c2v_single_item", "mixed_c2v_streamed_groups"):
+        module, args = build_static_mixed_examples()[name]
+        graph = export_and_normalize(module, args)
+        result = solve_graph(
+            graph,
+            solver_binary=_test_solver(),
+            solver_workers=2,
+            require_source_codegen=True,
+        )
+        assert result.successful
+        region = result.regions[0]
+        plan = scheduled_region(region).steps[0].plan
+        assert isinstance(plan, MixedKernelPlan)
+        plans[name] = plan
+        sources[name] = emit_pypto_region(graph, region, program_name=name).source
+
+    single = plans["mixed_c2v_single_item"]
+    assert single.spatial_tiles == 1
+    assert single.active_groups == 1
+    assert single.max_trips_per_group == 1
+    assert single.pipeline_stages == 1
+    assert not single.overlap_implementable
+    assert "pl.pipeline(" not in sources["mixed_c2v_single_item"]
+
+    streamed = plans["mixed_c2v_streamed_groups"]
+    assert streamed.spatial_tiles == 24
+    assert streamed.active_groups == 12
+    assert streamed.max_trips_per_group == 2
+    assert streamed.pipeline_stages == 2
+    assert streamed.requested_skew_depth == 1
+    assert streamed.overlap_implementable
+    assert "pl.pipeline(2, stage=2" in sources["mixed_c2v_streamed_groups"]
+
+    module, args = build_static_mixed_examples()["mixed_cvc_streamed_groups"]
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert result.successful
+    region = result.regions[0]
+    round_trip = scheduled_region(region).steps[0].plan
+    assert isinstance(round_trip, MixedKernelPlan)
+    assert round_trip.spatial_tiles == 16
+    assert round_trip.active_groups == 8
+    assert round_trip.max_trips_per_group == 2
+    assert round_trip.pipeline_stages == 3
+    assert round_trip.requested_skew_depth == 2
+    assert round_trip.overlap_implementable
+    round_trip_source = emit_pypto_region(
+        graph, region, program_name="mixed_cvc_streamed_groups"
+    ).source
+    assert "pl.pipeline(2, stage=3" in round_trip_source
 
 
 @pytest.mark.skipif(

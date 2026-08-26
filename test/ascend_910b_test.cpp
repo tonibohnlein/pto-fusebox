@@ -1324,7 +1324,8 @@ static void test_mixed_pipeline_stages() {
         if (analytic) {
             const CostResult cost = analytic->best_cost();
             const MixedSchedulePlan plan =
-                analytic->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+                analytic->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split,
+                                               cost.mixed_active_groups);
         CHECK("MIXSTAGE: pointwise depth-3 plan is source-ready and receives no skew overlap",
                   cost.feasible && plan.feasible &&
                       plan.mode == MixedPipelineMode::MultiRoundTripSequential &&
@@ -1358,7 +1359,8 @@ static void test_mixed_pipeline_stages() {
         if (mixed) {
             const CostResult cost = mixed->best_cost();
             const MixedSchedulePlan plan =
-                mixed->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split);
+                mixed->mixed_schedule_plan(cost.config, {}, {}, cost.parallel_split,
+                                           cost.mixed_active_groups);
             CHECK("MIXSTAGE: RHS reply propagates N rather than M through both first pipes",
                   cost.feasible && plan.feasible && plan.source_codegen_ready &&
                       plan.fifos.size() == 3 &&
@@ -1370,10 +1372,12 @@ static void test_mixed_pipeline_stages() {
 }
 
 // MixedSchedulePlan is the cost/emit handoff: same-engine stage topology is
-// candidate-invariant, while the fixed candidate supplies the 24-group mapping
-// and actual per-group pipeline trips. In particular, two GLOBAL tiles assigned
-// one-per-group do not form a two-item pipeline on either group.  The model and
-// emit bits must agree; there is no longer a legacy optimistic grant.
+// candidate-invariant, while the fixed candidate supplies the selected group
+// mapping and actual per-group pipeline trips. In particular, two GLOBAL tiles
+// assigned one-per-group do not form a two-item pipeline on either group. The
+// model may instead assign several complete items to fewer 1-AIC + 2-AIV groups;
+// those successor items form the cross-core pipeline. The model and emit bits
+// must agree; there is no longer a legacy optimistic grant.
 static void test_mixed_schedule_plan() {
     std::cout << "[MIXPLAN] mixed stage topology and per-group pipeline trips\n";
     const Tensor sq{128, 128};
@@ -1411,7 +1415,43 @@ static void test_mixed_schedule_plan() {
           forty_eight_tiles.feasible && forty_eight_tiles.spatial_tiles == 48 &&
               forty_eight_tiles.loop.active_groups == 24 && forty_eight_tiles.loop.min_trips_per_group == 2 &&
               forty_eight_tiles.loop.max_trips_per_group == 2 && forty_eight_tiles.model_overlap_granted &&
-              forty_eight_tiles.overlap_implementable);
+              forty_eight_tiles.overlap_implementable &&
+              forty_eight_tiles.loop.pipeline_stages == 2 &&
+              forty_eight_tiles.loop.requested_skew_depth == 1);
+
+    auto twelve_groups = mixed->mixed_schedule_plan(
+        TileConfig{16, 32, 128, 6, 8, 1}, {}, {}, /*parallel_split=*/1,
+        /*active_groups=*/12);
+    CHECK("MIXPLAN: 12 groups stream four complete C->V items each",
+          twelve_groups.feasible && twelve_groups.loop.active_groups == 12 &&
+              twelve_groups.loop.min_trips_per_group == 4 &&
+              twelve_groups.loop.max_trips_per_group == 4 &&
+              twelve_groups.loop.pipeline_stages == 2 &&
+              twelve_groups.overlap_implementable);
+
+    auto uneven_groups = mixed->mixed_schedule_plan(
+        TileConfig{16, 32, 128, 6, 8, 1}, {}, {}, /*parallel_split=*/1,
+        /*active_groups=*/10);
+    CHECK("MIXPLAN: a non-uniform group assignment fails closed",
+          !uneven_groups.feasible);
+
+    Problem overhead_limited = p;
+    overhead_limited.per_task_overhead_cycles = 1000000;
+    DAG overhead_dag = DAG::build(overhead_limited);
+    auto overhead_mixed =
+        Ascend910BMixed::create(overhead_limited, overhead_dag, {0, 1, 2});
+    const TileConfig streamed_cfg{16, 32, 128, 6, 8, 1};
+    const CostResult overhead_cost = overhead_mixed->compute_cost(streamed_cfg);
+    const MixedSchedulePlan overhead_plan = overhead_mixed->mixed_schedule_plan(
+        streamed_cfg, {}, {}, overhead_cost.parallel_split,
+        overhead_cost.mixed_active_groups);
+    CHECK("MIXPLAN: per-group overhead can select fewer pipelined groups",
+          overhead_cost.feasible && overhead_cost.mixed_active_groups > 0 &&
+              overhead_cost.mixed_active_groups < 24 && overhead_plan.feasible &&
+              overhead_plan.loop.active_groups ==
+                  overhead_cost.mixed_active_groups &&
+              overhead_plan.loop.min_trips_per_group >= 2 &&
+              overhead_plan.loop.pipeline_stages == 2);
   }
 
   // C->V->V->C remains one round trip: the two connected vector operations
@@ -1471,7 +1511,7 @@ static void test_mixed_schedule_plan() {
     if (mixed) {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
-          cost.config, {}, {}, cost.parallel_split);
+          cost.config, {}, {}, cost.parallel_split, cost.mixed_active_groups);
       CHECK("MIXPLAN: round-trip C->V FIFO retains full intermediate axis",
             cost.feasible && plan.feasible && plan.source_codegen_ready &&
                 plan.protocol ==
@@ -1528,7 +1568,7 @@ static void test_mixed_schedule_plan() {
     if (mixed) {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
-          cost.config, {}, {}, cost.parallel_split);
+          cost.config, {}, {}, cost.parallel_split, cost.mixed_active_groups);
       CHECK("MIXPLAN: LHS V->C is source-ready with its directional descriptor",
             cost.feasible && plan.feasible && plan.emit_compatible &&
                 plan.source_codegen_ready && plan.split_k == 1 &&
@@ -1566,7 +1606,7 @@ static void test_mixed_schedule_plan() {
     if (mixed) {
       const CostResult cost = mixed->best_cost();
       const auto plan = mixed->mixed_schedule_plan(
-          cost.config, {}, {}, cost.parallel_split);
+          cost.config, {}, {}, cost.parallel_split, cost.mixed_active_groups);
       CHECK("MIXPLAN: RHS V->C is source-ready with K-by-N FIFO geometry",
             cost.feasible && plan.feasible && plan.source_codegen_ready &&
                 plan.split_k == 1 && plan.stages.size() == 2 &&
@@ -1610,7 +1650,9 @@ static void test_mixed_schedule_plan() {
                 plan.vector_lanes == 2 && plan.fifos.size() == 1 &&
                 plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
                 plan.fifos[0].slot_bytes == 32 * 32 * 4 && plan.fifos[0].slot_count == 8 &&
-                plan.fifos[0].reserved_bytes == 8 * 32 * 32 * 4 && plan.loop.pipeline_stages == 1);
+                plan.fifos[0].reserved_bytes == 8 * 32 * 32 * 4 &&
+                plan.loop.pipeline_stages == 2 &&
+                plan.loop.requested_skew_depth == 1);
     }
 
     Problem too_wide = p;
@@ -2255,7 +2297,8 @@ static void test_mixed_flash_attention() {
     if (softmax_pv) {
         const CostResult partial_cost = softmax_pv->best_cost();
         const MixedSchedulePlan partial_plan = softmax_pv->mixed_schedule_plan(
-            partial_cost.config, {}, {}, partial_cost.parallel_split);
+            partial_cost.config, {}, {}, partial_cost.parallel_split,
+            partial_cost.mixed_active_groups);
         CHECK("MIXFA: streamed softmax->PV publishes its exact apply chunk",
               partial_cost.feasible && partial_plan.feasible &&
                   partial_plan.source_codegen_ready &&
@@ -2301,7 +2344,8 @@ static void test_mixed_flash_attention() {
         const CostResult source_cost = source_softmax_pv->best_cost();
         const MixedSchedulePlan source_plan =
             source_softmax_pv->mixed_schedule_plan(
-                source_cost.config, {}, {}, source_cost.parallel_split);
+                source_cost.config, {}, {}, source_cost.parallel_split,
+                source_cost.mixed_active_groups);
         CHECK("MIXFA: source-constrained softmax->PV has a feasible winner",
               source_cost.feasible);
         CHECK("MIXFA: source-constrained softmax->PV is source ready",
