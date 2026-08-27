@@ -213,7 +213,8 @@ public:
                          const FlatSet<size_t> &retained_from_prev = {},
                          const FlatSet<size_t> &retain_these = {},
                          int64_t reduce_chunk = INT64_MAX,
-                         int stream_axis = 0) const;
+                         int stream_axis = 0,
+                         bool include_reduction_workspaces = true) const;
 
   // Solver-owned vector sub-stream specification. Candidate costing derives it
   // as a stack-local value; final-solution/forced-plan consumers call this again
@@ -266,6 +267,14 @@ public:
   // modeled costs, then force one for the device emit and measure its latency. Not on the solver
   // hot path.
   std::vector<std::pair<TileConfig, CostResult>> enumerate_plans() const;
+
+  // Enumerate every uniform active-group divisor for one concrete mixed tile
+  // configuration, including the production per-pipe and launch breakdown.
+  // This is diagnostic/model-grounding API and is never used by local search.
+  std::vector<MixedGroupCostCandidate> enumerate_mixed_group_costs(
+      const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev = {},
+      const FlatSet<size_t> &retain_these = {}) const;
 
 
   Ascend910BCost() = default;
@@ -331,9 +340,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       const TileConfig &cfg,
       const FlatSet<size_t> &retained_from_prev,
       const FlatSet<size_t> &retain_these,
-      int64_t active_groups) const;
+      int64_t active_groups,
+      MixedCostBreakdown *breakdown = nullptr) const;
 
-  CostResult compute_dense_mlp_cost(const TileConfig& cfg, const MixedSchedulePlan& schedule) const;
+  CostResult compute_dense_mlp_cost(
+      const TileConfig& cfg, const MixedSchedulePlan& schedule,
+      MixedCostBreakdown* breakdown = nullptr) const;
 
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
   //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)

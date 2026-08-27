@@ -10,6 +10,15 @@ from .cube_sweep import (
     enumerate_cube_plans,
     region_for_cube_candidate,
 )
+from .mixed_sweep import (
+    MIXED_GROUP_SWEEP_SCHEMA,
+    MixedCostBreakdown,
+    MixedGroupCandidate,
+    MixedGroupSweep,
+    MixedGroupTile,
+    enumerate_mixed_group_plans,
+    region_for_mixed_group_candidate,
+)
 from .ir import (
     NORMALIZED_GRAPH_SCHEMA,
     PROBLEM_SCHEMA,
@@ -82,6 +91,13 @@ __all__ = [
     "emit_pypto_callable",
     "emit_pypto_region",
     "enumerate_cube_plans",
+    "MIXED_GROUP_SWEEP_SCHEMA",
+    "MixedCostBreakdown",
+    "MixedGroupCandidate",
+    "MixedGroupSweep",
+    "MixedGroupTile",
+    "enumerate_mixed_group_plans",
+    "region_for_mixed_group_candidate",
     "extract_solver_regions",
     "normalize_exported",
     "region_for_cube_candidate",

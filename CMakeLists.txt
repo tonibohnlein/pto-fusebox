@@ -53,6 +53,7 @@ file(GLOB_RECURSE LIB_SOURCES
     src/io/*.cpp
     src/pipeline/solver.cpp
     src/pipeline/cube_plan_sweep.cpp
+    src/pipeline/mixed_group_sweep.cpp
 )
 
 add_library(solver_lib STATIC ${LIB_SOURCES})
@@ -84,6 +85,11 @@ target_link_libraries(symmetry_app solver_lib Threads::Threads)
 # replay without adding a benchmark-only lowering path.
 add_executable(cube_plan_sweep src/pipeline/cube_plan_sweep_main.cpp)
 target_link_libraries(cube_plan_sweep solver_lib Threads::Threads)
+
+# Developer tool: expose the production mixed cost decomposition for every
+# uniform active-group divisor of the selected tile configuration.
+add_executable(mixed_group_sweep src/pipeline/mixed_group_sweep_main.cpp)
+target_link_libraries(mixed_group_sweep solver_lib Threads::Threads)
 
 
 # --- Tests ---

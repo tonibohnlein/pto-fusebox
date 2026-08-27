@@ -340,7 +340,7 @@ MIXED_CASES = (
         V2CLhs(),
         _random_args((96, 64), (64, 128), scale=0.1),
         mixed_contract="v2c_lhs_streamed_groups",
-        forced_mixed_groups=2,
+        forced_mixed_groups=1,
     ),
     SiliconCase(
         "mixed_v2c_rhs_96x64x128",
@@ -484,29 +484,29 @@ def _assert_mixed_contract(
     assert plan.source_codegen_ready
     if case.mixed_contract == "cvc_streamed_groups":
         assert len(plan.fifos) == 2
-        assert plan.spatial_tiles == 16
-        assert plan.active_groups == 8
-        assert plan.max_trips_per_group == 2
-        assert plan.pipeline_stages == 3
-        assert plan.requested_skew_depth == 2
-        assert plan.overlap_implementable
-        assert "pl.pipeline(2, stage=3" in source
+        assert plan.spatial_tiles == 4
+        assert plan.active_groups == 4
+        assert plan.max_trips_per_group == 1
+        assert plan.pipeline_stages == 1
+        assert plan.requested_skew_depth == 0
+        assert not plan.overlap_implementable
+        assert "pl.range(1, init_values=" in source
         return
     assert len(plan.fifos) == 1
     fifo = plan.fifos[0]
     if case.mixed_contract == "c2v_streamed_groups":
         assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
         assert plan.spatial_tiles == 24
-        assert plan.active_groups == 12
-        assert plan.max_trips_per_group == 2
+        assert plan.active_groups == 6
+        assert plan.max_trips_per_group == 4
         assert plan.pipeline_stages == 2
         assert plan.requested_skew_depth == 1
         assert plan.overlap_implementable
-        assert "pl.pipeline(2, stage=2" in source
+        assert "pl.pipeline(4, stage=2" in source
         return
     if case.mixed_contract == "v2c_lhs_streamed_groups":
-        assert plan.spatial_tiles == 4
-        assert plan.active_groups == 2
+        assert plan.spatial_tiles == 2
+        assert plan.active_groups == 1
         assert plan.max_trips_per_group == 2
         assert plan.pipeline_stages == 2
         assert plan.requested_skew_depth == 1

@@ -496,6 +496,7 @@ def _parse_vector_plan(
         "m_partition",
         "n_partition",
         "full_peak_ub_bytes",
+        "workspace_free_peak_ub_bytes",
         "chunk_peak_ub_bytes",
         "stream_band_count",
         "physical_frame",
@@ -567,6 +568,10 @@ def _parse_vector_plan(
         ),
         full_peak_ub_bytes=_nonnegative_int(
             item.get("full_peak_ub_bytes"), f"{field}.full_peak_ub_bytes"
+        ),
+        workspace_free_peak_ub_bytes=_nonnegative_int(
+            item.get("workspace_free_peak_ub_bytes"),
+            f"{field}.workspace_free_peak_ub_bytes",
         ),
         chunk_peak_ub_bytes=_nonnegative_int(
             item.get("chunk_peak_ub_bytes"), f"{field}.chunk_peak_ub_bytes"
@@ -1465,9 +1470,11 @@ def _validate_mixed_contract(  # noqa: PLR0913
         expected_fill_absorbed = (
             successor_overlap and plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP
         )
+        expected_stages = 3 if successor_overlap else 1
+        expected_skew = 2 if successor_overlap else 0
         if (
-            plan.pipeline_stages != 3
-            or plan.requested_skew_depth != 2
+            plan.pipeline_stages != expected_stages
+            or plan.requested_skew_depth != expected_skew
             or plan.model_overlap_granted != successor_overlap
             or plan.overlap_implementable != successor_overlap
             or plan.pipeline_fill_absorbed != expected_fill_absorbed
@@ -1522,7 +1529,9 @@ def _validate_mixed_contract(  # noqa: PLR0913
             realized_peak = (
                 stage.vector_stream.chunk_peak_ub_bytes
                 if stage.vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
-                else stage.vector_stream.full_peak_ub_bytes
+                else _mixed_materialized_source_peak(
+                    stage.vector_stream, lowered=lowered
+                )
             )
             vector_stage_peaks.append(realized_peak)
             if realized_peak > plan.vector_stage_peak_ub_bytes:
@@ -1733,6 +1742,25 @@ def _validate_mixed_contract(  # noqa: PLR0913
             raise ScheduleContractError(f"{field}.dense_mlp is incomplete")
     elif plan.dense_mlp is not None:
         raise ScheduleContractError(f"{field} generic plan carries dense-MLP state")
+
+
+def _mixed_materialized_source_peak(
+    plan: VectorKernelPlan, *, lowered: LoweredRegion
+) -> int:
+    """Return current-main PyPTO's physical mixed-stage Vec allocation bound."""
+
+    if plan.kind is not VectorStreamKind.MATERIALIZED:
+        return plan.full_peak_ub_bytes
+    workspace_bytes = [
+        workspace.physical[0]
+        * workspace.physical[1]
+        * lowered.tensor(workspace.source_tensor).byte_width
+        for phase in plan.phases
+        for workspace in phase.workspaces
+    ]
+    if not workspace_bytes:
+        return plan.full_peak_ub_bytes
+    return plan.workspace_free_peak_ub_bytes + sum(workspace_bytes)
 
 
 def _parse_cube_plan(

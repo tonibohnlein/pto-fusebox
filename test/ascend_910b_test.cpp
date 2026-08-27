@@ -1436,7 +1436,7 @@ static void test_mixed_schedule_plan() {
           !uneven_groups.feasible);
 
     Problem overhead_limited = p;
-    overhead_limited.per_task_overhead_cycles = 1000000;
+    overhead_limited.mixed_group_overhead_cycles = 1000000;
     DAG overhead_dag = DAG::build(overhead_limited);
     auto overhead_mixed =
         Ascend910BMixed::create(overhead_limited, overhead_dag, {0, 1, 2});
@@ -5281,6 +5281,66 @@ static void test_singleton_column_transform_reaches_vector_plan() {
              8LL * 16 * 4 + 8LL * 1 * 4 + 8LL * 16 * 4);
 }
 
+static void test_heterogeneous_reduction_workspaces_have_a_sound_source_peak() {
+    std::cout << "[VREDWS2] heterogeneous reduction workspaces use an explicit workspace-free peak\n";
+    Problem p;
+    p.tensors = {{256, 64, DType::FP32}, {1, 64, DType::FP32},
+                 {128, 64, DType::FP32}, {1, 64, DType::FP32},
+                 {1, 64, DType::FP32}};
+    p.ops = {{OpType::Reduction, {0}, {1}},
+             {OpType::Reduction, {2}, {3}},
+             {OpType::Pointwise, {1, 3}, {4}}};
+    for (size_t op : {0UL, 1UL}) {
+        p.ops[op].vector_capability = VectorOpCapability::ReductionSum;
+        p.ops[op].vector_primitive = VectorPrimitiveFamily::RowSum;
+        p.ops[op].vector_geometry = VectorOpGeometry::Flat;
+    }
+    p.ops[2].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[2].vector_primitive = VectorPrimitiveFamily::Add;
+    p.ops[2].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs.insert(4);
+    set_910b(p);
+    p.vec_capacity = 1 << 20;
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1, 2});
+    const CostResult best = subgraph ? subgraph->best_cost() : CostResult{};
+    const VectorStreamPlan plan =
+        subgraph && best.feasible
+            ? subgraph->vector_stream_plan(best.config)
+            : VectorStreamPlan{};
+    CHECK("VREDWS2: heterogeneous two-reduction graph materializes",
+          plan.feasible && plan.kind == VectorStreamKind::Materialized);
+    const auto workspaces = BuildVectorWorkspaceFrames(p, plan);
+    int64_t workspace_sum = 0;
+    int64_t workspace_max = 0;
+    size_t workspace_count = 0;
+    for (const auto& phase : workspaces) {
+        for (const auto& workspace : phase) {
+            const int64_t bytes = workspace.physical_rows *
+                                  workspace.physical_cols *
+                                  dtype_bytes(p.tensors[workspace.source_tensor].dtype);
+            workspace_sum += bytes;
+            workspace_max = std::max(workspace_max, bytes);
+            ++workspace_count;
+        }
+    }
+    const int64_t source_peak =
+        plan.workspace_free_peak_ub_bytes + workspace_sum;
+    const int64_t unsafe_largest_subtraction =
+        plan.full_peak_ub_bytes + workspace_sum - workspace_max;
+    CHECK("VREDWS2: both heterogeneous workspaces are serialized",
+          workspace_count == 2 &&
+              workspace_sum == workspace_max + workspace_max / 2 &&
+              workspace_max > 0);
+    CHECK("VREDWS2: workspace-free peak is independently recomputed",
+          plan.workspace_free_peak_ub_bytes ==
+              subgraph->vector_peak_ub(best.config, {}, {}, INT64_MAX, 0,
+                                       /*include_reduction_workspaces=*/false));
+    CHECK("VREDWS2: source bound adds both frames to the workspace-free peak",
+          source_peak == plan.workspace_free_peak_ub_bytes + workspace_sum &&
+              source_peak >= unsafe_largest_subtraction);
+}
+
 int main() {
     test_subgraph_structure();
     test_cube_vector_fusion();
@@ -5329,6 +5389,7 @@ int main() {
     test_native_cast_chain_granule_is_class_local();
     test_reduction_state_uses_its_class_local_granule();
     test_singleton_column_transform_reaches_vector_plan();
+    test_heterogeneous_reduction_workspaces_have_a_sound_source_peak();
     test_vector_band_ub();
     test_reduction_sink_gating();
     test_streamed_reduction_sink_no_split();

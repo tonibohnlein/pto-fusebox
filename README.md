@@ -52,6 +52,8 @@ The primary targets are:
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
   with its modeled cost and ordinary `solution.v6` replay payload; and
+- `mixed_group_sweep`: enumerate every uniform active-group assignment for the
+  model-selected mixed tile with its production pipe/stage cost breakdown; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:

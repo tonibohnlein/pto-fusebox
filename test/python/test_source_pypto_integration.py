@@ -36,6 +36,7 @@ from pto_fusebox import (
 )
 from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
+    MixedCrossCoreProtocol,
     MixedKernelPlan,
     VectorKernelPlan,
 )
@@ -683,18 +684,34 @@ def _compile_mixed_source(
         solution = copy.deepcopy(region.solution)
         step = solution["steps"][0]
         descriptor = step["plan"]
-        assert descriptor["protocol"] == "one_way"
+        protocol = descriptor["protocol"]
+        assert protocol in {"one_way", "single_round_trip_bundle"}
         spatial_tiles = descriptor["spatial_tiles"]
         assert spatial_tiles % forced_active_groups == 0
         trips = spatial_tiles // forced_active_groups
-        assert trips >= 2
         descriptor["active_groups"] = forced_active_groups
         descriptor["min_trips_per_group"] = trips
         descriptor["max_trips_per_group"] = trips
-        descriptor["pipeline_stages"] = 2
-        descriptor["requested_skew_depth"] = 1
-        descriptor["model_overlap_granted"] = True
-        descriptor["overlap_implementable"] = True
+        overlap = trips >= 2
+        descriptor["pipeline_stages"] = (
+            3
+            if protocol == "single_round_trip_bundle" and overlap
+            else 2
+            if overlap
+            else 1
+        )
+        descriptor["requested_skew_depth"] = (
+            2
+            if protocol == "single_round_trip_bundle" and overlap
+            else 1
+            if overlap
+            else 0
+        )
+        descriptor["model_overlap_granted"] = overlap
+        descriptor["overlap_implementable"] = overlap
+        descriptor["pipeline_fill_absorbed"] = (
+            protocol == "single_round_trip_bundle" and overlap
+        )
         step["launch"]["cores"] = forced_active_groups * (
             1 + descriptor["vector_lanes"]
         )
@@ -731,16 +748,49 @@ def test_nonstreaming_v2c_stage_two_lowers_through_pypto(
         (torch.zeros(96, 64), torch.zeros(64, 128)),
         tmp_path,
         monkeypatch,
-        forced_active_groups=2,
+        forced_active_groups=1,
     )
-    assert plan.spatial_tiles == 4
-    assert plan.active_groups == 2
+    assert plan.spatial_tiles == 2
+    assert plan.active_groups == 1
     assert plan.max_trips_per_group == 2
     assert plan.pipeline_stages == 2
     assert "pl.pipeline(2, stage=2" in source
     assert "pto.tpush_to_aic" in pto
     assert "pto.tpop_from_aiv" in pto
     assert "pto.tfree_from_aiv" in pto
+
+
+def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _, plan = _compile_mixed_source(
+        "mixed_attention_one_trip",
+        _AttentionCore(),
+        (
+            torch.zeros(768, 64),
+            torch.zeros(64, 64),
+            torch.zeros(64, 128),
+        ),
+        tmp_path,
+        monkeypatch,
+        forced_active_groups=12,
+    )
+    assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert plan.spatial_tiles == plan.active_groups == 12
+    assert plan.min_trips_per_group == plan.max_trips_per_group == 1
+    assert plan.pipeline_stages == 1
+    assert plan.requested_skew_depth == 0
+    assert not plan.overlap_implementable
+    assert "pl.range(1, init_values=" in source
+    assert "stage=3" not in source
+    fifo_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction.value == "cube_to_vector"
+    )
+    assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 114816
+    assert plan.vector_stage_peak_ub_bytes + fifo_bytes <= 188416
 
 
 @pytest.mark.parametrize(
@@ -904,20 +954,20 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert "pto.tadd" not in pto
     if name == "mixed_c2v_streamed_groups":
         assert plan.spatial_tiles == 24
-        assert plan.active_groups == 12
-        assert plan.max_trips_per_group == 2
+        assert plan.active_groups == 6
+        assert plan.max_trips_per_group == 4
         assert plan.pipeline_stages == 2
         assert plan.requested_skew_depth == 1
         assert plan.overlap_implementable
-        assert "pl.pipeline(2, stage=2" in source
+        assert "pl.pipeline(4, stage=2" in source
     if name == "mixed_attention_streamed_groups":
-        assert plan.spatial_tiles == 16
-        assert plan.active_groups == 8
-        assert plan.max_trips_per_group == 2
-        assert plan.pipeline_stages == 3
-        assert plan.requested_skew_depth == 2
-        assert plan.overlap_implementable
-        assert "pl.pipeline(2, stage=3" in source
+        assert plan.spatial_tiles == 4
+        assert plan.active_groups == 4
+        assert plan.max_trips_per_group == 1
+        assert plan.pipeline_stages == 1
+        assert plan.requested_skew_depth == 0
+        assert not plan.overlap_implementable
+        assert "pl.range(1, init_values=" in source
 
 
 def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(

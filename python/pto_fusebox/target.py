@@ -99,6 +99,10 @@ class Ascend910BTarget(TargetProfile):
             "cube_compute_cost": 1,
             "kernel_fill_cost": 10000,
             "per_task_overhead_cycles": 64,
+            # 0.2579 us/group at 1.85 GHz = 477 cycles; use the nearest
+            # convenient 16-cycle quantum. This is distinct from a single-AIV
+            # homogeneous task because one group launches 1 AIC + 2 AIV lanes.
+            "mixed_group_overhead_cycles": 480,
             "cube_split_sync_cycles": 0,
             "cube_freq_hz": 1.85e9,
             "bw_gm_l1": 135.0,

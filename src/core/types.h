@@ -231,14 +231,17 @@ struct Problem {
     // (fewer tiles than cores), this penalizes over-tiling (more) — so the
     // optimum sits at ~one kernel per core. 0 => off (legacy/competition).
     int64_t kernel_fill_cost = 0;
-    // Per-TASK launch overhead (cycles). Homogeneous vector schedules charge
-    // num_tiles*split; mixed schedules charge the selected 1-AIC + 2-AIV
-    // active groups. The kernel_fill term above is per-WAVE, so this term
-    // distinguishes otherwise tied grids with different task counts. Value is
-    // in the MODEL's cost-cycle scale, not wall microseconds. The adapter's 64
-    // cycle value remains an initial device-grounded calibration pending a
-    // tighter clock-anchored fit. 0 => off.
+    // Per-TASK launch overhead (cycles) for homogeneous vector schedules,
+    // charged as num_tiles*split. The kernel_fill term above is per-WAVE, so
+    // this term distinguishes otherwise tied grids with different task counts.
+    // It remains separate from the heavier 1-AIC + 2-AIV mixed-group launch.
     int64_t per_task_overhead_cycles = 0;
+    // Per active 1-AIC + 2-AIV mixed group (cycles). A two-device 910B2 block
+    // sweep measured 0.2579 us/group (95% CI [0.2545, 0.2619]); at 1.85 GHz
+    // that is 477 cycles, rounded to 480 in the production target profile.
+    // Keeping this separate avoids perturbing the already-grounded vector-only
+    // task term. 0 => off for legacy/research problem descriptors.
+    int64_t mixed_group_overhead_cycles = 0;
     // Additional ordered-task synchronization cost for either cube split-K
     // merge: AIC first-partial -> AIC atomic-rest, or AIV zero-seed -> AIC
     // atomic-all. The task walls themselves are always serialized; this is only
@@ -728,6 +731,12 @@ struct VectorStreamPlan {
   // both in the derived plan lets compute_cost reuse the feasibility work
   // instead of rescanning the pebbling order for every cost term.
   int64_t full_peak_ub_bytes = 0;
+  // Full-region peak with row-reduction scratch transients excluded. Source
+  // backends that allocate every reduction workspace eagerly add their exact
+  // phase-local workspace sum to this value; unlike subtracting an arbitrary
+  // workspace from full_peak_ub_bytes, that remains sound when workspaces have
+  // heterogeneous shapes or dtypes.
+  int64_t workspace_free_peak_ub_bytes = 0;
   int64_t chunk_peak_ub_bytes = 0;
   int64_t stream_band_count = 0;
   // Mechanical physical-frame contract shared by pricing and emission. These
@@ -1280,4 +1289,32 @@ struct CostResult {
     bool uses_model_ahead_split_k = false;  // this config's parallel_split > 1 came from the
                                  // model-ahead split-K path (Problem::allow_model_ahead_split_k;
                                  // base lone-matmul or mixed cube-sink) — NOT yet emittable.
+};
+
+// Developer-facing mixed-candidate decomposition. This stays out of
+// CostResult because that value occupies the million-entry local-search cache.
+// Every field is reconstructed by the production cost path; the diagnostic
+// sweep never re-prices a candidate in Python.
+struct MixedCostBreakdown {
+    bool feasible = false;
+    int64_t active_groups = 0;
+    int64_t trips_per_group = 0;
+    int64_t pipeline_stages = 0;
+    bool overlap_implementable = false;
+    double cube_phase_cycles = 0.0;
+    double vector_phase_cycles = 0.0;
+    double gm_l1_cycles = 0.0;
+    double gm_ub_cycles = 0.0;
+    double l0c_gm_cycles = 0.0;
+    double ub_gm_cycles = 0.0;
+    double ddr_wall_cycles = 0.0;
+    double pipeline_wall_cycles = 0.0;
+    double kernel_fill_cycles = 0.0;
+    double group_overhead_cycles = 0.0;
+    double total_cycles = std::numeric_limits<double>::infinity();
+};
+
+struct MixedGroupCostCandidate {
+    CostResult cost;
+    MixedCostBreakdown breakdown;
 };

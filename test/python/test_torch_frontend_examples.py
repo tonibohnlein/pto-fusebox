@@ -313,12 +313,12 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert len(result.regions) == 1
     region = result.regions[0]
     assert region.problem is not None
-    # The larger C2V example deliberately exercises the source-constrained
-    # mixed planner: its unconstrained winner overcommits the C2V FIFO ring,
-    # while the retried winner is the emitted 12-group x 2-trip schedule.  The
-    # remaining examples are source-ready without replacing their winner.
+    # The streamed C2V and CVC examples deliberately exercise the
+    # source-constrained mixed planner: their unconstrained winners exceed
+    # a source-realization memory bound, so emission retries with that
+    # bound enabled.  The remaining examples keep their analytic winner.
     assert region.problem["require_source_codegen"] is (
-        name == "mixed_c2v_streamed_groups"
+        name in {"mixed_c2v_streamed_groups", "mixed_cvc_streamed_groups"}
     )
     assert can_emit_region(graph, region)
     plan = scheduled_region(region).steps[0].plan
@@ -365,12 +365,12 @@ def test_mixed_examples_discriminate_single_item_from_cross_core_streaming() -> 
 
     streamed = plans["mixed_c2v_streamed_groups"]
     assert streamed.spatial_tiles == 24
-    assert streamed.active_groups == 12
-    assert streamed.max_trips_per_group == 2
+    assert streamed.active_groups == 6
+    assert streamed.max_trips_per_group == 4
     assert streamed.pipeline_stages == 2
     assert streamed.requested_skew_depth == 1
     assert streamed.overlap_implementable
-    assert "pl.pipeline(2, stage=2" in sources["mixed_c2v_streamed_groups"]
+    assert "pl.pipeline(4, stage=2" in sources["mixed_c2v_streamed_groups"]
 
     module, args = build_static_mixed_examples()["mixed_cvc_streamed_groups"]
     graph = export_and_normalize(module, args)
@@ -384,16 +384,16 @@ def test_mixed_examples_discriminate_single_item_from_cross_core_streaming() -> 
     region = result.regions[0]
     round_trip = scheduled_region(region).steps[0].plan
     assert isinstance(round_trip, MixedKernelPlan)
-    assert round_trip.spatial_tiles == 16
-    assert round_trip.active_groups == 8
-    assert round_trip.max_trips_per_group == 2
-    assert round_trip.pipeline_stages == 3
-    assert round_trip.requested_skew_depth == 2
-    assert round_trip.overlap_implementable
+    assert round_trip.spatial_tiles == 4
+    assert round_trip.active_groups == 4
+    assert round_trip.max_trips_per_group == 1
+    assert round_trip.pipeline_stages == 1
+    assert round_trip.requested_skew_depth == 0
+    assert not round_trip.overlap_implementable
     round_trip_source = emit_pypto_region(
         graph, region, program_name="mixed_cvc_streamed_groups"
     ).source
-    assert "pl.pipeline(2, stage=3" in round_trip_source
+    assert "pl.range(1, init_values=" in round_trip_source
 
 
 @pytest.mark.skipif(
@@ -602,7 +602,12 @@ def test_softmax_to_pv_serializes_the_complete_flash_stream() -> None:
         SoftmaxPv(),
         (torch.zeros(16, 4096), torch.zeros(4096, 64)),
     )
-    result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
 
     assert result.regions_solved
     assert result.whole_graph_codegen_ready

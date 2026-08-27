@@ -286,6 +286,8 @@ static json vector_stream_plan_json(const Problem& problem,
             {"m_partition", axis_partition_json(plan.m_partition)},
             {"n_partition", axis_partition_json(plan.n_partition)},
             {"full_peak_ub_bytes", plan.full_peak_ub_bytes},
+            {"workspace_free_peak_ub_bytes",
+             plan.workspace_free_peak_ub_bytes},
             {"chunk_peak_ub_bytes", plan.chunk_peak_ub_bytes},
             {"stream_band_count", plan.stream_band_count},
             {"physical_frame",
@@ -839,6 +841,9 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("kernel_fill_cost"))    p.kernel_fill_cost    = j["kernel_fill_cost"].get<int64_t>();
     if (j.contains("per_task_overhead_cycles")) {
         p.per_task_overhead_cycles = j["per_task_overhead_cycles"].get<int64_t>();
+    }
+    if (j.contains("mixed_group_overhead_cycles")) {
+        p.mixed_group_overhead_cycles = j["mixed_group_overhead_cycles"].get<int64_t>();
     }
     if (j.contains("cube_split_sync_cycles")) {
         p.cube_split_sync_cycles = j["cube_split_sync_cycles"].get<int64_t>();

@@ -1074,8 +1074,8 @@ def test_source_readiness_emits_a_zero_copy_transposed_matmul_operand() -> None:
 
     assert can_emit_region(graph, result)
     source = emit_pypto_region(graph, result, program_name="transposed_matmul").source
-    assert "pl.tile.transpose_view(rhs_mat_natural" in source
-    assert "pl.tile.move(rhs_mat" in source
+    assert "pl.tile.move(pl.tile.transpose_view(rhs_mat_natural" in source
+    assert "rhs_mat = pl.tile.transpose_view(" not in source
     assert "pl.create_tensor" not in source
 
 
@@ -1093,7 +1093,10 @@ def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
     _assert_pypto_main_mixed_scope(source, step.plan)
-    assert "pl.pipeline(1, stage=3" in source
+    assert step.plan.max_trips_per_group == 2
+    assert step.plan.pipeline_stages == 3
+    assert step.plan.overlap_implementable
+    assert "pl.pipeline(2, stage=3" in source
     assert source.count("pl.tensor.matmul(") == 2
     assert "b_trans=True" in source
     assert "pl.tensor.row_max(" in source
@@ -1544,7 +1547,7 @@ def test_one_way_c2v_replays_frozen_group_count_controls(
         scheduled_region(replace(result, solution=inconsistent))
 
 
-@pytest.mark.parametrize(("active_groups", "trips"), [(16, 1), (4, 4)])
+@pytest.mark.parametrize(("active_groups", "trips"), [(12, 1), (6, 2)])
 def test_cvc_replays_frozen_group_count_controls(
     active_groups: int,
     trips: int,
@@ -1552,7 +1555,7 @@ def test_cvc_replays_frozen_group_count_controls(
     graph = export_and_normalize(
         StaticAttentionCore(),
         (
-            torch.zeros(384, 64),
+            torch.zeros(768, 64),
             torch.zeros(64, 64),
             torch.zeros(64, 128),
         ),
@@ -1568,14 +1571,32 @@ def test_cvc_replays_frozen_group_count_controls(
     solution = copy.deepcopy(result.solution)
     step = solution["steps"][0]
     plan = step["plan"]
-    assert plan["spatial_tiles"] == 16
+    assert plan["spatial_tiles"] == 12
     assert plan["protocol"] == "single_round_trip_bundle"
+    assert result.problem is not None
+    assert result.problem["require_source_codegen"] is True
+    assert plan["m_partition"] == {
+        "parts": 12,
+        "small": 64,
+        "big": 64,
+        "num_big": 0,
+    }
+    c2v_ring_bytes = sum(
+        fifo["reserved_bytes"]
+        for fifo in plan["fifos"]
+        if fifo["direction"] == "cube_to_vector"
+    )
+    assert plan["vector_stage_peak_ub_bytes"] == 49280
+    assert c2v_ring_bytes == 65536
+    assert plan["vector_stage_peak_ub_bytes"] + c2v_ring_bytes == 114816
     plan["active_groups"] = active_groups
     plan["min_trips_per_group"] = trips
     plan["max_trips_per_group"] = trips
     plan["model_overlap_granted"] = trips >= 2
     plan["overlap_implementable"] = trips >= 2
     plan["pipeline_fill_absorbed"] = trips >= 2
+    plan["pipeline_stages"] = 3 if trips >= 2 else 1
+    plan["requested_skew_depth"] = 2 if trips >= 2 else 0
     step["launch"]["cores"] = active_groups * 3
 
     forced = replace(result, solution=solution)
@@ -1588,7 +1609,11 @@ def test_cvc_replays_frozen_group_count_controls(
         program_name=f"cvc_groups_{active_groups}",
     ).source
     _assert_single_spmd_grid(source, active_groups)
-    assert f"pl.pipeline({trips}, stage=3" in source
+    if trips >= 2:
+        assert f"pl.pipeline({trips}, stage=3" in source
+    else:
+        assert f"pl.range({trips}, init_values=" in source
+        assert "stage=3" not in source
 
     inconsistent = copy.deepcopy(solution)
     inconsistent_plan = inconsistent["steps"][0]["plan"]
@@ -1830,15 +1855,15 @@ def test_one_way_v2c_replays_a_frozen_stage_two_group_loop() -> None:
     solution = copy.deepcopy(result.solution)
     step = solution["steps"][0]
     plan = step["plan"]
-    assert plan["spatial_tiles"] == 4
-    plan["active_groups"] = 2
+    assert plan["spatial_tiles"] == 2
+    plan["active_groups"] = 1
     plan["min_trips_per_group"] = 2
     plan["max_trips_per_group"] = 2
     plan["pipeline_stages"] = 2
     plan["requested_skew_depth"] = 1
     plan["model_overlap_granted"] = True
     plan["overlap_implementable"] = True
-    step["launch"]["cores"] = 6
+    step["launch"]["cores"] = 3
 
     forced = replace(result, solution=solution)
     forced_plan = scheduled_region(forced).steps[0].plan
@@ -1849,7 +1874,7 @@ def test_one_way_v2c_replays_a_frozen_stage_two_group_loop() -> None:
         forced,
         program_name="v2c_stage_two",
     ).source
-    _assert_single_spmd_grid(source, 2)
+    _assert_single_spmd_grid(source, 1)
     assert "pl.pipeline(2, stage=2" in source
 
 
@@ -1912,13 +1937,13 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
 def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:
     graph, result = _solve_module(
         _StreamingSoftmaxPv(),
-        (torch.zeros(768, 4096), torch.zeros(4096, 64)),
+        (torch.zeros(384, 4096), torch.zeros(4096, 64)),
     )
     plan = scheduled_region(result).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
-    assert plan.spatial_tiles == 48
+    assert plan.spatial_tiles == 24
     assert plan.active_groups == 24
-    assert plan.max_trips_per_group == 2
+    assert plan.max_trips_per_group == 1
     assert plan.pipeline_stages == 1
     assert not plan.model_overlap_granted
     assert not plan.overlap_implementable
@@ -1928,7 +1953,7 @@ def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:
         result,
         program_name="streaming_softmax_pv_phase_local",
     ).source
-    assert "pl.range(2, init_values=(output,))" in source
+    assert "pl.range(1, init_values=(output,))" in source
     assert "for apply_chunk, (sink_acc,) in pl.pipeline(" in source
 
 

@@ -1008,6 +1008,43 @@ BuildVectorWorkspaceFrames(const Problem& problem,
   return result;
 }
 
+namespace {
+
+int64_t MixedMaterializedSourcePeak(const Problem& problem,
+                                    const VectorStreamPlan& plan) {
+  const int64_t modeled_peak = plan.full_peak_ub_bytes;
+  if (!plan.feasible || plan.kind != VectorStreamKind::Materialized) {
+    return modeled_peak;
+  }
+
+  // The generic mixed source emits each row reduction through a distinct
+  // high-level PyPTO operation, initially creating one scratch allocation per
+  // reduction inside the split AIV function. Current-main MemoryReuse may
+  // coalesce those buffers only after it has found a capacity-fitting packing;
+  // the old R2 frame could not, fell back to legacy packing, and overflowed by
+  // exactly one 32 KiB workspace. Source admission must not depend on that
+  // optimistic coalescing. Add all serialized workspace frames to the exact
+  // peak computed with row-reduction scratch transients removed. This remains
+  // sound when scratch frames have heterogeneous shapes or dtypes: the
+  // ordinary peak need not occur at the op carrying the largest workspace.
+  // One-reduction kernels retain the same accounting; multi-reduction mixed
+  // stages fail closed or select a smaller physical frame.
+  const auto workspaces = BuildVectorWorkspaceFrames(problem, plan);
+  int64_t total_workspace_bytes = 0;
+  for (const auto& phase : workspaces) {
+    for (const VectorWorkspaceFramePlan& workspace : phase) {
+      const int64_t bytes =
+          workspace.physical_rows * workspace.physical_cols *
+          dtype_bytes(problem.tensors[workspace.source_tensor].dtype);
+      total_workspace_bytes += bytes;
+    }
+  }
+  if (total_workspace_bytes == 0) return modeled_peak;
+  return plan.workspace_free_peak_ub_bytes + total_workspace_bytes;
+}
+
+}  // namespace
+
 double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
                                   int64_t valid_rows, int64_t valid_cols) {
   return GroundedRowReductionCyclesImpl(family, dtype, valid_rows, valid_cols);
@@ -4123,7 +4160,8 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
 int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
                                  const FlatSet<size_t> &retained_from_prev,
                                  const FlatSet<size_t> &retain_these,
-                                 int64_t reduce_chunk, int stream_axis) const {
+                                 int64_t reduce_chunk, int stream_axis,
+                                 bool include_reduction_workspaces) const {
   const auto &order = dfs_order_;
 
   // Tile footprint. The reduced axis of a reduction is READ FULL (FIXED_1 role), so
@@ -4205,6 +4243,10 @@ int64_t Ascend910BCost::vector_peak_ub(const TileConfig &cfg,
     const size_t end = vector_ub_transient_offsets_[(size_t)s + 1];
     for (size_t ref_idx = begin; ref_idx < end; ++ref_idx) {
       const VectorUBTransientRef& ref = vector_ub_transient_refs_[ref_idx];
+      if (!include_reduction_workspaces &&
+          ref.minimum_physical_cols > 0) {
+        continue;
+      }
       if ((ref.skip_mask & kSkipRetainedFromPrev) != 0 &&
           retained_from_prev.count(ref.tensor))
         continue;
@@ -4624,6 +4666,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   logical_cfg.w = plan.tile_w;
   plan.full_peak_ub_bytes =
       vector_peak_ub(logical_cfg, retained_from_prev, retain_these);
+  plan.workspace_free_peak_ub_bytes = vector_peak_ub(
+      logical_cfg, retained_from_prev, retain_these, INT64_MAX,
+      /*stream_axis=*/0, /*include_reduction_workspaces=*/false);
   const bool materializes = budget <= 0 || plan.full_peak_ub_bytes <= budget;
 
   const auto all_phase_lifetimes = plan.input_lifetimes;
@@ -5318,7 +5363,10 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
           std::max(vector_stage_peak, lane_plan.chunk_peak_ub_bytes);
     } else {
       vector_stage_peak =
-          std::max(vector_stage_peak, lane_plan.full_peak_ub_bytes);
+          std::max(vector_stage_peak,
+                   prob_->require_source_codegen
+                       ? MixedMaterializedSourcePeak(*prob_, lane_plan)
+                       : lane_plan.full_peak_ub_bytes);
     }
   }
   if (vector_stage_peak <= 0) return false;
@@ -6809,9 +6857,13 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
       plan.loop.min_trips_per_group >= 2 &&
       plan.loop.min_trips_per_group == plan.loop.max_trips_per_group;
   plan.loop.pipeline_stages =
-      single_round_trip ? 3 : (one_way && uniform_successors ? 2 : 1);
+      single_round_trip && uniform_successors
+          ? 3
+          : (one_way && uniform_successors ? 2 : 1);
   plan.loop.requested_skew_depth =
-      single_round_trip ? 2 : (one_way && uniform_successors ? 1 : 0);
+      single_round_trip && uniform_successors
+          ? 2
+          : (one_way && uniform_successors ? 1 : 0);
 
   plan.overlap_implementable = uniform_successors;
   plan.model_overlap_granted = plan.overlap_implementable;
@@ -6925,6 +6977,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
           stage.vector_stream.kind = VectorStreamKind::Materialized;
           stage.vector_stream.work_units = plan.work_units;
           stage.vector_stream.full_peak_ub_bytes = plan.vector_stage_peak_ub_bytes;
+          stage.vector_stream.workspace_free_peak_ub_bytes =
+              plan.vector_stage_peak_ub_bytes;
           stage.vector_stream.chunk_peak_ub_bytes = plan.vector_stage_peak_ub_bytes;
           stage.vector_stream.tile_h = stage.valid_rows;
           stage.vector_stream.tile_w = stage.valid_cols;
@@ -7066,9 +7120,10 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             // kind; each stage carries its authoritative stream descriptor.
             plan.vector_stage_kind = stage.vector_stream.kind;
           }
-          const int64_t realized_peak = stage.vector_stream.streamed()
-              ? stage.vector_stream.chunk_peak_ub_bytes
-              : stage.vector_stream.full_peak_ub_bytes;
+          const int64_t realized_peak =
+              stage.vector_stream.streamed()
+                  ? stage.vector_stream.chunk_peak_ub_bytes
+                  : MixedMaterializedSourcePeak(*prob_, stage.vector_stream);
           plan.vector_stage_peak_ub_bytes =
               std::max(plan.vector_stage_peak_ub_bytes, realized_peak);
         }
@@ -7175,9 +7230,11 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
   return plan;
 }
 
-CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
-                                                  const MixedSchedulePlan& schedule) const {
+CostResult Ascend910BCost::compute_dense_mlp_cost(
+    const TileConfig& cfg, const MixedSchedulePlan& schedule,
+    MixedCostBreakdown* breakdown) const {
   CostResult result;
+  if (breakdown != nullptr) *breakdown = MixedCostBreakdown{};
   result.config = cfg;
   if (!schedule.feasible || !schedule.dense_mlp.present || !mixed_topology_ ||
       !mixed_topology_->dense_mlp.present) {
@@ -7260,14 +7317,17 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
   // and one reply form the standard successor-item wavefront.
   const double cube_phase = std::max(cube_compute, gm_l1) + l0c_gm;
   const double vector_phase = gm_ub + vector_compute + ub_gm;
-  result.latency = schedule.overlap_implementable
-                       ? std::max(cube_phase + vector_phase / static_cast<double>(chunks),
-                                  vector_phase + cube_phase / static_cast<double>(chunks))
-                       : cube_phase + vector_phase;
-  if (prob_->kernel_fill_cost > 0) {
-    result.latency += static_cast<double>(prob_->kernel_fill_cost);
-  }
-  result.latency += static_cast<double>(groups) * prob_->per_task_overhead_cycles;
+  const double pipeline_wall =
+      schedule.overlap_implementable
+          ? std::max(cube_phase + vector_phase / static_cast<double>(chunks),
+                     vector_phase + cube_phase / static_cast<double>(chunks))
+          : cube_phase + vector_phase;
+  const double kernel_fill = prob_->kernel_fill_cost > 0
+                                 ? static_cast<double>(prob_->kernel_fill_cost)
+                                 : 0.0;
+  const double group_overhead =
+      static_cast<double>(groups) * prob_->mixed_group_overhead_cycles;
+  result.latency = pipeline_wall + kernel_fill + group_overhead;
   result.ddr_traffic = std::max({gm_l1, gm_ub, l0c_gm, ub_gm});
   result.l1l0_extract = static_cast<double>(chunks) * (2.0 * gate_extract + down_extract);
   result.compute_bound = std::max(cube_compute, vector_compute) >= result.ddr_traffic;
@@ -7277,6 +7337,24 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(const TileConfig& cfg,
   result.num_spatial_tiles = static_cast<int>(schedule.spatial_tiles);
   result.num_k_passes = static_cast<int>(chunks);
   result.pipeline_fill_absorbed = false;
+  if (breakdown != nullptr) {
+    breakdown->feasible = true;
+    breakdown->active_groups = groups;
+    breakdown->trips_per_group = schedule.loop.max_trips_per_group;
+    breakdown->pipeline_stages = schedule.loop.pipeline_stages;
+    breakdown->overlap_implementable = schedule.overlap_implementable;
+    breakdown->cube_phase_cycles = cube_phase;
+    breakdown->vector_phase_cycles = vector_phase;
+    breakdown->gm_l1_cycles = gm_l1;
+    breakdown->gm_ub_cycles = gm_ub;
+    breakdown->l0c_gm_cycles = l0c_gm;
+    breakdown->ub_gm_cycles = ub_gm;
+    breakdown->ddr_wall_cycles = result.ddr_traffic;
+    breakdown->pipeline_wall_cycles = pipeline_wall;
+    breakdown->kernel_fill_cycles = kernel_fill;
+    breakdown->group_overhead_cycles = group_overhead;
+    breakdown->total_cycles = result.latency;
+  }
   return result;
 }
 
@@ -7337,11 +7415,53 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
   return best;
 }
 
+std::vector<MixedGroupCostCandidate>
+Ascend910BCost::enumerate_mixed_group_costs(
+    const TileConfig& cfg,
+    const FlatSet<size_t>& retained_from_prev,
+    const FlatSet<size_t>& retain_these) const {
+  std::vector<MixedGroupCostCandidate> candidates;
+  const MixedSchedulePlan maximal = derive_mixed_schedule_plan(
+      cfg, retained_from_prev, retain_these, /*parallel_split=*/1,
+      /*active_groups=*/0);
+  if (!maximal.feasible) {
+    return candidates;
+  }
+
+  const int vector_to_cube_mask = vector_to_cube_operand_mask();
+  const VectorStreamPlan vector_to_cube_stream =
+      vector_to_cube_mask != 0
+          ? vector_to_cube_stream_plan(cfg, maximal.vector_lanes)
+          : VectorStreamPlan{};
+  const bool streamed_vector_to_cube =
+      vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
+      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const bool group_tunable =
+      maximal.algorithm != MixedAlgorithmKind::DenseSwiGluMlp &&
+      !streamed_vector_to_cube &&
+      (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
+       maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle);
+  const int64_t max_groups = std::min(
+      maximal.loop.work_items, maximal.group_capacity);
+  for (int64_t groups = 1; groups <= max_groups; ++groups) {
+    if (maximal.loop.work_items % groups != 0) continue;
+    if (!group_tunable && groups != maximal.loop.active_groups) continue;
+    MixedCostBreakdown breakdown;
+    CostResult cost = compute_mixed_cost_for_groups(
+        cfg, retained_from_prev, retain_these, groups, &breakdown);
+    if (cost.feasible && breakdown.feasible) {
+      candidates.push_back({std::move(cost), std::move(breakdown)});
+    }
+  }
+  return candidates;
+}
+
 CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     const TileConfig& cfg,
     const FlatSet<size_t>& retained_from_prev,
     const FlatSet<size_t>& retain_these,
-    int64_t active_groups) const {
+    int64_t active_groups,
+    MixedCostBreakdown* breakdown) const {
   // ===== MIXED cube+vector kernel — 910B DDR-streamed, latency hidden =====
   // Cube ops run on the cube pool and vector ops on the vector pool CONCURRENTLY.
   // A cube↔vector intermediate cannot stay on chip (910B has no direct Acc→Vec
@@ -7355,6 +7475,7 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   // the DDR total is the same on 910B). A future 950 makes the handoff direct
   // (the crossing intermediate avoids DDR) — same formula, cheaper ddr term.
   CostResult result;
+  if (breakdown != nullptr) *breakdown = MixedCostBreakdown{};
   result.config = cfg;
   const MixedSchedulePlan schedule =
       derive_mixed_schedule_plan(cfg, retained_from_prev, retain_these,
@@ -7365,10 +7486,16 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   // kernels each fit their one pool.
   if (!schedule.feasible) return result;
   if (schedule.algorithm == MixedAlgorithmKind::DenseSwiGluMlp) {
-    return compute_dense_mlp_cost(cfg, schedule);
+    return compute_dense_mlp_cost(cfg, schedule, breakdown);
   }
   result.mixed_active_groups =
       static_cast<int>(schedule.loop.active_groups);
+  if (breakdown != nullptr) {
+    breakdown->active_groups = schedule.loop.active_groups;
+    breakdown->trips_per_group = schedule.loop.max_trips_per_group;
+    breakdown->pipeline_stages = schedule.loop.pipeline_stages;
+    breakdown->overlap_implementable = schedule.overlap_implementable;
+  }
   const int vector_to_cube_mask = vector_to_cube_operand_mask();
   const bool vector_to_cube = vector_to_cube_mask != 0;
   const VectorStreamPlan vector_to_cube_stream =
@@ -7830,7 +7957,18 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
                          buildable_cube_windows.size()
                  ? buildable_cube_windows[static_cast<size_t>(sink_mm_op_)]
                  : output_K_);
-  struct MixEval { double wall, ddr, max_stage, eff_cube; };
+  struct MixEval {
+    double wall = 0.0;
+    double ddr = 0.0;
+    double max_stage = 0.0;
+    double eff_cube = 0.0;
+    double cube_phase = 0.0;
+    double vector_phase = 0.0;
+    double gm_l1 = 0.0;
+    double gm_ub = 0.0;
+    double l0c_gm = 0.0;
+    double ub_gm = 0.0;
+  };
   auto eval_S = [&](int64_t S) -> MixEval {
     const double eff_cube =
         std::min((double)schedule.loop.active_groups * (double)S, n_units);
@@ -7870,8 +8008,16 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
                                 ? std::max(cube_phase + vector_phase / static_cast<double>(trips),
                                            vector_phase + cube_phase / static_cast<double>(trips))
                                 : cube_phase + vector_phase;
-        return {wall, std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat}),
-                std::max(cube_phase, vector_phase), eff_cube};
+        return {wall,
+                std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat}),
+                std::max(cube_phase, vector_phase),
+                eff_cube,
+                cube_phase,
+                vector_phase,
+                gm_l1_lat,
+                gm_ub_lat,
+                l0c_gm_lat,
+                ub_gm_lat};
       }
       const int64_t full_k = std::max<int64_t>(1, output_K_);
       const int64_t k_window =
@@ -7913,8 +8059,16 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
                               ? std::max(cube_phase + vector_phase / (double)trips,
                                          vector_phase + cube_phase / (double)trips)
                               : cube_phase + vector_phase;
-      return {wall, std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat}),
-              std::max(cube_phase, vector_phase), eff_cube};
+      return {wall,
+              std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat}),
+              std::max(cube_phase, vector_phase),
+              eff_cube,
+              cube_phase,
+              vector_phase,
+              gm_l1_lat,
+              gm_ub_lat,
+              l0c_gm_lat,
+              ub_gm_lat};
     }
 
     // Analytic/research topologies retain the broader mixed-study formula.
@@ -7937,7 +8091,9 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
           ? std::max({cube_wall, vec_stage, ddr})
           : std::max({cube_wall + one_vec_tile, vec_stage + one_cube_tile, ddr});
     }
-    return {wall, ddr, std::max(cube_stage, vec_stage), eff_cube};
+    return {wall, ddr, std::max(cube_stage, vec_stage), eff_cube,
+            cube_wall, vec_stage, gm_l1_lat, gm_ub_lat, l0c_gm_lat,
+            ub_gm_lat};
   };
   MixEval best = eval_S(1);
   int64_t best_S = 1;
@@ -7961,11 +8117,27 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   // spatial items live in the per-group inner loop.  Kernel fill is therefore
   // paid once, while the grounded per-task term follows the actual launch
   // blocks rather than the number of logical regions.
-  if (prob_->kernel_fill_cost > 0) {
-    result.latency += (double)prob_->kernel_fill_cost;
+  const double kernel_fill = prob_->kernel_fill_cost > 0
+                                 ? static_cast<double>(prob_->kernel_fill_cost)
+                                 : 0.0;
+  const double group_overhead =
+      static_cast<double>(schedule.loop.active_groups) *
+      static_cast<double>(prob_->mixed_group_overhead_cycles);
+  result.latency += kernel_fill + group_overhead;
+  if (breakdown != nullptr) {
+    breakdown->feasible = true;
+    breakdown->cube_phase_cycles = best.cube_phase;
+    breakdown->vector_phase_cycles = best.vector_phase;
+    breakdown->gm_l1_cycles = best.gm_l1;
+    breakdown->gm_ub_cycles = best.gm_ub;
+    breakdown->l0c_gm_cycles = best.l0c_gm;
+    breakdown->ub_gm_cycles = best.ub_gm;
+    breakdown->ddr_wall_cycles = best.ddr;
+    breakdown->pipeline_wall_cycles = best.wall;
+    breakdown->kernel_fill_cycles = kernel_fill;
+    breakdown->group_overhead_cycles = group_overhead;
+    breakdown->total_cycles = result.latency;
   }
-  result.latency += (double)schedule.loop.active_groups *
-                    (double)prob_->per_task_overhead_cycles;
 
   // Emitted per-core cube k: the single-core seq-k derived for the sink matmul
   // (same derivation as the homogeneous cube), so the lowered kernel and the

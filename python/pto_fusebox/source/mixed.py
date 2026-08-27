@@ -777,8 +777,9 @@ def _emit_single_round_trip(
         plan.algorithm is not MixedAlgorithm.GENERIC
         or plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
         or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
-        or plan.pipeline_stages != 3
-        or plan.requested_skew_depth != 2
+        or plan.pipeline_stages not in {1, 3}
+        or (plan.pipeline_stages == 3) is not plan.overlap_implementable
+        or plan.requested_skew_depth != (2 if plan.pipeline_stages == 3 else 0)
         or len(plan.stages) != 3
         or tuple(stage.engine for stage in plan.stages)
         != (MixedEngine.CUBE, MixedEngine.VECTOR, MixedEngine.CUBE)
@@ -817,9 +818,11 @@ def _emit_single_round_trip(
     writer = _mixed_header(context, program_name, plan)
     output = context.interface.output_argument
     trips = plan.max_trips_per_group
+    trip_loop = "pl.pipeline" if plan.pipeline_stages == 3 else "pl.range"
+    trip_stage = ", stage=3" if plan.pipeline_stages == 3 else ""
     writer.line(
         3,
-        f"for mixed_trip, (output_iter,) in pl.pipeline({trips}, stage=3, "
+        f"for mixed_trip, (output_iter,) in {trip_loop}({trips}{trip_stage}, "
         f"init_values=({output},)):",
     )
     row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")

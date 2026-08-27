@@ -282,6 +282,7 @@ class VectorKernelPlan:
     m_partition: AxisPartition
     n_partition: AxisPartition
     full_peak_ub_bytes: int
+    workspace_free_peak_ub_bytes: int
     chunk_peak_ub_bytes: int
     stream_band_count: int
     physical_frame: VectorPhysicalFramePlan

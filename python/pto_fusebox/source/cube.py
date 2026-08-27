@@ -1133,17 +1133,9 @@ def _emit_cube_window(
     lhs_mat = f"lhs_mat_natural{suffix}"
     rhs_mat = f"rhs_mat_natural{suffix}"
     if lhs_transposed:
-        lhs_mat = f"lhs_mat{suffix}"
-        writer.line(
-            indent,
-            f"{lhs_mat} = pl.tile.transpose_view(lhs_mat_natural{suffix})",
-        )
+        lhs_mat = f"pl.tile.transpose_view({lhs_mat})"
     if rhs_transposed:
-        rhs_mat = f"rhs_mat{suffix}"
-        writer.line(
-            indent,
-            f"{rhs_mat} = pl.tile.transpose_view(rhs_mat_natural{suffix})",
-        )
+        rhs_mat = f"pl.tile.transpose_view({rhs_mat})"
     writer.line(
         indent,
         f"lhs_left{suffix} = pl.tile.move({lhs_mat}, target_memory=pl.Mem.Left)",

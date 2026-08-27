@@ -7,8 +7,8 @@ local capture while retaining legal 910B cube dimensions, dtypes, and operation
 order.  Neither graph carries a model-name or algorithm recognizer hint.
 
 The two C2V epilogues deliberately use the same two-op DAG at different
-shapes.  The small case has one mixed item.  The streamed case has 24 spatial
-items but uses 12 1-AIC + 2-AIV groups, giving each group two successor items
+shapes.  The small case has one mixed item.  The larger case has 24 spatial
+items but uses six 1-AIC + 2-AIV groups, giving each group four successor items
 for the cross-core stage-2 pipeline.
 """
 

@@ -393,7 +393,7 @@ one_cube_tile = max(cube_mac,cube_extract)/num_tiles ;  one_vec_tile = Σ VecOpC
 3-stage: wall = max( cube_stage, vec_stage, ddr_lat )     # fill absorbed (output unit busy from t=0)
 serial:  wall = max( cube_stage + vec_stage, ddr_lat )    # unsupported FIFO topology; no skewed max
 
-lat       = wall + kernel_fill_cost + groups · task_cost  # one launch; block overhead follows groups
+lat       = wall + kernel_fill_cost + groups · mixed_group_overhead_cycles
 trips     = num_tiles / groups                            # uniform successor items per mixed group
 groups    = selected divisor of num_tiles, at most 24     # each group = 1 cube : 2 vector cores
 ```
@@ -430,6 +430,41 @@ count is serialized and the source emitter uses it for both `pl.spmd(groups)` an
 underfilled grids. Full attention additionally needs a key-chunk axis distinct from its query grid;
 streaming softmax→PV already carries that phase-local axis and is not reinterpreted as a spatial
 successor loop.
+
+The mixed group term is independent of the vector-only task term. A zero-work grid sweep on two
+910B2 devices measured **0.2579 µs per additional block** (95% CI
+**[0.2545, 0.2619]**). At 1.85 GHz this is 477 cycles, represented by the nearest 16-cycle quantum,
+`mixed_group_overhead_cycles = 480`, in the production target profile. This coefficient was not fit
+to the C2V kernels it changes. With that fixed term, a fresh analytic solve selects:
+
+| case | output geometry | selected tile / grid | groups × trips | modeled cycles |
+| ---- | --------------- | -------------------- | -------------- | -------------- |
+| C1 | `[192,256]` | `[64,64]`, `3×4` | `6×2` | 15417.208145 |
+| C2 | `[384,256]` | `[64,64]`, `6×4` | `6×4` | 17572.151835 |
+| H1 | `[768,256]` | `[64,64]`, `12×4` | `8×6` | 21316.361628 |
+| H2 | `[384,512]` | `[64,64]`, `6×8` | `8×6` | 21316.361628 |
+
+C2/H1/H2 move to the silicon-preferred side of the previous frozen sweeps. C1's selected six-group
+point was not measured in that campaign and therefore remains a required device discriminator, not
+a closure claim. The `mixed_group_sweep` developer tool serializes every uniform group divisor for
+the selected tile together with cube/vector phase cycles, all four GM pipe cycles, pipeline wall,
+kernel fill, group overhead, FIFO descriptors, and stage topology. It calls the production cost
+path; it is diagnostic, not a second planner. Non-tunable streaming, sequential multi-round-trip,
+and dense C,C→V→C plans contribute one selected row so their FIFO topology and stage balance are
+auditable without pretending that they support the generic active-group choice.
+
+A successor loop is pipelined only when every group has at least two complete items. In particular,
+a one-trip C→V→C candidate is serialized as `pl.range(1)` with pipeline depth 1 and no skew.
+
+Materialized mixed vector stages also carry a fail-closed current-main PyPTO workspace bound. Each
+row reduction initially creates a distinct scratch allocation. MemoryReuse may later coalesce
+non-overlapping workspaces, but source admission cannot require that optimization to succeed. The
+old R2 candidate priced 49,408 bytes of vector state, omitting the second 32,768-byte workspace; its
+fallback packing plus the 131,072-byte C2V ring reached the observed 213,248 bytes and failed the
+188,416-byte Vec limit. Source-constrained planning now rejects that tile and selects a 64-row
+physical tile with a conservative bound of 49,280 bytes of vector state plus a 65,536-byte C2V ring,
+or 114,816 bytes total. The corrected plan may still be forced to 12 one-trip groups for the
+serial-loop discriminator.
 
 **Four-port DDR — `max`, not sum, each HBM-capped.** The GM ring is four independent per-unit
 pipes that **overlap**, so `ddr_lat` is the `max` over them — not the summed
