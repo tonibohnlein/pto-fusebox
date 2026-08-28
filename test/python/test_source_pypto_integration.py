@@ -1021,7 +1021,7 @@ def test_mixed_source_rejects_duplicate_pypto_pipe_id() -> None:
     ).source
     parser_diagnostics = importlib.import_module("pypto.language.parser.diagnostics")
     pl = importlib.import_module("pypto.language")
-    pipe = re.search(r"pl\.cross_core_pipe\([^\n]+\)", source)
+    pipe = re.search(r"pl\.cross_core_pipe\([^)]*\)", source)
     assert pipe is not None
     duplicated = source.replace(pipe.group(0), f"{pipe.group(0)}, {pipe.group(0)}", 1)
     assert duplicated != source

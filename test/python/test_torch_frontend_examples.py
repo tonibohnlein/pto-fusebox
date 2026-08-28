@@ -325,11 +325,22 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert isinstance(plan, MixedKernelPlan)
     slot_counts = {fifo.slot_count for fifo in plan.fifos}
     assert len(slot_counts) == 1
-    (slot_count,) = slot_counts
     source = emit_pypto_region(graph, region, program_name=name).source
-    assert source.count("pl.cross_core_slot(") == 1
-    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
-    assert "pl.cross_core_pipe" not in source
+    assert "pl.cross_core_slot(" not in source
+    assert source.count("pl.cross_core_pipe(") == len(plan.fifos)
+    for fifo in plan.fifos:
+        direction = (
+            "pl.CrossCoreDirection.CUBE_TO_VECTOR"
+            if fifo.direction.value == "cube_to_vector"
+            else "pl.CrossCoreDirection.VECTOR_TO_CUBE"
+        )
+        assert (
+            "pl.cross_core_pipe("
+            f"tensor_id={fifo.tensor}, direction={direction}, "
+            f"valid_shape=[{fifo.valid_rows}, {fifo.valid_cols}], "
+            f"slot_size_bytes={fifo.slot_bytes}, slot_num={fifo.slot_count}, "
+            f"pipe_id={fifo.pipe_id}, bundle={fifo.bundle})"
+        ) in source
     assert "auto_fuse" not in source and "auto_tile" not in source
 
 
