@@ -19,7 +19,7 @@ from .schedule import scheduled_region
 from .schedule.schema import MixedKernelPlan
 
 
-MIXED_GROUP_SWEEP_SCHEMA = "pto_fusebox.mixed_group_sweep.v1"
+MIXED_GROUP_SWEEP_SCHEMA = "pto_fusebox.mixed_group_sweep.v2"
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,14 @@ class MixedCostBreakdown:
 
     cube_phase_cycles: float
     vector_phase_cycles: float
+    gm_l1_bytes: float
+    gm_ub_bytes: float
+    l0c_gm_bytes: float
+    ub_gm_bytes: float
+    gm_l1_effective_parallelism: float
+    gm_ub_effective_parallelism: float
+    l0c_gm_effective_parallelism: float
+    ub_gm_effective_parallelism: float
     gm_l1_cycles: float
     gm_ub_cycles: float
     l0c_gm_cycles: float

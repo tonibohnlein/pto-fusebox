@@ -7316,10 +7316,14 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(
   };
   const double cube_pipes = static_cast<double>(groups);
   const double vector_pipes = cube_pipes * static_cast<double>(schedule.vector_lanes);
-  const double gm_l1 = gm_l1_bytes * bc.reload / parallelism(cube_pipes, prob_->bw_gm_l1);
-  const double gm_ub = gm_ub_bytes * bc.ub_in / parallelism(vector_pipes, prob_->bw_gm_ub);
-  const double l0c_gm = l0c_gm_bytes * bc.store / parallelism(cube_pipes, prob_->bw_l0c_gm);
-  const double ub_gm = ub_gm_bytes * bc.ub_out / parallelism(vector_pipes, prob_->bw_ub_gm);
+  const double gm_l1_parallelism = parallelism(cube_pipes, prob_->bw_gm_l1);
+  const double gm_ub_parallelism = parallelism(vector_pipes, prob_->bw_gm_ub);
+  const double l0c_gm_parallelism = parallelism(cube_pipes, prob_->bw_l0c_gm);
+  const double ub_gm_parallelism = parallelism(vector_pipes, prob_->bw_ub_gm);
+  const double gm_l1 = gm_l1_bytes * bc.reload / gm_l1_parallelism;
+  const double gm_ub = gm_ub_bytes * bc.ub_in / gm_ub_parallelism;
+  const double l0c_gm = l0c_gm_bytes * bc.store / l0c_gm_parallelism;
+  const double ub_gm = ub_gm_bytes * bc.ub_out / ub_gm_parallelism;
 
   // Gate/up/down are serial on one AIC, but each matmul's ordinary GM->L1
   // feed overlaps its local Matrix/MTE1 work.  The AIV side is a blocking
@@ -7355,6 +7359,14 @@ CostResult Ascend910BCost::compute_dense_mlp_cost(
     breakdown->overlap_implementable = schedule.overlap_implementable;
     breakdown->cube_phase_cycles = cube_phase;
     breakdown->vector_phase_cycles = vector_phase;
+    breakdown->gm_l1_bytes = gm_l1_bytes;
+    breakdown->gm_ub_bytes = gm_ub_bytes;
+    breakdown->l0c_gm_bytes = l0c_gm_bytes;
+    breakdown->ub_gm_bytes = ub_gm_bytes;
+    breakdown->gm_l1_effective_parallelism = gm_l1_parallelism;
+    breakdown->gm_ub_effective_parallelism = gm_ub_parallelism;
+    breakdown->l0c_gm_effective_parallelism = l0c_gm_parallelism;
+    breakdown->ub_gm_effective_parallelism = ub_gm_parallelism;
     breakdown->gm_l1_cycles = gm_l1;
     breakdown->gm_ub_cycles = gm_ub;
     breakdown->l0c_gm_cycles = l0c_gm;
@@ -7783,10 +7795,12 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
       exact_source_mixed
           ? eff_units * (double)std::max<int64_t>(1, schedule.vector_lanes)
           : eff_units;
-  const double gm_ub_lat =
-      gm_ub_bytes * bc.ub_in / par(active_vector_pipes, prob_->bw_gm_ub);
-  const double ub_gm_lat =
-      ub_gm_bytes * bc.ub_out / par(active_vector_pipes, prob_->bw_ub_gm);
+  const double gm_ub_parallelism =
+      par(active_vector_pipes, prob_->bw_gm_ub);
+  const double ub_gm_parallelism =
+      par(active_vector_pipes, prob_->bw_ub_gm);
+  const double gm_ub_lat = gm_ub_bytes * bc.ub_in / gm_ub_parallelism;
+  const double ub_gm_lat = ub_gm_bytes * bc.ub_out / ub_gm_parallelism;
   // Compute distribution: the LPT makespan over the non-uniform grid regions (the BUSIEST
   // unit), NOT the flat total/eff_units average, which under-predicts an imbalanced grid's
   // biggest region (up to ~2x at one region/unit, the few-tile decode corner). The CUBE region
@@ -7979,6 +7993,14 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     double gm_ub = 0.0;
     double l0c_gm = 0.0;
     double ub_gm = 0.0;
+    double gm_l1_bytes = 0.0;
+    double gm_ub_bytes = 0.0;
+    double l0c_gm_bytes = 0.0;
+    double ub_gm_bytes = 0.0;
+    double gm_l1_parallelism = 0.0;
+    double gm_ub_parallelism = 0.0;
+    double l0c_gm_parallelism = 0.0;
+    double ub_gm_parallelism = 0.0;
   };
   auto eval_S = [&](int64_t S) -> MixEval {
     const double eff_cube =
@@ -7989,9 +8011,14 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
         ? LptMakespan((int64_t)eff_cube, g_pm, g_pn, cube_region_work, S)
         : WaveComputeCycles(base_cube_work, num_tiles * S, (int64_t)eff_cube);
     const double one_cube_tile = (base_cube_work / (double)num_tiles) / std::min((double)S, n_units);
-    const double gm_l1_lat  = gm_l1_bytes * bc.reload / par(eff_cube, prob_->bw_gm_l1);
-    const double l0c_gm_lat = (l0c_gm_bytes + (double)(S - 1) * sink_store_bytes) * bc.store
-                              / par(eff_cube, prob_->bw_l0c_gm);
+    const double effective_l0c_gm_bytes =
+        l0c_gm_bytes + (double)(S - 1) * sink_store_bytes;
+    const double gm_l1_parallelism = par(eff_cube, prob_->bw_gm_l1);
+    const double l0c_gm_parallelism = par(eff_cube, prob_->bw_l0c_gm);
+    const double gm_l1_lat =
+        gm_l1_bytes * bc.reload / gm_l1_parallelism;
+    const double l0c_gm_lat =
+        effective_l0c_gm_bytes * bc.store / l0c_gm_parallelism;
     const double ddr = std::max({gm_l1_lat, gm_ub_lat, l0c_gm_lat, ub_gm_lat});
     // Analytic topologies retain the historical homogeneous two-fractal proxy
     // until they acquire stage-local cube plans. Buildable v0 is priced below
@@ -8028,7 +8055,15 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
                 gm_l1_lat,
                 gm_ub_lat,
                 l0c_gm_lat,
-                ub_gm_lat};
+                ub_gm_lat,
+                gm_l1_bytes,
+                gm_ub_bytes,
+                effective_l0c_gm_bytes,
+                ub_gm_bytes,
+                gm_l1_parallelism,
+                gm_ub_parallelism,
+                l0c_gm_parallelism,
+                ub_gm_parallelism};
       }
       const int64_t full_k = std::max<int64_t>(1, output_K_);
       const int64_t k_window =
@@ -8079,7 +8114,15 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
               gm_l1_lat,
               gm_ub_lat,
               l0c_gm_lat,
-              ub_gm_lat};
+              ub_gm_lat,
+              gm_l1_bytes,
+              gm_ub_bytes,
+              effective_l0c_gm_bytes,
+              ub_gm_bytes,
+              gm_l1_parallelism,
+              gm_ub_parallelism,
+              l0c_gm_parallelism,
+              ub_gm_parallelism};
     }
 
     // Analytic/research topologies retain the broader mixed-study formula.
@@ -8104,7 +8147,9 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     }
     return {wall, ddr, std::max(cube_stage, vec_stage), eff_cube,
             cube_wall, vec_stage, gm_l1_lat, gm_ub_lat, l0c_gm_lat,
-            ub_gm_lat};
+            ub_gm_lat, gm_l1_bytes, gm_ub_bytes, effective_l0c_gm_bytes,
+            ub_gm_bytes, gm_l1_parallelism, gm_ub_parallelism,
+            l0c_gm_parallelism, ub_gm_parallelism};
   };
   MixEval best = eval_S(1);
   int64_t best_S = 1;
@@ -8139,6 +8184,14 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     breakdown->feasible = true;
     breakdown->cube_phase_cycles = best.cube_phase;
     breakdown->vector_phase_cycles = best.vector_phase;
+    breakdown->gm_l1_bytes = best.gm_l1_bytes;
+    breakdown->gm_ub_bytes = best.gm_ub_bytes;
+    breakdown->l0c_gm_bytes = best.l0c_gm_bytes;
+    breakdown->ub_gm_bytes = best.ub_gm_bytes;
+    breakdown->gm_l1_effective_parallelism = best.gm_l1_parallelism;
+    breakdown->gm_ub_effective_parallelism = best.gm_ub_parallelism;
+    breakdown->l0c_gm_effective_parallelism = best.l0c_gm_parallelism;
+    breakdown->ub_gm_effective_parallelism = best.ub_gm_parallelism;
     breakdown->gm_l1_cycles = best.gm_l1;
     breakdown->gm_ub_cycles = best.gm_ub;
     breakdown->l0c_gm_cycles = best.l0c_gm;

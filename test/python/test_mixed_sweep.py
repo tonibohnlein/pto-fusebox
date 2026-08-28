@@ -79,6 +79,32 @@ def _solve_and_sweep(
 def _assert_cost_identity(candidate: MixedGroupCandidate) -> None:
     breakdown = candidate.breakdown
     assert breakdown.group_overhead_cycles == 480 * candidate.groups
+    ports = (
+        (
+            breakdown.gm_l1_bytes,
+            breakdown.gm_l1_effective_parallelism,
+            breakdown.gm_l1_cycles,
+        ),
+        (
+            breakdown.gm_ub_bytes,
+            breakdown.gm_ub_effective_parallelism,
+            breakdown.gm_ub_cycles,
+        ),
+        (
+            breakdown.l0c_gm_bytes,
+            breakdown.l0c_gm_effective_parallelism,
+            breakdown.l0c_gm_cycles,
+        ),
+        (
+            breakdown.ub_gm_bytes,
+            breakdown.ub_gm_effective_parallelism,
+            breakdown.ub_gm_cycles,
+        ),
+    )
+    for issued_bytes, effective_parallelism, cycles in ports:
+        assert issued_bytes >= 0
+        assert effective_parallelism >= 1
+        assert (issued_bytes == 0) == (cycles == 0)
     assert breakdown.ddr_wall_cycles == max(
         breakdown.gm_l1_cycles,
         breakdown.gm_ub_cycles,
@@ -181,6 +207,21 @@ def test_calibrated_c2v_group_ranking_uses_production_breakdown(
         assert len(candidate.fifos) == 1
         assert candidate.fifos[0]["direction"] == "cube_to_vector"
         assert [stage["engine"] for stage in candidate.stages] == ["cube", "vector"]
+
+    for field in ("gm_l1_bytes", "gm_ub_bytes", "l0c_gm_bytes", "ub_gm_bytes"):
+        assert (
+            len({getattr(candidate.breakdown, field) for candidate in sweep.candidates})
+            == 1
+        )
+    by_groups = sorted(sweep.candidates, key=lambda candidate: candidate.groups)
+    for field in (
+        "gm_l1_effective_parallelism",
+        "gm_ub_effective_parallelism",
+        "l0c_gm_effective_parallelism",
+        "ub_gm_effective_parallelism",
+    ):
+        values = [getattr(candidate.breakdown, field) for candidate in by_groups]
+        assert values == sorted(values)
 
     forced = region_for_mixed_group_candidate(region, sweep.selected)
     assert can_emit_region(graph, forced)

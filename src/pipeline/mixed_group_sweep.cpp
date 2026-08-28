@@ -58,7 +58,7 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
   }
 
   json output = {
-      {"schema_version", "pto_fusebox.mixed_group_sweep.v1"},
+      {"schema_version", "pto_fusebox.mixed_group_sweep.v2"},
       {"selection_resolution_cycles",
        Ascend910BCost::kMixedGroupSelectionResolutionCycles},
       {"selected_candidate_id",
@@ -122,6 +122,18 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
          {"model",
           {{"cube_phase_cycles", breakdown.cube_phase_cycles},
            {"vector_phase_cycles", breakdown.vector_phase_cycles},
+           {"gm_l1_bytes", breakdown.gm_l1_bytes},
+           {"gm_ub_bytes", breakdown.gm_ub_bytes},
+           {"l0c_gm_bytes", breakdown.l0c_gm_bytes},
+           {"ub_gm_bytes", breakdown.ub_gm_bytes},
+           {"gm_l1_effective_parallelism",
+            breakdown.gm_l1_effective_parallelism},
+           {"gm_ub_effective_parallelism",
+            breakdown.gm_ub_effective_parallelism},
+           {"l0c_gm_effective_parallelism",
+            breakdown.l0c_gm_effective_parallelism},
+           {"ub_gm_effective_parallelism",
+            breakdown.ub_gm_effective_parallelism},
            {"gm_l1_cycles", breakdown.gm_l1_cycles},
            {"gm_ub_cycles", breakdown.gm_ub_cycles},
            {"l0c_gm_cycles", breakdown.l0c_gm_cycles},

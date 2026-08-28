@@ -1303,6 +1303,14 @@ struct MixedCostBreakdown {
     bool overlap_implementable = false;
     double cube_phase_cycles = 0.0;
     double vector_phase_cycles = 0.0;
+    double gm_l1_bytes = 0.0;
+    double gm_ub_bytes = 0.0;
+    double l0c_gm_bytes = 0.0;
+    double ub_gm_bytes = 0.0;
+    double gm_l1_effective_parallelism = 0.0;
+    double gm_ub_effective_parallelism = 0.0;
+    double l0c_gm_effective_parallelism = 0.0;
+    double ub_gm_effective_parallelism = 0.0;
     double gm_l1_cycles = 0.0;
     double gm_ub_cycles = 0.0;
     double l0c_gm_cycles = 0.0;

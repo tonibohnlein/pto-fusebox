@@ -454,7 +454,9 @@ closure claim. Descriptor-matched C2V controls at 8, 16, and 24 work items retai
 `64×64×64` tile and 131,072-byte FIFO while varying group count, trips, and grid orientation. The
 `mixed_group_sweep` developer tool serializes every uniform group divisor for
 the selected tile together with cube/vector phase cycles, all four GM pipe cycles, pipeline wall,
-kernel fill, group overhead, FIFO descriptors, and stage topology. It calls the production cost
+kernel fill, group overhead, FIFO descriptors, and stage topology. For calibration it also reports
+the exact issued bytes and HBM-capped effective parallelism used to derive each of the four GM-pipe
+cycle terms. It calls the production cost
 path; it is diagnostic, not a second planner. Non-tunable streaming, sequential multi-round-trip,
 and dense C,C→V→C plans contribute one selected row so their FIFO topology and stage balance are
 auditable without pretending that they support the generic active-group choice.
