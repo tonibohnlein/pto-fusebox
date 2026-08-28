@@ -124,10 +124,16 @@ def _assert_source_pipeline_identity(candidate: MixedGroupCandidate) -> None:
     )
 
 
+def _selection_bucket(total_cycles: float, resolution_cycles: float) -> int:
+    """Mirror positive ``std::llround`` used by the production selector."""
+
+    return math.floor(total_cycles / resolution_cycles + 0.5)
+
+
 @pytest.mark.parametrize(
     ("name", "shapes", "selected_groups", "selected_trips"),
     (
-        ("C1", ((192, 64), (64, 256), (1, 256)), 6, 2),
+        ("C1", ((192, 64), (64, 256), (1, 256)), 4, 3),
         ("C2", ((384, 64), (64, 256), (1, 256)), 6, 4),
         ("H1", ((768, 64), (64, 256), (1, 256)), 8, 6),
         ("H2", ((384, 64), (64, 512), (1, 512)), 8, 6),
@@ -142,10 +148,25 @@ def test_calibrated_c2v_group_ranking_uses_production_breakdown(
     graph, region, plan, sweep = _solve_and_sweep(StaticC2VEpilogue(), shapes)
 
     assert plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+    assert sweep.selection_resolution_cycles == 16.0
     assert plan.active_groups == sweep.selected.groups == selected_groups
     assert plan.max_trips_per_group == sweep.selected.trips_per_group == selected_trips
-    assert sweep.selected.breakdown.total_cycles == min(
-        candidate.breakdown.total_cycles for candidate in sweep.candidates
+    selected_bucket = _selection_bucket(
+        sweep.selected.breakdown.total_cycles,
+        sweep.selection_resolution_cycles,
+    )
+    candidate_buckets = {
+        candidate.groups: _selection_bucket(
+            candidate.breakdown.total_cycles,
+            sweep.selection_resolution_cycles,
+        )
+        for candidate in sweep.candidates
+    }
+    assert selected_bucket == min(candidate_buckets.values())
+    assert selected_groups == min(
+        groups
+        for groups, bucket in candidate_buckets.items()
+        if bucket == selected_bucket
     )
     assert {candidate.groups for candidate in sweep.candidates} == {
         divisor
@@ -165,6 +186,46 @@ def test_calibrated_c2v_group_ranking_uses_production_breakdown(
     assert can_emit_region(graph, forced)
     source = emit_pypto_region(
         graph, forced, program_name=f"mixed_{name.lower()}"
+    ).source
+    assert f"pl.spmd({selected_groups}," in source
+    assert f"pl.pipeline({selected_trips}, stage=2" in source
+
+
+@pytest.mark.parametrize(
+    ("name", "shapes", "expected_grid", "selected_groups", "selected_trips"),
+    (
+        ("D1", ((128, 64), (64, 256), (1, 256)), (2, 4), 4, 2),
+        ("D2", ((256, 64), (64, 256), (1, 256)), (4, 4), 4, 4),
+        ("D3", ((256, 64), (64, 384), (1, 384)), (4, 6), 6, 4),
+    ),
+)
+def test_c2v_descriptor_matched_group_controls(
+    name: str,
+    shapes: tuple[tuple[int, ...], ...],
+    expected_grid: tuple[int, int],
+    selected_groups: int,
+    selected_trips: int,
+) -> None:
+    graph, region, plan, sweep = _solve_and_sweep(StaticC2VEpilogue(), shapes)
+
+    assert plan.protocol is MixedCrossCoreProtocol.ONE_WAY
+    assert (plan.m_partition.parts, plan.n_partition.parts) == expected_grid
+    assert (sweep.tile.height, sweep.tile.width, sweep.tile.contraction) == (64, 64, 64)
+    assert sweep.selection_resolution_cycles == 16.0
+    assert sweep.selected.groups == plan.active_groups == selected_groups
+    assert sweep.selected.trips_per_group == plan.max_trips_per_group == selected_trips
+    assert len(plan.fifos) == 1
+    fifo = plan.fifos[0]
+    assert fifo.direction.value == "cube_to_vector"
+    assert (fifo.valid_rows, fifo.valid_cols) == (64, 64)
+    assert fifo.slot_bytes == 16384
+    assert fifo.slot_count == 8
+    assert fifo.reserved_bytes == 131072
+
+    forced = region_for_mixed_group_candidate(region, sweep.selected)
+    assert can_emit_region(graph, forced)
+    source = emit_pypto_region(
+        graph, forced, program_name=f"mixed_descriptor_{name.lower()}"
     ).source
     assert f"pl.spmd({selected_groups}," in source
     assert f"pl.pipeline({selected_trips}, stage=2" in source

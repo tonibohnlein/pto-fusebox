@@ -75,6 +75,7 @@ class MixedGroupSweep:
     """All group-count candidates for the model-selected mixed tile."""
 
     selected_candidate_id: str
+    selection_resolution_cycles: float
     tile: MixedGroupTile
     candidates: tuple[MixedGroupCandidate, ...]
     stdout: str = ""
@@ -235,6 +236,12 @@ def _parse_sweep(
             f"{payload.get('schema_version')!r}; expected {MIXED_GROUP_SWEEP_SCHEMA!r}"
         )
     selected_id = payload.get("selected_candidate_id")
+    selection_resolution_cycles = _finite_float(
+        payload.get("selection_resolution_cycles"),
+        "selection_resolution_cycles",
+    )
+    if selection_resolution_cycles <= 0:
+        raise ValueError("selection_resolution_cycles must be positive")
     tile = _parse_tile(payload.get("tile"), field="tile")
     raw_candidates = payload.get("candidates")
     if not isinstance(selected_id, str) or not selected_id:
@@ -257,7 +264,14 @@ def _parse_sweep(
     selected = [candidate for candidate in candidates if candidate.selected]
     if len(selected) != 1 or selected[0].id != selected_id:
         raise ValueError("mixed group sweep selected-candidate markers disagree")
-    return MixedGroupSweep(selected_id, tile, candidates, stdout, stderr)
+    return MixedGroupSweep(
+        selected_candidate_id=selected_id,
+        selection_resolution_cycles=selection_resolution_cycles,
+        tile=tile,
+        candidates=candidates,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def _parse_candidate(

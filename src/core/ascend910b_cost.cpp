@@ -40,6 +40,16 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
+// Mixed-group totals combine fitted instruction formulas and a group overhead
+// represented at the machine model's 16-cycle quantum.  Treat sub-quantum
+// differences as indistinguishable instead of letting floating-point noise
+// choose more physical groups.  The raw latency remains available for reports;
+// this helper is only the deterministic selection key.
+int64_t MixedSelectionBucket(double latency) {
+  return static_cast<int64_t>(std::llround(
+      latency / Ascend910BCost::kMixedGroupSelectionResolutionCycles));
+}
+
 struct VectorPhysicalFrame {
   int64_t rows;
   int64_t cols;
@@ -7404,12 +7414,13 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
     CostResult candidate = compute_mixed_cost_for_groups(
         cfg, retained_from_prev, retain_these, groups);
     if (!candidate.feasible) continue;
-    const double tolerance =
-        1e-9 * std::max(1.0, std::min(best.latency, candidate.latency));
-    const bool take =
-        !best.feasible || candidate.latency < best.latency - tolerance ||
-        (std::abs(candidate.latency - best.latency) <= tolerance &&
-         candidate.mixed_active_groups > best.mixed_active_groups);
+    const int64_t candidate_bucket = MixedSelectionBucket(candidate.latency);
+    const int64_t best_bucket =
+        best.feasible ? MixedSelectionBucket(best.latency) : INT64_MAX;
+    const bool take = !best.feasible || candidate_bucket < best_bucket ||
+                      (candidate_bucket == best_bucket &&
+                       candidate.mixed_active_groups <
+                           best.mixed_active_groups);
     if (take) best = candidate;
   }
   return best;

@@ -276,6 +276,9 @@ public:
       const FlatSet<size_t> &retained_from_prev = {},
       const FlatSet<size_t> &retain_these = {}) const;
 
+  /// Resolution used only when comparing mixed active-group candidates.
+  /// Raw modeled cycles remain unquantized in CostResult and sweep reports.
+  static constexpr double kMixedGroupSelectionResolutionCycles = 16.0;
 
   Ascend910BCost() = default;
 

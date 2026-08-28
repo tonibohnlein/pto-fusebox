@@ -92,14 +92,22 @@ def _solve_module(
 
 
 def _assert_pypto_main_mixed_scope(source: str, plan: MixedKernelPlan) -> None:
-    slot_counts = {fifo.slot_count for fifo in plan.fifos}
-    assert len(slot_counts) == 1
-    (slot_count,) = slot_counts
     assert "pl.split(pl.SplitMode.UP_DOWN)" in source
-    assert source.count("pl.cross_core_slot(") == 1
-    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
-    assert "pl.cross_core_pipe" not in source
-    assert "CrossCoreDirection" not in source
+    assert "pl.cross_core_slot(" not in source
+    assert source.count("pl.cross_core_pipe(") == len(plan.fifos)
+    for fifo in plan.fifos:
+        direction = (
+            "pl.CrossCoreDirection.CUBE_TO_VECTOR"
+            if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+            else "pl.CrossCoreDirection.VECTOR_TO_CUBE"
+        )
+        assert (
+            "pl.cross_core_pipe("
+            f"tensor_id={fifo.tensor}, direction={direction}, "
+            f"valid_shape=[{fifo.valid_rows}, {fifo.valid_cols}], "
+            f"slot_size_bytes={fifo.slot_bytes}, slot_num={fifo.slot_count}, "
+            f"pipe_id={fifo.pipe_id}, bundle={fifo.bundle})"
+        ) in source
 
 
 class _C2VEpilogue(nn.Module):

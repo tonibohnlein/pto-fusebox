@@ -70,6 +70,8 @@ class SiliconCase:
     atol: float = 1.0e-4
     mixed_contract: str | None = None
     forced_mixed_groups: int | None = None
+    expected_mixed_groups: int | None = None
+    expected_mixed_trips: int | None = None
 
 
 class PointwiseChain(nn.Module):
@@ -319,6 +321,50 @@ MIXED_CASES = (
         atol=1.0e-4,
     ),
     SiliconCase(
+        "mixed_c2v_resolution_192x64x256",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((192, 64), (64, 256), (1, 256), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="c2v_descriptor_control",
+        expected_mixed_groups=4,
+        expected_mixed_trips=3,
+    ),
+    SiliconCase(
+        "mixed_c2v_descriptor_128x64x256",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((128, 64), (64, 256), (1, 256), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="c2v_descriptor_control",
+        expected_mixed_groups=4,
+        expected_mixed_trips=2,
+    ),
+    SiliconCase(
+        "mixed_c2v_descriptor_256x64x256",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((256, 64), (64, 256), (1, 256), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="c2v_descriptor_control",
+        expected_mixed_groups=4,
+        expected_mixed_trips=4,
+    ),
+    SiliconCase(
+        "mixed_c2v_descriptor_256x64x384",
+        "mixed",
+        C2VEpilogue(),
+        _random_args((256, 64), (64, 384), (1, 384), scale=0.1),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+        mixed_contract="c2v_descriptor_control",
+        expected_mixed_groups=6,
+        expected_mixed_trips=4,
+    ),
+    SiliconCase(
         "mixed_c2v_streamed_groups_384x64x256",
         "mixed",
         C2VEpilogue(),
@@ -503,6 +549,21 @@ def _assert_mixed_contract(
         assert plan.requested_skew_depth == 1
         assert plan.overlap_implementable
         assert "pl.pipeline(4, stage=2" in source
+        return
+    if case.mixed_contract == "c2v_descriptor_control":
+        assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+        assert (fifo.valid_rows, fifo.valid_cols) == (64, 64)
+        assert fifo.slot_bytes == 16384
+        assert fifo.slot_count == 8
+        assert fifo.reserved_bytes == 131072
+        assert case.expected_mixed_groups is not None
+        assert case.expected_mixed_trips is not None
+        assert plan.active_groups == case.expected_mixed_groups
+        assert plan.max_trips_per_group == case.expected_mixed_trips
+        assert plan.pipeline_stages == 2
+        assert plan.requested_skew_depth == 1
+        assert plan.overlap_implementable
+        assert f"pl.pipeline({case.expected_mixed_trips}, stage=2" in source
         return
     if case.mixed_contract == "v2c_lhs_streamed_groups":
         assert plan.spatial_tiles == 2

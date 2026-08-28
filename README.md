@@ -147,10 +147,11 @@ Mixed source initially covers generic one-way `C -> V`, generic one-way
 `C -> V -> C`, dense
 `C,C -> V -> C`, and one linear `C -> V -> C -> V` plan through PyPTO's
 public `pl.split(UP_DOWN)` mechanism. Fusebox retains its logical FIFO
-descriptors for planning, validation, and costing, while generated source uses
-the current PyPTO `main` contract: one `pl.cross_core_slot(slot_num=N)` ring
-depth per mixed scope and compiler-inferred crossing directions. Plans that
-require different per-pipe depths fail closed at source readiness. The
+descriptors for planning, validation, and costing, and emits each one through
+PyPTO's generic `pl.cross_core_pipe(...)` contract. PyPTO validates the ordered
+unidirectional descriptors against the actual crossings, then owns AIC/AIV
+outlining, pipe setup, and pipeline lowering. Different pipes may therefore
+carry different slot sizes and depths without hand-written core programs. The
 four-stage form is deliberately
 sequential: its three FIFO crossings replay in topological order and receive no
 skew-overlap credit. Online softmax-to-PV replays the serialized statistics and

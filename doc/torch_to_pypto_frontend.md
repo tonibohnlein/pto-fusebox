@@ -471,15 +471,16 @@ optional future extension via a PyPTO schedule directive or explicit low-level
 tile loops; current source makes no exact child-L0 performance claim.
 
 Mixed source validates every logical transfer/FIFO descriptor in solver order.
-Generated source targets upstream PyPTO `main`: it emits
-`pl.split(pl.SplitMode.UP_DOWN)` and one
-`pl.cross_core_slot(slot_num=N)` entry for the enclosing scope, while ordinary
-tensor def-use expresses each crossing. PyPTO's `ExpandMixedKernel` and
+Generated source targets PyPTO's generic explicit-pipe API: it emits
+`pl.split(pl.SplitMode.UP_DOWN)` plus one generic
+`pl.cross_core_pipe(...)` entry per logical transfer. The entries preserve
+direction, physical frame, slot geometry, pipe ID, and protocol bundle, while
+ordinary tensor def-use expresses each crossing. PyPTO's `ExpandMixedKernel` and
 `SkewCrossCorePipeline` own the AIC/AIV split and the physical
 initialize/push/pop/free lowering; the external emitter does not hand-code
-either core program. Because the public API has one scope-level ring depth,
-source readiness rejects a plan whose logical pipes require different slot
-counts. Source readiness charges the serialized cube-stage L1 peak together
+either core program. Repeated loop/tail realizations reuse the same ordered
+pipe protocol rather than creating extra logical FIFOs. Source readiness
+charges the serialized cube-stage L1 peak together
 with every V2C consumer ring, and the vector-stage peak together with every
 C2V consumer ring; neither direction can hide its physical FIFO reservation.
 No attention or SwiGLU recognizer is involved in this transport contract.

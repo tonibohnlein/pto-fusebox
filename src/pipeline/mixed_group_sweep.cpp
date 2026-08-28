@@ -59,6 +59,8 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
 
   json output = {
       {"schema_version", "pto_fusebox.mixed_group_sweep.v1"},
+      {"selection_resolution_cycles",
+       Ascend910BCost::kMixedGroupSelectionResolutionCycles},
       {"selected_candidate_id",
        "g" + std::to_string(selected.mixed_active_groups)},
       {"tile",

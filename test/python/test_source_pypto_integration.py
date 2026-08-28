@@ -919,36 +919,37 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         raise
 
     assert "pl.split(pl.SplitMode.UP_DOWN" in source
-    slot_counts = {fifo.slot_count for fifo in plan.fifos}
-    assert len(slot_counts) == 1
-    (slot_count,) = slot_counts
-    assert source.count("pl.cross_core_slot(") == 1
-    assert f"pl.cross_core_slot(slot_num={slot_count})" in source
-    assert "pl.cross_core_pipe" not in source
-    assert "CrossCoreDirection" not in source
+    assert "pl.cross_core_slot(" not in source
+    assert source.count("pl.cross_core_pipe(") == len(plan.fifos)
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
     assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
-    assert pto.count("pto.aic_initialize_pipe") == 1
-    assert pto.count("pto.aiv_initialize_pipe") == 1
-    expected_dir_mask = 0
+    assert pto.count("pto.aic_initialize_pipe") == len(plan.fifos)
+    assert pto.count("pto.aiv_initialize_pipe") == len(plan.fifos)
+    for fifo in plan.fifos:
+        direction = 1 if fifo.direction.value == "cube_to_vector" else 2
+        assert f"dir_mask = {direction}" in pto
+        assert f"slot_num = {fifo.slot_count}" in pto
+        assert f"slot_size = {fifo.slot_bytes}" in pto
+    expected_c2v_ids = {
+        fifo.pipe_id for fifo in plan.fifos if fifo.direction.value == "cube_to_vector"
+    }
+    expected_v2c_ids = {
+        fifo.pipe_id for fifo in plan.fifos if fifo.direction.value == "vector_to_cube"
+    }
     if any(fifo.direction.value == "cube_to_vector" for fifo in plan.fifos):
-        expected_dir_mask |= 1
-    if any(fifo.direction.value == "vector_to_cube" for fifo in plan.fifos):
-        expected_dir_mask |= 2
-    assert f"dir_mask = {expected_dir_mask}" in pto
-    assert f"slot_num = {slot_count}" in pto
-    if expected_dir_mask & 1:
         assert _pto_pipe_ids(pto, "tpush_to_aiv")
         assert _pto_pipe_ids(pto, "tpush_to_aiv") == _pto_pipe_ids(pto, "tpop_from_aic")
         assert _pto_pipe_ids(pto, "tpop_from_aic") == _pto_pipe_ids(
             pto, "tfree_from_aic"
         )
-    if expected_dir_mask & 2:
+        assert _pto_pipe_ids(pto, "tpush_to_aiv") == expected_c2v_ids
+    if any(fifo.direction.value == "vector_to_cube" for fifo in plan.fifos):
         assert _pto_pipe_ids(pto, "tpush_to_aic")
         assert _pto_pipe_ids(pto, "tpush_to_aic") == _pto_pipe_ids(pto, "tpop_from_aiv")
         assert _pto_pipe_ids(pto, "tpop_from_aiv") == _pto_pipe_ids(
             pto, "tfree_from_aiv"
         )
+        assert _pto_pipe_ids(pto, "tpush_to_aic") == expected_v2c_ids
     if name == "mixed_c2v":
         assert "pto.tcolexpandadd" in pto
         assert "pto.tadd" not in pto
@@ -999,7 +1000,7 @@ def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(
     assert _pto_pipe_ids(pto, "tpush_to_aic") == _pto_pipe_ids(pto, "tpop_from_aiv")
 
 
-def test_mixed_source_rejects_duplicate_pypto_slot_optimization() -> None:
+def test_mixed_source_rejects_duplicate_pypto_pipe_id() -> None:
     graph = export_and_normalize(
         _C2VEpilogue(),
         (
@@ -1020,13 +1021,13 @@ def test_mixed_source_rejects_duplicate_pypto_slot_optimization() -> None:
     ).source
     parser_diagnostics = importlib.import_module("pypto.language.parser.diagnostics")
     pl = importlib.import_module("pypto.language")
-    slot = re.search(r"pl\.cross_core_slot\(slot_num=[0-9]+\)", source)
-    assert slot is not None
-    duplicated = source.replace(slot.group(0), f"{slot.group(0)}, {slot.group(0)}", 1)
+    pipe = re.search(r"pl\.cross_core_pipe\([^\n]+\)", source)
+    assert pipe is not None
+    duplicated = source.replace(pipe.group(0), f"{pipe.group(0)}, {pipe.group(0)}", 1)
     assert duplicated != source
     with pytest.raises(
         parser_diagnostics.ParserSyntaxError,
-        match="Duplicate 'pl.cross_core_slot",
+        match="Duplicate pl.cross_core_pipe pipe_id=0",
     ):
         pl.parse_program(duplicated)
 

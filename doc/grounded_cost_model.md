@@ -435,18 +435,24 @@ The mixed group term is independent of the vector-only task term. A zero-work gr
 910B2 devices measured **0.2579 µs per additional block** (95% CI
 **[0.2545, 0.2619]**). At 1.85 GHz this is 477 cycles, represented by the nearest 16-cycle quantum,
 `mixed_group_overhead_cycles = 480`, in the production target profile. This coefficient was not fit
-to the C2V kernels it changes. With that fixed term, a fresh analytic solve selects:
+to the C2V kernels it changes. Candidate selection uses a 16-cycle resolution, matching the target
+model's instruction-cost quantum. Candidates in the same resolution bucket are indistinguishable;
+the deterministic tie-break chooses the smaller active-group count. Raw modeled cycles remain
+unquantized in reports. With the unchanged 480-cycle term, a fresh analytic solve selects:
 
 | case | output geometry | selected tile / grid | groups × trips | modeled cycles |
 | ---- | --------------- | -------------------- | -------------- | -------------- |
-| C1 | `[192,256]` | `[64,64]`, `3×4` | `6×2` | 15417.208145 |
+| C1 | `[192,256]` | `[64,64]`, `3×4` | `4×3` | 15422.132926 |
 | C2 | `[384,256]` | `[64,64]`, `6×4` | `6×4` | 17572.151835 |
 | H1 | `[768,256]` | `[64,64]`, `12×4` | `8×6` | 21316.361628 |
 | H2 | `[384,512]` | `[64,64]`, `6×8` | `8×6` | 21316.361628 |
 
-C2/H1/H2 move to the silicon-preferred side of the previous frozen sweeps. C1's selected six-group
-point was not measured in that campaign and therefore remains a required device discriminator, not
-a closure claim. The `mixed_group_sweep` developer tool serializes every uniform group divisor for
+C2/H1/H2 move to the silicon-preferred side of the previous frozen sweeps. C1's four- and six-group
+rows differ by only 4.9 modeled cycles, so both occupy the same selection bucket; the smaller-group
+rule selects the silicon-nearer four-group row. It remains a required device discriminator, not a
+closure claim. Descriptor-matched C2V controls at 8, 16, and 24 work items retain the same
+`64×64×64` tile and 131,072-byte FIFO while varying group count, trips, and grid orientation. The
+`mixed_group_sweep` developer tool serializes every uniform group divisor for
 the selected tile together with cube/vector phase cycles, all four GM pipe cycles, pipeline wall,
 kernel fill, group overhead, FIFO descriptors, and stage topology. It calls the production cost
 path; it is diagnostic, not a second planner. Non-tunable streaming, sequential multi-round-trip,
