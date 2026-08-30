@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import copy
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -37,6 +37,13 @@ from torch import nn
 class V2COnly(nn.Module):
     def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.mm(torch.exp(value), weight)
+
+
+class V2COnlyRhs(nn.Module):
+    def forward(
+        self, lhs: torch.Tensor, value: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.mm(lhs, torch.exp(value + bias))
 
 
 class StreamingSoftmaxPv(nn.Module):
@@ -154,6 +161,96 @@ def _selection_bucket(total_cycles: float, resolution_cycles: float) -> int:
     """Mirror positive ``std::llround`` used by the production selector."""
 
     return math.floor(total_cycles / resolution_cycles + 0.5)
+
+
+def test_source_costing_changes_attention_plan_before_emission() -> None:
+    graph = export_and_normalize(
+        StaticAttentionCore(),
+        (torch.zeros(96, 64), torch.zeros(64, 64), torch.zeros(64, 128)),
+    )
+    analytic = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=False,
+    ).regions[0]
+    source = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    ).regions[0]
+
+    assert analytic.problem is not None and source.problem is not None
+    assert analytic.problem["require_source_codegen"] is False
+    assert source.problem["require_source_codegen"] is True
+    analytic_plan = scheduled_region(analytic).steps[0].plan
+    source_plan = scheduled_region(source).steps[0].plan
+    assert isinstance(analytic_plan, MixedKernelPlan)
+    assert isinstance(source_plan, MixedKernelPlan)
+    assert (
+        analytic_plan.m_partition.parts,
+        analytic_plan.n_partition.parts,
+        analytic_plan.active_groups,
+        analytic_plan.max_trips_per_group,
+    ) == (1, 4, 2, 2)
+    assert (
+        source_plan.m_partition.parts,
+        source_plan.n_partition.parts,
+        source_plan.active_groups,
+        source_plan.max_trips_per_group,
+    ) == (2, 1, 2, 1)
+    assert can_emit_region(graph, analytic)
+    assert can_emit_region(graph, source)
+
+
+def test_attention_source_plan_traffic_matches_emitted_topology() -> None:
+    graph, region, plan, sweep = _solve_and_sweep(
+        StaticAttentionCore(), ((96, 64), (64, 64), (64, 128))
+    )
+
+    assert (plan.m_partition.parts, plan.n_partition.parts) == (2, 1)
+    assert (sweep.tile.height, sweep.tile.width, sweep.tile.contraction) == (
+        48,
+        128,
+        64,
+    )
+    regions = plan.spatial_tiles
+    query_bytes = regions * 48 * 64 * 4
+    key_bytes = regions * 64 * 64 * 4
+    value_bytes = regions * 64 * 128 * 4
+    crossing_bytes = regions * 48 * 64 * 4
+    output_bytes = 96 * 128 * 4
+    assert (
+        sweep.selected.breakdown.gm_l1_bytes,
+        sweep.selected.breakdown.gm_ub_bytes,
+        sweep.selected.breakdown.l0c_gm_bytes,
+        sweep.selected.breakdown.ub_gm_bytes,
+    ) == (
+        query_bytes + key_bytes + value_bytes + crossing_bytes,
+        crossing_bytes,
+        crossing_bytes + output_bytes,
+        crossing_bytes,
+    )
+    source = emit_pypto_region(graph, region, program_name="attention_source").source
+    assert "pl.spmd(2," in source
+    assert "pl.range(1, init_values=" in source
+    assert source.count("pl.tensor.slice(arg_query, [48, 64]") == 1
+    assert source.count("pl.tensor.slice(arg_key, [64, 64]") == 1
+    assert source.count("pl.tensor.slice(arg_value, [64, 128]") == 1
+    assert source.count("pl.tensor.matmul(") == 2
+
+
+def test_v2c_rhs_prices_broadcast_bias_load_on_both_aiv_lanes() -> None:
+    _, _, plan, sweep = _solve_and_sweep(V2COnlyRhs(), ((96, 64), (64, 128), (1, 128)))
+
+    assert plan.vector_lanes == 2
+    assert plan.vector_split.value == "rows"
+    expected_value_bytes = 64 * 128 * 4
+    expected_bias_bytes = plan.vector_lanes * 1 * 128 * 4
+    assert sweep.selected.breakdown.gm_ub_bytes == (
+        expected_value_bytes + expected_bias_bytes
+    )
 
 
 @pytest.mark.parametrize(

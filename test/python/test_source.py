@@ -1101,10 +1101,10 @@ def test_generic_round_trip_emits_the_solver_owned_mixed_pipeline() -> None:
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
     _assert_pypto_main_mixed_scope(source, step.plan)
-    assert step.plan.max_trips_per_group == 2
-    assert step.plan.pipeline_stages == 3
-    assert step.plan.overlap_implementable
-    assert "pl.pipeline(2, stage=3" in source
+    assert step.plan.max_trips_per_group == 1
+    assert step.plan.pipeline_stages == 1
+    assert not step.plan.overlap_implementable
+    assert "pl.range(1, init_values=" in source
     assert source.count("pl.tensor.matmul(") == 2
     assert "b_trans=True" in source
     assert "pl.tensor.row_max(" in source
@@ -1386,8 +1386,17 @@ def test_mixed_typed_contract_rejects_stale_protocol_bundle() -> None:
 def test_mixed_source_rejects_planned_fifo_rings_over_capacity() -> None:
     graph, result = _solved("attention_core")
     assert result.problem is not None
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    c2v_fifo_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+    )
+    required_vec_bytes = plan.vector_stage_peak_ub_bytes + c2v_fifo_bytes
+    assert required_vec_bytes > 0
     problem = dict(result.problem)
-    problem["vec_capacity"] = 130_000
+    problem["vec_capacity"] = required_vec_bytes - 1
     stale = replace(result, problem=problem)
 
     assert not can_emit_region(graph, stale)
@@ -1943,9 +1952,12 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
 
 
 def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:
+    # Freeze the mixed emitter contract directly. Source-oriented whole-region
+    # costing may legitimately cut this graph into homogeneous kernels.
     graph, result = _solve_module(
         _StreamingSoftmaxPv(),
         (torch.zeros(384, 4096), torch.zeros(4096, 64)),
+        require_source_codegen=False,
     )
     plan = scheduled_region(result).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)

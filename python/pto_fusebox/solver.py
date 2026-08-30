@@ -48,7 +48,7 @@ class SolveResult:
 
     @property
     def successful(self) -> bool:
-        """Backward-compatible alias for analytic region-solving success."""
+        """Backward-compatible alias for region-solving success."""
 
         return self.regions_solved
 
@@ -80,9 +80,9 @@ def solve_graph(
     This function never builds PTO-Fusebox. A solver executable must already
     exist or be supplied explicitly, keeping compilation and graph capture as
     separate, reproducible steps. Set ``require_source_codegen`` when the
-    selected schedule will be rendered as standalone PyPTO DSL. The analytic
-    winner is retained when it is already source-ready; otherwise the region is
-    solved again with the stricter source-realization constraint.
+    selected schedule will be rendered as standalone PyPTO DSL. Source-oriented
+    solving applies the stricter source-realization constraint from the first
+    candidate search. Analytic solving is unchanged when the flag is false.
     """
 
     if solver_workers is not None and solver_workers <= 0:
@@ -116,6 +116,10 @@ def solve_graph(
             region_results.append(declined_by_region[region.id])
             continue
         lowered = lowered_by_region[region.id]
+        if require_source_codegen:
+            problem = dict(lowered.problem)
+            problem["require_source_codegen"] = True
+            lowered = replace(lowered, problem=problem)
         solved = _solve_region(
             executable,
             region,
@@ -123,29 +127,17 @@ def solve_graph(
             solver_workers=solver_workers,
         )
         if require_source_codegen and solved.status == "solved":
-            # The standalone source backend is intentionally a refinement of
-            # analytic planning.  Do not perturb an already-realizable winner:
-            # retry only when the selected analytic schedule cannot be emitted.
             from .source import can_emit_region
 
             if not can_emit_region(graph, solved):
-                problem = dict(lowered.problem)
-                problem["require_source_codegen"] = True
-                solved = _solve_region(
-                    executable,
-                    region,
-                    replace(lowered, problem=problem),
-                    solver_workers=solver_workers,
+                solved = replace(
+                    solved,
+                    status="infeasible",
+                    diagnostics=(
+                        *solved.diagnostics,
+                        "source-constrained solver result is not PyPTO-emittable",
+                    ),
                 )
-                if solved.status == "solved" and not can_emit_region(graph, solved):
-                    solved = replace(
-                        solved,
-                        status="infeasible",
-                        diagnostics=(
-                            *solved.diagnostics,
-                            "source-constrained solver result is not PyPTO-emittable",
-                        ),
-                    )
         region_results.append(solved)
     return SolveResult(
         graph=graph,

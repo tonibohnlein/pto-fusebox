@@ -100,10 +100,10 @@ The core entry points are:
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
 wrapper around `torch.export.export`. `solve_graph` never builds the solver. A
 caller must provide an executable or set `PTO_FUSEBOX_SOLVER`.
-The optional `require_source_codegen=True` flag retains an analytically selected
-schedule when it is already source-ready. Otherwise it retries candidate
-selection under the external PyPTO source topology, stage-kind, and physical
-FIFO capacity contract. Leave it false for analytic studies. `scheduled_region`
+The optional `require_source_codegen=True` flag applies the external PyPTO
+source topology, stage-kind, and physical FIFO capacity contract to the first
+candidate search. Leave it false to preserve the unrestricted analytic search.
+`scheduled_region`
 rejects incomplete or internally inconsistent solution
 arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
 typed emission context and run the same graph-aware renderer validation; the
@@ -316,20 +316,20 @@ emitter path exists. Solution metadata records the stages, directional
 transfers, and protocol for every analytic mixed plan. Plans with a complete
 stage-local geometry, vector stream, cube-window, and FIFO contract also set
 their internal `source_codegen_ready=true` contract-completeness bit.
-When the caller requests `require_source_codegen=True`, the analytic winner is
-checked first. Only a non-emittable winner triggers a second solve filtered by
-the external-source constraints, so source planning cannot perturb an already
-realizable analytic schedule and a cheaper analytic-only tile cannot hide a
-realizable source-ready alternative.
+When the caller requests `require_source_codegen=True`, source constraints
+participate in candidate costing and selection from the first solve. This can
+intentionally select a different source-realizable tile than the unrestricted
+analytic optimum. With the flag false, analytic admission and costing are
+unchanged.
 The Python backend separately admits generic one-way `C -> V`, generic one-way
 `V -> C` with an in-memory or online-softmax vector producer, generic
 `C -> V -> C`, dense
 `C,C -> V -> C`, and linear sequential `C -> V -> C -> V` today. Broader
 analytic winners remain valid research results but are not presented as
 source-emittable.
-`regions_solved` therefore reports analytic
-solver success separately from `whole_graph_codegen_ready`, which additionally
-requires no opaque graph boundaries and a successful exact
+`regions_solved` therefore reports solver success for the requested analytic or
+source-oriented policy separately from `whole_graph_codegen_ready`, which
+additionally requires no opaque graph boundaries and a successful exact
 `can_emit_region(graph, region)` check for every selected step.
 
 ## Goal and ownership

@@ -313,13 +313,7 @@ def test_static_mixed_examples_solve_and_emit_generic_pypto_source(
     assert len(result.regions) == 1
     region = result.regions[0]
     assert region.problem is not None
-    # The streamed C2V and CVC examples deliberately exercise the
-    # source-constrained mixed planner: their unconstrained winners exceed
-    # a source-realization memory bound, so emission retries with that
-    # bound enabled.  The remaining examples keep their analytic winner.
-    assert region.problem["require_source_codegen"] is (
-        name in {"mixed_c2v_streamed_groups", "mixed_cvc_streamed_groups"}
-    )
+    assert region.problem["require_source_codegen"] is True
     assert can_emit_region(graph, region)
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)

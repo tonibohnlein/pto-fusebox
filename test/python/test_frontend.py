@@ -968,7 +968,7 @@ def test_same_dtype_to_copy_operator_is_not_a_metadata_alias() -> None:
     assert extract_solver_regions(graph) == []
 
 
-def test_solve_graph_declines_nonemittable_source_retry_and_preserves_mappings(
+def test_solve_graph_declines_nonemittable_source_plan_and_preserves_mappings(
     tmp_path: Path,
 ) -> None:
     class Pointwise(nn.Module):
@@ -984,9 +984,9 @@ def test_solve_graph_declines_nonemittable_source_retry_and_preserves_mappings(
         "problem=json.loads(pathlib.Path(sys.argv[3]).read_text())\n"
         "assert problem['schema_version']=='pto_fusebox.problem.v1'\n"
         "attempt=pathlib.Path(__file__).with_suffix('.attempt')\n"
-        "count=int(attempt.read_text()) if attempt.exists() else 0\n"
-        "assert problem['require_source_codegen'] is (count == 1)\n"
-        "attempt.write_text(str(count + 1))\n"
+        "assert not attempt.exists()\n"
+        "assert problem['require_source_codegen'] is True\n"
+        "attempt.write_text('1')\n"
         "pathlib.Path(sys.argv[4]).write_text(json.dumps({"
         "'schema_version':'pto_fusebox.solution.v6','steps':[{"
         "'kind':'vector','ops':[0],'op_order':[0],"
@@ -1013,7 +1013,7 @@ def test_solve_graph_declines_nonemittable_source_retry_and_preserves_mappings(
     assert problem is not None
     assert problem["frontend_mapping"]["region_id"] == "region0000"
     assert problem["require_source_codegen"] is True
-    assert solver.with_suffix(".attempt").read_text(encoding="utf-8") == "2"
+    assert solver.with_suffix(".attempt").read_text(encoding="utf-8") == "1"
 
 
 def test_solve_graph_rejects_nonpositive_worker_count(tmp_path: Path) -> None:

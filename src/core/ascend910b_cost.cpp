@@ -7648,6 +7648,15 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
       if (vector_to_cube) {
         const Tensor& crossing =
             prob_->tensors[mixed_topology_->transfers.front().tensor];
+        // A row-broadcast input is loaded independently by each row-split AIV
+        // lane. This is distinct from output-grid replay: even a single
+        // spatial M partition issues one load per physical vector lane.
+        if (prob_->require_source_codegen &&
+            schedule.vector_split == MixedVectorSplit::Rows &&
+            schedule.vector_lanes > 1 && tensor.height == 1 &&
+            crossing.height > 1) {
+          request_multiplicity *= schedule.vector_lanes;
+        }
         // A broadcast along the vector stage's partitioned axis is reloaded
         // by every partition. The orthogonal sink partition is already the
         // vector_replay factor above.
