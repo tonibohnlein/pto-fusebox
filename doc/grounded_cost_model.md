@@ -435,10 +435,12 @@ The mixed group term is independent of the vector-only task term. A zero-work gr
 910B2 devices measured **0.2579 µs per additional block** (95% CI
 **[0.2545, 0.2619]**). At 1.85 GHz this is 477 cycles, represented by the nearest 16-cycle quantum,
 `mixed_group_overhead_cycles = 480`, in the production target profile. This coefficient was not fit
-to the C2V kernels it changes. Candidate selection uses a 16-cycle resolution, matching the target
-model's instruction-cost quantum. Candidates in the same resolution bucket are indistinguishable;
-the deterministic tie-break chooses the smaller active-group count. Raw modeled cycles remain
-unquantized in reports. With the unchanged 480-cycle term, a fresh analytic solve selects:
+to the C2V kernels it changes. It is a measured **low-group reference**, not a claim that arbitrary
+mixed schedules pay an independent `480 × groups` law. Candidate selection uses a 16-cycle
+resolution, matching the target model's instruction-cost quantum. Candidates in the same resolution
+bucket are indistinguishable; the deterministic tie-break chooses the smaller active-group count.
+Raw modeled cycles remain unquantized in reports. With the unchanged provisional 480-cycle term, a
+fresh analytic solve selects:
 
 | case | output geometry | selected tile / grid | groups × trips | modeled cycles |
 | ---- | --------------- | -------------------- | -------------- | -------------- |
@@ -463,6 +465,74 @@ auditable without pretending that they support the generic active-group choice.
 
 A successor loop is pipelined only when every group has at least two complete items. In particular,
 a one-trip C→V→C candidate is serialized as `pl.range(1)` with pipeline depth 1 and no skew.
+
+### Group/trip calibration boundary
+
+An eight-cell, two-device C2V experiment varied active groups and trips while keeping the emitted
+tile, FIFO geometry, operation order, and four-port byte accounting fixed. At constant total work,
+fewer groups with more trips won in every comparison. The first additional trip was nearly free
+because it changed the schedule from a one-trip serial loop to a stage-2 pipeline; later trips cost
+about 0.55 µs each. For the fixed-work `(groups,trips) = (2,4), (4,2), (8,1)` cells, model, PTO, and
+simulator bytes agree exactly on all four ports. Per-block simulator spans fall with work per group
+and the cube side remains MTE2-bound, so the observed extra device wall is not unexplained traffic.
+The single-core simulator cannot distinguish multi-block dispatch/occupancy from a device-level
+scheduling effect.
+
+The experiment rejects a separable `Work(groups × trips) + Overhead(groups)` interpretation. The
+measured 2-to-4 group increment changes from 1.605 µs at one work level to 0.550 µs at another, and
+the 4-to-8 increment changes from 4.470 µs to 3.465 µs. The only constant-work comparison that
+keeps a stage-2 schedule on both sides and stays near the low-group measurement is the 2-to-4 step
+at the 256-row geometry: 0.275 µs/group versus the independent 0.2524–0.2582 µs/group range.
+
+Small stage-aware alternatives were evaluated without changing production costing. The calibration
+side was the fixed-work group/trip matrix; the held-out side was the earlier C1/C2/H1/H2/D1/D2/D3
+two-device ranking matrix. The acceptance gate was mean held-out Spearman ≥ 0.80 and at most 5%
+regret on each device; fit error alone was not accepted.
+
+| candidate | held-out mean Spearman | exact argmins | maximum device regret |
+| --- | ---: | ---: | ---: |
+| current `480 × groups` | 0.424 | 1/7 | 4.39% |
+| add `480 × groups` only for one-trip schedules | 0.504 | 1/7 | 4.39% |
+| add `480 × groups / trips` | 0.623 | 1/7 | 4.39% |
+| add `768 × groups / trips` | 0.686 | 2/7 | 4.39% |
+
+The 768-cycle value is the smallest 16-cycle multiple that restores the measured ordering of the
+three fixed-work 256-row cells; it was chosen without consulting the held-out rankings. It improves
+regret but fails the rank gate, so **no stage-aware occupancy model or new coefficient is frozen**.
+Production retains the measured 480-cycle reference and reports its breakdown explicitly. The next
+silicon matrix must first distinguish work-per-group, active-group occupancy, and stage fill/drain;
+it must not merely fit a larger per-group constant.
+
+Regret uses the production 16-cycle selection bucket and smaller-group tie-break, not a raw-cycle
+argmin. An exploratory post-analysis of these same held-out rows finds that
+`1296 × groups / trips` would raise mean Spearman to 0.844 and lower maximum device regret to 2.18%.
+Because 1296 was chosen after inspecting those rows, they are no longer a valid holdout for that
+coefficient. This is a candidate for a newly frozen shape matrix, not a calibrated production term.
+
+The next validation matrix was frozen before device timing with the exact experimental score
+
+```text
+experimental_total = production_total + 1296 × groups / trips
+```
+
+followed by the production 16-cycle nearest bucket and smaller-group tie-break. The production
+cost remains unchanged during validation. All cases use the generic FP32 C2V epilogue
+`(M,K) × (K,N)` followed by a `[1,N]` bias, and none of these exact shape triples appeared in the
+calibration matrix:
+
+| case | `(M,K,N)` | selected tile | candidate `(groups,trips)` | production pick | frozen pick |
+| --- | --- | --- | --- | ---: | ---: |
+| V1 | `(320,80,192)` | `80×64×80` | `1×12, 2×6, 3×4, 4×3, 6×2, 12×1` | 6 | 4 |
+| V2 | `(320,96,256)` | `80×64×96` | `1×16, 2×8, 4×4, 8×2, 16×1` | 8 | 4 |
+| V3 | `(384,80,320)` | `64×80×80` | `1×24, 2×12, 3×8, 4×6, 6×4, 8×3, 12×2, 24×1` | 8 | 6 |
+| V4 | `(288,96,384)` | `96×48×96` | `1×24, 2×12, 3×8, 4×6, 6×4, 8×3, 12×2, 24×1` | 8 | 6 |
+| V5 | `(384,128,384)` | `64×48×128` | `1×48, 2×24, 3×16, 4×12, 6×8, 8×6, 12×4, 16×3, 24×2` | 8 | 8 |
+| V6 | `(576,96,320)` | `48×80×96` | `1×48, 2×24, 3×16, 4×12, 6×8, 8×6, 12×4, 16×3, 24×2` | 8 | 8 |
+
+The hypothesis is grounded only if the new matrix reaches mean within-case Spearman ≥ 0.80 and
+maximum selected-plan regret ≤ 2.5% separately on both devices, while not worsening either metric
+relative to the unchanged production score. No coefficient, shape, candidate set, or acceptance
+gate may change after timing begins.
 
 Materialized mixed vector stages also carry a fail-closed current-main PyPTO workspace bound. Each
 row reduction initially creates a distinct scratch allocation. MemoryReuse may later coalesce
@@ -576,6 +646,11 @@ Among equal-latency configs, lexicographic:
 - **Short-grid ranking.** Grounded valid-row work fixed the tall-softmax under-parallel plan, but
   `[128,8192]` mildly over-splits to 48 tasks (about 7.1% wall regret versus 16 tasks). This is a
   bounded ranking/calibration issue, not a task-count, traffic, or emitted-grid mismatch.
+- **Mixed active-group occupancy.** Four-port traffic and source-first topology selection are
+  grounded for the A1 attention and T2 lane-broadcast discriminators, but the current
+  `mixed_group_overhead_cycles × groups` term remains a provisional low-group reference. A
+  two-dimensional group/trip matrix disproves an independent additive group law, and the tested
+  stage-aware replacements fail the held-out Spearman gate. No replacement coefficient is frozen.
 - **Pure-cube plan buildability.** AutoFuse emits uniform multi-matmul grids from
   `CubeSchedulePlan`, including exact output-tile variants, sequential K streams, one final drain,
   and ordered first-partial/atomic-rest split stores. Unequal multi-op grids and identical deduplicated boundary requests
