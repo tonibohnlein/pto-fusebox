@@ -40,18 +40,30 @@ Mixed source covers generic one-way `C -> V`, generic one-way `V -> C` with an
 in-memory or online-softmax vector producer, generic `C -> V -> C`, dense
 `C,C -> V -> C`, and linear `C -> V -> C -> V` schedules. It replays the
 serialized stages and tensor DAG through one `pl.spmd` grid with
-`pl.split(UP_DOWN)`; PyPTO inserts
+`pl.split(UP_DOWN)` plus generic `pl.cross_core_pipe` descriptors; PyPTO inserts
 the concrete push/pop/free pipeline. The four-stage form is an ordinary ordered
 loop and receives no skew-overlap credit. Online softmax-to-PV publishes
 normalized K chunks into the sink's matching accumulation windows. One complete
 square panel may serve both sink operands without replication; partitioned
-dual-role values, branched/deeper round trips, and mixed multi-step composition
-fail closed. Welford/multi-stat
+dual-role values and branched/deeper round trips fail closed. Linear multi-step
+source may compose homogeneous and mixed solver steps through explicit GM cuts.
+Welford/multi-stat
 vector plans, singleton-column normalization, and nonuniform cube spatial
 partitions remain outside source readiness. A uniform cube DAG may split only
 its unique sink through the selected dependency-linked PyPTO task protocol.
 Dynamic-shape classes are retained but declined when they affect solver
 geometry.
+
+Source-oriented mixed planning is now applied from the first and only solver
+invocation when `require_source_codegen=True`; it is not an analytic solve
+followed by an emission-time retry. This distinction is material for attention:
+the source-oriented A1 plan avoids recomputing QK across four N partitions,
+matches the emitted PTO and simulator traffic on all four GM ports, moves 2.4×
+less traffic than the analytic topology, and was measured about 4.1–4.4% faster on
+two 910B2 devices. Lane-aware broadcast traffic is also closed: a row-broadcast
+V2C bias is charged once per AIV lane, matching both emitted PTO and the
+simulator. Analytic mode deliberately retains its broader assumptions and prior
+traffic accounting for research comparisons.
 
 ## Python API
 
@@ -94,7 +106,9 @@ The core entry points are:
 - `solve_graph(graph, target=..., solver_binary=...) -> SolveResult`;
 - `scheduled_region(result) -> ScheduledRegion`;
 - `can_emit_region(graph, result) -> bool`;
-- `emit_pypto_callable(graph, result, ...) -> EmittedPyPTOCallable`; and
+- `emit_pypto_callable(graph, result, ...) -> EmittedPyPTOCallable`;
+- `emit_pypto_static_bundle(graph, result, ...) -> EmittedPyPTOStaticBundle`;
+  and
 - `emit_pypto_region(graph, result, ...) -> EmittedPyPTOSource`.
 
 `normalize_exported` is authoritative; `export_and_normalize` is a convenience
@@ -108,9 +122,8 @@ rejects incomplete or internally inconsistent solution
 arrays before emission. `can_emit_region` and `emit_pypto_region` build the same
 typed emission context and run the same graph-aware renderer validation; the
 readiness query is not a weaker schedule-family approximation. The emitter
-accepts one or more selected homogeneous steps or one supported mixed step and
-raises `SourceEmissionError` for every unimplemented algorithm or unsafe cut
-edge.
+accepts one or more selected homogeneous or mixed steps and raises
+`SourceEmissionError` for every unimplemented algorithm or unsafe cut edge.
 `EmittedPyPTOSource.kinds` preserves the ordered engine kind of every emitted
 step; its compatibility `kind` property is populated only when all steps use
 the same engine kind.
@@ -123,6 +136,15 @@ Callable extraction requires exactly one generated program class containing
 one `main` function and no other class members. Unexpected members, multiple
 generated functions, and runtime argument names that collide with generated
 identifiers fail closed instead of being silently dropped or shadowed.
+
+`emit_pypto_static_bundle` emits every solved region in a graph as one such
+callable and returns a graph-linked emission manifest. Its `native_op_ids` are
+the exact ordered complement of the solved-region operations, so admitted
+metadata views cannot disappear between a callable and an opaque operation.
+The original normalized graph and native implementation remain authoritative;
+the manifest does not serialize or reconstruct TopK arguments, paged-gather
+metadata, routing, or dynamic control flow. Both sides use normalized value IDs
+as the wiring contract.
 
 `runtime_valid_shape=RuntimeValidShapeSpec()` adds a named
 `valid_rows: pl.Scalar[pl.INDEX]` argument to a single homogeneous vector
@@ -752,22 +774,39 @@ and boundary semantics; model or function names must never affect planning.
 
 1. **Qwen RMSNorm and LM head as separate regions.** The reduced
    `qwen3_rms_norm_chunk` and `qwen3_lm_head_chunk` fixtures now capture, solve,
-   and emit independent callable vector and cube regions. The RMSNorm callable
-   carries the first runtime-valid-row ABI. The LM-head callable preserves the
+   and emit independent callable vector and cube regions. The checked contract
+   uses the native 16-row batch tile, a 512-wide hidden dimension and LM
+   contraction window, a 192-wide vocabulary tile, BF16 stored activations and
+   weights, rank-two FP32 gamma, and FP32 logits. The independent native
+   reference accumulates RMS statistics in 128-wide chunks; Fusebox is free to
+   choose a different source-ready plan. The RMSNorm callable carries
+   the first runtime-valid-row ABI. The LM-head callable preserves the
    production `[VOCAB, HIDDEN]` weight layout through a zero-copy
    `pl.tile.transpose_view`. Silicon comparison with
    `models/qwen3_14b/rms_lm_head.py` remains outstanding.
-2. **Qwen RMSNorm to LM head.** Solve the connected `V -> C` graph, emit the
-   selected boundary, and compare it with `models/qwen3_14b/rms_lm_head.py`.
-   This is the smallest model-derived one-way mixed-source target.
+2. **Qwen RMSNorm to LM head.** The connected graph now solves and emits as one
+   generic `V -> C` region: three active groups, one 16x512 BF16 V2C FIFO, and
+   no model-specific recognizer. The generated callable is compiled inside
+   native orchestration by the opt-in integration suite. Silicon correctness
+   and performance comparison with `models/qwen3_14b/rms_lm_head.py` remain
+   outstanding.
 3. **DeepSeek V4-Flash MTP projection at fixed token extents.** Cover the two
    normalizations, activation quantization, two projections, and their sum
    without recognizing an MTP pattern. Start with concrete decode and prefill
-   token extents; later use the same case for Type-1 dynamic-token support.
+   token extents. The current unquantized fixture now emits one callable with
+   three dependency-ordered steps (`mixed V -> C`, vector, `mixed C -> V`) and
+   two explicit GM intermediates. Production INT8 activation quantization and
+   dequantization remain outside this fixture and require ordinary normalized
+   cast/scale operations rather than an MTP recognizer.
 4. **Qwen layer with paged attention kept opaque.** Preserve the CANN
    `pl.jit.extern` attention call and its cache metadata interface. Schedule
    the QKV preprocessing and MLP sides as independent Fusebox regions and
    verify that generated source preserves every crossing value and dependency.
+   `emit_pypto_static_bundle` now returns deterministic static callables plus a
+   graph-linked manifest of the native-operation complement. The reduced
+   paged-attention fixture emits
+   QK/softmax and PV callables around an opaque `index_select`; native PyPTO
+   orchestration remains responsible for the real paged gather.
 5. **Static QK to softmax to PV.** Capture the ordinary matmul, reduction, and
    pointwise DAG and exercise generic `C -> V -> C` planning and source
    emission. The experiment must not use an attention recognizer and initially
@@ -776,12 +815,17 @@ and boundary semantics; model or function names must never affect planning.
    solve -> callable-source path together with the dense SwiGLU core from the
    next target, using reduced but legal static dimensions. Both are compiled
    as imports inside independent native PyPTO orchestration by the opt-in
-   integration suite.
+   integration suite. A checked-in silicon test compares each generated kernel
+   with an independently tiled PyPTO-lib-style control in balanced order using
+   PyPTO's register-once `device_wall` benchmark; results remain device-eval
+   pending.
 6. **DeepSeek MoE cut at data-dependent routing.** Schedule the dense
    normalization/router prefix and the bounded expert-local
    matmul/SwiGLU/matmul computation separately. Keep TopK, token-to-expert
    dispatch, variable expert counts, and distributed exchange explicit and
-   opaque.
+   opaque. The reduced fixture now emits a router-matmul callable and a
+   two-step expert callable while preserving TopK, reshape, and index-select as
+   three native-orchestration boundaries.
 
 For every target, record four independent outcomes:
 

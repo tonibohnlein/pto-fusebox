@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..ir import NormalizedGraph, normalized_graph_sha256
+from ..ir import NormalizedGraph, NormalizedOp, normalized_graph_sha256
 from ..lowered import LoweredContractError, LoweredRegion, lowered_region
 from ..schedule import (
     KernelKind,
@@ -17,7 +17,7 @@ from ..schedule import (
     VectorKernelPlan,
     scheduled_region,
 )
-from ..solver import RegionSolveResult
+from ..solver import RegionSolveResult, SolveResult
 from .common import (
     EmissionContext,
     Interface,
@@ -124,6 +124,30 @@ class EmittedPyPTOCallable:
 
         unique = set(self.kinds)
         return next(iter(unique)) if len(unique) == 1 else None
+
+
+@dataclass(frozen=True)
+class EmittedPyPTOStaticBundle:
+    """Graph-linked manifest of static callables and native operations.
+
+    ``graph`` remains the authoritative description of operations and values.
+    ``native_op_ids`` is the exact ordered complement of the operations owned
+    by ``callables``. Native PyPTO orchestration retains the corresponding
+    source implementation and uses normalized value IDs to wire it to the
+    generated static callables. The manifest does not serialize or regenerate
+    dynamic control flow, paged gathers, TopK, routing, or metadata operations.
+    """
+
+    graph: NormalizedGraph
+    callables: tuple[EmittedPyPTOCallable, ...]
+    native_op_ids: tuple[str, ...]
+
+    @property
+    def native_operations(self) -> tuple[NormalizedOp, ...]:
+        """Return native operations in normalized graph order."""
+
+        operations = self.graph.op_map()
+        return tuple(operations[op_id] for op_id in self.native_op_ids)
 
 
 def can_emit_region(graph: NormalizedGraph, result: RegionSolveResult) -> bool:
@@ -233,6 +257,74 @@ def emit_pypto_callable(
         ),
         source=source,
     )
+
+
+def emit_pypto_static_bundle(
+    graph: NormalizedGraph,
+    result: SolveResult,
+    *,
+    function_prefix: str = "fused",
+) -> EmittedPyPTOStaticBundle:
+    """Emit every solved static region while preserving native boundaries.
+
+    This is a graph-linked manifest for native PyPTO orchestration. Every
+    region must be solved and source-emittable. Every operation outside those
+    regions remains in ``bundle.graph`` and is named by ``native_op_ids`` in
+    graph order. Callers retain the original native implementation of those
+    operations; this function does not attempt to reconstruct it.
+    """
+
+    if normalized_graph_sha256(graph) != normalized_graph_sha256(result.graph):
+        raise SourceEmissionError(
+            "solve result belongs to a different normalized graph"
+        )
+    if not result.regions:
+        raise SourceEmissionError("static bundle requires at least one solver region")
+    prefix = identifier(function_prefix)
+    callables: list[EmittedPyPTOCallable] = []
+    for region in result.regions:
+        if region.status != "solved":
+            raise SourceEmissionError(
+                f"region {region.region.id} is not solved: {region.status}"
+            )
+        callables.append(
+            emit_pypto_callable(
+                graph,
+                region,
+                function_name=f"{prefix}_{region.region.id}",
+            )
+        )
+
+    graph_op_ids = {op.id for op in graph.ops}
+    static_op_ids: set[str] = set()
+    for region in result.regions:
+        overlap = static_op_ids.intersection(region.region.op_ids)
+        if overlap:
+            repeated = ", ".join(sorted(overlap))
+            raise SourceEmissionError(
+                f"solver regions overlap on normalized operations: {repeated}"
+            )
+        unknown = set(region.region.op_ids).difference(graph_op_ids)
+        if unknown:
+            missing = ", ".join(sorted(unknown))
+            raise SourceEmissionError(
+                f"solver region references unknown normalized operations: {missing}"
+            )
+        static_op_ids.update(region.region.op_ids)
+
+    native_op_ids = tuple(op.id for op in graph.ops if op.id not in static_op_ids)
+    represented_op_ids = static_op_ids.union(native_op_ids)
+    if represented_op_ids != graph_op_ids:
+        raise SourceEmissionError(
+            "static bundle does not cover every normalized operation"
+        )
+    for value in graph.values:
+        if value.producer is not None and value.producer not in represented_op_ids:
+            raise SourceEmissionError(
+                f"normalized value {value.id!r} has an unrepresented producer "
+                f"{value.producer!r}"
+            )
+    return EmittedPyPTOStaticBundle(graph, tuple(callables), native_op_ids)
 
 
 def _emission_contract(
@@ -402,13 +494,14 @@ def _step_interface(  # noqa: PLR0913
                 continue
             tensor = lowered.tensor(tensor_index)
             if producer_op is None:
+                input_value = (
+                    tensor.alias_of if tensor.alias_of is not None else tensor.value_id
+                )
                 try:
-                    inputs[tensor.value_id] = region_interface.input_arguments[
-                        tensor.value_id
-                    ]
+                    inputs[input_value] = region_interface.input_arguments[input_value]
                 except KeyError as error:
                     raise SourceEmissionError(
-                        f"step {step.index} input {tensor.value_id!r} is absent from the region ABI"
+                        f"step {step.index} input {input_value!r} is absent from the region ABI"
                     ) from error
             else:
                 inputs[tensor.value_id] = tensor_variables[tensor_index]

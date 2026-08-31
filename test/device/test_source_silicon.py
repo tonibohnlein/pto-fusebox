@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 import torch
 from examples.torch_frontend.pr2335_vector import LayerNorm, RmsNorm, Silu, Softmax
+from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
 from examples.torch_frontend.static_mixed import (
     StaticAttentionCore,
     StaticAttentionResidual,
@@ -56,6 +57,7 @@ if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
 
 
 ArgsFactory = Callable[[int], tuple[torch.Tensor, ...]]
+ReferenceFactory = Callable[[nn.Module, tuple[torch.Tensor, ...]], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,7 @@ class SiliconCase:
     forced_mixed_groups: int | None = None
     expected_mixed_groups: int | None = None
     expected_mixed_trips: int | None = None
+    reference: ReferenceFactory | None = None
 
 
 class PointwiseChain(nn.Module):
@@ -187,6 +190,47 @@ def _static_dense_swiglu() -> StaticDenseSwiGlu:
     return module
 
 
+_QWEN_EXAMPLES = build_qwen_examples()
+
+
+def _qwen_args(seed: int) -> tuple[torch.Tensor, ...]:
+    generator = _generator(seed)
+    return (
+        torch.randn((16, 512), generator=generator, dtype=torch.float32).to(
+            torch.bfloat16
+        ),
+    )
+
+
+def _qwen_rms_reference(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    value = args[0].float()
+    gamma = module.get_parameter("norm_weight")
+    inverse_rms = torch.rsqrt(
+        torch.sum(value * value, dim=-1, keepdim=True) * (1.0 / value.shape[-1])
+        + 1.0e-6
+    )
+    return (value * inverse_rms * gamma).to(torch.bfloat16)
+
+
+def _qwen_lm_reference(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    weight = module.get_parameter("lm_head_weight")
+    return torch.mm(args[0].float(), weight.float().t())
+
+
+def _qwen_connected_reference(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    normalized = _qwen_rms_reference(module, args)
+    return _qwen_lm_reference(module, (normalized,))
+
+
 def _rms_args(seed: int) -> tuple[torch.Tensor, ...]:
     generator = _generator(seed)
     value = torch.randn((512, 512), generator=generator) * 0.5
@@ -284,6 +328,15 @@ VECTOR_CASES = (
         Silu(),
         _random_args((512, 256), scale=0.5),
     ),
+    SiliconCase(
+        "qwen_rms_norm_chunk_16x512",
+        "vector",
+        _QWEN_EXAMPLES["qwen3_rms_norm_chunk"][0],
+        _qwen_args,
+        rtol=1.0e-2,
+        atol=1.0e-2,
+        reference=_qwen_rms_reference,
+    ),
 )
 
 
@@ -308,6 +361,17 @@ MATMUL_CASES = tuple(
         (48, 512, 128),
         (64, 512, 256),
     )
+)
+MATMUL_CASES += (
+    SiliconCase(
+        "qwen_lm_head_chunk_16x512x192",
+        "cube",
+        _QWEN_EXAMPLES["qwen3_lm_head_chunk"][0],
+        _qwen_args,
+        rtol=2.0e-2,
+        atol=2.0e-2,
+        reference=_qwen_lm_reference,
+    ),
 )
 
 
@@ -448,6 +512,16 @@ MIXED_CASES = (
         rtol=1.0e-4,
         atol=1.0e-4,
     ),
+    SiliconCase(
+        "qwen_rms_lm_head_v2c_16x512x192",
+        "mixed",
+        _QWEN_EXAMPLES["qwen3_rms_lm_head"][0],
+        _qwen_args,
+        rtol=2.0e-2,
+        atol=2.0e-2,
+        mixed_contract="qwen_rms_lm_head_v2c",
+        reference=_qwen_connected_reference,
+    ),
 )
 
 
@@ -537,6 +611,20 @@ def _assert_mixed_contract(
         assert plan.requested_skew_depth == 0
         assert not plan.overlap_implementable
         assert "pl.range(1, init_values=" in source
+        return
+    if case.mixed_contract == "qwen_rms_lm_head_v2c":
+        assert plan.active_groups == 3
+        assert plan.spatial_tiles == 3
+        assert plan.max_trips_per_group == 1
+        assert plan.pipeline_stages == 1
+        assert len(plan.fifos) == 1
+        fifo = plan.fifos[0]
+        assert fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+        assert (fifo.valid_rows, fifo.valid_cols) == (16, 512)
+        assert fifo.slot_bytes == 16 * 512 * 2
+        assert fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count
+        assert "pl.tensor.cast(" in source
+        assert "b_trans=True" in source
         return
     assert len(plan.fifos) == 1
     fifo = plan.fifos[0]
@@ -704,7 +792,11 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         args = case.make_args(seed)
         runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():
-            expected = case.module(*args)
+            expected = (
+                case.module(*args)
+                if case.reference is None
+                else case.reference(case.module, args)
+            )
         output = torch.full_like(expected, torch.nan)
         if compiled is None:
             compiled = runtime.run(program, *runtime_args, output, config=config)
@@ -720,7 +812,11 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         args = case.make_args(0)
         runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():
-            expected = case.module(*args)
+            expected = (
+                case.module(*args)
+                if case.reference is None
+                else case.reference(case.module, args)
+            )
         signatures: set[str] = set()
         for repeat in range(repeat_count):
             output = torch.full_like(expected, torch.nan)

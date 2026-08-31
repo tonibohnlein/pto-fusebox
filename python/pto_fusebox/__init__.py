@@ -43,6 +43,7 @@ from .schedule import (
 from .solver import RegionSolveResult, SolveResult, solve_graph
 from .source import (
     EmittedPyPTOCallable,
+    EmittedPyPTOStaticBundle,
     EmittedPyPTOSource,
     PyPTOABIArgument,
     PyPTORuntimeValidShapeArgument,
@@ -51,6 +52,7 @@ from .source import (
     can_emit_region,
     emit_pypto_callable,
     emit_pypto_region,
+    emit_pypto_static_bundle,
 )
 from .target import Ascend910BTarget, TargetProfile
 
@@ -65,6 +67,7 @@ __all__ = [
     "CubePlanCandidate",
     "CubePlanSweep",
     "EmittedPyPTOCallable",
+    "EmittedPyPTOStaticBundle",
     "EmittedPyPTOSource",
     "GraphPattern",
     "GraphPatternBinding",
@@ -90,6 +93,7 @@ __all__ = [
     "export_and_normalize",
     "emit_pypto_callable",
     "emit_pypto_region",
+    "emit_pypto_static_bundle",
     "enumerate_cube_plans",
     "MIXED_GROUP_SWEEP_SCHEMA",
     "MixedCostBreakdown",

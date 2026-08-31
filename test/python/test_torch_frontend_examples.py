@@ -10,7 +10,16 @@ from examples.torch_frontend.basic import build_examples as build_basic_examples
 from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
 )
+from examples.torch_frontend.orchestration_boundaries import (
+    build_examples as build_boundary_examples,
+)
 from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
+from examples.torch_frontend.qwen3 import (
+    QWEN_BATCH_TILE,
+    QWEN_LM_HEAD_K_CHUNK,
+    QWEN_REFERENCE_RMS_K_CHUNK,
+    QWEN_VOCAB_CHUNK,
+)
 from examples.torch_frontend.static_mixed import (
     build_examples as build_static_mixed_examples,
 )
@@ -23,6 +32,7 @@ from pto_fusebox import (
     can_emit_region,
     emit_pypto_callable,
     emit_pypto_region,
+    emit_pypto_static_bundle,
     export_and_normalize,
     extract_solver_regions,
     scheduled_region,
@@ -32,6 +42,20 @@ from pto_fusebox.schedule.schema import MixedKernelPlan
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
+
+
+class _MetadataViewIntoNativeBoundary(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        value: torch.Tensor,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        static = torch.mm(lhs, rhs)
+        viewed = value.view(64, 64)
+        gathered = torch.index_select(viewed, 0, index)
+        return static + gathered
 
 
 def _all_examples() -> dict[str, Example]:
@@ -110,7 +134,7 @@ def test_basic_examples_export_as_expected(
         (
             build_qwen_examples,
             "qwen3_rms_norm_chunk",
-            ["mul", "sum", "mul", "add", "rsqrt", "mul", "mul", "cast"],
+            ["cast", "mul", "sum", "mul", "add", "rsqrt", "mul", "mul", "cast"],
         ),
         (
             build_qwen_examples,
@@ -129,6 +153,7 @@ def test_basic_examples_export_as_expected(
                 "rsqrt",
                 "mul",
                 "mul",
+                "cast",
                 "transpose_view",
                 "matmul",
             ],
@@ -201,6 +226,147 @@ def test_static_mixed_examples_export_one_coherent_dag(
     assert [op.kind for op in graph.ops] == expected_kinds
     assert all(op.supported for op in graph.ops)
     assert len(extract_solver_regions(graph)) == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_regions", "expected_boundaries"),
+    [
+        (
+            "paged_attention_static_regions",
+            [
+                ["transpose_view", "matmul", "max", "sub", "exp", "sum", "div"],
+                ["matmul"],
+            ],
+            ["aten.index_select.default"],
+        ),
+        (
+            "moe_static_regions",
+            [
+                ["matmul"],
+                [
+                    "matmul",
+                    "matmul",
+                    "neg",
+                    "exp",
+                    "add",
+                    "div",
+                    "mul",
+                    "mul",
+                    "matmul",
+                ],
+            ],
+            ["aten.topk.default", "aten.reshape.default", "aten.index_select.default"],
+        ),
+    ],
+)
+def test_orchestration_examples_preserve_explicit_opaque_boundaries(
+    name: str,
+    expected_regions: list[list[str]],
+    expected_boundaries: list[str],
+) -> None:
+    module, args = build_boundary_examples()[name]
+    graph = export_and_normalize(module, args)
+    regions = extract_solver_regions(graph)
+
+    op_map = graph.op_map()
+    assert [[op_map[op].kind for op in region.op_ids] for region in regions] == (
+        expected_regions
+    )
+    assert [
+        str(op.attributes["source_operator"]) for op in graph.ops if not op.supported
+    ] == expected_boundaries
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+@pytest.mark.parametrize(
+    ("name", "boundary_count"),
+    [("paged_attention_static_regions", 1), ("moe_static_regions", 3)],
+)
+def test_static_bundle_wires_solved_regions_around_native_boundaries(
+    name: str,
+    boundary_count: int,
+) -> None:
+    module, args = build_boundary_examples()[name]
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert result.successful
+    assert not result.whole_graph_supported
+    bundle = emit_pypto_static_bundle(
+        graph, result, function_prefix=f"generated_{name}"
+    )
+    repeated = emit_pypto_static_bundle(
+        graph, result, function_prefix=f"generated_{name}"
+    )
+    assert bundle == repeated
+    assert len(bundle.callables) == 2
+    assert bundle.graph == graph
+    assert len(bundle.native_operations) == boundary_count
+    assert [callable.region_id for callable in bundle.callables] == [
+        "region0000",
+        "region0001",
+    ]
+    assert [callable.function_name for callable in bundle.callables] == [
+        f"generated_{name}_region0000",
+        f"generated_{name}_region0001",
+    ]
+    for callable in bundle.callables:
+        assert "@pl.inline" in callable.source
+        assert "auto_fuse" not in callable.source
+        assert "auto_tile" not in callable.source
+
+    first, second = bundle.callables
+    boundaries = bundle.native_operations
+    assert set(first.output_value_ids) & (
+        set(second.input_value_ids) | set(boundaries[0].inputs)
+    )
+    assert set(boundaries[-1].outputs) & set(second.input_value_ids)
+
+    static_op_ids = {
+        op_id for region in result.regions for op_id in region.region.op_ids
+    }
+    native_op_ids = set(bundle.native_op_ids)
+    assert static_op_ids.isdisjoint(native_op_ids)
+    assert static_op_ids | native_op_ids == {op.id for op in graph.ops}
+    represented = static_op_ids | native_op_ids
+    assert all(
+        value.producer is None or value.producer in represented
+        for value in graph.values
+    )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_static_bundle_keeps_admitted_metadata_on_the_native_side() -> None:
+    module = _MetadataViewIntoNativeBoundary()
+    args = (
+        torch.zeros(64, 64),
+        torch.zeros(64, 64),
+        torch.zeros(64, 64),
+        torch.arange(64),
+    )
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    bundle = emit_pypto_static_bundle(graph, result)
+
+    assert [op.kind for op in bundle.native_operations] == ["view", "opaque"]
+    view, gather = bundle.native_operations
+    assert view.metadata_only and view.supported
+    assert gather.inputs[0] == view.outputs[0]
+    assert graph.value_map()[gather.inputs[0]].producer == view.id
 
 
 @pytest.mark.parametrize("name", sorted(_all_examples()))
@@ -481,18 +647,137 @@ def test_qwen_lm_head_replays_the_transposed_weight_without_copying_it() -> None
     assert "pl.create_tensor" not in emitted.source
 
 
+def test_qwen_components_preserve_the_native_static_chunk_contract() -> None:
+    examples = build_qwen_examples()
+    rms_module, rms_args = examples["qwen3_rms_norm_chunk"]
+    lm_module, lm_args = examples["qwen3_lm_head_chunk"]
+    connected_module, connected_args = examples["qwen3_rms_lm_head"]
+    rms_weight = rms_module.get_parameter("norm_weight")
+    lm_weight = lm_module.get_parameter("lm_head_weight")
+
+    assert QWEN_BATCH_TILE == 16
+    assert QWEN_REFERENCE_RMS_K_CHUNK == 128
+    assert QWEN_LM_HEAD_K_CHUNK == 512
+    assert QWEN_VOCAB_CHUNK == 192
+    assert rms_args[0].shape == (QWEN_BATCH_TILE, QWEN_LM_HEAD_K_CHUNK)
+    assert rms_args[0].dtype is torch.bfloat16
+    assert tuple(rms_weight.shape) == (1, QWEN_LM_HEAD_K_CHUNK)
+    assert rms_weight.dtype is torch.float32
+    assert lm_args[0].shape == (QWEN_BATCH_TILE, QWEN_LM_HEAD_K_CHUNK)
+    assert lm_args[0].dtype is torch.bfloat16
+    assert tuple(lm_weight.shape) == (
+        QWEN_VOCAB_CHUNK,
+        QWEN_LM_HEAD_K_CHUNK,
+    )
+    assert lm_weight.dtype is torch.bfloat16
+    assert connected_args[0].dtype is torch.bfloat16
+
+    rms_graph = export_and_normalize(rms_module, rms_args)
+    lm_graph = export_and_normalize(lm_module, lm_args)
+    connected_graph = export_and_normalize(connected_module, connected_args)
+    assert rms_graph.value_map()[rms_graph.outputs[0]].shape == (
+        QWEN_BATCH_TILE,
+        QWEN_LM_HEAD_K_CHUNK,
+    )
+    assert rms_graph.value_map()[rms_graph.outputs[0]].dtype == "bfloat16"
+    for graph in (lm_graph, connected_graph):
+        output = graph.value_map()[graph.outputs[0]]
+        assert output.shape == (QWEN_BATCH_TILE, QWEN_VOCAB_CHUNK)
+        assert output.dtype == "float32"
+
+
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
-def test_analytic_success_is_distinct_from_source_codegen_readiness() -> None:
+def test_connected_qwen_rms_norm_lm_head_is_one_exact_v2c_region() -> None:
+    module, args = build_qwen_examples()["qwen3_rms_lm_head"]
+    graph = export_and_normalize(module, args)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert result.successful
+    assert result.whole_graph_codegen_ready
+    assert len(result.regions) == 1
+    schedule = scheduled_region(result.regions[0])
+    assert len(schedule.steps) == 1
+    step = schedule.steps[0]
+    assert step.kind is KernelKind.MIXED
+    assert step.solver_ops == tuple(range(10))
+    plan = step.plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol.value == "one_way"
+    assert [stage.engine.value for stage in plan.stages] == ["vector", "cube"]
+    assert plan.active_groups == 3
+    assert plan.spatial_tiles == 3
+    assert plan.pipeline_stages == 1
+    assert len(plan.fifos) == 1
+    fifo = plan.fifos[0]
+    assert fifo.direction.value == "vector_to_cube"
+    assert (fifo.valid_rows, fifo.valid_cols) == (
+        QWEN_BATCH_TILE,
+        QWEN_LM_HEAD_K_CHUNK,
+    )
+    assert fifo.slot_bytes == 16 * 512 * 2
+    assert fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count
+
+    emitted = emit_pypto_callable(
+        graph,
+        result.regions[0],
+        function_name="generated_qwen_rms_lm_head",
+    )
+    assert emitted.kind is KernelKind.MIXED
+    assert emitted.source.count("pl.spmd(") == 1
+    assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in emitted.source
+    assert "b_trans=True" in emitted.source
+    assert "pl.create_tensor" not in emitted.source
+    assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_deepseek_mtp_projection_emits_a_generic_three_step_composition() -> None:
     module, args = build_deepseek_examples()["deepseek_v4_mtp_projection"]
     graph = export_and_normalize(module, args)
-    result = solve_graph(graph, solver_binary=_test_solver(), solver_workers=2)
+    result = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
 
-    assert result.regions_solved
+    assert result.successful
     assert result.whole_graph_supported
-    assert not result.whole_graph_codegen_ready
-    assert any(not can_emit_region(graph, region) for region in result.regions)
+    assert result.whole_graph_codegen_ready
+    assert len(result.regions) == 1
+    schedule = scheduled_region(result.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.MIXED,
+        KernelKind.VECTOR,
+        KernelKind.MIXED,
+    ]
+    region = result.regions[0]
+    assert region.solver_op_to_graph == tuple(
+        op.id for op in graph.ops if not op.metadata_only
+    )
+    assert tuple(op for step in schedule.steps for op in step.solver_ops) == tuple(
+        range(len(region.solver_op_to_graph))
+    )
+    emitted = emit_pypto_callable(
+        graph,
+        result.regions[0],
+        function_name="generated_deepseek_mtp_projection",
+    )
+    assert emitted.source.count("pl.spmd(") == 3
+    assert emitted.source.count("pl.create_tensor(") == 2
+    assert emitted.source.count("pl.cross_core_pipe(") == 2
+    assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in emitted.source
+    assert "pl.CrossCoreDirection.CUBE_TO_VECTOR" in emitted.source
+    assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
 
 
 @pytest.mark.skipif(

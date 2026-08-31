@@ -17,16 +17,24 @@ from pathlib import Path
 
 import pytest
 import torch
+from examples.torch_frontend.deepseek_v4 import (
+    build_examples as build_deepseek_examples,
+)
+from examples.torch_frontend.orchestration_boundaries import (
+    build_examples as build_boundary_examples,
+)
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
 from pto_fusebox import (
     EmittedPyPTOCallable,
+    KernelKind,
     RegionSolveResult,
     RuntimeValidShapeSpec,
     emit_pypto_callable,
     emit_pypto_region,
+    emit_pypto_static_bundle,
     enumerate_cube_plans,
     export_and_normalize,
     extract_solver_regions,
@@ -387,6 +395,114 @@ def test_callable_qwen_static_components_lower_inside_native_orchestration(
     if name == "qwen3_lm_head_chunk":
         assert "pto.tmatmul" in pto[0]
         assert re.search(r"loc=right, dtype=bf16, rows=80, cols=64", pto[0])
+
+
+def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_qwen_examples()["qwen3_rms_lm_head"]
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.whole_graph_codegen_ready
+    plan = scheduled_region(solved.regions[0]).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert len(plan.fifos) == 1
+    assert plan.fifos[0].direction.value == "vector_to_cube"
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_qwen_rms_lm_head",
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="qwen_rms_lm_head"
+    )
+    assert len(pto) == 1
+    assert "pto.kernel_kind = #pto.kernel_kind<cube>" in pto[0]
+    assert "pto.kernel_kind = #pto.kernel_kind<vector>" in pto[0]
+    assert "pto.tpush_to_aic" in pto[0]
+    assert "pto.tpop_from_aiv" in pto[0]
+    assert orchestration.count("rt_submit_task(") == 1
+    assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
+
+
+def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_deepseek_examples()["deepseek_v4_mtp_projection"]
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.whole_graph_codegen_ready
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.MIXED,
+        KernelKind.VECTOR,
+        KernelKind.MIXED,
+    ]
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_deepseek_mtp_projection",
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted, tmp_path, monkeypatch, name="deepseek_mtp_projection"
+    )
+    assert len(pto) == 3
+    assert orchestration.count("rt_submit_task(") == 2
+    assert orchestration.count("rt_submit_aiv_task(") == 1
+    assert orchestration.count("set_dependencies(") == 2
+    assert orchestration.count("add_output(intermediate_tensor_") == 2
+    assert orchestration.count("add_input(intermediate_tensor_") == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_pto_count"),
+    [("paged_attention_static_regions", 2), ("moe_static_regions", 3)],
+)
+def test_static_bundle_callables_lower_independently_around_native_boundaries(
+    name: str,
+    expected_pto_count: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args = build_boundary_examples()[name]
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    assert not solved.whole_graph_supported
+    bundle = emit_pypto_static_bundle(
+        graph, solved, function_prefix=f"generated_{name}"
+    )
+
+    pto_count = 0
+    for index, emitted in enumerate(bundle.callables):
+        pto, orchestration = _compile_callable_in_native_orchestration(
+            emitted,
+            tmp_path,
+            monkeypatch,
+            name=f"{name}_region_{index}",
+        )
+        pto_count += len(pto)
+        assert orchestration.count("rt_submit_") >= 1
+    assert pto_count == expected_pto_count
 
 
 class _SumOfSquares(nn.Module):

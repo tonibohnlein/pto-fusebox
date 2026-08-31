@@ -87,6 +87,7 @@ python -m pip install -e ".[torch]"
 from pto_fusebox import (
     can_emit_region,
     emit_pypto_callable,
+    emit_pypto_static_bundle,
     export_and_normalize,
     solve_graph,
 )
@@ -106,6 +107,11 @@ callable_source = emit_pypto_callable(
     function_name="fused_region",
 )
 print(callable_source.source)
+
+# A graph containing paged gathers, TopK, or routing can still emit every
+# solved static region. Native PyPTO orchestration retains the original native
+# operations and wires values through the published normalized value IDs.
+bundle = emit_pypto_static_bundle(graph, result, function_prefix="model_region")
 ```
 
 The current Torch reader schedules **static-shape tensor DAGs only**. It records
@@ -127,6 +133,13 @@ logical-shape metadata. Native PyPTO orchestration imports that function and
 owns loops, metadata, dispatch, and dependencies outside the static region.
 `emit_pypto_region` remains available when a standalone generated
 `@pl.program` is more convenient.
+`emit_pypto_static_bundle` applies the callable API to every solved region and
+returns a graph-linked emission manifest. Its ordered `native_op_ids` are the
+exact complement of the static-region operations, including admitted metadata
+views as well as opaque operations. It never reconstructs paged gathers, TopK,
+token routing, metadata operations, or dynamic control flow; callers retain
+the original native PyPTO implementation and connect it to the static
+callables through stable normalized value IDs.
 
 Unsupported operations remain explicit graph boundaries. The source backend
 replays supported vector, cube, and mixed steps from the selected schedule.
@@ -159,26 +172,26 @@ skew-overlap credit. Online softmax-to-PV replays the serialized statistics and
 apply phases, publishes each normalized K chunk through one V2C pipe, and
 accumulates the sink matmul over the same K windows. A complete square produced
 panel may also serve both operands of a single-region sink matmul through one
-FIFO-owned L1 ring. Partitioned dual-role values, branched/deeper round trips,
-and mixed multi-step composition still fail closed.
+FIFO-owned L1 ring. Partitioned dual-role values and branched/deeper round
+trips still fail closed. A linear region may compose mixed and homogeneous
+steps through dependency-linked GM cuts.
 Mixed source readiness combines the serialized cube-stage L1 peak with V2C
 ring reservations and the vector-stage Vec peak with C2V ring reservations.
 The initial split-K task bundle must be the region's only selected step; the
 multi-step composer fails closed rather than splicing its internal dependency
 into a larger launch sequence.
 
-The earlier fork-only explicit-pipe contract was silicon-closed for one-way
-`C -> V`, generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
-`C -> V -> C -> V` source families. It is historical validation evidence, not
-the compatibility target. PTO Fusebox now targets upstream PyPTO `main` and
-emits only its public automatic-pipe contract. On the current upstream-main
-host matrix, the callable integration surface covers multi-step cube,
-single-sink split-K, mixed attention, and dense SwiGLU inside independent
-native orchestration. The dense case still exposes a general
-nested-accumulator join defect in PyPTO's memory-reuse lowering until the
-corresponding generic PyPTO repair is present. Current-main runtime-valid and
-PyPTO-lib comparison silicon revalidation is in progress; historical evidence
-is not presented as current-main closure.
+The public explicit-pipe contract has been silicon-closed for one-way `C -> V`,
+generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
+`C -> V -> C -> V` source families. PTO Fusebox emits that generic descriptor;
+PyPTO still owns AIC/AIV outlining and pipeline lowering. Until the required
+generic PyPTO changes land upstream, the compatibility lane is recent PyPTO
+`main` composed without manual edits with the split-AIV FIFO-lane and
+nested-accumulator repairs. The callable integration surface covers multi-step
+cube, single-sink split-K, mixed attention, and dense SwiGLU inside independent
+native orchestration. Current-main runtime-valid and PyPTO-lib comparison
+silicon revalidation is in progress; historical evidence is not presented as
+current-main closure.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized
@@ -194,12 +207,12 @@ online-softmax-to-PV, and the complete-square dual-role case. Source and silicon
 status are evaluated against upstream PyPTO `main`, rather than inherited from
 the historical explicit-pipe fork.
 Partitioned dual-role schedules are rejected until the plan defines replication
-and FIFO ownership. PyPTO already supports multiple dependency-
-linked `pl.spmd` tasks, so deeper composition does not require a new PyPTO
-primitive. Fusebox still needs an ordered mixed task-bundle contract that
-preserves GM cuts, task dependencies, internal pipes, and result ownership.
-Branched replay additionally needs explicit fan-out, lifetime, and per-consumer
-FIFO ownership and must not be inferred by the emitter.
+and FIFO ownership. Linear multi-step composition may contain homogeneous and mixed steps and
+materializes solver-selected cuts as dependency-linked GM tensors. This is now
+used by the reduced DeepSeek MTP projection fixture. PyPTO already supports the
+required dependency-linked `pl.spmd` tasks. Branched replay additionally needs
+explicit fan-out, lifetime, and per-consumer FIFO ownership and must not be
+inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
 `pto_fusebox.solution.v6`: C++ owns the selected launch, order, loops, physical
@@ -235,6 +248,7 @@ python -m examples.torch_frontend.deepseek_v4
 python -m examples.torch_frontend.qwen3
 python -m examples.torch_frontend.pr2335_vector
 python -m examples.torch_frontend.static_mixed
+python -m examples.torch_frontend.orchestration_boundaries
 ```
 
 Pass `--json` to inspect the normalized graph or `--solver build/mlsys_mixed`
@@ -277,8 +291,9 @@ current source backend—including deeper mixed cross-core plans—remain useful
 analytic evidence but fail closed instead of being approximated by source.
 
 The generated-source silicon matrix is opt-in and is not part of the default
-host suite. Its reusable base matrix covers 14 vector and 10 single-matmul cube
-programs, compiles each emitted PyPTO program once, and checks five seeded
+host suite. Its reusable base matrix covers 15 vector and 11 single-matmul cube
+programs plus the mixed surface, compiles each emitted PyPTO program once, and
+checks five seeded
 executions:
 
 ```bash
@@ -287,6 +302,19 @@ PTO_FUSEBOX_DEVICE_ID=<physical-id> \
 PTO_FUSEBOX_SOLVER=build/mlsys_mixed \
 PYTHONPATH=python:<pypto-checkout>/python \
 python -m pytest test/device/test_source_silicon.py -v
+```
+
+The reduced PyPTO-lib comparison surface gates correctness against independent
+16-row controls and characterizes timing with PyPTO's register-once device-wall
+benchmark. The test deliberately has no performance pass threshold; device
+reports classify timing only after stratified uncertainty analysis:
+
+```bash
+PTO_FUSEBOX_RUN_DEVICE_TESTS=1 \
+PTO_FUSEBOX_DEVICE_ID=<physical-id> \
+PTO_FUSEBOX_SOLVER=build/mlsys_mixed \
+PYTHONPATH=python:<pypto-checkout>/python \
+python -m pytest test/device/test_pypto_lib_performance.py -v -s
 ```
 
 The opt-in source-integration suite separately exercises callable expansion

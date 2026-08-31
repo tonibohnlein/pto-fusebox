@@ -1,8 +1,10 @@
 """Shape-reduced Torch form of the Qwen3 final RMSNorm and LM-head DAG.
 
-This is the tensor algebra from pypto-lib's
-``models/qwen3_14b/rms_lm_head.py`` with demonstration dimensions and FP32
-weights. It is an exporter example, not a replacement checkpoint definition.
+The fixtures mirror the static chunk contract in pypto-lib's
+``models/qwen3_14b/rms_lm_head.py``: 16 rows, 128-wide RMSNorm accumulation
+chunks, a 512-wide LM-head K window, a 192-wide vocabulary tile, BF16 stored
+activations and weights, and an FP32 projection result.  They are reduced
+kernel comparisons, not replacement checkpoint definitions.
 """
 
 from __future__ import annotations
@@ -12,19 +14,36 @@ from torch import nn
 
 from ._runner import Example, run_examples
 
+QWEN_BATCH_TILE = 16
+# The native PyPTO-lib control accumulates RMS statistics in 128-wide chunks.
+# Fusebox remains free to select a different source-ready schedule.
+QWEN_REFERENCE_RMS_K_CHUNK = 128
+QWEN_LM_HEAD_K_CHUNK = 512
+QWEN_VOCAB_CHUNK = 192
+
 
 class Qwen3RmsLmHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.norm_weight = nn.Parameter(torch.ones(hidden_size))
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.norm_weight = nn.Parameter(torch.ones(1, hidden_size))
+        self.lm_head_weight = nn.Parameter(
+            torch.empty(vocab_size, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         wide = hidden_states.float()
-        inverse_rms = torch.rsqrt((wide * wide).mean(dim=-1, keepdim=True) + self.eps)
+        inverse_rms = torch.rsqrt(
+            torch.sum(wide * wide, dim=-1, keepdim=True) * (1.0 / wide.shape[-1])
+            + self.eps
+        )
         normalized = wide * inverse_rms * self.norm_weight
-        return self.lm_head(normalized)
+        return torch.mm(
+            normalized.to(torch.bfloat16),
+            self.lm_head_weight.t(),
+            out_dtype=torch.float32,
+        )
 
 
 class Qwen3RmsNormChunk(nn.Module):
@@ -36,10 +55,12 @@ class Qwen3RmsNormChunk(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        wide = hidden_states.float()
         inverse_rms = torch.rsqrt(
-            (hidden_states * hidden_states).mean(dim=-1, keepdim=True) + self.eps
+            torch.sum(wide * wide, dim=-1, keepdim=True) * (1.0 / wide.shape[-1])
+            + self.eps
         )
-        return (hidden_states * inverse_rms * self.norm_weight).to(torch.bfloat16)
+        return (wide * inverse_rms * self.norm_weight).to(torch.bfloat16)
 
 
 class Qwen3LmHeadChunk(nn.Module):
@@ -61,25 +82,51 @@ class Qwen3LmHeadChunk(nn.Module):
 
 
 def build_examples() -> dict[str, Example]:
-    """Return a reduced but 910B-buildable Qwen3 output-head example."""
+    """Return chunk-exact, reduced Qwen3 output-head comparisons."""
 
     torch.manual_seed(0)
-    rms_norm = Qwen3RmsNormChunk(hidden_size=256)
-    lm_head = Qwen3LmHeadChunk(hidden_size=256, vocab_size=512)
+    rms_norm = Qwen3RmsNormChunk(hidden_size=QWEN_LM_HEAD_K_CHUNK)
+    lm_head = Qwen3LmHeadChunk(
+        hidden_size=QWEN_LM_HEAD_K_CHUNK,
+        vocab_size=QWEN_VOCAB_CHUNK,
+    )
+    connected = Qwen3RmsLmHead(
+        hidden_size=QWEN_LM_HEAD_K_CHUNK,
+        vocab_size=QWEN_VOCAB_CHUNK,
+    )
     with torch.no_grad():
         lm_head.lm_head_weight.normal_(std=0.02)
+        connected.lm_head_weight.copy_(lm_head.lm_head_weight)
     return {
         "qwen3_rms_norm_chunk": (
             rms_norm,
-            (torch.randn(64, 256),),
+            (
+                torch.randn(
+                    QWEN_BATCH_TILE,
+                    QWEN_LM_HEAD_K_CHUNK,
+                    dtype=torch.bfloat16,
+                ),
+            ),
         ),
         "qwen3_lm_head_chunk": (
             lm_head,
-            (torch.randn(64, 256, dtype=torch.bfloat16),),
+            (
+                torch.randn(
+                    QWEN_BATCH_TILE,
+                    QWEN_LM_HEAD_K_CHUNK,
+                    dtype=torch.bfloat16,
+                ),
+            ),
         ),
         "qwen3_rms_lm_head": (
-            Qwen3RmsLmHead(hidden_size=256, vocab_size=512),
-            (torch.randn(64, 256, dtype=torch.bfloat16),),
+            connected,
+            (
+                torch.randn(
+                    QWEN_BATCH_TILE,
+                    QWEN_LM_HEAD_K_CHUNK,
+                    dtype=torch.bfloat16,
+                ),
+            ),
         ),
     }
 

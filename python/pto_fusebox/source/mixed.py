@@ -44,10 +44,6 @@ def emit_mixed(context: EmissionContext, program_name: str) -> str:
     plan = context.step.plan
     if not isinstance(plan, MixedKernelPlan):
         raise SourceEmissionError("mixed step does not carry a mixed plan")
-    if len(context.schedule.steps) != 1:
-        raise SourceEmissionError(
-            "mixed source currently requires the region's only selected step"
-        )
     _validate_common(context, plan)
     if plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP:
         return _emit_dense_swiglu(context, program_name, plan)

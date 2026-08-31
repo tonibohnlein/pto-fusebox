@@ -2,6 +2,7 @@
 
 from .api import (
     EmittedPyPTOCallable,
+    EmittedPyPTOStaticBundle,
     EmittedPyPTOSource,
     PyPTOABIArgument,
     PyPTORuntimeValidShapeArgument,
@@ -10,10 +11,12 @@ from .api import (
     can_emit_region,
     emit_pypto_callable,
     emit_pypto_region,
+    emit_pypto_static_bundle,
 )
 
 __all__ = [
     "EmittedPyPTOCallable",
+    "EmittedPyPTOStaticBundle",
     "EmittedPyPTOSource",
     "PyPTOABIArgument",
     "PyPTORuntimeValidShapeArgument",
@@ -22,4 +25,5 @@ __all__ = [
     "can_emit_region",
     "emit_pypto_callable",
     "emit_pypto_region",
+    "emit_pypto_static_bundle",
 ]

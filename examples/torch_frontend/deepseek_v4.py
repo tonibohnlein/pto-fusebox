@@ -31,8 +31,10 @@ class DeepSeekV4MtpProjection(nn.Module):
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.enorm_weight = nn.Parameter(torch.ones(hidden_size))
-        self.hnorm_weight = nn.Parameter(torch.ones(hidden_size))
+        # Rank-two singleton rows match the native PyPTO broadcast ABI and
+        # remain ordinary external tensors in generated source.
+        self.enorm_weight = nn.Parameter(torch.ones(1, hidden_size))
+        self.hnorm_weight = nn.Parameter(torch.ones(1, hidden_size))
         self.e_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.h_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.eps = eps

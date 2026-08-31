@@ -134,8 +134,16 @@ def emit_vector(
             "vector tile does not match the solver-owned iteration frame"
         )
 
-    expected_rows = max(tensor.height for tensor in lowered.tensors)
-    expected_cols = max(tensor.width for tensor in lowered.tensors)
+    step_tensors = {
+        tensor
+        for operation_index in step.solver_ops
+        for tensor in (
+            *lowered.operation(operation_index).inputs,
+            *lowered.operation(operation_index).outputs,
+        )
+    }
+    expected_rows = max(lowered.tensor(tensor).height for tensor in step_tensors)
+    expected_cols = max(lowered.tensor(tensor).width for tensor in step_tensors)
     if (frame.iteration_rows, frame.iteration_cols) != (
         expected_rows,
         expected_cols,
@@ -1270,13 +1278,18 @@ def _emit_vector_body(
     def ensure_loaded(tensor: int) -> str:
         if tensor in local:
             return local[tensor]
-        if producers[tensor] is not None:
-            raise SourceEmissionError(
-                f"solver tensor {tensor} is used before its producer"
-            )
-        value_id = lowered.tensor(tensor).value_id
+        descriptor = lowered.tensor(tensor)
+        value_id = (
+            descriptor.alias_of
+            if producers[tensor] is None and descriptor.alias_of is not None
+            else descriptor.value_id
+        )
         argument = io.input_arguments.get(value_id)
         if argument is None:
+            if producers[tensor] is not None:
+                raise SourceEmissionError(
+                    f"solver tensor {tensor} is used before its producer"
+                )
             raise SourceEmissionError(
                 f"external solver tensor {tensor} ({value_id}) is not a direct region input"
             )
