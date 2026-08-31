@@ -394,7 +394,8 @@ def test_callable_qwen_static_components_lower_inside_native_orchestration(
     assert orchestration.count(expected_submit) == 1
     if name == "qwen3_lm_head_chunk":
         assert "pto.tmatmul" in pto[0]
-        assert re.search(r"loc=right, dtype=bf16, rows=80, cols=64", pto[0])
+        assert re.search(r"loc=right, dtype=bf16, rows=160, cols=32", pto[0])
+        assert re.search(r"loc=right, dtype=bf16, rows=32, cols=32", pto[0])
 
 
 def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
@@ -463,9 +464,27 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     assert len(pto) == 3
     assert orchestration.count("rt_submit_task(") == 2
     assert orchestration.count("rt_submit_aiv_task(") == 1
-    assert orchestration.count("set_dependencies(") == 2
     assert orchestration.count("add_output(intermediate_tensor_") == 2
     assert orchestration.count("add_input(intermediate_tensor_") == 2
+    produced = {
+        tensor: int(task)
+        for task, tensor in re.findall(
+            r"params_t(\d+)\.add_output\((intermediate_tensor_\d+)\);",
+            orchestration,
+        )
+    }
+    consumed = {
+        tensor: int(task)
+        for task, tensor in re.findall(
+            r"params_t(\d+)\.add_input\((intermediate_tensor_\d+)\);",
+            orchestration,
+        )
+    }
+    assert produced.keys() == consumed.keys()
+    assert len(produced) == 2
+    assert set(produced.values()) == {0, 1}
+    assert set(consumed.values()) == {2}
+    assert all(produced[tensor] < consumed[tensor] for tensor in produced)
 
 
 @pytest.mark.parametrize(
