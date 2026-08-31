@@ -429,6 +429,11 @@ def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
     assert "pto.kernel_kind = #pto.kernel_kind<vector>" in pto[0]
     assert "pto.tpush_to_aic" in pto[0]
     assert "pto.tpop_from_aiv" in pto[0]
+    assert not [
+        line
+        for line in pto[0].splitlines()
+        if "pto.tmov" in line and line.count("loc=mat") >= 2
+    ], "a V2C pop already lands in Mat; a redundant Mat -> Mat move is illegal"
     assert orchestration.count("rt_submit_task(") == 1
     assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
 
@@ -462,6 +467,12 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
         emitted, tmp_path, monkeypatch, name="deepseek_mtp_projection"
     )
     assert len(pto) == 3
+    assert not [
+        line
+        for program in pto
+        for line in program.splitlines()
+        if "pto.tmov" in line and line.count("loc=mat") >= 2
+    ], "a V2C pop already lands in Mat; a redundant Mat -> Mat move is illegal"
     assert orchestration.count("rt_submit_task(") == 2
     assert orchestration.count("rt_submit_aiv_task(") == 1
     assert orchestration.count("add_output(intermediate_tensor_") == 2

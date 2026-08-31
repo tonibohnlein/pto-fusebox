@@ -231,6 +231,31 @@ def _qwen_connected_reference(
     return _qwen_lm_reference(module, (normalized,))
 
 
+def _dense_swiglu_reference(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """CPU-portable reference for the BF16-storage dense SwiGLU fixture.
+
+    The captured module intentionally uses ``torch.mm(..., out_dtype=FP32)`` to
+    describe the device accumulation contract, but that overload is not
+    available in every CPU Torch build used by the device harness. Compute the
+    same accumulation explicitly in FP32 and preserve the BF16 activation
+    boundary before the down projection.
+    """
+
+    value = args[0].float()
+    gate_weight = module.get_parameter("gate_weight")
+    up_weight = module.get_parameter("up_weight")
+    down_weight = module.get_parameter("down_weight")
+    gate = torch.mm(value, gate_weight.float())
+    up = torch.mm(value, up_weight.float())
+    activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
+        torch.bfloat16
+    )
+    return torch.mm(activation.float(), down_weight.float())
+
+
 def _rms_args(seed: int) -> tuple[torch.Tensor, ...]:
     generator = _generator(seed)
     value = torch.randn((512, 512), generator=generator) * 0.5
@@ -497,6 +522,7 @@ MIXED_CASES = (
         _random_bf16_args((128, 64)),
         rtol=2.0e-2,
         atol=2.0e-2,
+        reference=_dense_swiglu_reference,
     ),
     SiliconCase(
         "mixed_qk_softmax_pv_residual_96x64x128",

@@ -138,11 +138,18 @@ def test_generated_source_matches_control_and_characterizes_performance(
     expected = _reference(comparison, module, args)
     generated_output = torch.full_like(expected, torch.nan)
     control_output = torch.full_like(expected, torch.nan)
-    config = runtime.RunConfig(
+    generated_config = runtime.RunConfig(
         platform=os.environ.get("PTO_FUSEBOX_PLATFORM", "a2a3"),
         device_id=_device_id(),
         save_kernels=True,
-        save_kernels_dir=str(tmp_path),
+        save_kernels_dir=str(tmp_path / "generated"),
+        dump_passes=False,
+    )
+    control_config = runtime.RunConfig(
+        platform=os.environ.get("PTO_FUSEBOX_PLATFORM", "a2a3"),
+        device_id=_device_id(),
+        save_kernels=True,
+        save_kernels_dir=str(tmp_path / "control"),
         dump_passes=False,
     )
 
@@ -150,13 +157,13 @@ def test_generated_source_matches_control_and_characterizes_performance(
         generated_program,
         *generated_args,
         generated_output,
-        config=config,
+        config=generated_config,
     )
     control_compiled = runtime.run(
         control_program,
         *control_args,
         control_output,
-        config=config,
+        config=control_config,
     )
     torch.testing.assert_close(
         generated_output, expected, rtol=comparison.rtol, atol=comparison.atol
@@ -179,28 +186,28 @@ def test_generated_source_matches_control_and_characterizes_performance(
         generated_dispatch,
         rounds=rounds,
         warmup=warmup,
-        config=config,
+        config=generated_config,
     )
     control_second = runtime.benchmark(
         control_compiled,
         control_dispatch,
         rounds=rounds,
         warmup=warmup,
-        config=config,
+        config=control_config,
     )
     control_first = runtime.benchmark(
         control_compiled,
         control_dispatch,
         rounds=rounds,
         warmup=warmup,
-        config=config,
+        config=control_config,
     )
     generated_second = runtime.benchmark(
         generated_compiled,
         generated_dispatch,
         rounds=rounds,
         warmup=warmup,
-        config=config,
+        config=generated_config,
     )
     generated_samples = generated_first.device_wall_us + generated_second.device_wall_us
     control_samples = control_first.device_wall_us + control_second.device_wall_us
