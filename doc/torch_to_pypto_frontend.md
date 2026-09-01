@@ -819,10 +819,13 @@ and boundary semantics; model or function names must never affect planning.
    durable numerical contract remains `rtol = atol = 1e-2`: five frozen seeds
    happened to be bit-identical, but independent schedules are not required to
    retain an identical FP32 accumulation order across compiler revisions.
-4. **Qwen layer with paged attention kept opaque.** Preserve the CANN
-   `pl.jit.extern` attention call and its cache metadata interface. Schedule
-   the QKV preprocessing and MLP sides as independent Fusebox regions and
-   verify that generated source preserves every crossing value and dependency.
+4. **Qwen layer around native PyPTO paged attention.** Preserve the existing
+   native PyPTO orchestration, block-table gathers, cache updates, and metadata
+   interface. Schedule the affine QKV preprocessing and MLP sides as independent
+   Fusebox regions and verify that generated source preserves every crossing
+   value and dependency. The dense QK/softmax/PV stack inside the native kernel
+   is a separate comparison target, but its block-table gather remains a native
+   boundary rather than being reconstructed by Fusebox.
    `emit_pypto_static_bundle` now returns deterministic static callables plus a
    graph-linked manifest of the native-operation complement. The reduced
    paged-attention fixture emits
@@ -848,6 +851,60 @@ and boundary semantics; model or function names must never affect planning.
    opaque. The reduced fixture now emits a router-matmul callable and a
    two-step expert callable while preserving TopK, reshape, and index-select as
    three native-orchestration boundaries.
+7. **DeepSeek hyper-connection transforms.** Cover `hc_pre`, `hc_post`, and
+   `hc_head` as ordinary reduction, pointwise, and matmul DAGs. The test surface
+   must include the 4-stream mixing geometry, Sinkhorn loop boundary, split-K
+   projection, and decode/prefill row tails without recognizing a
+   hyper-connection pattern.
+8. **DeepSeek QKV/LoRA projection and output projection.** Capture the static
+   projection, RMSNorm, dequantization, and RoPE-affine regions around native
+   cache addressing. Compare Flash and Pro contraction dimensions separately;
+   context compression, index selection, and cache lookup remain native
+   boundaries.
+9. **DeepSeek compressor and indexer dense regions.** Schedule the ratio-4 and
+   ratio-128 compressor projections plus the affine indexer projections. Keep
+   TopK and indirect cache gathers opaque, and compare the resulting callables
+   at the native compressed-block and index-head dimensions.
+10. **DeepSeek shared and routed expert compute.** Schedule the per-token
+    quantization and local matmul/SwiGLU/matmul DAGs after routing. Native PyPTO
+    continues to own TopK, expert dispatch, collectives, and variable receive
+    counts. The campaign varies the valid expert-local row count and routing
+    skew inside one fixed physical receive frame.
+11. **DSpark drafter projection and Markov head.** Cover the three-hidden-state
+    projection/RMSNorm and the affine Markov logits projection. Embedding lookup
+    stays an indirect boundary, while token/CP gathers and TP publication remain
+    native orchestration. This target supplies the production 512-row static
+    regime that is absent from the MTP deployment point.
+12. **Model output heads.** Compare Qwen's full 152,064-column LM head and the
+    DeepSeek 129,280-column TP-sharded head with their native implementations.
+    Sampling and real-vocabulary masking remain native boundaries. This surface
+    is also the main discriminator for grid choices that trade weight reuse
+    against activation reloads.
+
+### Production shape matrix
+
+Production coverage varies the dimensions that change scheduling decisions;
+it does not generate arbitrary scaled copies of model kernels. A public batch
+larger than a kernel's physical row frame is primarily an orchestration test,
+whereas a different hidden size, context stack, expert occupancy, or output
+width is a distinct static-planning problem.
+
+| Surface | Static physical shapes | Runtime/tail controls | Scheduling question |
+| --- | --- | --- | --- |
+| Qwen decode vector/MLP/head | 16-row frame; hidden 5,120; MLP 17,408; padded vocab 152,064 | valid rows 1, 8, 15, 16; batches 17 and 32 as two orchestration windows | underfill versus weight reuse; no new kernel geometry above 16 rows |
+| Qwen prefill vector/MLP | 128-row token tile with 256-wide inner activation chunks | valid rows 1, 127, 128 and a multi-tile packed prompt | pipeline fill/drain and ragged final token tile |
+| Qwen paged attention | 5 query heads per KV head; head dim 128; 128-token pages; 512-token compute stacks | context lengths 127, 128, 129, 511, 512, 513, 3,584, and 4,096; active batch 1, 8, 16 | page and stack tails, online-softmax streaming, and task-grid occupancy |
+| DeepSeek V4-Flash MTP | decode `T=8`; prefill tile `T=128`; hidden 4,096; head dim 512; MLP 2,048 | valid decode/prefill tails and repeated 128-token prefill tiles | quantize/project/dequant composition and mixed-pipeline amortization |
+| DeepSeek V4-Pro | decode `T=8`; hidden 7,168; head dim 512; MLP 3,072; 384 experts; index TopK 1,024 | structural capture first; A5 performance only after calibration | transfer of plans across larger K/N and expert dimensions |
+| DeepSeek DSpark | decode/prefill `T=512`; main projection K=12,288; 32-token pages | CP-owned row partitions and page/context tails stay in orchestration | wide-row occupancy, retained operands, and drafter/output-head grids |
+| DeepSeek expert-local compute | fixed receive frame with 16-row matmul tiles | valid rows 0, 1, 15, 16, 17, nominal balanced occupancy, and a skewed hot expert | whether the selected plan remains good under sparse and imbalanced routing |
+| Output heads | Qwen 152,064 x 5,120; DeepSeek 129,280 x {4,096, 7,168}, with native TP shards | partial active rows and real-vocabulary masking outside the callable | activation reloads, weight reuse, spatial grid, and outer-K choice |
+
+The context-length and public-batch sweeps deliberately separate static-kernel
+questions from orchestration questions. Fusebox plans one fixed physical frame;
+native PyPTO supplies the runtime logical extent, repeats frames, owns paged
+metadata, and dispatches static callable families when more than one physical
+schedule is required.
 
 For every target, record four independent outcomes:
 
