@@ -773,6 +773,7 @@ def _force_one_way_mixed_groups(
 
 
 def _run_case(case: SiliconCase, tmp_path: Path) -> None:
+    ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
     runtime = importlib.import_module("pypto.runtime")
 
@@ -813,7 +814,8 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     seed_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_SEEDS", "5"))
     assert seed_count > 0
 
-    compiled = None
+    compiled = ir.compile(program, **config.compile_kwargs())
+    _assert_static_artifact(compiled, case, plan)
     for seed in range(seed_count):
         args = case.make_args(seed)
         runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
@@ -824,17 +826,12 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
                 else case.reference(case.module, args)
             )
         output = torch.full_like(expected, torch.nan)
-        if compiled is None:
-            compiled = runtime.run(program, *runtime_args, output, config=config)
-            _assert_static_artifact(compiled, case, plan)
-        else:
-            compiled(*runtime_args, output, config=config)
+        compiled(*runtime_args, output, config=config)
         _assert_numerics(case, seed, output, expected)
 
     repeat_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_REPEATS", "1"))
     assert repeat_count > 0
     if repeat_count > 1:
-        assert compiled is not None
         args = case.make_args(0)
         runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():

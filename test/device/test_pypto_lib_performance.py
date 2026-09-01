@@ -10,8 +10,21 @@ from pathlib import Path
 
 import pytest
 import torch
-from examples.torch_frontend.static_mixed import build_examples
-from pypto_lib_static_controls import attention_source, dense_swiglu_source
+from examples.torch_frontend.deepseek_v4 import (
+    build_examples as build_deepseek_examples,
+)
+from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
+from examples.torch_frontend.static_mixed import (
+    build_examples as build_static_mixed_examples,
+)
+from pypto_lib_static_controls import (
+    attention_source,
+    deepseek_mtp_unfused_source,
+    dense_swiglu_source,
+    qwen_lm_head_source,
+    qwen_rms_lm_head_source,
+    qwen_rms_norm_source,
+)
 from torch import nn
 
 from pto_fusebox import (
@@ -31,28 +44,81 @@ if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
 @dataclass(frozen=True)
 class Comparison:
     name: str
+    family: str
     example_name: str
     control_source: str
     rtol: float
     atol: float
+    control_kind: str
+    bit_exact: bool = True
 
 
 COMPARISONS = (
     Comparison(
         "static_attention",
+        "static_mixed",
         "pypto_lib_static_attention",
         attention_source(),
         1.0e-4,
         1.0e-4,
+        "pypto_lib_style",
     ),
     Comparison(
         "dense_swiglu",
+        "static_mixed",
         "pypto_lib_static_dense_swiglu",
         dense_swiglu_source(),
         2.0e-2,
         2.0e-2,
+        "pypto_lib_style",
+    ),
+    Comparison(
+        "qwen_rms_norm",
+        "qwen",
+        "qwen3_rms_norm_chunk",
+        qwen_rms_norm_source(),
+        1.0e-2,
+        1.0e-2,
+        "pypto_lib_reduced",
+    ),
+    Comparison(
+        "qwen_lm_head",
+        "qwen",
+        "qwen3_lm_head_chunk",
+        qwen_lm_head_source(),
+        2.0e-2,
+        2.0e-2,
+        "pypto_lib_reduced",
+    ),
+    Comparison(
+        "qwen_rms_lm_head",
+        "qwen",
+        "qwen3_rms_lm_head",
+        qwen_rms_lm_head_source(),
+        2.0e-2,
+        2.0e-2,
+        "pypto_lib_reduced",
+    ),
+    Comparison(
+        "deepseek_mtp_projection",
+        "deepseek",
+        "deepseek_v4_mtp_projection",
+        deepseek_mtp_unfused_source(),
+        1.0e-2,
+        1.0e-2,
+        "independent_unfused",
+        bit_exact=False,
     ),
 )
+
+
+def _example(comparison: Comparison) -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
+    builders = {
+        "static_mixed": build_static_mixed_examples,
+        "qwen": build_qwen_examples,
+        "deepseek": build_deepseek_examples,
+    }
+    return builders[comparison.family]()[comparison.example_name]
 
 
 def _solver() -> Path:
@@ -83,16 +149,56 @@ def _reference(
     if comparison.name == "static_attention":
         with torch.no_grad():
             return module(*args)
-    value = args[0].float()
-    gate_weight = module.get_parameter("gate_weight")
-    up_weight = module.get_parameter("up_weight")
-    down_weight = module.get_parameter("down_weight")
-    gate = torch.mm(value, gate_weight.float())
-    up = torch.mm(value, up_weight.float())
-    activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
-        torch.bfloat16
-    )
-    return torch.mm(activation.float(), down_weight.float())
+    if comparison.name == "dense_swiglu":
+        value = args[0].float()
+        gate_weight = module.get_parameter("gate_weight")
+        up_weight = module.get_parameter("up_weight")
+        down_weight = module.get_parameter("down_weight")
+        gate = torch.mm(value, gate_weight.float())
+        up = torch.mm(value, up_weight.float())
+        activation = (gate * torch.reciprocal(torch.exp(-gate) + 1.0) * up).to(
+            torch.bfloat16
+        )
+        return torch.mm(activation.float(), down_weight.float())
+    if comparison.name.startswith("qwen_"):
+        value = args[0].float()
+        if comparison.name != "qwen_lm_head":
+            gamma = module.get_parameter("norm_weight")
+            inverse_rms = torch.rsqrt(
+                torch.sum(value * value, dim=-1, keepdim=True) * (1.0 / value.shape[-1])
+                + 1.0e-6
+            )
+            value = (value * inverse_rms * gamma).to(torch.bfloat16).float()
+        weight = (
+            module.get_parameter("lm_head_weight")
+            if comparison.name != "qwen_rms_norm"
+            else None
+        )
+        if weight is None:
+            return value.to(torch.bfloat16)
+        return torch.mm(value, weight.float().t())
+    if comparison.name == "deepseek_mtp_projection":
+        hidden = args[0].float()
+        previous = args[1].float()
+        enorm = module.get_parameter("enorm_weight")
+        hnorm = module.get_parameter("hnorm_weight")
+        hidden_inv = torch.rsqrt(
+            torch.sum(hidden * hidden, dim=-1, keepdim=True) / hidden.shape[-1] + 1.0e-6
+        )
+        previous_inv = torch.rsqrt(
+            torch.sum(previous * previous, dim=-1, keepdim=True) / previous.shape[-1]
+            + 1.0e-6
+        )
+        embedded = torch.mm(
+            hidden * hidden_inv * enorm,
+            module.get_parameter("e_proj.weight").float().t(),
+        )
+        history = torch.mm(
+            previous * previous_inv * hnorm,
+            module.get_parameter("h_proj.weight").float().t(),
+        )
+        return embedded + history
+    raise AssertionError(f"missing reference for {comparison.name}")
 
 
 def _control_arguments(
@@ -102,12 +208,33 @@ def _control_arguments(
 ) -> tuple[torch.Tensor, ...]:
     if comparison.name == "static_attention":
         return args
-    return (
-        args[0],
-        module.get_parameter("gate_weight"),
-        module.get_parameter("up_weight"),
-        module.get_parameter("down_weight"),
-    )
+    if comparison.name == "dense_swiglu":
+        return (
+            args[0],
+            module.get_parameter("gate_weight"),
+            module.get_parameter("up_weight"),
+            module.get_parameter("down_weight"),
+        )
+    if comparison.name == "qwen_rms_norm":
+        return args[0], module.get_parameter("norm_weight")
+    if comparison.name == "qwen_lm_head":
+        return args[0], module.get_parameter("lm_head_weight")
+    if comparison.name == "qwen_rms_lm_head":
+        return (
+            args[0],
+            module.get_parameter("norm_weight"),
+            module.get_parameter("lm_head_weight"),
+        )
+    if comparison.name == "deepseek_mtp_projection":
+        return (
+            args[0],
+            module.get_parameter("enorm_weight"),
+            module.get_parameter("e_proj.weight"),
+            args[1],
+            module.get_parameter("hnorm_weight"),
+            module.get_parameter("h_proj.weight"),
+        )
+    raise AssertionError(f"missing control arguments for {comparison.name}")
 
 
 @pytest.mark.parametrize("comparison", COMPARISONS, ids=lambda item: item.name)
@@ -115,9 +242,10 @@ def test_generated_source_matches_control_and_characterizes_performance(
     comparison: Comparison,
     tmp_path: Path,
 ) -> None:
+    ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
     runtime = importlib.import_module("pypto.runtime")
-    module, args = build_examples()[comparison.example_name]
+    module, args = _example(comparison)
     graph = export_and_normalize(module, args)
     solved = solve_graph(
         graph,
@@ -153,25 +281,27 @@ def test_generated_source_matches_control_and_characterizes_performance(
         dump_passes=False,
     )
 
-    generated_compiled = runtime.run(
-        generated_program,
-        *generated_args,
-        generated_output,
-        config=generated_config,
+    generated_compiled = ir.compile(
+        generated_program, **generated_config.compile_kwargs()
     )
-    control_compiled = runtime.run(
-        control_program,
-        *control_args,
-        control_output,
-        config=control_config,
-    )
+    control_compiled = ir.compile(control_program, **control_config.compile_kwargs())
+    generated_compiled(*generated_args, generated_output, config=generated_config)
+    control_compiled(*control_args, control_output, config=control_config)
     torch.testing.assert_close(
         generated_output, expected, rtol=comparison.rtol, atol=comparison.atol
     )
     torch.testing.assert_close(
         control_output, expected, rtol=comparison.rtol, atol=comparison.atol
     )
-    assert torch.equal(generated_output, control_output)
+    if comparison.bit_exact:
+        assert torch.equal(generated_output, control_output)
+    else:
+        torch.testing.assert_close(
+            generated_output,
+            control_output,
+            rtol=comparison.rtol,
+            atol=comparison.atol,
+        )
 
     # These are characterization samples, not a performance acceptance gate.
     # The device campaign reports order strata and uncertainty before any
@@ -218,5 +348,6 @@ def test_generated_source_matches_control_and_characterizes_performance(
     print(
         f"{comparison.name}: control/generated device_wall ratio={ratio:.6f}; "
         f"generated={statistics.median(generated_samples):.6f}us; "
-        f"control={statistics.median(control_samples):.6f}us"
+        f"control={statistics.median(control_samples):.6f}us; "
+        f"control_kind={comparison.control_kind}"
     )
