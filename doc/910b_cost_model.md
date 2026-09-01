@@ -267,6 +267,29 @@ Host coverage includes:
 - Torch numerics and PTOAS-backed default-stack lowering, including a 192 KiB BF16 intermediate,
   explicit FP32 accumulation/narrowing, and FP32-chain decline.
 
+The reduced Qwen LM-head comparison provides one exact traffic discriminator
+and a spatial-grid ranking lead. For `[16,512] @ [512,192]`, the selected
+`p1_q6_s1` plan emits
+six 32-column work units. Both it and the one-block control read 196,608 bytes
+of BF16 weights. The selected grid additionally reloads the complete 16x512
+BF16 activation in every work unit: 98,304 bytes instead of 16,384, an exact
+81,920-byte difference. Emitted PTO and the loop-aware traffic audit agree with
+the model's byte multiplicity; this is not an accounting defect.
+
+The model assigns 11,128 cycles to the generated `p1_q6_s1` plan and 14,841
+cycles to its `p1_q1_s1` candidate, while the generated kernel and the
+hand-written one-block control receive an aggregate tie classification at
+roughly 29.6 microseconds. Device 4's interval includes parity; device 5
+resolves about 0.7% in favor of the control. This does not isolate the spatial
+grid: the generated plan replays explicit 160+160+160+32 K windows and
+32-column output tiles, whereas the high-level control lets PyPTO choose a
+64-wide L0 K loop over the full 192-column output. Therefore treat the result
+as a model-quality lead, not proof that a particular active-pipe or
+per-work-unit term is wrong. Do not remove the reload charge or fit a
+coefficient from this pair. A future forced-candidate experiment should compare
+`q={1,2,3,4,6}` with comparable child plans, then validate any selected
+occupancy/dispatch term on held-out shapes.
+
 Before device ranking is trusted, complete:
 
 1. implement variable-shape non-uniform multi-op grids; lone split=1 ceil+clamp is complete;

@@ -8,6 +8,15 @@ The first frontend milestone is implemented. PTO-Fusebox can capture a
 boundaries, extract statically schedulable regions, lower them into a versioned
 solver problem, and invoke an already-built C++ solver.
 
+The first reduced PyPTO-lib matrix of standalone generated programs is
+silicon-closed on two Ascend 910B2 devices through a published current-main
+integration lane. All six generated and control pairs are correct. Generated
+attention, dense SwiGLU, Qwen RMSNorm, connected Qwen RMSNorm-to-LM-head, and
+reduced unquantized DeepSeek MTP are faster by 1.093x, 1.098x, 1.050x, 1.143x,
+and 1.046x respectively; standalone Qwen LM-head ties. These are matching
+static-region comparisons, not imported-callable, end-to-end model, or ordinary
+upstream-main closure.
+
 The implemented reader is currently **static-shape only for scheduling**.
 Symbolic tensor dimensions and bounds are retained in the normalized graph so
 capture remains faithful and future extensions have a stable boundary, but no
@@ -756,13 +765,18 @@ The remaining source capabilities are ordered by contract complexity:
    serialized plan. Continue failing closed until that contract exists.
 5. Preserve unsupported nodes as explicit graph cuts and verify every value
    crossing those boundaries.
-6. Ground and compose the new callable ABI. A single homogeneous vector step
-   can now receive a runtime logical row extent over one fixed planned physical
-   frame; cube, mixed, multi-step, and non-row variation fail closed. Next,
-   compare the generated Qwen RMSNorm/LM-head, attention, and dense-SwiGLU
-   callables with same-shape PyPTO-lib-derived controls and compose independently
-   emitted regions under native PyPTO orchestration. Keep Types 2-5 in
-   orchestration and outside Fusebox planning.
+6. Ground and compose the callable ABI. A single homogeneous vector step can
+   receive a runtime logical row extent over one fixed planned physical frame;
+   cube, mixed, multi-step, and non-row variation fail closed. Same-shape
+   standalone generated-program comparisons for Qwen RMSNorm/LM-head,
+   attention, and dense SwiGLU are silicon-closed. With the proposed PyPTO
+   external-inline parameter-lineage repair, separately generated Qwen RMSNorm
+   and LM-head callables compile together inside one native orchestration
+   program, with the native program owning their GM intermediate and submission
+   order. This imported-callable path is a host integration result, not
+   ordinary-main or silicon closure. Next, apply that import boundary to a
+   selected pypto-lib model entry point. Keep Types 2-5 in orchestration and
+   outside Fusebox planning.
 
 ## PyPTO-lib validation targets
 
@@ -782,14 +796,17 @@ and boundary semantics; model or function names must never affect planning.
    choose a different source-ready plan. The RMSNorm callable carries
    the first runtime-valid-row ABI. The LM-head callable preserves the
    production `[VOCAB, HIDDEN]` weight layout through a zero-copy
-   `pl.tile.transpose_view`. Silicon comparison with
-   `models/qwen3_14b/rms_lm_head.py` remains outstanding.
+   `pl.tile.transpose_view`. Silicon correctness is closed for both components.
+   Against reduced native controls, RMSNorm is 1.050x faster and LM-head ties.
+   The LM-head result has a precise model-quality follow-up: its six-block plan
+   reloads the 16x512 BF16 activation six times, moving 81,920 more GM-load
+   bytes than the one-block control, even though weight traffic is identical.
 2. **Qwen RMSNorm to LM head.** The connected graph now solves and emits as one
    generic `V -> C` region: three active groups, one 16x512 BF16 V2C FIFO, and
    no model-specific recognizer. The generated callable is compiled inside
    native orchestration by the opt-in integration suite. Silicon correctness
-   and performance comparison with `models/qwen3_14b/rms_lm_head.py` remain
-   outstanding.
+   is closed and the connected generated region is 1.143x faster than the
+   reduced native two-task control with its GM normalization intermediate.
 3. **DeepSeek V4-Flash MTP projection at fixed token extents.** Cover the two
    normalizations, activation quantization, two projections, and their sum
    without recognizing an MTP pattern. Start with concrete decode and prefill
@@ -797,7 +814,11 @@ and boundary semantics; model or function names must never affect planning.
    three dependency-ordered steps (`mixed V -> C`, vector, `mixed C -> V`) and
    two explicit GM intermediates. Production INT8 activation quantization and
    dequantization remain outside this fixture and require ordinary normalized
-   cast/scale operations rather than an MTP recognizer.
+   cast/scale operations rather than an MTP recognizer. The generated reduced
+   composition is 1.046x faster than its independent unfused baseline. The
+   durable numerical contract remains `rtol = atol = 1e-2`: five frozen seeds
+   happened to be bit-identical, but independent schedules are not required to
+   retain an identical FP32 accumulation order across compiler revisions.
 4. **Qwen layer with paged attention kept opaque.** Preserve the CANN
    `pl.jit.extern` attention call and its cache metadata interface. Schedule
    the QKV preprocessing and MLP sides as independent Fusebox regions and
@@ -817,8 +838,9 @@ and boundary semantics; model or function names must never affect planning.
    as imports inside independent native PyPTO orchestration by the opt-in
    integration suite. A checked-in silicon test compares each generated kernel
    with an independently tiled PyPTO-lib-style control in balanced order using
-   PyPTO's register-once `device_wall` benchmark; results remain device-eval
-   pending.
+   PyPTO's register-once `device_wall` benchmark. Both comparisons are
+   silicon-closed and reproduce their earlier performance pattern at 1.093x
+   and 1.098x faster respectively.
 6. **DeepSeek MoE cut at data-dependent routing.** Schedule the dense
    normalization/router prefix and the bounded expert-local
    matmul/SwiGLU/matmul computation separately. Keep TopK, token-to-expert

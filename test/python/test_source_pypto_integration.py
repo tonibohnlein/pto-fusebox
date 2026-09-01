@@ -438,6 +438,102 @@ def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
     assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
 
 
+def test_separate_qwen_callables_compose_in_native_orchestration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native orchestration owns the GM cut between two generated regions."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    examples = build_qwen_examples()
+    emitted_by_name: dict[str, EmittedPyPTOCallable] = {}
+    for name in ("qwen3_rms_norm_chunk", "qwen3_lm_head_chunk"):
+        module, args = examples[name]
+        graph = export_and_normalize(module, args)
+        solved = solve_graph(
+            graph,
+            solver_binary=_solver(),
+            solver_workers=2,
+            require_source_codegen=True,
+        )
+        emitted_by_name[name] = emit_pypto_callable(
+            graph,
+            solved.regions[0],
+            function_name=f"generated_{name}",
+        )
+
+    module_names: dict[str, str] = {}
+    for name, emitted in emitted_by_name.items():
+        module_name = re.sub(r"\W", "_", f"generated_{name}_{tmp_path.name}")
+        module_names[name] = module_name
+        (tmp_path / f"{module_name}.py").write_text(emitted.source, encoding="utf-8")
+
+    caller = f"""\
+from {module_names["qwen3_rms_norm_chunk"]} import generated_qwen3_rms_norm_chunk
+from {module_names["qwen3_lm_head_chunk"]} import generated_qwen3_lm_head_chunk
+import pypto.language as pl
+
+
+@pl.program
+class NativeQwenRmsLmHead:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        hidden_states: pl.Tensor[[16, 512], pl.BF16],
+        norm_weight: pl.Tensor[[1, 512], pl.FP32],
+        lm_head_weight: pl.Tensor[[192, 512], pl.BF16],
+        output: pl.Out[pl.Tensor[[16, 192], pl.FP32]],
+    ) -> pl.Tensor[[16, 192], pl.FP32]:
+        normalized = pl.create_tensor([16, 512], dtype=pl.BF16)
+        normalized = generated_qwen3_rms_norm_chunk(
+            hidden_states, norm_weight, normalized
+        )
+        output = generated_qwen3_lm_head_chunk(
+            lm_head_weight, normalized, output
+        )
+        return output
+"""
+    caller_path = tmp_path / "native_qwen_rms_lm_head.py"
+    caller_path.write_text(caller, encoding="utf-8")
+
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / "native_qwen_rms_lm_head"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 2
+    assert len(orchestration_files) == 1
+    orchestration = orchestration_files[0].read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_aiv_task(") == 1
+    assert orchestration.count("rt_submit_aic_task(") == 1
+    assert orchestration.index("rt_submit_aiv_task(") < orchestration.index(
+        "rt_submit_aic_task("
+    )
+    produced = re.findall(r"params_t0\.add_output\(([^)]+)\);", orchestration)
+    consumed = re.findall(r"params_t1\.add_input\(([^)]+)\);", orchestration)
+    aliases = dict(re.findall(r"TaskTensor\s+(\w+)\s*=\s*(\w+);", orchestration))
+
+    def root_name(name: str) -> str:
+        seen: set[str] = set()
+        while name in aliases:
+            assert name not in seen, f"cyclic orchestration alias at {name}"
+            seen.add(name)
+            name = aliases[name]
+        return name
+
+    assert len(produced) == 1
+    assert sum(root_name(name) == produced[0] for name in consumed) == 1
+    assert "params_t1.add_output(ext_output);" in orchestration
+    assert "params_t1.add_inout(" not in orchestration
+
+
 def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

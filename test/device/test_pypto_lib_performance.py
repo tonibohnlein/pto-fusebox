@@ -107,6 +107,9 @@ COMPARISONS = (
         1.0e-2,
         1.0e-2,
         "independent_unfused",
+        # Five frozen silicon seeds happened to be bit-identical, but the
+        # independent schedules are allowed to change FP32 accumulation order
+        # across compiler revisions. Keep the durable contract tolerance-based.
         bit_exact=False,
     ),
 )

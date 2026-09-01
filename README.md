@@ -187,11 +187,24 @@ generic `C -> V -> C`, dense `C,C -> V -> C`, and sequential
 PyPTO still owns AIC/AIV outlining and pipeline lowering. Until the required
 generic PyPTO changes land upstream, the compatibility lane is recent PyPTO
 `main` composed without manual edits with the split-AIV FIFO-lane and
-nested-accumulator repairs. The callable integration surface covers multi-step
-cube, single-sink split-K, mixed attention, and dense SwiGLU inside independent
-native orchestration. Current-main runtime-valid and PyPTO-lib comparison
-silicon revalidation is in progress; historical evidence is not presented as
-current-main closure.
+nested-accumulator repairs. The standalone generated-program validation surface
+covers multi-step cube, single-sink split-K, mixed attention, and dense SwiGLU.
+A six-case two-device campaign on the published current-main integration lane
+closed correctness for every standalone generated/control pair. Against reduced
+PyPTO-lib-derived controls,
+generated attention, dense SwiGLU, Qwen RMSNorm, and connected Qwen
+RMSNorm-to-LM-head were respectively 1.093x, 1.098x, 1.050x, and 1.143x
+faster; standalone Qwen LM-head tied. The reduced unquantized DeepSeek MTP
+composition was 1.046x faster than its independent unfused baseline. This is
+integration-lane evidence, not upstream-main closure: the split-AIV and
+nested-accumulator repairs remain external to upstream main. Separately, host
+integration composes independently generated Qwen RMSNorm and LM-head callables
+under one native orchestration program when paired with the proposed PyPTO
+external inline-parameter-lineage repair; the imported-callable path is not yet
+a silicon or ordinary-main claim. The reduced MTP comparison keeps its committed
+tolerance-based contract even though the five frozen seeds happened to be
+bit-identical; the fixture omits the production kernel's INT8 quantization and
+dequantization stages.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized
