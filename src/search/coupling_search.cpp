@@ -222,6 +222,9 @@ double CoupledPartition::group_cost(size_t g) const {
 }
 
 double CoupledPartition::total_cost() const {
+    if (part.prob->require_source_codegen && part.has_recomputed_ops())
+        return 1e18;
+
     double total = 0;
     for (size_t g = 0; g < part.groups.size(); g++)
         if (part.groups[g].alive)

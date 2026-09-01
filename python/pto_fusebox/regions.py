@@ -185,17 +185,24 @@ def lower_solver_region(
         _allocation_owner(value_id, values, ops) for value_id in region.output_values
     ]
     use_count = {value.id: 0 for value in ordered_values}
+    consumers_by_value: dict[str, list[NormalizedOp]] = {
+        value.id: [] for value in ordered_values
+    }
     for op in compute_ops:
         for value_id in op.inputs:
             use_count[value_id] += 1
+            consumers_by_value[value_id].append(op)
     required_value_set = set(required_value_ids)
     for value in ordered_values:
         if _solver_dtype(value.dtype) != "INT8":
             continue
-        if value.id not in required_value_set or use_count[value.id] != 0:
+        consumers = consumers_by_value[value.id]
+        returned_leaf = value.id in required_value_set and not consumers
+        cube_operand = bool(consumers) and all(op.kind == "matmul" for op in consumers)
+        if not returned_leaf and not cube_operand:
             raise ValueError(
-                "Ascend910B vector scheduling supports INT8 only as an "
-                f"unconsumed returned cast result, got {value.id}"
+                "Ascend910B scheduling supports INT8 only as a cube operand or "
+                f"an unconsumed returned cast result, got {value.id}"
             )
     graph_op_indices: dict[str, list[int]] = {}
     for index, graph_op in enumerate(solver_op_to_graph):
@@ -379,6 +386,7 @@ def _expand_native_casts(
                     inputs=(previous,),
                     outputs=(output_id,),
                     attributes={
+                        **op.attributes,
                         "dtype": dtype,
                         "native_cast_hop": hop,
                         "normalized_op": op.id,

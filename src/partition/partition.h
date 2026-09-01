@@ -139,6 +139,7 @@ struct Partition {
 
     double total_cost() const;
     size_t num_alive()  const;
+    bool has_recomputed_ops() const;
 
     // All alive groups containing op — O(1) via index.
     const std::vector<size_t>& groups_of(size_t op) const {

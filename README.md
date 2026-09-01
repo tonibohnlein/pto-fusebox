@@ -204,7 +204,14 @@ external inline-parameter-lineage repair; the imported-callable path is not yet
 a silicon or ordinary-main claim. The reduced MTP comparison keeps its committed
 tolerance-based contract even though the five frozen seeds happened to be
 bit-identical; the fixture omits the production kernel's INT8 quantization and
-dequantization stages.
+dequantization stages. A separate production Flash-MTP path now normalizes and
+emits those stages generically: RMSNorm/smoothing, row quantization with the
+native rounding chain, INT8 matmul with INT32 accumulation, and FP32
+dequantization. It generates fixed physical decode callables and patches only
+the projection import in a copy of the native decode entry point, leaving all
+dynamic attention, MoE, sampling, and distributed orchestration in PyPTO-lib.
+The production overlay and its 128-row prefill branch are source-ready; device
+compilation and silicon comparison are not yet claimed.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized

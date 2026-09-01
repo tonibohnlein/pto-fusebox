@@ -309,6 +309,14 @@ Partition Partition::trivial(const Problem& prob, const DAG& dag) {
 // ============================================================================
 
 double Partition::total_cost() const {
+    // Standalone PyPTO source assigns each normalized operation to exactly one
+    // launch.  Analytic search may still use overlapping groups to model
+    // recomputation, but a source-oriented partition must materialize a fork
+    // before it can serve consumers in different launches.  Make that
+    // distinction part of candidate selection rather than rejecting the
+    // winning schedule after the solve has completed.
+    if (prob->require_source_codegen && has_recomputed_ops()) return 1e18;
+
     double t = 0;
     for (auto& g : groups) if (g.alive) t += g.cost;
     return t;
@@ -318,6 +326,18 @@ size_t Partition::num_alive() const {
     size_t n = 0;
     for (auto& g : groups) if (g.alive) n++;
     return n;
+}
+
+bool Partition::has_recomputed_ops() const {
+    std::vector<bool> seen(prob->num_ops(), false);
+    for (const auto& group : groups) {
+        if (!group.alive) continue;
+        for (auto op : group.ops) {
+            if (seen[op]) return true;
+            seen[op] = true;
+        }
+    }
+    return false;
 }
 
 bool Partition::is_border_op(size_t op, size_t gi) const {

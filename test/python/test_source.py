@@ -565,6 +565,37 @@ def test_cube_retained_panel_is_sliced_once_outside_output_tile_replay() -> None
     assert source.count("pl.assemble(output,") == 2
 
 
+def test_cube_retained_transposed_rhs_uses_physical_owner_coordinates() -> None:
+    class WideTransposedMatmul(nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            return torch.mm(lhs, rhs.t())
+
+    graph, result = _solve_module(
+        WideTransposedMatmul(),
+        (
+            torch.zeros(512, 64, dtype=torch.bfloat16),
+            torch.zeros(2048, 64, dtype=torch.bfloat16),
+        ),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.matmuls[0].retained_panels.rhs
+
+    source = emit_pypto_region(
+        graph, result, program_name="retained_transposed_rhs"
+    ).source
+
+    ast.parse(source)
+    assert (
+        "matmul_0_rhs_retained = pl.slice(arg_rhs, [256, 64], [region_col, 0 * 64])"
+    ) in source
+    assert (
+        "matmul_0_tile_0_rhs_init = pl.slice(matmul_0_rhs_retained, [256, 16], [0, 0])"
+    ) in source
+    assert "a_trans=False, b_trans=True" in source
+    assert "pl.slice(arg_rhs, [64, 256], [0 * 64, region_col])" not in source
+
+
 def test_general_cube_path_rejects_lowered_l0_capacity_overflow() -> None:
     class WideMatmul(nn.Module):
         def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -1767,7 +1798,9 @@ def test_multi_round_trip_replays_transfer_specific_axes(
     _assert_pypto_main_mixed_scope(source, step.plan)
 
 
-def test_multi_round_trip_final_row_reduction_fails_closed() -> None:
+def test_multi_round_trip_final_row_reduction_emits_as_a_following_vector_step() -> (
+    None
+):
     module = _AttentionRowReduction()
     args = (
         torch.zeros(96, 64),
@@ -1780,7 +1813,11 @@ def test_multi_round_trip_final_row_reduction_fails_closed() -> None:
         KernelKind.MIXED,
         KernelKind.VECTOR,
     ]
-    assert not can_emit_region(graph, analytic)
+    assert can_emit_region(graph, analytic)
+    source = emit_pypto_region(
+        graph, analytic, program_name="attention_row_reduction"
+    ).source
+    ast.parse(source)
 
     solved = solve_graph(
         graph,
@@ -1788,10 +1825,9 @@ def test_multi_round_trip_final_row_reduction_fails_closed() -> None:
         solver_workers=2,
         require_source_codegen=True,
     )
-    assert not solved.regions_solved
-    assert solved.regions[0].diagnostics[-1] == (
-        "source-constrained solver result is not PyPTO-emittable"
-    )
+    assert solved.regions_solved
+    assert solved.regions[0].solution is not None
+    assert can_emit_region(graph, solved.regions[0])
 
 
 def test_column_reduction_round_trip_stops_at_the_static_frontend_boundary() -> None:

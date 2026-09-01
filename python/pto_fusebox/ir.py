@@ -26,8 +26,15 @@ _UNARY_NORMALIZED_OPS = {
     "transpose_view",
     "view",
 }
-_BINARY_NORMALIZED_OPS = {"maximum", "minimum", "matmul"}
-_SCALAR_BINARY_NORMALIZED_OPS = {"add", "div", "mul", "sub"}
+_BINARY_NORMALIZED_OPS = {"matmul"}
+_SCALAR_BINARY_NORMALIZED_OPS = {
+    "add",
+    "div",
+    "maximum",
+    "minimum",
+    "mul",
+    "sub",
+}
 
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]

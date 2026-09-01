@@ -919,7 +919,7 @@ def test_casts_expand_to_native_910b_chains(
     ]
 
 
-def test_int8_is_limited_to_an_unconsumed_returned_cast_result() -> None:
+def test_int8_pointwise_intermediate_is_rejected() -> None:
     class Int8Intermediate(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return value.to(torch.int8).to(torch.float32)
@@ -928,9 +928,62 @@ def test_int8_is_limited_to_an_unconsumed_returned_cast_result() -> None:
     region = extract_solver_regions(graph)[0]
 
     with pytest.raises(
-        ValueError, match="INT8 only as an unconsumed returned cast result"
+        ValueError, match="INT8 only as a cube operand or an unconsumed"
     ):
         region.lower(graph)
+
+
+def test_explicit_row_quantization_and_int8_matmul_lower_generically() -> None:
+    class QuantizedLinear(nn.Module):
+        def forward(
+            self,
+            value: torch.Tensor,
+            scale: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            bounded = torch.clamp_min(
+                torch.amax(torch.abs(value), dim=-1, keepdim=True), 1e-12
+            )
+            quant_scale = torch.reciprocal(bounded) * 127.0 * scale
+            quantized = (
+                torch.round(value * quant_scale)
+                .to(torch.int32)
+                .to(torch.float16)
+                .to(torch.int8)
+            )
+            return torch._int_mm(quantized, weight.t())
+
+    graph = export_and_normalize(
+        QuantizedLinear(),
+        (
+            torch.empty(16, 256, device="meta"),
+            torch.empty(16, 1, device="meta"),
+            torch.empty(256, 256, dtype=torch.int8, device="meta"),
+        ),
+    )
+
+    assert [op.kind for op in graph.ops] == [
+        "abs",
+        "max",
+        "maximum",
+        "div",
+        "mul",
+        "mul",
+        "mul",
+        "cast",
+        "cast",
+        "cast",
+        "transpose_view",
+        "matmul",
+    ]
+    casts = [op for op in graph.ops if op.kind == "cast"]
+    assert [op.attributes["mode"] for op in casts] == ["rint", "round", "trunc"]
+    assert all(op.attributes["explicit_rounding_provenance"] for op in casts)
+    matmul = graph.ops[-1]
+    assert matmul.attributes["source_operator"] == "aten._int_mm.default"
+    assert matmul.attributes["rhs_transposed"] is True
+    lowered = extract_solver_regions(graph)[0].lower(graph)
+    assert lowered.problem["dtypes"][-3:] == ["INT8", "INT8", "INT32"]
 
 
 def test_same_dtype_to_is_alias_unless_copy_is_requested() -> None:

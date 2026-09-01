@@ -2938,6 +2938,21 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         }
       }
     }
+    // The standalone source emitter can replay generic floating-point C->V
+    // epilogues, but it does not yet carry an integer-family vector contract
+    // across a mixed FIFO.  Keep INT8->INT32 matmul followed by dequantization
+    // available to the analytic partitioner while forcing source-oriented
+    // search to cut between the homogeneous cube and vector steps.
+    if (one_way_chain && topology->stages[0].engine == MixedEngine::Cube &&
+        topology->stages[1].engine == MixedEngine::Vector &&
+        topology->stages[0].ops.size() == 1) {
+      const Op& first = prob.ops[topology->stages[0].ops.front()];
+      if (first.inputs.size() == 2 &&
+          (prob.tensors[first.inputs[0]].dtype == DType::INT8 ||
+           prob.tensors[first.inputs[1]].dtype == DType::INT8)) {
+        topology->emit_compatible = false;
+      }
+    }
     // Generic compiler increment 2 is a capability-defined C->V->C round
     // trip.  It is deliberately not an attention/QK/softmax recognizer: one
     // standard matmul produces a rectangular crossing, an arbitrary connected

@@ -568,7 +568,8 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
     def ensure_loaded(tensor_index: int) -> str:
         if tensor_index in local:
             return local[tensor_index]
-        if producers[tensor_index] is not None:
+        producer = producers[tensor_index]
+        if producer is not None and producer in context.step.solver_ops:
             raise SourceEmissionError(
                 f"stream phase uses solver tensor {tensor_index} before its producer"
             )
@@ -1423,7 +1424,10 @@ def _vector_expression(  # noqa: PLR0913 -- arguments are explicit contract fiel
         return f"pl.{unary[op.kind]}({operands[0]})"
     if op.kind == "cast" and len(operands) == 1:
         dtype = pypto_dtype(lowered.tensor(output_tensor).dtype)
-        return f"pl.cast({operands[0]}, target_type={dtype})"
+        mode = op.attributes.get("mode", "none")
+        if mode not in {"none", "rint", "round", "trunc"}:
+            raise SourceEmissionError(f"vector cast {op.id} has invalid mode {mode!r}")
+        return f'pl.cast({operands[0]}, target_type={dtype}, mode="{mode}")'
     if op.kind in {"sum", "max"} and len(operands) == 1:
         if op.attributes.get("axis") != -1 or op.attributes.get("keepdim") is not True:
             raise SourceEmissionError(
@@ -1530,7 +1534,10 @@ def _validate_cast_semantics(graph: NormalizedGraph, lowered: LoweredRegion) -> 
         graph_op = graph_ops.get(graph_op_id)
         if graph_op is None or graph_op.kind != "cast" or len(graph_op.outputs) != 1:
             continue
-        if values[graph_op.outputs[0]].dtype == "int8":
+        if (
+            values[graph_op.outputs[0]].dtype == "int8"
+            and graph_op.attributes.get("explicit_rounding_provenance") is not True
+        ):
             raise SourceEmissionError(
                 "vector source cannot preserve Torch float-to-INT8 truncation "
                 "through the Ascend910B native FP16 conversion path"
@@ -1548,7 +1555,7 @@ def _validate_vector_body_lifetimes(
     position = {solver_op: index for index, solver_op in enumerate(op_order)}
     for solver_op in op_order:
         for argument, tensor in enumerate(lowered.operation(solver_op).inputs):
-            if producers[tensor] is None:
+            if producers[tensor] is None or producers[tensor] not in position:
                 expected.setdefault(tensor, []).append((solver_op, argument))
 
     body = plan.phase(VectorReplayPhase.BODY)

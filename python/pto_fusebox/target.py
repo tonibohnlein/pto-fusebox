@@ -247,11 +247,17 @@ def _matmul_admission_reason(
                 "matmul output geometry does not match its inputs: "
                 f"expected [{lhs_height},{rhs_width}], got [{output_height},{output_width}]"
             )
-    if any(
-        values[value_id].dtype not in {"float16", "bfloat16", "float32"}
-        for value_id in op.inputs
-    ):
+    operand_dtypes = {values[value_id].dtype for value_id in op.inputs}
+    if len(operand_dtypes) != 1 or operand_dtypes - {
+        "float16",
+        "bfloat16",
+        "float32",
+        "int8",
+    }:
         return "unsupported Ascend910B cube operand dtype"
+    operand_dtype = next(iter(operand_dtypes))
+    if operand_dtype == "int8" and values[op.outputs[0]].dtype != "int32":
+        return "Ascend910B int8 matmul requires int32 output"
     return None
 
 
@@ -261,7 +267,7 @@ def _cast_admission_reason(
     dtypes: set[str],
     target: TargetProfile,
 ) -> str | None:
-    if dtypes - {"float16", "bfloat16", "float32", "int8"}:
+    if dtypes - {"float16", "bfloat16", "float32", "int8", "int16", "int32"}:
         return "unsupported Ascend910B cast endpoint dtype"
     source = values[op.inputs[0]].dtype
     destination = values[op.outputs[0]].dtype

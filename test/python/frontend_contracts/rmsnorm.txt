@@ -19,7 +19,7 @@ op op0004 add(v0005)->v0006 supported=1 metadata=0 reason=- attrs={"scalars":[{"
 op op0005 rsqrt(v0006)->v0007 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.rsqrt.default"}
 op op0006 mul(v0002,v0007)->v0008 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.mul.Tensor"}
 op op0007 mul(v0008,v0000)->v0009 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.mul.Tensor"}
-op op0008 cast(v0009)->v0010 supported=1 metadata=0 reason=- attrs={"dtype":"float16","source_operator":"aten.to.dtype"}
+op op0008 cast(v0009)->v0010 supported=1 metadata=0 reason=- attrs={"dtype":"float16","explicit_rounding_provenance":false,"mode":"round","source_operator":"aten.to.dtype"}
 region region0000 ops=op0000,op0001,op0002,op0003,op0004,op0005,op0006,op0007,op0008 inputs=v0001,v0000 outputs=v0010 diagnostics=-
   tensor 0=v0001 FP16[8x64] alias=- synthetic=0
   tensor 1=v0002 FP32[8x64] alias=- synthetic=0

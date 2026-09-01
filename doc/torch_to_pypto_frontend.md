@@ -810,11 +810,22 @@ and boundary semantics; model or function names must never affect planning.
 3. **DeepSeek V4-Flash MTP projection at fixed token extents.** Cover the two
    normalizations, activation quantization, two projections, and their sum
    without recognizing an MTP pattern. Start with concrete decode and prefill
-   token extents. The current unquantized fixture now emits one callable with
+   token extents. The reduced unquantized fixture emits one callable with
    three dependency-ordered steps (`mixed V -> C`, vector, `mixed C -> V`) and
-   two explicit GM intermediates. Production INT8 activation quantization and
-   dequantization remain outside this fixture and require ordinary normalized
-   cast/scale operations rather than an MTP recognizer. The generated reduced
+   two explicit GM intermediates. The production branch is now captured as
+   ordinary RMSNorm, smooth scaling, row `abs/max`, reciprocal scaling,
+   `rint -> FP16 round -> INT8 trunc`, INT8 matmul with an INT32 accumulator,
+   and FP32 dequantization. Source-oriented search materializes the shared
+   quantization scale instead of recomputing normalized operations in several
+   tasks, and emits dependency-ordered vector, cube, and vector callables
+   without an MTP recognizer. The checked decode adapter generates separate
+   16-row hidden and 32-row hyperconnection-history callables, pads or reshapes
+   the native `T=8` inputs, and replaces only the `mtp_projection` import in a
+   copy of the real Flash-MTP decode entry point. Cache, attention, MoE,
+   sampling, and distributed orchestration remain native PyPTO. A 128-row
+   prefill branch is source-ready through the same generic algebra. PyPTO
+   parsing, PTOAS, silicon numerics, and performance for the production overlay
+   remain the next closure campaign. The generated reduced
    composition is 1.046x faster than its independent unfused baseline. The
    durable numerical contract remains `rtol = atol = 1e-2`: five frozen seeds
    happened to be bit-identical, but independent schedules are not required to
@@ -894,7 +905,7 @@ width is a distinct static-planning problem.
 | Qwen decode vector/MLP/head | 16-row frame; hidden 5,120; MLP 17,408; padded vocab 152,064 | valid rows 1, 8, 15, 16; batches 17 and 32 as two orchestration windows | underfill versus weight reuse; no new kernel geometry above 16 rows |
 | Qwen prefill vector/MLP | 128-row token tile with 256-wide inner activation chunks | valid rows 1, 127, 128 and a multi-tile packed prompt | pipeline fill/drain and ragged final token tile |
 | Qwen paged attention | 5 query heads per KV head; head dim 128; 128-token pages; 512-token compute stacks | context lengths 127, 128, 129, 511, 512, 513, 3,584, and 4,096; active batch 1, 8, 16 | page and stack tails, online-softmax streaming, and task-grid occupancy |
-| DeepSeek V4-Flash MTP | decode `T=8`; prefill tile `T=128`; hidden 4,096; head dim 512; MLP 2,048 | valid decode/prefill tails and repeated 128-token prefill tiles | quantize/project/dequant composition and mixed-pipeline amortization |
+| DeepSeek V4-Flash MTP | decode logical `T=8`, hidden linear frame 16 and history rows 32; prefill tile `T=128`; hidden 4,096; head dim 512; MLP 2,048 | native orchestration owns decode padding, valid prefill tails, and repeated 128-token tiles | quantize/project/dequant composition and mixed-pipeline amortization |
 | DeepSeek V4-Pro | decode `T=8`; hidden 7,168; head dim 512; MLP 3,072; 384 experts; index TopK 1,024 | structural capture first; A5 performance only after calibration | transfer of plans across larger K/N and expert dimensions |
 | DeepSeek DSpark | decode/prefill `T=512`; main projection K=12,288; 32-token pages | CP-owned row partitions and page/context tails stay in orchestration | wide-row occupancy, retained operands, and drafter/output-head grids |
 | DeepSeek expert-local compute | fixed receive frame with 16-row matmul tiles | valid rows 0, 1, 15, 16, 17, nominal balanced occupancy, and a skewed hot expert | whether the selected plan remains good under sparse and imbalanced routing |

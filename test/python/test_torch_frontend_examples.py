@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import math
 import os
 from pathlib import Path
@@ -8,7 +9,15 @@ import pytest
 import torch
 from examples.torch_frontend.basic import build_examples as build_basic_examples
 from examples.torch_frontend.deepseek_v4 import (
+    DEEPSEEK_V4_DECODE_TOKENS,
+    DEEPSEEK_V4_HC_MULT,
+    DEEPSEEK_V4_HIDDEN,
+    DEEPSEEK_V4_LINEAR_TOKENS,
+    DEEPSEEK_V4_PREFILL_TOKENS,
     build_examples as build_deepseek_examples,
+    build_production_mtp_history_projection_branch,
+    build_production_mtp_projection_branch,
+    build_production_mtp_prefill_projection_branch,
 )
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
@@ -29,8 +38,10 @@ from examples.torch_frontend.pr2335_vector import (
 from pto_fusebox import (
     KernelKind,
     RuntimeValidShapeSpec,
+    SourceEmissionError,
     can_emit_region,
     emit_pypto_callable,
+    emit_flash_mtp_decode_projection_overlay,
     emit_pypto_region,
     emit_pypto_static_bundle,
     export_and_normalize,
@@ -171,6 +182,172 @@ def test_model_examples_form_one_supported_region(
     regions = extract_solver_regions(graph)
     assert len(regions) == 1
     assert regions[0].op_ids == tuple(op.id for op in graph.ops)
+
+
+def test_deepseek_int8_projection_is_ordinary_supported_algebra() -> None:
+    module, args = build_deepseek_examples()["deepseek_v4_int8_mtp_branch"]
+    graph = export_and_normalize(module, args)
+
+    assert [op.kind for op in graph.ops] == [
+        "cast",
+        "mul",
+        "sum",
+        "mul",
+        "add",
+        "rsqrt",
+        "mul",
+        "mul",
+        "mul",
+        "abs",
+        "max",
+        "maximum",
+        "div",
+        "mul",
+        "mul",
+        "cast",
+        "cast",
+        "cast",
+        "div",
+        "transpose_view",
+        "matmul",
+        "cast",
+        "mul",
+        "mul",
+    ]
+    assert all(op.supported for op in graph.ops)
+    assert [
+        op.attributes.get("mode", "none") for op in graph.ops if op.kind == "cast"
+    ] == ["none", "rint", "round", "trunc", "none"]
+    assert graph.ops[20].attributes["source_operator"] == "aten._int_mm.default"
+    assert len(extract_solver_regions(graph)) == 1
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
+    analytic_module, analytic_args = build_production_mtp_projection_branch()
+    analytic_graph = export_and_normalize(analytic_module, analytic_args)
+    analytic = solve_graph(
+        analytic_graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=False,
+    )
+    assert analytic.successful and not analytic.whole_graph_codegen_ready
+    assert analytic.regions[0].solution is not None
+    analytic_ops = [
+        op for step in analytic.regions[0].solution["steps"] for op in step["ops"]
+    ]
+    assert len(analytic_ops) > len(set(analytic_ops))
+
+    solved = []
+    for builder, rows in (
+        (build_production_mtp_projection_branch, DEEPSEEK_V4_LINEAR_TOKENS),
+        (
+            build_production_mtp_history_projection_branch,
+            DEEPSEEK_V4_DECODE_TOKENS * DEEPSEEK_V4_HC_MULT,
+        ),
+    ):
+        module, args = builder()
+        graph = export_and_normalize(module, args)
+        result = solve_graph(
+            graph,
+            solver_binary=_test_solver(),
+            solver_workers=2,
+            require_source_codegen=True,
+        )
+        assert result.successful and result.whole_graph_codegen_ready
+        assert tuple(graph.value_map()[graph.inputs[0]].shape) == (
+            rows,
+            DEEPSEEK_V4_HIDDEN,
+        )
+        schedule = scheduled_region(result.regions[0])
+        source_ops = [op for step in schedule.steps for op in step.op_order]
+        compute_op_count = sum(not op.metadata_only for op in graph.ops)
+        assert len(source_ops) == len(set(source_ops)) == compute_op_count
+        assert [step.kind for step in schedule.steps] == [
+            KernelKind.VECTOR,
+            KernelKind.VECTOR,
+            KernelKind.VECTOR,
+            KernelKind.CUBE,
+            KernelKind.VECTOR,
+        ]
+        source = emit_pypto_callable(
+            graph,
+            result.regions[0],
+            function_name=f"projection_{rows}",
+        ).source
+        assert "mode='rint'" in source
+        assert "mode='round'" in source
+        assert "mode='trunc'" in source
+        assert "b_trans=True" in source
+        assert "out_dtype=pl.INT32" in source
+        solved.append((graph, result.regions[0]))
+
+    native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
+    overlay = emit_flash_mtp_decode_projection_overlay(
+        solved[0][0],
+        solved[0][1],
+        solved[1][0],
+        solved[1][1],
+        native_decode_source=native,
+    )
+    compile(overlay.source, "<fusebox_mtp_projection>", "exec")
+    assert overlay.source.count("@pl.inline") == 3
+    assert "pl.create_tensor([16, 4096], dtype=pl.BF16)" in overlay.source
+    assert "pl.reshape(prev_hidden_states, [32, 4096])" in overlay.source
+    assert "pl.spmd(128, name_hint='fusebox_mtp_combine')" in overlay.source
+    assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
+    assert overlay.decode_source == (
+        "from mtp_projection import golden_mtp_projection\n"
+        "from fusebox_mtp_projection import mtp_projection\n"
+    )
+    with pytest.raises(SourceEmissionError, match="module name is invalid"):
+        emit_flash_mtp_decode_projection_overlay(
+            solved[0][0],
+            solved[0][1],
+            solved[1][0],
+            solved[1][1],
+            native_decode_source=native,
+            module_name="fusebox-mtp-projection",
+        )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_production_flash_mtp_prefill_branch_is_source_ready() -> None:
+    module, args = build_production_mtp_prefill_projection_branch()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert solved.successful and solved.whole_graph_codegen_ready
+    assert graph.value_map()[graph.inputs[0]].shape == (
+        DEEPSEEK_V4_PREFILL_TOKENS,
+        DEEPSEEK_V4_HIDDEN,
+    )
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.VECTOR,
+        KernelKind.VECTOR,
+        KernelKind.VECTOR,
+        KernelKind.CUBE,
+        KernelKind.VECTOR,
+    ]
+    source = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="fusebox_mtp_prefill_projection",
+    ).source
+    ast.parse(source)
+    assert "b_trans=True" in source
+    assert "out_dtype=pl.INT32" in source
 
 
 @pytest.mark.parametrize(

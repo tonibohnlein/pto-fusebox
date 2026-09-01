@@ -1520,9 +1520,12 @@ def _tensor_vector_expression(
     if op.kind in unary and len(operands) == 1:
         return f"pl.tensor.{op.kind}({operands[0]})"
     if op.kind == "cast" and len(operands) == 1:
+        mode = op.attributes.get("mode", "none")
+        if mode not in {"none", "rint", "round", "trunc"}:
+            raise SourceEmissionError(f"mixed cast {op.id} has invalid mode {mode!r}")
         return (
             f"pl.tensor.cast({operands[0]}, target_type={pypto_dtype(output_dtype)}, "
-            'mode="round")'
+            f'mode="{mode}")'
         )
     if op.kind in {"sum", "max"} and len(operands) == 1:
         if op.attributes.get("axis") != -1 or op.attributes.get("keepdim") is not True:

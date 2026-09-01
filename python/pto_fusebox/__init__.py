@@ -31,6 +31,10 @@ from .ir import (
     ShapeDimension,
 )
 from .normalize import export_and_normalize, normalize_exported
+from .pypto_lib import (
+    FlashMtpProjectionOverlay,
+    emit_flash_mtp_decode_projection_overlay,
+)
 from .regions import SolverRegion, extract_solver_regions
 from .schedule import (
     AxisPartition,
@@ -69,6 +73,7 @@ __all__ = [
     "EmittedPyPTOCallable",
     "EmittedPyPTOStaticBundle",
     "EmittedPyPTOSource",
+    "FlashMtpProjectionOverlay",
     "GraphPattern",
     "GraphPatternBinding",
     "InputBindingError",
@@ -92,6 +97,7 @@ __all__ = [
     "bind_emitted_inputs",
     "export_and_normalize",
     "emit_pypto_callable",
+    "emit_flash_mtp_decode_projection_overlay",
     "emit_pypto_region",
     "emit_pypto_static_bundle",
     "enumerate_cube_plans",

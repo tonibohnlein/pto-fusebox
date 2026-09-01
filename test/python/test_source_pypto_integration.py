@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import copy
 import importlib
+import importlib.util
 import os
 import re
 from dataclasses import replace
@@ -19,6 +20,8 @@ import pytest
 import torch
 from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
+    build_production_mtp_history_projection_branch,
+    build_production_mtp_projection_branch,
 )
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
@@ -33,6 +36,7 @@ from pto_fusebox import (
     RegionSolveResult,
     RuntimeValidShapeSpec,
     emit_pypto_callable,
+    emit_flash_mtp_decode_projection_overlay,
     emit_pypto_region,
     emit_pypto_static_bundle,
     enumerate_cube_plans,
@@ -120,6 +124,60 @@ def test_callable_region_expands_inside_native_orchestration(
     _assert_single_spmd_orchestration(
         orchestration_files[0].read_text(encoding="utf-8"), 8
     )
+
+
+def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated static callables replace only the native projection import."""
+
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    if pypto_lib_root is None:
+        pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+    assert pypto_lib_root is not None
+    model_dir = Path(pypto_lib_root) / "models" / "deepseek_v4_flash_mtp"
+    native_decode = model_dir / "decode_mtp.py"
+    if not native_decode.is_file():
+        pytest.skip("current pypto-lib checkout has no Flash-MTP decode entry point")
+
+    solved_branches = []
+    for builder in (
+        build_production_mtp_projection_branch,
+        build_production_mtp_history_projection_branch,
+    ):
+        module, args = builder()
+        graph = export_and_normalize(module, args)
+        solved = solve_graph(
+            graph,
+            solver_binary=_solver(),
+            solver_workers=2,
+            require_source_codegen=True,
+        )
+        assert solved.successful and solved.whole_graph_codegen_ready
+        solved_branches.append((graph, solved.regions[0]))
+
+    overlay = emit_flash_mtp_decode_projection_overlay(
+        solved_branches[0][0],
+        solved_branches[0][1],
+        solved_branches[1][0],
+        solved_branches[1][1],
+        native_decode_source=native_decode.read_text(encoding="utf-8"),
+    )
+    overlay_path = tmp_path / f"{overlay.module_name}.py"
+    decode_path = tmp_path / "decode_mtp_fusebox.py"
+    overlay_path.write_text(overlay.source, encoding="utf-8")
+    decode_path.write_text(overlay.decode_source, encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(model_dir))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_file_location("decode_mtp_fusebox", decode_path)
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    assert callable(loaded.decode_mtp)
+    assert loaded.mtp_projection is not None
+    assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
 
 
 def _compile_callable_in_native_orchestration(

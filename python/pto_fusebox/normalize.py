@@ -30,6 +30,7 @@ _POINTWISE = {
     "aten.div.Scalar": "div",
     "aten.maximum.default": "maximum",
     "aten.minimum.default": "minimum",
+    "aten.clamp_min.default": "maximum",
     "aten.exp.default": "exp",
     "aten.log.default": "log",
     "aten.abs.default": "abs",
@@ -183,13 +184,21 @@ class _ExportNormalizer:
         if target == "aten.reciprocal.default":
             self._reciprocal(node)
             return
+        if target == "aten.round.default":
+            self._round_for_integer_cast(node)
+            return
         if target in _REDUCTIONS:
             self._reduction(node, _REDUCTIONS[target], target)
             return
         if target == "aten.mean.dim":
             self._mean(node)
             return
-        if target in {"aten.mm.default", "aten.mm.dtype", "aten.matmul.default"}:
+        if target in {
+            "aten.mm.default",
+            "aten.mm.dtype",
+            "aten.matmul.default",
+            "aten._int_mm.default",
+        }:
             self._matmul(node, target)
             return
         if target == "aten.linear.default":
@@ -320,6 +329,43 @@ class _ExportNormalizer:
                 "scalars": [{"position": 0, "value": 1}],
             },
         )
+
+    def _round_for_integer_cast(self, node: Any) -> None:
+        """Fold Torch round into its immediately consuming integer cast.
+
+        PyPTO exposes round-to-nearest through ``pl.cast(..., mode="rint")``
+        rather than as a same-dtype tensor operator.  Retain the input value
+        here and attach the rounding contract when the consuming cast is
+        normalized.  Metadata-only assertion users inserted by ``torch.export``
+        do not change the one semantic-consumer requirement.
+        """
+
+        tensor_inputs = self._tensor_inputs(node.args[:1])
+        if len(tensor_inputs) != 1 or node.kwargs:
+            self._opaque(node, "aten.round.default requires one tensor input")
+            return
+        semantic_users = [
+            user
+            for user in node.users
+            if _target_name(user.target) not in _DROPPED_METADATA
+        ]
+        if len(semantic_users) != 1 or _target_name(semantic_users[0].target) not in {
+            "aten.to.dtype",
+            "aten._to_copy.default",
+        }:
+            self._opaque(
+                node,
+                "aten.round.default is supported only before one explicit integer cast",
+            )
+            return
+        output_meta = _metadata_outputs(semantic_users[0].meta.get("val"))[0]
+        if _dtype_from_meta(output_meta) not in {"int16", "int32"}:
+            self._opaque(
+                node,
+                "aten.round.default consumer must cast to INT16 or INT32",
+            )
+            return
+        self.node_values[node] = tuple(tensor_inputs)
 
     def _mean(self, node: Any) -> None:
         tensor_inputs = self._tensor_inputs(node.args[:1])
@@ -553,15 +599,35 @@ class _ExportNormalizer:
             self._set_producer(output_id, op_id)
             self.node_values[node] = (output_id,)
             return
-        self._single_output_op(
-            node,
-            "cast",
-            tensor_inputs,
-            {
-                "dtype": destination_dtype,
-                "source_operator": target,
-            },
+        explicit_round = (
+            bool(node.args)
+            and hasattr(node.args[0], "target")
+            and _target_name(node.args[0].target) == "aten.round.default"
         )
+        rounding_provenance = explicit_round or _has_explicit_rounding_provenance(
+            node.args[0]
+        )
+        mode = "none"
+        if explicit_round:
+            mode = "rint"
+        elif destination_dtype == "int8":
+            mode = "trunc"
+        elif source.dtype in {"float32", "int16", "int32"} and destination_dtype in {
+            "float16",
+            "bfloat16",
+        }:
+            mode = "round"
+        attributes: dict[str, Any] = {
+            "dtype": destination_dtype,
+            "source_operator": target,
+        }
+        # Keep ordinary casts stable.  The extra provenance is part of the
+        # contract only when lowering must preserve an explicit native
+        # rounding operation (notably the production FP32 -> INT8 chain).
+        if mode != "none":
+            attributes["mode"] = mode
+            attributes["explicit_rounding_provenance"] = rounding_provenance
+        self._single_output_op(node, "cast", tensor_inputs, attributes)
 
     def _view(self, node: Any, target: str, *, transpose: bool) -> None:
         tensor_inputs = self._tensor_inputs(node.args[:1])
@@ -585,6 +651,7 @@ class _ExportNormalizer:
                 "aten.mm.default",
                 "aten.mm.dtype",
                 "aten.matmul.default",
+                "aten._int_mm.default",
             }
             if len(source.shape) != 2 or permutation != [1, 0] or not allowed_user:
                 self._opaque(
@@ -819,6 +886,22 @@ def _target_name(target: Any) -> str:
     if target is operator.getitem:
         return "operator.getitem"
     return str(target)
+
+
+def _has_explicit_rounding_provenance(node: Any) -> bool:
+    """Return whether a chain of explicit casts originates at ``torch.round``."""
+
+    seen: set[Any] = set()
+    current = node
+    while hasattr(current, "target") and current not in seen:
+        seen.add(current)
+        target = _target_name(current.target)
+        if target == "aten.round.default":
+            return True
+        if target not in {"aten.to.dtype", "aten._to_copy.default"} or not current.args:
+            return False
+        current = current.args[0]
+    return False
 
 
 def _input_spec_map(program: Any) -> dict[str, tuple[str, str | None]]:

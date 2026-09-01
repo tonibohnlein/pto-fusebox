@@ -88,9 +88,12 @@ def emit_cube(
         raise SourceEmissionError(
             "cube source v1 requires one L0 output tile per region"
         )
-    if matmul.accumulator_dtype != "fp32" or matmul.storage_dtype != "fp32":
+    if (
+        matmul.accumulator_dtype not in {"fp32", "int32"}
+        or matmul.storage_dtype != matmul.accumulator_dtype
+    ):
         raise SourceEmissionError(
-            "cube source v1 currently supports FP32 accumulation and storage"
+            "cube source v1 requires FP32 or INT32 accumulator-width storage"
         )
 
     m_partition = plan.m_partition
@@ -391,6 +394,7 @@ def _emit_split_cube_zero_seed(
         coordinates.col,
     )
     output_argument = context.interface.output_argument
+    zero_literal = "0" if matmul.storage_dtype == "int32" else "0.0"
     tiles_m, tiles_n = matmul.output_grid
     for tile_m in range(tiles_m):
         local_row = tile_m * matmul.output_tile[0]
@@ -401,7 +405,8 @@ def _emit_split_cube_zero_seed(
             writer.line(
                 indent,
                 f"{output_argument} = pl.assemble({output_argument}, "
-                f"pl.full([{tile_height}, {tile_width}], dtype=pl.FP32, value=0.0), "
+                f"pl.full([{tile_height}, {tile_width}], "
+                f"dtype={pypto_dtype(matmul.storage_dtype)}, value={zero_literal}), "
                 f"[{_add_offset(output_row, local_row)}, "
                 f"{_add_offset(output_col, local_col)}])",
             )
@@ -423,6 +428,9 @@ def _emit_split_cube_output_tile(  # noqa: PLR0913
     output_height: int,
     output_width: int,
     tile_index: int,
+    *,
+    lhs_transposed: bool,
+    rhs_transposed: bool,
 ) -> str:
     """Replay the serialized child-K loop inside every outer L1 window."""
 
@@ -466,31 +474,46 @@ def _emit_split_cube_output_tile(  # noqa: PLR0913
             child_offset = child_index * child_loop.chunk
             k_offset = _add_expression(outer_offset, str(child_offset))
             child_suffix = f"{suffix}_{child_index}"
+            lhs_shape, lhs_offsets = _physical_operand_slice(
+                output_height,
+                child_extent,
+                _add_offset(lhs_row, output_row),
+                _add_expression(lhs_col, k_offset),
+                transposed=lhs_transposed,
+            )
+            rhs_shape, rhs_offsets = _physical_operand_slice(
+                child_extent,
+                output_width,
+                _add_expression(rhs_row, k_offset),
+                _add_offset(rhs_col, output_col),
+                transposed=rhs_transposed,
+            )
             writer.line(
                 level,
                 f"{prefix}_lhs_{child_suffix} = pl.slice({lhs}, "
-                f"[{output_height}, {child_extent}], "
-                f"[{_add_offset(lhs_row, output_row)}, "
-                f"{_add_expression(lhs_col, k_offset)}])",
+                f"[{lhs_shape[0]}, {lhs_shape[1]}], "
+                f"[{lhs_offsets[0]}, {lhs_offsets[1]}])",
             )
             writer.line(
                 level,
                 f"{prefix}_rhs_{child_suffix} = pl.slice({rhs}, "
-                f"[{child_extent}, {output_width}], "
-                f"[{_add_expression(rhs_row, k_offset)}, "
-                f"{_add_offset(rhs_col, output_col)}])",
+                f"[{rhs_shape[0]}, {rhs_shape[1]}], "
+                f"[{rhs_offsets[0]}, {rhs_offsets[1]}])",
             )
             if first_outer and child_index == 0:
                 writer.line(
                     level,
                     f"{accumulator} = pl.matmul({prefix}_lhs_{child_suffix}, "
-                    f"{prefix}_rhs_{child_suffix}, out_dtype=pl.FP32)",
+                    f"{prefix}_rhs_{child_suffix}, "
+                    f"a_trans={lhs_transposed}, b_trans={rhs_transposed}, "
+                    f"out_dtype={pypto_dtype(matmul.accumulator_dtype)})",
                 )
             else:
                 writer.line(
                     level,
                     f"{accumulator} = pl.matmul_acc({accumulator}, "
-                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix})",
+                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix}, "
+                    f"a_trans={lhs_transposed}, b_trans={rhs_transposed})",
                 )
 
         for child_index in range(child_loop.full_chunks):
@@ -638,14 +661,10 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                 f"cube request {matmul.instance} output identity is stale"
             )
         graph_op = graph_ops[operation.graph_op_id]
-        if (
-            graph_op.kind != "matmul"
-            or graph_op.attributes.get("lhs_transposed")
-            or graph_op.attributes.get("rhs_transposed")
-        ):
-            raise SourceEmissionError(
-                "full-window cube DAG source requires non-transposed matmuls"
-            )
+        if graph_op.kind != "matmul":
+            raise SourceEmissionError("full-window cube DAG source requires matmuls")
+        lhs_transposed = graph_op.attributes.get("lhs_transposed") is True
+        rhs_transposed = graph_op.attributes.get("rhs_transposed") is True
         if matmul.instance != request_index:
             raise SourceEmissionError(
                 "cube request instances are not dense and ordered"
@@ -656,11 +675,17 @@ def _emit_cube_dag_body(  # noqa: PLR0913
             )
         if not matmul.output_variants:
             raise SourceEmissionError("cube DAG request omits its output-tile variants")
-        if matmul.accumulator_dtype != "fp32":
-            raise SourceEmissionError("cube DAG source requires FP32 accumulation")
-        if matmul.storage_dtype not in {"fp32", "fp16", "bf16"}:
+        if matmul.accumulator_dtype not in {"fp32", "int32"}:
+            raise SourceEmissionError(
+                "cube DAG source requires FP32 or INT32 accumulation"
+            )
+        if matmul.storage_dtype not in {"fp32", "fp16", "bf16", "int32"}:
             raise SourceEmissionError(
                 f"cube DAG storage dtype {matmul.storage_dtype!r} is unsupported"
+            )
+        if matmul.accumulator_dtype == "int32" and matmul.storage_dtype != "int32":
+            raise SourceEmissionError(
+                "INT32 cube accumulation requires accumulator-width storage"
             )
         _validate_lowered_l0_capacity(context, matmul)
 
@@ -679,6 +704,7 @@ def _emit_cube_dag_body(  # noqa: PLR0913
             producer_by_tensor,
             resident_values,
             split_index,
+            transposed=lhs_transposed,
         )
         rhs, rhs_row, rhs_col = _cube_dag_operand(
             writer,
@@ -695,6 +721,7 @@ def _emit_cube_dag_body(  # noqa: PLR0913
             producer_by_tensor,
             resident_values,
             split_index,
+            transposed=rhs_transposed,
         )
 
         if matmul.retained_panels.lhs:
@@ -707,6 +734,7 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                 lhs_col,
                 matmul.instance,
                 "lhs",
+                transposed=lhs_transposed,
             )
             lhs_row = lhs_col = "0"
         if matmul.retained_panels.rhs:
@@ -719,6 +747,7 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                 rhs_col,
                 matmul.instance,
                 "rhs",
+                transposed=rhs_transposed,
             )
             rhs_row = rhs_col = "0"
 
@@ -793,6 +822,8 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                         tile_height,
                         tile_width,
                         tile_index,
+                        lhs_transposed=lhs_transposed,
+                        rhs_transposed=rhs_transposed,
                     )
                 else:
                     accumulator = _emit_cube_dag_output_tile(
@@ -810,6 +841,8 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                         tile_height,
                         tile_width,
                         tile_index,
+                        lhs_transposed=lhs_transposed,
+                        rhs_transposed=rhs_transposed,
                     )
                 if matmul.is_sink:
                     atomic_suffix = ", atomic=pl.AtomicType.Add" if atomic_sink else ""
@@ -868,6 +901,8 @@ def _cube_dag_operand(  # noqa: PLR0913
     producer_by_tensor: Mapping[int, int],
     resident_values: dict[int, str],
     split_index: str,
+    *,
+    transposed: bool,
 ) -> tuple[str, str, str]:
     if region.tensor in local:
         actual_producer = producer_by_tensor[region.tensor]
@@ -883,10 +918,11 @@ def _cube_dag_operand(  # noqa: PLR0913
     if declared_producer != -1:
         raise SourceEmissionError(f"cube {role} producer result is unavailable")
     tensor = context.lowered.tensor(region.tensor)
-    argument = context.interface.input_arguments.get(tensor.value_id)
+    value_id = tensor.alias_of if tensor.alias_of is not None else tensor.value_id
+    argument = context.interface.input_arguments.get(value_id)
     if argument is None:
         raise SourceEmissionError(
-            f"cube external {role} tensor {tensor.value_id!r} is not a region input"
+            f"cube external {role} tensor {value_id!r} is not a region input"
         )
     row_offset, col_offset = _cube_tensor_region_offsets(
         region,
@@ -908,10 +944,18 @@ def _cube_dag_operand(  # noqa: PLR0913
                 f"cube {role} resident boundary is used before materialization"
             )
         name = f"resident_{resident_boundary}_{role}"
+        physical_shape, physical_offsets = _physical_operand_slice(
+            region.height,
+            region.width,
+            row_offset,
+            col_offset,
+            transposed=transposed,
+        )
         writer.line(
             indent,
-            f"{name} = pl.slice({argument}, [{region.height}, {region.width}], "
-            f"[{row_offset}, {col_offset}])",
+            f"{name} = pl.slice({argument}, "
+            f"[{physical_shape[0]}, {physical_shape[1]}], "
+            f"[{physical_offsets[0]}, {physical_offsets[1]}])",
         )
         resident_values[resident_boundary] = name
     elif resident.first_use == consumer_instance:
@@ -954,6 +998,21 @@ def _cube_tensor_region_offsets(
     )
 
 
+def _physical_operand_slice(
+    logical_height: int,
+    logical_width: int,
+    logical_row: str,
+    logical_col: str,
+    *,
+    transposed: bool,
+) -> tuple[tuple[int, int], tuple[str, str]]:
+    """Map one logical matmul operand region onto its physical owner."""
+
+    if transposed:
+        return (logical_width, logical_height), (logical_col, logical_row)
+    return (logical_height, logical_width), (logical_row, logical_col)
+
+
 def _emit_retained_panel(
     writer: SourceWriter,
     indent: int,
@@ -963,12 +1022,22 @@ def _emit_retained_panel(
     col_offset: str,
     instance: int,
     role: str,
+    *,
+    transposed: bool,
 ) -> str:
     name = f"matmul_{instance}_{role}_retained"
+    physical_shape, physical_offsets = _physical_operand_slice(
+        region.height,
+        region.width,
+        row_offset,
+        col_offset,
+        transposed=transposed,
+    )
     writer.line(
         indent,
-        f"{name} = pl.slice({source}, [{region.height}, {region.width}], "
-        f"[{row_offset}, {col_offset}])",
+        f"{name} = pl.slice({source}, "
+        f"[{physical_shape[0]}, {physical_shape[1]}], "
+        f"[{physical_offsets[0]}, {physical_offsets[1]}])",
     )
     return name
 
@@ -988,6 +1057,9 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
     output_height: int,
     output_width: int,
     tile_index: int,
+    *,
+    lhs_transposed: bool,
+    rhs_transposed: bool,
 ) -> str:
     loop = matmul.k_loop
     if (
@@ -1003,19 +1075,31 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
     prefix = f"matmul_{matmul.instance}_tile_{tile_index}"
 
     def emit_window(level: int, suffix: str, k_offset: str, k_extent: int) -> None:
+        lhs_shape, lhs_offsets = _physical_operand_slice(
+            output_height,
+            k_extent,
+            _add_offset(lhs_row, output_row),
+            _add_expression(lhs_col, k_offset),
+            transposed=lhs_transposed,
+        )
+        rhs_shape, rhs_offsets = _physical_operand_slice(
+            k_extent,
+            output_width,
+            _add_expression(rhs_row, k_offset),
+            _add_offset(rhs_col, output_col),
+            transposed=rhs_transposed,
+        )
         writer.line(
             level,
             f"{prefix}_lhs_{suffix} = pl.slice({lhs}, "
-            f"[{output_height}, {k_extent}], "
-            f"[{_add_offset(lhs_row, output_row)}, "
-            f"{_add_expression(lhs_col, k_offset)}])",
+            f"[{lhs_shape[0]}, {lhs_shape[1]}], "
+            f"[{lhs_offsets[0]}, {lhs_offsets[1]}])",
         )
         writer.line(
             level,
             f"{prefix}_rhs_{suffix} = pl.slice({rhs}, "
-            f"[{k_extent}, {output_width}], "
-            f"[{_add_expression(rhs_row, k_offset)}, "
-            f"{_add_offset(rhs_col, output_col)}])",
+            f"[{rhs_shape[0]}, {rhs_shape[1]}], "
+            f"[{rhs_offsets[0]}, {rhs_offsets[1]}])",
         )
 
     emit_window(indent, "init", "0", loop.chunk)
@@ -1023,7 +1107,8 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
     writer.line(
         indent,
         f"{accumulator} = pl.matmul({prefix}_lhs_init, {prefix}_rhs_init, "
-        "out_dtype=pl.FP32)",
+        f"a_trans={lhs_transposed}, b_trans={rhs_transposed}, "
+        f"out_dtype={pypto_dtype(matmul.accumulator_dtype)})",
     )
     if loop.full_chunks > 1:
         iterator = "pl.pipeline" if loop.pipeline_stages > 1 else "pl.range"
@@ -1041,7 +1126,8 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
         writer.line(
             indent + 1,
             f"{accumulator} = pl.matmul_acc({accumulator}, "
-            f"{prefix}_lhs_rolled, {prefix}_rhs_rolled)",
+            f"{prefix}_lhs_rolled, {prefix}_rhs_rolled, "
+            f"a_trans={lhs_transposed}, b_trans={rhs_transposed})",
         )
     if loop.tail:
         emit_window(
@@ -1053,7 +1139,8 @@ def _emit_cube_dag_output_tile(  # noqa: PLR0913
         writer.line(
             indent,
             f"{accumulator} = pl.matmul_acc({accumulator}, "
-            f"{prefix}_lhs_tail, {prefix}_rhs_tail)",
+            f"{prefix}_lhs_tail, {prefix}_rhs_tail, "
+            f"a_trans={lhs_transposed}, b_trans={rhs_transposed})",
         )
     return accumulator
 
