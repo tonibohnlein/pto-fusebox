@@ -1,8 +1,9 @@
 """Generate static Qwen callables for a native PyPTO orchestration.
 
 This example demonstrates the hybrid authoring contract. ``qwen3.py`` holds
-ordinary Torch definitions of two static tensor regions. Fusebox replaces
-those definitions with scheduled PyPTO callables, while the companion
+one ordinary Torch definition of the complete static output-head DAG. Fusebox
+chooses fusion and cut boundaries for that DAG and emits one scheduled PyPTO
+callable, while the companion
 ``hybrid_qwen_orchestration.py.in`` remains hand-authored PyPTO orchestration.
 Torch is not imported or executed by the generated program.
 """
@@ -26,28 +27,24 @@ from pto_fusebox import (
 from ._runner import Example
 from .qwen3 import build_examples
 
-_RMS_MODULE = "generated_qwen_rms_norm"
-_RMS_FUNCTION = "generated_qwen_rms_norm"
-_LM_HEAD_MODULE = "generated_qwen_lm_head"
-_LM_HEAD_FUNCTION = "generated_qwen_lm_head"
+_OUTPUT_HEAD_MODULE = "generated_qwen_output_head"
+_OUTPUT_HEAD_FUNCTION = "generated_qwen_output_head"
 _ORCHESTRATION_FILE = "native_qwen_output_head.py"
 _TEMPLATE = Path(__file__).with_name("hybrid_qwen_orchestration.py.in")
 
 
 @dataclass(frozen=True)
 class HybridQwenOutputHeadSources:
-    """The two generated modules and their native orchestration caller."""
+    """The generated maximal static callable and its native caller."""
 
-    rms_norm: EmittedPyPTOCallable
-    lm_head: EmittedPyPTOCallable
+    output_head: EmittedPyPTOCallable
     orchestration_source: str
 
     def files(self) -> dict[str, str]:
         """Return the complete source tree keyed by output filename."""
 
         return {
-            f"{_RMS_MODULE}.py": self.rms_norm.source,
-            f"{_LM_HEAD_MODULE}.py": self.lm_head.source,
+            f"{_OUTPUT_HEAD_MODULE}.py": self.output_head.source,
             _ORCHESTRATION_FILE: self.orchestration_source,
         }
 
@@ -57,46 +54,30 @@ def emit_hybrid_qwen_output_head(
     *,
     solver_workers: int = 2,
 ) -> HybridQwenOutputHeadSources:
-    """Solve the Torch regions and link them into native PyPTO source."""
+    """Solve the complete static Torch DAG and link it into native PyPTO."""
 
     examples = build_examples()
-    rms_graph, rms_norm = _emit_static_callable(
-        examples["qwen3_rms_norm_chunk"],
+    graph, output_head = _emit_static_callable(
+        examples["qwen3_rms_lm_head"],
         solver_binary,
         solver_workers=solver_workers,
-        function_name=_RMS_FUNCTION,
+        function_name=_OUTPUT_HEAD_FUNCTION,
     )
-    lm_graph, lm_head = _emit_static_callable(
-        examples["qwen3_lm_head_chunk"],
-        solver_binary,
-        solver_workers=solver_workers,
-        function_name=_LM_HEAD_FUNCTION,
-    )
-    rms_arguments = _ordered_call_arguments(
-        rms_graph,
-        rms_norm,
+    output_head_arguments = _ordered_call_arguments(
+        graph,
+        output_head,
         {
             "hidden_states": "hidden_states",
             "norm_weight": "norm_weight",
-        },
-        output="normalized",
-    )
-    lm_arguments = _ordered_call_arguments(
-        lm_graph,
-        lm_head,
-        {
-            "normalized": "normalized",
             "lm_head_weight": "lm_head_weight",
         },
         output="output",
     )
     orchestration_source = _render_orchestration(
-        rms_arguments=rms_arguments,
-        lm_arguments=lm_arguments,
+        output_head_arguments=output_head_arguments,
     )
     return HybridQwenOutputHeadSources(
-        rms_norm=rms_norm,
-        lm_head=lm_head,
+        output_head=output_head,
         orchestration_source=orchestration_source,
     )
 
@@ -162,15 +143,12 @@ def _ordered_call_arguments(
     return ", ".join([*arguments, output])
 
 
-def _render_orchestration(*, rms_arguments: str, lm_arguments: str) -> str:
+def _render_orchestration(*, output_head_arguments: str) -> str:
     source = _TEMPLATE.read_text(encoding="utf-8")
     replacements = {
-        "__RMS_MODULE__": _RMS_MODULE,
-        "__RMS_FUNCTION__": _RMS_FUNCTION,
-        "__RMS_ARGUMENTS__": rms_arguments,
-        "__LM_HEAD_MODULE__": _LM_HEAD_MODULE,
-        "__LM_HEAD_FUNCTION__": _LM_HEAD_FUNCTION,
-        "__LM_HEAD_ARGUMENTS__": lm_arguments,
+        "__OUTPUT_HEAD_MODULE__": _OUTPUT_HEAD_MODULE,
+        "__OUTPUT_HEAD_FUNCTION__": _OUTPUT_HEAD_FUNCTION,
+        "__OUTPUT_HEAD_ARGUMENTS__": output_head_arguments,
     }
     for placeholder, replacement in replacements.items():
         if placeholder not in source:

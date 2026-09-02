@@ -1,11 +1,11 @@
-from __RMS_MODULE__ import __RMS_FUNCTION__
-from __LM_HEAD_MODULE__ import __LM_HEAD_FUNCTION__
+from __OUTPUT_HEAD_MODULE__ import __OUTPUT_HEAD_FUNCTION__
 import pypto.language as pl
 
 
 @pl.program
 class NativeQwenOutputHead:
-    # Native orchestration linking two independently planned static regions.
+    # Native orchestration calls one maximal static region. Fusebox owns any
+    # fusion or cut decisions inside the complete RMSNorm -> LM-head DAG.
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(
         self,
@@ -14,9 +14,7 @@ class NativeQwenOutputHead:
         lm_head_weight: pl.Tensor[[192, 512], pl.BF16],
         output: pl.Out[pl.Tensor[[16, 192], pl.FP32]],
     ) -> pl.Tensor[[16, 192], pl.FP32]:
-        # Native PyPTO owns this GM boundary and the call sequence. A serving
-        # program may place the same static calls inside its runtime loops.
-        normalized = pl.create_tensor([16, 512], dtype=pl.BF16)
-        normalized = __RMS_FUNCTION__(__RMS_ARGUMENTS__)
-        output = __LM_HEAD_FUNCTION__(__LM_HEAD_ARGUMENTS__)
+        # A serving program may place the same static call inside its runtime
+        # loops; it must not pre-partition the tensor DAG before Fusebox sees it.
+        output = __OUTPUT_HEAD_FUNCTION__(__OUTPUT_HEAD_ARGUMENTS__)
         return output

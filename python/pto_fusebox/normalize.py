@@ -717,11 +717,20 @@ class _ExportNormalizer:
             )
             for index, meta in enumerate(outputs)
         )
+        attributes: dict[str, Any] = {
+            "source_operator": _target_name(node.target),
+        }
+        positional_literals = _json_literal_arguments(node.args)
+        if positional_literals:
+            attributes["literal_args"] = positional_literals
+        keyword_literals = _json_literal_keywords(node.kwargs)
+        if keyword_literals:
+            attributes["literal_kwargs"] = keyword_literals
         op_id = self._add_op(
             "opaque",
             self._tensor_inputs((node.args, node.kwargs)),
             output_ids,
-            {"source_operator": _target_name(node.target)},
+            attributes,
             supported=False,
             opaque_reason=reason,
         )
@@ -1129,6 +1138,48 @@ def _walk(value: Any) -> Iterable[Any]:
 
 def _is_json_scalar(value: Any) -> bool:
     return value is None or isinstance(value, (bool, int, float, str))
+
+
+def _json_literal(value: Any) -> tuple[bool, Any]:
+    """Return a deterministic JSON form for one static FX literal."""
+
+    if _is_json_scalar(value):
+        return True, value
+    if isinstance(value, (tuple, list)):
+        converted: list[Any] = []
+        for item in value:
+            supported, literal = _json_literal(item)
+            if not supported:
+                return False, None
+            converted.append(literal)
+        return True, converted
+    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
+        converted_mapping: dict[str, Any] = {}
+        for key in sorted(value):
+            supported, literal = _json_literal(value[key])
+            if not supported:
+                return False, None
+            converted_mapping[key] = literal
+        return True, converted_mapping
+    return False, None
+
+
+def _json_literal_arguments(arguments: Sequence[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for position, argument in enumerate(arguments):
+        supported, literal = _json_literal(argument)
+        if supported:
+            result.append({"position": position, "value": literal})
+    return result
+
+
+def _json_literal_keywords(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in sorted(arguments):
+        supported, literal = _json_literal(arguments[name])
+        if supported:
+            result[str(name)] = literal
+    return result
 
 
 def _hashable(value: Any) -> bool:

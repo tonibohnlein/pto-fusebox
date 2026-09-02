@@ -6,7 +6,7 @@ value v0002 intermediate float32[4x8] producer=op0001 alias=- target=-
 value v0003 intermediate int64[4x8] producer=op0001 alias=- target=-
 value v0004 intermediate float32[4x8] producer=op0002 alias=- target=-
 op op0000 exp(v0000)->v0001 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.exp.default"}
-op op0001 opaque(v0001)->v0002,v0003 supported=0 metadata=0 reason=unsupported operator aten.topk.default attrs={"source_operator":"aten.topk.default"}
+op op0001 opaque(v0001)->v0002,v0003 supported=0 metadata=0 reason=unsupported operator aten.topk.default attrs={"literal_args":[{"position":1,"value":8}],"source_operator":"aten.topk.default"}
 op op0002 abs(v0002)->v0004 supported=1 metadata=0 reason=- attrs={"source_operator":"aten.abs.default"}
 region region0000 ops=op0000 inputs=v0000 outputs=v0001 diagnostics=-
   tensor 0=v0000 FP32[4x32] alias=- synthetic=0

@@ -473,6 +473,28 @@ def test_copy_capable_views_are_opaque(operation: str) -> None:
     )
 
 
+def test_opaque_ops_preserve_static_literal_arguments() -> None:
+    class OpaqueSliceReshape(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value[1:3].reshape(1, 2, 4)
+
+    graph = export_and_normalize(OpaqueSliceReshape(), (torch.randn(4, 4),))
+    opaque = [op for op in graph.ops if not op.supported]
+
+    assert [op.attributes["source_operator"] for op in opaque] == [
+        "aten.slice.Tensor",
+        "aten.reshape.default",
+    ]
+    assert opaque[0].attributes["literal_args"] == [
+        {"position": 1, "value": 0},
+        {"position": 2, "value": 1},
+        {"position": 3, "value": 3},
+    ]
+    assert opaque[1].attributes["literal_args"] == [
+        {"position": 1, "value": [1, 2, 4]},
+    ]
+
+
 def test_duplicate_structured_outputs_preserve_order_and_pytree() -> None:
     class StructuredOutputs(nn.Module):
         def forward(self, value: torch.Tensor) -> dict[str, object]:

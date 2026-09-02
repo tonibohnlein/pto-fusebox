@@ -96,6 +96,56 @@ class DeepSeekV4Int8ProjectionBranch(nn.Module):
         return accumulator.float() * dequant_scale * projection_scale
 
 
+class DeepSeekV4Int8MtpProjection(nn.Module):
+    """Complete static Flash-MTP projection tensor DAG.
+
+    The physical hidden frame and flattened history frame are the stable ABI
+    supplied by native PyPTO orchestration.  Both projection branches and the
+    final logical composition are captured together; Fusebox, rather than the
+    caller, decides where the currently supported source regions are cut.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.branch = DeepSeekV4Int8ProjectionBranch(hidden_size, eps)
+
+    def forward(
+        self,
+        hidden_padded: torch.Tensor,
+        history_flat: torch.Tensor,
+        enorm_weight: torch.Tensor,
+        hnorm_weight: torch.Tensor,
+        e_smooth: torch.Tensor,
+        h_smooth: torch.Tensor,
+        e_projection_weight: torch.Tensor,
+        h_projection_weight: torch.Tensor,
+        e_projection_scale: torch.Tensor,
+        h_projection_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_projected = self.branch(
+            hidden_padded,
+            enorm_weight,
+            e_smooth,
+            e_projection_weight,
+            e_projection_scale,
+        )
+        history_projected = self.branch(
+            history_flat,
+            hnorm_weight,
+            h_smooth,
+            h_projection_weight,
+            h_projection_scale,
+        )
+        hidden_logical = hidden_projected[:DEEPSEEK_V4_DECODE_TOKENS].unsqueeze(1)
+        history_logical = history_projected.reshape(
+            DEEPSEEK_V4_DECODE_TOKENS,
+            DEEPSEEK_V4_HC_MULT,
+            self.hidden_size,
+        )
+        return hidden_logical + history_logical
+
+
 def build_production_mtp_projection_branch() -> Example:
     """Return one production Flash-MTP branch at its physical linear frame.
 
@@ -153,6 +203,38 @@ def build_production_mtp_prefill_projection_branch() -> Example:
             torch.empty(1, hidden, device="meta"),
             torch.empty(1, hidden, device="meta"),
             torch.empty(hidden, hidden, dtype=torch.int8, device="meta"),
+            torch.empty(1, hidden, device="meta"),
+        ),
+    )
+
+
+def build_production_mtp_decode_projection() -> Example:
+    """Return the complete production decode projection as one Torch graph.
+
+    Native orchestration owns construction of the physical hidden frame and
+    flattening of the history input. It does not pre-partition the two static
+    projection branches before Fusebox receives their shared output DAG.
+    """
+
+    hidden = DEEPSEEK_V4_HIDDEN
+    history_rows = DEEPSEEK_V4_DECODE_TOKENS * DEEPSEEK_V4_HC_MULT
+    return (
+        DeepSeekV4Int8MtpProjection(hidden),
+        (
+            torch.empty(
+                DEEPSEEK_V4_LINEAR_TOKENS,
+                hidden,
+                dtype=torch.bfloat16,
+                device="meta",
+            ),
+            torch.empty(history_rows, hidden, dtype=torch.float32, device="meta"),
+            torch.empty(1, hidden, device="meta"),
+            torch.empty(1, hidden, device="meta"),
+            torch.empty(1, hidden, device="meta"),
+            torch.empty(1, hidden, device="meta"),
+            torch.empty(hidden, hidden, dtype=torch.int8, device="meta"),
+            torch.empty(hidden, hidden, dtype=torch.int8, device="meta"),
+            torch.empty(1, hidden, device="meta"),
             torch.empty(1, hidden, device="meta"),
         ),
     )

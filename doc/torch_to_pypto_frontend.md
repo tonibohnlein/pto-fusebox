@@ -426,13 +426,11 @@ PyPTO call site:
 
 ```text
 qwen3.py                         # ordinary Torch, build-time only
-  Qwen3RmsNormChunk
-  Qwen3LmHeadChunk
+  Qwen3RmsLmHead                 # complete connected static DAG
         |
         | torch.export -> normalize -> solve -> emit
         v
-generated_qwen_rms_norm.py       # ordinary generated PyPTO DSL
-generated_qwen_lm_head.py        # ordinary generated PyPTO DSL
+generated_qwen_output_head.py    # ordinary generated PyPTO DSL
         ^
         | stable named callable ABI
         |
@@ -442,8 +440,8 @@ native_qwen_output_head.py       # hand-authored PyPTO orchestration
 `examples/torch_frontend/hybrid_qwen.py` implements this layout. Its companion
 `hybrid_qwen_orchestration.py.in` is native PyPTO source and remains unchanged
 by scheduling except for resolving generated module, function, and ABI argument
-placeholders. The example emits two static callables and links them through one
-PyPTO-owned GM intermediate:
+placeholders. The example emits one callable for the complete connected DAG;
+Fusebox, not the caller, chooses its V2C fusion and grid:
 
 ```bash
 python -m examples.torch_frontend.hybrid_qwen \
@@ -451,8 +449,8 @@ python -m examples.torch_frontend.hybrid_qwen \
   --output-dir build/hybrid-qwen
 ```
 
-The resulting three files import only PyPTO. A serving model may put the same
-calls inside native runtime loops or dispatch among several generated physical
+The resulting two files import only PyPTO. A serving model may put the same
+call inside native runtime loops or dispatch among several generated physical
 frames; neither behavior is represented in or inferred from the Torch modules.
 
 No compiler-integrated AutoFuse pass is required for this path. The generated
@@ -818,13 +816,10 @@ The remaining source capabilities are ordered by contract complexity:
    cube, mixed, multi-step, and non-row variation fail closed. Same-shape
    standalone generated-program comparisons for Qwen RMSNorm/LM-head,
    attention, and dense SwiGLU are silicon-closed. With the proposed PyPTO
-   external-inline parameter-lineage repair, separately generated Qwen RMSNorm
-   and LM-head callables compile together inside one native orchestration
-   program, with the native program owning their GM intermediate and submission
-   order. This imported-callable path is a host integration result, not
-   ordinary-main or silicon closure. Next, apply that import boundary to a
-   selected pypto-lib model entry point. Keep Types 2-5 in orchestration and
-   outside Fusebox planning.
+   external-inline parameter-lineage repair, the connected Qwen RMSNorm-to-
+   LM-head graph compiles as one generated callable inside native orchestration.
+   The caller does not own an artificial GM intermediate. Keep Types 2-5 in
+   orchestration and outside Fusebox planning.
 
 ## PyPTO-lib validation targets
 
@@ -866,14 +861,18 @@ and boundary semantics; model or function names must never affect planning.
    and FP32 dequantization. Source-oriented search materializes the shared
    quantization scale instead of recomputing normalized operations in several
    tasks, and emits dependency-ordered vector, cube, and vector callables
-   without an MTP recognizer. The checked decode adapter generates separate
-   16-row hidden and 32-row hyperconnection-history callables, pads or reshapes
-   the native `T=8` inputs, and replaces only the `mtp_projection` import in a
-   copy of the real Flash-MTP decode entry point. Cache, attention, MoE,
+   without an MTP recognizer. The checked decode adapter captures the complete
+   static projection once. Fusebox currently extracts a 24-op hidden branch
+   and a 24-op history branch, while the unsupported hidden prefix, history
+   reshape, and grouped broadcast-add remain explicit native operations. The
+   adapter pads or reshapes the native `T=8` inputs and replaces only the
+   `mtp_projection` import in a copy of the real Flash-MTP decode entry point.
+   Cache, attention, MoE,
    sampling, and distributed orchestration remain native PyPTO. A 128-row
-   prefill branch is source-ready through the same generic algebra. PyPTO
-   parsing, PTOAS, silicon numerics, and performance for the production overlay
-   remain the next closure campaign. The generated reduced
+   prefill branch is source-ready through the same generic algebra. The former
+   pre-split overlay is silicon-correct but about 1.57x slower than native due
+   to 13 submissions and 11 GM intermediates, motivating the maximal-graph
+   contract and further grouped-broadcast source support. The generated reduced
    composition is 1.046x faster than its independent unfused baseline. The
    durable numerical contract remains `rtol = atol = 1e-2`: five frozen seeds
    happened to be bit-identical, but independent schedules are not required to

@@ -22,6 +22,7 @@ import torch
 from examples.torch_frontend._runner import Example
 from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
+    build_production_mtp_decode_projection,
     build_production_mtp_history_projection_branch,
     build_production_mtp_prefill_projection_branch,
     build_production_mtp_projection_branch,
@@ -144,27 +145,21 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
     if not native_decode.is_file():
         pytest.skip("current pypto-lib checkout has no Flash-MTP decode entry point")
 
-    solved_branches = []
-    for builder in (
-        build_production_mtp_projection_branch,
-        build_production_mtp_history_projection_branch,
-    ):
-        module, args = builder()
-        graph = export_and_normalize(module, args)
-        solved = solve_graph(
-            graph,
-            solver_binary=_solver(),
-            solver_workers=2,
-            require_source_codegen=True,
-        )
-        assert solved.successful and solved.whole_graph_codegen_ready
-        solved_branches.append((graph, solved.regions[0]))
+    module, args = build_production_mtp_decode_projection()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    assert not solved.whole_graph_supported
+    assert len(solved.regions) == 2
 
     overlay = emit_flash_mtp_decode_projection_overlay(
-        solved_branches[0][0],
-        solved_branches[0][1],
-        solved_branches[1][0],
-        solved_branches[1][1],
+        graph,
+        solved,
         native_decode_source=native_decode.read_text(encoding="utf-8"),
     )
     overlay_path = tmp_path / f"{overlay.module_name}.py"
@@ -598,11 +593,11 @@ def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
     assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
 
 
-def test_separate_qwen_callables_compose_in_native_orchestration(
+def test_maximal_qwen_callable_composes_in_native_orchestration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Native orchestration owns the GM cut between two generated regions."""
+    """Fusebox sees the full static output head before choosing its schedule."""
 
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
@@ -623,30 +618,13 @@ def test_separate_qwen_callables_compose_in_native_orchestration(
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
     orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
-    assert len(pto_files) == 2
+    assert len(pto_files) == 1
     assert len(orchestration_files) == 1
     orchestration = orchestration_files[0].read_text(encoding="utf-8")
-    assert orchestration.count("rt_submit_aiv_task(") == 1
-    assert orchestration.count("rt_submit_aic_task(") == 1
-    assert orchestration.index("rt_submit_aiv_task(") < orchestration.index(
-        "rt_submit_aic_task("
-    )
-    produced = re.findall(r"params_t0\.add_output\(([^)]+)\);", orchestration)
-    consumed = re.findall(r"params_t1\.add_input\(([^)]+)\);", orchestration)
-    aliases = dict(re.findall(r"TaskTensor\s+(\w+)\s*=\s*(\w+);", orchestration))
-
-    def root_name(name: str) -> str:
-        seen: set[str] = set()
-        while name in aliases:
-            assert name not in seen, f"cyclic orchestration alias at {name}"
-            seen.add(name)
-            name = aliases[name]
-        return name
-
-    assert len(produced) == 1
-    assert sum(root_name(name) == produced[0] for name in consumed) == 1
-    assert "params_t1.add_output(ext_output);" in orchestration
-    assert "params_t1.add_inout(" not in orchestration
+    assert orchestration.count("rt_submit_task(") == 1
+    assert "intermediate_tensor" not in orchestration
+    assert "add_output(ext_output)" in orchestration
+    assert "add_inout(" not in orchestration
 
 
 def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(

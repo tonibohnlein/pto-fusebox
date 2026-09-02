@@ -157,9 +157,11 @@ from Torch. A hybrid program has separate sources with one stable callable ABI:
   callable imported by the native orchestration.
 
 Torch is a build-time specification and is absent from the generated program.
-`examples/torch_frontend/hybrid_qwen.py` demonstrates the arrangement with two
-Torch regions, two generated PyPTO callable modules, and the separately
-hand-authored `hybrid_qwen_orchestration.py.in` caller:
+Callers must expose the largest static tensor DAG available; they must not
+choose fusion boundaries by constructing smaller Torch modules first.
+`examples/torch_frontend/hybrid_qwen.py` demonstrates the arrangement with the
+complete connected RMSNorm-to-LM-head graph, one generated PyPTO callable, and
+the separately hand-authored `hybrid_qwen_orchestration.py.in` caller:
 
 ```bash
 python -m examples.torch_frontend.hybrid_qwen \
@@ -225,28 +227,30 @@ RMSNorm-to-LM-head were respectively 1.093x, 1.098x, 1.050x, and 1.143x
 faster; standalone Qwen LM-head tied. The reduced unquantized DeepSeek MTP
 composition was 1.046x faster than its independent unfused baseline. This is
 integration-lane evidence, not upstream-main closure: the split-AIV and
-nested-accumulator repairs remain external to upstream main. Separately, host
-integration composes independently generated Qwen RMSNorm and LM-head callables
-under one native orchestration program when paired with the proposed PyPTO
-external inline-parameter-lineage repair; the imported-callable path is not yet
-a silicon or ordinary-main claim. The reduced MTP comparison keeps its committed
+nested-accumulator repairs remain external to upstream main. The production
+hybrid Qwen adapter now passes the connected RMSNorm-to-LM-head graph to
+Fusebox once; the selected one-way V2C plan removes the caller-imposed GM
+normalization cut. The reduced MTP comparison keeps its committed
 tolerance-based contract even though the five frozen seeds happened to be
 bit-identical; the fixture omits the production kernel's INT8 quantization and
 dequantization stages. A separate production Flash-MTP path now normalizes and
 emits those stages generically: RMSNorm/smoothing, row quantization with the
 native rounding chain, INT8 matmul with INT32 accumulation, and FP32
-dequantization. It generates fixed physical decode callables and patches only
-the projection import in a copy of the native decode entry point, leaving all
-dynamic attention, MoE, sampling, and distributed orchestration in PyPTO-lib.
+dequantization. Its adapter captures the complete decode projection once and
+asks Fusebox to extract maximal supported regions. The current generic surface
+selects two 24-op branches and leaves only the static prefix view, history
+reshape, and grouped broadcast-add in native PyPTO. Those boundaries are
+explicit limitations rather than caller-selected fusion cuts. The adapter
+patches only the projection import in a copy of the native decode entry point,
+leaving all dynamic attention, MoE, sampling, and distributed orchestration in
+PyPTO-lib.
 The three production projection branches (hidden decode, history decode and the
 128-row prefill frame) are silicon-closed against independently written
-controls. The composed overlay now has a cross-layer regression that expands
-both generated callables in one native program and compiles all 13 tasks
-through PyPTO. Full-overlay silicon closure remains pending at this revision.
-The previous manually de-collided diagnostic overlay was correct but about
+controls. The previous separately solved overlay was correct but about
 1.57x slower than the native projection: it retained 13 submissions and 11 GM
 intermediates versus the native implementation's 4 and 6. That is a composition
-and cut-placement optimization target, not a branch-kernel correctness issue.
+and cut-placement optimization target—and direct evidence that integrations
+must not pre-partition static graphs—not a branch-kernel correctness issue.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized

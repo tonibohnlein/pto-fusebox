@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from examples.torch_frontend.deepseek_v4 import (
     DEEPSEEK_V4_LINEAR_TOKENS,
     DEEPSEEK_V4_PREFILL_TOKENS,
     build_examples as build_deepseek_examples,
+    build_production_mtp_decode_projection,
     build_production_mtp_history_projection_branch,
     build_production_mtp_projection_branch,
     build_production_mtp_prefill_projection_branch,
@@ -51,6 +53,7 @@ from pto_fusebox import (
     solve_graph,
 )
 from pto_fusebox.schedule.schema import MixedKernelPlan
+from pto_fusebox.ir import normalized_graph_sha256
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
@@ -231,32 +234,24 @@ def test_hybrid_qwen_example_links_torch_regions_into_native_pypto() -> None:
     files = sources.files()
 
     assert list(files) == [
-        "generated_qwen_rms_norm.py",
-        "generated_qwen_lm_head.py",
+        "generated_qwen_output_head.py",
         "native_qwen_output_head.py",
     ]
     for source in files.values():
         ast.parse(source)
         assert "auto_tile" not in source and "auto_fuse" not in source
-    assert "@pl.inline" in sources.rms_norm.source
-    assert "@pl.inline" in sources.lm_head.source
+    assert "@pl.inline" in sources.output_head.source
+    assert sources.output_head.kind is KernelKind.MIXED
     assert "torch" not in sources.orchestration_source.lower()
-    assert "from generated_qwen_rms_norm import generated_qwen_rms_norm" in (
-        sources.orchestration_source
-    )
-    assert "from generated_qwen_lm_head import generated_qwen_lm_head" in (
+    assert "from generated_qwen_output_head import generated_qwen_output_head" in (
         sources.orchestration_source
     )
     assert (
-        "generated_qwen_rms_norm(hidden_states, norm_weight, normalized)"
-        in sources.orchestration_source
+        "generated_qwen_output_head(hidden_states, norm_weight, "
+        "lm_head_weight, output)" in sources.orchestration_source
     )
-    assert (
-        "generated_qwen_lm_head(lm_head_weight, normalized, output)"
-        in sources.orchestration_source
-    )
-    assert "__RMS_" not in sources.orchestration_source
-    assert "__LM_HEAD_" not in sources.orchestration_source
+    assert "pl.create_tensor" not in sources.orchestration_source
+    assert "__OUTPUT_HEAD_" not in sources.orchestration_source
 
 
 @pytest.mark.skipif(
@@ -322,12 +317,37 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         assert "out_dtype=pl.INT32" in source
         solved.append((graph, result.regions[0]))
 
+    full_module, full_args = build_production_mtp_decode_projection()
+    full_graph = export_and_normalize(full_module, full_args)
+    full_result = solve_graph(
+        full_graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert full_result.regions_solved
+    assert not full_result.whole_graph_supported
+    assert len(full_result.regions) == 2
+    assert tuple(len(region.region.op_ids) for region in full_result.regions) == (
+        24,
+        24,
+    )
+    expected_branch_steps = [
+        KernelKind.VECTOR,
+        KernelKind.VECTOR,
+        KernelKind.VECTOR,
+        KernelKind.CUBE,
+        KernelKind.VECTOR,
+    ]
+    assert [
+        [step.kind for step in scheduled_region(region).steps]
+        for region in full_result.regions
+    ] == [expected_branch_steps, expected_branch_steps]
+
     native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
     overlay = emit_flash_mtp_decode_projection_overlay(
-        solved[0][0],
-        solved[0][1],
-        solved[1][0],
-        solved[1][1],
+        full_graph,
+        full_result,
         native_decode_source=native,
     )
     compile(overlay.source, "<fusebox_mtp_projection>", "exec")
@@ -335,6 +355,8 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
     assert "pl.create_tensor([16, 4096], dtype=pl.BF16)" in overlay.source
     assert "pl.reshape(prev_hidden_states, [32, 4096])" in overlay.source
     assert "pl.spmd(128, name_hint='fusebox_mtp_combine')" in overlay.source
+    assert len(overlay.static_callables) == 2
+    assert overlay.native_op_ids == ("op0048", "op0049", "op0050", "op0051")
     assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
     assert overlay.decode_source == (
         "from mtp_projection import golden_mtp_projection\n"
@@ -342,12 +364,79 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
     )
     with pytest.raises(SourceEmissionError, match="module name is invalid"):
         emit_flash_mtp_decode_projection_overlay(
-            solved[0][0],
-            solved[0][1],
-            solved[1][0],
-            solved[1][1],
+            full_graph,
+            full_result,
             native_decode_source=native,
             module_name="fusebox-mtp-projection",
+        )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_flash_mtp_native_tail_fails_closed_on_semantic_drift() -> None:
+    module, args = build_production_mtp_decode_projection()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
+
+    def mutate_op(op_id: str, **changes):
+        mutated = replace(
+            graph,
+            ops=tuple(
+                replace(op, **changes) if op.id == op_id else op for op in graph.ops
+            ),
+        )
+        assert normalized_graph_sha256(mutated) != normalized_graph_sha256(graph)
+        regions = []
+        for region in solved.regions:
+            assert region.problem is not None
+            problem = dict(region.problem)
+            frontend = dict(problem["frontend_mapping"])
+            frontend["normalized_graph_sha256"] = normalized_graph_sha256(mutated)
+            problem["frontend_mapping"] = frontend
+            regions.append(replace(region, problem=problem))
+        return mutated, replace(solved, graph=mutated, regions=tuple(regions))
+
+    slice_attrs = dict(graph.op_map()["op0048"].attributes)
+    for position, value in ((2, 1), (3, 7)):
+        literal_args = slice_attrs["literal_args"]
+        assert isinstance(literal_args, list)
+        literals = []
+        for item in literal_args:
+            assert isinstance(item, dict)
+            literals.append(dict(item))
+        next(item for item in literals if item["position"] == position)["value"] = value
+        attributes = {**slice_attrs, "literal_args": literals}
+        mutated, mutated_result = mutate_op("op0048", attributes=attributes)
+        with pytest.raises(SourceEmissionError, match="slice must select rows"):
+            emit_flash_mtp_decode_projection_overlay(
+                mutated,
+                mutated_result,
+                native_decode_source=native,
+            )
+
+    hidden_output = graph.op_map()["op0048"].inputs[0]
+    mutated, mutated_result = mutate_op("op0050", inputs=(hidden_output,))
+    with pytest.raises(SourceEmissionError, match="branch outputs"):
+        emit_flash_mtp_decode_projection_overlay(
+            mutated,
+            mutated_result,
+            native_decode_source=native,
+        )
+
+    add = graph.op_map()["op0051"]
+    mutated, mutated_result = mutate_op("op0051", inputs=tuple(reversed(add.inputs)))
+    with pytest.raises(SourceEmissionError, match="value lineage is stale"):
+        emit_flash_mtp_decode_projection_overlay(
+            mutated,
+            mutated_result,
+            native_decode_source=native,
         )
 
 
@@ -898,6 +987,36 @@ def test_qwen_components_preserve_the_native_static_chunk_contract() -> None:
         output = graph.value_map()[graph.outputs[0]]
         assert output.shape == (QWEN_BATCH_TILE, QWEN_VOCAB_CHUNK)
         assert output.dtype == "float32"
+
+
+def test_model_examples_expose_maximal_static_graphs_before_solving() -> None:
+    """Integration examples must not pre-partition supported tensor DAGs."""
+
+    examples = {
+        "attention": build_static_mixed_examples()["pypto_lib_static_attention"],
+        "dense_swiglu": build_static_mixed_examples()["pypto_lib_static_dense_swiglu"],
+        "qwen_output_head": build_qwen_examples()["qwen3_rms_lm_head"],
+        "deepseek_rmsnorm": build_deepseek_examples()["deepseek_v4_rmsnorm"],
+        "reduced_mtp": build_deepseek_examples()["deepseek_v4_mtp_projection"],
+    }
+    for name, (module, args) in examples.items():
+        graph = export_and_normalize(module, args)
+        regions = extract_solver_regions(graph)
+        assert len(regions) == 1, name
+        assert regions[0].op_ids == tuple(op.id for op in graph.ops), name
+
+    module, args = build_production_mtp_decode_projection()
+    graph = export_and_normalize(module, args)
+    regions = extract_solver_regions(graph)
+    static_op_ids = {op_id for region in regions for op_id in region.op_ids}
+    assert len(regions) == 2
+    assert tuple(len(region.op_ids) for region in regions) == (24, 24)
+    assert tuple(op.kind for op in graph.ops if op.id not in static_op_ids) == (
+        "opaque",
+        "view",
+        "opaque",
+        "add",
+    )
 
 
 @pytest.mark.skipif(
