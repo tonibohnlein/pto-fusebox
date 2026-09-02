@@ -2382,7 +2382,7 @@ def test_float_to_int8_is_analytic_but_not_source_ready() -> None:
         emit_pypto_region(graph, result)
 
 
-def test_cast_chain_alignment_is_local_to_its_physical_shape_class() -> None:
+def test_cast_chain_broadcast_alignment_matches_non_singleton_axis() -> None:
     class CastThenBroadcast(torch.nn.Module):
         def forward(self, value: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
             restored = value.to(torch.float16).to(torch.float32)
@@ -2401,10 +2401,10 @@ def test_cast_chain_alignment_is_local_to_its_physical_shape_class() -> None:
     }
 
     assert body_frames[bias_tensor].logical[1] == 1
-    assert body_frames[bias_tensor].physical[0] == 8
+    assert body_frames[bias_tensor].physical[0] == 16
     assert body_frames[bias_tensor].physical[1] == 1
     source = emit_pypto_region(graph, result).source
-    assert "[8, 1], [3, 1], target_memory=pl.Mem.Vec" in source
+    assert "[16, 1], [3, 1], target_memory=pl.Mem.Vec" in source
     assert "[32, 1], [3, 1], target_memory=pl.Mem.Vec" not in source
 
 

@@ -1397,13 +1397,17 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
             std::max(vector_max_dtype_bytes, (int64_t)dtype_bytes(prob.tensors[input].dtype));
         sg.vector_iter_W_ = std::max(sg.vector_iter_W_, prob.tensors[input].width);
         sg.vector_iter_H_ = std::max(sg.vector_iter_H_, prob.tensors[input].height);
-        // Elementwise type conversion preserves the physical box of every
-        // same-shaped operand.  Join that complete class (not merely adjacent
-        // cast hops), while leaving differently shaped broadcast operands in
-        // their own dtype-sized class.
+        // Elementwise tile operations require every non-broadcast physical
+        // axis to match. Join both same-shaped values and singleton-expansion
+        // participants into one alignment class. VectorAllocatedFrame still
+        // keeps the true singleton axis thin, while the shared axis inherits
+        // the widest DMA granule (for example an FP32 [M,1] row scale used by
+        // an INT8 cast chain with a 32-row physical frame).
         if (candidate_op.type == OpType::Pointwise &&
-            prob.tensors[input].width == prob.tensors[t].width &&
-            prob.tensors[input].height == prob.tensors[t].height) {
+            ((prob.tensors[input].width == prob.tensors[t].width &&
+              prob.tensors[input].height == prob.tensors[t].height) ||
+             candidate_op.vector_geometry == VectorOpGeometry::RowExpand ||
+             candidate_op.vector_geometry == VectorOpGeometry::ColExpand)) {
           unite_physical_shape(input, t);
         }
       }

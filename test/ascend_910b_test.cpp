@@ -5095,8 +5095,8 @@ static void test_native_cast_chain_uses_dtype_sized_pebble_bands() {
           plan.full_peak_ub_bytes == plan.tile_h * plan.tile_w * 6);
 }
 
-static void test_native_cast_chain_granule_is_class_local() {
-    std::cout << "[CASTCLASS] cast alignment does not inflate an unrelated broadcast box\n";
+static void test_native_cast_chain_broadcast_shares_physical_axis() {
+    std::cout << "[CASTCLASS] cast and broadcast operands share their non-singleton frame\n";
     Problem p;
     p.tensors = {{512, 3, DType::FP32},
                  {512, 3, DType::FP16},
@@ -5131,8 +5131,8 @@ static void test_native_cast_chain_granule_is_class_local() {
     CHECK("CASTCLASS: native cast class uses its FP16-compatible granule",
           granules.size() == p.tensors.size() && granules[0] == 16 &&
               granules[1] == 16 && granules[2] == 16 && granules[4] == 16);
-    CHECK("CASTCLASS: differently shaped FP32 broadcast retains granule eight",
-          granules[3] == 8);
+    CHECK("CASTCLASS: differently shaped FP32 broadcast inherits the shared granule",
+          granules[3] == 16);
 
     const auto frames = BuildVectorTensorFrames(p, plan);
     const auto& body =
@@ -5142,9 +5142,9 @@ static void test_native_cast_chain_granule_is_class_local() {
         [](const VectorTensorFramePlan& frame) { return frame.tensor == 3; });
     CHECK("CASTCLASS: broadcast tensor is present in the body frame",
           broadcast != body.end());
-    CHECK("CASTCLASS: broadcast rows use FP32 alignment rather than cast alignment",
+    CHECK("CASTCLASS: broadcast rows match the cast frame while width stays singleton",
           broadcast != body.end() && broadcast->logical_cols == 1 &&
-              broadcast->physical_rows == 8 &&
+              broadcast->physical_rows == 16 &&
               broadcast->physical_cols == 1);
 }
 
@@ -5386,7 +5386,7 @@ int main() {
     test_cost_cache_concurrent_publication();
     test_vector_capability_gates_cost_admission();
     test_native_cast_chain_uses_dtype_sized_pebble_bands();
-    test_native_cast_chain_granule_is_class_local();
+    test_native_cast_chain_broadcast_shares_physical_axis();
     test_reduction_state_uses_its_class_local_granule();
     test_singleton_column_transform_reaches_vector_plan();
     test_heterogeneous_reduction_workspaces_have_a_sound_source_peak();

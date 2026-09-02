@@ -13,14 +13,17 @@ import importlib
 import importlib.util
 import os
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
+from examples.torch_frontend._runner import Example
 from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
     build_production_mtp_history_projection_branch,
+    build_production_mtp_prefill_projection_branch,
     build_production_mtp_projection_branch,
 )
 from examples.torch_frontend.hybrid_qwen import emit_hybrid_qwen_output_head
@@ -179,6 +182,47 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
     assert callable(loaded.decode_mtp)
     assert loaded.mtp_projection is not None
     assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
+
+
+@pytest.mark.parametrize(
+    ("builder", "name"),
+    (
+        (build_production_mtp_projection_branch, "mtp_hidden_decode"),
+        (build_production_mtp_history_projection_branch, "mtp_history_decode"),
+        (build_production_mtp_prefill_projection_branch, "mtp_hidden_prefill"),
+    ),
+)
+def test_production_mtp_physical_broadcast_frames_compile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Callable[[], Example],
+    name: str,
+) -> None:
+    """Cross-layer guard for the quantize row-scale physical frame."""
+
+    module, args = builder()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.successful and solved.whole_graph_codegen_ready
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name=f"generated_{name}",
+    )
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted,
+        tmp_path,
+        monkeypatch,
+        name=name,
+    )
+    assert len(pto) == 5
+    assert orchestration.count("rt_submit_") == 5
 
 
 def _compile_callable_in_native_orchestration(
