@@ -19,6 +19,7 @@ from examples.torch_frontend.deepseek_v4 import (
     build_production_mtp_projection_branch,
     build_production_mtp_prefill_projection_branch,
 )
+from examples.torch_frontend.hybrid_qwen import emit_hybrid_qwen_output_head
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
 )
@@ -220,6 +221,42 @@ def test_deepseek_int8_projection_is_ordinary_supported_algebra() -> None:
     ] == ["none", "rint", "round", "trunc", "none"]
     assert graph.ops[20].attributes["source_operator"] == "aten._int_mm.default"
     assert len(extract_solver_regions(graph)) == 1
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_hybrid_qwen_example_links_torch_regions_into_native_pypto() -> None:
+    sources = emit_hybrid_qwen_output_head(_test_solver(), solver_workers=2)
+    files = sources.files()
+
+    assert list(files) == [
+        "generated_qwen_rms_norm.py",
+        "generated_qwen_lm_head.py",
+        "native_qwen_output_head.py",
+    ]
+    for source in files.values():
+        ast.parse(source)
+        assert "auto_tile" not in source and "auto_fuse" not in source
+    assert "@pl.inline" in sources.rms_norm.source
+    assert "@pl.inline" in sources.lm_head.source
+    assert "torch" not in sources.orchestration_source.lower()
+    assert "from generated_qwen_rms_norm import generated_qwen_rms_norm" in (
+        sources.orchestration_source
+    )
+    assert "from generated_qwen_lm_head import generated_qwen_lm_head" in (
+        sources.orchestration_source
+    )
+    assert (
+        "generated_qwen_rms_norm(hidden_states, norm_weight, normalized)"
+        in sources.orchestration_source
+    )
+    assert (
+        "generated_qwen_lm_head(lm_head_weight, normalized, output)"
+        in sources.orchestration_source
+    )
+    assert "__RMS_" not in sources.orchestration_source
+    assert "__LM_HEAD_" not in sources.orchestration_source
 
 
 @pytest.mark.skipif(

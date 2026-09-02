@@ -23,6 +23,7 @@ from examples.torch_frontend.deepseek_v4 import (
     build_production_mtp_history_projection_branch,
     build_production_mtp_projection_branch,
 )
+from examples.torch_frontend.hybrid_qwen import emit_hybrid_qwen_output_head
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
 )
@@ -504,56 +505,11 @@ def test_separate_qwen_callables_compose_in_native_orchestration(
 
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
-    examples = build_qwen_examples()
-    emitted_by_name: dict[str, EmittedPyPTOCallable] = {}
-    for name in ("qwen3_rms_norm_chunk", "qwen3_lm_head_chunk"):
-        module, args = examples[name]
-        graph = export_and_normalize(module, args)
-        solved = solve_graph(
-            graph,
-            solver_binary=_solver(),
-            solver_workers=2,
-            require_source_codegen=True,
-        )
-        emitted_by_name[name] = emit_pypto_callable(
-            graph,
-            solved.regions[0],
-            function_name=f"generated_{name}",
-        )
-
-    module_names: dict[str, str] = {}
-    for name, emitted in emitted_by_name.items():
-        module_name = re.sub(r"\W", "_", f"generated_{name}_{tmp_path.name}")
-        module_names[name] = module_name
-        (tmp_path / f"{module_name}.py").write_text(emitted.source, encoding="utf-8")
-
-    caller = f"""\
-from {module_names["qwen3_rms_norm_chunk"]} import generated_qwen3_rms_norm_chunk
-from {module_names["qwen3_lm_head_chunk"]} import generated_qwen3_lm_head_chunk
-import pypto.language as pl
-
-
-@pl.program
-class NativeQwenRmsLmHead:
-    @pl.function(type=pl.FunctionType.Orchestration)
-    def main(
-        self,
-        hidden_states: pl.Tensor[[16, 512], pl.BF16],
-        norm_weight: pl.Tensor[[1, 512], pl.FP32],
-        lm_head_weight: pl.Tensor[[192, 512], pl.BF16],
-        output: pl.Out[pl.Tensor[[16, 192], pl.FP32]],
-    ) -> pl.Tensor[[16, 192], pl.FP32]:
-        normalized = pl.create_tensor([16, 512], dtype=pl.BF16)
-        normalized = generated_qwen3_rms_norm_chunk(
-            hidden_states, norm_weight, normalized
-        )
-        output = generated_qwen3_lm_head_chunk(
-            lm_head_weight, normalized, output
-        )
-        return output
-"""
+    sources = emit_hybrid_qwen_output_head(_solver(), solver_workers=2)
+    for name, source in sources.files().items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
     caller_path = tmp_path / "native_qwen_rms_lm_head.py"
-    caller_path.write_text(caller, encoding="utf-8")
+    caller_path.write_text(sources.orchestration_source, encoding="utf-8")
 
     monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
     monkeypatch.syspath_prepend(str(tmp_path))

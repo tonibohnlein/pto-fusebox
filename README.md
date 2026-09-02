@@ -141,6 +141,31 @@ token routing, metadata operations, or dynamic control flow; callers retain
 the original native PyPTO implementation and connect it to the static
 callables through stable normalized value IDs.
 
+#### Hybrid authoring contract
+
+PTO-Fusebox does not extend Torch and does not translate native orchestration
+from Torch. A hybrid program has separate sources with one stable callable ABI:
+
+- hand-authored PyPTO owns runtime loops, dispatch, indirect access, metadata,
+  communication, state, and output placement;
+- an ordinary Torch module specifies only the tensor semantics of a fixed
+  static region; and
+- Fusebox replaces that Torch specification with an explicit scheduled PyPTO
+  callable imported by the native orchestration.
+
+Torch is a build-time specification and is absent from the generated program.
+`examples/torch_frontend/hybrid_qwen.py` demonstrates the arrangement with two
+Torch regions, two generated PyPTO callable modules, and the separately
+hand-authored `hybrid_qwen_orchestration.py.in` caller:
+
+```bash
+python -m examples.torch_frontend.hybrid_qwen \
+  --solver build/mlsys_mixed \
+  --output-dir build/hybrid-qwen
+```
+
+The emitted directory is ordinary PyPTO source and no longer imports Torch.
+
 Unsupported operations remain explicit graph boundaries. The source backend
 replays supported vector, cube, and mixed steps from the selected schedule.
 Vector source covers materialized/pointwise replay, versioned two-pass online

@@ -407,6 +407,54 @@ logical extent through its tensor view or named scalar ABI, but its physical
 tiles, allocations, grid, pipeline, and engine assignment are fixed by the
 serialized Fusebox solution.
 
+### Hybrid source layout
+
+Hybrid authoring does not add decorators, operators, or orchestration semantics
+to Torch/Hugging Face. It keeps three artifacts separate:
+
+| artifact | authored by | role |
+| --- | --- | --- |
+| Native PyPTO module | algorithm developer | Runtime loops, dispatch, valid extents, indirect accesses, communication, state, and calls through stable named ABIs. |
+| Companion Torch module | algorithm developer or imported model code | Tensor semantics for one fixed-shape static scope only. It is consumed at build time. |
+| Generated PyPTO callable | PTO-Fusebox | Explicit fusion boundaries, grids, tiles, buffers, pipelines, engine assignments, and transfers implementing the companion Torch scope. |
+
+The Torch and PyPTO sources are not combined into one syntax tree. Their link is
+the callable ABI: semantic tensor names, physical shapes, dtypes, optional
+runtime logical extents, and returned-value lineage. The generation step is
+equivalent to linking a generated implementation behind an already-authored
+PyPTO call site:
+
+```text
+qwen3.py                         # ordinary Torch, build-time only
+  Qwen3RmsNormChunk
+  Qwen3LmHeadChunk
+        |
+        | torch.export -> normalize -> solve -> emit
+        v
+generated_qwen_rms_norm.py       # ordinary generated PyPTO DSL
+generated_qwen_lm_head.py        # ordinary generated PyPTO DSL
+        ^
+        | stable named callable ABI
+        |
+native_qwen_output_head.py       # hand-authored PyPTO orchestration
+```
+
+`examples/torch_frontend/hybrid_qwen.py` implements this layout. Its companion
+`hybrid_qwen_orchestration.py.in` is native PyPTO source and remains unchanged
+by scheduling except for resolving generated module, function, and ABI argument
+placeholders. The example emits two static callables and links them through one
+PyPTO-owned GM intermediate:
+
+```bash
+python -m examples.torch_frontend.hybrid_qwen \
+  --solver build/mlsys_mixed \
+  --output-dir build/hybrid-qwen
+```
+
+The resulting three files import only PyPTO. A serving model may put the same
+calls inside native runtime loops or dispatch among several generated physical
+frames; neither behavior is represented in or inferred from the Torch modules.
+
 No compiler-integrated AutoFuse pass is required for this path. The generated
 PyPTO source will contain the selected fusion boundaries, grid, propagated
 regions, topological order, physical tiles, loops, pipelines, lifetimes,
