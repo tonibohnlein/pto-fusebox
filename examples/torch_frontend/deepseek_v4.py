@@ -92,7 +92,7 @@ class DeepSeekV4Int8ProjectionBranch(nn.Module):
             .to(torch.int8)
         )
         dequant_scale = torch.reciprocal(quant_scale)
-        accumulator = torch._int_mm(quantized, projection_weight.t())
+        accumulator = torch.ops.aten._int_mm.default(quantized, projection_weight.t())
         return accumulator.float() * dequant_scale * projection_scale
 
 

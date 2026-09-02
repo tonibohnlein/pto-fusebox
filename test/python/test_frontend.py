@@ -951,7 +951,7 @@ def test_explicit_row_quantization_and_int8_matmul_lower_generically() -> None:
                 .to(torch.float16)
                 .to(torch.int8)
             )
-            return torch._int_mm(quantized, weight.t())
+            return torch.ops.aten._int_mm.default(quantized, weight.t())
 
     graph = export_and_normalize(
         QuantizedLinear(),
