@@ -129,8 +129,11 @@ Cube, mixed, multi-step, and non-row dynamic geometry still fail closed.
 `emit_pypto_callable` is the integration-oriented API: it returns one
 module-level `@pl.inline` function with stable named tensor and output
 arguments, ordered normalized value IDs for binding, and optional runtime
-logical-shape metadata. Native PyPTO orchestration imports that function and
-owns loops, metadata, dispatch, and dependencies outside the static region.
+logical-shape metadata. Compiler-generated orchestration locals are namespaced
+by callable, so independently emitted functions can expand in one native
+program without rebinding each other's tiles. Native PyPTO orchestration
+imports that function and owns loops, metadata, dispatch, and dependencies
+outside the static region.
 `emit_pypto_region` remains available when a standalone generated
 `@pl.program` is more convenient.
 `emit_pypto_static_bundle` applies the callable API to every solved region and
@@ -235,8 +238,15 @@ native rounding chain, INT8 matmul with INT32 accumulation, and FP32
 dequantization. It generates fixed physical decode callables and patches only
 the projection import in a copy of the native decode entry point, leaving all
 dynamic attention, MoE, sampling, and distributed orchestration in PyPTO-lib.
-The production overlay and its 128-row prefill branch are source-ready; device
-compilation and silicon comparison are not yet claimed.
+The three production projection branches (hidden decode, history decode and the
+128-row prefill frame) are silicon-closed against independently written
+controls. The composed overlay now has a cross-layer regression that expands
+both generated callables in one native program and compiles all 13 tasks
+through PyPTO. Full-overlay silicon closure remains pending at this revision.
+The previous manually de-collided diagnostic overlay was correct but about
+1.57x slower than the native projection: it retained 13 submissions and 11 GM
+intermediates versus the native implementation's 4 and 6. That is a composition
+and cut-placement optimization target, not a branch-kernel correctness issue.
 An earlier reported residual in the generic attention case was retracted: the
 device harness passed `(query, key, value)` positionally to an emitted
 `(key, query, value)` ABI. Generated source now publishes its ordered normalized

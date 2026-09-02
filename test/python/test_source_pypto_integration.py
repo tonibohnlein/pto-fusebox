@@ -175,6 +175,62 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
     monkeypatch.syspath_prepend(str(model_dir))
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
+
+    caller_path = tmp_path / "flash_mtp_overlay_probe.py"
+    caller_path.write_text(
+        f"""from {overlay.module_name} import mtp_projection
+import pypto.language as pl
+
+
+@pl.program
+class FlashMtpOverlayProbe:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        hidden_states: pl.Tensor[[8, 4096], pl.BF16],
+        prev_hidden_states: pl.Tensor[[8, 4, 4096], pl.FP32],
+        enorm_w: pl.Tensor[[4096], pl.FP32],
+        hnorm_w: pl.Tensor[[4096], pl.FP32],
+        e_proj_w: pl.Tensor[[4096, 4096], pl.INT8],
+        e_proj_w_scale: pl.Tensor[[4096], pl.FP32],
+        e_proj_smooth: pl.Tensor[[4096], pl.FP32],
+        h_proj_w: pl.Tensor[[4096, 4096], pl.INT8],
+        h_proj_w_scale: pl.Tensor[[4096], pl.FP32],
+        h_proj_smooth: pl.Tensor[[4096], pl.FP32],
+        hidden_states_out: pl.Out[pl.Tensor[[8, 4, 4096], pl.FP32]],
+    ) -> pl.Tensor[[8, 4, 4096], pl.FP32]:
+        hidden_states_out = mtp_projection(
+            hidden_states,
+            prev_hidden_states,
+            enorm_w,
+            hnorm_w,
+            e_proj_w,
+            e_proj_w_scale,
+            e_proj_smooth,
+            h_proj_w,
+            h_proj_w_scale,
+            h_proj_smooth,
+            hidden_states_out,
+        )
+        return hidden_states_out
+""",
+        encoding="utf-8",
+    )
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / "flash_mtp_overlay_probe"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 13
+    assert len(orchestration_files) == 1
+    assert orchestration_files[0].read_text(encoding="utf-8").count("rt_submit_") == 13
+
     spec = importlib.util.spec_from_file_location("decode_mtp_fusebox", decode_path)
     assert spec is not None and spec.loader is not None
     loaded = importlib.util.module_from_spec(spec)
@@ -316,8 +372,9 @@ def test_callable_multi_step_cube_preserves_ordered_gm_cut_launches(
     )
     assert len(pto) == 2
     assert orchestration.count("rt_submit_aic_task(") == 2
-    assert "params_t0.add_output(intermediate_tensor_2);" in orchestration
-    assert "params_t1.add_input(intermediate_tensor_2);" in orchestration
+    produced = set(re.findall(r"params_t0\.add_output\(([^)]+)\);", orchestration))
+    consumed = set(re.findall(r"params_t1\.add_input\(([^)]+)\);", orchestration))
+    assert len(produced & consumed) == 1
     assert orchestration.index("rt_submit_aic_task(0") < orchestration.index(
         "rt_submit_aic_task(1"
     )
@@ -629,19 +686,18 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     ], "a V2C pop already lands in Mat; a redundant Mat -> Mat move is illegal"
     assert orchestration.count("rt_submit_task(") == 2
     assert orchestration.count("rt_submit_aiv_task(") == 1
-    assert orchestration.count("add_output(intermediate_tensor_") == 2
-    assert orchestration.count("add_input(intermediate_tensor_") == 2
     produced = {
         tensor: int(task)
         for task, tensor in re.findall(
-            r"params_t(\d+)\.add_output\((intermediate_tensor_\d+)\);",
+            r"params_t(\d+)\.add_output\(([^)]+)\);",
             orchestration,
         )
+        if not tensor.startswith("ext_output")
     }
     consumed = {
         tensor: int(task)
         for task, tensor in re.findall(
-            r"params_t(\d+)\.add_input\((intermediate_tensor_\d+)\);",
+            r"params_t(\d+)\.add_input\(([^)]+)\);",
             orchestration,
         )
     }

@@ -244,11 +244,11 @@ def mtp_projection(
 ):
     hidden_padded = pl.create_tensor([16, 4096], dtype=pl.BF16)
     for hidden_row in pl.spmd(8, name_hint="fusebox_mtp_hidden_copy"):
-        hidden_tile = hidden_states[hidden_row:hidden_row + 1, 0:4096]
-        hidden_padded[hidden_row:hidden_row + 1, 0:4096] = hidden_tile
+        hidden_copy_tile = hidden_states[hidden_row:hidden_row + 1, 0:4096]
+        hidden_padded[hidden_row:hidden_row + 1, 0:4096] = hidden_copy_tile
     for hidden_zero_row in pl.spmd(8, name_hint="fusebox_mtp_hidden_zero"):
-        hidden_tile = pl.full([1, 4096], dtype=pl.BF16, value=0.0)
-        hidden_padded[hidden_zero_row + 8:hidden_zero_row + 9, 0:4096] = hidden_tile
+        hidden_zero_tile = pl.full([1, 4096], dtype=pl.BF16, value=0.0)
+        hidden_padded[hidden_zero_row + 8:hidden_zero_row + 9, 0:4096] = hidden_zero_tile
 
     history_flat = pl.reshape(prev_hidden_states, [32, 4096])
     enorm_2d = pl.reshape(enorm_w, [1, 4096])
@@ -269,9 +269,9 @@ def mtp_projection(
         token = history_row // 4
         hyperconnection = history_row - token * 4
         col = output_chunk * 1024
-        hidden_tile = hidden_projected[token:token + 1, col:col + 1024]
+        hidden_projection_tile = hidden_projected[token:token + 1, col:col + 1024]
         history_tile = history_projected[history_row:history_row + 1, col:col + 1024]
-        combined = pl.add(hidden_tile, history_tile)
+        combined = pl.add(hidden_projection_tile, history_tile)
         output_col = hyperconnection * 4096 + col
         output_flat[token:token + 1, output_col:output_col + 1024] = combined
     return pl.reshape(output_flat, [8, 4, 4096])

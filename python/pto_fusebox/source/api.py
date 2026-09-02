@@ -697,6 +697,7 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
         raise SourceEmissionError("generated main function must start with self")
     function.name = function_name
     function.args.args = function.args.args[1:]
+    _namespace_inline_locals(function, function_name)
     function.decorator_list = [
         ast.Attribute(
             value=ast.Name(id="pl", ctx=ast.Load()),
@@ -714,6 +715,64 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
     if _has_automatic_scheduling_tag(module):
         raise SourceEmissionError("callable source must encode the plan directly")
     return rendered
+
+
+def _namespace_inline_locals(function: ast.FunctionDef, function_name: str) -> None:
+    """Give compiler-generated locals a callable-specific namespace.
+
+    PyPTO expands ``@pl.inline`` functions into their caller.  Two separately
+    generated callables therefore cannot safely reuse orchestration-local
+    names: a later expansion may rebind an earlier tile at a different type.
+    Parameters are the public callable ABI and deliberately remain unchanged.
+    """
+
+    parameters = {
+        argument.arg
+        for argument in (
+            *function.args.posonlyargs,
+            *function.args.args,
+            *function.args.kwonlyargs,
+        )
+    }
+    if function.args.vararg is not None:
+        parameters.add(function.args.vararg.arg)
+    if function.args.kwarg is not None:
+        parameters.add(function.args.kwarg.arg)
+
+    assigned = {
+        node.id
+        for statement in function.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    }
+    locals_to_rename = sorted(assigned - parameters)
+    replacements = {
+        name: _inline_local_name(function_name, name) for name in locals_to_rename
+    }
+    replacement_names = set(replacements.values())
+    if len(replacement_names) != len(replacements) or replacement_names & parameters:
+        raise SourceEmissionError(
+            "callable-local namespace collides with the generated function ABI"
+        )
+
+    class _RenameLocals(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.Name:  # noqa: N802 - AST API.
+            replacement = replacements.get(node.id)
+            if replacement is None:
+                return node
+            return ast.copy_location(
+                ast.Name(id=replacement, ctx=node.ctx),
+                node,
+            )
+
+    for index, statement in enumerate(function.body):
+        function.body[index] = _RenameLocals().visit(statement)
+
+
+def _inline_local_name(function_name: str, local_name: str) -> str:
+    """Return an injective callable/local namespace encoding."""
+
+    return f"fusebox_local_{len(function_name)}_{function_name}_{local_name}"
 
 
 def _add_runtime_valid_shape(  # noqa: PLR0913 -- explicit ABI contract inputs.

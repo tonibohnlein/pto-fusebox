@@ -46,7 +46,11 @@ from pto_fusebox.schedule.schema import (
     VectorSpatialPolicy,
     VectorStreamKind,
 )
-from pto_fusebox.source.api import _append_spmd_statement, _program_as_inline_callable
+from pto_fusebox.source.api import (
+    _append_spmd_statement,
+    _inline_local_name,
+    _program_as_inline_callable,
+)
 from pto_fusebox.source.common import SourceWriter
 from torch import nn
 
@@ -1216,8 +1220,76 @@ def test_callable_source_exposes_the_stable_named_region_abi() -> None:
     standalone_main = next(
         node for node in standalone_class.body if isinstance(node, ast.FunctionDef)
     )
-    assert ast.dump(ast.Module(body=function.body, type_ignores=[])) == ast.dump(
+    standalone_parameters = {argument.arg for argument in standalone_main.args.args}
+    standalone_locals = {
+        node.id
+        for statement in standalone_main.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id not in standalone_parameters
+    }
+    callable_locals = {
+        node.id
+        for statement in function.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id not in {argument.arg for argument in function.args.args}
+    }
+    assert callable_locals == {
+        _inline_local_name(function.name, name) for name in standalone_locals
+    }
+
+    reverse_locals = {
+        _inline_local_name(function.name, name): name for name in standalone_locals
+    }
+
+    class RestoreStandaloneLocals(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.Name:  # noqa: N802 - AST API.
+            restored = reverse_locals.get(node.id)
+            if restored is None:
+                return node
+            return ast.copy_location(ast.Name(id=restored, ctx=node.ctx), node)
+
+    restored_body = [
+        RestoreStandaloneLocals().visit(statement)
+        for statement in copy.deepcopy(function.body)
+    ]
+    assert ast.dump(ast.Module(body=restored_body, type_ignores=[])) == ast.dump(
         ast.Module(body=standalone_main.body, type_ignores=[])
+    )
+
+
+def test_separately_emitted_callables_have_disjoint_local_namespaces() -> None:
+    module, args = build_examples()["attention_core"]
+    graph, result = _solve_module(module, args)
+    hidden = emit_pypto_callable(graph, result, function_name="hidden_projection")
+    history = emit_pypto_callable(graph, result, function_name="history_projection")
+
+    def local_bindings(emitted_source: str) -> set[str]:
+        function = next(
+            node
+            for node in ast.parse(emitted_source).body
+            if isinstance(node, ast.FunctionDef)
+        )
+        parameters = {argument.arg for argument in function.args.args}
+        return {
+            node.id
+            for statement in function.body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id not in parameters
+        }
+
+    hidden_locals = local_bindings(hidden.source)
+    history_locals = local_bindings(history.source)
+    assert hidden_locals
+    assert history_locals
+    assert hidden_locals.isdisjoint(history_locals)
+    assert tuple(argument.name for argument in hidden.input_arguments) == tuple(
+        argument.name for argument in history.input_arguments
     )
 
 
@@ -1245,9 +1317,12 @@ def test_callable_source_preserves_a_multi_step_task_graph() -> None:
 
     assert emitted.kinds == (KernelKind.CUBE, KernelKind.CUBE)
     assert emitted.source.count("pl.spmd(") == 2
-    assert "intermediate_tensor_2 = pl.create_tensor" in emitted.source
-    assert emitted.source.index("for step_0_region_index") < emitted.source.index(
-        "for step_1_region_index"
+    intermediate = _inline_local_name(emitted.function_name, "intermediate_tensor_2")
+    step_0_index = _inline_local_name(emitted.function_name, "step_0_region_index")
+    step_1_index = _inline_local_name(emitted.function_name, "step_1_region_index")
+    assert f"{intermediate} = pl.create_tensor" in emitted.source
+    assert emitted.source.index(f"for {step_0_index}") < emitted.source.index(
+        f"for {step_1_index}"
     )
 
 
@@ -1338,14 +1413,25 @@ def test_callable_runtime_valid_shape_rejects_schedule_defining_variation() -> N
             vector_result,
             runtime_valid_shape=RuntimeValidShapeSpec(axis=1),
         )
-    with pytest.raises(
-        SourceEmissionError, match="collides with a generated function identifier"
-    ):
-        emit_pypto_callable(
-            vector_graph,
-            vector_result,
-            runtime_valid_shape=RuntimeValidShapeSpec(argument_name="region_index"),
-        )
+    namespaced = emit_pypto_callable(
+        vector_graph,
+        vector_result,
+        runtime_valid_shape=RuntimeValidShapeSpec(argument_name="region_index"),
+    )
+    namespaced_function = next(
+        node
+        for node in ast.parse(namespaced.source).body
+        if isinstance(node, ast.FunctionDef)
+    )
+    assert "region_index" in {
+        argument.arg for argument in namespaced_function.args.args
+    }
+    assert "region_index" not in {
+        node.id
+        for statement in namespaced_function.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
 
     mixed_module, mixed_args = build_examples()["attention_core"]
     mixed_graph, mixed_result = _solve_module(mixed_module, mixed_args)
