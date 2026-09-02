@@ -404,7 +404,7 @@ def test_flash_mtp_native_tail_fails_closed_on_semantic_drift() -> None:
         return mutated, replace(solved, graph=mutated, regions=tuple(regions))
 
     slice_attrs = dict(graph.op_map()["op0048"].attributes)
-    for position, value in ((2, 1), (3, 7)):
+    for position, value in ((2, 1), (2, 8), (3, 7), (3, 16)):
         literal_args = slice_attrs["literal_args"]
         assert isinstance(literal_args, list)
         literals = []
@@ -421,6 +421,48 @@ def test_flash_mtp_native_tail_fails_closed_on_semantic_drift() -> None:
                 native_decode_source=native,
             )
 
+    same_shape_args = slice_attrs["literal_args"]
+    assert isinstance(same_shape_args, list)
+    same_shape_literals = []
+    for item in same_shape_args:
+        assert isinstance(item, dict)
+        same_shape_literals.append(dict(item))
+    next(item for item in same_shape_literals if item["position"] == 2)["value"] = 8
+    next(item for item in same_shape_literals if item["position"] == 3)["value"] = 16
+    mutated, mutated_result = mutate_op(
+        "op0048",
+        attributes={**slice_attrs, "literal_args": same_shape_literals},
+    )
+    with pytest.raises(SourceEmissionError, match="slice must select rows"):
+        emit_flash_mtp_decode_projection_overlay(
+            mutated,
+            mutated_result,
+            native_decode_source=native,
+        )
+
+    reshape = graph.op_map()["op0050"]
+    reshape_attrs = dict(reshape.attributes)
+    reshape_literals = reshape_attrs["literal_args"]
+    assert isinstance(reshape_literals, list)
+    mutated_reshape_literals = []
+    for item in reshape_literals:
+        assert isinstance(item, dict)
+        mutated_reshape_literals.append(dict(item))
+    mutated_reshape_literals[0]["value"] = [16, 8192]
+    mutated, mutated_result = mutate_op(
+        "op0050",
+        attributes={
+            **reshape_attrs,
+            "literal_args": mutated_reshape_literals,
+        },
+    )
+    with pytest.raises(SourceEmissionError, match="reshape must produce"):
+        emit_flash_mtp_decode_projection_overlay(
+            mutated,
+            mutated_result,
+            native_decode_source=native,
+        )
+
     hidden_output = graph.op_map()["op0048"].inputs[0]
     mutated, mutated_result = mutate_op("op0050", inputs=(hidden_output,))
     with pytest.raises(SourceEmissionError, match="branch outputs"):
@@ -431,13 +473,40 @@ def test_flash_mtp_native_tail_fails_closed_on_semantic_drift() -> None:
         )
 
     add = graph.op_map()["op0051"]
-    mutated, mutated_result = mutate_op("op0051", inputs=tuple(reversed(add.inputs)))
-    with pytest.raises(SourceEmissionError, match="value lineage is stale"):
-        emit_flash_mtp_decode_projection_overlay(
-            mutated,
-            mutated_result,
-            native_decode_source=native,
-        )
+    for inputs in (tuple(reversed(add.inputs)), (add.inputs[1], add.inputs[1])):
+        mutated, mutated_result = mutate_op("op0051", inputs=inputs)
+        with pytest.raises(SourceEmissionError, match="value lineage is stale"):
+            emit_flash_mtp_decode_projection_overlay(
+                mutated,
+                mutated_result,
+                native_decode_source=native,
+            )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_rank_one_rmsnorm_weight_lifts_to_a_row_broadcast_abi() -> None:
+    module, args = build_deepseek_examples()["deepseek_v4_rmsnorm"]
+    graph = export_and_normalize(module, args)
+    weight = next(value for value in graph.values if value.name == "p_weight")
+    assert weight.shape == (1024,)
+
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.whole_graph_codegen_ready
+    assert len(solved.regions) == 1
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="deepseek_v4_rmsnorm",
+    )
+    assert "arg_p_weight: pl.Tensor[[1, 1024], pl.FP32]" in emitted.source
+    assert "pl.col_expand_mul" in emitted.source
 
 
 @pytest.mark.skipif(

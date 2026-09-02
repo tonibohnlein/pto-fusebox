@@ -679,11 +679,18 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
             orchestration,
         )
     }
-    assert produced.keys() == consumed.keys()
-    assert len(produced) == 2
-    assert set(produced.values()) == {0, 1}
-    assert set(consumed.values()) == {2}
-    assert all(produced[tensor] < consumed[tensor] for tensor in produced)
+    solver_cuts = set(produced) & set(consumed)
+    compiler_pipe_buffers = {
+        tensor for tensor in produced if tensor.startswith("gm_pipe_buffer_")
+    }
+    external_inputs = set(consumed) - set(produced)
+    assert set(produced) == solver_cuts | compiler_pipe_buffers
+    assert not compiler_pipe_buffers & set(consumed)
+    assert all(tensor.startswith("ext_arg_") for tensor in external_inputs)
+    assert len(solver_cuts) == 2
+    assert {produced[tensor] for tensor in solver_cuts} == {0, 1}
+    assert {consumed[tensor] for tensor in solver_cuts} == {2}
+    assert all(produced[tensor] < consumed[tensor] for tensor in solver_cuts)
 
 
 @pytest.mark.parametrize(

@@ -507,8 +507,13 @@ def _emit_streaming_softmax_v2c(  # noqa: PLR0915 -- typed phase replay.
             old_max=running_max,
             old_sum=running_sum,
         )
-        writer.line(4, f"{running_max} = {tail_max}")
-        writer.line(4, f"{running_sum} = {tail_sum}")
+        # Keep the split-tracked tail results as the apply-phase operands.
+        # Emitting a plain Python alias assignment here creates a fresh SSA
+        # value with the original full-row type; LowerAutoVectorSplit can no
+        # longer prove that it is the per-lane half and correctly rejects the
+        # later row expansion.  Referring to the actual tail definitions keeps
+        # the split lineage intact without adding work or storage.
+        running_max, running_sum = tail_max, tail_sum
 
     output_dtype = pypto_dtype(context.lowered.tensor(sink.outputs[0]).dtype)
     writer.line(

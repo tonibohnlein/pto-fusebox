@@ -304,7 +304,9 @@ Softmax is decomposed into its ordinary max/sub/exp/sum/div tensor DAG. The
 graph also carries the exact P4 op set and semantically named substitutions
 that permit the existing online softmax implementation. There is no attention, RMSNorm, or
 model-name recognizer. Mean is similarly lowered to sum plus reciprocal
-multiplication, and linear becomes matmul plus optional broadcast bias.
+multiplication, and linear becomes matmul plus optional broadcast bias. Static rank-one
+row-broadcast inputs such as an RMSNorm weight `[N]` retain their normalized identity but are
+rendered in the PyPTO source ABI using the solver-equivalent `[1, N]` geometry.
 
 Ascend 910B admission keeps FP16/FP32 vector arithmetic, BF16 storage/cube/cast
 endpoints, and the supported cube dtypes distinct. It accepts dense storage at

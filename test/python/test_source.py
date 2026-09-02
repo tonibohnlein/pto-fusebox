@@ -2071,6 +2071,10 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     assert source.count("pl.tensor.matmul_acc(") == 2
     assert "apply_tail" in source
     assert f"valid_shape=[16, {apply_phase.tail.extent}]" in source
+    assert "stats_result_max = stats_tail_next_max" not in source
+    assert "stats_result_sum = stats_tail_next_sum" not in source
+    assert "pl.tensor.row_expand_sub(apply_input, stats_tail_next_max)" in source
+    assert "pl.tensor.row_expand_div(apply_tensor_3, stats_tail_next_sum)" in source
 
 
 def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:

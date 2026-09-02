@@ -357,24 +357,35 @@ def solver_tensor_for_value(lowered: LoweredRegion, value_id: str) -> int:
 
 
 def tensor_type(value: NormalizedValue) -> str:
-    """Render one static rank-2 PyPTO tensor type."""
+    """Render one static PyPTO tensor type in solver-owned rank-two geometry."""
 
     rows, cols = static_shape(value, field=value.id)
     return f"pl.Tensor[[{rows}, {cols}], {pypto_dtype(value.dtype)}]"
 
 
 def static_shape(value: NormalizedValue, *, field: str) -> tuple[int, int]:
-    """Return a static rank-2 shape or fail closed."""
+    """Return the static rank-two geometry consumed by the source backend.
 
-    if len(value.shape) != 2 or any(
+    The analytic solver represents a rank-one ``[N]`` value as the row vector
+    ``[1, N]``.  Preserve that same geometry in the generated PyPTO ABI so a
+    rank-one row-broadcast operand does not become source-infeasible after it
+    has already been admitted and priced correctly.
+    """
+
+    if len(value.shape) not in {1, 2} or any(
         isinstance(dim, ShapeDimension) for dim in value.shape
     ):
         raise SourceEmissionError(
-            f"source v1 requires a static rank-2 value, got {field}"
+            f"source v1 requires a static rank-1 or rank-2 value, got {field}"
         )
-    rows, cols = value.shape
-    if not isinstance(rows, int) or not isinstance(cols, int):
+    if not all(isinstance(dim, int) for dim in value.shape):
         raise SourceEmissionError(f"source v1 requires static dimensions for {field}")
+    if len(value.shape) == 1:
+        (cols,) = value.shape
+        assert isinstance(cols, int)
+        return 1, cols
+    rows, cols = value.shape
+    assert isinstance(rows, int) and isinstance(cols, int)
     return rows, cols
 
 
