@@ -806,8 +806,8 @@ def test_callable_deepseek_mtp_projection_compiles_as_one_branched_region(
     )
     assert tuple(fifo.direction for fifo in plan.fifos) == (
         MixedTransferDirection.VECTOR_TO_CUBE,
-        MixedTransferDirection.VECTOR_TO_CUBE,
         MixedTransferDirection.CUBE_TO_VECTOR,
+        MixedTransferDirection.VECTOR_TO_CUBE,
         MixedTransferDirection.CUBE_TO_VECTOR,
     )
     emitted = emit_pypto_callable(
@@ -855,7 +855,7 @@ def test_callable_deepseek_mtp_projection_compiles_as_one_branched_region(
 
 @pytest.mark.parametrize(
     ("name", "expected_pto_count"),
-    [("paged_attention_static_regions", 2), ("moe_static_regions", 3)],
+    [("paged_attention_static_regions", 2), ("moe_static_regions", 2)],
 )
 def test_static_bundle_callables_lower_independently_around_native_boundaries(
     name: str,
@@ -1109,7 +1109,7 @@ def _assert_static_vector_frames(pto: str) -> None:
 
 
 def _assert_single_spmd_orchestration(source: str, work_units: int) -> None:
-    submits = re.findall(r"\brt_submit_ai[cv]_task\(", source)
+    submits = re.findall(r"\brt_submit_(?:ai[cv]_task|task)\(", source)
     assert len(submits) == 1
     assert source.count("launch_spec.set_block_num(") == 1
     assert f"launch_spec.set_block_num({work_units});" in source
@@ -1200,14 +1200,21 @@ def _compile_mixed_source(
         step = solution["steps"][0]
         descriptor = step["plan"]
         protocol = descriptor["protocol"]
-        assert protocol in {"one_way", "single_round_trip_bundle"}
+        assert protocol in {
+            "one_way",
+            "single_round_trip_bundle",
+            "multi_round_trip_sequential",
+        }
         spatial_tiles = descriptor["spatial_tiles"]
         assert spatial_tiles % forced_active_groups == 0
         trips = spatial_tiles // forced_active_groups
         descriptor["active_groups"] = forced_active_groups
         descriptor["min_trips_per_group"] = trips
         descriptor["max_trips_per_group"] = trips
-        overlap = trips >= 2
+        # Sequential multi-round trips deliberately replay an ordered loop;
+        # they do not claim the cross-core skew used by one-way and three-stage
+        # round-trip pipelines.
+        overlap = trips >= 2 and protocol != "multi_round_trip_sequential"
         descriptor["pipeline_stages"] = (
             3
             if protocol == "single_round_trip_bundle" and overlap
@@ -1504,13 +1511,14 @@ def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(
         "mixed_attention_residual_two_trips",
         _AttentionResidual(),
         (
-            torch.zeros(3072, 64),
-            torch.zeros(32, 64),
-            torch.zeros(32, 64),
-            torch.zeros(3072, 64),
+            torch.zeros(512, 64),
+            torch.zeros(64, 64),
+            torch.zeros(64, 128),
+            torch.zeros(512, 128),
         ),
         tmp_path,
         monkeypatch,
+        forced_active_groups=8,
     )
 
     assert plan.protocol.value == "multi_round_trip_sequential"

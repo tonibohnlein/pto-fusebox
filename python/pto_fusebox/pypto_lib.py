@@ -619,7 +619,7 @@ def rms_lm_head_fp32(
                 static_output,
                 [0, output_col],
                 [16, 192],
-                valid_shapes=[valid_rows, 192],
+                valid_shape=[valid_rows, 192],
                 target_memory=pl.MemorySpace.Vec,
             )
             pl.store(output_tile, [row_offset, output_col], out)

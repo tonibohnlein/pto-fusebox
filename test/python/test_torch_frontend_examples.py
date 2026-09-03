@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import math
 import os
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -367,7 +368,7 @@ def test_production_qwen_output_head_overlay_preserves_native_window_abi() -> No
     assert "pl.Tensor[[16, 5120], pl.FP32]" in overlay.source
     assert "pl.Tensor[[152064, 5120], pl.BF16]" in overlay.source
     assert "static_output = pl.create_tensor([16, 152064]" in overlay.source
-    assert "valid_shapes=[valid_rows, 192]" in overlay.source
+    assert "valid_shape=[valid_rows, 192]" in overlay.source
     assert "pl.store(output_tile, [row_offset, output_col], out)" in overlay.source
     assert overlay.decode_source == (
         "from rms_lm_head import rms_lm_head\n"
@@ -1392,6 +1393,22 @@ def test_deepseek_mtp_projection_emits_one_generic_branched_region() -> None:
     assert emitted.source.count("pl.cross_core_pipe(") == 4
     assert emitted.source.count("pl.CrossCoreDirection.VECTOR_TO_CUBE") == 2
     assert emitted.source.count("pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
+    pipe_specs = re.findall(r"pl\.cross_core_pipe\(([^)]*)\)", emitted.source)
+    assert [
+        int(match.group(1))
+        for spec in pipe_specs
+        if (match := re.search(r"\bpipe_id=([0-9]+)", spec)) is not None
+    ] == [0, 2, 1, 3]
+    assert [
+        match.group(1)
+        for spec in pipe_specs
+        if (
+            match := re.search(
+                r"CrossCoreDirection\.(VECTOR_TO_CUBE|CUBE_TO_VECTOR)", spec
+            )
+        )
+        is not None
+    ] == ["VECTOR_TO_CUBE", "VECTOR_TO_CUBE", "CUBE_TO_VECTOR", "CUBE_TO_VECTOR"]
     assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
 
 

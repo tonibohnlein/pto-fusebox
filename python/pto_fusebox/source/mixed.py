@@ -135,19 +135,26 @@ def _mixed_header(
     context: EmissionContext,
     program_name: str,
     plan: MixedKernelPlan,
+    *,
+    fifo_indices: tuple[int, ...] | None = None,
 ) -> SourceWriter:
     direction = {
         MixedTransferDirection.CUBE_TO_VECTOR: "pl.CrossCoreDirection.CUBE_TO_VECTOR",
         MixedTransferDirection.VECTOR_TO_CUBE: "pl.CrossCoreDirection.VECTOR_TO_CUBE",
     }
     optimizations = ["pl.split(pl.SplitMode.UP_DOWN)"]
+    ordered_fifos = (
+        plan.fifos
+        if fifo_indices is None
+        else tuple(plan.fifos[index] for index in fifo_indices)
+    )
     optimizations.extend(
         "pl.cross_core_pipe("
         f"tensor_id={fifo.tensor}, direction={direction[fifo.direction]}, "
         f"valid_shape=[{fifo.valid_rows}, {fifo.valid_cols}], "
         f"slot_size_bytes={fifo.slot_bytes}, slot_num={fifo.slot_count}, "
         f"pipe_id={fifo.pipe_id}, bundle={fifo.bundle})"
-        for fifo in plan.fifos
+        for fifo in ordered_fifos
     )
     writer = program_preamble(program_name, context.interface, context.graph)
     writer.line(
@@ -1150,7 +1157,16 @@ def _emit_branched_round_trip(
             "branched round-trip sink does not produce the region output"
         )
 
-    writer = _mixed_header(context, program_name, plan)
+    # PyPTO discovers split boundaries bundle-by-bundle: all producer
+    # crossings first, followed by their replies.  The typed plan keeps FIFOs
+    # aligned with topologically ordered transfers, so serialize the explicit
+    # descriptors in PyPTO's boundary order without changing their pipe IDs.
+    writer = _mixed_header(
+        context,
+        program_name,
+        plan,
+        fifo_indices=(*producer_bundle, *reply_bundle),
+    )
     output = context.interface.output_argument
     trip_loop = "pl.pipeline" if plan.pipeline_stages == 3 else "pl.range"
     trip_stage = ", stage=3" if plan.pipeline_stages == 3 else ""
