@@ -17,6 +17,7 @@ DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_DECODE_TOKENS = 8
 DEEPSEEK_V4_LINEAR_TOKENS = 16
 DEEPSEEK_V4_PREFILL_TOKENS = 128
+DEEPSEEK_V4_DSPARK_TARGET_LAYERS = 3
 
 
 class DeepSeekV4RmsNorm(nn.Module):
@@ -29,6 +30,29 @@ class DeepSeekV4RmsNorm(nn.Module):
         wide = value.float()
         inverse_rms = torch.rsqrt((wide * wide).mean(dim=-1, keepdim=True) + self.eps)
         return (wide * inverse_rms * self.weight).to(value.dtype)
+
+
+class DeepSeekV4DsparkProjection(nn.Module):
+    """Production-shape DSpark target projection followed by RMSNorm."""
+
+    def __init__(self, hidden_size: int, target_layers: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        input_size = hidden_size * target_layers
+        self.main_projection = nn.Parameter(
+            torch.empty(hidden_size, input_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.norm_weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.eps = eps
+
+    def forward(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        projected = torch.mm(main_hidden, self.main_projection.t()).to(torch.bfloat16)
+        wide = projected.float()
+        inverse_rms = torch.rsqrt((wide * wide).mean(dim=-1, keepdim=True) + self.eps)
+        return (wide * inverse_rms * self.norm_weight.float()).to(torch.bfloat16)
 
 
 class DeepSeekV4MtpProjection(nn.Module):
@@ -94,6 +118,23 @@ class DeepSeekV4Int8ProjectionBranch(nn.Module):
         dequant_scale = torch.reciprocal(quant_scale)
         accumulator = torch.ops.aten._int_mm.default(quantized, projection_weight.t())
         return accumulator.float() * dequant_scale * projection_scale
+
+
+def build_production_dspark_projection() -> Example:
+    """Return the full fixed decode DSpark projection-to-RMSNorm DAG."""
+
+    input_size = DEEPSEEK_V4_HIDDEN * DEEPSEEK_V4_DSPARK_TARGET_LAYERS
+    with torch.device("meta"):
+        module = DeepSeekV4DsparkProjection(
+            DEEPSEEK_V4_HIDDEN,
+            DEEPSEEK_V4_DSPARK_TARGET_LAYERS,
+        )
+        main_hidden = torch.empty(
+            DEEPSEEK_V4_LINEAR_TOKENS,
+            input_size,
+            dtype=torch.bfloat16,
+        )
+    return module, (main_hidden,)
 
 
 class DeepSeekV4Int8MtpProjection(nn.Module):

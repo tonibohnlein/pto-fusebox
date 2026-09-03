@@ -1849,6 +1849,92 @@ static void test_mixed_schedule_plan() {
               plan.topology->protocol.peer_engine == MixedEngine::Cube &&
               plan.topology->protocol.skew_pass_compatible && plan.topology->sink_runs_early_stage &&
               !plan.pipeline_fill_absorbed);
+
+    p.require_source_codegen = true;
+    DAG source_dag = DAG::build(p);
+    auto source_mixed = Ascend910BMixed::create(p, source_dag, {0, 1, 2});
+    CHECK("MIXPLAN: V->C->V is source-buildable without a workload recognizer",
+          (bool)source_mixed);
+    if (source_mixed) {
+      auto source_plan = source_mixed->mixed_schedule_plan(
+          TileConfig{64, 64, 128, 2, 2, 1});
+      CHECK("MIXPLAN: V->C->V source plan carries symmetric typed crossings",
+            source_plan.feasible && source_plan.emit_compatible &&
+                source_plan.source_codegen_ready &&
+                source_plan.stages.size() == 3 &&
+                source_plan.stages[0].engine == MixedEngine::Vector &&
+                source_plan.stages[1].engine == MixedEngine::Cube &&
+                source_plan.stages[2].engine == MixedEngine::Vector &&
+                source_plan.fifos.size() == 2 &&
+                source_plan.fifos[0].direction ==
+                    MixedTransferDirection::VectorToCube &&
+                source_plan.fifos[1].direction ==
+                    MixedTransferDirection::CubeToVector &&
+                source_plan.fifos[0].valid_rows == 64 &&
+                source_plan.fifos[0].valid_cols == 128 &&
+                source_plan.fifos[1].valid_rows == 64 &&
+                source_plan.fifos[1].valid_cols == 64);
+    }
+  }
+
+  // Two independent vector producers may feed two cube peers whose results
+  // join in one vector sink. This is a generic bundled topology, not the
+  // dense-SwiGLU recognizer: operation semantics and names are irrelevant.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq, sq, sq, sq, sq};
+    p.ops = {{OT::Pointwise, {0}, {2}},
+             {OT::Pointwise, {1}, {3}},
+             {OT::MatMul, {2, 4}, {6}},
+             {OT::MatMul, {3, 5}, {7}},
+             {OT::Pointwise, {6, 7}, {8}}};
+    p.fast_memory_capacity = 1 << 26;
+    p.require_source_codegen = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4});
+    CHECK("MIXPLAN: branched V,V->C,C->V topology is classified generically",
+          (bool)mixed);
+    if (mixed) {
+      auto plan = mixed->mixed_schedule_plan(
+          TileConfig{64, 64, 128, 2, 2, 1});
+      CHECK("MIXPLAN: branched round trip serializes both typed FIFO bundles",
+            plan.feasible && plan.emit_compatible &&
+                plan.source_codegen_ready &&
+                plan.protocol ==
+                    MixedCrossCoreProtocol::BranchedRoundTripBundle &&
+                plan.stages.size() == 5 && plan.fifos.size() == 4 &&
+                plan.topology->protocol.producer_bundle_transfers.size() == 2 &&
+                plan.topology->protocol.reply_bundle_transfers.size() == 2 &&
+                plan.fifos[0].bundle == 0 && plan.fifos[1].bundle == 0 &&
+                plan.fifos[2].bundle == 1 && plan.fifos[3].bundle == 1);
+    }
+  }
+
+  // The protocol classifier is intentionally engine-symmetric for analytic
+  // exploration, but source readiness must not advertise the inverse until a
+  // C,C->V,V->C renderer owns its reply/FIFO contract.  The final sink is
+  // cube here, unlike the emitted V,V->C,C->V form above.
+  {
+    Problem p;
+    p.tensors = {sq, sq, sq, sq, sq, sq, sq};
+    p.ops = {{OT::MatMul, {0, 1}, {2}},
+             {OT::MatMul, {0, 1}, {3}},
+             {OT::Pointwise, {2}, {4}},
+             {OT::Pointwise, {3}, {5}},
+             {OT::MatMul, {4, 5}, {6}}};
+    p.fast_memory_capacity = 1 << 26;
+    p.require_source_codegen = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4});
+    CHECK("MIXPLAN: inverse branched topology remains analyzable", (bool)mixed);
+    if (mixed) {
+      const auto plan = mixed->mixed_schedule_plan(
+          TileConfig{64, 64, 128, 2, 2, 1});
+      CHECK("MIXPLAN: inverse branched topology is analytic-only for source",
+            !plan.source_codegen_ready);
+    }
   }
 
   // Alternation depth alone is insufficient: two vector branches create two
@@ -1901,9 +1987,10 @@ static void test_mixed_schedule_plan() {
     }
   }
 
-  // Dense decoder MLP: two homogeneous cube projections, one homogeneous
-  // vector SwiGLU chain, and a final cube projection joined by three standard
-  // mixed FIFOs. Candidate k is the temporal intermediate-feature chunk.
+  // Generic feature round trip: two homogeneous cube projections, one
+  // homogeneous vector DAG, and a final cube projection joined by three
+  // standard mixed FIFOs. Candidate k is the temporal feature chunk; no
+  // workload recognizer participates in admission.
   {
     Problem p;
     p.tensors = {
@@ -1947,19 +2034,23 @@ static void test_mixed_schedule_plan() {
     set_910b(p);
     DAG dag = DAG::build(p);
     auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
-    CHECK("MIXPLAN: dense SwiGLU MLP is admitted", (bool)mixed);
+    CHECK("MIXPLAN: feature round trip is admitted", (bool)mixed);
     if (mixed) {
       const TileConfig cfg{64, 16, 32, 2, 1, 1};
       const MixedSchedulePlan plan = mixed->mixed_schedule_plan(cfg);
       const CostResult cost = mixed->compute_cost(cfg);
-      CHECK("MIXPLAN: dense MLP composes four homogeneous stages",
-            plan.feasible && plan.emit_compatible && plan.algorithm == MixedAlgorithmKind::DenseSwiGluMlp &&
+      CHECK("MIXPLAN: feature round trip composes homogeneous stages",
+            plan.feasible && plan.emit_compatible &&
+                plan.algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip &&
                 plan.topology && plan.topology->stages.size() == 4 && plan.stages.size() == 4 &&
                 plan.stages[0].engine == MixedEngine::Cube && plan.stages[1].engine == MixedEngine::Cube &&
                 plan.stages[2].engine == MixedEngine::Vector && plan.stages[3].engine == MixedEngine::Cube &&
                 plan.stages[2].vector_stream.feasible);
-      CHECK("MIXPLAN: dense MLP owns the feature loop and FIFO bundles",
-            plan.dense_mlp.present && plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
+      CHECK("MIXPLAN: generic round trip owns the feature loop and FIFO bundles",
+            plan.feature_round_trip.present &&
+                plan.feature_round_trip.producer_window_k ==
+                    std::vector<int64_t>({64, 64}) &&
+                plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
                 plan.cube_stage_peak_l1_bytes == 12288 &&
                 plan.topology->protocol.skew_pass_compatible &&
                 plan.topology->protocol.producer_stages == std::vector<size_t>({0, 1}) &&
@@ -1972,9 +2063,71 @@ static void test_mixed_schedule_plan() {
                 plan.fifos[1].bundle == 0 && plan.fifos[2].bundle == 1 &&
                 plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
                 plan.fifos[2].direction == MixedTransferDirection::VectorToCube);
-      CHECK("MIXPLAN: dense MLP cost is finite and grants only realizable overlap",
+      CHECK("MIXPLAN: feature cost is finite and grants only realizable overlap",
             cost.feasible && std::isfinite(cost.latency) && plan.model_overlap_granted &&
                 plan.model_overlap_granted == plan.overlap_implementable);
+
+      // Enumerate every set partition of the four homogeneous stage atoms.
+      // Invalid/disconnected groups are discarded by Subgraph::create; every
+      // remaining grouping is priced with its real GM boundaries. This is the
+      // small exhaustive discriminator that the local partition search must
+      // agree with for the source-oriented feature mechanism.
+      const std::array<std::vector<size_t>, 4> atoms = {
+          std::vector<size_t>{0}, std::vector<size_t>{1},
+          std::vector<size_t>{2, 3, 4, 5, 6, 7, 8},
+          std::vector<size_t>{9}};
+      std::vector<std::vector<std::vector<size_t>>> partitions;
+      std::vector<std::vector<size_t>> blocks;
+      auto enumerate_partitions = [&](auto&& self, size_t atom) -> void {
+        if (atom == atoms.size()) {
+          partitions.push_back(blocks);
+          return;
+        }
+        for (size_t block = 0; block < blocks.size(); ++block) {
+          blocks[block].push_back(atom);
+          self(self, atom + 1);
+          blocks[block].pop_back();
+        }
+        blocks.push_back({atom});
+        self(self, atom + 1);
+        blocks.pop_back();
+      };
+      enumerate_partitions(enumerate_partitions, 0);
+      double best_partition_cost = std::numeric_limits<double>::infinity();
+      size_t best_partition_groups = 0;
+      size_t valid_partitions = 0;
+      for (const auto& partition : partitions) {
+        double partition_cost = 0.0;
+        bool valid = true;
+        for (const auto& block : partition) {
+          std::vector<size_t> ops;
+          for (size_t atom : block) {
+            ops.insert(ops.end(), atoms[atom].begin(), atoms[atom].end());
+          }
+          auto candidate = Subgraph::create(p, dag, ops);
+          if (!candidate) {
+            valid = false;
+            break;
+          }
+          const CostResult candidate_cost = candidate->best_cost();
+          if (!candidate_cost.feasible) {
+            valid = false;
+            break;
+          }
+          partition_cost += candidate_cost.latency;
+        }
+        if (!valid) continue;
+        ++valid_partitions;
+        if (partition_cost < best_partition_cost) {
+          best_partition_cost = partition_cost;
+          best_partition_groups = partition.size();
+        }
+      }
+      const CostResult best_fused_cost = mixed->best_cost();
+      CHECK("MIXPLAN: feature fusion is compared with every valid GM cut",
+            valid_partitions > 1 && best_partition_groups == 1 &&
+                best_fused_cost.feasible &&
+                std::abs(best_partition_cost - best_fused_cost.latency) < 1e-6);
 
       Problem tight_l1 = p;
       tight_l1.l1_capacity = 14 * 1024;
@@ -1990,14 +2143,20 @@ static void test_mixed_schedule_plan() {
     Problem escaped = p;
     escaped.required_outputs.insert(4);
     DAG escaped_dag = DAG::build(escaped);
-    CHECK("MIXPLAN: escaped gate result declines dense MLP fusion",
+    CHECK("MIXPLAN: escaped producer result declines feature fusion",
           !Ascend910BMixed::create(escaped, escaped_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}).has_value());
 
     Problem miswired = p;
     miswired.ops[6].inputs = {5, 9};
     DAG miswired_dag = DAG::build(miswired);
-    CHECK("MIXPLAN: non-SwiGLU dataflow declines dense MLP fusion",
-          !Ascend910BMixed::create(miswired, miswired_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}).has_value());
+    auto generic_feature = Ascend910BMixed::create(
+        miswired, miswired_dag, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    CHECK("MIXPLAN: alternate pointwise DAG uses the generic feature mechanism",
+          generic_feature &&
+              generic_feature
+                      ->mixed_schedule_plan(TileConfig{64, 16, 32, 2, 1, 1})
+                      .algorithm ==
+                  MixedAlgorithmKind::FeatureChunkRoundTrip);
   }
 
   // Analytic V->C vector-input traffic is request-role aware. A value
@@ -4025,19 +4184,25 @@ static void test_vector_streaming_reduction() {
           str > 2.0 * mat && str < 3.5 * mat);
 }
 
-// --- G1/P4: streamed MULTI-reduction buildability is candidate-local ----------
-// In buildable mode a streamed >1-reduction group is infeasible unless its COMPLETE op set is an
-// exact P4 pattern supplied by the IR adapter. The analytic override retains the historical
-// model-ahead behaviour for standalone research instances.
+// --- G1/P4: named algorithms and generic multi-pass stay distinct -------------
+// Source-oriented mode can now replay an arbitrary dependency-derived sequence
+// of reductions. An exact P4 pattern remains a separate, more efficient online
+// algorithm and never leaks to a different subgroup.
 static void test_g1_multi_reduction_stream_decline() {
     std::cout << "[G1/P4] streamed multi-reduction requires an exact candidate pattern\n";
     Problem p = mk_softmax(32768, 128);   // 2 reductions (max, sum), streams (huge reduced W)
     DAG dag = DAG::build(p);
     CHECK("G1: analytic mode prices streamed softmax feasible (model-ahead, assumes P4)",
           std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
-    p.allow_model_ahead_multi_reduction_stream = false;  // buildable: no P4 emit yet
-    CHECK("G1: buildable mode marks streamed softmax INfeasible (partitioner must cut it)",
-          !std::isfinite(Subgraph::create(p, dag, {0, 1, 2, 3})->best_cost().latency));
+    p.allow_model_ahead_multi_reduction_stream = false;
+    auto generic_softmax_sg = Subgraph::create(p, dag, {0, 1, 2, 3});
+    const auto generic_softmax = generic_softmax_sg->best_cost();
+    const auto generic_stream =
+        generic_softmax_sg->vector_stream_plan(generic_softmax.config);
+    CHECK("G1: buildable mode uses dependency-derived multi-pass replay",
+          std::isfinite(generic_softmax.latency) && generic_stream.feasible &&
+              generic_stream.kind == VectorStreamKind::MultiPass &&
+              generic_stream.replay_passes.size() == 3);
     p.p4_patterns.push_back({P4PatternKind::SoftmaxFlash, FlatSet<size_t>{0, 1, 2, 3}});
     auto exact_softmax_sg = Subgraph::create(p, dag, {0, 1, 2, 3});
     auto exact_softmax = exact_softmax_sg->best_cost();
@@ -4108,8 +4273,13 @@ static void test_g1_multi_reduction_stream_decline() {
     h8.split_k = 1;
     CHECK("P4GRID: padded h=11 no longer outranks the device-best h=8 grid",
           rank_sg->compute_cost(h8).latency < rank_sg->compute_cost(h11).latency);
-    CHECK("P4: a different subgroup does not inherit function-level permission",
-          !std::isfinite(Subgraph::create(p, dag, {0, 1, 2})->best_cost().latency));
+    auto different_subgroup = Subgraph::create(p, dag, {0, 1, 2});
+    const auto different_cost = different_subgroup->best_cost();
+    const auto different_plan =
+        different_subgroup->vector_stream_plan(different_cost.config);
+    CHECK("P4: a different subgroup does not inherit the named online algorithm",
+          std::isfinite(different_cost.latency) &&
+              different_plan.kind != VectorStreamKind::SoftmaxFlash);
 
     Problem ln = p;
     ln.p4_patterns.clear();
@@ -4148,6 +4318,80 @@ static void test_g1_multi_reduction_stream_decline() {
     CHECK("G7: generated Welford/Chan work costs more than softmax stats at one fixed schedule",
           exact_layernorm_sg->compute_cost(exact_softmax.config).latency >
               exact_softmax_sg->compute_cost(exact_softmax.config).latency);
+}
+
+static void test_generic_multi_pass_vector_replay() {
+    std::cout << "[VMULTIPASS] dependent reductions derive ordered generic replay passes\n";
+    constexpr int64_t rows = 16;
+    constexpr int64_t width = 32768;
+    Problem p;
+    p.tensors = {
+        {width, rows, DType::FP32},  // x
+        {width, rows, DType::FP32},  // x*x
+        {1, rows, DType::FP32},      // sum
+        {1, rows, DType::FP32},      // inverse rms
+        {width, rows, DType::FP32},  // normalized
+        {width, rows, DType::FP32},  // abs
+        {1, rows, DType::FP32},      // max
+        {1, rows, DType::FP32},      // inverse max
+        {width, rows, DType::FP32},  // scaled output
+    };
+    p.ops = {
+        {OpType::Pointwise, {0, 0}, {1}},
+        {OpType::Reduction, {1}, {2}},
+        {OpType::Pointwise, {2}, {3}},
+        {OpType::Pointwise, {0, 3}, {4}},
+        {OpType::Pointwise, {4}, {5}},
+        {OpType::Reduction, {5}, {6}},
+        {OpType::Pointwise, {6}, {7}},
+        {OpType::Pointwise, {4, 7}, {8}},
+    };
+    const std::array<VectorPrimitiveFamily, 8> primitives = {
+        VectorPrimitiveFamily::Mul, VectorPrimitiveFamily::RowSum,
+        VectorPrimitiveFamily::Rsqrt, VectorPrimitiveFamily::Mul,
+        VectorPrimitiveFamily::Abs, VectorPrimitiveFamily::RowExtrema,
+        VectorPrimitiveFamily::Recip, VectorPrimitiveFamily::Mul};
+    for (size_t index = 0; index < p.ops.size(); ++index) {
+        p.ops[index].vector_capability =
+            p.ops[index].type == OpType::Reduction
+                ? (index == 1 ? VectorOpCapability::ReductionSum
+                              : VectorOpCapability::ReductionMax)
+                : VectorOpCapability::Elementwise;
+        p.ops[index].vector_primitive = primitives[index];
+        p.ops[index].vector_geometry = VectorOpGeometry::Flat;
+    }
+    p.required_outputs.insert(8);
+    set_910b(p);
+    p.allow_model_ahead_multi_reduction_stream = false;
+    DAG dag = DAG::build(p);
+    auto subgraph = Subgraph::create(p, dag, {0, 1, 2, 3, 4, 5, 6, 7});
+    CHECK("VMULTIPASS: complete vector DAG is a valid subgraph", subgraph.has_value());
+    TileConfig cfg{width, rows, 1};
+    const VectorStreamPlan plan = subgraph->vector_stream_plan(cfg);
+    CHECK("VMULTIPASS: source-oriented plan is a feasible generic multi-pass replay",
+          plan.feasible && plan.kind == VectorStreamKind::MultiPass &&
+              plan.replay_topology && plan.replay_passes.size() == 3);
+    if (plan.replay_topology && plan.replay_topology->passes.size() == 3) {
+        const auto& first = plan.replay_topology->passes[0];
+        const auto& second = plan.replay_topology->passes[1];
+        const auto& apply = plan.replay_topology->passes[2];
+        CHECK("VMULTIPASS: first reduction pass stops at the first barrier",
+              first.ops == std::vector<size_t>({0, 1}) &&
+                  first.state_inputs.empty() &&
+                  first.state_outputs == std::vector<size_t>({2}));
+        CHECK("VMULTIPASS: second pass recomputes its pointwise cone from the first state",
+              second.ops == std::vector<size_t>({2, 3, 4, 5}) &&
+                  second.state_inputs == std::vector<size_t>({2}) &&
+                  second.state_outputs == std::vector<size_t>({6}));
+        CHECK("VMULTIPASS: final pass names both carried states and recomputes the sink cone",
+              apply.ops == std::vector<size_t>({2, 3, 6, 7}) &&
+                  apply.state_inputs == std::vector<size_t>({2, 6}) &&
+                  apply.output_tensors == std::vector<size_t>({8}));
+    }
+    CHECK("VMULTIPASS: every pass covers the selected reduced axis exactly",
+          plan.full_chunks * plan.chunk + plan.tail == width);
+    CHECK("VMULTIPASS: the source-oriented multi-pass cost is finite",
+          std::isfinite(subgraph->compute_cost(cfg).latency));
 }
 
 // --- G3: streamed input multiplicity is per boundary input (A7) ---------------
@@ -5396,6 +5640,7 @@ int main() {
     test_streaming_detected_via_coupled_peak();
     test_vector_streaming_reduction();
     test_g1_multi_reduction_stream_decline();
+    test_generic_multi_pass_vector_replay();
     test_g9_row_aware_multicore_ranking();
     test_g3_spanning_reduction_rereads_input();
     test_ragged_vector_traffic_matches_static_emitted_body();

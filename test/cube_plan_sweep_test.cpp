@@ -102,7 +102,7 @@ int main() {
         std::isfinite(solution.at("steps").front().at("latency_cycles").get<double>());
     all_forced_solutions =
         all_forced_solutions &&
-        solution.at("schema_version") == "pto_fusebox.solution.v6" &&
+        solution.at("schema_version") == "pto_fusebox.solution.v7" &&
         solution.at("steps").size() == 1 &&
         solution.at("steps").front().at("launch").at("split") == split;
     if (split > 1) {

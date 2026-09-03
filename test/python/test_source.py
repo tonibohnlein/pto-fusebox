@@ -6,6 +6,7 @@ import os
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from examples.torch_frontend.static_mixed import (
 )
 from pto_fusebox import (
     PyPTORuntimeValidShapeArgument,
+    RegionSolveResult,
     RuntimeValidShapeSpec,
     bind_emitted_inputs,
     emit_pypto_callable,
@@ -31,7 +33,7 @@ from pto_fusebox import (
     scheduled_region,
     solve_graph,
 )
-from pto_fusebox.ir import normalized_graph_sha256
+from pto_fusebox.ir import NormalizedGraph, normalized_graph_sha256
 from pto_fusebox.schedule.schema import (
     AxisPartition,
     CubeKernelPlan,
@@ -42,6 +44,7 @@ from pto_fusebox.schedule.schema import (
     MixedPipelineMode,
     MixedTransferDirection,
     VectorKernelPlan,
+    VectorReplayPassKind,
     VectorReplayPhase,
     VectorSpatialPolicy,
     VectorStreamKind,
@@ -50,8 +53,10 @@ from pto_fusebox.source.api import (
     _append_spmd_statement,
     _inline_local_name,
     _program_as_inline_callable,
+    _validate_completion_task_contract,
 )
-from pto_fusebox.source.common import SourceWriter
+from pto_fusebox.source.common import Interface, SourceWriter
+from pto_fusebox.target import Ascend910BTarget
 from torch import nn
 
 
@@ -140,6 +145,36 @@ class _DenseSwiGlu(nn.Module):
         return torch.mm(activation, down_weight, out_dtype=torch.float32)
 
 
+class _FeatureBlend(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        sink_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(lhs, first_weight, out_dtype=torch.float32)
+        second = torch.mm(lhs, second_weight, out_dtype=torch.float32)
+        blended = (first + second).to(torch.bfloat16)
+        return torch.mm(blended, sink_weight, out_dtype=torch.float32)
+
+
+class _FeatureBlendLinearSink(nn.Module):
+    """The generic feature pipeline must replay a normalized Linear RHS view."""
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        sink_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        blended = torch.mm(value, first_weight, out_dtype=torch.float32) + torch.mm(
+            value, second_weight, out_dtype=torch.float32
+        )
+        return torch.nn.functional.linear(blended, sink_weight)
+
+
 class _V2COnly(nn.Module):
     def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.mm(torch.exp(value), weight)
@@ -150,6 +185,54 @@ class _V2COnlyRhs(nn.Module):
         self, lhs: torch.Tensor, value: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         return torch.mm(lhs, torch.exp(value + bias))
+
+
+class _Int8V2C(nn.Module):
+    def forward(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        quantized = value.to(torch.float16).to(torch.int8)
+        return torch.ops.aten._int_mm.default(quantized, weight.t())
+
+
+class _Int32C2V(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        accumulator = torch.ops.aten._int_mm.default(value, weight.t())
+        return accumulator.float() * scale
+
+
+class _Int8ProjectionBranch(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        quantized = value.to(torch.float16).to(torch.int8)
+        accumulator = torch.ops.aten._int_mm.default(quantized, weight.t())
+        return accumulator.float() * scale
+
+
+class _BranchedInt8Projection(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        lhs_weight: torch.Tensor,
+        rhs_weight: torch.Tensor,
+        lhs_scale: torch.Tensor,
+        rhs_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        lhs_quantized = lhs.to(torch.float16).to(torch.int8)
+        rhs_quantized = rhs.to(torch.float16).to(torch.int8)
+        lhs_accumulator = torch.ops.aten._int_mm.default(lhs_quantized, lhs_weight.t())
+        rhs_accumulator = torch.ops.aten._int_mm.default(rhs_quantized, rhs_weight.t())
+        lhs_projection = lhs_accumulator.float() * lhs_scale
+        rhs_projection = rhs_accumulator.float() * rhs_scale
+        return lhs_projection + rhs_projection
 
 
 class _V2CSharedLhs(nn.Module):
@@ -1326,6 +1409,88 @@ def test_callable_source_preserves_a_multi_step_task_graph() -> None:
     )
 
 
+def test_callable_can_expose_its_final_spmd_completion_task() -> None:
+    class Fp32ChainedMatmul(nn.Module):
+        def forward(
+            self,
+            lhs: torch.Tensor,
+            middle: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.mm(torch.mm(lhs, middle), rhs)
+
+    graph, result = _solve_module(
+        Fp32ChainedMatmul(),
+        (
+            torch.zeros(64, 128),
+            torch.zeros(128, 96),
+            torch.zeros(96, 80),
+        ),
+    )
+    emitted = emit_pypto_callable(
+        graph,
+        result,
+        function_name="generated_chained_matmul_with_completion",
+        expose_completion_task=True,
+    )
+
+    assert emitted.completion_task == _inline_local_name(
+        emitted.function_name, "completion_task"
+    )
+    tree = ast.parse(emitted.source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+    spmd_loops = [
+        statement
+        for statement in function.body
+        if isinstance(statement, (ast.For, ast.With))
+        and "pl.spmd(" in ast.unparse(statement)
+    ]
+    assert len(spmd_loops) == 2
+    assert isinstance(spmd_loops[0], ast.For)
+    assert isinstance(spmd_loops[1], ast.With)
+    completion_binding = spmd_loops[1].items[0].optional_vars
+    assert completion_binding is not None
+    assert ast.unparse(completion_binding) == emitted.completion_task
+    assert "pl.tile.get_block_idx()" in ast.unparse(spmd_loops[1])
+    returned = next(
+        statement for statement in function.body if isinstance(statement, ast.Return)
+    )
+    assert isinstance(returned.value, ast.Tuple)
+    assert ast.unparse(returned.value.elts[-1]) == emitted.completion_task
+    assert function.returns is not None
+    assert ast.unparse(function.returns).endswith(", pl.Scalar[pl.TASK_ID]]")
+
+
+def test_callable_completion_rejects_an_independent_earlier_step() -> None:
+    """A final lexical launch cannot stand in for an unrelated branch."""
+
+    lowered = SimpleNamespace(
+        tensors=(0, 1, 2),
+        operations=(
+            SimpleNamespace(index=0, inputs=(0,), outputs=(1,)),
+            SimpleNamespace(index=1, inputs=(0,), outputs=(2,)),
+        ),
+        required_outputs=(2,),
+    )
+    schedule = SimpleNamespace(
+        steps=(
+            SimpleNamespace(index=0, solver_ops=(0,)),
+            SimpleNamespace(index=1, solver_ops=(1,)),
+        )
+    )
+    region_interface = Interface(
+        input_arguments={"value": "arg_value"},
+        output_arguments={"output": "arg_output"},
+        output_allocation_owners={"output": "output"},
+    )
+
+    with pytest.raises(
+        SourceEmissionError,
+        match="requires every step to reach the final output",
+    ):
+        _validate_completion_task_contract(lowered, schedule, region_interface)
+
+
 def test_callable_extraction_rejects_unexpected_program_members() -> None:
     source = """\
 import pypto.language as pl
@@ -1342,7 +1507,11 @@ class UnexpectedMember:
     with pytest.raises(
         SourceEmissionError, match="program class contains unexpected members: Assign"
     ):
-        _program_as_inline_callable(source, "generated")
+        _program_as_inline_callable(
+            source,
+            "generated",
+            expose_completion_task=False,
+        )
 
 
 def test_callable_runtime_valid_shape_keeps_physical_frame_static() -> None:
@@ -1573,6 +1742,38 @@ def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     assert source.count("pl.tensor.assemble(") == 1
 
 
+def test_int32_accumulator_crosses_from_cube_to_vector_generically() -> None:
+    graph, result = _solve_module(
+        _Int32C2V(),
+        (
+            torch.ones(16, 256, dtype=torch.int8),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(16, 1),
+        ),
+    )
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    step = schedule.steps[0]
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert tuple(stage.engine for stage in step.plan.stages) == (
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    fifo = step.plan.fifos[0]
+    assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+    assert result.problem is not None
+    assert result.problem["dtypes"][fifo.tensor] == "INT32"
+    assert fifo.slot_bytes == fifo.valid_rows * fifo.valid_cols * 4
+
+    source = emit_pypto_region(graph, result, program_name="int32_c2v").source
+    ast.parse(source)
+    _assert_pypto_main_mixed_scope(source, step.plan)
+    assert "out_dtype=pl.INT32" in source
+    assert "target_type=pl.FP32" in source
+    assert "pl.tensor.row_expand_mul(" in source
+
+
 def test_one_way_c2v_can_stream_successor_items_on_fewer_mixed_groups() -> None:
     graph = export_and_normalize(
         _C2VEpilogue(),
@@ -1788,7 +1989,9 @@ def test_mixed_plan_rejects_launch_participation_drift() -> None:
         scheduled_region(replace(result, solution=solution))
 
 
-def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> None:
+def test_feature_round_trip_emits_two_producers_vector_dag_and_sink_accumulator() -> (
+    None
+):
     graph, result = _solve_module(
         _DenseSwiGlu(),
         (
@@ -1802,7 +2005,9 @@ def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> N
 
     assert step.kind is KernelKind.MIXED
     assert isinstance(step.plan, MixedKernelPlan)
-    assert step.plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP
+    assert step.plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    assert step.plan.feature_round_trip is not None
+    assert len(step.plan.feature_round_trip.producer_window_k) == 2
     assert step.op_order[:2] == (1, 0)
     assert can_emit_region(graph, result)
 
@@ -1815,6 +2020,91 @@ def test_dense_swiglu_emits_two_producers_vector_dag_and_down_accumulator() -> N
     assert source.count("pl.tensor.matmul_acc(") == 1
     assert "pl.tensor.recip(" in source
     assert 'target_type=pl.BF16, mode="round"' in source
+
+
+def test_feature_round_trip_is_topology_driven_not_swiglu_recognized() -> None:
+    graph, result = _solve_module(
+        _FeatureBlend(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(
+        graph, result, program_name="generic_feature_blend"
+    ).source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, step.plan.active_groups)
+    _assert_pypto_main_mixed_scope(source, step.plan)
+    assert "pl.tensor.add(" in source
+    assert "pl.tensor.exp(" not in source
+    assert source.count("pl.tensor.matmul(") == 3
+    assert source.count("pl.tensor.matmul_acc(") == 1
+
+
+def test_feature_round_trip_replays_a_transposed_linear_sink() -> None:
+    graph, result = _solve_module(
+        _FeatureBlendLinearSink(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert step.plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    source = emit_pypto_region(
+        graph, result, program_name="generic_feature_linear_sink"
+    ).source
+    ast.parse(source)
+    assert (
+        "sink_rhs_tile = pl.tensor.slice(arg_sink_weight, [64, 64], [0, feature])"
+        in source
+    )
+    assert (
+        "sink_first = pl.tensor.matmul(vector_5, sink_rhs_tile, a_trans=False, b_trans=True"
+        in source
+    )
+    assert (
+        "sink_later = pl.tensor.matmul_acc(sink_acc, vector_5, sink_rhs_tile, a_trans=False, b_trans=True)"
+        in source
+    )
+
+
+def test_feature_round_trip_rejects_a_stale_stage_window_before_emission() -> None:
+    graph, result = _solve_module(
+        _FeatureBlend(),
+        (
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 64, dtype=torch.bfloat16),
+        ),
+    )
+    assert result.solution is not None
+    stale = copy.deepcopy(result.solution)
+    stale_feature = stale["steps"][0]["plan"]["feature_round_trip"]
+    stale_feature["producer_window_k"][0] += 16
+    stale_result = replace(result, solution=stale)
+
+    assert not can_emit_region(graph, stale_result)
+    with pytest.raises(
+        SourceEmissionError,
+        match="feature-chunk producer descriptor does not match its cube stage",
+    ):
+        emit_pypto_region(graph, stale_result)
 
 
 def test_multi_round_trip_attention_epilogue_emits_one_ordered_generic_loop() -> None:
@@ -1983,6 +2273,216 @@ def test_one_way_v2c_emits_vector_producer_and_matmul_consumer(
     assert source.count("pl.tensor.matmul(") == 1
     assert source.index("pl.tensor.exp(") < source.index("pl.tensor.matmul(")
     assert source.count("pl.tensor.assemble(") == 1
+
+
+def test_int8_operand_crosses_from_vector_to_cube_generically() -> None:
+    graph, result = _solve_module(
+        _Int8V2C(),
+        (
+            torch.ones(16, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+        ),
+    )
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    step = schedule.steps[0]
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    assert tuple(stage.engine for stage in step.plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+    )
+    fifo = step.plan.fifos[0]
+    assert fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    assert result.problem is not None
+    assert result.problem["dtypes"][fifo.tensor] == "INT8"
+    assert fifo.slot_bytes == fifo.valid_rows * fifo.valid_cols
+
+    source = emit_pypto_region(graph, result, program_name="int8_v2c").source
+    ast.parse(source)
+    _assert_pypto_main_mixed_scope(source, step.plan)
+    assert "target_type=pl.INT8" in source
+    assert "out_dtype=pl.INT32" in source
+    assert source.index("target_type=pl.INT8") < source.index("pl.tensor.matmul(")
+
+
+def test_int8_projection_branch_emits_generic_vector_cube_vector_round_trip() -> None:
+    graph = export_and_normalize(
+        _Int8ProjectionBranch(),
+        (
+            torch.ones(64, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(64, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    assert len(solved.regions) == 1
+    result = solved.regions[0]
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    step = schedule.steps[0]
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    plan = step.plan
+    assert plan.algorithm is MixedAlgorithm.GENERIC
+    assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert tuple(stage.engine for stage in plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    assert tuple(fifo.direction for fifo in plan.fifos) == (
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+    )
+    assert result.problem is not None
+    assert tuple(result.problem["dtypes"][fifo.tensor] for fifo in plan.fifos) == (
+        "INT8",
+        "INT32",
+    )
+    assert tuple(fifo.slot_bytes for fifo in plan.fifos) == tuple(
+        fifo.valid_rows * fifo.valid_cols * (1 if index == 0 else 4)
+        for index, fifo in enumerate(plan.fifos)
+    )
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(
+        graph, result, program_name="int8_projection_branch"
+    ).source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.active_groups)
+    _assert_pypto_main_mixed_scope(source, plan)
+    assert source.count("pl.tensor.matmul(") == 1
+    assert source.count("pl.tensor.cast(") == 3
+    assert "target_type=pl.INT8" in source
+    assert "out_dtype=pl.INT32" in source
+    assert "target_type=pl.FP32" in source
+    assert source.index("target_type=pl.INT8") < source.index("pl.tensor.matmul(")
+    assert source.index("pl.tensor.matmul(") < source.index("target_type=pl.FP32")
+    assert "pl.tensor.row_expand_mul(" in source
+
+
+def test_branched_int8_projections_emit_two_generic_fifo_bundles() -> None:
+    graph = export_and_normalize(
+        _BranchedInt8Projection(),
+        (
+            torch.ones(64, 256),
+            torch.ones(64, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(64, 1),
+            torch.ones(64, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    assert len(solved.regions) == 1
+    result = solved.regions[0]
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    step = schedule.steps[0]
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    plan = step.plan
+    assert plan.algorithm is MixedAlgorithm.GENERIC
+    assert plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE
+    assert tuple(stage.engine for stage in plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    assert plan.protocol_peer_stage is None
+    assert plan.protocol_sink_stage == 4
+    assert plan.protocol_producer_bundle == (0, 1)
+    assert plan.protocol_reply_bundle == (2, 3)
+    assert tuple(fifo.bundle for fifo in plan.fifos) == (0, 0, 1, 1)
+    assert tuple(fifo.direction for fifo in plan.fifos) == (
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+    )
+    assert result.problem is not None
+    assert tuple(result.problem["dtypes"][fifo.tensor] for fifo in plan.fifos) == (
+        "INT8",
+        "INT8",
+        "INT32",
+        "INT32",
+    )
+    assert can_emit_region(graph, result)
+
+    source = emit_pypto_region(
+        graph, result, program_name="branched_int8_projection"
+    ).source
+    ast.parse(source)
+    _assert_single_spmd_grid(source, plan.active_groups)
+    _assert_pypto_main_mixed_scope(source, plan)
+    assert source.count("pl.tensor.matmul(") == 2
+    assert source.count("target_type=pl.INT8") == 2
+    assert source.count("out_dtype=pl.INT32") == 2
+    assert source.count("target_type=pl.FP32") == 2
+    assert source.count("pl.tensor.row_expand_mul(") == 2
+    assert "pl.tensor.add(" in source
+
+
+def test_mixed_static_tail_uses_solver_priced_clamped_overlap() -> None:
+    graph = export_and_normalize(
+        _Int8ProjectionBranch(),
+        (
+            torch.ones(50, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(50, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == 1
+    result = solved.regions[0]
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.m_partition.big == plan.m_partition.small == 32
+    assert plan.m_partition.parts == 2
+    assert plan.m_partition.big * plan.m_partition.parts > 50
+
+    source = emit_pypto_region(graph, result, program_name="mixed_static_tail").source
+    ast.parse(source)
+    assert "region_row = pl.min(m_index * 32, 18)" in source
+    assert "[region_row, region_col]" in source
+
+
+def test_vector_alias_output_keeps_its_allocation_owner() -> None:
+    class AliasedOutput(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.exp(value).view(64, 128).view(64, 128)
+
+    graph, result = _solve_module(AliasedOutput(), (torch.ones(64, 128),))
+    assert result.problem is not None
+    frontend = result.problem["frontend_mapping"]
+    assert frontend["region_outputs"] != frontend["region_output_allocation_owners"]
+    source = emit_pypto_region(graph, result, program_name="aliased_output").source
+    ast.parse(source)
+    assert source.count("pl.store(") == 1
+    assert "pl.create_tensor" not in source
 
 
 def test_one_way_v2c_replays_a_frozen_stage_two_group_loop() -> None:
@@ -2426,6 +2926,139 @@ def test_ragged_pointwise_clamps_region_and_strip_origins_not_shapes() -> None:
     assert "[9, 65], target_memory=pl.Mem.Vec" in source
     assert "valid_rows" not in source
     assert "valid_cols" not in source
+
+
+class _MultiPassVectorTarget(Ascend910BTarget):
+    """Keep the complete reduction chain selected for contract testing."""
+
+    def problem_fields(self) -> dict[str, object]:
+        fields = super().problem_fields()
+        fields["kernel_fill_cost"] = 100_000_000
+        return fields
+
+
+class _MultiPassReductionChain(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        inverse_rms = torch.rsqrt(
+            torch.sum(value * value, dim=-1, keepdim=True) / value.shape[-1] + 1e-6
+        )
+        normalized = value * inverse_rms
+        inverse_amax = torch.reciprocal(
+            torch.amax(torch.abs(normalized), dim=-1, keepdim=True)
+        )
+        return normalized * inverse_amax
+
+
+class _NestedThinReduction(nn.Module):
+    """The second reduction consumes [M, 1], not the original stream frame."""
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        first = torch.sum(value, dim=-1, keepdim=True)
+        return torch.sum(first, dim=-1, keepdim=True)
+
+
+def _solve_multi_pass_reduction_chain(
+    *, require_source_codegen: bool
+) -> tuple[NormalizedGraph, RegionSolveResult]:
+    graph = export_and_normalize(_MultiPassReductionChain(), (torch.ones(16, 32768),))
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=require_source_codegen,
+    )
+    assert solved.regions_solved
+    assert len(solved.regions) == 1
+    return graph, solved.regions[0]
+
+
+def test_general_multi_pass_vector_plan_and_source_replay() -> None:
+    graph, analytic = _solve_multi_pass_reduction_chain(require_source_codegen=False)
+    analytic_plan = scheduled_region(analytic).steps[0].plan
+    assert isinstance(analytic_plan, VectorKernelPlan)
+    assert analytic_plan.kind is VectorStreamKind.MODEL_AHEAD_MULTI_REDUCTION
+
+    graph, result = _solve_multi_pass_reduction_chain(require_source_codegen=True)
+    schedule = scheduled_region(result)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.MULTI_PASS
+    assert tuple(replay.kind for replay in plan.replay_passes) == (
+        VectorReplayPassKind.REDUCTION,
+        VectorReplayPassKind.REDUCTION,
+        VectorReplayPassKind.APPLY,
+    )
+    assert tuple(replay.ops for replay in plan.replay_passes) == (
+        (0, 1),
+        (2, 3, 4, 5, 6, 7),
+        (2, 3, 4, 5, 8, 9),
+    )
+    assert tuple(replay.state_inputs for replay in plan.replay_passes) == (
+        (),
+        (2,),
+        (2, 8),
+    )
+    assert tuple(replay.state_outputs for replay in plan.replay_passes) == (
+        (2,),
+        (8,),
+        (),
+    )
+    assert plan.full_chunks * plan.chunk + plan.tail == plan.extent
+
+    source = emit_pypto_region(
+        graph, result, program_name="general_multi_pass_vector"
+    ).source
+    ast.parse(source)
+    assert source.count("pl.spmd(") == 1
+    assert source.count("pl.pipeline(") == 3
+    assert "intermediate_tensor" not in source
+    assert "pass_0_result_state_2" in source
+    assert "pass_1_result_state_8" in source
+    assert source.index("pass_0_result_state_2") < source.index(
+        "pass_1_initial_tensor_3"
+    )
+    assert source.index("pass_1_result_state_8") < source.index("for pass_2_chunk")
+
+
+def test_general_multi_pass_vector_contract_rejects_stale_state_and_workspace() -> None:
+    graph, result = _solve_multi_pass_reduction_chain(require_source_codegen=True)
+    assert result.solution is not None
+
+    stale_state = copy.deepcopy(result.solution)
+    stale_state["steps"][0]["plan"]["replay_passes"][1]["state_inputs"] = []
+    with pytest.raises(
+        ScheduleContractError, match="undeclared cross-pass tensor|state_inputs"
+    ):
+        scheduled_region(replace(result, solution=stale_state))
+
+    stale_workspace = copy.deepcopy(result.solution)
+    workspace = stale_workspace["steps"][0]["plan"]["replay_passes"][0]["workspaces"][0]
+    workspace["physical"][1] += 128
+    with pytest.raises(
+        ScheduleContractError,
+        match="workspace .* differs from its lowered scratch frame",
+    ):
+        scheduled_region(replace(result, solution=stale_workspace))
+
+
+def test_general_multi_pass_rejects_a_nested_thin_reduction() -> None:
+    graph = export_and_normalize(_NestedThinReduction(), (torch.ones(16, 32768),))
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert len(solved.regions) == 1
+    result = solved.regions[0]
+    assert result.status == "infeasible"
+    assert result.solution is not None
+    assert result.solution["steps"][0]["plan"]["kind"] == "model_ahead_multi_reduction"
+    assert not can_emit_region(graph, result)
 
 
 def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:

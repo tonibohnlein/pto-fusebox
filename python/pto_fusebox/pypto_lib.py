@@ -23,13 +23,28 @@ from .source import (
 
 @dataclass(frozen=True)
 class FlashMtpProjectionOverlay:
-    """Generated projection module plus the minimally patched decode source."""
+    """Generated DeepSeek projection plus a minimally patched native source.
+
+    The compatibility name predates the DeepSeek-V4 Pro integration.  The
+    projection ABI and wrapper are shared by Flash-MTP and Pro; the adapter
+    never inspects a model name when it schedules the tensor graph.
+    """
 
     module_name: str
     source: str
     decode_source: str
     static_callables: tuple[EmittedPyPTOCallable, ...]
     native_op_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QwenOutputHeadOverlay:
+    """Production Qwen output-head module plus its patched native entry."""
+
+    module_name: str
+    source: str
+    decode_source: str
+    output_head: EmittedPyPTOCallable
 
 
 def emit_flash_mtp_decode_projection_overlay(
@@ -39,12 +54,35 @@ def emit_flash_mtp_decode_projection_overlay(
     native_decode_source: str,
     module_name: str = "fusebox_mtp_projection",
 ) -> FlashMtpProjectionOverlay:
-    """Emit production INT8 projection and wire it into ``decode_mtp``.
+    """Emit the Flash-MTP production projection and patch ``decode_mtp``.
+
+    This compatibility entry point delegates to the model-independent
+    DeepSeek projection adapter.
+    """
+
+    return emit_deepseek_mtp_projection_overlay(
+        graph,
+        result,
+        native_source=native_decode_source,
+        module_name=module_name,
+    )
+
+
+def emit_deepseek_mtp_projection_overlay(
+    graph: NormalizedGraph,
+    result: SolveResult,
+    *,
+    native_source: str,
+    module_name: str = "fusebox_mtp_projection",
+) -> FlashMtpProjectionOverlay:
+    """Emit a production INT8 projection for a native DeepSeek entry point.
 
     ``graph`` is the complete static projection DAG, not two caller-selected
     branch graphs. Fusebox extracts and solves its maximal supported regions;
-    this adapter only realizes the remaining native shape operations and
-    patches the decode import. No MTP operator or recognizer is introduced.
+    this adapter realizes the remaining native shape operations and replaces
+    only the imported ``mtp_projection`` symbol. It accepts both one-line and
+    parenthesized native imports, so the same contract covers Flash-MTP and
+    DeepSeek-V4 Pro without a model recognizer.
     """
 
     if not module_name or any(
@@ -132,13 +170,97 @@ def emit_flash_mtp_decode_projection_overlay(
         raise SourceEmissionError(
             "Flash-MTP overlay must encode static schedules directly"
         )
-    decode_source = _patch_decode_import(native_decode_source, module_name)
+    decode_source = _patch_imported_symbol(
+        native_source,
+        source_module="mtp_projection",
+        symbol="mtp_projection",
+        replacement_module=module_name,
+    )
     return FlashMtpProjectionOverlay(
         module_name=module_name,
         source=source,
         decode_source=decode_source,
         static_callables=bundle.callables,
         native_op_ids=bundle.native_op_ids,
+    )
+
+
+def emit_qwen_output_head_overlay(
+    graph: NormalizedGraph,
+    result: SolveResult,
+    *,
+    native_decode_source: str,
+    module_name: str = "fusebox_qwen_output_head",
+) -> QwenOutputHeadOverlay:
+    """Emit the full Qwen RMSNorm-to-LM-head DAG behind its native ABI.
+
+    Fusebox receives one production-size static graph and owns every fusion,
+    tiling, and cut decision inside it. The wrapper preserves PyPTO-lib's
+    dynamic row-window ABI by copying only ``valid_rows`` from the static
+    physical frame into the caller-owned output tensor.
+    """
+
+    if not module_name or any(
+        not part.isidentifier() or keyword.iskeyword(part)
+        for part in module_name.split(".")
+    ):
+        raise SourceEmissionError(
+            f"Qwen output-head overlay module name is invalid: {module_name!r}"
+        )
+    bundle = emit_pypto_static_bundle(
+        graph,
+        result,
+        function_prefix="fusebox_qwen_output_head",
+    )
+    if bundle.native_op_ids:
+        raise SourceEmissionError(
+            "Qwen output-head graph must be one fully static region"
+        )
+    if len(bundle.callables) != 1:
+        raise SourceEmissionError(
+            f"Qwen output-head graph emitted {len(bundle.callables)} callables; "
+            "expected 1"
+        )
+    output_head = bundle.callables[0]
+    bindings = _qwen_output_head_bindings(graph, output_head)
+    functions = [
+        _callable_function(output_head),
+        ast.parse(
+            _qwen_output_head_wrapper_source(
+                output_head.function_name,
+                bindings,
+            )
+        ).body[0],
+    ]
+    module = ast.Module(
+        body=[
+            ast.Import(names=[ast.alias(name="pypto.language", asname="pl")]),
+            ast.ImportFrom(
+                module="config",
+                names=[ast.alias(name="QWEN3_14B_DIMS", asname="D")],
+                level=0,
+            ),
+            *functions,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    source = ast.unparse(module) + "\n"
+    if "auto_tile" in source or "auto_fuse" in source:
+        raise SourceEmissionError(
+            "Qwen output-head overlay must encode static schedules directly"
+        )
+    decode_source = _patch_imported_symbol(
+        native_decode_source,
+        source_module="rms_lm_head",
+        symbol="rms_lm_head_fp32",
+        replacement_module=module_name,
+    )
+    return QwenOutputHeadOverlay(
+        module_name=module_name,
+        source=source,
+        decode_source=decode_source,
+        output_head=output_head,
     )
 
 
@@ -360,6 +482,54 @@ def _projection_bindings(
     return tuple(arguments)
 
 
+def _qwen_output_head_bindings(
+    graph: NormalizedGraph,
+    emitted: EmittedPyPTOCallable,
+) -> tuple[str, ...]:
+    values = graph.value_map()
+    expected_inputs = {
+        "hidden_states": ((16, 5120), "float32", "hidden_states"),
+        "norm_weight": ((1, 5120), "float32", "final_norm_weight"),
+        "lm_head_weight": (
+            (152064, 5120),
+            "bfloat16",
+            "lm_head_weight",
+        ),
+    }
+    arguments: list[str] = []
+    seen: set[str] = set()
+    for argument in emitted.input_arguments:
+        value = values[argument.value_id]
+        semantic_name = value.target or value.name
+        if semantic_name not in expected_inputs:
+            raise SourceEmissionError(
+                f"Qwen output-head has unexpected input {semantic_name!r}"
+            )
+        shape, dtype, native_name = expected_inputs[semantic_name]
+        if tuple(value.shape) != shape or value.dtype != dtype:
+            raise SourceEmissionError(
+                f"Qwen output-head input {semantic_name!r} is stale: "
+                f"shape={value.shape!r}, dtype={value.dtype!r}"
+            )
+        if semantic_name in seen:
+            raise SourceEmissionError(
+                f"Qwen output-head repeats input {semantic_name!r}"
+            )
+        seen.add(semantic_name)
+        arguments.append(native_name)
+    if seen != set(expected_inputs):
+        missing = tuple(sorted(set(expected_inputs).difference(seen)))
+        raise SourceEmissionError(
+            f"Qwen output-head is missing semantic inputs {missing!r}"
+        )
+    if len(emitted.output_arguments) != 1:
+        raise SourceEmissionError("Qwen output-head requires one output")
+    output = values[emitted.output_arguments[0].value_id]
+    if tuple(output.shape) != (16, 152064) or output.dtype != "float32":
+        raise SourceEmissionError("Qwen output-head output must be FP32[16,152064]")
+    return tuple([*arguments, "static_output"])
+
+
 def _callable_function(emitted: EmittedPyPTOCallable) -> ast.FunctionDef:
     tree = ast.parse(emitted.source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
@@ -426,14 +596,93 @@ def mtp_projection(
 """
 
 
-def _patch_decode_import(source: str, module_name: str) -> str:
-    expected = "from mtp_projection import golden_mtp_projection, mtp_projection"
-    if source.count(expected) != 1:
+def _qwen_output_head_wrapper_source(
+    generated_name: str,
+    generated_arguments: tuple[str, ...],
+) -> str:
+    generated_call = ", ".join(generated_arguments)
+    return f"""@pl.inline
+def rms_lm_head_fp32(
+    hidden_states: pl.Tensor[[16, 5120], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, 5120], pl.FP32],
+    lm_head_weight: pl.Tensor[[152064, 5120], pl.BF16],
+    out: pl.Tensor[[D.batch, 152064], pl.FP32],
+    row_offset: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor[[D.batch, 152064], pl.FP32]:
+    static_output = pl.create_tensor([16, 152064], dtype=pl.FP32)
+    static_output = {generated_name}({generated_call})
+    for output_core in pl.spmd(24, name_hint="fusebox_qwen_output_window"):
+        for output_chunk in pl.range(output_core, 792, 24):
+            output_col = output_chunk * 192
+            output_tile = pl.load(
+                static_output,
+                [0, output_col],
+                [16, 192],
+                valid_shapes=[valid_rows, 192],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pl.store(output_tile, [row_offset, output_col], out)
+    return out
+"""
+
+
+def _patch_imported_symbol(
+    source: str,
+    *,
+    source_module: str,
+    symbol: str,
+    replacement_module: str,
+) -> str:
+    """Move one unaliased imported symbol to a generated source module."""
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        raise SourceEmissionError("native PyPTO source is not valid Python") from error
+    matches: list[ast.ImportFrom] = []
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        if statement.level != 0 or statement.module != source_module:
+            continue
+        imported = [alias for alias in statement.names if alias.name == symbol]
+        if imported:
+            if len(imported) != 1 or imported[0].asname is not None:
+                raise SourceEmissionError(
+                    f"native import of {source_module}.{symbol} must be unaliased"
+                )
+            matches.append(statement)
+    if len(matches) != 1:
         raise SourceEmissionError(
-            "native decode source does not contain the expected MTP projection import"
+            f"native source must import {source_module}.{symbol} exactly once; "
+            f"found {len(matches)}"
         )
-    replacement = (
-        "from mtp_projection import golden_mtp_projection\n"
-        f"from {module_name} import mtp_projection"
-    )
-    return source.replace(expected, replacement)
+
+    statement = matches[0]
+    if statement.end_lineno is None:
+        raise SourceEmissionError("native import has no source extent")
+    remaining = [alias for alias in statement.names if alias.name != symbol]
+    replacement_lines: list[str] = []
+    if remaining:
+        retained = ast.ImportFrom(
+            module=source_module,
+            names=remaining,
+            level=0,
+        )
+        replacement_lines.append(ast.unparse(retained))
+    replacement_lines.append(f"from {replacement_module} import {symbol}")
+
+    lines = source.splitlines(keepends=True)
+    start = statement.lineno - 1
+    end = statement.end_lineno
+    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+    replacement = newline.join(replacement_lines) + newline
+    patched = "".join([*lines[:start], replacement, *lines[end:]])
+    try:
+        ast.parse(patched)
+    except SyntaxError as error:  # pragma: no cover - replacement is generated.
+        raise SourceEmissionError(
+            "generated native import replacement is not valid Python"
+        ) from error
+    return patched

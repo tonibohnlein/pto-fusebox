@@ -467,7 +467,8 @@ enum class VectorStreamKind {
     ReductionSpanning,        // P2: stats pass + spanning apply pass
     SoftmaxFlash,             // P4: online (m,l) + apply
     LayerNormWelford,         // P4: online (mean,M2,count) + apply
-    ModelAheadMultiReduction  // analytic-only multi-reduction algorithm
+    ModelAheadMultiReduction, // legacy analytic-only multi-reduction estimate
+    MultiPass                 // generic ordered reduction-barrier replay
 };
 
 // Spatial ownership and executable replay are related but distinct.  The
@@ -690,6 +691,32 @@ struct VectorInputLifetimeTopology {
   std::array<std::vector<VectorInputLifetimePlan>, 4> phases;
 };
 
+// A generic replay pass is derived only from graph dependencies. Reduction
+// passes accumulate one or more same-depth reductions over the streamed axis;
+// the final apply pass replays the remaining sink cone. Values crossing a
+// pass boundary are named explicitly and must be thin reduction results.
+enum class VectorReplayPassKind : uint8_t { Reduction, Apply };
+
+struct VectorReplayPassTopology {
+  VectorReplayPassKind kind = VectorReplayPassKind::Apply;
+  std::vector<size_t> ops;
+  std::vector<size_t> state_inputs;
+  std::vector<size_t> state_outputs;
+  std::vector<size_t> output_tensors;
+  std::vector<VectorInputLifetimePlan> input_lifetimes;
+};
+
+struct VectorReplayTopology {
+  std::vector<VectorReplayPassTopology> passes;
+};
+
+struct VectorReplayPassExecutionPlan {
+  size_t index = 0;
+  VectorLoopPlan loop;
+  VectorSerialPhasePlan init;
+  VectorSerialPhasePlan tail;
+};
+
 struct VectorTensorFramePlan {
   // Concrete candidate-local tile frame for one tensor in one replay phase.
   // Logical extents drive valid_shape; physical extents drive allocation and
@@ -768,6 +795,11 @@ struct VectorStreamPlan {
   // by the emitter. Traffic is one GM->UB slice per tensor, phase and emitted
   // strip/chunk; the tile stays live through the descriptor's last use.
   std::shared_ptr<const VectorInputLifetimeTopology> input_lifetimes;
+  // Ordered generic replay contract. Empty for the four compatibility phases
+  // above; populated for MultiPass. Topology is candidate-invariant while the
+  // loop descriptors carry the selected chunk geometry.
+  std::shared_ptr<const VectorReplayTopology> replay_topology;
+  std::vector<VectorReplayPassExecutionPlan> replay_passes;
   // Solver-owned materialized/pointwise strip geometry.  The emitter must not
   // independently choose a row/width strip count: these fields are the exact
   // uniform (clamp-overlap on a ragged edge) loop it builds.
@@ -1038,7 +1070,12 @@ enum class MixedPipelineMode {
 //   producer_bundle[0..N] -> one peer stage -> one reply -> sink stage
 //
 // where every producer bundle transfer has the same direction.
-// MultiRoundTripSequential is initially the exact linear C->V->C->V chain; it
+// BranchedRoundTripBundle is a three-phase fan-in/fan-out protocol:
+//
+//   producer stages --bundle 0--> peer stages --bundle 1--> one sink stage
+//
+// with one reverse-direction reply per peer. MultiRoundTripSequential is
+// initially the exact linear C->V->C->V chain; it
 // preserves all three FIFO descriptors but deliberately receives no skew
 // overlap. Adjacent same-engine operations have already been collapsed into
 // one stage; the two physical AIV lanes are represented by MixedVectorSplit,
@@ -1047,6 +1084,7 @@ enum class MixedCrossCoreProtocol {
   Unsupported,
   OneWay,
   SingleRoundTripBundle,
+  BranchedRoundTripBundle,
   MultiRoundTripSequential
 };
 
@@ -1058,11 +1096,11 @@ enum class MixedPipelineAxis {
   IntermediateFeatureChunk
 };
 
-// Source algorithm recognized by the mixed planner. Generic preserves the
-// analytic stage-DAG path. DenseSwiGluMlp is the first production round-trip
-// algorithm: two independent gate/up cube projections feed one vector SwiGLU
-// stage, whose narrowed result feeds the down-projection cube stage.
-enum class MixedAlgorithmKind { Generic, DenseSwiGluMlp };
+// Source algorithm selected by the mixed planner. FeatureChunkRoundTrip is a
+// topology/geometry mechanism, not a workload recognizer: multiple cube
+// projections feed an arbitrary supported vector DAG, whose result is consumed
+// by a sink matmul one feature chunk at a time.
+enum class MixedAlgorithmKind { Generic, FeatureChunkRoundTrip };
 
 // How the vector stage uses the two AIV lanes in one 910B mixed group.  This
 // is an algorithmic fact, not merely a hardware count: an unsplit mixed kernel
@@ -1100,29 +1138,28 @@ struct MixedCrossCoreProtocolTopology {
   size_t peer_stage = std::numeric_limits<size_t>::max();
   size_t sink_stage = std::numeric_limits<size_t>::max();
   // Indices into MixedScheduleTopology::transfers. The producer bundle is
-  // advanced together; the current skew pass admits exactly one reply.
+  // advanced together; a single-round-trip bundle has exactly one reply while
+  // the branched protocol carries one reply from each peer stage.
   std::vector<size_t> producer_bundle_transfers;
   std::vector<size_t> reply_bundle_transfers;
   bool skew_pass_compatible = false;
 };
 
-struct MixedDenseMlpTopology {
+struct MixedFeatureRoundTripTopology {
   bool present = false;
-  size_t gate_matmul = std::numeric_limits<size_t>::max();
-  size_t up_matmul = std::numeric_limits<size_t>::max();
-  size_t down_matmul = std::numeric_limits<size_t>::max();
-  size_t gate_tensor = std::numeric_limits<size_t>::max();
-  size_t up_tensor = std::numeric_limits<size_t>::max();
-  size_t activated_tensor = std::numeric_limits<size_t>::max();
-  std::vector<size_t> vector_ops;
-  int64_t input_extent = 0;
+  std::vector<size_t> producer_matmuls;
+  std::vector<size_t> producer_tensors;
+  size_t peer_stage = std::numeric_limits<size_t>::max();
+  size_t sink_matmul = std::numeric_limits<size_t>::max();
+  size_t reply_tensor = std::numeric_limits<size_t>::max();
+  std::vector<int64_t> producer_input_extents;
+  std::vector<DType> producer_operand_dtypes;
   int64_t intermediate_extent = 0;
   int64_t output_extent = 0;
-  DType operand_dtype = DType::FP32;
-  // Candidate K values have a different meaning for this algorithm: they
-  // partition the gate/up output and the down-projection contraction.  They
-  // are built once with the topology, then crossed with the ordinary final
-  // output grid without introducing a per-matmul combinatorial search.
+  DType sink_operand_dtype = DType::FP32;
+  // Candidate K values partition every producer output, the complete vector
+  // DAG, and the sink-matmul contraction. They are built once with the
+  // topology, then crossed with the final output grid.
   std::vector<int64_t> feature_chunks;
 };
 
@@ -1144,7 +1181,7 @@ struct MixedScheduleTopology {
   bool compiler_emit_compatible = false;
   MixedCrossCoreProtocolTopology protocol;
   MixedAlgorithmKind algorithm = MixedAlgorithmKind::Generic;
-  MixedDenseMlpTopology dense_mlp;
+  MixedFeatureRoundTripTopology feature_round_trip;
 };
 
 struct MixedFifoPlan {
@@ -1152,7 +1189,7 @@ struct MixedFifoPlan {
   MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
   // Bind a spatial-region FIFO frame to the unified output grid without
   // inferring axis identity from equal numeric extents. Protocol-local loops
-  // such as dense feature chunks retain their own serialized frame geometry.
+  // such as generic feature chunks retain their own serialized frame geometry.
   bool spatial_m = false;
   bool spatial_n = false;
   int64_t valid_rows = 0;
@@ -1195,15 +1232,13 @@ struct MixedStagePlan {
   VectorStreamPlan vector_stream;
 };
 
-struct MixedDenseMlpPlan {
+struct MixedFeatureRoundTripPlan {
   bool present = false;
-  int64_t input_extent = 0;
   int64_t intermediate_extent = 0;
   int64_t intermediate_chunk = 0;
   int64_t intermediate_chunks = 0;
   int64_t output_extent = 0;
-  int64_t gate_window_k = 0;
-  int64_t up_window_k = 0;
+  std::vector<int64_t> producer_window_k;
   int64_t persistent_accumulator_bytes = 0;
   bool first_chunk_initializes = false;
   bool later_chunks_accumulate = false;
@@ -1244,7 +1279,7 @@ struct MixedSchedulePlan {
   MixedPipelineLoopPlan loop;
   std::vector<MixedFifoPlan> fifos;
   std::vector<MixedStagePlan> stages;
-  MixedDenseMlpPlan dense_mlp;
+  MixedFeatureRoundTripPlan feature_round_trip;
   // Kept separate during migration: the first bit records what the legacy
   // scalar cost grants, while the second mirrors what the existing PyPTO
   // pipeline passes can actually construct for this exact topology/loop.

@@ -11,17 +11,22 @@ import torch
 from examples.torch_frontend.basic import build_examples as build_basic_examples
 from examples.torch_frontend.deepseek_v4 import (
     DEEPSEEK_V4_DECODE_TOKENS,
+    DEEPSEEK_V4_DSPARK_TARGET_LAYERS,
     DEEPSEEK_V4_HC_MULT,
     DEEPSEEK_V4_HIDDEN,
     DEEPSEEK_V4_LINEAR_TOKENS,
     DEEPSEEK_V4_PREFILL_TOKENS,
     build_examples as build_deepseek_examples,
+    build_production_dspark_projection,
     build_production_mtp_decode_projection,
     build_production_mtp_history_projection_branch,
     build_production_mtp_projection_branch,
     build_production_mtp_prefill_projection_branch,
 )
-from examples.torch_frontend.hybrid_qwen import emit_hybrid_qwen_output_head
+from examples.torch_frontend.hybrid_qwen import (
+    emit_hybrid_qwen_output_head,
+    emit_production_qwen_output_head_overlay,
+)
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
 )
@@ -29,8 +34,11 @@ from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
 from examples.torch_frontend.qwen3 import (
     QWEN_BATCH_TILE,
     QWEN_LM_HEAD_K_CHUNK,
+    QWEN_PRODUCTION_HIDDEN,
+    QWEN_PRODUCTION_VOCAB,
     QWEN_REFERENCE_RMS_K_CHUNK,
     QWEN_VOCAB_CHUNK,
+    build_production_qwen_output_head,
 )
 from examples.torch_frontend.static_mixed import (
     build_examples as build_static_mixed_examples,
@@ -38,19 +46,26 @@ from examples.torch_frontend.static_mixed import (
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
+from examples.torch_frontend.production_models import (
+    emit_production_model_integration,
+)
 from pto_fusebox import (
     KernelKind,
     RuntimeValidShapeSpec,
     SourceEmissionError,
     can_emit_region,
+    emit_deepseek_mtp_projection_overlay,
     emit_pypto_callable,
     emit_flash_mtp_decode_projection_overlay,
     emit_pypto_region,
     emit_pypto_static_bundle,
     export_and_normalize,
     extract_solver_regions,
+    pypto_lib_model_manifest,
+    pypto_lib_model_manifests,
     scheduled_region,
     solve_graph,
+    validate_pypto_lib_model,
 )
 from pto_fusebox.schedule.schema import MixedKernelPlan
 from pto_fusebox.ir import normalized_graph_sha256
@@ -88,6 +103,49 @@ def _test_solver() -> Path:
     if configured:
         return Path(configured)
     return Path(__file__).resolve().parents[2] / "build" / "mlsys_mixed"
+
+
+def test_production_model_manifests_name_all_four_integration_targets() -> None:
+    manifests = pypto_lib_model_manifests()
+
+    assert tuple(manifest.name for manifest in manifests) == (
+        "deepseek_v4_flash_dspark",
+        "deepseek_v4_flash_mtp",
+        "deepseek_v4_pro",
+        "qwen3_14b",
+    )
+    for manifest in manifests:
+        assert manifest.entry_points
+        assert manifest.static_regions
+        assert manifest.native_boundaries
+        assert len({region.name for region in manifest.static_regions}) == len(
+            manifest.static_regions
+        )
+        assert len({boundary.name for boundary in manifest.native_boundaries}) == len(
+            manifest.native_boundaries
+        )
+        assert pypto_lib_model_manifest(manifest.name) == manifest
+
+    with pytest.raises(ValueError, match="unknown PyPTO-lib model"):
+        pypto_lib_model_manifest("deepseek_v4_unknown")
+
+
+def test_production_model_manifests_match_configured_pypto_lib_checkout() -> None:
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    if pypto_lib_root is None:
+        pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+
+    validated = tuple(
+        validate_pypto_lib_model(pypto_lib_root, manifest)
+        for manifest in pypto_lib_model_manifests()
+    )
+    assert tuple(model.manifest.name for model in validated) == (
+        "deepseek_v4_flash_dspark",
+        "deepseek_v4_flash_mtp",
+        "deepseek_v4_pro",
+        "qwen3_14b",
+    )
+    assert all(model.files for model in validated)
 
 
 @pytest.mark.parametrize(
@@ -257,6 +315,119 @@ def test_hybrid_qwen_example_links_torch_regions_into_native_pypto() -> None:
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
+def test_production_dspark_projection_is_one_completion_aware_static_region() -> None:
+    module, args = build_production_dspark_projection()
+    graph = export_and_normalize(module, args)
+    assert graph.value_map()[graph.inputs[-1]].shape == (
+        DEEPSEEK_V4_LINEAR_TOKENS,
+        DEEPSEEK_V4_HIDDEN * DEEPSEEK_V4_DSPARK_TARGET_LAYERS,
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.whole_graph_codegen_ready
+    assert len(solved.regions) == 1
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.MIXED,
+        KernelKind.VECTOR,
+    ]
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="fusebox_dspark_projection",
+        expose_completion_task=True,
+    )
+    assert emitted.completion_task is not None
+    assert "pl.Scalar[pl.TASK_ID]" in emitted.source
+    assert "auto_tile" not in emitted.source and "auto_fuse" not in emitted.source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_production_qwen_output_head_overlay_preserves_native_window_abi() -> None:
+    module, args = build_production_qwen_output_head()
+    graph = export_and_normalize(module, args)
+    assert [graph.value_map()[value_id].shape for value_id in graph.inputs] == [
+        (1, QWEN_PRODUCTION_HIDDEN),
+        (QWEN_PRODUCTION_VOCAB, QWEN_PRODUCTION_HIDDEN),
+        (QWEN_BATCH_TILE, QWEN_PRODUCTION_HIDDEN),
+    ]
+    native = "from rms_lm_head import rms_lm_head, rms_lm_head_fp32\n"
+    overlay = emit_production_qwen_output_head_overlay(
+        _test_solver(),
+        native_decode_source=native,
+        solver_workers=2,
+    )
+
+    assert "pl.Tensor[[16, 5120], pl.FP32]" in overlay.source
+    assert "pl.Tensor[[152064, 5120], pl.BF16]" in overlay.source
+    assert "static_output = pl.create_tensor([16, 152064]" in overlay.source
+    assert "valid_shapes=[valid_rows, 192]" in overlay.source
+    assert "pl.store(output_tile, [row_offset, output_col], out)" in overlay.source
+    assert overlay.decode_source == (
+        "from rms_lm_head import rms_lm_head\n"
+        "from fusebox_qwen_output_head import rms_lm_head_fp32\n"
+    )
+    assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+@pytest.mark.parametrize(
+    ("model_name", "region", "callable_count", "patched_file"),
+    (
+        ("deepseek_v4_flash_dspark", "dspark_projection", 1, None),
+        ("deepseek_v4_flash_mtp", "mtp_projection", 2, "decode_mtp.py"),
+        ("deepseek_v4_pro", "mtp_projection", 2, "decode_mtp.py"),
+        ("qwen3_14b", "output_head", 1, "decode_fwd.py"),
+    ),
+)
+def test_production_model_integration_emits_first_maximal_region(
+    model_name: str,
+    region: str,
+    callable_count: int,
+    patched_file: str | None,
+) -> None:
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    if pypto_lib_root is None:
+        pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+    integration = emit_production_model_integration(
+        model_name,
+        pypto_lib_root,
+        _test_solver(),
+        solver_workers=2,
+    )
+
+    assert integration.model_name == model_name
+    assert integration.implemented_static_regions == (region,)
+    assert len(integration.callables) == callable_count
+    assert all(
+        "auto_tile" not in source.source for source in integration.generated_sources
+    )
+    assert all(
+        "auto_fuse" not in source.source for source in integration.generated_sources
+    )
+    if patched_file is None:
+        assert integration.patched_native_sources == ()
+        assert integration.callables[0].completion_task is not None
+    else:
+        assert tuple(
+            source.relative_path for source in integration.patched_native_sources
+        ) == (patched_file,)
+    assert len(integration.files()) == len(integration.generated_sources) + len(
+        integration.patched_native_sources
+    )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
 def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
     analytic_module, analytic_args = build_production_mtp_projection_branch()
     analytic_graph = export_and_normalize(analytic_module, analytic_args)
@@ -268,10 +439,6 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
     )
     assert analytic.successful and not analytic.whole_graph_codegen_ready
     assert analytic.regions[0].solution is not None
-    analytic_ops = [
-        op for step in analytic.regions[0].solution["steps"] for op in step["ops"]
-    ]
-    assert len(analytic_ops) > len(set(analytic_ops))
 
     solved = []
     for builder, rows in (
@@ -362,6 +529,46 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         "from mtp_projection import golden_mtp_projection\n"
         "from fusebox_mtp_projection import mtp_projection\n"
     )
+    pro_native = """from mtp_projection import (
+    _quantize_weight_per_out,
+    golden_mtp_projection,
+    mtp_projection,
+)
+"""
+    pro_overlay = emit_deepseek_mtp_projection_overlay(
+        full_graph,
+        full_result,
+        native_source=pro_native,
+        module_name="fusebox_pro_mtp_projection",
+    )
+    assert pro_overlay.decode_source == (
+        "from mtp_projection import _quantize_weight_per_out, "
+        "golden_mtp_projection\n"
+        "from fusebox_pro_mtp_projection import mtp_projection\n"
+    )
+    with pytest.raises(SourceEmissionError, match="exactly once; found 0"):
+        emit_deepseek_mtp_projection_overlay(
+            full_graph,
+            full_result,
+            native_source="from mtp_projection import golden_mtp_projection\n",
+        )
+    with pytest.raises(SourceEmissionError, match="must be unaliased"):
+        emit_deepseek_mtp_projection_overlay(
+            full_graph,
+            full_result,
+            native_source=(
+                "from mtp_projection import mtp_projection as native_projection\n"
+            ),
+        )
+    with pytest.raises(SourceEmissionError, match="exactly once; found 2"):
+        emit_deepseek_mtp_projection_overlay(
+            full_graph,
+            full_result,
+            native_source=(
+                "from mtp_projection import mtp_projection\n"
+                "from mtp_projection import mtp_projection\n"
+            ),
+        )
     with pytest.raises(SourceEmissionError, match="module name is invalid"):
         emit_flash_mtp_decode_projection_overlay(
             full_graph,
@@ -1142,7 +1349,7 @@ def test_connected_qwen_rms_norm_lm_head_is_one_exact_v2c_region() -> None:
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
-def test_deepseek_mtp_projection_emits_a_generic_three_step_composition() -> None:
+def test_deepseek_mtp_projection_emits_one_generic_branched_region() -> None:
     module, args = build_deepseek_examples()["deepseek_v4_mtp_projection"]
     graph = export_and_normalize(module, args)
     result = solve_graph(
@@ -1157,10 +1364,16 @@ def test_deepseek_mtp_projection_emits_a_generic_three_step_composition() -> Non
     assert result.whole_graph_codegen_ready
     assert len(result.regions) == 1
     schedule = scheduled_region(result.regions[0])
-    assert [step.kind for step in schedule.steps] == [
-        KernelKind.MIXED,
-        KernelKind.VECTOR,
-        KernelKind.MIXED,
+    assert [step.kind for step in schedule.steps] == [KernelKind.MIXED]
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol.value == "branched_round_trip_bundle"
+    assert [stage.engine.value for stage in plan.stages] == [
+        "vector",
+        "cube",
+        "vector",
+        "cube",
+        "vector",
     ]
     region = result.regions[0]
     assert region.solver_op_to_graph == tuple(
@@ -1174,11 +1387,11 @@ def test_deepseek_mtp_projection_emits_a_generic_three_step_composition() -> Non
         result.regions[0],
         function_name="generated_deepseek_mtp_projection",
     )
-    assert emitted.source.count("pl.spmd(") == 3
-    assert emitted.source.count("pl.create_tensor(") == 2
-    assert emitted.source.count("pl.cross_core_pipe(") == 2
-    assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in emitted.source
-    assert "pl.CrossCoreDirection.CUBE_TO_VECTOR" in emitted.source
+    assert emitted.source.count("pl.spmd(") == 1
+    assert emitted.source.count("pl.create_tensor(") == 0
+    assert emitted.source.count("pl.cross_core_pipe(") == 4
+    assert emitted.source.count("pl.CrossCoreDirection.VECTOR_TO_CUBE") == 2
+    assert emitted.source.count("pl.CrossCoreDirection.CUBE_TO_VECTOR") == 2
     assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
 
 

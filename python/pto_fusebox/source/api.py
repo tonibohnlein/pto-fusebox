@@ -104,6 +104,7 @@ class EmittedPyPTOCallable:
     input_arguments: tuple[PyPTOABIArgument, ...]
     runtime_valid_shapes: tuple[PyPTORuntimeValidShapeArgument, ...]
     output_arguments: tuple[PyPTOABIArgument, ...]
+    completion_task: str | None
     source: str
 
     @property
@@ -209,6 +210,7 @@ def emit_pypto_callable(
     *,
     function_name: str | None = None,
     runtime_valid_shape: RuntimeValidShapeSpec | None = None,
+    expose_completion_task: bool = False,
 ) -> EmittedPyPTOCallable:
     """Emit one solver-owned schedule as a callable PyPTO inline fragment.
 
@@ -222,6 +224,8 @@ def emit_pypto_callable(
     except (LoweredContractError, ScheduleContractError) as error:
         raise SourceEmissionError(str(error)) from error
     chosen_name = identifier(function_name or f"fused_{result.region.id}")
+    if expose_completion_task:
+        _validate_completion_task_contract(lowered, schedule, region_interface)
     program_source = _render_region(
         graph,
         result.problem,
@@ -230,7 +234,11 @@ def emit_pypto_callable(
         region_interface,
         class_name(chosen_name),
     )
-    source = _program_as_inline_callable(program_source, chosen_name)
+    source, completion_task = _program_as_inline_callable(
+        program_source,
+        chosen_name,
+        expose_completion_task=expose_completion_task,
+    )
     runtime_arguments: tuple[PyPTORuntimeValidShapeArgument, ...] = ()
     if runtime_valid_shape is not None:
         source, runtime_argument = _add_runtime_valid_shape(
@@ -255,8 +263,69 @@ def emit_pypto_callable(
             PyPTOABIArgument(value_id, argument)
             for value_id, argument in region_interface.output_arguments.items()
         ),
+        completion_task=completion_task,
         source=source,
     )
+
+
+def _validate_completion_task_contract(
+    lowered: LoweredRegion,
+    schedule: ScheduledRegion,
+    region_interface: Interface,
+) -> None:
+    """Require the exposed task to post-dominate the emitted step graph.
+
+    A callable completion token is a dependency for *external* native work.
+    Capturing the lexically final SPMD launch is sound only when every earlier
+    launch flows into that sink.  Do not silently expose one branch of a
+    fan-out/multi-output callable as if it completed the whole region.
+    """
+
+    if len(region_interface.output_arguments) != 1:
+        raise SourceEmissionError(
+            "callable completion TaskId requires one region output"
+        )
+    producer = _tensor_producers(lowered)
+    consumers = _tensor_consumers(lowered)
+    step_by_op = {
+        operation: step.index
+        for step in schedule.steps
+        for operation in step.solver_ops
+    }
+    if len(step_by_op) != len(lowered.operations):
+        raise SourceEmissionError(
+            "callable completion TaskId requires complete step coverage"
+        )
+    final_step = schedule.steps[-1].index
+    required_output = next(iter(lowered.required_outputs))
+    output_producer = producer[required_output]
+    if output_producer is None or step_by_op[output_producer] != final_step:
+        raise SourceEmissionError(
+            "callable completion TaskId requires the final step to produce the output"
+        )
+
+    predecessors: dict[int, set[int]] = {step.index: set() for step in schedule.steps}
+    for tensor, producer_op in enumerate(producer):
+        if producer_op is None:
+            continue
+        producer_step = step_by_op[producer_op]
+        for consumer_op in consumers[tensor]:
+            consumer_step = step_by_op[consumer_op]
+            if consumer_step != producer_step:
+                predecessors[consumer_step].add(producer_step)
+
+    postdominated = {final_step}
+    pending = [final_step]
+    while pending:
+        step = pending.pop()
+        for predecessor in predecessors[step]:
+            if predecessor not in postdominated:
+                postdominated.add(predecessor)
+                pending.append(predecessor)
+    if postdominated != set(predecessors):
+        raise SourceEmissionError(
+            "callable completion TaskId requires every step to reach the final output"
+        )
 
 
 def emit_pypto_static_bundle(
@@ -673,7 +742,12 @@ def _has_automatic_scheduling_tag(tree: ast.AST) -> bool:
     return False
 
 
-def _program_as_inline_callable(source: str, function_name: str) -> str:
+def _program_as_inline_callable(
+    source: str,
+    function_name: str,
+    *,
+    expose_completion_task: bool,
+) -> tuple[str, str | None]:
     """Convert one generated orchestration program into an inline callable."""
 
     tree = ast.parse(source)
@@ -698,6 +772,9 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
     function.name = function_name
     function.args.args = function.args.args[1:]
     _namespace_inline_locals(function, function_name)
+    completion_task = None
+    if expose_completion_task:
+        completion_task = _expose_completion_task(function, function_name)
     function.decorator_list = [
         ast.Attribute(
             value=ast.Name(id="pl", ctx=ast.Load()),
@@ -714,7 +791,153 @@ def _program_as_inline_callable(source: str, function_name: str) -> str:
     rendered = ast.unparse(module) + "\n"
     if _has_automatic_scheduling_tag(module):
         raise SourceEmissionError("callable source must encode the plan directly")
-    return rendered
+    return rendered, completion_task
+
+
+def _expose_completion_task(
+    function: ast.FunctionDef,
+    function_name: str,
+) -> str:
+    """Return the final generated launch as a native orchestration dependency.
+
+    Generated callables normally expose only their tensor ABI. Some native
+    PyPTO orchestration deliberately delays unrelated work using the completion
+    ``TaskId`` of a static kernel. Capture the final top-level SPMD launch
+    without changing its grid, body, or dependency inference, and append that
+    token to the callable return value.
+    """
+
+    completion_name = _inline_local_name(function_name, "completion_task")
+    if any(
+        isinstance(node, ast.Name) and node.id == completion_name
+        for node in ast.walk(function)
+    ):
+        raise SourceEmissionError(
+            "callable completion TaskId collides with a generated local"
+        )
+
+    launch_indices = [
+        index
+        for index, statement in enumerate(function.body)
+        if _top_level_spmd(statement) is not None
+    ]
+    if not launch_indices:
+        raise SourceEmissionError(
+            "callable completion TaskId requires a top-level SPMD launch"
+        )
+    launch_index = launch_indices[-1]
+    statement = function.body[launch_index]
+    if isinstance(statement, ast.For):
+        if statement.orelse:
+            raise SourceEmissionError(
+                "callable completion TaskId does not support an SPMD loop else"
+            )
+        block_index = ast.Assign(
+            targets=[statement.target],
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Attribute(
+                        value=ast.Name(id="pl", ctx=ast.Load()),
+                        attr="tile",
+                        ctx=ast.Load(),
+                    ),
+                    attr="get_block_idx",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[],
+            ),
+        )
+        captured = ast.With(
+            items=[
+                ast.withitem(
+                    context_expr=statement.iter,
+                    optional_vars=ast.Name(id=completion_name, ctx=ast.Store()),
+                )
+            ],
+            body=[block_index, *statement.body],
+            type_comment=None,
+        )
+        function.body[launch_index] = ast.copy_location(captured, statement)
+    elif isinstance(statement, ast.With):
+        item = _top_level_spmd(statement)
+        assert isinstance(item, ast.withitem)
+        if item.optional_vars is not None:
+            if not isinstance(item.optional_vars, ast.Name):
+                raise SourceEmissionError(
+                    "callable completion SPMD binds a non-scalar TaskId"
+                )
+            completion_name = item.optional_vars.id
+        else:
+            item.optional_vars = ast.Name(id=completion_name, ctx=ast.Store())
+    else:  # pragma: no cover - guarded by _top_level_spmd.
+        raise AssertionError("unknown top-level SPMD statement")
+
+    returns = [
+        statement for statement in function.body if isinstance(statement, ast.Return)
+    ]
+    if len(returns) != 1 or returns[0].value is None:
+        raise SourceEmissionError(
+            "callable completion TaskId requires one tensor return"
+        )
+    original_return = returns[0].value
+    returns[0].value = ast.Tuple(
+        elts=[original_return, ast.Name(id=completion_name, ctx=ast.Load())],
+        ctx=ast.Load(),
+    )
+    if function.returns is None:
+        raise SourceEmissionError(
+            "callable completion TaskId requires an annotated tensor return"
+        )
+    function.returns = ast.Subscript(
+        value=ast.Name(id="tuple", ctx=ast.Load()),
+        slice=ast.Tuple(
+            elts=[
+                function.returns,
+                ast.Subscript(
+                    value=ast.Attribute(
+                        value=ast.Name(id="pl", ctx=ast.Load()),
+                        attr="Scalar",
+                        ctx=ast.Load(),
+                    ),
+                    slice=ast.Attribute(
+                        value=ast.Name(id="pl", ctx=ast.Load()),
+                        attr="TASK_ID",
+                        ctx=ast.Load(),
+                    ),
+                    ctx=ast.Load(),
+                ),
+            ],
+            ctx=ast.Load(),
+        ),
+        ctx=ast.Load(),
+    )
+    return completion_name
+
+
+def _top_level_spmd(statement: ast.stmt) -> ast.withitem | ast.Call | None:
+    """Return the SPMD descriptor for one top-level launch statement."""
+
+    if isinstance(statement, ast.For) and _is_pl_spmd_call(statement.iter):
+        assert isinstance(statement.iter, ast.Call)
+        return statement.iter
+    if isinstance(statement, ast.With) and len(statement.items) == 1:
+        item = statement.items[0]
+        if _is_pl_spmd_call(item.context_expr):
+            return item
+    return None
+
+
+def _is_pl_spmd_call(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    function = node.func
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr == "spmd"
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "pl"
+    )
 
 
 def _namespace_inline_locals(function: ast.FunctionDef, function_name: str) -> None:

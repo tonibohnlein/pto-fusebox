@@ -31,9 +31,23 @@ from .ir import (
     ShapeDimension,
 )
 from .normalize import export_and_normalize, normalize_exported
+from .model import (
+    NativeBoundaryKind,
+    PyPTOLibModelManifest,
+    PyPTOLibNativeBoundary,
+    PyPTOLibStaticRegion,
+    StaticRegionOwnership,
+    ValidatedPyPTOLibModel,
+    pypto_lib_model_manifest,
+    pypto_lib_model_manifests,
+    validate_pypto_lib_model,
+)
 from .pypto_lib import (
     FlashMtpProjectionOverlay,
+    QwenOutputHeadOverlay,
+    emit_deepseek_mtp_projection_overlay,
     emit_flash_mtp_decode_projection_overlay,
+    emit_qwen_output_head_overlay,
 )
 from .regions import SolverRegion, extract_solver_regions
 from .schedule import (
@@ -82,8 +96,13 @@ __all__ = [
     "NormalizedGraph",
     "NormalizedOp",
     "NormalizedValue",
+    "NativeBoundaryKind",
     "PyPTOABIArgument",
+    "PyPTOLibModelManifest",
+    "PyPTOLibNativeBoundary",
+    "PyPTOLibStaticRegion",
     "PyPTORuntimeValidShapeArgument",
+    "QwenOutputHeadOverlay",
     "RegionSolveResult",
     "RuntimeValidShapeSpec",
     "ScheduleContractError",
@@ -92,12 +111,16 @@ __all__ = [
     "SolveResult",
     "SolverRegion",
     "SourceEmissionError",
+    "StaticRegionOwnership",
     "TargetProfile",
+    "ValidatedPyPTOLibModel",
     "can_emit_region",
     "bind_emitted_inputs",
     "export_and_normalize",
     "emit_pypto_callable",
+    "emit_deepseek_mtp_projection_overlay",
     "emit_flash_mtp_decode_projection_overlay",
+    "emit_qwen_output_head_overlay",
     "emit_pypto_region",
     "emit_pypto_static_bundle",
     "enumerate_cube_plans",
@@ -110,7 +133,10 @@ __all__ = [
     "region_for_mixed_group_candidate",
     "extract_solver_regions",
     "normalize_exported",
+    "pypto_lib_model_manifest",
+    "pypto_lib_model_manifests",
     "region_for_cube_candidate",
     "scheduled_region",
     "solve_graph",
+    "validate_pypto_lib_model",
 ]

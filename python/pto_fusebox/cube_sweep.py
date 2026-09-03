@@ -81,7 +81,7 @@ def enumerate_cube_plans(
     """Enumerate every feasible cube plan for one lowered homogeneous cube region.
 
     The C++ sweep executable reuses the production model and serializes each
-    fixed candidate as ``solution.v6``. This function validates that envelope;
+    fixed candidate as ``solution.v7``. This function validates that envelope;
     it does not re-price or re-plan the candidate in Python.
 
     Args:

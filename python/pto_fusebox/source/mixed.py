@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ..ir import NormalizedOp
+from ..lowered import LoweredOperation
 from ..schedule import MixedKernelPlan
 from ..schedule.schema import (
     MixedAlgorithm,
@@ -23,6 +24,7 @@ from .common import (
     SourceEmissionError,
     SourceWriter,
     broadcast_operands,
+    emit_partition_indices,
     emit_return,
     literal,
     program_preamble,
@@ -45,10 +47,12 @@ def emit_mixed(context: EmissionContext, program_name: str) -> str:
     if not isinstance(plan, MixedKernelPlan):
         raise SourceEmissionError("mixed step does not carry a mixed plan")
     _validate_common(context, plan)
-    if plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP:
-        return _emit_dense_swiglu(context, program_name, plan)
+    if plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP:
+        return _emit_feature_chunk_round_trip(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
         return _emit_single_round_trip(context, program_name, plan)
+    if plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE:
+        return _emit_branched_round_trip(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL:
         return _emit_multi_round_trip_sequential(context, program_name, plan)
     if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
@@ -65,13 +69,14 @@ def _validate_common(context: EmissionContext, plan: MixedKernelPlan) -> None:
         raise SourceEmissionError("mixed source currently requires split_k=1")
     if len(context.interface.output_values) != 1:
         raise SourceEmissionError("mixed source currently requires one region output")
-    if (
-        plan.m_partition.big != plan.m_partition.small
-        or plan.n_partition.big != plan.n_partition.small
-        or plan.m_partition.num_big != 0
-        or plan.n_partition.num_big != 0
-    ):
-        raise SourceEmissionError("mixed source requires a uniform spatial grid")
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    output = context.lowered.tensor(output_tensor)
+    if plan.m_partition.big > output.height or plan.n_partition.big > output.width:
+        raise SourceEmissionError(
+            "mixed source physical tile exceeds its logical output frame"
+        )
     if (
         plan.vector_split is not MixedVectorSplit.ROWS
         or plan.vector_lanes != 2
@@ -218,7 +223,7 @@ def _emit_one_way_c2v(
         f"for mixed_trip, (output_iter,) in {trip_loop}({trips}{trip_stage}, "
         f"init_values=({output},)):",
     )
-    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
     local = {
         crossing: _emit_matmul_tile(
             writer,
@@ -330,7 +335,7 @@ def _emit_one_way_v2c(
         f"({plan.max_trips_per_group}{trip_stage}, "
         f"init_values=({output},)):",
     )
-    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
     vector_row = row if fifo.spatial_m else "0"
     vector_col = col if fifo.spatial_n else "0"
     vector_local: dict[int, str] = {}
@@ -444,7 +449,7 @@ def _emit_streaming_softmax_v2c(  # noqa: PLR0915 -- typed phase replay.
         f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
         f"init_values=({output},)):",
     )
-    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
     running_max, running_sum = _emit_tensor_softmax_stats_chunk(
         writer,
         4,
@@ -776,6 +781,11 @@ def _emit_single_round_trip(
     program_name: str,
     plan: MixedKernelPlan,
 ) -> str:
+    engines = tuple(stage.engine for stage in plan.stages)
+    supported_engines = {
+        (MixedEngine.CUBE, MixedEngine.VECTOR, MixedEngine.CUBE),
+        (MixedEngine.VECTOR, MixedEngine.CUBE, MixedEngine.VECTOR),
+    }
     if (
         plan.algorithm is not MixedAlgorithm.GENERIC
         or plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
@@ -784,39 +794,53 @@ def _emit_single_round_trip(
         or (plan.pipeline_stages == 3) is not plan.overlap_implementable
         or plan.requested_skew_depth != (2 if plan.pipeline_stages == 3 else 0)
         or len(plan.stages) != 3
-        or tuple(stage.engine for stage in plan.stages)
-        != (MixedEngine.CUBE, MixedEngine.VECTOR, MixedEngine.CUBE)
-        or len(plan.stages[0].ops) != 1
-        or len(plan.stages[2].ops) != 1
+        or engines not in supported_engines
         or len(plan.transfers) != 2
-        or tuple(fifo.direction for fifo in plan.fifos)
-        != (
-            MixedTransferDirection.CUBE_TO_VECTOR,
-            MixedTransferDirection.VECTOR_TO_CUBE,
+        or any(
+            transfer.producer_stage != index or transfer.consumer_stage != index + 1
+            for index, transfer in enumerate(plan.transfers)
         )
         or any(fifo.slot_count != 4 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
-            "mixed plan is not the supported generic C->V->C topology"
+            "mixed plan is not a supported generic three-stage round trip"
         )
-    vector_stage = plan.stages[1]
-    _require_materialized_vector_stage(vector_stage)
-    first_op = plan.stages[0].ops[0]
-    sink_op = plan.stages[2].ops[0]
-    first_crossing = plan.transfers[0].tensor
-    reply_crossing = plan.transfers[1].tensor
-    if (
-        context.lowered.operation(first_op).outputs != (first_crossing,)
-        or context.lowered.operation(sink_op).inputs[0] != reply_crossing
-    ):
-        raise SourceEmissionError("round-trip transfers do not connect the cube stages")
-    crossing_rows = plan.fifos[0].valid_rows
-    crossing_cols = plan.fifos[0].valid_cols
-    if (crossing_rows, crossing_cols) != (
-        plan.fifos[1].valid_rows,
-        plan.fifos[1].valid_cols,
-    ) or crossing_rows != plan.m_partition.big:
-        raise SourceEmissionError("round-trip FIFO frames disagree")
+    for stage in plan.stages:
+        if stage.engine is MixedEngine.CUBE:
+            if len(stage.ops) != 1:
+                raise SourceEmissionError(
+                    "generic round-trip cube stages require one matmul"
+                )
+        else:
+            _require_in_memory_vector_stage(stage)
+    expected_directions = tuple(
+        MixedTransferDirection.CUBE_TO_VECTOR
+        if plan.stages[index].engine is MixedEngine.CUBE
+        else MixedTransferDirection.VECTOR_TO_CUBE
+        for index in range(2)
+    )
+    if tuple(fifo.direction for fifo in plan.fifos) != expected_directions:
+        raise SourceEmissionError(
+            "generic round-trip FIFO directions differ from its stage engines"
+        )
+    for index, transfer in enumerate(plan.transfers):
+        producer = context.lowered.operation(plan.stages[index].ops[-1])
+        consumer_uses_transfer = any(
+            transfer.tensor in context.lowered.operation(op).inputs
+            for op in plan.stages[index + 1].ops
+        )
+        if producer.outputs != (transfer.tensor,) or not consumer_uses_transfer:
+            raise SourceEmissionError(
+                "generic round-trip transfers do not connect adjacent stages"
+            )
+
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    if context.lowered.operation(plan.stages[-1].ops[-1]).outputs != (output_tensor,):
+        raise SourceEmissionError(
+            "generic round-trip final stage does not produce the region output"
+        )
 
     writer = _mixed_header(context, program_name, plan)
     output = context.interface.output_argument
@@ -828,47 +852,71 @@ def _emit_single_round_trip(
         f"for mixed_trip, (output_iter,) in {trip_loop}({trips}{trip_stage}, "
         f"init_values=({output},)):",
     )
-    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
-    local = {
-        first_crossing: _emit_matmul_tile(
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
+    local: dict[int, str] = {}
+    for index in range(2):
+        stage = plan.stages[index]
+        transfer = plan.transfers[index]
+        fifo = plan.fifos[index]
+        stage_row = row if fifo.spatial_m else "0"
+        stage_col = col if fifo.spatial_n else "0"
+        if stage.engine is MixedEngine.CUBE:
+            value = _emit_matmul_tile(
+                writer,
+                4,
+                context,
+                stage.ops[0],
+                stage.cube_window_k[0],
+                rows=fifo.valid_rows,
+                cols=fifo.valid_cols,
+                row_offset=stage_row,
+                col_offset=stage_col,
+                local=local,
+                prefix=f"round_trip_{index}_cube",
+            )
+        else:
+            value = _emit_vector_stage(
+                writer,
+                4,
+                context,
+                stage,
+                local,
+                frame_rows=fifo.valid_rows,
+                frame_cols=fifo.valid_cols,
+                row_offset=stage_row,
+                col_offset=stage_col,
+                allow_external=True,
+            )
+        local[transfer.tensor] = value
+
+    final_stage = plan.stages[2]
+    if final_stage.engine is MixedEngine.CUBE:
+        result = _emit_matmul_tile(
             writer,
             4,
             context,
-            first_op,
-            plan.stages[0].cube_window_k[0],
-            rows=crossing_rows,
-            cols=crossing_cols,
+            final_stage.ops[0],
+            final_stage.cube_window_k[0],
+            rows=plan.m_partition.big,
+            cols=plan.n_partition.big,
             row_offset=row,
-            col_offset="0",
-            local={},
-            prefix="producer",
+            col_offset=col,
+            local=local,
+            prefix="round_trip_final_cube",
         )
-    }
-    local[reply_crossing] = _emit_vector_stage(
-        writer,
-        4,
-        context,
-        vector_stage,
-        local,
-        frame_rows=crossing_rows,
-        frame_cols=crossing_cols,
-        row_offset=row,
-        col_offset="0",
-        allow_external=True,
-    )
-    result = _emit_matmul_tile(
-        writer,
-        4,
-        context,
-        sink_op,
-        plan.stages[2].cube_window_k[0],
-        rows=plan.m_partition.big,
-        cols=plan.n_partition.big,
-        row_offset=row,
-        col_offset=col,
-        local=local,
-        prefix="sink",
-    )
+    else:
+        result = _emit_vector_stage(
+            writer,
+            4,
+            context,
+            final_stage,
+            local,
+            frame_rows=plan.m_partition.big,
+            frame_cols=plan.n_partition.big,
+            row_offset=row,
+            col_offset=col,
+            allow_external=True,
+        )
     writer.line(
         4,
         f"next_output = pl.tensor.assemble(output_iter, {result}, [{row}, {col}])",
@@ -950,7 +998,7 @@ def _emit_multi_round_trip_sequential(
         f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
         f"init_values=({output},)):",
     )
-    row, col = _emit_spatial_coordinates(writer, 4, plan, "mixed_trip")
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
     first_rows = plan.fifos[0].valid_rows
     first_cols = plan.fifos[0].valid_cols
     first_row = row if plan.fifos[0].spatial_m else "0"
@@ -1020,102 +1068,307 @@ def _emit_multi_round_trip_sequential(
     return writer.render()
 
 
-def _emit_dense_swiglu(
+def _emit_branched_round_trip(
     context: EmissionContext,
     program_name: str,
     plan: MixedKernelPlan,
 ) -> str:
-    dense = plan.dense_mlp
+    """Replay a generic producer-bundle/peer-bundle/vector-sink pipeline."""
+
+    producer_bundle = plan.protocol_producer_bundle
+    reply_bundle = plan.protocol_reply_bundle
+    sink_stage = plan.protocol_sink_stage
     if (
-        dense is None
-        or plan.protocol is not MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+        plan.algorithm is not MixedAlgorithm.GENERIC
+        or plan.protocol is not MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE
         or plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
-        or plan.pipeline_axis is not MixedPipelineAxis.INTERMEDIATE_FEATURE_CHUNK
-        or len(plan.stages) != 4
-        or tuple(stage.engine for stage in plan.stages)
-        != (
-            MixedEngine.CUBE,
-            MixedEngine.CUBE,
-            MixedEngine.VECTOR,
-            MixedEngine.CUBE,
-        )
-        or any(len(plan.stages[index].ops) != 1 for index in (0, 1, 3))
-        or len(plan.fifos) != 3
-        or tuple(fifo.direction for fifo in plan.fifos)
-        != (
-            MixedTransferDirection.CUBE_TO_VECTOR,
-            MixedTransferDirection.CUBE_TO_VECTOR,
-            MixedTransferDirection.VECTOR_TO_CUBE,
-        )
+        or plan.pipeline_axis is not MixedPipelineAxis.SPATIAL_REGION
+        or plan.pipeline_stages not in {1, 3}
+        or (plan.pipeline_stages == 3) is not plan.overlap_implementable
+        or plan.requested_skew_depth != (2 if plan.pipeline_stages == 3 else 0)
+        or len(producer_bundle) < 2
+        or len(reply_bundle) != len(producer_bundle)
+        or sorted((*producer_bundle, *reply_bundle)) != list(range(len(plan.transfers)))
+        or sink_stage is None
+        or sink_stage != len(plan.stages) - 1
+        or plan.protocol_peer_stage is not None
         or any(fifo.slot_count != 4 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
-            "mixed plan is not the supported dense SwiGLU topology"
+            "mixed plan is not a supported generic branched round trip"
         )
-    gate_op = plan.stages[0].ops[0]
-    up_op = plan.stages[1].ops[0]
-    vector_stage = plan.stages[2]
-    down_op = plan.stages[3].ops[0]
-    _require_materialized_vector_stage(vector_stage)
-    gate = context.lowered.operation(gate_op)
-    up = context.lowered.operation(up_op)
-    down = context.lowered.operation(down_op)
-    if gate.inputs[0] != up.inputs[0] or down.inputs[0] != plan.transfers[2].tensor:
+    for stage in plan.stages:
+        if stage.engine is MixedEngine.CUBE:
+            if len(stage.ops) != 1:
+                raise SourceEmissionError(
+                    "branched round-trip cube stages require one matmul"
+                )
+        else:
+            _require_in_memory_vector_stage(stage)
+    if plan.stages[sink_stage].engine is not MixedEngine.VECTOR:
+        raise SourceEmissionError("branched round-trip sink must be vector work")
+
+    outgoing: dict[int, int] = {}
+    for transfer_index, transfer in enumerate(plan.transfers):
+        if transfer.producer_stage in outgoing:
+            raise SourceEmissionError(
+                "branched round-trip stage publishes more than one value"
+            )
+        outgoing[transfer.producer_stage] = transfer_index
+        producer = context.lowered.operation(
+            plan.stages[transfer.producer_stage].ops[-1]
+        )
+        consumer_uses_transfer = any(
+            transfer.tensor in context.lowered.operation(op).inputs
+            for op in plan.stages[transfer.consumer_stage].ops
+        )
+        if producer.outputs != (transfer.tensor,) or not consumer_uses_transfer:
+            raise SourceEmissionError(
+                "branched round-trip transfer does not connect its stages"
+            )
+        expected_direction = (
+            MixedTransferDirection.CUBE_TO_VECTOR
+            if plan.stages[transfer.producer_stage].engine is MixedEngine.CUBE
+            else MixedTransferDirection.VECTOR_TO_CUBE
+        )
+        if plan.fifos[transfer_index].direction is not expected_direction:
+            raise SourceEmissionError(
+                "branched round-trip FIFO direction differs from its producer"
+            )
+    if set(outgoing) != set(range(sink_stage)):
         raise SourceEmissionError(
-            "dense SwiGLU projection wiring differs from its plan"
+            "branched round-trip stages do not each publish one declared value"
         )
-    if (plan.transfers[0].tensor, plan.transfers[1].tensor) != (
-        gate.outputs[0],
-        up.outputs[0],
-    ) or tuple(plan.stages[2].ops) == ():
-        raise SourceEmissionError("dense SwiGLU producer bundle is incomplete")
-    rows = plan.m_partition.big
-    cols = plan.n_partition.big
-    if dense.persistent_accumulator_bytes != rows * cols * 4:
-        raise SourceEmissionError("dense SwiGLU persistent accumulator size is stale")
+
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    if context.lowered.operation(plan.stages[sink_stage].ops[-1]).outputs != (
+        output_tensor,
+    ):
+        raise SourceEmissionError(
+            "branched round-trip sink does not produce the region output"
+        )
 
     writer = _mixed_header(context, program_name, plan)
-    row, col = _emit_spatial_coordinates(writer, 3, plan, None)
-    output_dtype = pypto_dtype(context.lowered.tensor(down.outputs[0]).dtype)
+    output = context.interface.output_argument
+    trip_loop = "pl.pipeline" if plan.pipeline_stages == 3 else "pl.range"
+    trip_stage = ", stage=3" if plan.pipeline_stages == 3 else ""
     writer.line(
         3,
-        f"down_acc_init = pl.tensor.create([{rows}, {cols}], "
+        f"for mixed_trip, (output_iter,) in {trip_loop}"
+        f"({plan.max_trips_per_group}{trip_stage}, init_values=({output},)):",
+    )
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
+    local: dict[int, str] = {}
+    for stage_index in range(sink_stage):
+        stage = plan.stages[stage_index]
+        transfer_index = outgoing[stage_index]
+        transfer = plan.transfers[transfer_index]
+        fifo = plan.fifos[transfer_index]
+        stage_row = row if fifo.spatial_m else "0"
+        stage_col = col if fifo.spatial_n else "0"
+        if stage.engine is MixedEngine.CUBE:
+            value = _emit_matmul_tile(
+                writer,
+                4,
+                context,
+                stage.ops[0],
+                stage.cube_window_k[0],
+                rows=fifo.valid_rows,
+                cols=fifo.valid_cols,
+                row_offset=stage_row,
+                col_offset=stage_col,
+                local=local,
+                prefix=f"branched_{stage_index}_cube",
+            )
+        else:
+            value = _emit_vector_stage(
+                writer,
+                4,
+                context,
+                stage,
+                local,
+                frame_rows=fifo.valid_rows,
+                frame_cols=fifo.valid_cols,
+                row_offset=stage_row,
+                col_offset=stage_col,
+                allow_external=True,
+            )
+        local[transfer.tensor] = value
+
+    result = _emit_vector_stage(
+        writer,
+        4,
+        context,
+        plan.stages[sink_stage],
+        local,
+        frame_rows=plan.m_partition.big,
+        frame_cols=plan.n_partition.big,
+        row_offset=row,
+        col_offset=col,
+        allow_external=True,
+    )
+    writer.line(
+        4,
+        f"next_output = pl.tensor.assemble(output_iter, {result}, [{row}, {col}])",
+    )
+    writer.line(4, f"{output} = pl.yield_(next_output)")
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
+def _emit_feature_chunk_round_trip(
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+) -> str:
+    feature = plan.feature_round_trip
+    producer_transfers = tuple(
+        plan.transfers[index] for index in plan.protocol_producer_bundle
+    )
+    reply_transfer = (
+        plan.transfers[plan.protocol_reply_bundle[0]]
+        if len(plan.protocol_reply_bundle) == 1
+        else None
+    )
+    peer_stage_index = plan.protocol_peer_stage
+    sink_stage_index = plan.protocol_sink_stage
+    if (
+        feature is None
+        or plan.protocol is not MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+        or plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
+        or plan.pipeline_axis is not MixedPipelineAxis.INTERMEDIATE_FEATURE_CHUNK
+        or not producer_transfers
+        or reply_transfer is None
+        or peer_stage_index is None
+        or sink_stage_index is None
+        or peer_stage_index >= len(plan.stages)
+        or sink_stage_index >= len(plan.stages)
+        or plan.stages[peer_stage_index].engine is not MixedEngine.VECTOR
+        or plan.stages[sink_stage_index].engine is not MixedEngine.CUBE
+        or len(plan.stages[sink_stage_index].ops) != 1
+        or len(feature.producer_window_k) != len(producer_transfers)
+        or len(plan.fifos) != len(producer_transfers) + 1
+        or any(
+            plan.fifos[index].direction is not MixedTransferDirection.CUBE_TO_VECTOR
+            for index in plan.protocol_producer_bundle
+        )
+        or plan.fifos[plan.protocol_reply_bundle[0]].direction
+        is not MixedTransferDirection.VECTOR_TO_CUBE
+        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+    ):
+        raise SourceEmissionError(
+            "mixed plan is not a supported feature-chunk round trip"
+        )
+    vector_stage = plan.stages[peer_stage_index]
+    sink_op = plan.stages[sink_stage_index].ops[0]
+    _require_in_memory_vector_stage(vector_stage)
+    sink = context.lowered.operation(sink_op)
+    sink_graph_op = context.graph.op_map()[sink.graph_op_id]
+    if sink_graph_op.kind != "matmul":
+        raise SourceEmissionError("feature-chunk sink is not a matmul")
+    sink_lhs_transposed = sink_graph_op.attributes.get("lhs_transposed") is True
+    sink_rhs_transposed = sink_graph_op.attributes.get("rhs_transposed") is True
+    if sink_lhs_transposed:
+        raise SourceEmissionError(
+            "feature-chunk sink cannot transpose its FIFO-produced lhs"
+        )
+    if sink.inputs[0] != reply_transfer.tensor:
+        raise SourceEmissionError("feature-chunk reply does not feed the sink matmul")
+    rows = plan.m_partition.big
+    cols = plan.n_partition.big
+    if (
+        plan.pipeline_extent != feature.intermediate_extent
+        or plan.pipeline_chunk != feature.intermediate_chunk
+        or plan.items_per_spatial_tile != feature.intermediate_chunks
+        or plan.pipeline_work_items != plan.spatial_tiles * feature.intermediate_chunks
+        or plan.min_trips_per_group != feature.intermediate_chunks
+        or plan.max_trips_per_group != feature.intermediate_chunks
+    ):
+        raise SourceEmissionError(
+            "feature-chunk loop geometry differs from its descriptor"
+        )
+    reply = context.lowered.tensor(reply_transfer.tensor)
+    if (
+        reply.height < rows
+        or reply.width != feature.intermediate_extent
+        or reply_transfer.producer_stage != peer_stage_index
+        or reply_transfer.consumer_stage != sink_stage_index
+    ):
+        raise SourceEmissionError(
+            "feature-chunk reply descriptor does not match the vector-to-cube handoff"
+        )
+    if (
+        len(sink.inputs) != 2
+        or len(sink.outputs) != 1
+        or context.lowered.tensor(sink.inputs[1]).height != feature.intermediate_extent
+        or context.lowered.tensor(sink.inputs[1]).width != feature.output_extent
+        or context.lowered.tensor(sink.inputs[1]).width < cols
+    ):
+        raise SourceEmissionError(
+            "feature-chunk sink geometry differs from its descriptor"
+        )
+    producers: list[tuple[int, LoweredOperation]] = []
+    for index, transfer in enumerate(producer_transfers):
+        stage = plan.stages[transfer.producer_stage]
+        if stage.engine is not MixedEngine.CUBE or len(stage.ops) != 1:
+            raise SourceEmissionError("feature-chunk producer stage is not one matmul")
+        producer = context.lowered.operation(stage.ops[0])
+        if producer.outputs != (transfer.tensor,):
+            raise SourceEmissionError(
+                "feature-chunk producer does not publish its declared tensor"
+            )
+        produced = context.lowered.tensor(transfer.tensor)
+        if (
+            produced.height < rows
+            or produced.width != feature.intermediate_extent
+            or transfer.consumer_stage != peer_stage_index
+            or feature.producer_window_k[index] != stage.cube_window_k[0]
+        ):
+            raise SourceEmissionError(
+                "feature-chunk producer descriptor does not match its cube stage"
+            )
+        producers.append((stage.ops[0], producer))
+    output_descriptor = context.lowered.tensor(sink.outputs[0])
+    if (
+        output_descriptor.height < rows
+        or output_descriptor.width != feature.output_extent
+        or output_descriptor.width < cols
+        or feature.persistent_accumulator_bytes
+        != rows * cols * output_descriptor.byte_width
+    ):
+        raise SourceEmissionError("feature-chunk persistent accumulator size is stale")
+
+    writer = _mixed_header(context, program_name, plan)
+    row, col = _emit_spatial_coordinates(writer, 3, context, plan, None)
+    output_dtype = pypto_dtype(output_descriptor.dtype)
+    writer.line(
+        3,
+        f"sink_acc_init = pl.tensor.create([{rows}, {cols}], "
         f"dtype={output_dtype}, layout=pl.TensorLayout.ND)",
     )
     writer.line(
         3,
-        "for feature, (down_acc,) in pl.pipeline("
-        f"0, {dense.intermediate_extent}, {dense.intermediate_chunk}, "
-        f"stage={plan.pipeline_stages}, init_values=(down_acc_init,)):",
+        "for feature, (sink_acc,) in pl.pipeline("
+        f"0, {feature.intermediate_extent}, {feature.intermediate_chunk}, "
+        f"stage={plan.pipeline_stages}, init_values=(sink_acc_init,)):",
     )
-    local = {
-        gate.outputs[0]: _emit_matmul_tile(
+    local: dict[int, str] = {}
+    for index, (producer_op, producer) in enumerate(producers):
+        local[producer.outputs[0]] = _emit_matmul_tile(
             writer,
             4,
             context,
-            gate_op,
-            dense.gate_window_k,
+            producer_op,
+            feature.producer_window_k[index],
             rows=rows,
-            cols=dense.intermediate_chunk,
+            cols=feature.intermediate_chunk,
             row_offset=row,
             col_offset="feature",
             local={},
-            prefix="gate",
-        ),
-        up.outputs[0]: _emit_matmul_tile(
-            writer,
-            4,
-            context,
-            up_op,
-            dense.up_window_k,
-            rows=rows,
-            cols=dense.intermediate_chunk,
-            row_offset=row,
-            col_offset="feature",
-            local={},
-            prefix="up",
-        ),
-    }
+            prefix=f"producer_{index}",
+        )
     activation = _emit_vector_stage(
         writer,
         4,
@@ -1123,60 +1376,52 @@ def _emit_dense_swiglu(
         vector_stage,
         local,
         frame_rows=rows,
-        frame_cols=dense.intermediate_chunk,
+        frame_cols=feature.intermediate_chunk,
         row_offset=row,
         col_offset="feature",
-        allow_external=False,
+        allow_external=True,
     )
-    if local.get(down.inputs[0]) != activation:
+    if local.get(sink.inputs[0]) != activation:
         raise SourceEmissionError(
-            "dense SwiGLU activation does not feed the down projection"
+            "feature-chunk vector result does not feed the sink projection"
         )
-    down_rhs = _emit_matrix_operand(
+    sink_rhs = _emit_matrix_operand(
         writer,
         4,
         context,
-        down.inputs[1],
+        sink.inputs[1],
         role="rhs",
-        rows=dense.intermediate_chunk,
+        rows=feature.intermediate_chunk,
         cols=cols,
         row_offset="feature",
         col_offset=col,
-        prefix="down_rhs",
-        transposed=False,
+        prefix="sink_rhs",
+        transposed=sink_rhs_transposed,
         local=local,
     )
     writer.line(4, "if feature == 0:")
     writer.line(
         5,
-        f"down_first = pl.tensor.matmul({activation}, {down_rhs}, "
-        f"a_trans=False, b_trans=False, c_matrix_nz=False, out_dtype={output_dtype})",
+        f"sink_first = pl.tensor.matmul({activation}, {sink_rhs}, "
+        f"a_trans=False, b_trans={sink_rhs_transposed}, c_matrix_nz=False, "
+        f"out_dtype={output_dtype})",
     )
-    writer.line(5, "down_next = pl.yield_(down_first)")
+    writer.line(5, "sink_next = pl.yield_(sink_first)")
     writer.line(4, "else:")
     writer.line(
         5,
-        f"down_later = pl.tensor.matmul_acc(down_acc, {activation}, {down_rhs}, "
-        "a_trans=False, b_trans=False)",
+        f"sink_later = pl.tensor.matmul_acc(sink_acc, {activation}, {sink_rhs}, "
+        f"a_trans=False, b_trans={sink_rhs_transposed})",
     )
-    writer.line(5, "down_next = pl.yield_(down_later)")
-    writer.line(4, "down_tile = pl.yield_(down_next)")
+    writer.line(5, "sink_next = pl.yield_(sink_later)")
+    writer.line(4, "sink_tile = pl.yield_(sink_next)")
     output = context.interface.output_argument
     writer.line(
         3,
-        f"{output} = pl.tensor.assemble({output}, down_tile, [{row}, {col}])",
+        f"{output} = pl.tensor.assemble({output}, sink_tile, [{row}, {col}])",
     )
     emit_return(writer, context.interface)
     return writer.render()
-
-
-def _require_materialized_vector_stage(stage: MixedStagePlan) -> None:
-    if (
-        stage.engine is not MixedEngine.VECTOR
-        or stage.vector_stream is None
-        or stage.vector_stream.kind is not VectorStreamKind.MATERIALIZED
-    ):
-        raise SourceEmissionError("mixed vector stage is not materialized")
 
 
 def _require_in_memory_vector_stage(stage: MixedStagePlan) -> None:
@@ -1194,6 +1439,7 @@ def _require_in_memory_vector_stage(stage: MixedStagePlan) -> None:
 def _emit_spatial_coordinates(
     writer: SourceWriter,
     indent: int,
+    context: EmissionContext,
     plan: MixedKernelPlan,
     trip: str | None,
 ) -> tuple[str, str]:
@@ -1204,17 +1450,19 @@ def _emit_spatial_coordinates(
             f"mixed_item = region_index * {plan.max_trips_per_group} + {trip}",
         )
         item = "mixed_item"
-    if plan.m_partition.parts > 1:
-        writer.line(indent, f"mixed_m = {item} // {plan.n_partition.parts}")
-        row = f"mixed_m * {plan.m_partition.big}"
-    else:
-        row = "0"
-    if plan.n_partition.parts > 1:
-        writer.line(indent, f"mixed_n = {item} % {plan.n_partition.parts}")
-        col = f"mixed_n * {plan.n_partition.big}"
-    else:
-        col = "0"
-    return row, col
+    output_tensor = solver_tensor_for_value(
+        context.lowered, context.interface.output_allocation_owner
+    )
+    output = context.lowered.tensor(output_tensor)
+    coordinates = emit_partition_indices(
+        writer,
+        indent,
+        plan.m_partition,
+        plan.n_partition,
+        clamped_overlap_extents=(output.height, output.width),
+        linear_index=item,
+    )
+    return coordinates.row, coordinates.col
 
 
 def _emit_matmul_tile(  # noqa: PLR0913
@@ -1445,7 +1693,7 @@ def _emit_vector_stage(  # noqa: PLR0913
             if tensor not in local:
                 if not allow_external:
                     raise SourceEmissionError(
-                        f"dense mixed vector op {solver_op} has an external tensor operand"
+                        f"feature-chunk vector op {solver_op} has an external tensor operand"
                     )
                 local[tensor] = _emit_vector_slice(
                     writer,
@@ -1588,9 +1836,19 @@ def _tensor_vector_expression(
 
 def _argument_for_tensor(context: EmissionContext, tensor: int) -> str:
     descriptor = context.lowered.tensor(tensor)
-    value_id = (
-        descriptor.alias_of if descriptor.alias_of is not None else descriptor.value_id
-    )
+    values = context.graph.value_map()
+    value_id = descriptor.value_id
+    visited: set[str] = set()
+    while values[value_id].alias_of is not None:
+        if value_id in visited:
+            raise SourceEmissionError(
+                f"mixed external tensor {tensor} has a cyclic alias lineage"
+            )
+        visited.add(value_id)
+        alias = values[value_id].alias_of
+        if alias is None:
+            break
+        value_id = alias
     try:
         return context.interface.input_arguments[value_id]
     except KeyError as error:

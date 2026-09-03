@@ -228,6 +228,7 @@ def emit_partition_indices(
     n_partition: AxisPartition,
     *,
     clamped_overlap_extents: tuple[int, int] | None = None,
+    linear_index: str = "region_index",
 ) -> PartitionCoordinates:
     """Emit deterministic coordinates for two solver-owned axis partitions.
 
@@ -238,15 +239,15 @@ def emit_partition_indices(
     """
 
     if m_partition.parts > 1:
-        m_index = "region_index" if n_partition.parts == 1 else "m_index"
-        if m_index != "region_index":
-            writer.line(indent, f"m_index = region_index // {n_partition.parts}")
+        m_index = linear_index if n_partition.parts == 1 else "m_index"
+        if m_index != linear_index:
+            writer.line(indent, f"m_index = {linear_index} // {n_partition.parts}")
     else:
         m_index = "0"
     if n_partition.parts > 1:
-        n_index = "region_index" if m_partition.parts == 1 else "n_index"
-        if n_index != "region_index":
-            writer.line(indent, f"n_index = region_index % {n_partition.parts}")
+        n_index = linear_index if m_partition.parts == 1 else "n_index"
+        if n_index != linear_index:
+            writer.line(indent, f"n_index = {linear_index} % {n_partition.parts}")
     else:
         n_index = "0"
     m_extent = None if clamped_overlap_extents is None else clamped_overlap_extents[0]
@@ -283,9 +284,20 @@ def _emit_axis_partition(
     if partition.parts == 1:
         return "0"
     if partition.big == partition.small:
+        offset = f"{index} * {partition.big}"
+        if (
+            clamped_overlap_extent is not None
+            and partition.parts * partition.big > clamped_overlap_extent
+        ):
+            maximum_offset = clamped_overlap_extent - partition.big
+            if maximum_offset < 0:
+                raise SourceEmissionError(
+                    f"clamped {prefix} partition tile exceeds its logical extent"
+                )
+            offset = f"pl.min({offset}, {maximum_offset})"
         writer.line(
             indent,
-            f"region_{coordinate} = {index} * {partition.big}",
+            f"region_{coordinate} = {offset}",
         )
         return f"region_{coordinate}"
     writer.line(

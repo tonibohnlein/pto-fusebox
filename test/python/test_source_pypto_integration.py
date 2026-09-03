@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +28,10 @@ from examples.torch_frontend.deepseek_v4 import (
     build_production_mtp_prefill_projection_branch,
     build_production_mtp_projection_branch,
 )
-from examples.torch_frontend.hybrid_qwen import emit_hybrid_qwen_output_head
+from examples.torch_frontend.hybrid_qwen import (
+    emit_hybrid_qwen_output_head,
+    emit_production_qwen_output_head_overlay,
+)
 from examples.torch_frontend.orchestration_boundaries import (
     build_examples as build_boundary_examples,
 )
@@ -54,9 +58,13 @@ from pto_fusebox import (
 from pto_fusebox.schedule.schema import (
     CubeKernelPlan,
     MixedCrossCoreProtocol,
+    MixedEngine,
     MixedKernelPlan,
+    MixedTransferDirection,
     VectorKernelPlan,
+    VectorStreamKind,
 )
+from pto_fusebox.target import Ascend910BTarget
 from torch import nn
 
 
@@ -375,6 +383,80 @@ def test_callable_multi_step_cube_preserves_ordered_gm_cut_launches(
     )
 
 
+def test_completion_aware_callable_feeds_native_task_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ChainedMatmul()
+    args = (
+        torch.zeros(64, 128),
+        torch.zeros(128, 96),
+        torch.zeros(96, 80),
+    )
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="fusebox_completion_probe",
+        expose_completion_task=True,
+    )
+    assert emitted.completion_task is not None
+    tree = ast.parse(emitted.source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+    assert isinstance(function.returns, ast.Subscript)
+    assert isinstance(function.returns.slice, ast.Tuple)
+    tensor_return = function.returns.slice.elts[0]
+    module_name = "generated_completion_probe"
+    (tmp_path / f"{module_name}.py").write_text(emitted.source, encoding="utf-8")
+    parameters = "\n".join(
+        f"        {argument.arg}: {ast.unparse(argument.annotation)},"
+        for argument in function.args.args
+        if argument.annotation is not None
+    )
+    arguments = ", ".join(argument.arg for argument in function.args.args)
+    output = emitted.output_arguments[0].name
+    caller = f"""from {module_name} import {emitted.function_name}
+import pypto.language as pl
+
+
+@pl.program
+class NativeCompletionProbe:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+{parameters}
+    ) -> {ast.unparse(tensor_return)}:
+        {output}, projection_done = {emitted.function_name}({arguments})
+        completion_fence = pl.system.task_dummy(deps=[projection_done])
+        return {output}
+"""
+    caller_path = tmp_path / "native_completion_probe.py"
+    caller_path.write_text(caller, encoding="utf-8")
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / "compiled_completion_probe"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    orchestration = next(
+        (compiled.output_dir / "orchestration").glob("*.cpp")
+    ).read_text(encoding="utf-8")
+    assert orchestration.count("rt_submit_") >= 3
+    assert "set_dependencies(" in orchestration
+
+
 def test_callable_split_k_preserves_two_phase_dependency_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -627,7 +709,77 @@ def test_maximal_qwen_callable_composes_in_native_orchestration(
     assert "add_inout(" not in orchestration
 
 
-def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
+def test_production_qwen_output_head_preserves_dynamic_native_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    if pypto_lib_root is None:
+        pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+    model_dir = Path(pypto_lib_root) / "models" / "qwen3_14b"
+    overlay = emit_production_qwen_output_head_overlay(
+        _solver(),
+        native_decode_source=(model_dir / "decode_fwd.py").read_text(encoding="utf-8"),
+        solver_workers=2,
+    )
+    (tmp_path / f"{overlay.module_name}.py").write_text(
+        overlay.source,
+        encoding="utf-8",
+    )
+    caller = f"""from {overlay.module_name} import rms_lm_head_fp32
+from config import QWEN3_14B_DIMS as D
+import pypto.language as pl
+
+
+@pl.program
+class ProductionQwenOutputHead:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        hidden_states: pl.Tensor[[16, 5120], pl.FP32],
+        final_norm_weight: pl.Tensor[[1, 5120], pl.FP32],
+        lm_head_weight: pl.Tensor[[152064, 5120], pl.BF16],
+        row_offset: pl.Scalar[pl.INDEX],
+        valid_rows: pl.Scalar[pl.INDEX],
+        out: pl.Out[pl.Tensor[[D.batch, 152064], pl.FP32]],
+    ) -> pl.Tensor[[D.batch, 152064], pl.FP32]:
+        out = rms_lm_head_fp32(
+            hidden_states,
+            final_norm_weight,
+            lm_head_weight,
+            out,
+            row_offset,
+            valid_rows,
+        )
+        return out
+"""
+    caller_path = tmp_path / "production_qwen_output_head.py"
+    caller_path.write_text(caller, encoding="utf-8")
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    monkeypatch.delitem(sys.modules, "config", raising=False)
+    monkeypatch.syspath_prepend(str(model_dir))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    compiled = ir.compile(
+        pl.loads(str(caller_path)),
+        output_dir=str(tmp_path / "compiled_production_qwen_output_head"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration = next(
+        (compiled.output_dir / "orchestration").glob("*.cpp")
+    ).read_text(encoding="utf-8")
+    assert len(pto_files) == 3
+    assert orchestration.count("rt_submit_aiv_task") == 2
+    assert orchestration.count("rt_submit_aic_task") == 1
+    assert "gm_pipe_buffer_" not in orchestration
+
+
+def test_callable_deepseek_mtp_projection_compiles_as_one_branched_region(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,11 +793,23 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     )
     assert solved.whole_graph_codegen_ready
     schedule = scheduled_region(solved.regions[0])
-    assert [step.kind for step in schedule.steps] == [
-        KernelKind.MIXED,
-        KernelKind.VECTOR,
-        KernelKind.MIXED,
-    ]
+    assert [step.kind for step in schedule.steps] == [KernelKind.MIXED]
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE
+    assert tuple(stage.engine for stage in plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    assert tuple(fifo.direction for fifo in plan.fifos) == (
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+    )
     emitted = emit_pypto_callable(
         graph,
         solved.regions[0],
@@ -655,15 +819,14 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     pto, orchestration = _compile_callable_in_native_orchestration(
         emitted, tmp_path, monkeypatch, name="deepseek_mtp_projection"
     )
-    assert len(pto) == 3
+    assert len(pto) == 1
     assert not [
         line
         for program in pto
         for line in program.splitlines()
         if "pto.tmov" in line and line.count("loc=mat") >= 2
     ], "a V2C pop already lands in Mat; a redundant Mat -> Mat move is illegal"
-    assert orchestration.count("rt_submit_task(") == 2
-    assert orchestration.count("rt_submit_aiv_task(") == 1
+    _assert_single_spmd_orchestration(orchestration, plan.active_groups)
     produced = {
         tensor: int(task)
         for task, tensor in re.findall(
@@ -687,10 +850,7 @@ def test_callable_deepseek_mtp_projection_preserves_three_step_dependencies(
     assert set(produced) == solver_cuts | compiler_pipe_buffers
     assert not compiler_pipe_buffers & set(consumed)
     assert all(tensor.startswith("ext_arg_") for tensor in external_inputs)
-    assert len(solver_cuts) == 2
-    assert {produced[tensor] for tensor in solver_cuts} == {0, 1}
-    assert {consumed[tensor] for tensor in solver_cuts} == {2}
-    assert all(produced[tensor] < consumed[tensor] for tensor in solver_cuts)
+    assert not solver_cuts
 
 
 @pytest.mark.parametrize(
@@ -920,6 +1080,20 @@ class _DenseSwiGlu(nn.Module):
             torch.bfloat16
         )
         return torch.mm(activation, down_weight, out_dtype=torch.float32)
+
+
+class _FeatureBlend(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        sink_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(lhs, first_weight, out_dtype=torch.float32)
+        second = torch.mm(lhs, second_weight, out_dtype=torch.float32)
+        blended = (first + second).to(torch.bfloat16)
+        return torch.mm(blended, sink_weight, out_dtype=torch.float32)
 
 
 def _solver() -> Path:
@@ -1218,6 +1392,16 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
             ),
         ),
         (
+            "mixed_generic_feature_blend",
+            _FeatureBlend(),
+            (
+                torch.zeros(128, 64, dtype=torch.bfloat16),
+                torch.zeros(64, 128, dtype=torch.bfloat16),
+                torch.zeros(64, 128, dtype=torch.bfloat16),
+                torch.zeros(128, 64, dtype=torch.bfloat16),
+            ),
+        ),
+        (
             "mixed_attention_residual",
             _AttentionResidual(),
             (
@@ -1477,6 +1661,278 @@ def test_generated_source_compiles_through_pypto_and_ptoas(
     assert expected_pto_op in pto
     if static_vector_frames:
         _assert_static_vector_frames(pto)
+
+
+class _MultiPassVectorTarget(Ascend910BTarget):
+    """Keep the complete reduction chain selected for source integration."""
+
+    def problem_fields(self) -> dict[str, object]:
+        fields = super().problem_fields()
+        fields["kernel_fill_cost"] = 100_000_000
+        return fields
+
+
+class _MultiPassReductionChain(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        inverse_rms = torch.rsqrt(
+            torch.sum(value * value, dim=-1, keepdim=True) / value.shape[-1] + 1e-6
+        )
+        normalized = value * inverse_rms
+        inverse_amax = torch.reciprocal(
+            torch.amax(torch.abs(normalized), dim=-1, keepdim=True)
+        )
+        return normalized * inverse_amax
+
+
+class _Int8ProjectionBranch(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        quantized = value.to(torch.float16).to(torch.int8)
+        accumulator = torch.ops.aten._int_mm.default(quantized, weight.t())
+        return accumulator.float() * scale
+
+
+class _BranchedInt8Projection(nn.Module):
+    def forward(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        lhs_weight: torch.Tensor,
+        rhs_weight: torch.Tensor,
+        lhs_scale: torch.Tensor,
+        rhs_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        lhs_quantized = lhs.to(torch.float16).to(torch.int8)
+        rhs_quantized = rhs.to(torch.float16).to(torch.int8)
+        lhs_accumulator = torch.ops.aten._int_mm.default(lhs_quantized, lhs_weight.t())
+        rhs_accumulator = torch.ops.aten._int_mm.default(rhs_quantized, rhs_weight.t())
+        return lhs_accumulator.float() * lhs_scale + rhs_accumulator.float() * rhs_scale
+
+
+def test_general_multi_pass_vector_source_compiles_through_pypto_and_ptoas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(_MultiPassReductionChain(), (torch.ones(16, 32768),))
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    region = solved.regions[0]
+    schedule = scheduled_region(region)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, VectorKernelPlan)
+    assert plan.kind is VectorStreamKind.MULTI_PASS
+
+    source = emit_pypto_region(
+        graph, region, program_name="general_multi_pass_vector"
+    ).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "general_multi_pass_vector"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    pto = pto_files[0].read_text(encoding="utf-8")
+    assert pto.count("pto.trowsum") >= 3
+    assert pto.count("pto.trowmax") >= 3
+    _assert_static_vector_frames(pto)
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"), plan.work_units
+    )
+
+
+def test_generic_int8_projection_round_trip_compiles_through_pypto_and_ptoas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _Int8ProjectionBranch(),
+        (
+            torch.ones(64, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(64, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    region = solved.regions[0]
+    schedule = scheduled_region(region)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert tuple(stage.engine for stage in plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    assert tuple(fifo.direction for fifo in plan.fifos) == (
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+    )
+
+    source = emit_pypto_region(
+        graph, region, program_name="generic_int8_projection_round_trip"
+    ).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "generic_int8_projection_round_trip"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    pto = pto_files[0].read_text(encoding="utf-8")
+    assert "pto.tmatmul" in pto
+    assert "pto.tpush_to_aic" in pto
+    assert "pto.tpop_from_aiv" in pto
+    assert "pto.tpush_to_aiv" in pto
+    assert "pto.tpop_from_aic" in pto
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"), plan.active_groups
+    )
+
+
+def test_generic_branched_int8_round_trip_compiles_through_pypto_and_ptoas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _BranchedInt8Projection(),
+        (
+            torch.ones(64, 256),
+            torch.ones(64, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(64, 1),
+            torch.ones(64, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    region = solved.regions[0]
+    schedule = scheduled_region(region)
+    assert len(schedule.steps) == 1
+    plan = schedule.steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE
+    assert tuple(stage.engine for stage in plan.stages) == (
+        MixedEngine.VECTOR,
+        MixedEngine.VECTOR,
+        MixedEngine.CUBE,
+        MixedEngine.CUBE,
+        MixedEngine.VECTOR,
+    )
+    assert tuple(fifo.direction for fifo in plan.fifos) == (
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.VECTOR_TO_CUBE,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+        MixedTransferDirection.CUBE_TO_VECTOR,
+    )
+
+    source = emit_pypto_region(
+        graph, region, program_name="generic_branched_int8_round_trip"
+    ).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "generic_branched_int8_round_trip"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    pto = pto_files[0].read_text(encoding="utf-8")
+    assert pto.count("pto.tmatmul") == 2
+    assert pto.count("pto.tpush_to_aic") >= 2
+    assert pto.count("pto.tpop_from_aiv") >= 2
+    assert pto.count("pto.tpush_to_aiv") >= 2
+    assert pto.count("pto.tpop_from_aic") >= 2
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"), plan.active_groups
+    )
+
+
+def test_generic_int8_round_trip_static_tail_compiles_through_pypto_and_ptoas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _Int8ProjectionBranch(),
+        (
+            torch.ones(50, 256),
+            torch.ones(128, 256, dtype=torch.int8),
+            torch.ones(50, 1),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        target=_MultiPassVectorTarget(),
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved
+    region = solved.regions[0]
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.m_partition.big * plan.m_partition.parts > 50
+
+    source = emit_pypto_region(
+        graph, region, program_name="generic_int8_round_trip_static_tail"
+    ).source
+    assert "region_row = pl.min(m_index * 32, 18)" in source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "generic_int8_round_trip_static_tail"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert len(pto_files) == 1
+    assert len(orchestration_files) == 1
+    assert "pto.tmatmul" in pto_files[0].read_text(encoding="utf-8")
+    _assert_single_spmd_orchestration(
+        orchestration_files[0].read_text(encoding="utf-8"), plan.active_groups
+    )
 
 
 @pytest.mark.parametrize(

@@ -40,24 +40,30 @@ and submits dependency-linked SPMD tasks in solver order.
 Vector execution replays one maximum compile-time tile per work unit and clamps
 ragged-edge origins backwards, preserving static shapes while recomputing the
 small overlap already charged by the model. The implemented vector set is
-materialized or pointwise replay, versioned two-pass online softmax, and
-one-reduction folded or spanning streams. Cube execution covers uniform
+materialized or pointwise replay, versioned online softmax, one-reduction
+folded or spanning streams, and generic ordered multi-pass replay for
+dependent reduction barriers. Cube execution covers uniform
 non-split spatial schedules, nested matmul DAGs, sequential outer-K windows,
 produced values resident in L1, and solver-selected retained boundary panels.
 
 Mixed source covers generic one-way `C -> V`, generic one-way `V -> C` with an
-in-memory or online-softmax vector producer, generic `C -> V -> C`, dense
-`C,C -> V -> C`, and linear `C -> V -> C -> V` schedules. It replays the
+in-memory or online-softmax vector producer, generic `C -> V -> C`, branched
+`V,V -> C,C -> V`, linear `C -> V -> C -> V`, and feature-chunk
+`C[,C...] -> V -> C` schedules. It replays the
 serialized stages and tensor DAG through one `pl.spmd` grid with
 `pl.split(UP_DOWN)` plus generic `pl.cross_core_pipe` descriptors; PyPTO inserts
 the concrete push/pop/free pipeline. The four-stage form is an ordinary ordered
 loop and receives no skew-overlap credit. Online softmax-to-PV publishes
-normalized K chunks into the sink's matching accumulation windows. One complete
-square panel may serve both sink operands without replication; partitioned
-dual-role values and branched/deeper round trips fail closed. Linear multi-step
-source may compose homogeneous and mixed solver steps through explicit GM cuts.
-Welford/multi-stat
-vector plans, singleton-column normalization, and nonuniform cube spatial
+normalized K chunks into the sink's matching accumulation windows. The
+feature-chunk contract streams any number of same-frame cube projections
+through an arbitrary admitted pointwise vector DAG and accumulates one sink
+matmul over exact, disjoint feature chunks. It is derived entirely from stage
+topology, tensor geometry, dtypes, lifetimes, and capacities; no attention,
+SwiGLU, or model recognizer participates. One complete square panel may serve
+both sink operands without replication; partitioned dual-role values and
+unsupported deeper round trips fail closed. Linear multi-step source may
+compose homogeneous and mixed solver steps through explicit GM cuts.
+Welford-specific recurrences, singleton-column normalization, and nonuniform cube spatial
 partitions remain outside source readiness. A uniform cube DAG may split only
 its unique sink through the selected dependency-linked PyPTO task protocol.
 Dynamic-shape classes are retained but declined when they affect solver
@@ -232,7 +238,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v6`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v7`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -273,7 +279,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v6`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v7`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -342,9 +348,9 @@ existing `mlsys_mixed` build when one is available.
 The standalone target admits the complete analytic schedule surface by
 default. It does not restrict partition search to schedules supported by the
 historical in-compiler AutoFuse emitter: PTO-Fusebox will ultimately generate
-tensor/tile PyPTO source from its own selected schedule. Split cube DAGs,
-multi-reduction streaming, non-uniform cube-DAG grids, and deeper serial mixed
-topologies therefore remain eligible even when no source
+tensor/tile PyPTO source from its own selected schedule. Non-uniform cube-DAG
+grids, Welford-specific recurrences, and mixed topologies outside the admitted
+generic protocols therefore remain eligible even when no source
 emitter path exists. Solution metadata records the stages, directional
 transfers, and protocol for every analytic mixed plan. Plans with a complete
 stage-local geometry, vector stream, cube-window, and FIFO contract also set
@@ -454,6 +460,46 @@ python -m examples.torch_frontend.hybrid_qwen \
 The resulting two files import only PyPTO. A serving model may put the same
 call inside native runtime loops or dispatch among several generated physical
 frames; neither behavior is represented in or inferred from the Torch modules.
+
+For native callers that must order later orchestration work after a generated
+region, `emit_pypto_callable(..., expose_completion_task=True)` returns the
+callable's output tensor together with the `TaskId` of its final scheduled
+SPMD task. Completion exposure is deliberately limited to a one-output
+single-sink task graph: every emitted step must flow to that final task.
+Independent fan-out is rejected instead of publishing one branch as a false
+completion token. The callable metadata records the returned scalar name.
+This is an ABI feature, not a new scheduling decision: all internal tasks and
+their dependencies remain exactly those selected by Fusebox, and the native
+caller may use the returned ID in an ordinary PyPTO dependency.
+
+### Initial production-model integration surface
+
+`python/pto_fusebox/model.py` records a checked manifest for the four current
+PyPTO-lib targets. The manifest validates real entry points, static callable
+symbols, and native boundary modules against a concrete checkout before source
+generation. `examples/torch_frontend/production_models.py` implements the
+first production-shape static ownership unit for each target:
+
+| PyPTO-lib model | generated static ownership today | native ownership retained |
+| --- | --- | --- |
+| `deepseek_v4_flash_dspark` | Complete fixed-frame BF16 DSpark projection followed by RMSNorm, emitted as one completion-aware callable. | Dynamic token-frame selection and the call site in the drafter orchestration. |
+| `deepseek_v4_flash_mtp` | Complete production INT8 MTP projection input graph; Fusebox extracts both maximal *source-emittable* branch regions. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus the currently unsupported static view/add tail. |
+| `deepseek_v4_pro` | The same model-independent production INT8 projection contract, linked through the Pro entry point's parenthesized import. | Sparse attention, indexer/TopK, MoE routing, dynamic packing, communication, and state. |
+| `qwen3_14b` | Complete production `16 x 5120` FP32 RMSNorm-to-`152064`-vocabulary LM-head DAG, solved once as one mixed V2C region. | Dynamic batch/window traversal and placement into the runtime-sized logits output. |
+
+These are real production tensor dimensions but not claims that all four full
+models have been regenerated. Each row is the first connected static region
+linked to the existing model tree. The remaining manifest entries define the
+next integration work without moving dynamic or data-dependent orchestration
+into Fusebox. In particular, model names select only native source wiring; no
+model name, attention pattern, MTP pattern, or SwiGLU pattern enters solver
+admission, costing, or emission.
+
+Fusebox is always given the complete normalized static graph. It, rather than
+the caller, chooses maximal source-emittable regions and explicit cuts. A
+remaining `view`, reshape, alias, or pointwise tail is retained by native
+PyPTO only when its normalized/source contract is not yet admitted; it is a
+tracked source-emission limitation, not a caller-selected pre-partition.
 
 No compiler-integrated AutoFuse pass is required for this path. The generated
 PyPTO source will contain the selected fusion boundaries, grid, propagated
@@ -599,9 +645,9 @@ Two ABI/numerical findings must remain distinct from that transport result:
   BF16 vector-stage narrowing therefore remains a reported numerical-oracle
   caveat, not a mixed FIFO defect; the tolerance is not silently weakened.
 
-Analytic support is broader than the renderer. Welford/multi-stat P4 and mixed
-plans outside the admitted stage patterns remain valid solver results but
-are not source-ready. P4
+Analytic support is broader than the renderer. Welford-specific multi-stat
+plans and mixed plans outside the admitted stage patterns remain valid solver
+results but are not source-ready. P4
 descriptors preserve named roles; each new recipe must version its carry and
 publication semantics. Future plan classes can add those contracts and
 cross-core transport without changing the ownership boundary.
@@ -789,39 +835,32 @@ dynamic physical tile that reaches allocation or tile-flattening.
 
 ## Implementation sequence
 
-The homogeneous vector/cube matrix, single-sink cube-DAG split-K, explicit
-mixed pipes, and the first sequential CVCV source contract are silicon-closed.
-Generic one-way V2C is source-ready for materialized LHS/RHS producers, online
-softmax-to-PV K streaming, and one complete-square value used in both matmul
-roles. The last two paths have real PyPTO lowering coverage but still require
-focused silicon closure.
-The remaining source capabilities are ordered by contract complexity:
+The source contract now contains the general mechanisms that were previously
+missing from maximal static ownership:
 
-1. Silicon-close online softmax-to-PV and complete-square dual-role V2C replay.
-   Keep partitioned dual-role cases rejected until an explicit replication
-   policy exists.
-2. Replace the fixed four-stage sequential replay with a generic renderer over
-   a serialized linear alternating engine chain. Keep deeper chains sequential
-   until the model explicitly grants a realizable overlap schedule.
-3. Allow a mixed step to participate in dependency-linked multi-step source,
-   preserving GM cuts, task order, and the mixed step's internal SPMD/pipe
-   contract. PyPTO already supports dependency-linked `pl.spmd` tasks; this is
-   a Fusebox task-bundle and ownership-contract gap, not a missing PyPTO
-   execution primitive.
-4. Add branched mixed graphs only after defining fan-out replication versus
-   retention, per-consumer FIFO ownership, lifetimes, and backpressure in the
-   serialized plan. Continue failing closed until that contract exists.
-5. Preserve unsupported nodes as explicit graph cuts and verify every value
-   crossing those boundaries.
-6. Ground and compose the callable ABI. A single homogeneous vector step can
-   receive a runtime logical row extent over one fixed planned physical frame;
-   cube, mixed, multi-step, and non-row variation fail closed. Same-shape
-   standalone generated-program comparisons for Qwen RMSNorm/LM-head,
-   attention, and dense SwiGLU are silicon-closed. With the proposed PyPTO
-   external-inline parameter-lineage repair, the connected Qwen RMSNorm-to-
-   LM-head graph compiles as one generated callable inside native orchestration.
-   The caller does not own an artificial GM intermediate. Keep Types 2-5 in
-   orchestration and outside Fusebox planning.
+1. Vector schedules serialize and emit arbitrary ordered replay passes across
+   dependent reduction barriers.
+2. Mixed transfers preserve the crossing dtype, including INT8 `V -> C` cube
+   operands and INT32 `C -> V` accumulator results.
+3. Generic symmetric `V -> C -> V`, sequential `C -> V -> C -> V`, and
+   branched `V,V -> C,C -> V` plans reproduce their selected stage order and
+   FIFO ownership.
+4. Static alias chains and runtime logical tails propagate over the solver's
+   fixed physical frames without changing their planned tile geometry.
+5. Multiple cube projections can stream feature chunks through an admitted
+   pointwise vector DAG into one persistent sink accumulator. This generic
+   mechanism replaces the former dense-SwiGLU-specific path.
+6. Fusion selection remains the ordinary partition problem: every valid
+   connected grouping is charged by the same model, and cuts materialize their
+   real GM traffic. A four-stage exhaustive regression compares all set
+   partitions and verifies that generic feature fusion competes directly with
+   every legal cut.
+
+Next, silicon validation must close the newly generalized feature mechanism
+and the model must be grounded on additional, held-out DAGs. Unsupported
+dynamic orchestration, indirect access, and opaque operations remain explicit
+native boundaries. Partitioned dual-role values remain rejected until the plan
+defines replication and FIFO ownership.
 
 ## PyPTO-lib validation targets
 

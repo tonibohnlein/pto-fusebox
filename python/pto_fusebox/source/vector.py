@@ -12,6 +12,8 @@ from ..schedule.schema import (
     VectorPhasePlan,
     VectorPhysicalFramePlan,
     VectorReductionSplitKind,
+    VectorReplayPassKind,
+    VectorReplayPassPlan,
     VectorReplayPhase,
     VectorSpatialPolicy,
     VectorStreamKind,
@@ -69,6 +71,8 @@ def emit_vector(
         )
     if plan.kind is VectorStreamKind.SOFTMAX_FLASH:
         return _emit_softmax_flash(context, program_name, plan)
+    if plan.kind is VectorStreamKind.MULTI_PASS:
+        return _emit_multi_pass(context, program_name, plan)
     if plan.kind in {
         VectorStreamKind.REDUCTION_FOLDED,
         VectorStreamKind.REDUCTION_SPANNING,
@@ -482,6 +486,294 @@ def _emit_streamed_reduction(
     return writer.render()
 
 
+def _emit_multi_pass(
+    context: EmissionContext,
+    program_name: str,
+    plan: VectorKernelPlan,
+) -> str:
+    """Replay an arbitrary dependency-derived sequence of reduction barriers."""
+
+    graph = context.graph
+    lowered = context.lowered
+    step = context.step
+    io = context.interface
+    if plan.axis != 1 or plan.physical_frame.reduced_axis != 1:
+        raise SourceEmissionError(
+            "multi-pass vector source currently supports the last axis only"
+        )
+    if not plan.replay_passes or plan.stream_passes != len(plan.replay_passes):
+        raise SourceEmissionError("multi-pass vector replay has no ordered passes")
+    if plan.chunk <= 0 or plan.full_chunks <= 0:
+        raise SourceEmissionError("multi-pass vector replay has invalid chunk geometry")
+    if plan.full_chunks * plan.chunk + plan.tail != plan.extent:
+        raise SourceEmissionError(
+            "multi-pass vector replay does not cover its reduced extent"
+        )
+    if step.sequential_tiles is None or tuple(step.sequential_tiles) != (
+        plan.chunk,
+    ) * len(step.solver_ops):
+        raise SourceEmissionError(
+            "multi-pass vector sequential tiles differ from its chunk"
+        )
+    validate_grid(
+        step,
+        plan.work_units,
+        plan.m_partition,
+        plan.n_partition,
+    )
+    validate_partition_extent(
+        plan.m_partition,
+        plan.physical_frame.iteration_rows,
+        "vector.m_partition",
+    )
+    if plan.n_partition.parts != 1:
+        raise SourceEmissionError(
+            "multi-pass last-axis replay requires one reduced-axis partition"
+        )
+
+    writer = program_header(
+        program_name,
+        io,
+        graph,
+        plan.work_units,
+        kernel_name_hint=context.region_id + "_vector",
+    )
+    indent = 3
+    coordinates = emit_partition_indices(
+        writer,
+        indent,
+        plan.m_partition,
+        plan.n_partition,
+        clamped_overlap_extents=(plan.physical_frame.iteration_rows, 1),
+    )
+    graph_ops = graph.op_map()
+    state: dict[int, str] = {}
+    stored: set[str] = set()
+
+    for replay in plan.replay_passes:
+        missing_states = set(replay.state_inputs) - set(state)
+        if missing_states:
+            raise SourceEmissionError(
+                "multi-pass replay references unavailable states "
+                + ", ".join(str(tensor) for tensor in sorted(missing_states))
+            )
+        inherited = {tensor: state[tensor] for tensor in replay.state_inputs}
+        prefix = f"pass_{replay.index}"
+        if replay.kind is VectorReplayPassKind.REDUCTION:
+            if not replay.init.present:
+                raise SourceEmissionError(
+                    f"multi-pass reduction {replay.index} omits initialization"
+                )
+            initial = _emit_reduction_phase_chunk(
+                writer,
+                indent,
+                context,
+                replay,
+                prefix=f"{prefix}_initial",
+                row_offset=coordinates.row,
+                col_offset="0",
+                valid_cols=replay.init.extent,
+                frame_cols=plan.chunk,
+                initial_values=inherited,
+            )
+            running = {tensor: initial[tensor] for tensor in replay.state_outputs}
+            if replay.loop.trip_count:
+                iter_names = tuple(
+                    f"{prefix}_iter_state_{tensor}" for tensor in replay.state_outputs
+                )
+                result_names = tuple(
+                    f"{prefix}_result_state_{tensor}" for tensor in replay.state_outputs
+                )
+                _emit_loop_header(
+                    writer,
+                    indent,
+                    f"{prefix}_chunk",
+                    replay.loop,
+                    iter_values=iter_names,
+                    init_values=tuple(
+                        running[tensor] for tensor in replay.state_outputs
+                    ),
+                )
+                loop_indent = indent + 1
+                writer.line(
+                    loop_indent,
+                    f"{prefix}_col = {prefix}_chunk * {plan.chunk}",
+                )
+                chunk_values = _emit_reduction_phase_chunk(
+                    writer,
+                    loop_indent,
+                    context,
+                    replay,
+                    prefix=prefix,
+                    row_offset=coordinates.row,
+                    col_offset=f"{prefix}_col",
+                    valid_cols=plan.chunk,
+                    frame_cols=plan.chunk,
+                    initial_values=inherited,
+                )
+                merged: list[str] = []
+                for tensor, previous in zip(replay.state_outputs, iter_names):
+                    producer = _tensor_producers(lowered)[tensor]
+                    if producer is None:
+                        raise SourceEmissionError(
+                            f"multi-pass state {tensor} has no producer"
+                        )
+                    reduction = graph_ops[lowered.operation(producer).graph_op_id]
+                    merged.append(
+                        _emit_reduction_merge(
+                            writer,
+                            loop_indent,
+                            reduction.kind,
+                            previous,
+                            chunk_values[tensor],
+                            f"{prefix}_merged_{tensor}",
+                        )
+                    )
+                lhs = ", ".join(result_names)
+                if len(result_names) == 1:
+                    lhs += ","
+                writer.line(
+                    loop_indent,
+                    f"{lhs} = pl.yield_({', '.join(merged)})",
+                )
+                running = dict(zip(replay.state_outputs, result_names))
+            if replay.tail.present:
+                tail_values = _emit_reduction_phase_chunk(
+                    writer,
+                    indent,
+                    context,
+                    replay,
+                    prefix=f"{prefix}_tail",
+                    row_offset=coordinates.row,
+                    col_offset=str(replay.tail.chunk_index * plan.chunk),
+                    valid_cols=replay.tail.extent,
+                    frame_cols=plan.chunk,
+                    initial_values=inherited,
+                )
+                for tensor in replay.state_outputs:
+                    producer = _tensor_producers(lowered)[tensor]
+                    if producer is None:
+                        raise SourceEmissionError(
+                            f"multi-pass state {tensor} has no producer"
+                        )
+                    reduction = graph_ops[lowered.operation(producer).graph_op_id]
+                    running[tensor] = _emit_reduction_merge(
+                        writer,
+                        indent,
+                        reduction.kind,
+                        running[tensor],
+                        tail_values[tensor],
+                        f"{prefix}_tail_state_{tensor}",
+                    )
+            state.update(running)
+            _emit_replay_outputs(
+                writer,
+                indent,
+                io,
+                lowered,
+                replay,
+                state,
+                coordinates.row,
+                "0",
+                stored,
+            )
+            continue
+
+        if replay.loop.trip_count:
+            _emit_loop_header(writer, indent, f"{prefix}_chunk", replay.loop)
+            loop_indent = indent + 1
+            writer.line(
+                loop_indent,
+                f"{prefix}_col = {prefix}_chunk * {plan.chunk}",
+            )
+            values = _emit_reduction_phase_chunk(
+                writer,
+                loop_indent,
+                context,
+                replay,
+                prefix=prefix,
+                row_offset=coordinates.row,
+                col_offset=f"{prefix}_col",
+                valid_cols=plan.chunk,
+                frame_cols=plan.chunk,
+                initial_values=inherited,
+            )
+            _emit_replay_outputs(
+                writer,
+                loop_indent,
+                io,
+                lowered,
+                replay,
+                values,
+                coordinates.row,
+                f"{prefix}_col",
+                stored,
+            )
+        if replay.tail.present:
+            values = _emit_reduction_phase_chunk(
+                writer,
+                indent,
+                context,
+                replay,
+                prefix=f"{prefix}_tail",
+                row_offset=coordinates.row,
+                col_offset=str(replay.tail.chunk_index * plan.chunk),
+                valid_cols=replay.tail.extent,
+                frame_cols=plan.chunk,
+                initial_values=inherited,
+            )
+            _emit_replay_outputs(
+                writer,
+                indent,
+                io,
+                lowered,
+                replay,
+                values,
+                coordinates.row,
+                str(replay.tail.chunk_index * plan.chunk),
+                stored,
+            )
+
+    missing = set(io.output_values) - stored
+    if missing:
+        raise SourceEmissionError(
+            "multi-pass vector replay does not produce region outputs "
+            + ", ".join(sorted(missing))
+        )
+    emit_return(writer, io)
+    return writer.render()
+
+
+def _emit_replay_outputs(
+    writer: SourceWriter,
+    indent: int,
+    io: Interface,
+    lowered: LoweredRegion,
+    replay: VectorReplayPassPlan,
+    values: Mapping[int, str],
+    row_offset: str,
+    col_offset: str,
+    stored: set[str],
+) -> None:
+    allowed = set(replay.output_tensors)
+    for output_value in io.output_values:
+        owner = solver_tensor_for_value(
+            lowered, io.output_allocation_owners[output_value]
+        )
+        if owner not in allowed or owner not in values:
+            continue
+        _emit_output_store(
+            writer,
+            indent,
+            io,
+            output_value,
+            values[owner],
+            row_offset,
+            col_offset,
+        )
+        stored.add(output_value)
+
+
 def _validate_reduction_stream_loops(
     plan: VectorKernelPlan,
     stats: VectorPhasePlan,
@@ -544,7 +836,7 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
     writer: SourceWriter,
     indent: int,
     context: EmissionContext,
-    phase: VectorPhasePlan,
+    phase: VectorPhasePlan | VectorReplayPassPlan,
     *,
     prefix: str,
     row_offset: str,

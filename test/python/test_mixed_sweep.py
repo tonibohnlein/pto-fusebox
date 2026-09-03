@@ -495,7 +495,7 @@ def test_dense_swiglu_sweep_exposes_its_fixed_fifo_and_stage_breakdown() -> None
     region = solved.regions[0]
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
-    assert plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP
+    assert plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
 
     sweep = enumerate_mixed_group_plans(region, sweep_binary=_sweep_binary())
     assert len(sweep.candidates) == 1

@@ -20,6 +20,8 @@ QWEN_BATCH_TILE = 16
 QWEN_REFERENCE_RMS_K_CHUNK = 128
 QWEN_LM_HEAD_K_CHUNK = 512
 QWEN_VOCAB_CHUNK = 192
+QWEN_PRODUCTION_HIDDEN = 5120
+QWEN_PRODUCTION_VOCAB = 152064
 
 
 class Qwen3RmsLmHead(nn.Module):
@@ -79,6 +81,27 @@ class Qwen3LmHeadChunk(nn.Module):
             self.lm_head_weight.t(),
             out_dtype=torch.float32,
         )
+
+
+def build_production_qwen_output_head() -> Example:
+    """Return the full static Qwen3-14B decode output-head DAG.
+
+    Meta tensors keep the production vocabulary weight out of host memory.
+    Fusebox still receives the exact ``16 x 5120`` activation frame and
+    ``152064 x 5120`` BF16 weight shape used by PyPTO-lib.
+    """
+
+    with torch.device("meta"):
+        module = Qwen3RmsLmHead(
+            hidden_size=QWEN_PRODUCTION_HIDDEN,
+            vocab_size=QWEN_PRODUCTION_VOCAB,
+        )
+        hidden_states = torch.empty(
+            QWEN_BATCH_TILE,
+            QWEN_PRODUCTION_HIDDEN,
+            dtype=torch.float32,
+        )
+    return module, (hidden_states,)
 
 
 def build_examples() -> dict[str, Example]:

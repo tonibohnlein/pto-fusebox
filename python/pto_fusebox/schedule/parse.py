@@ -36,7 +36,7 @@ from .schema import (
     LaunchPlan,
     MixedAlgorithm,
     MixedCrossCoreProtocol,
-    MixedDenseMlpPlan,
+    MixedFeatureRoundTripPlan,
     MixedEngine,
     MixedFifoPlan,
     MixedKernelPlan,
@@ -63,6 +63,8 @@ from .schema import (
     VectorReductionSeedPlan,
     VectorReductionSplitKind,
     VectorReductionSplitPlan,
+    VectorReplayPassKind,
+    VectorReplayPassPlan,
     VectorReplayPhase,
     VectorSpatialPolicy,
     VectorSerialPhasePlan,
@@ -378,7 +380,222 @@ def _validate_vector_phase_links(
                 f"{phase_field} input lifetimes do not cover exactly the "
                 "boundary-tensor uses"
             )
+    _validate_vector_replay_pass_links(
+        plan,
+        lowered=lowered,
+        step_ops=step_ops,
+        step_order=step_order,
+        field=field,
+    )
     _validate_vector_p4_contract(plan, lowered=lowered, field=field)
+
+
+def _validate_vector_replay_pass_links(
+    plan: VectorKernelPlan,
+    *,
+    lowered: LoweredRegion,
+    step_ops: tuple[int, ...],
+    step_order: tuple[int, ...],
+    field: str,
+) -> None:
+    if plan.kind is not VectorStreamKind.MULTI_PASS:
+        return
+    if plan.stream_passes != len(plan.replay_passes):
+        raise ScheduleContractError(f"{field}.stream_passes differs from replay_passes")
+    if plan.axis not in {1, 2} or plan.chunk <= 0 or plan.full_chunks <= 0:
+        raise ScheduleContractError(f"{field}.replay_passes has invalid geometry")
+    if plan.full_chunks * plan.chunk + plan.tail != plan.extent:
+        raise ScheduleContractError(
+            f"{field}.replay_passes do not cover the reduced extent"
+        )
+
+    order_position = {op: index for index, op in enumerate(step_order)}
+    step_set = set(step_ops)
+    producer_by_tensor: dict[int, int] = {}
+    consumers_by_tensor: dict[int, set[int]] = {}
+    for operation in lowered.operations:
+        for tensor in operation.outputs:
+            producer_by_tensor[tensor] = operation.index
+        for tensor in operation.inputs:
+            consumers_by_tensor.setdefault(tensor, set()).add(operation.index)
+    prior_states: set[int] = set()
+    covered_ops: set[int] = set()
+    for replay in plan.replay_passes:
+        replay_field = f"{field}.replay_passes[{replay.index}]"
+        replay_set = set(replay.ops)
+        if not replay_set.issubset(step_set):
+            raise ScheduleContractError(
+                f"{replay_field}.ops references an operation outside its kernel step"
+            )
+        if tuple(sorted(replay.ops, key=order_position.__getitem__)) != replay.ops:
+            raise ScheduleContractError(
+                f"{replay_field}.ops does not preserve the selected operation order"
+            )
+        covered_ops.update(replay_set)
+        if not set(replay.state_inputs).issubset(prior_states):
+            raise ScheduleContractError(
+                f"{replay_field}.state_inputs are not produced by earlier passes"
+            )
+        expected_states = {
+            output
+            for op in replay.ops
+            if lowered.operation(op).op_type == "Reduction"
+            for output in lowered.operation(op).outputs
+        }
+        if set(replay.state_outputs) != expected_states:
+            raise ScheduleContractError(
+                f"{replay_field}.state_outputs do not match its reductions"
+            )
+        expected_outputs = {
+            tensor
+            for op in replay.ops
+            for tensor in lowered.operation(op).outputs
+            if tensor in lowered.required_outputs
+            or any(
+                consumer not in step_set
+                for consumer in consumers_by_tensor.get(tensor, set())
+            )
+        }
+        if set(replay.output_tensors) != expected_outputs:
+            raise ScheduleContractError(
+                f"{replay_field}.output_tensors do not match kernel boundaries"
+            )
+        if replay.kind is VectorReplayPassKind.REDUCTION and not expected_states:
+            raise ScheduleContractError(
+                f"{replay_field} is a reduction pass without a reduction"
+            )
+        if replay.kind is VectorReplayPassKind.APPLY and expected_states:
+            raise ScheduleContractError(
+                f"{replay_field} apply pass contains a reduction"
+            )
+
+        touched = {
+            tensor
+            for op in replay.ops
+            for tensor in (
+                *lowered.operation(op).inputs,
+                *lowered.operation(op).outputs,
+            )
+        }
+        if {frame.tensor for frame in replay.tensor_frames} != touched:
+            raise ScheduleContractError(
+                f"{replay_field}.tensor_frames do not cover exactly its tensors"
+            )
+        frame_by_tensor = {frame.tensor: frame for frame in replay.tensor_frames}
+        for frame in replay.tensor_frames:
+            tensor = lowered.tensor(frame.tensor)
+            if frame.logical[0] > tensor.height or frame.logical[1] > tensor.width:
+                raise ScheduleContractError(
+                    f"{replay_field} frame for tensor {frame.tensor} exceeds its extent"
+                )
+        expected_workspace_ops = (
+            {op for op in replay.ops if lowered.operation(op).op_type == "Reduction"}
+            if plan.physical_frame.reduced_axis == 1
+            else set()
+        )
+        if {workspace.op for workspace in replay.workspaces} != expected_workspace_ops:
+            raise ScheduleContractError(
+                f"{replay_field}.workspaces do not cover exactly its reductions"
+            )
+        for workspace in replay.workspaces:
+            operation = lowered.operation(workspace.op)
+            if not operation.inputs or operation.inputs[0] != workspace.source_tensor:
+                raise ScheduleContractError(
+                    f"{replay_field} workspace {workspace.op} has the wrong source tensor"
+                )
+            source_frame = frame_by_tensor[workspace.source_tensor]
+            expected_physical = (
+                source_frame.physical[0],
+                max(128, source_frame.physical[1]),
+            )
+            if (
+                workspace.logical != source_frame.logical
+                or workspace.physical != expected_physical
+            ):
+                raise ScheduleContractError(
+                    f"{replay_field} workspace {workspace.op} differs from its lowered scratch frame"
+                )
+        positions = {op: index for index, op in enumerate(replay.ops)}
+        expected_boundary_uses: set[tuple[int, int]] = set()
+        expected_state_inputs: set[int] = set()
+        for op in replay.ops:
+            operation = lowered.operation(op)
+            for argument, tensor in enumerate(operation.inputs):
+                producer = producer_by_tensor.get(tensor)
+                if producer in replay_set:
+                    continue
+                if tensor in replay.state_inputs:
+                    expected_state_inputs.add(tensor)
+                    continue
+                if producer in step_set:
+                    raise ScheduleContractError(
+                        f"{replay_field} has an undeclared cross-pass tensor {tensor}"
+                    )
+                expected_boundary_uses.add((op, argument))
+        if set(replay.state_inputs) != expected_state_inputs:
+            raise ScheduleContractError(
+                f"{replay_field}.state_inputs do not match cross-pass uses"
+            )
+        actual_boundary_uses = {
+            (use.op, use.arg)
+            for lifetime in replay.input_lifetimes
+            for use in lifetime.uses
+        }
+        if actual_boundary_uses != expected_boundary_uses:
+            raise ScheduleContractError(
+                f"{replay_field}.input_lifetimes do not match boundary uses"
+            )
+        for lifetime in replay.input_lifetimes:
+            use_positions = [positions[use.op] for use in lifetime.uses]
+            if (
+                not use_positions
+                or lifetime.first_use_step != min(use_positions)
+                or lifetime.last_use_step != max(use_positions)
+                or lifetime.use_count != len(use_positions)
+            ):
+                raise ScheduleContractError(
+                    f"{replay_field} has stale input lifetime bounds"
+                )
+
+        if replay.kind is VectorReplayPassKind.REDUCTION:
+            if (
+                not replay.init.present
+                or replay.init.chunk_index != 0
+                or replay.init.extent != plan.chunk
+                or replay.loop.first_chunk != 1
+                or replay.loop.trip_count != plan.full_chunks - 1
+            ):
+                raise ScheduleContractError(
+                    f"{replay_field} reduction loop differs from the stream geometry"
+                )
+        elif (
+            replay.init.present
+            or replay.loop.first_chunk != 0
+            or replay.loop.trip_count != plan.full_chunks
+        ):
+            raise ScheduleContractError(
+                f"{replay_field} apply loop differs from the stream geometry"
+            )
+        if replay.loop.pipeline_stages not in {1, 2}:
+            raise ScheduleContractError(
+                f"{replay_field} has an unsupported pipeline depth"
+            )
+        if replay.tail.present != (plan.tail > 0) or (
+            replay.tail.present
+            and (
+                replay.tail.chunk_index != plan.full_chunks
+                or replay.tail.extent != plan.tail
+            )
+        ):
+            raise ScheduleContractError(
+                f"{replay_field} tail differs from the stream geometry"
+            )
+        prior_states.update(replay.state_outputs)
+
+    if covered_ops != step_set:
+        raise ScheduleContractError(
+            f"{field}.replay_passes do not cover every selected operation"
+        )
 
 
 def _validate_vector_launch_contract(
@@ -509,6 +726,7 @@ def _parse_vector_plan(
         "tail",
         "stream_passes",
         "phases",
+        "replay_passes",
         "tile",
         "strip",
         "strip_grid",
@@ -547,8 +765,32 @@ def _parse_vector_plan(
     reduction = _parse_vector_reduction_split(
         item.get("reduction_split"), field=f"{field}.reduction_split"
     )
+    replay_passes = tuple(
+        _parse_vector_replay_pass(
+            replay,
+            field=f"{field}.replay_passes[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, replay in enumerate(
+            _sequence(item.get("replay_passes"), f"{field}.replay_passes")
+        )
+    )
+    if tuple(replay.index for replay in replay_passes) != tuple(
+        range(len(replay_passes))
+    ):
+        raise ScheduleContractError(
+            f"{field}.replay_passes must use contiguous ordered indices"
+        )
+    kind = _enum(VectorStreamKind, item.get("kind"), f"{field}.kind")
+    if kind is VectorStreamKind.MULTI_PASS and not replay_passes:
+        raise ScheduleContractError(f"{field}.replay_passes is empty for multi_pass")
+    if kind is not VectorStreamKind.MULTI_PASS and replay_passes:
+        raise ScheduleContractError(
+            f"{field}.replay_passes is present for {kind.value!r}"
+        )
     return VectorKernelPlan(
-        kind=_enum(VectorStreamKind, item.get("kind"), f"{field}.kind"),
+        kind=kind,
         coordinate_transform=_enum(
             VectorCoordinateTransform,
             item.get("coordinate_transform"),
@@ -609,6 +851,7 @@ def _parse_vector_plan(
             item.get("stream_passes"), f"{field}.stream_passes"
         ),
         phases=phases,
+        replay_passes=replay_passes,
         tile=_int_tuple(item.get("tile"), 2, f"{field}.tile"),
         strip=_nonnegative_int_tuple(item.get("strip"), 2, f"{field}.strip"),
         strip_grid=_int_tuple(item.get("strip_grid"), 2, f"{field}.strip_grid"),
@@ -621,6 +864,103 @@ def _parse_vector_plan(
             op_bound=op_bound,
             tensor_bound=tensor_bound,
         ),
+    )
+
+
+def _parse_vector_replay_pass(
+    value: Any,
+    *,
+    field: str,
+    op_bound: int,
+    tensor_bound: int,
+) -> VectorReplayPassPlan:
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "index",
+            "kind",
+            "ops",
+            "state_inputs",
+            "state_outputs",
+            "output_tensors",
+            "input_lifetimes",
+            "tensor_frames",
+            "workspaces",
+            "init",
+            "loop",
+            "tail",
+        },
+        field=field,
+    )
+    ops = tuple(
+        _bounded_int(op, f"{field}.ops", op_bound)
+        for op in _sequence(item.get("ops"), f"{field}.ops")
+    )
+    if len(ops) != len(set(ops)):
+        raise ScheduleContractError(f"{field}.ops contains duplicate operations")
+
+    def tensors(name: str) -> tuple[int, ...]:
+        result = tuple(
+            _bounded_int(tensor, f"{field}.{name}", tensor_bound)
+            for tensor in _sequence(item.get(name), f"{field}.{name}")
+        )
+        if len(result) != len(set(result)):
+            raise ScheduleContractError(f"{field}.{name} contains duplicates")
+        return result
+
+    lifetimes = tuple(
+        _parse_vector_input_lifetime(
+            lifetime,
+            field=f"{field}.input_lifetimes[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, lifetime in enumerate(
+            _sequence(item.get("input_lifetimes"), f"{field}.input_lifetimes")
+        )
+    )
+    frames = tuple(
+        _parse_vector_tensor_frame(
+            frame,
+            field=f"{field}.tensor_frames[{index}]",
+            tensor_bound=tensor_bound,
+        )
+        for index, frame in enumerate(
+            _sequence(item.get("tensor_frames"), f"{field}.tensor_frames")
+        )
+    )
+    workspaces = tuple(
+        _parse_vector_workspace_frame(
+            workspace,
+            field=f"{field}.workspaces[{index}]",
+            op_bound=op_bound,
+            tensor_bound=tensor_bound,
+        )
+        for index, workspace in enumerate(
+            _sequence(item.get("workspaces"), f"{field}.workspaces")
+        )
+    )
+    loop = _parse_optional_loop(item.get("loop"), field=f"{field}.loop")
+    init = _parse_optional_serial(item.get("init"), field=f"{field}.init")
+    tail = _parse_optional_serial(item.get("tail"), field=f"{field}.tail")
+    if loop is None or init is None or tail is None:
+        raise ScheduleContractError(
+            f"{field} requires concrete init, loop, and tail descriptors"
+        )
+    return VectorReplayPassPlan(
+        index=_nonnegative_int(item.get("index"), f"{field}.index"),
+        kind=_enum(VectorReplayPassKind, item.get("kind"), f"{field}.kind"),
+        ops=ops,
+        state_inputs=tensors("state_inputs"),
+        state_outputs=tensors("state_outputs"),
+        output_tensors=tensors("output_tensors"),
+        input_lifetimes=lifetimes,
+        tensor_frames=frames,
+        workspaces=workspaces,
+        loop=loop,
+        init=init,
+        tail=tail,
     )
 
 
@@ -1008,7 +1348,7 @@ def _parse_mixed_plan(
         "stages",
         "transfers",
         "fifos",
-        "dense_mlp",
+        "feature_round_trip",
     }
     _expect_keys(item, required=required, field=field)
     raw_stages = _sequence(item.get("stages"), f"{field}.stages")
@@ -1165,8 +1505,8 @@ def _parse_mixed_plan(
             )
             for index, fifo in enumerate(_sequence(item.get("fifos"), f"{field}.fifos"))
         ),
-        dense_mlp=_parse_mixed_dense_mlp(
-            item.get("dense_mlp"), field=f"{field}.dense_mlp"
+        feature_round_trip=_parse_mixed_feature_round_trip(
+            item.get("feature_round_trip"), field=f"{field}.feature_round_trip"
         ),
     )
 
@@ -1304,28 +1644,27 @@ def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifo
     )
 
 
-def _parse_mixed_dense_mlp(value: Any, *, field: str) -> MixedDenseMlpPlan | None:
+def _parse_mixed_feature_round_trip(
+    value: Any, *, field: str
+) -> MixedFeatureRoundTripPlan | None:
     if value is None:
         return None
     item = _mapping(value, field)
     _expect_keys(
         item,
         required={
-            "input_extent",
             "intermediate_extent",
             "intermediate_chunk",
             "intermediate_chunks",
             "output_extent",
-            "gate_window_k",
-            "up_window_k",
+            "producer_window_k",
             "persistent_accumulator_bytes",
             "first_chunk_initializes",
             "later_chunks_accumulate",
         },
         field=field,
     )
-    return MixedDenseMlpPlan(
-        input_extent=_positive_int(item.get("input_extent"), f"{field}.input_extent"),
+    return MixedFeatureRoundTripPlan(
         intermediate_extent=_positive_int(
             item.get("intermediate_extent"), f"{field}.intermediate_extent"
         ),
@@ -1338,10 +1677,15 @@ def _parse_mixed_dense_mlp(value: Any, *, field: str) -> MixedDenseMlpPlan | Non
         output_extent=_positive_int(
             item.get("output_extent"), f"{field}.output_extent"
         ),
-        gate_window_k=_positive_int(
-            item.get("gate_window_k"), f"{field}.gate_window_k"
+        producer_window_k=tuple(
+            _positive_int(window, f"{field}.producer_window_k[{index}]")
+            for index, window in enumerate(
+                _sequence(
+                    item.get("producer_window_k"),
+                    f"{field}.producer_window_k",
+                )
+            )
         ),
-        up_window_k=_positive_int(item.get("up_window_k"), f"{field}.up_window_k"),
         persistent_accumulator_bytes=_positive_int(
             item.get("persistent_accumulator_bytes"),
             f"{field}.persistent_accumulator_bytes",
@@ -1466,9 +1810,13 @@ def _validate_mixed_contract(  # noqa: PLR0913
             raise ScheduleContractError(
                 f"{field} one-way pipeline depth differs from its successor loop"
             )
-    if plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE:
+    if plan.protocol in {
+        MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE,
+        MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE,
+    }:
         expected_fill_absorbed = (
-            successor_overlap and plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP
+            successor_overlap
+            and plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
         )
         expected_stages = 3 if successor_overlap else 1
         expected_skew = 2 if successor_overlap else 0
@@ -1518,7 +1866,7 @@ def _validate_mixed_contract(  # noqa: PLR0913
                 raise ScheduleContractError(
                     f"{stage_field} contains cube work in a vector stage"
                 )
-            if plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP:
+            if plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP:
                 _validate_vector_phase_links(
                     stage.vector_stream,
                     lowered=lowered,
@@ -1557,13 +1905,49 @@ def _validate_mixed_contract(  # noqa: PLR0913
             f"{field} first vector-stage kind differs from its compatibility summary"
         )
     flattened_ops = tuple(op for stage in plan.stages for op in stage.ops)
-    if (
-        len(flattened_ops) != len(set(flattened_ops))
-        or set(flattened_ops) != set(step_ops)
-        or (
-            plan.algorithm is not MixedAlgorithm.DENSE_SWIGLU_MLP
-            and flattened_ops != step_order
+    if len(flattened_ops) != len(set(flattened_ops)) or set(flattened_ops) != set(
+        step_ops
+    ):
+        raise ScheduleContractError(
+            f"{field}.stages do not preserve the selected operation order"
         )
+    if plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE:
+        order_position = {op: position for position, op in enumerate(step_order)}
+        stage_by_op = {
+            op: stage_index
+            for stage_index, stage in enumerate(plan.stages)
+            for op in stage.ops
+        }
+        producer_by_tensor = {
+            tensor: op for op in step_ops for tensor in lowered.operation(op).outputs
+        }
+        for stage_index, stage in enumerate(plan.stages):
+            if tuple(sorted(stage.ops, key=order_position.__getitem__)) != stage.ops:
+                raise ScheduleContractError(
+                    f"{field}.stages[{stage_index}].ops do not preserve the "
+                    "selected operation order"
+                )
+            for op in stage.ops:
+                for tensor in lowered.operation(op).inputs:
+                    producer = producer_by_tensor.get(tensor)
+                    if producer is None:
+                        continue
+                    producer_stage = stage_by_op[producer]
+                    if producer_stage > stage_index:
+                        raise ScheduleContractError(
+                            f"{field}.stages contain a backward data dependency"
+                        )
+                    if (
+                        producer_stage == stage_index
+                        and order_position[producer] >= order_position[op]
+                    ):
+                        raise ScheduleContractError(
+                            f"{field}.stages[{stage_index}].ops reorder a data "
+                            "dependency"
+                        )
+    elif (
+        plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+        and flattened_ops != step_order
     ):
         raise ScheduleContractError(
             f"{field}.stages do not preserve the selected operation order"
@@ -1688,6 +2072,70 @@ def _validate_mixed_contract(  # noqa: PLR0913
             raise ScheduleContractError(
                 f"{field} has an inconsistent single-round-trip protocol"
             )
+    elif plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE:
+        producer_bundle = plan.protocol_producer_bundle
+        reply_bundle = plan.protocol_reply_bundle
+        if (
+            len(producer_bundle) < 2
+            or len(reply_bundle) != len(producer_bundle)
+            or sorted((*producer_bundle, *reply_bundle))
+            != list(range(len(plan.transfers)))
+            or plan.protocol_peer_stage is not None
+            or plan.protocol_sink_stage is None
+        ):
+            raise ScheduleContractError(
+                f"{field} has an incomplete branched-round-trip protocol"
+            )
+        producer_stages = tuple(
+            sorted(plan.transfers[index].producer_stage for index in producer_bundle)
+        )
+        peer_stages = {
+            plan.transfers[index].consumer_stage for index in producer_bundle
+        }
+        reply_producers = {
+            plan.transfers[index].producer_stage for index in reply_bundle
+        }
+        reply_consumers = {
+            plan.transfers[index].consumer_stage for index in reply_bundle
+        }
+        producer_engine = plan.stages[producer_stages[0]].engine
+        peer_engine = plan.stages[next(iter(peer_stages))].engine
+        incoming_per_peer = {
+            peer: sum(
+                plan.transfers[index].consumer_stage == peer
+                for index in producer_bundle
+            )
+            for peer in peer_stages
+        }
+        replies_per_peer = {
+            peer: sum(
+                plan.transfers[index].producer_stage == peer for index in reply_bundle
+            )
+            for peer in peer_stages
+        }
+        if (
+            plan.mode is not MixedPipelineMode.SINGLE_ROUND_TRIP_SKEW
+            or plan.protocol_producer_stages != producer_stages
+            or peer_stages != reply_producers
+            or reply_consumers != {plan.protocol_sink_stage}
+            or any(count != 1 for count in incoming_per_peer.values())
+            or any(count != 1 for count in replies_per_peer.values())
+            or any(
+                plan.stages[index].engine is not producer_engine
+                for index in producer_stages
+            )
+            or any(
+                plan.stages[index].engine is not peer_engine for index in peer_stages
+            )
+            or producer_engine is peer_engine
+            or plan.stages[plan.protocol_sink_stage].engine is not producer_engine
+            or not plan.protocol_skew_compatible
+            or any(plan.fifos[index].bundle != 0 for index in producer_bundle)
+            or any(plan.fifos[index].bundle != 1 for index in reply_bundle)
+        ):
+            raise ScheduleContractError(
+                f"{field} has an inconsistent branched-round-trip protocol"
+            )
     elif plan.protocol is MixedCrossCoreProtocol.MULTI_ROUND_TRIP_SEQUENTIAL:
         expected_engines = (
             MixedEngine.CUBE,
@@ -1730,18 +2178,30 @@ def _validate_mixed_contract(  # noqa: PLR0913
     else:
         raise ScheduleContractError(f"{field} source-ready protocol is unsupported")
 
-    if plan.algorithm is MixedAlgorithm.DENSE_SWIGLU_MLP:
-        dense = plan.dense_mlp
+    if plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP:
+        feature = plan.feature_round_trip
         if (
-            dense is None
-            or dense.intermediate_chunks * dense.intermediate_chunk
-            != dense.intermediate_extent
-            or not dense.first_chunk_initializes
-            or not dense.later_chunks_accumulate
+            feature is None
+            or feature.intermediate_chunks < 2
+            or feature.intermediate_chunks * feature.intermediate_chunk
+            != feature.intermediate_extent
+            or plan.pipeline_axis is not MixedPipelineAxis.INTERMEDIATE_FEATURE_CHUNK
+            or plan.pipeline_extent != feature.intermediate_extent
+            or plan.pipeline_chunk != feature.intermediate_chunk
+            or plan.items_per_spatial_tile != feature.intermediate_chunks
+            or plan.pipeline_work_items
+            != plan.spatial_tiles * feature.intermediate_chunks
+            or plan.min_trips_per_group != feature.intermediate_chunks
+            or plan.max_trips_per_group != feature.intermediate_chunks
+            or len(feature.producer_window_k) != len(plan.protocol_producer_bundle)
+            or not feature.first_chunk_initializes
+            or not feature.later_chunks_accumulate
         ):
-            raise ScheduleContractError(f"{field}.dense_mlp is incomplete")
-    elif plan.dense_mlp is not None:
-        raise ScheduleContractError(f"{field} generic plan carries dense-MLP state")
+            raise ScheduleContractError(f"{field}.feature_round_trip is incomplete")
+    elif plan.feature_round_trip is not None:
+        raise ScheduleContractError(
+            f"{field} generic plan carries feature-round-trip state"
+        )
 
 
 def _mixed_materialized_source_peak(

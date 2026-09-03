@@ -18,14 +18,17 @@ from pathlib import Path
 from pto_fusebox import (
     EmittedPyPTOCallable,
     NormalizedGraph,
+    QwenOutputHeadOverlay,
+    SolveResult,
     SourceEmissionError,
     emit_pypto_callable,
+    emit_qwen_output_head_overlay,
     export_and_normalize,
     solve_graph,
 )
 
 from ._runner import Example
-from .qwen3 import build_examples
+from .qwen3 import build_examples, build_production_qwen_output_head
 
 _OUTPUT_HEAD_MODULE = "generated_qwen_output_head"
 _OUTPUT_HEAD_FUNCTION = "generated_qwen_output_head"
@@ -82,6 +85,29 @@ def emit_hybrid_qwen_output_head(
     )
 
 
+def emit_production_qwen_output_head_overlay(
+    solver_binary: str | Path,
+    *,
+    native_decode_source: str,
+    solver_workers: int = 2,
+    module_name: str = "fusebox_qwen_output_head",
+) -> QwenOutputHeadOverlay:
+    """Replace the real Qwen decode output-head import with one solved DAG."""
+
+    graph, solved = _solve_static_graph(
+        build_production_qwen_output_head(),
+        solver_binary,
+        solver_workers=solver_workers,
+        function_name="production_qwen_output_head",
+    )
+    return emit_qwen_output_head_overlay(
+        graph,
+        solved,
+        native_decode_source=native_decode_source,
+        module_name=module_name,
+    )
+
+
 def _emit_static_callable(
     example: Example,
     solver_binary: str | Path,
@@ -89,6 +115,28 @@ def _emit_static_callable(
     solver_workers: int,
     function_name: str,
 ) -> tuple[NormalizedGraph, EmittedPyPTOCallable]:
+    graph, solved = _solve_static_graph(
+        example,
+        solver_binary,
+        solver_workers=solver_workers,
+        function_name=function_name,
+    )
+    return graph, emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name=function_name,
+    )
+
+
+def _solve_static_graph(
+    example: Example,
+    solver_binary: str | Path,
+    *,
+    solver_workers: int,
+    function_name: str,
+) -> tuple[NormalizedGraph, SolveResult]:
+    """Capture and solve one complete static graph without caller partitioning."""
+
     module, example_args = example
     graph = export_and_normalize(module.eval(), example_args)
     solved = solve_graph(
@@ -110,11 +158,7 @@ def _emit_static_callable(
         raise SourceEmissionError(
             f"static region {function_name!r} must solve as one callable"
         )
-    return graph, emit_pypto_callable(
-        graph,
-        solved.regions[0],
-        function_name=function_name,
-    )
+    return graph, solved
 
 
 def _ordered_call_arguments(

@@ -24,6 +24,7 @@ class VectorStreamKind(Enum):
     SOFTMAX_FLASH = "softmax_flash"
     LAYERNORM_WELFORD = "layernorm_welford"
     MODEL_AHEAD_MULTI_REDUCTION = "model_ahead_multi_reduction"
+    MULTI_PASS = "multi_pass"
 
 
 class VectorCoordinateTransform(Enum):
@@ -43,6 +44,11 @@ class VectorReplayPhase(Enum):
     STATS = "stats"
     APPLY = "apply"
     FINALIZE = "finalize"
+
+
+class VectorReplayPassKind(Enum):
+    REDUCTION = "reduction"
+    APPLY = "apply"
 
 
 class VectorReductionSplitKind(Enum):
@@ -77,6 +83,7 @@ class MixedCrossCoreProtocol(Enum):
     UNSUPPORTED = "unsupported"
     ONE_WAY = "one_way"
     SINGLE_ROUND_TRIP_BUNDLE = "single_round_trip_bundle"
+    BRANCHED_ROUND_TRIP_BUNDLE = "branched_round_trip_bundle"
     MULTI_ROUND_TRIP_SEQUENTIAL = "multi_round_trip_sequential"
 
 
@@ -90,7 +97,7 @@ class MixedPipelineAxis(Enum):
 
 class MixedAlgorithm(Enum):
     GENERIC = "generic"
-    DENSE_SWIGLU_MLP = "dense_swiglu_mlp"
+    FEATURE_CHUNK_ROUND_TRIP = "feature_chunk_round_trip"
 
 
 class MixedVectorSplit(Enum):
@@ -222,6 +229,24 @@ class VectorPhasePlan:
 
 
 @dataclass(frozen=True)
+class VectorReplayPassPlan:
+    """One dependency-derived pass in an ordered multi-pass replay."""
+
+    index: int
+    kind: VectorReplayPassKind
+    ops: tuple[int, ...]
+    state_inputs: tuple[int, ...]
+    state_outputs: tuple[int, ...]
+    output_tensors: tuple[int, ...]
+    input_lifetimes: tuple[VectorInputLifetimePlan, ...]
+    tensor_frames: tuple[VectorTensorFramePlan, ...]
+    workspaces: tuple[VectorWorkspaceFramePlan, ...]
+    loop: VectorLoopPlan
+    init: VectorSerialPhasePlan
+    tail: VectorSerialPhasePlan
+
+
+@dataclass(frozen=True)
 class VectorReductionSeedPlan:
     present: bool
     work_units: int
@@ -295,6 +320,7 @@ class VectorKernelPlan:
     tail: int
     stream_passes: int
     phases: tuple[VectorPhasePlan, ...]
+    replay_passes: tuple[VectorReplayPassPlan, ...]
     tile: tuple[int, int]
     strip: tuple[int, int]
     strip_grid: tuple[int, int]
@@ -500,14 +526,12 @@ class MixedFifoPlan:
 
 
 @dataclass(frozen=True)
-class MixedDenseMlpPlan:
-    input_extent: int
+class MixedFeatureRoundTripPlan:
     intermediate_extent: int
     intermediate_chunk: int
     intermediate_chunks: int
     output_extent: int
-    gate_window_k: int
-    up_window_k: int
+    producer_window_k: tuple[int, ...]
     persistent_accumulator_bytes: int
     first_chunk_initializes: bool
     later_chunks_accumulate: bool
@@ -558,7 +582,7 @@ class MixedKernelPlan:
     stages: tuple[MixedStagePlan, ...]
     transfers: tuple[MixedTransferPlan, ...]
     fifos: tuple[MixedFifoPlan, ...]
-    dense_mlp: MixedDenseMlpPlan | None
+    feature_round_trip: MixedFeatureRoundTripPlan | None
 
     @property
     def pipeline_work_items(self) -> int:

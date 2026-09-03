@@ -408,7 +408,7 @@ struct ScheduleStep {
 The production Ascend 910B solver deliberately disables cross-kernel
 fast-memory retention: `solver.cpp` constructs every selected step with an
 empty `retain_these`, because separate kernels exchange values through GM.
-`pto_fusebox.solution.v6` therefore does not publish a retention field, and its
+`pto_fusebox.solution.v7` therefore does not publish a retention field, and its
 serializer rejects a non-empty entering or outgoing retain set. Cube-local
 resident values and retained panels are different: they live inside one cube
 step and are serialized in its nested cube plan.

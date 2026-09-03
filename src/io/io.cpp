@@ -1,4 +1,5 @@
 #include "io/io.h"
+#include "core/ascend910b_cost.h"
 #include "core/types.h"
 #include "solution/solution.h"
 #include <array>
@@ -20,6 +21,15 @@ static const char* vector_stream_kind_name(VectorStreamKind kind) {
         case VectorStreamKind::SoftmaxFlash: return "softmax_flash";
         case VectorStreamKind::LayerNormWelford: return "layernorm_welford";
         case VectorStreamKind::ModelAheadMultiReduction: return "model_ahead_multi_reduction";
+        case VectorStreamKind::MultiPass: return "multi_pass";
+    }
+    return "unknown";
+}
+
+static const char* vector_replay_pass_kind_name(VectorReplayPassKind kind) {
+    switch (kind) {
+        case VectorReplayPassKind::Reduction: return "reduction";
+        case VectorReplayPassKind::Apply: return "apply";
     }
     return "unknown";
 }
@@ -250,6 +260,58 @@ static json vector_replay_phases_json(const Problem& problem,
     return result;
 }
 
+static json vector_replay_passes_json(const Problem& problem,
+                                      const VectorStreamPlan& plan) {
+    json result = json::array();
+    if (!plan.replay_topology) return result;
+    const auto frames = BuildVectorReplayPassTensorFrames(problem, plan);
+    const auto workspaces = BuildVectorReplayPassWorkspaceFrames(problem, plan);
+    if (plan.replay_passes.size() != plan.replay_topology->passes.size())
+        return result;
+    for (size_t index = 0; index < plan.replay_topology->passes.size(); ++index) {
+        const VectorReplayPassTopology& pass = plan.replay_topology->passes[index];
+        const VectorReplayPassExecutionPlan& execution = plan.replay_passes[index];
+        json lifetimes = json::array();
+        for (const auto& lifetime : pass.input_lifetimes) {
+            json uses = json::array();
+            for (const auto& use : lifetime.uses)
+                uses.push_back({{"op", use.op}, {"arg", use.arg}});
+            lifetimes.push_back({{"tensor", lifetime.tensor},
+                                 {"first_use_step", lifetime.first_use_step},
+                                 {"last_use_step", lifetime.last_use_step},
+                                 {"use_count", lifetime.use_count},
+                                 {"uses", std::move(uses)}});
+        }
+        json tensor_frames = json::array();
+        for (const auto& frame : frames[index])
+            tensor_frames.push_back(
+                {{"tensor", frame.tensor},
+                 {"logical", {frame.logical_rows, frame.logical_cols}},
+                 {"physical", {frame.physical_rows, frame.physical_cols}}});
+        json workspace_frames = json::array();
+        for (const auto& frame : workspaces[index])
+            workspace_frames.push_back(
+                {{"op", frame.op},
+                 {"source_tensor", frame.source_tensor},
+                 {"logical", {frame.logical_rows, frame.logical_cols}},
+                 {"physical", {frame.physical_rows, frame.physical_cols}}});
+        result.push_back(
+            {{"index", execution.index},
+             {"kind", vector_replay_pass_kind_name(pass.kind)},
+             {"ops", pass.ops},
+             {"state_inputs", pass.state_inputs},
+             {"state_outputs", pass.state_outputs},
+             {"output_tensors", pass.output_tensors},
+             {"input_lifetimes", std::move(lifetimes)},
+             {"tensor_frames", std::move(tensor_frames)},
+             {"workspaces", std::move(workspace_frames)},
+             {"init", vector_serial_phase_json(execution.init)},
+             {"loop", vector_loop_json(execution.loop)},
+             {"tail", vector_serial_phase_json(execution.tail)}});
+    }
+    return result;
+}
+
 static json vector_stream_plan_json(const Problem& problem,
                                     const VectorStreamPlan& plan) {
     const char* coordinate_transform =
@@ -305,6 +367,7 @@ static json vector_stream_plan_json(const Problem& problem,
             {"tail", plan.tail},
             {"stream_passes", plan.stream_passes},
             {"phases", vector_replay_phases_json(problem, plan)},
+            {"replay_passes", vector_replay_passes_json(problem, plan)},
             {"tile", {plan.tile_h, plan.tile_w}},
             {"strip", {plan.strip_h, plan.strip_w}},
             {"strip_grid", {plan.row_strips, plan.width_strips}},
@@ -460,6 +523,8 @@ static const char* mixed_cross_core_protocol_name(MixedCrossCoreProtocol protoco
       return "one_way";
     case MixedCrossCoreProtocol::SingleRoundTripBundle:
       return "single_round_trip_bundle";
+    case MixedCrossCoreProtocol::BranchedRoundTripBundle:
+      return "branched_round_trip_bundle";
     case MixedCrossCoreProtocol::MultiRoundTripSequential:
       return "multi_round_trip_sequential";
   }
@@ -486,8 +551,8 @@ static const char* mixed_algorithm_name(MixedAlgorithmKind algorithm) {
   switch (algorithm) {
     case MixedAlgorithmKind::Generic:
       return "generic";
-    case MixedAlgorithmKind::DenseSwiGluMlp:
-      return "dense_swiglu_mlp";
+    case MixedAlgorithmKind::FeatureChunkRoundTrip:
+      return "feature_chunk_round_trip";
   }
   return "unknown";
 }
@@ -983,14 +1048,14 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v6";
+    j["schema_version"] = "pto_fusebox.solution.v7";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
             throw std::logic_error(
-                "solution.v6 cannot serialize cross-kernel fast-memory retention");
+                "solution.v7 cannot serialize cross-kernel fast-memory retention");
         }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
@@ -1216,18 +1281,24 @@ std::string solution_json(const Solution& sol) {
                          {"pipe_id", fifo.pipe_id},
                          {"bundle", fifo.bundle}});
       }
-      json dense_mlp = nullptr;
-      if (mixed_plan.dense_mlp.present) {
-        dense_mlp = {{"input_extent", mixed_plan.dense_mlp.input_extent},
-                     {"intermediate_extent", mixed_plan.dense_mlp.intermediate_extent},
-                     {"intermediate_chunk", mixed_plan.dense_mlp.intermediate_chunk},
-                     {"intermediate_chunks", mixed_plan.dense_mlp.intermediate_chunks},
-                     {"output_extent", mixed_plan.dense_mlp.output_extent},
-                     {"gate_window_k", mixed_plan.dense_mlp.gate_window_k},
-                     {"up_window_k", mixed_plan.dense_mlp.up_window_k},
-                     {"persistent_accumulator_bytes", mixed_plan.dense_mlp.persistent_accumulator_bytes},
-                     {"first_chunk_initializes", mixed_plan.dense_mlp.first_chunk_initializes},
-                     {"later_chunks_accumulate", mixed_plan.dense_mlp.later_chunks_accumulate}};
+      json feature_round_trip = nullptr;
+      if (mixed_plan.feature_round_trip.present) {
+        feature_round_trip =
+            {{"intermediate_extent",
+              mixed_plan.feature_round_trip.intermediate_extent},
+             {"intermediate_chunk",
+              mixed_plan.feature_round_trip.intermediate_chunk},
+             {"intermediate_chunks",
+              mixed_plan.feature_round_trip.intermediate_chunks},
+             {"output_extent", mixed_plan.feature_round_trip.output_extent},
+             {"producer_window_k",
+              mixed_plan.feature_round_trip.producer_window_k},
+             {"persistent_accumulator_bytes",
+              mixed_plan.feature_round_trip.persistent_accumulator_bytes},
+             {"first_chunk_initializes",
+              mixed_plan.feature_round_trip.first_chunk_initializes},
+             {"later_chunks_accumulate",
+              mixed_plan.feature_round_trip.later_chunks_accumulate}};
       }
       auto protocol_stage = [](size_t stage) {
         return stage == std::numeric_limits<size_t>::max() ? json(nullptr) : json(stage);
@@ -1275,7 +1346,7 @@ std::string solution_json(const Solution& sol) {
            {"stages", stages},
            {"transfers", transfers},
            {"fifos", fifos},
-           {"dense_mlp", dense_mlp}};
+           {"feature_round_trip", feature_round_trip}};
         }
         serialized_step["latency_cycles"] = sol.step_latency(i);
         j["steps"].push_back(std::move(serialized_step));

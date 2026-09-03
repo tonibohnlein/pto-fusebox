@@ -41,6 +41,12 @@ BuildVectorTensorFrames(const Problem& problem, const VectorStreamPlan& plan);
 std::array<std::vector<VectorWorkspaceFramePlan>, 4>
 BuildVectorWorkspaceFrames(const Problem& problem,
                            const VectorStreamPlan& plan);
+std::vector<std::vector<VectorTensorFramePlan>>
+BuildVectorReplayPassTensorFrames(const Problem& problem,
+                                  const VectorStreamPlan& plan);
+std::vector<std::vector<VectorWorkspaceFramePlan>>
+BuildVectorReplayPassWorkspaceFrames(const Problem& problem,
+                                     const VectorStreamPlan& plan);
 
 // Ephemeral memo for one best_cost()/enumerate_plans() call. It is deliberately
 // absent from CostResult and CostCache: exact L0 costing may revisit the same
@@ -346,7 +352,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
       int64_t active_groups,
       MixedCostBreakdown *breakdown = nullptr) const;
 
-  CostResult compute_dense_mlp_cost(
+  CostResult compute_feature_round_trip_cost(
       const TileConfig& cfg, const MixedSchedulePlan& schedule,
       MixedCostBreakdown* breakdown = nullptr) const;
 
@@ -374,20 +380,22 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                           const FlatSet<size_t> &retained_from_prev,
                           const FlatSet<size_t> &retain_these) const;
 
-  struct DenseMlpResources {
+  struct FeatureRoundTripResources {
     bool feasible = false;
-    int64_t gate_window_k = 0;
-    int64_t up_window_k = 0;
+    std::vector<int64_t> producer_window_k;
     int64_t cube_peak_l1_bytes = 0;
     int64_t vector_peak_ub_bytes = 0;
     int64_t fifo_reserved_bytes = 0;
+    VectorStreamKind vector_kind = VectorStreamKind::Materialized;
   };
 
-  // Exact resources for the production Cx2->V->C SwiGLU algorithm.  This is
-  // intentionally separate from derive_exec()/vector_stream_plan(): those
-  // homogeneous planners see a final-output tile, while this algorithm streams
-  // an intermediate-feature chunk and keeps a down-projection accumulator.
-  DenseMlpResources derive_dense_mlp_resources(const TileConfig& cfg) const;
+  // Exact resources for a topology-driven CxN->V->C feature pipeline. This is
+  // intentionally separate from derive_exec(): the homogeneous cube planner
+  // sees a final-output tile, while this mechanism streams an intermediate
+  // feature chunk and keeps the sink accumulator across chunks. The vector
+  // stage itself is still priced by its homogeneous vector planner.
+  FeatureRoundTripResources derive_feature_round_trip_resources(
+      const TileConfig& cfg) const;
 
   // Engine behind cube_peak_l1(): sweep the request-instance execution order,
   // accumulate live intermediate-region bytes, derive each matmul instance's k
@@ -547,6 +555,7 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::array<std::vector<size_t>, 4> vector_phase_ops_;
   std::array<std::vector<size_t>, 4> vector_phase_inputs_;
   std::shared_ptr<const VectorInputLifetimeTopology> vector_input_lifetime_topology_;
+  std::shared_ptr<const VectorReplayTopology> vector_replay_topology_;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).

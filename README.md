@@ -8,8 +8,8 @@ faithful kernel emitter.
 The current hardware model targets the Ascend 910B. It includes:
 
 - grounded vector primitive, reduction, DMA, and launch costs;
-- `VectorStreamPlan` schedules for materialized, streamed, and online
-  multi-stat reductions;
+- `VectorStreamPlan` schedules for materialized, streamed, online, and generic
+  multi-pass reduction DAGs;
 - recursive `CubeSchedulePlan` schedules for matmuls and matmul DAGs;
 - an experimental mixed cube/vector model; and
 - compact cost evaluation suitable for local-search enumeration.
@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
-  with its modeled cost and ordinary `solution.v6` replay payload; and
+  with its modeled cost and ordinary `solution.v7` replay payload; and
 - `mixed_group_sweep`: enumerate every uniform active-group assignment for the
   model-selected mixed tile with its production pipe/stage cycles, issued bytes,
   and effective-port-parallelism breakdown; and
@@ -134,6 +134,10 @@ by callable, so independently emitted functions can expand in one native
 program without rebinding each other's tiles. Native PyPTO orchestration
 imports that function and owns loops, metadata, dispatch, and dependencies
 outside the static region.
+Pass `expose_completion_task=True` when the native caller must depend on the
+generated region as one orchestration phase. The callable then returns its
+ordinary output plus the `TaskId` of the last scheduled SPMD task; no task or
+dependency is rediscovered by the adapter.
 `emit_pypto_region` remains available when a standalone generated
 `@pl.program` is more convenient.
 `emit_pypto_static_bundle` applies the callable API to every solved region and
@@ -171,6 +175,18 @@ python -m examples.torch_frontend.hybrid_qwen \
 
 The emitted directory is ordinary PyPTO source and no longer imports Torch.
 
+The first production-tree integrations are available through
+`examples.torch_frontend.production_models.emit_production_model_integration`.
+They validate the requested model against the checked PyPTO-lib manifest,
+solve production-shape Torch DAGs, and return generated plus minimally patched
+PyPTO source files. Current coverage is the DSpark projection/RMSNorm region,
+the Flash-MTP and DeepSeek-V4-Pro production INT8 MTP projection, and the
+Qwen3-14B connected RMSNorm-to-LM-head output region. Native attention,
+indirect cache access, routing, sampling, communication, and dynamic window
+orchestration remain unchanged. This is intentionally an incremental
+full-model integration surface, not a claim that the four complete model
+trees are generated already.
+
 Unsupported operations remain explicit graph boundaries. The source backend
 replays supported vector, cube, and mixed steps from the selected schedule.
 Vector source covers materialized/pointwise replay, versioned two-pass online
@@ -186,23 +202,27 @@ dependency-linked `pl.spmd` launches in solver order. A split cube DAG may
 split only its unique sink: upstream matmuls replay their serial K plans inside
 each share, while resident inputs and retained panels stay local to that share.
 Multiple split accumulators and multiple-output split groups fail closed.
-Mixed source initially covers generic one-way `C -> V`, generic one-way
-`V -> C` with an in-memory or online-softmax vector producer, generic
-`C -> V -> C`, dense
-`C,C -> V -> C`, and one linear `C -> V -> C -> V` plan through PyPTO's
+Mixed source covers generic one-way `C -> V`, generic one-way `V -> C` with an
+in-memory or online-softmax vector producer, generic `C -> V -> C`, branched
+`V,V -> C,C -> V`, one linear `C -> V -> C -> V` plan, and a feature-chunk
+`C[,C...] -> V -> C` round trip through PyPTO's
 public `pl.split(UP_DOWN)` mechanism. Fusebox retains its logical FIFO
 descriptors for planning, validation, and costing, and emits each one through
 PyPTO's generic `pl.cross_core_pipe(...)` contract. PyPTO validates the ordered
 unidirectional descriptors against the actual crossings, then owns AIC/AIV
 outlining, pipe setup, and pipeline lowering. Different pipes may therefore
 carry different slot sizes and depths without hand-written core programs. The
-four-stage form is deliberately
+feature-chunk form accepts multiple matmul producers, replays the recorded
+pointwise DAG, and retains the sink matmul accumulator across disjoint feature
+chunks. It is selected from the stage DAG, tensor geometry, dtypes, and
+capacity; there is no dense-SwiGLU recognizer or emitter. The four-stage form is
+deliberately
 sequential: its three FIFO crossings replay in topological order and receive no
 skew-overlap credit. Online softmax-to-PV replays the serialized statistics and
 apply phases, publishes each normalized K chunk through one V2C pipe, and
 accumulates the sink matmul over the same K windows. A complete square produced
 panel may also serve both operands of a single-region sink matmul through one
-FIFO-owned L1 ring. Partitioned dual-role values and branched/deeper round
+FIFO-owned L1 ring. Partitioned dual-role values and unsupported deeper round
 trips still fail closed. A linear region may compose mixed and homogeneous
 steps through dependency-linked GM cuts.
 Mixed source readiness combines the serialized cube-stage L1 peak with V2C
@@ -274,7 +294,7 @@ explicit fan-out, lifetime, and per-consumer FIFO ownership and must not be
 inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v6`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v7`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
@@ -288,7 +308,7 @@ clamps ragged-edge origins backwards, so generated source preserves static tile
 shapes instead of turning known extents into runtime scalar operands. A
 homogeneous step is emitted as one `pl.spmd(work_units)` launch rather than a
 host loop of single-block submissions, matching the grid priced by the model.
-Welford/multi-stat vector schedules, singleton-column normalization, nonuniform
+Welford-specific vector schedules, singleton-column normalization, nonuniform
 cube spatial partitions, and mixed schedules outside the admitted stage
 patterns remain explicitly outside source readiness.
 Single-sink split-K is source-ready through the model-selected
