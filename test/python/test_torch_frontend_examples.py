@@ -68,7 +68,7 @@ from pto_fusebox import (
     solve_graph,
     validate_pypto_lib_model,
 )
-from pto_fusebox.schedule.schema import MixedKernelPlan
+from pto_fusebox.schedule.schema import CubeKernelPlan, MixedKernelPlan
 from pto_fusebox.ir import normalized_graph_sha256
 from torch import nn
 
@@ -332,10 +332,19 @@ def test_production_dspark_projection_is_one_completion_aware_static_region() ->
     assert solved.whole_graph_codegen_ready
     assert len(solved.regions) == 1
     schedule = scheduled_region(solved.regions[0])
+    # A chunked BF16 matmul carries FP32 until its logical BF16 storage
+    # boundary. The former mixed choice sized that crossing as BF16 and was
+    # therefore not source-feasible; the corrected model keeps the complete
+    # static graph but selects an explicit cube-to-vector GM cut.
     assert [step.kind for step in schedule.steps] == [
-        KernelKind.MIXED,
+        KernelKind.CUBE,
         KernelKind.VECTOR,
     ]
+    cube_plan = schedule.steps[0].plan
+    assert isinstance(cube_plan, CubeKernelPlan)
+    assert cube_plan.matmuls[0].accumulator_dtype == "fp32"
+    assert cube_plan.matmuls[0].storage_dtype == "bf16"
+    assert cube_plan.matmuls[0].k_loop.full_chunks > 1
     emitted = emit_pypto_callable(
         graph,
         solved.regions[0],
@@ -375,6 +384,80 @@ def test_production_qwen_output_head_overlay_preserves_native_window_abi() -> No
         "from fusebox_qwen_output_head import rms_lm_head_fp32\n"
     )
     assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_production_qwen_lm_head_accumulator_and_traffic_parity() -> None:
+    """Compare loop-weighted traffic, not static PTO statement counts.
+
+    The native implementation has one syntactic drain inside a 33-trip
+    grid-stride loop, while Fusebox expands nine output tiles per spatial
+    owner.  Counting the statement bodies makes the generated drain look
+    larger even though both schedules write the complete output exactly once.
+    """
+
+    module, args = build_production_qwen_output_head()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.VECTOR,
+        KernelKind.CUBE,
+    ]
+    cube_plan = schedule.steps[1].plan
+    assert isinstance(cube_plan, CubeKernelPlan)
+    assert cube_plan.spatial_tiles == 24
+    matmul = cube_plan.matmuls[0]
+
+    # The existing source candidate already retains one FP32 accumulator
+    # through every K contribution for each output tile.  A second
+    # "persistent accumulator" mechanism would therefore be a duplicate.
+    assert matmul.accumulator_dtype == "fp32"
+    assert matmul.storage_dtype == "fp32"
+    assert matmul.k_loop.full_chunks > 1
+    assert matmul.final_drain.required
+    assert not matmul.final_drain.atomic
+    assert matmul.final_drain.tile_count == math.prod(matmul.output_grid)
+
+    output_bytes = QWEN_BATCH_TILE * QWEN_PRODUCTION_VOCAB * 4
+    generated_drain_bytes = matmul.final_drain.bytes * cube_plan.spatial_tiles
+    native_vocab_trips = QWEN_PRODUCTION_VOCAB // QWEN_VOCAB_CHUNK
+    native_drain_bytes = QWEN_BATCH_TILE * QWEN_VOCAB_CHUNK * 4 * native_vocab_trips
+    assert generated_drain_bytes == native_drain_bytes == output_bytes
+
+    full_weight_bytes = QWEN_PRODUCTION_VOCAB * QWEN_PRODUCTION_HIDDEN * 2
+    generated_weight_bytes = (
+        matmul.rhs.height * matmul.rhs.width * 2 * cube_plan.spatial_tiles
+    )
+    native_k_trips = QWEN_PRODUCTION_HIDDEN // QWEN_LM_HEAD_K_CHUNK
+    native_weight_bytes = (
+        QWEN_VOCAB_CHUNK
+        * QWEN_LM_HEAD_K_CHUNK
+        * 2
+        * native_vocab_trips
+        * native_k_trips
+    )
+    assert generated_weight_bytes == native_weight_bytes == full_weight_bytes
+
+    # Fusebox retains each spatial owner's activation panel.  The native
+    # grid-stride loop reloads the activation for every vocabulary tile.
+    generated_activation_bytes = (
+        matmul.retained_panels.lhs_bytes * cube_plan.spatial_tiles
+    )
+    native_activation_bytes = (
+        QWEN_BATCH_TILE * QWEN_LM_HEAD_K_CHUNK * 2 * native_vocab_trips * native_k_trips
+    )
+    assert generated_activation_bytes == (
+        QWEN_BATCH_TILE * QWEN_PRODUCTION_HIDDEN * 2 * cube_plan.spatial_tiles
+    )
+    assert generated_activation_bytes < native_activation_bytes
 
 
 @pytest.mark.skipif(

@@ -404,6 +404,7 @@ def _parse_fifo(value: Any, *, field: str) -> Mapping[str, Any]:
         "tensor",
         "pipe_id",
         "direction",
+        "wire_dtype",
         "bundle",
         "spatial_m",
         "spatial_n",
@@ -418,10 +419,14 @@ def _parse_fifo(value: Any, *, field: str) -> Mapping[str, Any]:
     direction = value.get("direction")
     if direction not in {"cube_to_vector", "vector_to_cube"}:
         raise ValueError(f"{field}.direction is unsupported")
+    wire_dtype = value.get("wire_dtype")
+    if not isinstance(wire_dtype, str) or not wire_dtype:
+        raise ValueError(f"{field}.wire_dtype must be a non-empty string")
     return {
         "tensor": _nonnegative_int(value.get("tensor"), f"{field}.tensor"),
         "pipe_id": _nonnegative_int(value.get("pipe_id"), f"{field}.pipe_id"),
         "direction": direction,
+        "wire_dtype": wire_dtype,
         "bundle": _integer(value.get("bundle"), f"{field}.bundle"),
         "spatial_m": _bool(value.get("spatial_m"), f"{field}.spatial_m"),
         "spatial_n": _bool(value.get("spatial_n"), f"{field}.spatial_n"),
@@ -495,6 +500,7 @@ def _validate_sweep_against_region(
             "tensor": fifo.tensor,
             "pipe_id": fifo.pipe_id,
             "direction": fifo.direction.value,
+            "wire_dtype": fifo.wire_dtype,
             "bundle": fifo.bundle,
             "spatial_m": fifo.spatial_m,
             "spatial_n": fifo.spatial_n,

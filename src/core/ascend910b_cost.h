@@ -408,6 +408,12 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                       const FlatSet<size_t>& retain_these, std::vector<int64_t>* pernode_k_out,
                       std::vector<int64_t>* pernode_live_bytes_out = nullptr) const;
 
+  // Resolve a derive_exec() K-window result for a normalized op. Request-DAG
+  // plans index the vector by request node; legacy plans index it directly by
+  // op. A repeated op uses the narrowest window required by any request.
+  int64_t cube_window_k_for_op(const std::vector<int64_t>& windows,
+                               size_t op) const;
+
   struct CubeRequest {
     size_t tensor = std::numeric_limits<size_t>::max();
     CubeAxisBinding height_binding = CubeAxisBinding::Full;

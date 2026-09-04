@@ -204,6 +204,17 @@ class _Int32C2V(nn.Module):
         return accumulator.float() * scale
 
 
+class _ChunkedBF16C2V(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        product = torch.mm(value, weight)
+        return product.float() + bias
+
+
 class _Int8ProjectionBranch(nn.Module):
     def forward(
         self,
@@ -1772,6 +1783,36 @@ def test_int32_accumulator_crosses_from_cube_to_vector_generically() -> None:
     assert "out_dtype=pl.INT32" in source
     assert "target_type=pl.FP32" in source
     assert "pl.tensor.row_expand_mul(" in source
+
+
+def test_chunked_bf16_matmul_crosses_as_fp32_accumulator() -> None:
+    graph, result = _solve_module(
+        _ChunkedBF16C2V(),
+        (
+            torch.zeros(16, 12288, dtype=torch.bfloat16),
+            torch.zeros(12288, 128, dtype=torch.bfloat16),
+            torch.zeros(1, 128),
+        ),
+    )
+    step = scheduled_region(result).steps[0]
+
+    assert step.kind is KernelKind.MIXED
+    assert isinstance(step.plan, MixedKernelPlan)
+    cube_stage = step.plan.stages[0]
+    assert cube_stage.engine is MixedEngine.CUBE
+    assert 0 < cube_stage.cube_window_k[0] < 12288
+    fifo = step.plan.fifos[0]
+    assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+    assert fifo.wire_dtype == "fp32"
+    assert fifo.slot_bytes == fifo.valid_rows * fifo.valid_cols * 4
+
+    source = emit_pypto_region(graph, result, program_name="chunked_bf16_c2v").source
+    ast.parse(source)
+    _assert_pypto_main_mixed_scope(source, step.plan)
+    assert "out_dtype=pl.FP32" in source
+    assert "pl.tensor.matmul_acc(" in source
+    assert "target_type=pl.BF16, mode='rint'" in source
+    assert 'target_type=pl.FP32, mode="none"' in source
 
 
 def test_one_way_c2v_can_stream_successor_items_on_fewer_mixed_groups() -> None:

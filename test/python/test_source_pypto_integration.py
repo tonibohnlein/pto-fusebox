@@ -23,6 +23,7 @@ import torch
 from examples.torch_frontend._runner import Example
 from examples.torch_frontend.deepseek_v4 import (
     build_examples as build_deepseek_examples,
+    build_production_dspark_projection,
     build_production_mtp_decode_projection,
     build_production_mtp_history_projection_branch,
     build_production_mtp_prefill_projection_branch,
@@ -77,6 +78,16 @@ pytestmark = pytest.mark.skipif(
 class _PointwiseChain(nn.Module):
     def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         return torch.maximum(torch.exp(lhs * 0.5) + rhs, rhs)
+
+
+class _ChunkedBf16MatmulEpilogue(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.mm(value, weight).float() + bias
 
 
 def test_callable_region_expands_inside_native_orchestration(
@@ -282,6 +293,76 @@ def test_production_mtp_physical_broadcast_frames_compile(
     )
     assert len(pto) == 5
     assert orchestration.count("rt_submit_") == 5
+
+
+def test_production_dspark_chunked_bf16_accumulator_compiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep chunked BF16 storage separate from the FP32 L0C family."""
+
+    module, args = build_production_dspark_projection()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.whole_graph_codegen_ready and len(solved.regions) == 1
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_dspark_projection",
+    )
+    assert "out_dtype=pl.FP32" in emitted.source
+    assert "pl.matmul_acc(" in emitted.source
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted,
+        tmp_path,
+        monkeypatch,
+        name="dspark_projection",
+    )
+    assert len(pto) == 2
+    assert orchestration.count("rt_submit_") == 2
+
+
+def test_chunked_bf16_c2v_accumulator_compiles_as_fp32(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ChunkedBf16MatmulEpilogue()
+    args = (
+        torch.zeros(16, 12288, dtype=torch.bfloat16),
+        torch.zeros(12288, 128, dtype=torch.bfloat16),
+        torch.zeros(1, 128),
+    )
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [KernelKind.MIXED]
+    emitted = emit_pypto_callable(
+        graph,
+        solved.regions[0],
+        function_name="generated_chunked_bf16_epilogue",
+    )
+    assert "out_dtype=pl.FP32" in emitted.source
+    assert "pl.tensor.matmul_acc(" in emitted.source
+
+    pto, orchestration = _compile_callable_in_native_orchestration(
+        emitted,
+        tmp_path,
+        monkeypatch,
+        name="chunked_bf16_epilogue",
+    )
+    assert len(pto) == 1
+    assert orchestration.count("rt_submit_") == 1
 
 
 def _compile_callable_in_native_orchestration(

@@ -1187,6 +1187,11 @@ struct MixedScheduleTopology {
 struct MixedFifoPlan {
   size_t tensor = std::numeric_limits<size_t>::max();
   MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
+  // Physical dtype carried by the cross-core ring. A chunked floating-point
+  // matmul keeps its partial result in the hardware accumulator dtype until
+  // the AIV consumer performs the logical storage conversion, so this may be
+  // wider than the normalized tensor dtype.
+  DType wire_dtype = DType::FP32;
   // Bind a spatial-region FIFO frame to the unified output grid without
   // inferring axis identity from equal numeric extents. Protocol-local loops
   // such as generic feature chunks retain their own serialized frame geometry.

@@ -1271,6 +1271,7 @@ std::string solution_json(const Solution& sol) {
       for (const auto& fifo : mixed_plan.fifos) {
         fifos.push_back({{"tensor", fifo.tensor},
                          {"direction", mixed_transfer_direction_name(fifo.direction)},
+                         {"wire_dtype", dtype_name(fifo.wire_dtype)},
                          {"spatial_m", fifo.spatial_m},
                          {"spatial_n", fifo.spatial_n},
                          {"valid_rows", fifo.valid_rows},

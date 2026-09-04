@@ -3978,6 +3978,20 @@ int64_t Ascend910BCost::derive_exec(const TileConfig& cfg, int64_t sink_K_eff,
   return peak;
 }
 
+int64_t Ascend910BCost::cube_window_k_for_op(
+    const std::vector<int64_t>& windows, size_t op) const {
+  if (cube_request_nodes_.empty()) {
+    return op < windows.size() ? windows[op] : 0;
+  }
+  int64_t result = 0;
+  for (size_t node = 0;
+       node < cube_request_nodes_.size() && node < windows.size(); ++node) {
+    if (cube_request_nodes_[node].op != op || windows[node] <= 0) continue;
+    result = result == 0 ? windows[node] : std::min(result, windows[node]);
+  }
+  return result;
+}
+
 int64_t Ascend910BCost::cube_peak_l1(const TileConfig &cfg,
                                std::vector<int64_t> *perop_k) const {
   if (cube_request_nodes_.empty()) return derive_exec(cfg, output_K_, {}, {}, perop_k);
@@ -5719,10 +5733,10 @@ Ascend910BCost::derive_feature_round_trip_resources(
     producer_peak_l1_bytes =
         std::max(producer_peak_l1_bytes,
                  2 * selected_window * (mp.big + cfg.k) * operand_bytes);
-    const size_t output = prob_->ops[feature.producer_matmuls[index]].output();
-    producer_peak_acc_bytes =
-        std::max(producer_peak_acc_bytes,
-                 mp.big * cfg.k * dtype_bytes(prob_->tensors[output].dtype));
+    producer_peak_acc_bytes = std::max(
+        producer_peak_acc_bytes,
+        mp.big * cfg.k *
+            dtype_bytes(cube_accumulator_dtype(operand_dtype)));
   }
 
   // The sink projection consumes one complete feature chunk. Its operand
@@ -5743,9 +5757,16 @@ Ascend910BCost::derive_feature_round_trip_resources(
 
   constexpr int64_t kFifoSlots = 4;
   int64_t c2v_fifo_reserved_bytes = 0;
-  for (size_t tensor : feature.producer_tensors) {
+  for (size_t index = 0; index < feature.producer_tensors.size(); ++index) {
+    const size_t tensor = feature.producer_tensors[index];
+    const size_t op = feature.producer_matmuls[index];
+    const DType wire_dtype =
+        resources.producer_window_k[index] < op_K(op)
+            ? cube_accumulator_dtype(
+                  prob_->tensors[prob_->ops[op].inputs[0]].dtype)
+            : prob_->tensors[tensor].dtype;
     c2v_fifo_reserved_bytes +=
-        kFifoSlots * mp.big * cfg.k * dtype_bytes(prob_->tensors[tensor].dtype);
+        kFifoSlots * mp.big * cfg.k * dtype_bytes(wire_dtype);
   }
   const int64_t v2c_fifo_reserved_bytes =
       kFifoSlots * mp.big * cfg.k *
@@ -5805,11 +5826,12 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
   // L1 ring.  There is no additional cube-stage L1 operand outside that ring;
   // asking the generic cube pebble model to materialize the produced value in
   // both boundary roles would reject the otherwise representable schedule.
+  std::vector<int64_t> cube_windows;
   int64_t cube_peak_l1_bytes =
       vector_to_cube_operand_mask() == 3
           ? 0
           : derive_exec(cfg, output_K_, retained_from_prev, retain_these,
-                        nullptr);
+                        &cube_windows);
   if (cube_peak_l1_bytes == INT64_MAX) {
     return false;
   }
@@ -6000,8 +6022,27 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
       cols = streaming_softmax_v2c_chunk;
     }
     if (rows <= 0 || cols <= 0) return false;
+    DType wire_dtype = prob_->tensors[transfer.tensor].dtype;
+    if (transfer.producer_engine == MixedEngine::Cube) {
+      const MixedStageTopology& producer_stage =
+          mixed_topology_->stages[transfer.producer_stage];
+      const auto produced_by = std::find_if(
+          producer_stage.ops.begin(), producer_stage.ops.end(),
+          [&](size_t op) {
+            return prob_->ops[op].output() == transfer.tensor;
+          });
+      if (produced_by != producer_stage.ops.end() &&
+          prob_->ops[*produced_by].type == OpType::MatMul) {
+        const int64_t window =
+            cube_window_k_for_op(cube_windows, *produced_by);
+        if (window > 0 && window < op_K(*produced_by)) {
+          wire_dtype = cube_accumulator_dtype(
+              prob_->tensors[prob_->ops[*produced_by].inputs[0]].dtype);
+        }
+      }
+    }
     const int64_t reserved =
-        rows * cols * dtype_bytes(prob_->tensors[transfer.tensor].dtype) * slot_count;
+        rows * cols * dtype_bytes(wire_dtype) * slot_count;
     if (transfer.producer_engine == MixedEngine::Cube) {
       c2v_fifo_reserved += reserved;
     } else {
@@ -7357,8 +7398,24 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     constexpr int64_t kFifoSlots = 4;
     auto add_fifo = [&](size_t tensor, MixedTransferDirection direction, int pipe_id, int bundle) {
       const Tensor& value = prob_->tensors[tensor];
-      const int64_t slot_bytes = plan.m_partition.big * cfg.k * dtype_bytes(value.dtype);
-      plan.fifos.push_back({tensor, direction, /*spatial_m=*/true,
+      DType wire_dtype = value.dtype;
+      if (direction == MixedTransferDirection::CubeToVector) {
+        const auto producer = std::find(
+            feature.producer_tensors.begin(),
+            feature.producer_tensors.end(), tensor);
+        if (producer != feature.producer_tensors.end()) {
+          const size_t producer_index = static_cast<size_t>(
+              std::distance(feature.producer_tensors.begin(), producer));
+          const size_t op_index = feature.producer_matmuls[producer_index];
+          if (resources.producer_window_k[producer_index] < op_K(op_index)) {
+            wire_dtype = cube_accumulator_dtype(
+                prob_->tensors[prob_->ops[op_index].inputs[0]].dtype);
+          }
+        }
+      }
+      const int64_t slot_bytes =
+          plan.m_partition.big * cfg.k * dtype_bytes(wire_dtype);
+      plan.fifos.push_back({tensor, direction, wire_dtype, /*spatial_m=*/true,
                             /*spatial_n=*/false, plan.m_partition.big, cfg.k,
                             slot_bytes, kFifoSlots, slot_bytes * kFifoSlots,
                             pipe_id, bundle});
@@ -7495,6 +7552,18 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
         vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash &&
         vector_to_cube_stream.chunk > 0;
     const int64_t slot_count = mixed_topology_->transfers.size() == 1 ? 8 : 4;
+    std::vector<int64_t> fifo_cube_windows;
+    const bool has_c2v = std::any_of(
+        mixed_topology_->transfers.begin(), mixed_topology_->transfers.end(),
+        [](const MixedTransferTopology& transfer) {
+          return transfer.producer_engine == MixedEngine::Cube;
+        });
+    if (has_c2v &&
+        derive_exec(cfg, output_K_, retained_from_prev, retain_these,
+                    &fifo_cube_windows) == INT64_MAX) {
+      plan.feasible = false;
+      return plan;
+    }
     for (size_t transfer_index = 0;
          transfer_index < mixed_topology_->transfers.size(); ++transfer_index) {
       const MixedTransferTopology& transfer = mixed_topology_->transfers[transfer_index];
@@ -7530,7 +7599,27 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
           transfer.producer_engine == MixedEngine::Vector) {
         cols = vector_to_cube_stream.chunk;
       }
-      const int64_t slot_bytes = rows * cols * dtype_bytes(tensor.dtype);
+      DType wire_dtype = tensor.dtype;
+      if (transfer.producer_engine == MixedEngine::Cube) {
+        const MixedStageTopology& producer_stage =
+            mixed_topology_->stages[transfer.producer_stage];
+        const auto produced_by = std::find_if(
+            producer_stage.ops.begin(), producer_stage.ops.end(),
+            [&](size_t op_index) {
+              return prob_->ops[op_index].output() == transfer.tensor;
+            });
+        if (produced_by != producer_stage.ops.end()) {
+          const Op& producer = prob_->ops[*produced_by];
+          const int64_t window =
+              cube_window_k_for_op(fifo_cube_windows, *produced_by);
+          if (producer.type == OpType::MatMul && window > 0 &&
+              window < op_K(*produced_by)) {
+            wire_dtype = cube_accumulator_dtype(
+                prob_->tensors[producer.inputs[0]].dtype);
+          }
+        }
+      }
+      const int64_t slot_bytes = rows * cols * dtype_bytes(wire_dtype);
       int bundle = -1;
       if (skew_round_trip) {
         const auto& protocol = mixed_topology_->protocol;
@@ -7545,7 +7634,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
            transfer.producer_engine == MixedEngine::Cube
                ? MixedTransferDirection::CubeToVector
                : MixedTransferDirection::VectorToCube,
-           spatial_m, spatial_n, rows, cols, slot_bytes, slot_count,
+           wire_dtype, spatial_m, spatial_n, rows, cols, slot_bytes, slot_count,
            slot_bytes * slot_count,
            static_cast<int>(transfer_index), bundle});
     }
@@ -7623,26 +7712,35 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         plan.protocol == MixedCrossCoreProtocol::MultiRoundTripSequential;
     const int vector_to_cube_mask = vector_to_cube_operand_mask();
     const bool vector_to_cube = vector_to_cube_mask != 0;
-    std::vector<int64_t> pernode_k;
+    std::vector<int64_t> cube_windows;
     plan.cube_stage_peak_l1_bytes =
         vector_to_cube_mask == 3
             ? 0
             : derive_exec(cfg, output_K_, retained_from_prev, retain_these,
-                          &pernode_k);
+                          &cube_windows);
+    std::vector<int64_t> perop_k(prob_->ops.size(), 0);
+    for (const MixedStageTopology& stage : mixed_topology_->stages) {
+      if (stage.engine != MixedEngine::Cube) continue;
+      for (size_t op : stage.ops) {
+        if (op < perop_k.size()) {
+          perop_k[op] = cube_window_k_for_op(cube_windows, op);
+        }
+      }
+    }
     if (vector_to_cube_mask == 3) {
-      pernode_k.assign(prob_->ops.size(), 0);
+      perop_k.assign(prob_->ops.size(), 0);
       if (sink_mm_op_ >= 0 &&
-          static_cast<size_t>(sink_mm_op_) < pernode_k.size()) {
-        pernode_k[static_cast<size_t>(sink_mm_op_)] = output_K_;
+          static_cast<size_t>(sink_mm_op_) < perop_k.size()) {
+        perop_k[static_cast<size_t>(sink_mm_op_)] = output_K_;
       }
     }
     if (plan.cube_stage_peak_l1_bytes == INT64_MAX) {
       plan.feasible = false;
       return plan;
     }
-    if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < pernode_k.size() &&
-        pernode_k[static_cast<size_t>(sink_mm_op_)] > 0) {
-      plan.cube_window_k = pernode_k[static_cast<size_t>(sink_mm_op_)];
+    if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < perop_k.size() &&
+        perop_k[static_cast<size_t>(sink_mm_op_)] > 0) {
+      plan.cube_window_k = perop_k[static_cast<size_t>(sink_mm_op_)];
       plan.config.k = plan.cube_window_k;
     }
     if (mixed_topology_ && plan.emit_compatible) {
@@ -7706,7 +7804,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         if (stage.engine == MixedEngine::Cube) {
           for (size_t op : stage.ops) {
             stage.cube_window_k.push_back(
-                op < pernode_k.size() ? pernode_k[op] : 0);
+                op < perop_k.size() ? perop_k[op] : 0);
           }
         } else {
           if (plan.vector_split == MixedVectorSplit::Rows) {

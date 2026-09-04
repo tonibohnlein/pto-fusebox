@@ -34,6 +34,19 @@ const char* engine_name(MixedEngine engine) {
   throw std::logic_error("unknown mixed engine");
 }
 
+const char* dtype_name(DType dtype) {
+  switch (dtype) {
+    case DType::FP32: return "fp32";
+    case DType::FP16: return "fp16";
+    case DType::BF16: return "bf16";
+    case DType::INT32: return "int32";
+    case DType::INT16: return "int16";
+    case DType::INT8: return "int8";
+    case DType::BOOL: return "bool";
+  }
+  throw std::logic_error("unknown mixed FIFO wire dtype");
+}
+
 }  // namespace
 
 std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
@@ -92,6 +105,7 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
       fifos.push_back({{"tensor", fifo.tensor},
                        {"pipe_id", fifo.pipe_id},
                        {"direction", direction_name(fifo.direction)},
+                       {"wire_dtype", dtype_name(fifo.wire_dtype)},
                        {"bundle", fifo.bundle},
                        {"spatial_m", fifo.spatial_m},
                        {"spatial_n", fifo.spatial_n},

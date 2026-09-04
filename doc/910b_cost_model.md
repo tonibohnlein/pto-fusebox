@@ -290,6 +290,25 @@ coefficient from this pair. A future forced-candidate experiment should compare
 `q={1,2,3,4,6}` with comparable child plans, then validate any selected
 occupancy/dispatch term on held-out shapes.
 
+The production Qwen output head exposes a different discriminator. Its current
+cube step already keeps one FP32 L0C accumulator alive across the complete K
+stream and drains each output tile once. A second persistent-accumulator
+mechanism is therefore neither missing nor useful. Static PTO body counts also
+cannot be compared directly: the native source contains one 192-column drain
+inside a 33-trip grid-stride loop, while the generated source expands nine
+704-column drains for each of 24 spatial owners. Loop-weighted, both schedules
+store exactly `16 * 152064 * 4` output bytes and load the complete BF16 weight
+exactly once. Fusebox actually loads less activation traffic because each
+spatial owner retains its `16 x 5120` panel.
+
+The remaining production-shape gap is child-schedule and loop representation,
+not GM-drain accounting. The selected plan expands nine output tiles and uses
+32-wide L1 K windows with 16-wide child chunks; native PyPTO uses a compact
+grid-stride vocabulary loop, 192-column output tiles, 512-wide L1 K windows,
+and 64/128-wide child K tiles. Candidate enumeration should compare such
+output-window and child-plan combinations jointly, including compact repeated
+tiles, rather than adding a duplicate accumulator-lifetime candidate.
+
 Before device ranking is trusted, complete:
 
 1. implement variable-shape non-uniform multi-op grids; lone split=1 ceil+clamp is complete;

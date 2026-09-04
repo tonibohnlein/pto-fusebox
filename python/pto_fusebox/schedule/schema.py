@@ -514,6 +514,7 @@ class MixedTransferPlan:
 class MixedFifoPlan:
     tensor: int
     direction: MixedTransferDirection
+    wire_dtype: str
     spatial_m: bool
     spatial_n: bool
     valid_rows: int

@@ -1613,6 +1613,7 @@ def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifo
         required={
             "tensor",
             "direction",
+            "wire_dtype",
             "spatial_m",
             "spatial_n",
             "valid_rows",
@@ -1630,6 +1631,7 @@ def _parse_mixed_fifo(value: Any, *, field: str, tensor_bound: int) -> MixedFifo
         direction=_enum(
             MixedTransferDirection, item.get("direction"), f"{field}.direction"
         ),
+        wire_dtype=_dtype(item.get("wire_dtype"), f"{field}.wire_dtype"),
         spatial_m=_bool(item.get("spatial_m"), f"{field}.spatial_m"),
         spatial_n=_bool(item.get("spatial_n"), f"{field}.spatial_n"),
         valid_rows=_positive_int(item.get("valid_rows"), f"{field}.valid_rows"),
@@ -2000,6 +2002,35 @@ def _validate_mixed_contract(  # noqa: PLR0913
             else MixedTransferDirection.VECTOR_TO_CUBE
         )
         tensor = lowered.tensor(fifo.tensor)
+        wire_dtype = tensor.dtype.lower()
+        if direction is MixedTransferDirection.CUBE_TO_VECTOR:
+            producers = [
+                lowered.operation(op)
+                for op in producer.ops
+                if lowered.operation(op).outputs == (transfer.tensor,)
+            ]
+            if len(producers) != 1:
+                raise ScheduleContractError(
+                    f"{transfer_field}.tensor has no unique producer"
+                )
+            producing_op = producers[0]
+            if producing_op.op_type == "MatMul":
+                window_index = producer.ops.index(producing_op.index)
+                contraction = lowered.tensor(producing_op.inputs[0]).width
+                if producer.cube_window_k[window_index] < contraction:
+                    operand_dtype = lowered.tensor(producing_op.inputs[0]).dtype.lower()
+                    wire_dtype = (
+                        "fp32" if operand_dtype in {"fp32", "fp16", "bf16"} else "int32"
+                    )
+        wire_byte_width = {
+            "fp32": 4,
+            "fp16": 2,
+            "bf16": 2,
+            "int32": 4,
+            "int16": 2,
+            "int8": 1,
+            "bool": 1,
+        }[wire_dtype]
         spatial_frame = plan.pipeline_axis is MixedPipelineAxis.SPATIAL_REGION
         expected_rows = plan.m_partition.big if fifo.spatial_m else tensor.height
         expected_cols = plan.n_partition.big if fifo.spatial_n else tensor.width
@@ -2015,10 +2046,11 @@ def _validate_mixed_contract(  # noqa: PLR0913
         if (
             fifo.tensor != transfer.tensor
             or fifo.direction is not direction
+            or fifo.wire_dtype != wire_dtype
             or fifo.pipe_id != index
             or (spatial_frame and fifo.valid_rows != expected_rows)
             or (spatial_frame and fifo.valid_cols != expected_cols)
-            or fifo.slot_bytes != fifo.valid_rows * fifo.valid_cols * tensor.byte_width
+            or fifo.slot_bytes != fifo.valid_rows * fifo.valid_cols * wire_byte_width
             or fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count
         ):
             raise ScheduleContractError(

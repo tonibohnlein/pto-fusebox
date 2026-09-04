@@ -485,7 +485,7 @@ first production-shape static ownership unit for each target:
 | `deepseek_v4_flash_dspark` | Complete fixed-frame BF16 DSpark projection followed by RMSNorm, emitted as one completion-aware callable. | Dynamic token-frame selection and the call site in the drafter orchestration. |
 | `deepseek_v4_flash_mtp` | Complete production INT8 MTP projection input graph; Fusebox extracts both maximal *source-emittable* branch regions. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus the currently unsupported static view/add tail. |
 | `deepseek_v4_pro` | The same model-independent production INT8 projection contract, linked through the Pro entry point's parenthesized import. | Sparse attention, indexer/TopK, MoE routing, dynamic packing, communication, and state. |
-| `qwen3_14b` | Complete production `16 x 5120` FP32 RMSNorm-to-`152064`-vocabulary LM-head DAG, solved once as one mixed V2C region. | Dynamic batch/window traversal and placement into the runtime-sized logits output. |
+| `qwen3_14b` | Complete production `16 x 5120` FP32 RMSNorm-to-`152064`-vocabulary LM-head DAG, solved once as one static region. The current source optimum is a vector step followed by a cube step with one solver-selected GM normalization cut. | Dynamic batch/window traversal and placement into the runtime-sized logits output. |
 
 These are real production tensor dimensions but not claims that all four full
 models have been regenerated. Each row is the first connected static region
