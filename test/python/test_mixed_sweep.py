@@ -11,6 +11,7 @@ from examples.torch_frontend.static_mixed import (
     StaticAttentionCore,
     StaticAttentionResidual,
     StaticC2VEpilogue,
+    StaticDenseSwiGlu,
     build_examples as build_static_mixed_examples,
 )
 from pto_fusebox import (
@@ -30,6 +31,7 @@ from pto_fusebox.schedule.schema import (
     MixedAlgorithm,
     MixedCrossCoreProtocol,
     MixedKernelPlan,
+    MixedTransferDirection,
 )
 from torch import nn
 
@@ -251,6 +253,48 @@ def test_v2c_rhs_prices_broadcast_bias_load_on_both_aiv_lanes() -> None:
     assert sweep.selected.breakdown.gm_ub_bytes == (
         expected_value_bytes + expected_bias_bytes
     )
+
+
+def test_feature_round_trip_prices_physical_fp32_c2v_messages() -> None:
+    module = StaticDenseSwiGlu(hidden_size=64, intermediate_size=128).eval()
+    graph = export_and_normalize(
+        module,
+        (torch.zeros(128, 64, dtype=torch.bfloat16),),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == len(solved.regions) == 1
+    region = solved.regions[0]
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    assert plan.feature_round_trip is not None
+    sweep = enumerate_mixed_group_plans(region, sweep_binary=_sweep_binary())
+
+    c2v_fifos = tuple(
+        fifo
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
+    )
+    assert len(c2v_fifos) == 2
+    assert all(fifo.wire_dtype == "fp32" for fifo in c2v_fifos)
+    crossing_bytes = (
+        sum(fifo.slot_bytes for fifo in c2v_fifos)
+        * plan.spatial_tiles
+        * plan.feature_round_trip.intermediate_chunks
+    )
+    output = graph.value_map()[graph.outputs[0]]
+    assert all(isinstance(dimension, int) for dimension in output.shape)
+    output_bytes = (
+        math.prod(dimension for dimension in output.shape if isinstance(dimension, int))
+        * 4
+    )
+    assert sweep.selected.breakdown.gm_ub_bytes == crossing_bytes
+    assert sweep.selected.breakdown.l0c_gm_bytes == crossing_bytes + output_bytes
 
 
 @pytest.mark.parametrize(

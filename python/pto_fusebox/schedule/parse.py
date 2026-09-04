@@ -1888,6 +1888,22 @@ def _validate_mixed_contract(  # noqa: PLR0913
                 raise ScheduleContractError(
                     f"{stage_field} Vec peak exceeds the mixed plan"
                 )
+
+    cube_windows = tuple(
+        window
+        for stage in plan.stages
+        if stage.engine is MixedEngine.CUBE
+        for window in stage.cube_window_k
+    )
+    uniform_cube_window = (
+        cube_windows[0]
+        if cube_windows and all(window == cube_windows[0] for window in cube_windows)
+        else 0
+    )
+    if plan.cube_window_k != uniform_cube_window:
+        raise ScheduleContractError(
+            f"{field}.cube_window_k differs from its authoritative stage windows"
+        )
     if (
         not vector_stage_peaks
         or max(vector_stage_peaks) != plan.vector_stage_peak_ub_bytes
@@ -2015,13 +2031,10 @@ def _validate_mixed_contract(  # noqa: PLR0913
                 )
             producing_op = producers[0]
             if producing_op.op_type == "MatMul":
-                window_index = producer.ops.index(producing_op.index)
-                contraction = lowered.tensor(producing_op.inputs[0]).width
-                if producer.cube_window_k[window_index] < contraction:
-                    operand_dtype = lowered.tensor(producing_op.inputs[0]).dtype.lower()
-                    wire_dtype = (
-                        "fp32" if operand_dtype in {"fp32", "fp16", "bf16"} else "int32"
-                    )
+                operand_dtype = lowered.tensor(producing_op.inputs[0]).dtype.lower()
+                wire_dtype = (
+                    "fp32" if operand_dtype in {"fp32", "fp16", "bf16"} else "int32"
+                )
         wire_byte_width = {
             "fp32": 4,
             "fp16": 2,

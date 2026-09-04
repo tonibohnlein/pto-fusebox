@@ -50,6 +50,26 @@ int64_t MixedSelectionBucket(double latency) {
       latency / Ascend910BCost::kMixedGroupSelectionResolutionCycles));
 }
 
+// MixedStagePlan is the authoritative per-operation K-window contract.  The
+// top-level field is retained as a compatibility summary only when every cube
+// operation uses the same window; heterogeneous cube DAGs deliberately report
+// zero rather than inventing one representative value.
+int64_t UniformMixedCubeWindow(const std::vector<MixedStagePlan>& stages) {
+  int64_t result = 0;
+  for (const MixedStagePlan& stage : stages) {
+    if (stage.engine != MixedEngine::Cube) continue;
+    for (int64_t window : stage.cube_window_k) {
+      if (window <= 0) return 0;
+      if (result == 0) {
+        result = window;
+      } else if (window != result) {
+        return 0;
+      }
+    }
+  }
+  return result;
+}
+
 struct VectorPhysicalFrame {
   int64_t rows;
   int64_t cols;
@@ -5758,13 +5778,9 @@ Ascend910BCost::derive_feature_round_trip_resources(
   constexpr int64_t kFifoSlots = 4;
   int64_t c2v_fifo_reserved_bytes = 0;
   for (size_t index = 0; index < feature.producer_tensors.size(); ++index) {
-    const size_t tensor = feature.producer_tensors[index];
     const size_t op = feature.producer_matmuls[index];
-    const DType wire_dtype =
-        resources.producer_window_k[index] < op_K(op)
-            ? cube_accumulator_dtype(
-                  prob_->tensors[prob_->ops[op].inputs[0]].dtype)
-            : prob_->tensors[tensor].dtype;
+    const DType wire_dtype = cube_accumulator_dtype(
+        prob_->tensors[prob_->ops[op].inputs[0]].dtype);
     c2v_fifo_reserved_bytes +=
         kFifoSlots * mp.big * cfg.k * dtype_bytes(wire_dtype);
   }
@@ -6033,12 +6049,8 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
           });
       if (produced_by != producer_stage.ops.end() &&
           prob_->ops[*produced_by].type == OpType::MatMul) {
-        const int64_t window =
-            cube_window_k_for_op(cube_windows, *produced_by);
-        if (window > 0 && window < op_K(*produced_by)) {
-          wire_dtype = cube_accumulator_dtype(
-              prob_->tensors[prob_->ops[*produced_by].inputs[0]].dtype);
-        }
+        wire_dtype = cube_accumulator_dtype(
+            prob_->tensors[prob_->ops[*produced_by].inputs[0]].dtype);
       }
     }
     const int64_t reserved =
@@ -7407,10 +7419,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
           const size_t producer_index = static_cast<size_t>(
               std::distance(feature.producer_tensors.begin(), producer));
           const size_t op_index = feature.producer_matmuls[producer_index];
-          if (resources.producer_window_k[producer_index] < op_K(op_index)) {
-            wire_dtype = cube_accumulator_dtype(
-                prob_->tensors[prob_->ops[op_index].inputs[0]].dtype);
-          }
+          wire_dtype = cube_accumulator_dtype(
+              prob_->tensors[prob_->ops[op_index].inputs[0]].dtype);
         }
       }
       const int64_t slot_bytes =
@@ -7610,10 +7620,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
             });
         if (produced_by != producer_stage.ops.end()) {
           const Op& producer = prob_->ops[*produced_by];
-          const int64_t window =
-              cube_window_k_for_op(fifo_cube_windows, *produced_by);
-          if (producer.type == OpType::MatMul && window > 0 &&
-              window < op_K(*produced_by)) {
+          if (producer.type == OpType::MatMul) {
             wire_dtype = cube_accumulator_dtype(
                 prob_->tensors[producer.inputs[0]].dtype);
           }
@@ -7692,6 +7699,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         }
         plan.stages.push_back(std::move(stage));
       }
+      plan.cube_window_k = UniformMixedCubeWindow(plan.stages);
       plan.topology = mixed_topology_;
       plan.source_codegen_ready =
           plan.emit_compatible && plan.split_k == 1 &&
@@ -7975,6 +7983,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
                       });
     }
   }
+  plan.cube_window_k = UniformMixedCubeWindow(plan.stages);
   plan.topology = mixed_topology_;
   return plan;
 }
@@ -8017,8 +8026,11 @@ CostResult Ascend910BCost::compute_feature_round_trip_cost(
         extract);
     per_item_gm_l1 += static_cast<double>(operand_bytes) *
                       (rows * input_extent + input_extent * chunk);
+    // A cube matmul remains in the hardware accumulator type until the peer
+    // vector stage performs the logical storage conversion.  Charge the
+    // physical C2V message, not the graph tensor's eventual storage dtype.
     const int64_t crossing_bytes =
-        dtype_bytes(prob_->tensors[producer.output()].dtype);
+        dtype_bytes(cube_accumulator_dtype(operand_dtype));
     per_item_l0c_gm +=
         static_cast<double>(rows * chunk * crossing_bytes);
     per_item_gm_ub +=

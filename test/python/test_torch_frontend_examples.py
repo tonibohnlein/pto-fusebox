@@ -13,10 +13,13 @@ from examples.torch_frontend.basic import build_examples as build_basic_examples
 from examples.torch_frontend.deepseek_v4 import (
     DEEPSEEK_V4_DECODE_TOKENS,
     DEEPSEEK_V4_DSPARK_TARGET_LAYERS,
+    DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
     DEEPSEEK_V4_HC_MULT,
     DEEPSEEK_V4_HIDDEN,
     DEEPSEEK_V4_LINEAR_TOKENS,
     DEEPSEEK_V4_PREFILL_TOKENS,
+    DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+    DeepSeekV4MtpGeometry,
     build_examples as build_deepseek_examples,
     build_production_dspark_projection,
     build_production_mtp_decode_projection,
@@ -356,6 +359,35 @@ def test_production_dspark_projection_is_one_completion_aware_static_region() ->
     assert "auto_tile" not in emitted.source and "auto_fuse" not in emitted.source
 
 
+@pytest.mark.parametrize(
+    "geometry",
+    (DEEPSEEK_V4_FLASH_MTP_GEOMETRY, DEEPSEEK_V4_PRO_MTP_GEOMETRY),
+)
+def test_production_mtp_graph_uses_explicit_static_geometry(
+    geometry: DeepSeekV4MtpGeometry,
+) -> None:
+    """Model selection supplies shapes; the normalized DAG remains generic."""
+
+    module, args = build_production_mtp_decode_projection(geometry)
+    graph = export_and_normalize(module, args)
+    values = graph.value_map()
+    by_name = {values[value_id].name: values[value_id] for value_id in graph.inputs}
+
+    assert tuple(by_name["hidden_padded"].shape) == (
+        geometry.linear_tokens,
+        geometry.hidden_size,
+    )
+    assert tuple(by_name["history_flat"].shape) == (
+        geometry.decode_tokens * geometry.hyperconnections,
+        geometry.hidden_size,
+    )
+    assert tuple(values[graph.outputs[0]].shape) == (
+        geometry.decode_tokens,
+        geometry.hyperconnections,
+        geometry.hidden_size,
+    )
+
+
 @pytest.mark.skipif(
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
@@ -377,8 +409,12 @@ def test_production_qwen_output_head_overlay_preserves_native_window_abi() -> No
     assert "pl.Tensor[[16, 5120], pl.FP32]" in overlay.source
     assert "pl.Tensor[[152064, 5120], pl.BF16]" in overlay.source
     assert "static_output = pl.create_tensor([16, 152064]" in overlay.source
-    assert "valid_shape=[valid_rows, 192]" in overlay.source
+    assert overlay.source.count("valid_shape=[valid_rows, 192]") == 1
     assert "pl.store(output_tile, [row_offset, output_col], out)" in overlay.source
+    # Only this logical prefix belongs to the generated callable. Padded rows
+    # outside valid_rows need not match a native implementation that chooses
+    # to compute its complete physical frame.
+    assert "[0, output_col], [16, 192], valid_shape=[valid_rows, 192]" in overlay.source
     assert overlay.decode_source == (
         "from rms_lm_head import rms_lm_head\n"
         "from fusebox_qwen_output_head import rms_lm_head_fp32\n"
@@ -464,12 +500,24 @@ def test_production_qwen_lm_head_accumulator_and_traffic_parity() -> None:
     not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
 )
 @pytest.mark.parametrize(
-    ("model_name", "region", "callable_count", "patched_file"),
+    ("model_name", "region", "callable_count", "patched_file", "mtp_geometry"),
     (
-        ("deepseek_v4_flash_dspark", "dspark_projection", 1, None),
-        ("deepseek_v4_flash_mtp", "mtp_projection", 2, "decode_mtp.py"),
-        ("deepseek_v4_pro", "mtp_projection", 2, "decode_mtp.py"),
-        ("qwen3_14b", "output_head", 1, "decode_fwd.py"),
+        ("deepseek_v4_flash_dspark", "dspark_projection", 1, None, None),
+        (
+            "deepseek_v4_flash_mtp",
+            "mtp_projection",
+            2,
+            "decode_mtp.py",
+            DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+        ),
+        (
+            "deepseek_v4_pro",
+            "mtp_projection",
+            2,
+            "decode_mtp.py",
+            DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+        ),
+        ("qwen3_14b", "output_head", 1, "decode_fwd.py", None),
     ),
 )
 def test_production_model_integration_emits_first_maximal_region(
@@ -477,6 +525,7 @@ def test_production_model_integration_emits_first_maximal_region(
     region: str,
     callable_count: int,
     patched_file: str | None,
+    mtp_geometry: DeepSeekV4MtpGeometry | None,
 ) -> None:
     pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
     if pypto_lib_root is None:
@@ -504,6 +553,21 @@ def test_production_model_integration_emits_first_maximal_region(
         assert tuple(
             source.relative_path for source in integration.patched_native_sources
         ) == (patched_file,)
+    if mtp_geometry is not None:
+        source = integration.generated_sources[0].source
+        hidden = mtp_geometry.hidden_size
+        assert f"pl.Tensor[[{hidden}, {hidden}], pl.INT8]" in source
+        assert (
+            f"pl.Tensor[[{mtp_geometry.decode_tokens}, "
+            f"{mtp_geometry.hyperconnections}, {hidden}], pl.FP32]" in source
+        )
+        combine_cols = math.gcd(hidden, 1024)
+        combine_work = (
+            mtp_geometry.decode_tokens
+            * mtp_geometry.hyperconnections
+            * (hidden // combine_cols)
+        )
+        assert f"pl.spmd({combine_work}, name_hint='fusebox_mtp_combine')" in source
     assert len(integration.files()) == len(integration.generated_sources) + len(
         integration.patched_native_sources
     )

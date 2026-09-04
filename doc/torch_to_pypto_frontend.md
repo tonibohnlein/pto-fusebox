@@ -483,8 +483,8 @@ first production-shape static ownership unit for each target:
 | PyPTO-lib model | generated static ownership today | native ownership retained |
 | --- | --- | --- |
 | `deepseek_v4_flash_dspark` | Complete fixed-frame BF16 DSpark projection followed by RMSNorm, emitted as one completion-aware callable. | Dynamic token-frame selection and the call site in the drafter orchestration. |
-| `deepseek_v4_flash_mtp` | Complete production INT8 MTP projection input graph; Fusebox extracts both maximal *source-emittable* branch regions. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus the currently unsupported static view/add tail. |
-| `deepseek_v4_pro` | The same model-independent production INT8 projection contract, linked through the Pro entry point's parenthesized import. | Sparse attention, indexer/TopK, MoE routing, dynamic packing, communication, and state. |
+| `deepseek_v4_flash_mtp` | Complete production INT8 MTP projection input graph at hidden size 4,096; Fusebox extracts both maximal *source-emittable* branch regions. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus the currently unsupported static view/add tail. |
+| `deepseek_v4_pro` | The same model-independent INT8 projection algebra at Pro's actual hidden size 7,168. The adapter derives wrapper geometry from the normalized graph rather than reusing Flash constants. | Sparse attention, indexer/TopK, MoE routing, dynamic packing, communication, and state. |
 | `qwen3_14b` | Complete production `16 x 5120` FP32 RMSNorm-to-`152064`-vocabulary LM-head DAG, solved once as one static region. The current source optimum is a vector step followed by a cube step with one solver-selected GM normalization cut. | Dynamic batch/window traversal and placement into the runtime-sized logits output. |
 
 These are real production tensor dimensions but not claims that all four full
@@ -494,6 +494,20 @@ next integration work without moving dynamic or data-dependent orchestration
 into Fusebox. In particular, model names select only native source wiring; no
 model name, attention pattern, MTP pattern, or SwiGLU pattern enters solver
 admission, costing, or emission.
+
+Production integration may choose a concrete static shape family before Torch
+capture—for example the 4,096-wide Flash projection or the 7,168-wide Pro
+projection. After capture, dimensions are ordinary tensor facts. Wrapper
+generation derives its ABI and loop extents from that graph, while the solver
+enumerates the same generic vector, cube, mixed, and GM-cut alternatives for
+both. A model-specific constant must never select a schedule mechanism.
+
+Runtime-valid output windows follow the same separation. For the Qwen output
+head, the generated callable owns the logical prefix `0:valid_rows` inside its
+fixed 16-row frame. Rows outside that prefix are not output values of the
+callable, even if the native reference happens to compute them. Correctness
+and performance comparisons must therefore compare the declared prefix and
+report padded-frame writes separately.
 
 Fusebox is always given the complete normalized static graph. It, rather than
 the caller, chooses maximal source-emittable regions and explicit cuts. A

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import ast
 import keyword
+import math
 from dataclasses import dataclass
 
-from .ir import NormalizedGraph, NormalizedOp
+from .ir import Dimension, NormalizedGraph, NormalizedOp
 from .solver import SolveResult
 from .source import (
     EmittedPyPTOCallable,
@@ -26,8 +27,9 @@ class FlashMtpProjectionOverlay:
     """Generated DeepSeek projection plus a minimally patched native source.
 
     The compatibility name predates the DeepSeek-V4 Pro integration.  The
-    projection ABI and wrapper are shared by Flash-MTP and Pro; the adapter
-    never inspects a model name when it schedules the tensor graph.
+    wrapper mechanism is shared by Flash-MTP and Pro; its concrete dimensions
+    are inferred from the normalized graph, and the adapter never inspects a
+    model name when it realizes the solved tensor graph.
     """
 
     module_name: str
@@ -45,6 +47,18 @@ class QwenOutputHeadOverlay:
     source: str
     decode_source: str
     output_head: EmittedPyPTOCallable
+
+
+@dataclass(frozen=True)
+class _MtpProjectionGeometry:
+    """Static projection frame inferred from the normalized tensor graph."""
+
+    decode_rows: int
+    linear_rows: int
+    history_rows: int
+    hyperconnections: int
+    hidden_size: int
+    combine_cols: int
 
 
 def emit_flash_mtp_decode_projection_overlay(
@@ -98,19 +112,22 @@ def emit_deepseek_mtp_projection_overlay(
         result,
         function_prefix="fusebox_mtp",
     )
+    geometry = _mtp_projection_geometry(graph)
     hidden, history = _projection_callables(graph, bundle.callables)
     _validate_projection_callable(
         graph,
         hidden,
+        geometry=geometry,
         value_name="hidden_padded",
-        rows=16,
+        rows=geometry.linear_rows,
         value_dtype="bfloat16",
     )
     _validate_projection_callable(
         graph,
         history,
+        geometry=geometry,
         value_name="history_flat",
-        rows=32,
+        rows=geometry.history_rows,
         value_dtype="float32",
     )
     _validate_native_projection_ops(
@@ -118,6 +135,7 @@ def emit_deepseek_mtp_projection_overlay(
         bundle.native_op_ids,
         hidden=hidden,
         history=history,
+        geometry=geometry,
     )
 
     hidden_bindings = _projection_bindings(
@@ -154,6 +172,7 @@ def emit_deepseek_mtp_projection_overlay(
                 hidden_bindings,
                 history.function_name,
                 history_bindings,
+                geometry,
             )
         ).body[0],
     ]
@@ -197,7 +216,9 @@ def emit_qwen_output_head_overlay(
     Fusebox receives one production-size static graph and owns every fusion,
     tiling, and cut decision inside it. The wrapper preserves PyPTO-lib's
     dynamic row-window ABI by copying only ``valid_rows`` from the static
-    physical frame into the caller-owned output tensor.
+    physical frame into the caller-owned output tensor. Rows outside that
+    logical prefix are outside the callable's result contract; native
+    orchestration may reuse, ignore, or populate them independently.
     """
 
     if not module_name or any(
@@ -264,6 +285,80 @@ def emit_qwen_output_head_overlay(
     )
 
 
+def _mtp_projection_geometry(graph: NormalizedGraph) -> _MtpProjectionGeometry:
+    """Infer wrapper geometry without consulting a model name or recognizer."""
+
+    values = graph.value_map()
+    inputs_by_name = {
+        values[value_id].name: values[value_id] for value_id in graph.inputs
+    }
+    try:
+        hidden = inputs_by_name["hidden_padded"]
+        history = inputs_by_name["history_flat"]
+    except KeyError as error:
+        raise SourceEmissionError(
+            f"production projection is missing physical input {error.args[0]!r}"
+        ) from error
+    if len(hidden.shape) != 2 or len(history.shape) != 2:
+        raise SourceEmissionError(
+            "production projection physical inputs must be rank-two frames"
+        )
+    if len(graph.outputs) != 1:
+        raise SourceEmissionError("production projection requires one grouped output")
+    output = values[graph.outputs[0]]
+    if len(output.shape) != 3 or output.dtype != "float32":
+        raise SourceEmissionError(
+            "production projection output must be a rank-three FP32 frame"
+        )
+    decode_rows, hyperconnections, hidden_size = _positive_static_shape(
+        output.shape, "production projection output"
+    )
+    linear_rows, hidden_width = _positive_static_shape(
+        hidden.shape, "production projection hidden input"
+    )
+    history_rows, history_width = _positive_static_shape(
+        history.shape, "production projection history input"
+    )
+    if (
+        min(decode_rows, hyperconnections, hidden_size) <= 0
+        or hidden_width != hidden_size
+        or history_width != hidden_size
+        or history_rows != decode_rows * hyperconnections
+        or linear_rows < decode_rows
+    ):
+        raise SourceEmissionError(
+            "production projection physical frames disagree with its grouped output"
+        )
+    combine_cols = math.gcd(hidden_size, 1024)
+    if combine_cols < 32:
+        raise SourceEmissionError(
+            "production projection hidden extent has no aligned combine tile"
+        )
+    return _MtpProjectionGeometry(
+        decode_rows=decode_rows,
+        linear_rows=linear_rows,
+        history_rows=history_rows,
+        hyperconnections=hyperconnections,
+        hidden_size=hidden_size,
+        combine_cols=combine_cols,
+    )
+
+
+def _positive_static_shape(shape: tuple[Dimension, ...], field: str) -> tuple[int, ...]:
+    """Return a positive physical shape or reject symbolic wrapper geometry."""
+
+    result: list[int] = []
+    for dimension in shape:
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+        ):
+            raise SourceEmissionError(f"{field} must have positive static dimensions")
+        result.append(dimension)
+    return tuple(result)
+
+
 def _projection_callables(
     graph: NormalizedGraph,
     callables: tuple[EmittedPyPTOCallable, ...],
@@ -299,6 +394,7 @@ def _validate_projection_callable(
     graph: NormalizedGraph,
     emitted: EmittedPyPTOCallable,
     *,
+    geometry: _MtpProjectionGeometry,
     value_name: str,
     rows: int,
     value_dtype: str,
@@ -307,12 +403,13 @@ def _validate_projection_callable(
     input_values = [values[value_id] for value_id in emitted.input_value_ids]
     prefix = "e" if value_name == "hidden_padded" else "h"
     norm_name = "enorm_weight" if prefix == "e" else "hnorm_weight"
+    hidden = geometry.hidden_size
     expected_inputs = {
-        value_name: ((rows, 4096), value_dtype),
-        norm_name: ((1, 4096), "float32"),
-        f"{prefix}_smooth": ((1, 4096), "float32"),
-        f"{prefix}_projection_weight": ((4096, 4096), "int8"),
-        f"{prefix}_projection_scale": ((1, 4096), "float32"),
+        value_name: ((rows, hidden), value_dtype),
+        norm_name: ((1, hidden), "float32"),
+        f"{prefix}_smooth": ((1, hidden), "float32"),
+        f"{prefix}_projection_weight": ((hidden, hidden), "int8"),
+        f"{prefix}_projection_scale": ((1, hidden), "float32"),
     }
     if len(input_values) != 5 or len({value.name for value in input_values}) != 5:
         raise SourceEmissionError(
@@ -333,7 +430,7 @@ def _validate_projection_callable(
             f"production projection region requires input {value_name!r}"
         )
     value = value_inputs[0]
-    if tuple(value.shape) != (rows, 4096) or value.dtype != value_dtype:
+    if tuple(value.shape) != (rows, hidden) or value.dtype != value_dtype:
         raise SourceEmissionError(
             f"production projection input {value_name!r} is stale: "
             f"shape={value.shape!r}, dtype={value.dtype!r}"
@@ -342,7 +439,7 @@ def _validate_projection_callable(
         raise SourceEmissionError("production projection region requires one output")
     output = values[emitted.output_value_ids[0]]
     output_shape = tuple(output.shape)
-    if output_shape != (rows, 4096):
+    if output_shape != (rows, hidden):
         raise SourceEmissionError(
             f"production projection output shape is stale: {output_shape!r}"
         )
@@ -356,6 +453,7 @@ def _validate_native_projection_ops(
     *,
     hidden: EmittedPyPTOCallable,
     history: EmittedPyPTOCallable,
+    geometry: _MtpProjectionGeometry,
 ) -> None:
     """Prove that the hand-written native tail matches the normalized DAG."""
 
@@ -393,16 +491,26 @@ def _validate_native_projection_ops(
     if hidden_slice.attributes.get("literal_args") != [
         {"position": 1, "value": 0},
         {"position": 2, "value": 0},
-        {"position": 3, "value": 8},
+        {"position": 3, "value": geometry.decode_rows},
     ]:
         raise SourceEmissionError(
-            "production projection hidden slice must select rows [0:8] on axis 0"
+            "production projection hidden slice must select rows "
+            f"[0:{geometry.decode_rows}] on axis 0"
         )
     if history_reshape.attributes.get("literal_args") != [
-        {"position": 1, "value": [8, 4, 4096]},
+        {
+            "position": 1,
+            "value": [
+                geometry.decode_rows,
+                geometry.hyperconnections,
+                geometry.hidden_size,
+            ],
+        },
     ]:
         raise SourceEmissionError(
-            "production projection history reshape must produce [8, 4, 4096]"
+            "production projection history reshape must produce "
+            f"[{geometry.decode_rows}, {geometry.hyperconnections}, "
+            f"{geometry.hidden_size}]"
         )
     slice_output = _single_op_output(hidden_slice, "hidden slice")
     view_output = _single_op_output(hidden_view, "hidden singleton view")
@@ -416,10 +524,24 @@ def _validate_native_projection_ops(
             "production projection native tail value lineage is stale"
         )
     expected_values = {
-        slice_output: ((8, 4096), "float32"),
-        view_output: ((8, 1, 4096), "float32"),
-        reshape_output: ((8, 4, 4096), "float32"),
-        add_output: ((8, 4, 4096), "float32"),
+        slice_output: ((geometry.decode_rows, geometry.hidden_size), "float32"),
+        view_output: ((geometry.decode_rows, 1, geometry.hidden_size), "float32"),
+        reshape_output: (
+            (
+                geometry.decode_rows,
+                geometry.hyperconnections,
+                geometry.hidden_size,
+            ),
+            "float32",
+        ),
+        add_output: (
+            (
+                geometry.decode_rows,
+                geometry.hyperconnections,
+                geometry.hidden_size,
+            ),
+            "float32",
+        ),
     }
     actual_values = {
         value_id: (tuple(values[value_id].shape), values[value_id].dtype)
@@ -543,56 +665,71 @@ def _flash_mtp_wrapper_source(
     hidden_arguments: tuple[str, ...],
     history_name: str,
     history_arguments: tuple[str, ...],
+    geometry: _MtpProjectionGeometry,
 ) -> str:
     hidden_call = ", ".join(hidden_arguments)
     history_call = ", ".join(history_arguments)
+    decode_rows = geometry.decode_rows
+    linear_rows = geometry.linear_rows
+    history_rows = geometry.history_rows
+    hyperconnections = geometry.hyperconnections
+    hidden = geometry.hidden_size
+    combine_cols = geometry.combine_cols
+    combine_chunks = hidden // combine_cols
+    output_cols = hyperconnections * hidden
+    combine_work = history_rows * combine_chunks
+    padding_rows = linear_rows - decode_rows
+    zero_fill = ""
+    if padding_rows:
+        zero_fill = f"""    for hidden_zero_row in pl.spmd({padding_rows}, name_hint="fusebox_mtp_hidden_zero"):
+        hidden_zero_tile = pl.full([1, {hidden}], dtype=pl.BF16, value=0.0)
+        hidden_padded[hidden_zero_row + {decode_rows}:hidden_zero_row + {decode_rows + 1}, 0:{hidden}] = hidden_zero_tile
+"""
     return f"""@pl.inline
 def mtp_projection(
-    hidden_states: pl.Tensor[[8, 4096], pl.BF16],
-    prev_hidden_states: pl.Tensor[[8, 4, 4096], pl.FP32],
-    enorm_w: pl.Tensor[[4096], pl.FP32],
-    hnorm_w: pl.Tensor[[4096], pl.FP32],
-    e_proj_w: pl.Tensor[[4096, 4096], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[4096], pl.FP32],
-    e_proj_smooth: pl.Tensor[[4096], pl.FP32],
-    h_proj_w: pl.Tensor[[4096, 4096], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[4096], pl.FP32],
-    h_proj_smooth: pl.Tensor[[4096], pl.FP32],
-    hidden_states_out: pl.Tensor[[8, 4, 4096], pl.FP32],
+    hidden_states: pl.Tensor[[{decode_rows}, {hidden}], pl.BF16],
+    prev_hidden_states: pl.Tensor[[{decode_rows}, {hyperconnections}, {hidden}], pl.FP32],
+    enorm_w: pl.Tensor[[{hidden}], pl.FP32],
+    hnorm_w: pl.Tensor[[{hidden}], pl.FP32],
+    e_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8],
+    e_proj_w_scale: pl.Tensor[[{hidden}], pl.FP32],
+    e_proj_smooth: pl.Tensor[[{hidden}], pl.FP32],
+    h_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8],
+    h_proj_w_scale: pl.Tensor[[{hidden}], pl.FP32],
+    h_proj_smooth: pl.Tensor[[{hidden}], pl.FP32],
+    hidden_states_out: pl.Tensor[[{decode_rows}, {hyperconnections}, {hidden}], pl.FP32],
 ):
-    hidden_padded = pl.create_tensor([16, 4096], dtype=pl.BF16)
-    for hidden_row in pl.spmd(8, name_hint="fusebox_mtp_hidden_copy"):
-        hidden_copy_tile = hidden_states[hidden_row:hidden_row + 1, 0:4096]
-        hidden_padded[hidden_row:hidden_row + 1, 0:4096] = hidden_copy_tile
-    for hidden_zero_row in pl.spmd(8, name_hint="fusebox_mtp_hidden_zero"):
-        hidden_zero_tile = pl.full([1, 4096], dtype=pl.BF16, value=0.0)
-        hidden_padded[hidden_zero_row + 8:hidden_zero_row + 9, 0:4096] = hidden_zero_tile
+    hidden_padded = pl.create_tensor([{linear_rows}, {hidden}], dtype=pl.BF16)
+    for hidden_row in pl.spmd({decode_rows}, name_hint="fusebox_mtp_hidden_copy"):
+        hidden_copy_tile = hidden_states[hidden_row:hidden_row + 1, 0:{hidden}]
+        hidden_padded[hidden_row:hidden_row + 1, 0:{hidden}] = hidden_copy_tile
+{zero_fill}
 
-    history_flat = pl.reshape(prev_hidden_states, [32, 4096])
-    enorm_2d = pl.reshape(enorm_w, [1, 4096])
-    hnorm_2d = pl.reshape(hnorm_w, [1, 4096])
-    e_smooth_2d = pl.reshape(e_proj_smooth, [1, 4096])
-    h_smooth_2d = pl.reshape(h_proj_smooth, [1, 4096])
-    e_scale_2d = pl.reshape(e_proj_w_scale, [1, 4096])
-    h_scale_2d = pl.reshape(h_proj_w_scale, [1, 4096])
-    hidden_projected = pl.create_tensor([16, 4096], dtype=pl.FP32)
-    history_projected = pl.create_tensor([32, 4096], dtype=pl.FP32)
+    history_flat = pl.reshape(prev_hidden_states, [{history_rows}, {hidden}])
+    enorm_2d = pl.reshape(enorm_w, [1, {hidden}])
+    hnorm_2d = pl.reshape(hnorm_w, [1, {hidden}])
+    e_smooth_2d = pl.reshape(e_proj_smooth, [1, {hidden}])
+    h_smooth_2d = pl.reshape(h_proj_smooth, [1, {hidden}])
+    e_scale_2d = pl.reshape(e_proj_w_scale, [1, {hidden}])
+    h_scale_2d = pl.reshape(h_proj_w_scale, [1, {hidden}])
+    hidden_projected = pl.create_tensor([{linear_rows}, {hidden}], dtype=pl.FP32)
+    history_projected = pl.create_tensor([{history_rows}, {hidden}], dtype=pl.FP32)
     hidden_projected = {hidden_name}({hidden_call})
     history_projected = {history_name}({history_call})
 
-    output_flat = pl.reshape(hidden_states_out, [8, 16384])
-    for combine_index in pl.spmd(128, name_hint="fusebox_mtp_combine"):
-        history_row = combine_index // 4
-        output_chunk = combine_index - history_row * 4
-        token = history_row // 4
-        hyperconnection = history_row - token * 4
-        col = output_chunk * 1024
-        hidden_projection_tile = hidden_projected[token:token + 1, col:col + 1024]
-        history_tile = history_projected[history_row:history_row + 1, col:col + 1024]
+    output_flat = pl.reshape(hidden_states_out, [{decode_rows}, {output_cols}])
+    for combine_index in pl.spmd({combine_work}, name_hint="fusebox_mtp_combine"):
+        history_row = combine_index // {combine_chunks}
+        output_chunk = combine_index - history_row * {combine_chunks}
+        token = history_row // {hyperconnections}
+        hyperconnection = history_row - token * {hyperconnections}
+        col = output_chunk * {combine_cols}
+        hidden_projection_tile = hidden_projected[token:token + 1, col:col + {combine_cols}]
+        history_tile = history_projected[history_row:history_row + 1, col:col + {combine_cols}]
         combined = pl.add(hidden_projection_tile, history_tile)
-        output_col = hyperconnection * 4096 + col
-        output_flat[token:token + 1, output_col:output_col + 1024] = combined
-    return pl.reshape(output_flat, [8, 4, 4096])
+        output_col = hyperconnection * {hidden} + col
+        output_flat[token:token + 1, output_col:output_col + {combine_cols}] = combined
+    return pl.reshape(output_flat, [{decode_rows}, {hyperconnections}, {hidden}])
 """
 
 

@@ -1187,10 +1187,10 @@ struct MixedScheduleTopology {
 struct MixedFifoPlan {
   size_t tensor = std::numeric_limits<size_t>::max();
   MixedTransferDirection direction = MixedTransferDirection::CubeToVector;
-  // Physical dtype carried by the cross-core ring. A chunked floating-point
-  // matmul keeps its partial result in the hardware accumulator dtype until
-  // the AIV consumer performs the logical storage conversion, so this may be
-  // wider than the normalized tensor dtype.
+  // Physical dtype carried by the cross-core ring. A cube matmul produces its
+  // hardware accumulator dtype; the receiving vector stage performs any
+  // logical storage conversion. This may therefore be wider than the
+  // normalized tensor dtype even for a single K window.
   DType wire_dtype = DType::FP32;
   // Bind a spatial-region FIFO frame to the unified output grid without
   // inferring axis identity from equal numeric extents. Protocol-local loops
@@ -1269,9 +1269,9 @@ struct MixedSchedulePlan {
   int64_t group_capacity = 0;
   MixedCrossCoreProtocol protocol = MixedCrossCoreProtocol::Unsupported;
   MixedAlgorithmKind algorithm = MixedAlgorithmKind::Generic;
-  // Stage-local facts consumed by the first compiler emitter.  These are
-  // populated only when reconstructing a winning/forced plan, not retained
-  // in the hot CostResult cache.
+  // Compatibility summary of the authoritative stage-local K windows below.
+  // It is the shared positive window when every cube operation uses one value,
+  // otherwise zero.  Emitters must consume MixedStagePlan::cube_window_k.
   int64_t cube_window_k = 0;
   // Peak cube-side L1 operand/resident footprint before V2C consumer rings.
   // Source readiness combines this with every V2C FIFO reservation.

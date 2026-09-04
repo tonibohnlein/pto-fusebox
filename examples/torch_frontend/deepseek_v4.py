@@ -7,6 +7,8 @@ row-quantized INT8 projection branch are retained as distinct examples.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
@@ -18,6 +20,31 @@ DEEPSEEK_V4_DECODE_TOKENS = 8
 DEEPSEEK_V4_LINEAR_TOKENS = 16
 DEEPSEEK_V4_PREFILL_TOKENS = 128
 DEEPSEEK_V4_DSPARK_TARGET_LAYERS = 3
+
+
+@dataclass(frozen=True)
+class DeepSeekV4MtpGeometry:
+    """Static physical frame supplied by native MTP orchestration."""
+
+    hidden_size: int
+    hyperconnections: int = DEEPSEEK_V4_HC_MULT
+    decode_tokens: int = DEEPSEEK_V4_DECODE_TOKENS
+    linear_tokens: int = DEEPSEEK_V4_LINEAR_TOKENS
+    prefill_tokens: int = DEEPSEEK_V4_PREFILL_TOKENS
+
+    def __post_init__(self) -> None:
+        if (
+            self.hidden_size <= 0
+            or self.hyperconnections <= 0
+            or self.decode_tokens <= 0
+            or self.linear_tokens < self.decode_tokens
+            or self.prefill_tokens <= 0
+        ):
+            raise ValueError("DeepSeek MTP geometry has invalid positive extents")
+
+
+DEEPSEEK_V4_FLASH_MTP_GEOMETRY = DeepSeekV4MtpGeometry(hidden_size=DEEPSEEK_V4_HIDDEN)
+DEEPSEEK_V4_PRO_MTP_GEOMETRY = DeepSeekV4MtpGeometry(hidden_size=7168)
 
 
 class DeepSeekV4RmsNorm(nn.Module):
@@ -146,9 +173,18 @@ class DeepSeekV4Int8MtpProjection(nn.Module):
     caller, decides where the currently supported source regions are cut.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        decode_tokens: int = DEEPSEEK_V4_DECODE_TOKENS,
+        hyperconnections: int = DEEPSEEK_V4_HC_MULT,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.decode_tokens = decode_tokens
+        self.hyperconnections = hyperconnections
         self.branch = DeepSeekV4Int8ProjectionBranch(hidden_size, eps)
 
     def forward(
@@ -178,26 +214,28 @@ class DeepSeekV4Int8MtpProjection(nn.Module):
             h_projection_weight,
             h_projection_scale,
         )
-        hidden_logical = hidden_projected[:DEEPSEEK_V4_DECODE_TOKENS].unsqueeze(1)
+        hidden_logical = hidden_projected[: self.decode_tokens].unsqueeze(1)
         history_logical = history_projected.reshape(
-            DEEPSEEK_V4_DECODE_TOKENS,
-            DEEPSEEK_V4_HC_MULT,
+            self.decode_tokens,
+            self.hyperconnections,
             self.hidden_size,
         )
         return hidden_logical + history_logical
 
 
-def build_production_mtp_projection_branch() -> Example:
-    """Return one production Flash-MTP branch at its physical linear frame.
+def build_production_mtp_projection_branch(
+    geometry: DeepSeekV4MtpGeometry = DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+) -> Example:
+    """Return one production MTP branch at its configured physical frame.
 
-    Native decode orchestration has eight logical tokens, but deliberately
-    rounds the INT8 matmul frame up to sixteen rows. Fusebox plans that static
-    physical compilation unit; orchestration owns the logical eight-row
-    prefix and padded-frame construction.
+    Native decode orchestration supplies a logical token extent inside a
+    possibly larger INT8 matmul frame. Fusebox plans that static physical
+    compilation unit; orchestration owns the logical prefix and padded-frame
+    construction.
     """
 
-    tokens = DEEPSEEK_V4_LINEAR_TOKENS
-    hidden = DEEPSEEK_V4_HIDDEN
+    tokens = geometry.linear_tokens
+    hidden = geometry.hidden_size
     return (
         DeepSeekV4Int8ProjectionBranch(hidden),
         (
@@ -210,11 +248,13 @@ def build_production_mtp_projection_branch() -> Example:
     )
 
 
-def build_production_mtp_history_projection_branch() -> Example:
-    """Return the 8-token × 4-hyperconnection production history branch."""
+def build_production_mtp_history_projection_branch(
+    geometry: DeepSeekV4MtpGeometry = DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+) -> Example:
+    """Return the configured token × hyperconnection history branch."""
 
-    rows = DEEPSEEK_V4_DECODE_TOKENS * DEEPSEEK_V4_HC_MULT
-    hidden = DEEPSEEK_V4_HIDDEN
+    rows = geometry.decode_tokens * geometry.hyperconnections
+    hidden = geometry.hidden_size
     return (
         DeepSeekV4Int8ProjectionBranch(hidden),
         (
@@ -227,16 +267,18 @@ def build_production_mtp_history_projection_branch() -> Example:
     )
 
 
-def build_production_mtp_prefill_projection_branch() -> Example:
-    """Return one 128-token production prefill branch.
+def build_production_mtp_prefill_projection_branch(
+    geometry: DeepSeekV4MtpGeometry = DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+) -> Example:
+    """Return one configured production prefill frame.
 
     Prefill orchestration repeats this fixed physical frame and owns any final
     logical tail.  It deliberately reuses the same ordinary branch algebra as
     decode; the model name and execution phase never enter the solver.
     """
 
-    rows = DEEPSEEK_V4_PREFILL_TOKENS
-    hidden = DEEPSEEK_V4_HIDDEN
+    rows = geometry.prefill_tokens
+    hidden = geometry.hidden_size
     return (
         DeepSeekV4Int8ProjectionBranch(hidden),
         (
@@ -249,7 +291,9 @@ def build_production_mtp_prefill_projection_branch() -> Example:
     )
 
 
-def build_production_mtp_decode_projection() -> Example:
+def build_production_mtp_decode_projection(
+    geometry: DeepSeekV4MtpGeometry = DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+) -> Example:
     """Return the complete production decode projection as one Torch graph.
 
     Native orchestration owns construction of the physical hidden frame and
@@ -257,13 +301,17 @@ def build_production_mtp_decode_projection() -> Example:
     projection branches before Fusebox receives their shared output DAG.
     """
 
-    hidden = DEEPSEEK_V4_HIDDEN
-    history_rows = DEEPSEEK_V4_DECODE_TOKENS * DEEPSEEK_V4_HC_MULT
+    hidden = geometry.hidden_size
+    history_rows = geometry.decode_tokens * geometry.hyperconnections
     return (
-        DeepSeekV4Int8MtpProjection(hidden),
+        DeepSeekV4Int8MtpProjection(
+            hidden,
+            decode_tokens=geometry.decode_tokens,
+            hyperconnections=geometry.hyperconnections,
+        ),
         (
             torch.empty(
-                DEEPSEEK_V4_LINEAR_TOKENS,
+                geometry.linear_tokens,
                 hidden,
                 dtype=torch.bfloat16,
                 device="meta",

@@ -26,6 +26,9 @@ from pto_fusebox import (
 
 from ._runner import Example
 from .deepseek_v4 import (
+    DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+    DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+    DeepSeekV4MtpGeometry,
     build_production_dspark_projection,
     build_production_mtp_decode_projection,
 )
@@ -135,8 +138,19 @@ def _emit_mtp(
     *,
     solver_workers: int,
 ) -> ProductionModelIntegration:
+    geometry_by_model: dict[str, DeepSeekV4MtpGeometry] = {
+        "deepseek_v4_flash_mtp": DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
+        "deepseek_v4_pro": DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+    }
+    try:
+        geometry = geometry_by_model[model_name]
+    except KeyError as error:
+        raise SourceEmissionError(
+            f"DeepSeek MTP integration has no static geometry for {model_name!r}"
+        ) from error
     graph, solved = _solve_complete_projection(
         solver_binary,
+        geometry=geometry,
         solver_workers=solver_workers,
     )
     module_name = f"fusebox_{model_name}_mtp_projection"
@@ -191,11 +205,12 @@ def _emit_qwen(
 def _solve_complete_projection(
     solver_binary: str | Path,
     *,
+    geometry: DeepSeekV4MtpGeometry,
     solver_workers: int,
 ) -> tuple[NormalizedGraph, SolveResult]:
     """Solve the full INT8 projection graph, retaining native shape boundaries."""
 
-    module, args = build_production_mtp_decode_projection()
+    module, args = build_production_mtp_decode_projection(geometry)
     graph = export_and_normalize(module.eval(), args)
     solved = solve_graph(
         graph,

@@ -1785,12 +1785,13 @@ def test_int32_accumulator_crosses_from_cube_to_vector_generically() -> None:
     assert "pl.tensor.row_expand_mul(" in source
 
 
-def test_chunked_bf16_matmul_crosses_as_fp32_accumulator() -> None:
+@pytest.mark.parametrize("contraction", (4096, 12288))
+def test_bf16_matmul_crosses_as_fp32_accumulator(contraction: int) -> None:
     graph, result = _solve_module(
         _ChunkedBF16C2V(),
         (
-            torch.zeros(16, 12288, dtype=torch.bfloat16),
-            torch.zeros(12288, 128, dtype=torch.bfloat16),
+            torch.zeros(16, contraction, dtype=torch.bfloat16),
+            torch.zeros(contraction, 128, dtype=torch.bfloat16),
             torch.zeros(1, 128),
         ),
     )
@@ -1800,7 +1801,7 @@ def test_chunked_bf16_matmul_crosses_as_fp32_accumulator() -> None:
     assert isinstance(step.plan, MixedKernelPlan)
     cube_stage = step.plan.stages[0]
     assert cube_stage.engine is MixedEngine.CUBE
-    assert 0 < cube_stage.cube_window_k[0] < 12288
+    assert 0 < cube_stage.cube_window_k[0] <= contraction
     fifo = step.plan.fifos[0]
     assert fifo.direction is MixedTransferDirection.CUBE_TO_VECTOR
     assert fifo.wire_dtype == "fp32"
@@ -1810,9 +1811,35 @@ def test_chunked_bf16_matmul_crosses_as_fp32_accumulator() -> None:
     ast.parse(source)
     _assert_pypto_main_mixed_scope(source, step.plan)
     assert "out_dtype=pl.FP32" in source
-    assert "pl.tensor.matmul_acc(" in source
+    assert ("pl.tensor.matmul_acc(" in source) is (
+        cube_stage.cube_window_k[0] < contraction
+    )
     assert "target_type=pl.BF16, mode='rint'" in source
     assert 'target_type=pl.FP32, mode="none"' in source
+
+
+def test_mixed_cube_window_summary_must_match_authoritative_stage_windows() -> None:
+    graph, result = _solve_module(
+        _ChunkedBF16C2V(),
+        (
+            torch.zeros(16, 12288, dtype=torch.bfloat16),
+            torch.zeros(12288, 128, dtype=torch.bfloat16),
+            torch.zeros(1, 128),
+        ),
+    )
+    assert result.solution is not None
+    plan = result.solution["steps"][0]["plan"]
+    assert plan["cube_window_k"] == plan["stages"][0]["cube_window_k"][0]
+
+    stale_solution = copy.deepcopy(result.solution)
+    stale_plan = stale_solution["steps"][0]["plan"]
+    stale_plan["cube_window_k"] += 1
+    stale = replace(result, solution=stale_solution)
+    with pytest.raises(
+        ScheduleContractError,
+        match="cube_window_k differs from its authoritative stage windows",
+    ):
+        scheduled_region(stale)
 
 
 def test_one_way_c2v_can_stream_successor_items_on_fewer_mixed_groups() -> None:

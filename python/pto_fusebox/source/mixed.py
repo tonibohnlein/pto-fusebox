@@ -1514,7 +1514,6 @@ def _emit_matmul_tile(  # noqa: PLR0913
     accumulator_dtype = pypto_dtype(
         "fp32" if operand_dtype in {"fp32", "fp16", "bf16"} else "int32"
     )
-    chunked_accumulation = k_window < contraction
 
     first_extent = min(k_window, contraction)
     lhs = _emit_matrix_operand(
@@ -1549,13 +1548,12 @@ def _emit_matmul_tile(  # noqa: PLR0913
         indent,
         f"{prefix}_acc_first = pl.tensor.matmul({lhs}, {rhs}, "
         f"a_trans={lhs_transposed}, b_trans={rhs_transposed}, "
-        f"c_matrix_nz=False, out_dtype="
-        f"{accumulator_dtype if chunked_accumulation else output_dtype})",
+        f"c_matrix_nz=False, out_dtype={accumulator_dtype})",
     )
-    if k_window >= contraction:
-        return f"{prefix}_acc_first"
-    full_chunks, tail = divmod(contraction, k_window)
     accumulator = f"{prefix}_acc_first"
+    full_chunks, tail = (
+        (1, 0) if k_window >= contraction else divmod(contraction, k_window)
+    )
     if full_chunks > 1:
         loop = "pl.pipeline" if full_chunks >= 3 else "pl.range"
         stage = ", stage=2" if loop == "pl.pipeline" else ""
@@ -1635,7 +1633,7 @@ def _emit_matmul_tile(  # noqa: PLR0913
             f"a_trans={lhs_transposed}, b_trans={rhs_transposed})",
         )
         accumulator = f"{prefix}_acc_tail"
-    if chunked_accumulation and accumulator_dtype != output_dtype:
+    if accumulator_dtype != output_dtype:
         stored = f"{prefix}_stored"
         writer.line(
             indent,
