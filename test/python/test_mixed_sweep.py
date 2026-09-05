@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,8 +17,11 @@ from examples.torch_frontend.static_mixed import (
     build_examples as build_static_mixed_examples,
 )
 from pto_fusebox import (
+    MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA,
     MixedGroupCandidate,
     MixedGroupSweep,
+    MixedGroupTile,
+    MixedGroupSweepUnavailable,
     NormalizedGraph,
     RegionSolveResult,
     can_emit_region,
@@ -24,6 +29,7 @@ from pto_fusebox import (
     enumerate_mixed_group_plans,
     export_and_normalize,
     region_for_mixed_group_candidate,
+    mixed_group_sweep_availability,
     scheduled_region,
     solve_graph,
 )
@@ -51,6 +57,34 @@ class V2COnlyRhs(nn.Module):
 class StreamingSoftmaxPv(nn.Module):
     def forward(self, scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         return torch.mm(torch.softmax(scores, dim=-1), value)
+
+
+class GenericFeatureBlend(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        sink_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(value, first_weight, out_dtype=torch.float32)
+        second = torch.mm(value, second_weight, out_dtype=torch.float32)
+        blended = (first + second).to(torch.bfloat16)
+        return torch.mm(blended, sink_weight, out_dtype=torch.float32)
+
+
+class GenericFeatureBlendLinearSink(nn.Module):
+    def forward(
+        self,
+        value: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        sink_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        blended = torch.mm(value, first_weight, out_dtype=torch.float32) + torch.mm(
+            value, second_weight, out_dtype=torch.float32
+        )
+        return torch.nn.functional.linear(blended, sink_weight)
 
 
 def _solver() -> Path:
@@ -295,6 +329,199 @@ def test_feature_round_trip_prices_physical_fp32_c2v_messages() -> None:
     )
     assert sweep.selected.breakdown.gm_ub_bytes == crossing_bytes
     assert sweep.selected.breakdown.l0c_gm_bytes == crossing_bytes + output_bytes
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("swiglu", "blend", "linear_sink"),
+)
+@pytest.mark.parametrize(
+    "shape",
+    ((64, 96, 192), (128, 128, 256), (256, 160, 320)),
+)
+def test_feature_round_trip_is_selected_as_one_maximal_static_region(
+    shape: tuple[int, int, int],
+    variant: str,
+) -> None:
+    rows, hidden_size, intermediate_size = shape
+    if variant == "swiglu":
+        module: nn.Module = StaticDenseSwiGlu(
+            hidden_size=hidden_size, intermediate_size=intermediate_size
+        ).eval()
+        args = (torch.zeros(rows, hidden_size, dtype=torch.bfloat16),)
+    elif variant == "blend":
+        module = GenericFeatureBlend()
+        args = (
+            torch.zeros(rows, hidden_size, dtype=torch.bfloat16),
+            torch.zeros(hidden_size, intermediate_size, dtype=torch.bfloat16),
+            torch.zeros(hidden_size, intermediate_size, dtype=torch.bfloat16),
+            torch.zeros(intermediate_size, hidden_size, dtype=torch.bfloat16),
+        )
+    else:
+        module = GenericFeatureBlendLinearSink()
+        args = (
+            torch.zeros(rows, hidden_size, dtype=torch.bfloat16),
+            torch.zeros(hidden_size, intermediate_size, dtype=torch.bfloat16),
+            torch.zeros(hidden_size, intermediate_size, dtype=torch.bfloat16),
+            torch.zeros(hidden_size, intermediate_size),
+        )
+    graph = export_and_normalize(
+        module,
+        args,
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+
+    assert solved.regions_solved == len(solved.regions) == 1
+    region = solved.regions[0]
+    assert region.region.op_ids == tuple(op.id for op in graph.ops)
+    assert region.solution is not None
+    assert [step["kind"] for step in region.solution["steps"]] == ["mixed"]
+    assert [step["ops"] for step in region.solution["steps"]] == [
+        list(range(len(region.solver_op_to_graph)))
+    ]
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    assert mixed_group_sweep_availability(region).available
+    assert (
+        enumerate_mixed_group_plans(
+            region, sweep_binary=_sweep_binary()
+        ).selected.groups
+        == plan.active_groups
+    )
+
+
+@pytest.mark.parametrize(
+    ("shapes", "required_vec_bytes", "required_l1_bytes", "closest_tile"),
+    (
+        (
+            ((160, 64), (128, 64), (128, 64)),
+            245_920,
+            212_992,
+            MixedGroupTile(80, 16, 128, 2, 4),
+        ),
+        (
+            ((320, 128), (256, 128), (256, 128)),
+            491_680,
+            442_368,
+            MixedGroupTile(80, 32, 256, 4, 4),
+        ),
+    ),
+)
+def test_cvc_sweep_reports_when_source_solver_selects_a_gm_cut(
+    shapes: tuple[tuple[int, ...], ...],
+    required_vec_bytes: int,
+    required_l1_bytes: int,
+    closest_tile: MixedGroupTile,
+) -> None:
+    graph = export_and_normalize(
+        StaticAttentionCore(), tuple(torch.zeros(shape) for shape in shapes)
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == len(solved.regions) == 1
+    region = solved.regions[0]
+
+    availability = mixed_group_sweep_availability(region)
+    assert not availability.available
+    assert availability.code == "selected_solution_is_not_one_mixed_region"
+    assert availability.selected_step_kinds == ("cube", "mixed")
+    assert availability.selected_partition == ((0,), tuple(range(1, 7)))
+
+    probed = mixed_group_sweep_availability(region, sweep_binary=_sweep_binary())
+    assert not probed.available
+    assert probed.code == "mixed_vector_capacity_exceeded"
+    assert probed.closest_tile == closest_tile
+    assert probed.required_vec_bytes == required_vec_bytes
+    assert probed.available_vec_bytes == 188_416
+    assert probed.required_l1_bytes == required_l1_bytes
+    assert probed.available_l1_bytes == 524_288
+    with pytest.raises(
+        MixedGroupSweepUnavailable,
+        match="mixed_vector_capacity_exceeded",
+    ):
+        enumerate_mixed_group_plans(region)
+
+
+def test_non_capacity_sweep_rejection_has_no_fabricated_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A structural rejection carries no zero-sized capacity evidence."""
+
+    graph = export_and_normalize(
+        StaticAttentionCore(),
+        (
+            torch.zeros(160, 64),
+            torch.zeros(128, 64),
+            torch.zeros(128, 64),
+        ),
+    )
+    region = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    ).regions[0]
+
+    def unavailable_process(args, **kwargs):
+        Path(args[2]).write_text(
+            json.dumps(
+                {
+                    "schema_version": MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA,
+                    "available": False,
+                    "code": "whole_region_has_no_feasible_mixed_candidate",
+                    "reason": "the complete op set has no feasible mixed candidate",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", unavailable_process)
+    availability = mixed_group_sweep_availability(region, sweep_binary=_sweep_binary())
+
+    assert not availability.available
+    assert availability.code == "whole_region_has_no_feasible_mixed_candidate"
+    assert availability.closest_tile is None
+    assert availability.required_vec_bytes is None
+    assert availability.available_vec_bytes is None
+    assert availability.required_l1_bytes is None
+    assert availability.available_l1_bytes is None
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    (
+        ((192, 64), (160, 64), (160, 96)),
+        ((384, 96), (160, 96), (160, 128)),
+        ((512, 80), (160, 80), (160, 192)),
+        ((256, 96), (256, 96), (256, 160)),
+        ((384, 128), (128, 128), (128, 96)),
+        ((768, 80), (256, 80), (256, 128)),
+        ((384, 80), (224, 80), (224, 192)),
+    ),
+)
+def test_cvc_realization_corpus_has_rankable_group_candidates(
+    shapes: tuple[tuple[int, ...], ...],
+) -> None:
+    _, _, plan, sweep = _solve_and_sweep(StaticAttentionCore(), shapes)
+
+    assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert len(sweep.candidates) >= 3
+    assert all(
+        candidate.groups * candidate.trips_per_group == plan.spatial_tiles
+        for candidate in sweep.candidates
+    )
 
 
 @pytest.mark.parametrize(

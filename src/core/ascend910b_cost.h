@@ -282,6 +282,11 @@ public:
       const FlatSet<size_t> &retained_from_prev = {},
       const FlatSet<size_t> &retain_these = {}) const;
 
+  // Explain why the complete op set cannot form a rankable mixed sweep.  This
+  // walks the same grid as best_cost() and reports the closest capacity-tested
+  // candidate.  It is diagnostic-only and is never called by local search.
+  MixedSweepFeasibility diagnose_mixed_sweep_feasibility() const;
+
   /// Resolution used only when comparing mixed active-group candidates.
   /// Raw modeled cycles remain unquantized in CostResult and sweep reports.
   static constexpr double kMixedGroupSelectionResolutionCycles = 16.0;
@@ -378,7 +383,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // kernels — each tiling for its own single pool — both fit.
   bool mixed_fits_on_chip(const TileConfig &cfg,
                           const FlatSet<size_t> &retained_from_prev,
-                          const FlatSet<size_t> &retain_these) const;
+                          const FlatSet<size_t> &retain_these,
+                          MixedSweepFeasibility *diagnostic = nullptr) const;
 
   struct FeatureRoundTripResources {
     bool feasible = false;

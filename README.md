@@ -54,7 +54,8 @@ The primary targets are:
   with its modeled cost and ordinary `solution.v7` replay payload; and
 - `mixed_group_sweep`: enumerate every uniform active-group assignment for the
   model-selected mixed tile with its production pipe/stage cycles, issued bytes,
-  and effective-port-parallelism breakdown; and
+  and effective-port-parallelism breakdown, or report the exact whole-region
+  vector/L1 capacity shortfall when the selected solution contains a GM cut; and
 - `ascend_910b_test`: grounded cost and schedule-plan regression suite.
 
 For a portable standalone binary with static libstdc++ and libgcc:

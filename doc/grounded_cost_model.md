@@ -463,6 +463,26 @@ path; it is diagnostic, not a second planner. Non-tunable streaming, sequential 
 and dense C,C→V→C plans contribute one selected row so their FIFO topology and stage balance are
 auditable without pretending that they support the generic active-group choice.
 
+Generic feature round trips are owned as one maximal static mixed region for
+dense SwiGLU, a plain two-projection blend, and the same blend with a normalized
+transposed Linear sink across multiple geometries. A Linear lowering includes
+a metadata-only transpose view in the normalized graph; that view is folded
+into the sink matmul's `rhs_transposed` attribute and intentionally has no
+solver-op index. Counting the four solver ops against five normalized graph
+nodes can therefore look like a split, but the extracted region still owns all
+five nodes and emits one mixed step. Tests assert both mappings explicitly.
+
+If the selected source solution contains a GM cut, the Python availability API
+can probe the complete op set through the same diagnostic binary. It reports a
+stable rejection code and the closest legal grid's required and available
+vector/L1 bytes. This distinguishes a cheaper selected cut from an impossible
+whole-region mixed candidate. For example, the former A3/A5 calibration shapes
+are rejected because their legal 16-fractal grids require 245,920 B and
+491,680 B of vector storage respectively, above the 188,416-byte target limit;
+this is not a missing CVC topology. The rankable CVC corpus therefore uses
+source-ready geometries and verifies at least three active-group choices per
+shape.
+
 A successor loop is pipelined only when every group has at least two complete items. In particular,
 a one-trip C→V→C candidate is serialized as `pl.range(1)` with pipeline depth 1 and no skew.
 

@@ -1377,3 +1377,18 @@ struct MixedGroupCostCandidate {
     CostResult cost;
     MixedCostBreakdown breakdown;
 };
+
+// Developer-facing explanation for a whole-region mixed sweep that has no
+// feasible candidate.  This deliberately reports the closest concrete grid
+// rather than collapsing every miss into "no selected candidate": callers can
+// distinguish a capacity limit from a topology/costing rejection and see the
+// exact byte shortfall without reproducing the C++ search in Python.
+struct MixedSweepFeasibility {
+  bool feasible_candidate = false;
+  bool capacity_evaluated = false;
+  TileConfig closest_config;
+  int64_t required_vec_bytes = 0;
+  int64_t available_vec_bytes = 0;
+  int64_t required_l1_bytes = 0;
+  int64_t available_l1_bytes = 0;
+};

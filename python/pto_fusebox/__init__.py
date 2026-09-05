@@ -11,12 +11,16 @@ from .cube_sweep import (
     region_for_cube_candidate,
 )
 from .mixed_sweep import (
+    MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA,
     MIXED_GROUP_SWEEP_SCHEMA,
     MixedCostBreakdown,
     MixedGroupCandidate,
     MixedGroupSweep,
+    MixedGroupSweepAvailability,
+    MixedGroupSweepUnavailable,
     MixedGroupTile,
     enumerate_mixed_group_plans,
+    mixed_group_sweep_availability,
     region_for_mixed_group_candidate,
 )
 from .ir import (
@@ -133,12 +137,16 @@ __all__ = [
     "emit_pypto_region",
     "emit_pypto_static_bundle",
     "enumerate_cube_plans",
+    "MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA",
     "MIXED_GROUP_SWEEP_SCHEMA",
     "MixedCostBreakdown",
     "MixedGroupCandidate",
     "MixedGroupSweep",
+    "MixedGroupSweepAvailability",
+    "MixedGroupSweepUnavailable",
     "MixedGroupTile",
     "enumerate_mixed_group_plans",
+    "mixed_group_sweep_availability",
     "region_for_mixed_group_candidate",
     "extract_solver_regions",
     "normalize_exported",

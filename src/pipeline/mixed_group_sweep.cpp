@@ -4,6 +4,7 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -62,7 +63,47 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
   }
   const CostResult selected = subgraph->best_cost();
   if (!selected.feasible || selected.mixed_active_groups <= 0) {
-    throw std::invalid_argument("mixed group sweep found no selected candidate");
+    const MixedSweepFeasibility diagnostic =
+        subgraph->diagnose_mixed_sweep_feasibility();
+    const bool vector_capacity_exceeded =
+        diagnostic.capacity_evaluated &&
+        diagnostic.required_vec_bytes > diagnostic.available_vec_bytes;
+    const bool l1_capacity_exceeded =
+        diagnostic.capacity_evaluated &&
+        diagnostic.required_l1_bytes > diagnostic.available_l1_bytes;
+    std::string code = "whole_region_has_no_feasible_mixed_candidate";
+    std::string reason = "the complete op set has no feasible mixed candidate";
+    if (vector_capacity_exceeded || l1_capacity_exceeded) {
+      code = vector_capacity_exceeded && l1_capacity_exceeded
+                 ? "mixed_vector_and_l1_capacity_exceeded"
+                 : (vector_capacity_exceeded ? "mixed_vector_capacity_exceeded"
+                                             : "mixed_l1_capacity_exceeded");
+      reason = "closest legal grid requires vector " +
+               std::to_string(diagnostic.required_vec_bytes) + "/" +
+               std::to_string(diagnostic.available_vec_bytes) +
+               " bytes and L1 " + std::to_string(diagnostic.required_l1_bytes) +
+               "/" + std::to_string(diagnostic.available_l1_bytes) + " bytes";
+    }
+    json unavailable = {
+        {"schema_version", "pto_fusebox.mixed_group_sweep_availability.v1"},
+        {"available", false},
+        {"code", code},
+        {"reason", reason},
+    };
+    if (diagnostic.capacity_evaluated) {
+      unavailable["closest_tile"] = {
+          {"h", diagnostic.closest_config.h},
+          {"w", diagnostic.closest_config.w},
+          {"k", diagnostic.closest_config.k},
+          {"parts_m", diagnostic.closest_config.parts_m},
+          {"parts_n", diagnostic.closest_config.parts_n},
+      };
+      unavailable["required_vec_bytes"] = diagnostic.required_vec_bytes;
+      unavailable["available_vec_bytes"] = diagnostic.available_vec_bytes;
+      unavailable["required_l1_bytes"] = diagnostic.required_l1_bytes;
+      unavailable["available_l1_bytes"] = diagnostic.available_l1_bytes;
+    }
+    return unavailable.dump(2) + "\n";
   }
   const auto candidates = subgraph->enumerate_mixed_group_costs(selected.config);
   if (candidates.empty()) {

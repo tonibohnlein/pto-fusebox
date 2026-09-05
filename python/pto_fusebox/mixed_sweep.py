@@ -20,6 +20,7 @@ from .schedule.schema import MixedKernelPlan
 
 
 MIXED_GROUP_SWEEP_SCHEMA = "pto_fusebox.mixed_group_sweep.v2"
+MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA = "pto_fusebox.mixed_group_sweep_availability.v1"
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,130 @@ class MixedGroupSweep:
         )
 
 
+@dataclass(frozen=True)
+class MixedGroupSweepAvailability:
+    """Whether the selected solution can be swept, with a stable reason code."""
+
+    available: bool
+    code: str | None
+    reason: str | None
+    selected_step_kinds: tuple[str, ...]
+    selected_partition: tuple[tuple[int, ...], ...]
+    closest_tile: MixedGroupTile | None = None
+    required_vec_bytes: int | None = None
+    available_vec_bytes: int | None = None
+    required_l1_bytes: int | None = None
+    available_l1_bytes: int | None = None
+
+
+class MixedGroupSweepUnavailable(RuntimeError):
+    """A mixed sweep cannot be formed for the selected source solution."""
+
+    def __init__(self, availability: MixedGroupSweepAvailability):
+        if (
+            availability.available
+            or availability.code is None
+            or availability.reason is None
+        ):
+            raise ValueError("an unavailable mixed sweep requires a code and reason")
+        super().__init__(f"{availability.code}: {availability.reason}")
+        self.availability = availability
+
+
+def mixed_group_sweep_availability(
+    region: RegionSolveResult,
+    *,
+    sweep_binary: str | os.PathLike[str] | None = None,
+) -> MixedGroupSweepAvailability:
+    """Inspect sweep prerequisites, optionally probing the complete op set.
+
+    Without ``sweep_binary`` this is a cheap inspection of the selected
+    solution.  Supplying the diagnostic binary also explains why a solution
+    containing GM cuts could not be represented as one whole mixed region.
+    """
+
+    solution = region.solution
+    if region.status != "solved" or not isinstance(solution, Mapping):
+        return MixedGroupSweepAvailability(
+            available=False,
+            code="region_not_solved",
+            reason=f"region {region.region.id} has status {region.status!r}",
+            selected_step_kinds=(),
+            selected_partition=(),
+        )
+    raw_steps = solution.get("steps")
+    if not isinstance(raw_steps, list):
+        return MixedGroupSweepAvailability(
+            available=False,
+            code="solution_steps_missing",
+            reason="selected solution has no step list",
+            selected_step_kinds=(),
+            selected_partition=(),
+        )
+    kinds = tuple(
+        str(step.get("kind", "<missing>")) if isinstance(step, Mapping) else "<invalid>"
+        for step in raw_steps
+    )
+    partition = tuple(
+        tuple(int(op) for op in step.get("ops", ()))
+        for step in raw_steps
+        if isinstance(step, Mapping)
+        and isinstance(step.get("ops"), list)
+        and all(isinstance(op, int) and not isinstance(op, bool) for op in step["ops"])
+    )
+    if len(raw_steps) != 1 or kinds != ("mixed",):
+        selected = MixedGroupSweepAvailability(
+            available=False,
+            code="selected_solution_is_not_one_mixed_region",
+            reason=(
+                "mixed group sweeps preserve one selected mixed tile, but the "
+                f"solver selected {len(raw_steps)} steps with kinds {kinds!r}"
+            ),
+            selected_step_kinds=kinds,
+            selected_partition=partition,
+        )
+        if sweep_binary is None or region.problem is None:
+            return selected
+        return _probe_whole_region_availability(
+            region,
+            selected=selected,
+            sweep_binary=sweep_binary,
+        )
+    try:
+        step = scheduled_region(region).steps[0]
+    except (TypeError, ValueError) as error:
+        return MixedGroupSweepAvailability(
+            available=False,
+            code="selected_schedule_invalid",
+            reason=str(error),
+            selected_step_kinds=kinds,
+            selected_partition=partition,
+        )
+    if not isinstance(step.plan, MixedKernelPlan):
+        return MixedGroupSweepAvailability(
+            available=False,
+            code="selected_step_has_no_mixed_plan",
+            reason="selected mixed step does not carry a MixedKernelPlan",
+            selected_step_kinds=kinds,
+            selected_partition=partition,
+        )
+    if not step.plan.source_codegen_ready:
+        return MixedGroupSweepAvailability(
+            available=False,
+            code="selected_mixed_plan_is_not_source_ready",
+            reason="selected mixed plan is not source-codegen ready",
+            selected_step_kinds=kinds,
+            selected_partition=partition,
+        )
+    return MixedGroupSweepAvailability(
+        available=True,
+        code=None,
+        reason=None,
+        selected_step_kinds=kinds,
+        selected_partition=partition,
+    )
+
+
 def enumerate_mixed_group_plans(
     region: RegionSolveResult,
     *,
@@ -106,9 +231,21 @@ def enumerate_mixed_group_plans(
 ) -> MixedGroupSweep:
     """Enumerate group counts through the production C++ mixed cost model."""
 
+    availability = mixed_group_sweep_availability(region)
+    executable: Path | None = None
+    if (
+        not availability.available
+        and availability.code == "selected_solution_is_not_one_mixed_region"
+        and region.problem is not None
+    ):
+        executable = _resolve_sweep_binary(sweep_binary)
+        availability = mixed_group_sweep_availability(region, sweep_binary=executable)
+    if not availability.available:
+        raise MixedGroupSweepUnavailable(availability)
     if region.problem is None:
         raise ValueError(f"region {region.region.id} has no lowered problem")
-    executable = _resolve_sweep_binary(sweep_binary)
+    if executable is None:
+        executable = _resolve_sweep_binary(sweep_binary)
     canonical_problem = json.dumps(
         region.problem, sort_keys=True, separators=(",", ":")
     )
@@ -129,12 +266,32 @@ def enumerate_mixed_group_plans(
         )
         if process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()
-            raise RuntimeError(
-                f"mixed group sweep failed with status {process.returncode}: {detail}"
+            code = (
+                "whole_region_has_no_feasible_mixed_candidate"
+                if "found no selected candidate" in detail
+                else "mixed_group_sweep_process_failed"
+            )
+            raise MixedGroupSweepUnavailable(
+                MixedGroupSweepAvailability(
+                    available=False,
+                    code=code,
+                    reason=(
+                        f"sweep process exited with status {process.returncode}: {detail}"
+                    ),
+                    selected_step_kinds=availability.selected_step_kinds,
+                    selected_partition=availability.selected_partition,
+                )
             )
         if not output_path.is_file():
             raise RuntimeError("mixed group sweep did not create its output file")
         payload = json.loads(output_path.read_text(encoding="utf-8"))
+    unavailable = _availability_from_payload(
+        payload,
+        selected_step_kinds=availability.selected_step_kinds,
+        selected_partition=availability.selected_partition,
+    )
+    if unavailable is not None:
+        raise MixedGroupSweepUnavailable(unavailable)
     sweep = _parse_sweep(
         payload,
         problem_sha256=problem_sha256,
@@ -144,6 +301,101 @@ def enumerate_mixed_group_plans(
     )
     _validate_sweep_against_region(region, sweep)
     return sweep
+
+
+def _probe_whole_region_availability(
+    region: RegionSolveResult,
+    *,
+    selected: MixedGroupSweepAvailability,
+    sweep_binary: str | os.PathLike[str],
+) -> MixedGroupSweepAvailability:
+    """Run the diagnostic sweep on the whole lowered problem."""
+
+    executable = _resolve_sweep_binary(sweep_binary)
+    canonical_problem = json.dumps(
+        region.problem, sort_keys=True, separators=(",", ":")
+    )
+    with tempfile.TemporaryDirectory(prefix="pto-fusebox-mixed-probe-") as directory:
+        root = Path(directory)
+        problem_path = root / "problem.json"
+        output_path = root / "sweep.json"
+        problem_path.write_text(canonical_problem + "\n", encoding="utf-8")
+        process = subprocess.run(
+            [str(executable), str(problem_path), str(output_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if process.returncode != 0 or not output_path.is_file():
+            detail = process.stderr.strip() or process.stdout.strip()
+            return replace(
+                selected,
+                code="mixed_group_sweep_process_failed",
+                reason=(
+                    f"sweep process exited with status {process.returncode}: {detail}"
+                ),
+            )
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    unavailable = _availability_from_payload(
+        payload,
+        selected_step_kinds=selected.selected_step_kinds,
+        selected_partition=selected.selected_partition,
+    )
+    if unavailable is not None:
+        return unavailable
+    return replace(
+        selected,
+        code="selected_solution_prefers_gm_cut",
+        reason=(
+            "a whole-region mixed sweep is feasible, but the selected solution "
+            "has a lower-cost partition containing GM cuts"
+        ),
+    )
+
+
+def _availability_from_payload(
+    payload: Any,
+    *,
+    selected_step_kinds: tuple[str, ...],
+    selected_partition: tuple[tuple[int, ...], ...],
+) -> MixedGroupSweepAvailability | None:
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schema_version") != MIXED_GROUP_SWEEP_AVAILABILITY_SCHEMA:
+        return None
+    if payload.get("available") is not False:
+        raise ValueError("mixed sweep availability payload must be unavailable")
+    code = payload.get("code")
+    reason = payload.get("reason")
+    if not isinstance(code, str) or not isinstance(reason, str):
+        raise ValueError("unavailable mixed sweep omits its code or reason")
+    raw_tile = payload.get("closest_tile")
+    closest_tile = (
+        _parse_tile(raw_tile, field="closest_tile")
+        if isinstance(raw_tile, Mapping)
+        else None
+    )
+
+    def optional_int(field: str) -> int | None:
+        value = payload.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"unavailable mixed sweep has invalid {field}")
+        return value
+
+    return MixedGroupSweepAvailability(
+        available=False,
+        code=code,
+        reason=reason,
+        selected_step_kinds=selected_step_kinds,
+        selected_partition=selected_partition,
+        closest_tile=closest_tile,
+        required_vec_bytes=optional_int("required_vec_bytes"),
+        available_vec_bytes=optional_int("available_vec_bytes"),
+        required_l1_bytes=optional_int("required_l1_bytes"),
+        available_l1_bytes=optional_int("available_l1_bytes"),
+    )
 
 
 def region_for_mixed_group_candidate(

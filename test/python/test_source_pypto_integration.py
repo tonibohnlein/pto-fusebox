@@ -50,9 +50,11 @@ from pto_fusebox import (
     emit_pypto_region,
     emit_pypto_static_bundle,
     enumerate_cube_plans,
+    enumerate_mixed_group_plans,
     export_and_normalize,
     extract_solver_regions,
     region_for_cube_candidate,
+    region_for_mixed_group_candidate,
     scheduled_region,
     solve_graph,
 )
@@ -1190,6 +1192,10 @@ def _solver() -> Path:
     return Path(__file__).resolve().parents[2] / "build" / "mlsys_mixed"
 
 
+def _mixed_sweep_solver() -> Path:
+    return Path(__file__).resolve().parents[2] / "build" / "mixed_group_sweep"
+
+
 def _assert_static_vector_frames(pto: str) -> None:
     assert re.search(r"partition_tensor_view<[^>]*\?", pto) is None
     assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
@@ -1400,6 +1406,48 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
     )
     assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 114816
     assert plan.vector_stage_peak_ub_bytes + fifo_bytes <= 188416
+
+
+def test_wide_cvc_group_candidates_lower_through_memory_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A8 is a realization discriminator, not merely a model-only sweep row."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _AttentionCore(),
+        (
+            torch.zeros(384, 80),
+            torch.zeros(224, 80),
+            torch.zeros(224, 192),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved == len(solved.regions) == 1
+    region = solved.regions[0]
+    sweep = enumerate_mixed_group_plans(region, sweep_binary=_mixed_sweep_solver())
+    assert len(sweep.candidates) >= 3
+
+    for candidate in sweep.candidates:
+        forced = region_for_mixed_group_candidate(region, candidate)
+        source = emit_pypto_region(
+            graph, forced, program_name=f"wide_cvc_{candidate.id}"
+        ).source
+        compiled = ir.compile(
+            pl.parse_program(source),
+            output_dir=str(tmp_path / candidate.id),
+            dump_passes=False,
+            skip_ptoas=True,
+        )
+        assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
 
 
 @pytest.mark.parametrize(

@@ -5870,11 +5870,26 @@ Ascend910BCost::derive_feature_round_trip_resources(
   return resources;
 }
 
-bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<size_t>& retained_from_prev,
-                                        const FlatSet<size_t>& retain_these) const {
+bool Ascend910BCost::mixed_fits_on_chip(
+    const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+    const FlatSet<size_t> &retain_these,
+    MixedSweepFeasibility *diagnostic) const {
+  if (diagnostic != nullptr) {
+    *diagnostic = MixedSweepFeasibility{};
+    diagnostic->closest_config = cfg;
+    diagnostic->available_vec_bytes = prob_->vec_capacity;
+    diagnostic->available_l1_bytes = prob_->l1_capacity;
+  }
   if (mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip) {
-    return derive_feature_round_trip_resources(cfg).feasible;
+    const FeatureRoundTripResources resources =
+        derive_feature_round_trip_resources(cfg);
+    if (diagnostic != nullptr) {
+      diagnostic->capacity_evaluated = true;
+      diagnostic->required_vec_bytes = resources.vector_peak_ub_bytes;
+      diagnostic->required_l1_bytes = resources.cube_peak_l1_bytes;
+    }
+    return resources.feasible;
   }
   // Two-pool feasibility for a mixed cube+vector kernel — REUSE the homogeneous
   // single-core streams, now that both are affinity-aware (each skips the other
@@ -6113,10 +6128,15 @@ bool Ascend910BCost::mixed_fits_on_chip(const TileConfig& cfg, const FlatSet<siz
       v2c_fifo_reserved += reserved;
     }
   }
-  return c2v_fifo_reserved <= prob_->vec_capacity &&
-         vector_stage_peak <= prob_->vec_capacity - c2v_fifo_reserved &&
-         v2c_fifo_reserved <= prob_->l1_capacity &&
-         cube_peak_l1_bytes <= prob_->l1_capacity - v2c_fifo_reserved;
+  const int64_t required_vec_bytes = c2v_fifo_reserved + vector_stage_peak;
+  const int64_t required_l1_bytes = v2c_fifo_reserved + cube_peak_l1_bytes;
+  if (diagnostic != nullptr) {
+    diagnostic->capacity_evaluated = true;
+    diagnostic->required_vec_bytes = required_vec_bytes;
+    diagnostic->required_l1_bytes = required_l1_bytes;
+  }
+  return required_vec_bytes <= prob_->vec_capacity &&
+         required_l1_bytes <= prob_->l1_capacity;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -9319,4 +9339,57 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
     }
   }
   return out;
+}
+
+MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
+  MixedSweepFeasibility best;
+  int64_t best_excess = std::numeric_limits<int64_t>::max();
+  int64_t best_required = std::numeric_limits<int64_t>::max();
+  const bool feature_round_trip =
+      mixed_topology_ &&
+      mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip;
+  const std::vector<int64_t> grid_ks =
+      feature_round_trip
+          ? ks_cand_
+          : std::vector<int64_t>{ks_cand_.empty()
+                                     ? std::max<int64_t>(output_K_, 1)
+                                     : ks_cand_.back()};
+  for (const auto &grid : grid_cand_) {
+    const AxisPartition pm = partition_axis(out_H_, grid.parts_m, grid_gran_h_);
+    const AxisPartition pn = partition_axis(out_W_, grid.parts_n, grid_gran_w_);
+    for (int64_t grid_k : grid_ks) {
+      const TileConfig cfg{pn.big,   pm.big,   grid_k,
+                           pm.parts, pn.parts, grid.split_k};
+      if (!is_valid_tiling(cfg))
+        continue;
+      MixedSweepFeasibility current;
+      const bool fits = mixed_fits_on_chip(cfg, {}, {}, &current);
+      if (fits) {
+        const CostResult cost = compute_cost(cfg, {}, {});
+        if (cost.feasible && std::isfinite(cost.latency)) {
+          current.feasible_candidate = true;
+          return current;
+        }
+      }
+      if (!current.capacity_evaluated)
+        continue;
+      const int64_t excess =
+          std::max<int64_t>(0, current.required_vec_bytes -
+                                   current.available_vec_bytes) +
+          std::max<int64_t>(0, current.required_l1_bytes -
+                                   current.available_l1_bytes);
+      const int64_t required =
+          current.required_vec_bytes + current.required_l1_bytes;
+      if (!best.capacity_evaluated ||
+          std::tie(excess, required, cfg.parts_m, cfg.parts_n, cfg.split_k) <
+              std::tie(best_excess, best_required, best.closest_config.parts_m,
+                       best.closest_config.parts_n,
+                       best.closest_config.split_k)) {
+        best = current;
+        best_excess = excess;
+        best_required = required;
+      }
+    }
+  }
+  return best;
 }
