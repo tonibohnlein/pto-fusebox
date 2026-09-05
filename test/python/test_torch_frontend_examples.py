@@ -414,7 +414,8 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
     assert result.solution is not None
     constraints = result.problem["tcvt_safe_fragment_widths"]
     assert constraints == [
-        {"source_dtype": "INT32", "target_dtype": "FP16", "width": 128}
+        {"source_dtype": "INT32", "target_dtype": "FP16", "width": 128},
+        {"source_dtype": "FP16", "target_dtype": "INT8", "width": 128},
     ]
     assert len(result.candidate_summaries) >= 2
     assert result.candidate_summaries[0].selected
@@ -439,7 +440,10 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
     inputs = result.problem["inputs"]
     outputs = result.problem["outputs"]
     primitives = result.problem["vector_primitive_families"]
-    selected_widths: list[int] = []
+    selected_widths: dict[tuple[str, str], list[int]] = {
+        ("INT32", "FP16"): [],
+        ("FP16", "INT8"): [],
+    }
 
     def inspect_vector_plan(plan: dict[str, Any]) -> None:
         phases = plan.get("phases")
@@ -454,8 +458,9 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
                     continue
                 source_tensor = inputs[op_index][0]
                 target_tensor = outputs[op_index][0]
-                if dtypes[source_tensor] == "INT32" and dtypes[target_tensor] == "FP16":
-                    selected_widths.append(frames[source_tensor][1])
+                dtype_pair = (dtypes[source_tensor], dtypes[target_tensor])
+                if dtype_pair in selected_widths:
+                    selected_widths[dtype_pair].append(frames[source_tensor][1])
 
     for step in result.solution["steps"]:
         plan = step["plan"]
@@ -466,8 +471,12 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
                 if stage["vector_stream"] is not None:
                     inspect_vector_plan(stage["vector_stream"])
 
-    assert selected_widths
-    assert all(width <= 128 or width % 128 == 0 for width in selected_widths)
+    assert all(selected_widths.values())
+    assert all(
+        width <= 128 or width % 128 == 0
+        for widths in selected_widths.values()
+        for width in widths
+    )
     emitted = emit_pypto_callable(
         graph,
         result,

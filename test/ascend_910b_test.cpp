@@ -5382,6 +5382,28 @@ static void test_source_cast_fragment_capability_preserves_analytic_search() {
               (source_plan.strip_w <= 128 || source_plan.strip_w % 128 == 0));
     CHECK("CASTFRAG: source plan changes the unsafe analytic strip",
           source_plan.strip_w != analytic_plan.strip_w);
+
+    Problem quantize = p;
+    quantize.tensors = {{7168, 16, DType::FP16}, {7168, 16, DType::INT8}};
+    quantize.tcvt_safe_fragment_widths = {{DType::FP16, DType::INT8, 128}};
+    quantize.require_source_codegen = false;
+    DAG quantize_analytic_dag = DAG::build(quantize);
+    auto quantize_analytic = Subgraph::create(quantize, quantize_analytic_dag, {0});
+    const VectorStreamPlan quantize_analytic_plan =
+        quantize_analytic ? quantize_analytic->vector_stream_plan(config) : VectorStreamPlan{};
+    CHECK("CASTFRAG: FP16-to-INT8 analytic plan ignores the source-only capability",
+          quantize_analytic_plan.feasible && quantize_analytic_plan.strip_w == 224);
+
+    quantize.require_source_codegen = true;
+    DAG quantize_source_dag = DAG::build(quantize);
+    auto quantize_source = Subgraph::create(quantize, quantize_source_dag, {0});
+    const VectorStreamPlan quantize_source_plan =
+        quantize_source ? quantize_source->vector_stream_plan(config) : VectorStreamPlan{};
+    CHECK("CASTFRAG: FP16-to-INT8 source plan selects a safe physical cast strip",
+          quantize_source_plan.feasible && quantize_source_plan.strip_w > 0 &&
+              (quantize_source_plan.strip_w <= 128 || quantize_source_plan.strip_w % 128 == 0));
+    CHECK("CASTFRAG: FP16-to-INT8 source plan changes the unsafe analytic strip",
+          quantize_source_plan.strip_w != quantize_analytic_plan.strip_w);
 }
 
 static void test_native_cast_chain_broadcast_shares_physical_axis() {

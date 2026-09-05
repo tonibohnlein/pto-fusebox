@@ -80,13 +80,13 @@ V2C bias is charged once per AIV lane, matching both emitted PTO and the
 simulator. Analytic mode deliberately retains its broader assumptions and prior
 traffic accounting for research comparisons.
 
-The first DeepSeek-Pro 7,168-wide device run exposed an unsafe native
-INT32-to-FP16 cast strip (224 or 448 columns), not an incorrect matmul or
-model-specific graph. Source-first solving now consumes that backend capability
-and selects a safe alternative while leaving analytic search unchanged. The
-selected and runner-up partitions are observable through candidate summaries.
-This repair is host-verified; Pro and the complete generic/model correctness
-matrix still require a fresh two-device silicon run before closure.
+The first DeepSeek-Pro 7,168-wide device run exposed unsafe native narrowing
+strips (224 or 448 columns) in both INT32-to-FP16 and FP16-to-INT8 conversion,
+not an incorrect matmul or model-specific graph. Source-first solving now
+consumes both backend capabilities and selects a safe alternative while leaving
+analytic search unchanged. The selected and runner-up partitions are observable
+through candidate summaries. PyPTO fragments arbitrary callers of either cast
+into safe physical subviews.
 
 ## Python API
 
@@ -370,12 +370,12 @@ analytic optimum. With the flag false, analytic admission and costing are
 unchanged.
 Target profiles may also publish source-realization limits that are narrower
 than the analytic hardware model. Ascend 910B currently records the measured
-INT32-to-FP16 cast rule: a physical vector frame wider than 128 elements must
-be composed of complete 128-element fragments. Source-first search excludes an
-unsafe strip and continues through the ordinary candidate space; it does not
-special-case a model or permanently remove that analytic schedule. PyPTO
-separately legalizes an unsafe cast produced by any caller into at most
-128-element fragments.
+rule for both INT32-to-FP16 and FP16-to-INT8: a physical vector frame wider than
+128 elements must be composed of complete 128-element fragments. Source-first
+search excludes an unsafe strip and continues through the ordinary candidate
+space; it does not special-case a model or permanently remove that analytic
+schedule. PyPTO separately legalizes either unsafe cast produced by any caller
+into at most 128-element fragments.
 
 `solve_graph(..., collect_candidate_summaries=True)` exposes the selected and
 alternative solver results in modeled-cost order. Each
