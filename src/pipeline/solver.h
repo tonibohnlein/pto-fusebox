@@ -28,7 +28,8 @@
 
 Solution solve(const Problem& prob, const DAG& dag,
                TimePoint deadline = TimePoint::max(),
-               int num_threads = 0);
+               int num_threads = 0,
+               std::vector<Solution>* candidate_solutions = nullptr);
 
 // V2 pipeline: init-only seeding → evo loop (partition or coupled).
 // Skips Phase 2 (ordering+greedy) and does no FM in the init phase.

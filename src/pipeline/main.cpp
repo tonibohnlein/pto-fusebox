@@ -38,6 +38,7 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool use_v2 = false;
     int num_threads = 0;
+    std::string candidate_output;
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -60,13 +61,25 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        else if (arg == "--candidate-output") {
+            if (++i >= argc) {
+                std::cerr << "--candidate-output requires a path\n";
+                return 1;
+            }
+            candidate_output = argv[i];
+        }
         else args.push_back(argv[i]);
     }
     g_verbose = verbose;
 
     if (args.size() != 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " [-v] [--v1|--v2] [--threads N] <input.json> <output.json>\n";
+                  << " [-v] [--v1|--v2] [--threads N] [--candidate-output PATH]"
+                  << " <input.json> <output.json>\n";
+        return 1;
+    }
+    if (use_v2 && !candidate_output.empty()) {
+        std::cerr << "--candidate-output is currently supported by the v1 solver only\n";
         return 1;
     }
 
@@ -102,8 +115,11 @@ int main(int argc, char* argv[]) {
               << budget << "s (deadline=" << (budget * 0.95) << "s)\n\n";
 
     DAG dag = DAG::build(prob);
-    auto sol = use_v2 ? solve_v2(prob, dag, deadline, num_threads)
-                      : solve(prob, dag, deadline, num_threads);
+    std::vector<Solution> candidate_solutions;
+    auto sol = use_v2
+                   ? solve_v2(prob, dag, deadline, num_threads)
+                   : solve(prob, dag, deadline, num_threads,
+                           candidate_output.empty() ? nullptr : &candidate_solutions);
 
     auto elapsed = std::chrono::duration<double>(SteadyClock::now() - start).count();
 
@@ -151,5 +167,7 @@ int main(int argc, char* argv[]) {
               << " (" << std::setprecision(0) << (100.0 * elapsed / budget) << "%)\n";
 
     write_solution(args[1], sol);
+    if (!candidate_output.empty())
+        write_source_candidate_summaries(candidate_output, candidate_solutions);
     return 0;
 }

@@ -16,6 +16,29 @@ from .ir import SOLUTION_SCHEMA, NormalizedGraph
 from .regions import LoweredProblem, SolverRegion, extract_solver_regions
 from .target import TargetProfile, resolve_target
 
+SOURCE_CANDIDATE_SUMMARY_SCHEMA = "pto_fusebox.source_candidate_summaries.v1"
+
+
+@dataclass(frozen=True)
+class SourceCandidateSummary:
+    """One solver-discovered partition with source-readiness evidence.
+
+    ``schedule`` preserves serialized step order. ``memory`` preserves each
+    step's complete typed plan, including its physical frames, allocations,
+    high-water marks, and traffic fields.
+    """
+
+    id: str
+    rank: int
+    selected: bool
+    modeled_cost_cycles: float
+    partition: tuple[tuple[int, ...], ...]
+    schedule: tuple[Mapping[str, Any], ...]
+    memory: tuple[Mapping[str, Any], ...]
+    solution: Mapping[str, Any]
+    source_ready: bool
+    rejection_reason: str | None
+
 
 @dataclass(frozen=True)
 class RegionSolveResult:
@@ -29,6 +52,7 @@ class RegionSolveResult:
     stdout: str = ""
     stderr: str = ""
     returncode: int | None = None
+    candidate_summaries: tuple[SourceCandidateSummary, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +98,7 @@ def solve_graph(
     solver_binary: str | os.PathLike[str] | None = None,
     solver_workers: int | None = None,
     require_source_codegen: bool = False,
+    collect_candidate_summaries: bool = False,
 ) -> SolveResult:
     """Partition, lower, and solve every supported region in ``graph``.
 
@@ -83,6 +108,9 @@ def solve_graph(
     selected schedule will be rendered as standalone PyPTO DSL. Source-oriented
     solving applies the stricter source-realization constraint from the first
     candidate search. Analytic solving is unchanged when the flag is false.
+    Set ``collect_candidate_summaries`` to retain the selected and alternative
+    solver partitions with modeled costs, complete schedules and memory plans,
+    plus an explicit source-readiness result and rejection reason for each.
     """
 
     if solver_workers is not None and solver_workers <= 0:
@@ -122,9 +150,11 @@ def solve_graph(
             lowered = replace(lowered, problem=problem)
         solved = _solve_region(
             executable,
+            graph,
             region,
             lowered,
             solver_workers=solver_workers,
+            collect_candidate_summaries=collect_candidate_summaries,
         )
         if require_source_codegen and solved.status == "solved":
             from .source import can_emit_region
@@ -151,10 +181,12 @@ def solve_graph(
 
 def _solve_region(
     executable: Path | None,
+    graph: NormalizedGraph,
     region: SolverRegion,
     lowered: LoweredProblem,
     *,
     solver_workers: int | None,
+    collect_candidate_summaries: bool,
 ) -> RegionSolveResult:
     if executable is None:
         raise AssertionError("a lowerable region requires a solver executable")
@@ -162,6 +194,7 @@ def _solve_region(
         root = Path(directory)
         problem_path = root / "problem.json"
         solution_path = root / "solution.json"
+        candidates_path = root / "source_candidates.json"
         problem_path.write_text(
             json.dumps(lowered.problem, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
@@ -169,6 +202,8 @@ def _solve_region(
         command = [str(executable)]
         if solver_workers is not None:
             command.extend(("--threads", str(solver_workers)))
+        if collect_candidate_summaries:
+            command.extend(("--candidate-output", str(candidates_path)))
         command.extend((str(problem_path), str(solution_path)))
         process = subprocess.run(
             command,
@@ -232,7 +267,7 @@ def _solve_region(
                 stderr=process.stderr,
                 returncode=process.returncode,
             )
-        return RegionSolveResult(
+        result = RegionSolveResult(
             region=region,
             status="solved",
             problem=lowered.problem,
@@ -244,6 +279,134 @@ def _solve_region(
             stderr=process.stderr,
             returncode=process.returncode,
         )
+        if collect_candidate_summaries:
+            result = replace(
+                result,
+                candidate_summaries=_read_candidate_summaries(
+                    candidates_path, graph, result
+                ),
+            )
+        return result
+
+
+def _read_candidate_summaries(
+    path: Path,
+    graph: NormalizedGraph,
+    selected_result: RegionSolveResult,
+) -> tuple[SourceCandidateSummary, ...]:
+    if not path.is_file():
+        raise ValueError("solver did not create the requested candidate summary file")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("source candidate summary JSON must contain an object")
+    if payload.get("schema_version") != SOURCE_CANDIDATE_SUMMARY_SCHEMA:
+        raise ValueError("unsupported source candidate summary schema")
+    raw_candidates = payload.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise ValueError("source candidate summary contains no candidates")
+    selected_candidate_id = payload.get("selected_candidate_id")
+    if not isinstance(selected_candidate_id, str):
+        raise ValueError("source candidate summary has no selected candidate ID")
+
+    from .source import SourceEmissionError, emit_pypto_region
+
+    summaries: list[SourceCandidateSummary] = []
+    candidate_ids: set[str] = set()
+    for expected_rank, raw in enumerate(raw_candidates):
+        if not isinstance(raw, dict):
+            raise ValueError(f"source candidate {expected_rank} must be an object")
+        candidate_id = raw.get("id")
+        rank = raw.get("rank")
+        selected = raw.get("selected")
+        modeled_cost = raw.get("modeled_cost_cycles")
+        solution = raw.get("solution")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id in candidate_ids
+            or not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or rank != expected_rank
+            or not isinstance(selected, bool)
+            or not isinstance(modeled_cost, (int, float))
+            or isinstance(modeled_cost, bool)
+            or not math.isfinite(float(modeled_cost))
+            or not isinstance(solution, dict)
+            or solution.get("schema_version") != SOLUTION_SCHEMA
+        ):
+            raise ValueError(f"source candidate {expected_rank} is malformed")
+        candidate_ids.add(candidate_id)
+        raw_steps = solution.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError(f"source candidate {expected_rank} has no schedule steps")
+        schedule: list[Mapping[str, Any]] = []
+        partition: list[tuple[int, ...]] = []
+        memory: list[Mapping[str, Any]] = []
+        serialized_cost = 0.0
+        for step_index, step in enumerate(raw_steps):
+            if not isinstance(step, dict):
+                raise ValueError(
+                    f"source candidate {expected_rank} step {step_index} is malformed"
+                )
+            ops = step.get("ops")
+            plan = step.get("plan")
+            latency = step.get("latency_cycles")
+            if (
+                not isinstance(ops, list)
+                or any(not isinstance(op, int) or isinstance(op, bool) for op in ops)
+                or not isinstance(plan, dict)
+                or not isinstance(latency, (int, float))
+                or isinstance(latency, bool)
+                or not math.isfinite(float(latency))
+            ):
+                raise ValueError(
+                    f"source candidate {expected_rank} step {step_index} is malformed"
+                )
+            schedule.append(step)
+            partition.append(tuple(ops))
+            memory.append(plan)
+            serialized_cost += float(latency)
+        if not math.isclose(
+            float(modeled_cost), serialized_cost, rel_tol=1e-12, abs_tol=1e-9
+        ):
+            raise ValueError(
+                f"source candidate {expected_rank} modeled cost differs from its steps"
+            )
+        candidate_result = replace(
+            selected_result,
+            solution=solution,
+            candidate_summaries=(),
+        )
+        rejection_reason: str | None = None
+        try:
+            emit_pypto_region(
+                graph,
+                candidate_result,
+                program_name=f"FuseboxCandidate{expected_rank}",
+            )
+        except SourceEmissionError as error:
+            rejection_reason = str(error)
+        summaries.append(
+            SourceCandidateSummary(
+                id=candidate_id,
+                rank=rank,
+                selected=selected,
+                modeled_cost_cycles=float(modeled_cost),
+                partition=tuple(partition),
+                schedule=tuple(schedule),
+                memory=tuple(memory),
+                solution=solution,
+                source_ready=rejection_reason is None,
+                rejection_reason=rejection_reason,
+            )
+        )
+    if (
+        sum(candidate.selected for candidate in summaries) != 1
+        or not summaries[0].selected
+        or summaries[0].id != selected_candidate_id
+        or summaries[0].solution != selected_result.solution
+    ):
+        raise ValueError("source candidate selected marker is inconsistent")
+    return tuple(summaries)
 
 
 def _resolve_solver_binary(value: str | os.PathLike[str] | None) -> Path:

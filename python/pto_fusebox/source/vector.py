@@ -62,6 +62,7 @@ def emit_vector(
         )
     _validate_cast_roots(graph, lowered)
     _validate_cast_semantics(graph, lowered)
+    validate_source_cast_frames(context, plan)
     if (
         plan.reduction_split.kind is not VectorReductionSplitKind.NONE
         or plan.reduction_split.factor != 1
@@ -1834,6 +1835,62 @@ def _validate_cast_semantics(graph: NormalizedGraph, lowered: LoweredRegion) -> 
                 "vector source cannot preserve Torch float-to-INT8 truncation "
                 "through the Ascend910B native FP16 conversion path"
             )
+
+
+def validate_source_cast_frames(
+    context: EmissionContext, plan: VectorKernelPlan
+) -> None:
+    """Verify backend cast-width constraints against solver-owned frames."""
+
+    raw_constraints = context.problem.get("tcvt_safe_fragment_widths", ())
+    if not isinstance(raw_constraints, list):
+        raise SourceEmissionError("tcvt_safe_fragment_widths must be a list")
+    constraints: dict[tuple[str, str], int] = {}
+    for index, item in enumerate(raw_constraints):
+        if not isinstance(item, Mapping):
+            raise SourceEmissionError(
+                f"tcvt_safe_fragment_widths[{index}] must be an object"
+            )
+        source = item.get("source_dtype")
+        target = item.get("target_dtype")
+        width = item.get("width")
+        if (
+            not isinstance(source, str)
+            or not isinstance(target, str)
+            or not isinstance(width, int)
+            or isinstance(width, bool)
+            or width <= 0
+        ):
+            raise SourceEmissionError(
+                f"tcvt_safe_fragment_widths[{index}] is malformed"
+            )
+        constraints[(source.upper(), target.upper())] = width
+    if not constraints:
+        return
+
+    for phase in plan.phases:
+        frames = {frame.tensor: frame for frame in phase.tensor_frames}
+        for op_index in phase.ops:
+            operation = context.lowered.operation(op_index)
+            if len(operation.inputs) != 1 or len(operation.outputs) != 1:
+                continue
+            source = context.lowered.tensor(operation.inputs[0]).dtype.upper()
+            target = context.lowered.tensor(operation.outputs[0]).dtype.upper()
+            fragment_width = constraints.get((source, target))
+            if fragment_width is None:
+                continue
+            frame = frames.get(operation.inputs[0])
+            if frame is None:
+                raise SourceEmissionError(
+                    f"vector cast {op_index} omits its source physical frame"
+                )
+            physical_cols = frame.physical[1]
+            if physical_cols > fragment_width and physical_cols % fragment_width != 0:
+                raise SourceEmissionError(
+                    f"vector cast {op_index} physical width {physical_cols} has an "
+                    f"unsafe tail for {source}->{target}; expected width <= "
+                    f"{fragment_width} or a multiple of {fragment_width}"
+                )
 
 
 def _validate_vector_body_lifetimes(

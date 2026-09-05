@@ -5087,8 +5087,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   const int64_t reduction_output_granule = VectorTensorElementGranule(
       vector_tensor_emit_granules_, vector_reduction_output_tensor_,
       vector_emit_granule_);
-  auto planned_tile_bytes = [&](size_t tensor_id, int64_t tile_h, int64_t tile_w,
-                                int64_t reduce_chunk, int stream_axis) {
+  auto planned_physical_frame = [&](size_t tensor_id, int64_t tile_h,
+                                    int64_t tile_w, int64_t reduce_chunk,
+                                    int stream_axis) {
     const Tensor& tensor = prob_->tensors[tensor_id];
     int64_t tw = std::min(tile_w, tensor.width);
     int64_t th = std::min(tile_h, tensor.height);
@@ -5101,13 +5102,40 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       tw = std::min(tw, reduce_chunk);
     else if (axis == 2)
       th = std::min(th, reduce_chunk);
-    const VectorPhysicalFrame frame =
-        VectorAllocatedFrame(tensor, th, tw, vector_iter_H_, vector_iter_W_,
-                             reduced_axis_, has_reduction_ || vector_align_rows_,
-                             VectorTensorElementGranule(
-                                 vector_tensor_emit_granules_, tensor_id,
-                                 vector_emit_granule_));
-    return frame.rows * frame.cols * dtype_bytes(tensor.dtype);
+    return VectorAllocatedFrame(tensor, th, tw, vector_iter_H_, vector_iter_W_,
+                                reduced_axis_, has_reduction_ || vector_align_rows_,
+                                VectorTensorElementGranule(
+                                    vector_tensor_emit_granules_, tensor_id,
+                                    vector_emit_granule_));
+  };
+  auto planned_tile_bytes = [&](size_t tensor_id, int64_t tile_h, int64_t tile_w,
+                                int64_t reduce_chunk, int stream_axis) {
+    const VectorPhysicalFrame frame = planned_physical_frame(
+        tensor_id, tile_h, tile_w, reduce_chunk, stream_axis);
+    return frame.rows * frame.cols * dtype_bytes(prob_->tensors[tensor_id].dtype);
+  };
+  auto source_cast_frames_are_safe = [&](int64_t tile_h, int64_t tile_w,
+                                         int64_t reduce_chunk, int stream_axis) {
+    if (!prob_->require_source_codegen || prob_->tcvt_safe_fragment_widths.empty())
+      return true;
+    for (size_t op_index : ops_) {
+      const Op& op = prob_->ops[op_index];
+      if (op.vector_primitive != VectorPrimitiveFamily::Cast ||
+          op.inputs.size() != 1 || op.outputs.size() != 1)
+        continue;
+      const Tensor& input = prob_->tensors[op.inputs[0]];
+      const Tensor& output = prob_->tensors[op.outputs[0]];
+      const VectorPhysicalFrame frame = planned_physical_frame(
+          op.inputs[0], tile_h, tile_w, reduce_chunk, stream_axis);
+      for (const TcvtSafeFragmentWidth& constraint : prob_->tcvt_safe_fragment_widths) {
+        if (input.dtype != constraint.source_dtype ||
+            output.dtype != constraint.target_dtype)
+          continue;
+        if (frame.cols > constraint.width && frame.cols % constraint.width != 0)
+          return false;
+      }
+    }
+    return true;
   };
 
   // The candidate grid is a partition of the logical output, not a consequence
@@ -5158,6 +5186,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   };
   auto one_pass_materialized = [&]() {
     VectorStreamPlan candidate = plan;
+    if (!source_cast_frames_are_safe(candidate.tile_h, candidate.tile_w,
+                                     candidate.tile_w, /*stream_axis=*/0))
+      return candidate;
     candidate.input_lifetimes = body_only_lifetimes();
     candidate.feasible = true;
     candidate.kind = VectorStreamKind::Materialized;
@@ -5252,6 +5283,21 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
         }
       }
       int64_t strip_h = (plan.tile_h + row_strips - 1) / row_strips;
+      if (!source_cast_frames_are_safe(strip_h, strip_w, strip_w, reduced_axis_)) {
+        int64_t safe_strip_w = 0;
+        for (int64_t candidate_w = strip_w - vector_emit_granule_;
+             candidate_w > 0; candidate_w -= vector_emit_granule_) {
+          if (source_cast_frames_are_safe(strip_h, candidate_w, candidate_w,
+                                          reduced_axis_)) {
+            safe_strip_w = candidate_w;
+            break;
+          }
+        }
+        if (safe_strip_w == 0)
+          return plan;
+        strip_w = safe_strip_w;
+        width_strips = (plan.tile_w + strip_w - 1) / strip_w;
+      }
       auto selected_peak = [&]() {
         const int64_t strip_bytes = strip_h * strip_w * output_dtb;
         const bool pipelined =
@@ -5361,6 +5407,8 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
           trial.chunk_peak_ub_bytes = peak;
           trial.body = {0, trips, can_pipeline ? 2 : 1};
           trial.overlap_granted = can_pipeline;
+          if (!source_cast_frames_are_safe(strip_h, strip_w, strip_w, reduced_axis_))
+            continue;
           const VectorPlanCost trial_cost =
               vector_plan_cost(trial, retained_from_prev, retain_these);
           if (trial_cost.latency < best_body_cost.latency) {
@@ -5435,6 +5483,10 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       trial.chunk = chunk;
       trial.full_chunks = trial.extent / chunk;
       trial.tail = trial.extent - trial.full_chunks * chunk;
+      const int64_t frame_h = trial.axis == 1 ? trial.free_tile : chunk;
+      const int64_t frame_w = trial.axis == 1 ? chunk : trial.free_tile;
+      if (!source_cast_frames_are_safe(frame_h, frame_w, chunk, trial.axis))
+        continue;
       trial.replay_passes.clear();
       const int64_t chunk_bytes =
           trial.free_tile_alloc * chunk * vector_min_dtype_bytes_;

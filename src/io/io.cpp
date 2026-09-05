@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -104,6 +105,18 @@ static bool parse_mixed_vector_semantic(const std::string& name, MixedVectorSema
     *semantic = MixedVectorSemantic::Cast;
   else
     return false;
+  return true;
+}
+
+static bool parse_dtype_name(const std::string& name, DType* dtype) {
+  if (name == "FP32") *dtype = DType::FP32;
+  else if (name == "FP16") *dtype = DType::FP16;
+  else if (name == "BF16") *dtype = DType::BF16;
+  else if (name == "INT32") *dtype = DType::INT32;
+  else if (name == "INT16") *dtype = DType::INT16;
+  else if (name == "INT8") *dtype = DType::INT8;
+  else if (name == "BOOL") *dtype = DType::BOOL;
+  else return false;
   return true;
 }
 
@@ -636,14 +649,7 @@ Problem read_problem(const std::string& filename) {
         }
         for (size_t i = 0; i < dts.size(); i++) {
             const auto& s = dts[i].get_ref<const std::string&>();
-            if (s == "FP32") p.tensors[i].dtype = DType::FP32;
-            else if (s == "FP16") p.tensors[i].dtype = DType::FP16;
-            else if (s == "BF16") p.tensors[i].dtype = DType::BF16;
-            else if (s == "INT32") p.tensors[i].dtype = DType::INT32;
-            else if (s == "INT16") p.tensors[i].dtype = DType::INT16;
-            else if (s == "INT8") p.tensors[i].dtype = DType::INT8;
-            else if (s == "BOOL") p.tensors[i].dtype = DType::BOOL;
-            else {
+            if (!parse_dtype_name(s, &p.tensors[i].dtype)) {
                 std::cerr << "Error: unknown dtype '" << s << "' for tensor " << i << "\n";
                 std::exit(1);
             }
@@ -983,6 +989,38 @@ Problem read_problem(const std::string& filename) {
     if (j.contains("vec_reg_bytes"))    p.vec_reg_bytes    = j["vec_reg_bytes"].get<int64_t>();
     if (j.contains("vec_dma_align_bytes")) {
       p.vec_dma_align_bytes = j["vec_dma_align_bytes"].get<int64_t>();
+    }
+    if (j.contains("tcvt_safe_fragment_widths")) {
+      const auto& constraints = j["tcvt_safe_fragment_widths"];
+      if (!constraints.is_array()) {
+        std::cerr << "Error: tcvt_safe_fragment_widths must be an array\n";
+        std::exit(1);
+      }
+      for (size_t i = 0; i < constraints.size(); ++i) {
+        const auto& item = constraints[i];
+        if (!item.is_object() || !item.contains("source_dtype") ||
+            !item.contains("target_dtype") || !item.contains("width")) {
+          std::cerr << "Error: tcvt_safe_fragment_widths[" << i
+                    << "] must contain source_dtype, target_dtype, and width\n";
+          std::exit(1);
+        }
+        TcvtSafeFragmentWidth constraint;
+        const std::string source = item["source_dtype"].get<std::string>();
+        const std::string target = item["target_dtype"].get<std::string>();
+        if (!parse_dtype_name(source, &constraint.source_dtype) ||
+            !parse_dtype_name(target, &constraint.target_dtype)) {
+          std::cerr << "Error: tcvt_safe_fragment_widths[" << i
+                    << "] contains an unknown dtype pair\n";
+          std::exit(1);
+        }
+        constraint.width = item["width"].get<int64_t>();
+        if (constraint.width <= 0) {
+          std::cerr << "Error: tcvt_safe_fragment_widths[" << i
+                    << "].width must be positive\n";
+          std::exit(1);
+        }
+        p.tcvt_safe_fragment_widths.push_back(constraint);
+      }
     }
     if (j.contains("vec_op_head"))      p.vec_op_head      = j["vec_op_head"].get<double>();
     if (j.contains("vec_op_tail"))      p.vec_op_tail      = j["vec_op_tail"].get<double>();
@@ -1367,4 +1405,33 @@ void write_solution(const std::string& filename, const Solution& sol) {
         std::cerr << "Error: write failed for '" << filename << "'\n";
         std::exit(1);
     }
+}
+
+std::string source_candidate_summaries_json(const std::vector<Solution>& candidates) {
+    json output;
+    output["schema_version"] = "pto_fusebox.source_candidate_summaries.v1";
+    output["selected_candidate_id"] = candidates.empty() ? nullptr : json("candidate_0");
+    output["candidates"] = json::array();
+    std::set<std::string> seen;
+    for (const Solution& candidate : candidates) {
+        const std::string rendered = solution_json(candidate);
+        if (!seen.insert(rendered).second) continue;
+        const size_t rank = output["candidates"].size();
+        output["candidates"].push_back({
+            {"id", "candidate_" + std::to_string(rank)},
+            {"rank", rank},
+            {"selected", rank == 0},
+            {"modeled_cost_cycles", candidate.total_latency()},
+            {"solution", json::parse(rendered)},
+        });
+    }
+    return output.dump(2) + "\n";
+}
+
+void write_source_candidate_summaries(const std::string& filename,
+                                      const std::vector<Solution>& candidates) {
+    std::ofstream f(filename);
+    if (!f.is_open())
+        throw std::runtime_error("Failed to open candidate output file: " + filename);
+    f << source_candidate_summaries_json(candidates);
 }

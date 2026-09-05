@@ -37,6 +37,7 @@ from .vector import (
     _validate_softmax_frames,
     _validate_softmax_generated_work,
     _validate_softmax_loops,
+    validate_source_cast_frames,
 )
 
 
@@ -129,6 +130,9 @@ def _validate_common(context: EmissionContext, plan: MixedKernelPlan) -> None:
             "mixed cube stage and V2C FIFO rings exceed L1 capacity: "
             f"{required_l1_bytes} > {l1_capacity} bytes"
         )
+    for stage in plan.stages:
+        if stage.vector_stream is not None:
+            validate_source_cast_frames(context, stage.vector_stream)
 
 
 def _mixed_header(

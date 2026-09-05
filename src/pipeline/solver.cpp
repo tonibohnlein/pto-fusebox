@@ -21,6 +21,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -101,6 +102,39 @@ int effective_num_threads(int requested) {
     return detected > 0 ? detected : 4;
 }
 
+Partition MaterializeRecomputedSourceOps(Partition partition) {
+    std::vector<size_t> membership_count(partition.prob->num_ops(), 0);
+    for (const auto& group : partition.groups) {
+        if (!group.alive) continue;
+        for (size_t op : group.ops) ++membership_count[op];
+    }
+    for (size_t op = 0; op < membership_count.size(); ++op) {
+        if (membership_count[op] <= 1) continue;
+        for (auto& group : partition.groups) {
+            if (!group.alive) continue;
+            group.ops.erase(op);
+            if (group.ops.empty()) group.alive = false;
+        }
+        // A singleton launch turns the recomputed value into an explicit GM
+        // boundary that every downstream source group can consume. finalize()
+        // recomputes its cost and concrete subgraph after all repairs are applied.
+        partition.add_group({op}, 1e18);
+    }
+    const size_t groups_after_materialization = partition.groups.size();
+    for (size_t index = 0; index < groups_after_materialization; ++index) {
+        auto& group = partition.groups[index];
+        if (!group.alive || group.ops.empty()) continue;
+        const auto components = partition.connected_components(group.ops);
+        if (components.size() <= 1) continue;
+        group.ops = components.front();
+        for (size_t component = 1; component < components.size(); ++component)
+            partition.add_group(components[component], 1e18);
+    }
+    partition.rebuild_index();
+    partition.rebuild_group_dag();
+    return partition;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -108,7 +142,7 @@ int effective_num_threads(int requested) {
 // ============================================================================
 
 Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
-               int num_threads) {
+               int num_threads, std::vector<Solution>* candidate_solutions) {
 
     auto now              = SteadyClock::now();
     auto effective_dl     = deadline;
@@ -183,6 +217,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
     double after_build    = partition_pool[0].total_cost();
     double after_sol_evo  = after_build;
     Solution final_sol(prob, dag, {});
+    std::vector<Solution> source_solution_pool;
 
     if (!has_retain) {
         // No retainable tensors: ordering has no effect on cost (all groups
@@ -190,14 +225,43 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
         // a solution from a single topological ordering.
         std::cerr << "Phase 2: Build solution (no-retain)...\n";
 
-        partition_pool[0].rebuild_index();
-        partition_pool[0].finalize(&shared_cache);
-        auto dfs_res  = dfs_ordering(partition_pool[0]);
-        auto steps    = Solution::steps_from_ordering(
-            prob, dag, partition_pool[0], dfs_res, &shared_cache);
-        final_sol = Solution(prob, dag, std::move(steps));
-        if (!final_sol.validate().valid)
-            final_sol = Solution::from_partition(prob, dag, partition_pool[0]);
+        if (prob.require_source_codegen) {
+            // Search may discover partitions whose concrete subgraphs recompute a source op.
+            // Materialize such values at an explicit GM boundary, finalize every retained
+            // partition, and choose the cheapest complete disjoint source solution. Keep the
+            // trivial partition as a deterministic fallback after capability filtering.
+            for (const Partition& discovered : partition_pool) {
+                Partition candidate_partition = MaterializeRecomputedSourceOps(discovered);
+                candidate_partition.finalize(&shared_cache);
+                Solution candidate = Solution::from_partition(
+                    prob, dag, candidate_partition, 8, &shared_cache);
+                if (candidate.validate().valid)
+                    source_solution_pool.push_back(std::move(candidate));
+            }
+            Partition trivial = Partition::trivial(prob, dag);
+            trivial.finalize(&shared_cache);
+            Solution fallback = Solution::from_partition(prob, dag, trivial, 8, &shared_cache);
+            if (fallback.validate().valid)
+                source_solution_pool.push_back(std::move(fallback));
+            if (source_solution_pool.empty())
+                throw std::logic_error(
+                    "Source-constrained solve produced no disjoint fallback solution");
+            std::stable_sort(
+                source_solution_pool.begin(), source_solution_pool.end(),
+                [](const Solution& lhs, const Solution& rhs) {
+                    return lhs.total_latency() < rhs.total_latency();
+                });
+            final_sol = source_solution_pool.front();
+        } else {
+            partition_pool[0].rebuild_index();
+            partition_pool[0].finalize(&shared_cache);
+            auto dfs_res  = dfs_ordering(partition_pool[0]);
+            auto steps    = Solution::steps_from_ordering(
+                prob, dag, partition_pool[0], dfs_res, &shared_cache);
+            final_sol = Solution(prob, dag, std::move(steps));
+            if (!final_sol.validate().valid)
+                final_sol = Solution::from_partition(prob, dag, partition_pool[0]);
+        }
 
         after_build = final_sol.total_latency();
         auto phase2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -365,6 +429,31 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
               << " ret=" << shared_cache.ret_size()
               << " (" << shared_cache.ret_hits() << "h/" << shared_cache.ret_misses() << "m)";
     std::cerr << "\n";
+
+    if (candidate_solutions != nullptr) {
+        candidate_solutions->clear();
+        if (prob.require_source_codegen && !source_solution_pool.empty()) {
+            *candidate_solutions = source_solution_pool;
+        } else {
+            candidate_solutions->push_back(final_sol);
+        }
+        if (!has_retain && !prob.require_source_codegen) {
+            for (size_t index = 1; index < partition_pool.size(); ++index) {
+                Partition candidate_partition = partition_pool[index];
+                candidate_partition.rebuild_index();
+                candidate_partition.finalize(&shared_cache);
+                Solution candidate = Solution::from_partition(
+                    prob, dag, candidate_partition, 8, &shared_cache);
+                if (candidate.validate().valid)
+                    candidate_solutions->push_back(std::move(candidate));
+            }
+            std::stable_sort(
+                candidate_solutions->begin() + 1, candidate_solutions->end(),
+                [](const Solution& lhs, const Solution& rhs) {
+                    return lhs.total_latency() < rhs.total_latency();
+                });
+        }
+    }
 
     return final_sol;
 }

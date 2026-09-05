@@ -143,6 +143,18 @@ class Ascend910BTarget(TargetProfile):
             },
             "vec_reg_bytes": 256,
             "vec_dma_align_bytes": 32,
+            # A2/A3 tcvt accepts small INT32->FP16 tiles and complete
+            # 128-element fragments, but a wider incomplete final fragment is
+            # silently mis-lowered. Source-first solving must choose a strip
+            # whose emitted physical frame avoids that class; PyPTO separately
+            # legalizes arbitrary callers by fragmenting the cast.
+            "tcvt_safe_fragment_widths": [
+                {
+                    "source_dtype": "INT32",
+                    "target_dtype": "FP16",
+                    "width": 128,
+                }
+            ],
             "vec_op_head": 14.0,
             "vec_op_tail": 18.0,
             "vec_slope_pw": 2.0,

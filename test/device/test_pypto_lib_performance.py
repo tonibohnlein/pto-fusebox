@@ -28,7 +28,7 @@ from pypto_lib_static_controls import (
 from torch import nn
 
 from pto_fusebox import (
-    bind_emitted_inputs,
+    bind_emitted_call,
     emit_pypto_region,
     export_and_normalize,
     solve_graph,
@@ -264,7 +264,6 @@ def test_generated_source_matches_control_and_characterizes_performance(
     )
     generated_program = pl.parse_program(emitted.source)
     control_program = pl.parse_program(comparison.control_source)
-    generated_args = bind_emitted_inputs(module, graph, emitted, args)
     control_args = _control_arguments(comparison, module, args)
     expected = _reference(comparison, module, args)
     generated_output = torch.full_like(expected, torch.nan)
@@ -288,7 +287,10 @@ def test_generated_source_matches_control_and_characterizes_performance(
         generated_program, **generated_config.compile_kwargs()
     )
     control_compiled = ir.compile(control_program, **control_config.compile_kwargs())
-    generated_compiled(*generated_args, generated_output, config=generated_config)
+    generated_dispatch = bind_emitted_call(
+        module, graph, emitted, args, (generated_output,)
+    )
+    generated_compiled(*generated_dispatch, config=generated_config)
     control_compiled(*control_args, control_output, config=control_config)
     torch.testing.assert_close(
         generated_output, expected, rtol=comparison.rtol, atol=comparison.atol
@@ -312,7 +314,6 @@ def test_generated_source_matches_control_and_characterizes_performance(
     rounds = int(os.environ.get("PTO_FUSEBOX_PERF_ROUNDS", "30"))
     warmup = int(os.environ.get("PTO_FUSEBOX_PERF_WARMUP", "5"))
     assert rounds > 0 and warmup >= 0
-    generated_dispatch = (*generated_args, generated_output)
     control_dispatch = (*control_args, control_output)
     generated_first = runtime.benchmark(
         generated_compiled,

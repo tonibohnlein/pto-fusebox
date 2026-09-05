@@ -1,6 +1,6 @@
 """Public Torch/FX capture and PTO-Fusebox scheduling API."""
 
-from .bindings import InputBindingError, bind_emitted_inputs
+from .bindings import InputBindingError, bind_emitted_call, bind_emitted_inputs
 
 from .cube_sweep import (
     CUBE_PLAN_SWEEP_SCHEMA,
@@ -58,7 +58,13 @@ from .schedule import (
     ScheduledRegion,
     scheduled_region,
 )
-from .solver import RegionSolveResult, SolveResult, solve_graph
+from .solver import (
+    SOURCE_CANDIDATE_SUMMARY_SCHEMA,
+    RegionSolveResult,
+    SolveResult,
+    SourceCandidateSummary,
+    solve_graph,
+)
 from .source import (
     EmittedPyPTOCallable,
     EmittedPyPTOStaticBundle,
@@ -78,6 +84,7 @@ __all__ = [
     "NORMALIZED_GRAPH_SCHEMA",
     "PROBLEM_SCHEMA",
     "SOLUTION_SCHEMA",
+    "SOURCE_CANDIDATE_SUMMARY_SCHEMA",
     "Ascend910BTarget",
     "AxisPartition",
     "CUBE_PLAN_SWEEP_SCHEMA",
@@ -111,10 +118,12 @@ __all__ = [
     "SolveResult",
     "SolverRegion",
     "SourceEmissionError",
+    "SourceCandidateSummary",
     "StaticRegionOwnership",
     "TargetProfile",
     "ValidatedPyPTOLibModel",
     "can_emit_region",
+    "bind_emitted_call",
     "bind_emitted_inputs",
     "export_and_normalize",
     "emit_pypto_callable",

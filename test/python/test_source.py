@@ -7,6 +7,7 @@ from dataclasses import replace
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -22,6 +23,8 @@ from pto_fusebox import (
     PyPTORuntimeValidShapeArgument,
     RegionSolveResult,
     RuntimeValidShapeSpec,
+    InputBindingError,
+    bind_emitted_call,
     bind_emitted_inputs,
     emit_pypto_callable,
     KernelKind,
@@ -87,6 +90,7 @@ def _solve_module(
     args: tuple[torch.Tensor, ...],
     *,
     require_source_codegen: bool = True,
+    collect_candidate_summaries: bool = False,
 ):
     graph = export_and_normalize(module, args)
     solved = solve_graph(
@@ -94,6 +98,7 @@ def _solve_module(
         solver_binary=_solver(),
         solver_workers=2,
         require_source_codegen=require_source_codegen,
+        collect_candidate_summaries=collect_candidate_summaries,
     )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
@@ -1258,6 +1263,36 @@ def test_emitted_abi_reorders_torch_inputs_by_normalized_value_id() -> None:
         actual is expected
         for actual, expected in zip(bound, (args[1], args[0], args[2]), strict=True)
     )
+
+    output_shape = graph.value_map()[emitted.output_value_ids[0]].shape
+    assert all(isinstance(dim, int) for dim in output_shape)
+    output = torch.empty(cast(tuple[int, ...], output_shape))
+    call = bind_emitted_call(module, graph, emitted, args, (output,))
+    assert call == (*bound, output)
+
+    with pytest.raises(InputBindingError, match="expects dtype"):
+        bind_emitted_call(
+            module,
+            graph,
+            emitted,
+            args,
+            (output.to(torch.bfloat16),),
+        )
+
+
+def test_emitted_call_rejects_an_input_as_a_pure_output_buffer() -> None:
+    class Pointwise(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.exp(value)
+
+    module = Pointwise()
+    args = (torch.zeros(16, 128),)
+    graph, result = _solve_module(module, args)
+    emitted = emit_pypto_region(graph, result, program_name="pointwise_abi")
+
+    for output in (args[0], args[0].view_as(args[0])):
+        with pytest.raises(InputBindingError, match="aliased input and output"):
+            bind_emitted_call(module, graph, emitted, args, (output,))
 
 
 def test_callable_source_exposes_the_stable_named_region_abi() -> None:
@@ -3138,9 +3173,16 @@ def test_reduction_result_cast_is_analytic_but_not_source_ready() -> None:
         ReductionResultCast(),
         (torch.randn(16, 512),),
         require_source_codegen=False,
+        collect_candidate_summaries=True,
     )
 
     assert result.status == "solved"
+    assert result.candidate_summaries
+    assert result.candidate_summaries[0].selected
+    assert not result.candidate_summaries[0].source_ready
+    assert "cast chain rooted in a reduction result" in (
+        result.candidate_summaries[0].rejection_reason or ""
+    )
     assert not can_emit_region(graph, result)
     with pytest.raises(
         SourceEmissionError, match="cast chain rooted in a reduction result"

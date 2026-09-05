@@ -5339,6 +5339,51 @@ static void test_native_cast_chain_uses_dtype_sized_pebble_bands() {
           plan.full_peak_ub_bytes == plan.tile_h * plan.tile_w * 6);
 }
 
+static void test_source_cast_fragment_capability_preserves_analytic_search() {
+    std::cout << "[CASTFRAG] source-only cast shape constraints preserve analytic plans\n";
+    Problem p;
+    p.tensors = {{7168, 16, DType::INT32}, {7168, 16, DType::FP16}};
+    p.ops = {{OpType::Pointwise, {0}, {1}}};
+    p.ops[0].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[0].vector_primitive = VectorPrimitiveFamily::Cast;
+    p.ops[0].vector_geometry = VectorOpGeometry::Flat;
+    p.required_outputs = {1};
+    p.fast_memory_capacity = 1 << 24;
+    p.tcvt_safe_fragment_widths = {{DType::INT32, DType::FP16, 128}};
+    set_910b(p);
+
+    DAG analytic_dag = DAG::build(p);
+    auto analytic = Subgraph::create(p, analytic_dag, {0});
+    const TileConfig config{224, 16, 1};
+    const VectorStreamPlan analytic_plan =
+        analytic ? analytic->vector_stream_plan(config) : VectorStreamPlan{};
+    CHECK("CASTFRAG: analytic plan ignores the source-only capability",
+          analytic_plan.feasible && analytic_plan.strip_w == 224);
+
+    Problem unconstrained = p;
+    unconstrained.tcvt_safe_fragment_widths.clear();
+    DAG unconstrained_dag = DAG::build(unconstrained);
+    auto unconstrained_subgraph = Subgraph::create(unconstrained, unconstrained_dag, {0});
+    const VectorStreamPlan unconstrained_plan =
+        unconstrained_subgraph ? unconstrained_subgraph->vector_stream_plan(config)
+                               : VectorStreamPlan{};
+    CHECK("CASTFRAG: declaring a capability does not perturb analytic geometry",
+          unconstrained_plan.feasible &&
+              analytic_plan.strip_w == unconstrained_plan.strip_w &&
+              analytic_plan.full_peak_ub_bytes == unconstrained_plan.full_peak_ub_bytes);
+
+    p.require_source_codegen = true;
+    DAG source_dag = DAG::build(p);
+    auto source = Subgraph::create(p, source_dag, {0});
+    const VectorStreamPlan source_plan =
+        source ? source->vector_stream_plan(config) : VectorStreamPlan{};
+    CHECK("CASTFRAG: source plan selects a safe physical cast strip",
+          source_plan.feasible && source_plan.strip_w > 0 &&
+              (source_plan.strip_w <= 128 || source_plan.strip_w % 128 == 0));
+    CHECK("CASTFRAG: source plan changes the unsafe analytic strip",
+          source_plan.strip_w != analytic_plan.strip_w);
+}
+
 static void test_native_cast_chain_broadcast_shares_physical_axis() {
     std::cout << "[CASTCLASS] cast and broadcast operands share their non-singleton frame\n";
     Problem p;
@@ -5630,6 +5675,7 @@ int main() {
     test_cost_cache_concurrent_publication();
     test_vector_capability_gates_cost_admission();
     test_native_cast_chain_uses_dtype_sized_pebble_bands();
+    test_source_cast_fragment_capability_preserves_analytic_search();
     test_native_cast_chain_broadcast_shares_physical_axis();
     test_reduction_state_uses_its_class_local_granule();
     test_singleton_column_transform_reaches_vector_plan();

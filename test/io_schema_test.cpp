@@ -48,6 +48,9 @@ int main() {
     "fast_memory_capacity": 1073741824,
     "cube_freq_hz": 1850000000.0,
     "vec_dma_align_bytes": 64,
+    "tcvt_safe_fragment_widths": [
+      {"source_dtype": "INT32", "target_dtype": "FP16", "width": 128}
+    ],
     "require_source_codegen": true,
     "allow_model_ahead_split_k": false,
     "allow_model_ahead_multi_reduction_stream": false
@@ -65,6 +68,11 @@ int main() {
                 P4SubstitutionValue::RunningMax);
   check("mixed compatibility parses", !problem.ops[1].mixed_emit_compatible);
   check("DMA alignment parses", problem.vec_dma_align_bytes == 64);
+  check("tcvt safe fragment parses",
+        problem.tcvt_safe_fragment_widths.size() == 1 &&
+            problem.tcvt_safe_fragment_widths[0].source_dtype == DType::INT32 &&
+            problem.tcvt_safe_fragment_widths[0].target_dtype == DType::FP16 &&
+            problem.tcvt_safe_fragment_widths[0].width == 128);
   check("external source policy parses", problem.require_source_codegen);
   check("model-ahead split-K parses", !problem.allow_model_ahead_split_k);
   check("model-ahead P4 parses", !problem.allow_model_ahead_multi_reduction_stream);

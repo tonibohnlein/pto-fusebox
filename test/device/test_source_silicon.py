@@ -33,7 +33,7 @@ from torch import nn
 
 from pto_fusebox import (
     RegionSolveResult,
-    bind_emitted_inputs,
+    bind_emitted_call,
     can_emit_region,
     emit_pypto_region,
     export_and_normalize,
@@ -818,7 +818,6 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     _assert_static_artifact(compiled, case, plan)
     for seed in range(seed_count):
         args = case.make_args(seed)
-        runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():
             expected = (
                 case.module(*args)
@@ -826,14 +825,16 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
                 else case.reference(case.module, args)
             )
         output = torch.full_like(expected, torch.nan)
-        compiled(*runtime_args, output, config=config)
+        compiled(
+            *bind_emitted_call(case.module, graph, emitted, args, (output,)),
+            config=config,
+        )
         _assert_numerics(case, seed, output, expected)
 
     repeat_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_REPEATS", "1"))
     assert repeat_count > 0
     if repeat_count > 1:
         args = case.make_args(0)
-        runtime_args = bind_emitted_inputs(case.module, graph, emitted, args)
         with torch.no_grad():
             expected = (
                 case.module(*args)
@@ -843,7 +844,10 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         signatures: set[str] = set()
         for repeat in range(repeat_count):
             output = torch.full_like(expected, torch.nan)
-            compiled(*runtime_args, output, config=config)
+            compiled(
+                *bind_emitted_call(case.module, graph, emitted, args, (output,)),
+                config=config,
+            )
             _assert_numerics(case, repeat, output, expected)
             signatures.add(_output_signature(output))
         assert len(signatures) == 1, (

@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -386,6 +387,93 @@ def test_production_mtp_graph_uses_explicit_static_geometry(
         geometry.hyperconnections,
         geometry.hidden_size,
     )
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates() -> (
+    None
+):
+    """Source search avoids the A2/A3 wide-tail tcvt lowering defect."""
+
+    module, args = build_production_mtp_projection_branch(DEEPSEEK_V4_PRO_MTP_GEOMETRY)
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+
+    assert solved.regions_solved and solved.whole_graph_codegen_ready
+    assert len(solved.regions) == 1
+    result = solved.regions[0]
+    assert result.problem is not None
+    assert result.solution is not None
+    constraints = result.problem["tcvt_safe_fragment_widths"]
+    assert constraints == [
+        {"source_dtype": "INT32", "target_dtype": "FP16", "width": 128}
+    ]
+    assert len(result.candidate_summaries) >= 2
+    assert result.candidate_summaries[0].selected
+    assert all(
+        candidate.source_ready and candidate.rejection_reason is None
+        for candidate in result.candidate_summaries
+    )
+    assert [
+        candidate.modeled_cost_cycles for candidate in result.candidate_summaries
+    ] == sorted(
+        candidate.modeled_cost_cycles for candidate in result.candidate_summaries
+    )
+    selected_summary = result.candidate_summaries[0]
+    assert selected_summary.partition == tuple(
+        tuple(step["ops"]) for step in result.solution["steps"]
+    )
+    assert selected_summary.schedule == tuple(result.solution["steps"])
+    assert len(selected_summary.memory) == len(selected_summary.partition)
+    assert all(plan for plan in selected_summary.memory)
+
+    dtypes = result.problem["dtypes"]
+    inputs = result.problem["inputs"]
+    outputs = result.problem["outputs"]
+    primitives = result.problem["vector_primitive_families"]
+    selected_widths: list[int] = []
+
+    def inspect_vector_plan(plan: dict[str, Any]) -> None:
+        phases = plan.get("phases")
+        assert isinstance(phases, list)
+        for phase in phases:
+            assert isinstance(phase, dict)
+            frames = {
+                frame["tensor"]: frame["physical"] for frame in phase["tensor_frames"]
+            }
+            for op_index in phase["ops"]:
+                if primitives[op_index] != "cast":
+                    continue
+                source_tensor = inputs[op_index][0]
+                target_tensor = outputs[op_index][0]
+                if dtypes[source_tensor] == "INT32" and dtypes[target_tensor] == "FP16":
+                    selected_widths.append(frames[source_tensor][1])
+
+    for step in result.solution["steps"]:
+        plan = step["plan"]
+        if step["kind"] == "vector":
+            inspect_vector_plan(plan)
+        elif step["kind"] == "mixed":
+            for stage in plan["stages"]:
+                if stage["vector_stream"] is not None:
+                    inspect_vector_plan(stage["vector_stream"])
+
+    assert selected_widths
+    assert all(width <= 128 or width % 128 == 0 for width in selected_widths)
+    emitted = emit_pypto_callable(
+        graph,
+        result,
+        function_name="deepseek_v4_pro_safe_cast",
+    )
+    ast.parse(emitted.source)
 
 
 @pytest.mark.skipif(

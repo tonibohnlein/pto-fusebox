@@ -56,6 +56,12 @@ struct Tensor {
     int64_t size_bytes() const { return width * height * dtype_bytes(dtype); }  // bytes
 };
 
+struct TcvtSafeFragmentWidth {
+    DType source_dtype = DType::FP32;
+    DType target_dtype = DType::FP32;
+    int64_t width = 0;
+};
+
 // Coarse op category. Broadcast and the reduction AXIS are inferred from
 // input/output shapes (a Reduction collapses a dim [H,W]->[H,1]; a broadcast
 // input has extent 1 in a dim it is consumed along). The enum only carries what
@@ -315,6 +321,11 @@ struct Problem {
     // of 3 -> 8 for fp32) is otherwise under-counted ~2.7x, making a group look UB-feasible that
     // the emit overflows. Set by the AutoFuse adapter from BackendHandler::GetVectorDmaAlignment.
     int64_t vec_dma_align_bytes = 32;
+    // Backend-declared shape restrictions for native vector casts. In source-first mode, a
+    // physical cast frame wider than `width` must consist only of complete `width`-element
+    // fragments; otherwise the candidate is excluded and search continues. Analytic mode
+    // deliberately ignores these source-realization constraints.
+    std::vector<TcvtSafeFragmentWidth> tcvt_safe_fragment_widths;
     double vec_op_head = 0.0;         // per-op pipeline startup cycles (~14)
     double vec_op_tail = 0.0;         // per-op drain cycles (~18)
     double vec_slope_pw = 0.0;        // cycles/repeat, elementwise (~2)

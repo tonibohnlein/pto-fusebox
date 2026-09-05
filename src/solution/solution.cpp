@@ -250,7 +250,14 @@ Solution::ValidationResult Solution::validate() const {
     // Coverage
     FlatSet<size_t> covered;
     for (auto& step : steps_)
-        for (auto op : step.subgraph.ops()) covered.insert(op);
+        for (auto op : step.subgraph.ops()) {
+            const bool inserted = covered.insert(op).second;
+            if (prob_->require_source_codegen && !inserted) {
+                fail("Op " + std::to_string(op) +
+                     " is recomputed by more than one source launch");
+                return vr;
+            }
+        }
     for (size_t i = 0; i < prob_->num_ops(); i++)
         if (!covered.count(i)) { fail("Op " + std::to_string(i) + " not covered"); return vr; }
 
