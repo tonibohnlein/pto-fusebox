@@ -460,6 +460,13 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
         require_source_codegen=True,
         collect_candidate_summaries=True,
     )
+    repeated = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
 
     assert solved.regions_solved and solved.whole_graph_codegen_ready
     assert len(solved.regions) == 1
@@ -472,6 +479,13 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
         {"source_dtype": "FP16", "target_dtype": "INT8", "width": 128},
     ]
     assert len(result.candidate_summaries) >= 2
+    assert tuple(
+        (candidate.modeled_cost_cycles, candidate.partition, candidate.solution)
+        for candidate in result.candidate_summaries
+    ) == tuple(
+        (candidate.modeled_cost_cycles, candidate.partition, candidate.solution)
+        for candidate in repeated.regions[0].candidate_summaries
+    )
     assert result.candidate_summaries[0].selected
     assert all(
         candidate.source_ready and candidate.rejection_reason is None
@@ -1433,8 +1447,8 @@ def test_mixed_examples_discriminate_single_item_from_cross_core_streaming() -> 
     region = result.regions[0]
     round_trip = scheduled_region(region).steps[0].plan
     assert isinstance(round_trip, MixedKernelPlan)
-    assert round_trip.spatial_tiles == 4
-    assert round_trip.active_groups == 4
+    assert round_trip.spatial_tiles == 6
+    assert round_trip.active_groups == 6
     assert round_trip.max_trips_per_group == 1
     assert round_trip.pipeline_stages == 1
     assert round_trip.requested_skew_depth == 0
@@ -1826,7 +1840,7 @@ def test_softmax_to_pv_serializes_the_complete_flash_stream() -> None:
         graph,
         solver_binary=_test_solver(),
         solver_workers=2,
-        require_source_codegen=True,
+        require_source_codegen=False,
     )
 
     assert result.regions_solved

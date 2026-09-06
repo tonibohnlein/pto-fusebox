@@ -88,6 +88,25 @@ analytic search unchanged. The selected and runner-up partitions are observable
 through candidate summaries. PyPTO fragments arbitrary callers of either cast
 into safe physical subviews.
 
+Source-first memory admission now covers three separate contracts: Vec/UB and
+Mat/L1 stage peaks, lowered L0A/L0B operand families including outer-pipeline
+depth, and whole-program Mat/L1 residency across every selected task. The last
+contract may select a legal multi-step cube→mixed→cube program when a larger
+single mixed task plus its neighbouring cube allocation would exceed the
+shared arena. Candidate summaries and mixed group sweeps expose these memory
+quantities directly; source emission repeats the target checks and fails
+closed before invoking PyPTO if a serialized plan is stale.
+
+Alternative source-plan reporting is no longer populated from a
+deadline-dependent evolutionary pool. Regions with at most six lowered
+operations enumerate every valid set partition; larger regions use a fixed
+strategy corpus alongside the selected solution. Both paths sort by modeled
+cost and a canonical partition key. Candidate collection remains an
+observability option and does not alter the solve. The rebuilt CVC calibration
+and blind-holdout corpora contain at least three source-ready group choices per
+shape; their ranking and generic feature-round-trip performance remain device
+validation work, not host-side closure.
+
 ## Python API
 
 Install the optional Torch frontend dependencies and import the public package:
@@ -246,7 +265,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v7`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v8`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -287,7 +306,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v7`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v8`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a

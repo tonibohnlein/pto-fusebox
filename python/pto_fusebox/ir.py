@@ -11,7 +11,7 @@ from typing import Any
 
 NORMALIZED_GRAPH_SCHEMA = "pto_fusebox.normalized_graph.v1"
 PROBLEM_SCHEMA = "pto_fusebox.problem.v1"
-SOLUTION_SCHEMA = "pto_fusebox.solution.v7"
+SOLUTION_SCHEMA = "pto_fusebox.solution.v8"
 
 _UNARY_NORMALIZED_OPS = {
     "abs",

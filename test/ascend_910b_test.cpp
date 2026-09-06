@@ -1664,8 +1664,14 @@ static void test_mixed_schedule_plan() {
 
     Problem large_k = p;
     large_k.tensors = {{8192, 192}, {256, 8192}, {256, 1}, {256, 192}, {256, 192}};
-    DAG large_k_dag = DAG::build(large_k);
-    auto large_k_mixed = Ascend910BMixed::create(large_k, large_k_dag, {0, 1});
+    // This discriminator exercises the analytic sequential-K window.  The
+    // forced outer grid is not a source-ready allocation family; source-first
+    // costing correctly rejects it after the lowered L0/L1 admission checks.
+    Problem large_k_analytic = large_k;
+    large_k_analytic.require_buildable_mixed = false;
+    DAG large_k_dag = DAG::build(large_k_analytic);
+    auto large_k_mixed = Ascend910BMixed::create(
+        large_k_analytic, large_k_dag, {0, 1});
     const TileConfig large_k_cfg{32, 32, 8192, 6, 8, 1};
     const auto large_k_plan =
         large_k_mixed ? large_k_mixed->mixed_schedule_plan(large_k_cfg) : MixedSchedulePlan{};
@@ -2185,6 +2191,10 @@ static void test_mixed_schedule_plan() {
     p.fuse_cube_vector = true;
     p.require_buildable_mixed = true;
     set_910b(p);
+    // This discriminator isolates the aggregate L1 window rule; keep the
+    // independent lowered operand pools out of its way.
+    p.l0_matmul_config.l0a_bytes = 512 * 1024;
+    p.l0_matmul_config.l0b_bytes = 512 * 1024;
     DAG dag = DAG::build(p);
     auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
     CHECK("MIXPLAN: multi-window feature round trip is admitted", (bool)mixed);
@@ -2200,6 +2210,22 @@ static void test_mixed_schedule_plan() {
                     std::vector<int64_t>({16, 16}) &&
                 plan.cube_stage_peak_l1_bytes ==
                     3 * (producer_panels + sink_panel));
+      CHECK("MIXPLAN: feature source plan publishes lowered L0 operand peaks",
+            plan.cube_stage_peak_l0a_bytes > 0 &&
+                plan.cube_stage_peak_l0b_bytes > 64 * 1024);
+
+      Problem target_l0 = p;
+      target_l0.l0_matmul_config.l0a_bytes = 64 * 1024;
+      target_l0.l0_matmul_config.l0b_bytes = 64 * 1024;
+      DAG target_l0_dag = DAG::build(target_l0);
+      auto target_l0_mixed = Ascend910BMixed::create(
+          target_l0, target_l0_dag, {0, 1, 2, 3});
+      CHECK("MIXPLAN: lowered L0B overflow is rejected during admission",
+            target_l0_mixed &&
+                !target_l0_mixed
+                     ->mixed_schedule_plan(
+                         TileConfig{64, 16, 224, 2, 1, 1})
+                     .feasible);
     }
   }
 
@@ -2230,6 +2256,9 @@ static void test_mixed_schedule_plan() {
     p.fuse_cube_vector = true;
     p.require_buildable_mixed = true;
     set_910b(p);
+    // This discriminator isolates joint L1 window selection.
+    p.l0_matmul_config.l0a_bytes = 512 * 1024;
+    p.l0_matmul_config.l0b_bytes = 512 * 1024;
     DAG dag = DAG::build(p);
     auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
     CHECK("MIXPLAN: joint feature-window discriminator is recognized",

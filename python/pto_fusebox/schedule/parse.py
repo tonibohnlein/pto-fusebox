@@ -1320,6 +1320,9 @@ def _parse_mixed_plan(
         "group_capacity",
         "cube_window_k",
         "cube_stage_peak_l1_bytes",
+        "cube_stage_peak_l0a_bytes",
+        "cube_stage_peak_l0b_bytes",
+        "source_l1_allocation_bytes",
         "vector_stage_kind",
         "vector_stage_peak_ub_bytes",
         "vector_split",
@@ -1414,6 +1417,18 @@ def _parse_mixed_plan(
         cube_stage_peak_l1_bytes=_nonnegative_int(
             item.get("cube_stage_peak_l1_bytes"),
             f"{field}.cube_stage_peak_l1_bytes",
+        ),
+        cube_stage_peak_l0a_bytes=_nonnegative_int(
+            item.get("cube_stage_peak_l0a_bytes"),
+            f"{field}.cube_stage_peak_l0a_bytes",
+        ),
+        cube_stage_peak_l0b_bytes=_nonnegative_int(
+            item.get("cube_stage_peak_l0b_bytes"),
+            f"{field}.cube_stage_peak_l0b_bytes",
+        ),
+        source_l1_allocation_bytes=_nonnegative_int(
+            item.get("source_l1_allocation_bytes"),
+            f"{field}.source_l1_allocation_bytes",
         ),
         vector_stage_kind=_enum(
             VectorStreamKind,
@@ -1750,6 +1765,26 @@ def _validate_mixed_contract(  # noqa: PLR0913
     if plan.cube_stage_peak_l1_bytes <= 0 and not fifo_owned_dual_role:
         raise ScheduleContractError(
             f"{field}.cube_stage_peak_l1_bytes must be positive for source replay"
+        )
+    if plan.cube_stage_peak_l0a_bytes <= 0:
+        raise ScheduleContractError(
+            f"{field}.cube_stage_peak_l0a_bytes must be positive for source replay"
+        )
+    if plan.cube_stage_peak_l0b_bytes <= 0:
+        raise ScheduleContractError(
+            f"{field}.cube_stage_peak_l0b_bytes must be positive for source replay"
+        )
+    v2c_reserved_bytes = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    )
+    if plan.source_l1_allocation_bytes < (
+        plan.cube_stage_peak_l1_bytes + v2c_reserved_bytes
+    ):
+        raise ScheduleContractError(
+            f"{field}.source_l1_allocation_bytes is below its cube-stage peak "
+            "plus V2C FIFO reservation"
         )
     if plan.split_k != 1 or launch.split != 1:
         raise ScheduleContractError(f"{field} source-ready mixed replay cannot split K")
@@ -2287,6 +2322,7 @@ def _parse_cube_plan(
             "split_k",
             "work_units",
             "peak_l1_bytes",
+            "source_l1_allocation_bytes",
             "split_merge_policy",
             "first_partial_then_atomic",
             "aiv_zero_seed_then_atomic",
@@ -2372,6 +2408,10 @@ def _parse_cube_plan(
         work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
         peak_l1_bytes=_nonnegative_int(
             item.get("peak_l1_bytes"), f"{field}.peak_l1_bytes"
+        ),
+        source_l1_allocation_bytes=_nonnegative_int(
+            item.get("source_l1_allocation_bytes"),
+            f"{field}.source_l1_allocation_bytes",
         ),
         split_merge_policy=_enum(
             CubeSplitMergePolicy,

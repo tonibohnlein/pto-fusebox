@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
-  with its modeled cost and ordinary `solution.v7` replay payload; and
+  with its modeled cost and ordinary `solution.v8` replay payload; and
 - `mixed_group_sweep`: enumerate every uniform active-group assignment for the
   model-selected mixed tile with its production pipe/stage cycles, issued bytes,
   and effective-port-parallelism breakdown, or report the exact whole-region
@@ -297,7 +297,7 @@ explicit fan-out, lifetime, and per-consumer FIFO ownership and must not be
 inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v7`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v8`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path
@@ -397,6 +397,21 @@ PTO_FUSEBOX_DEVICE_ID=<physical-id> \
 PTO_FUSEBOX_SOLVER=build/mlsys_mixed \
 PYTHONPATH=python:<pypto-checkout>/python \
 python -m pytest test/device/test_pypto_lib_performance.py -v -s
+```
+
+The source-ready CVC holdout sweep and generic feature-round-trip comparison
+are separate opt-in matrices. The former times every admitted group choice;
+the latter compares the selected partition with the best independently
+enumerated source-ready partition having different kernel boundaries:
+
+```bash
+PTO_FUSEBOX_RUN_DEVICE_TESTS=1 \
+PTO_FUSEBOX_DEVICE_ID=<physical-id> \
+PTO_FUSEBOX_SOLVER=build/mlsys_mixed \
+PYTHONPATH=python:<pypto-checkout>/python \
+python -m pytest \
+  test/device/test_mixed_cvc_calibration.py \
+  test/device/test_feature_round_trip_performance.py -v -s
 ```
 
 The opt-in source-integration suite separately exercises callable expansion

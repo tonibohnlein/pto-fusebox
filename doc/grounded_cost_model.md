@@ -485,16 +485,33 @@ reject a fused candidate that fits with smaller child windows. This keeps
 source-first solving aligned with LowerPipelineLoops without either assuming
 serial panel reuse or permanently reserving a full producer operand.
 
+Source admission also prices the lowered L0A and L0B operand families. The
+child matmul plan supplies the physical fractal-aligned operand shape and its
+native ping-pong depth; an enclosing mixed loop raises that depth when its
+pipeline keeps more operand frames live. L0A and L0B are checked independently
+against their 64-KiB target pools and are serialized in mixed plans and group
+sweeps. This prevents a plan from being labelled source-ready only to fail in
+PyPTO allocation after its Right or Left family is expanded.
+
+The per-task L1 quantity is not sufficient for a multi-step source region.
+PyPTO outlines every selected step in one program whose task-local Mat
+allocation families share a physical arena. Source solution validation
+therefore sums the emitted allocation families of every cube and mixed step
+and rejects the partition when that whole-program residency exceeds L1. This
+is intentionally separate from each step's execution-time L1 peak: sequential
+task execution does not imply that their statically allocated families alias.
+
 If the selected source solution contains a GM cut, the Python availability API
 can probe the complete op set through the same diagnostic binary. It reports a
 stable rejection code and the closest legal grid's required and available
-vector/L1 bytes. This distinguishes a cheaper selected cut from an impossible
-whole-region mixed candidate. For example, the former A3/A5 calibration shapes
-are rejected because their legal 16-fractal grids require 245,920 B and
-491,680 B of vector storage respectively, above the 188,416-byte target limit;
-this is not a missing CVC topology. The rankable CVC corpus therefore uses
-source-ready geometries and verifies at least three active-group choices per
-shape.
+vector, L1, L0A, and L0B bytes. This distinguishes a cheaper selected cut from
+an impossible whole-region mixed candidate. Each realizable group candidate
+also publishes all four on-chip quantities, so calibration cannot rank an
+unbuildable row. The rebuilt rankable CVC corpus spans 96--768 output rows and
+uses independent calibration and holdout shape sets. Every row has at least
+three source-ready active-group choices. Its silicon ranking must be
+re-established after this stricter admission rather than reusing rows that
+contained lowered-capacity failures.
 
 A successor loop is pipelined only when every group has at least two complete items. In particular,
 a one-trip C→V→C candidate is serialized as `pl.range(1)` with pipeline depth 1 and no skew.

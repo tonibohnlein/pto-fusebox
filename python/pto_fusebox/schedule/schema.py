@@ -480,6 +480,7 @@ class CubeKernelPlan:
     split_k: int
     work_units: int
     peak_l1_bytes: int
+    source_l1_allocation_bytes: int
     split_merge_policy: CubeSplitMergePolicy
     first_partial_then_atomic: CubeFirstPartialThenAtomicPlan
     aiv_zero_seed_then_atomic: CubeAivZeroSeedThenAtomicPlan
@@ -555,6 +556,9 @@ class MixedKernelPlan:
     group_capacity: int
     cube_window_k: int
     cube_stage_peak_l1_bytes: int
+    cube_stage_peak_l0a_bytes: int
+    cube_stage_peak_l0b_bytes: int
+    source_l1_allocation_bytes: int
     vector_stage_kind: VectorStreamKind
     vector_stage_peak_ub_bytes: int
     vector_split: MixedVectorSplit

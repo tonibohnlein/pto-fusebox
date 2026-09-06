@@ -1761,6 +1761,47 @@ def test_mixed_source_rejects_cube_peak_plus_v2c_rings_over_l1_capacity() -> Non
         emit_pypto_region(graph, stale)
 
 
+def test_mixed_source_rejects_lowered_l0b_family_over_capacity() -> None:
+    graph, result = _solved("attention_core")
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.cube_stage_peak_l0b_bytes > 0
+    assert result.problem is not None
+    problem = copy.deepcopy(result.problem)
+    problem["l0_matmul_config"]["l0b_bytes"] = plan.cube_stage_peak_l0b_bytes - 1
+    stale = replace(result, problem=problem)
+
+    assert not can_emit_region(graph, stale)
+    with pytest.raises(
+        SourceEmissionError, match="cube stage exceeds lowered L0B capacity"
+    ):
+        emit_pypto_region(graph, stale)
+
+
+def test_mixed_source_rejects_complete_l1_allocation_family_over_capacity() -> None:
+    graph, result = _solve_module(
+        _C2VEpilogue(),
+        (
+            torch.zeros(192, 64),
+            torch.zeros(64, 256),
+            torch.zeros(1, 256),
+        ),
+    )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.source_l1_allocation_bytes > plan.cube_stage_peak_l1_bytes
+    assert result.problem is not None
+    problem = dict(result.problem)
+    problem["l1_capacity"] = plan.source_l1_allocation_bytes - 1
+    stale = replace(result, problem=problem)
+
+    assert not can_emit_region(graph, stale)
+    with pytest.raises(
+        SourceEmissionError, match="source allocation families exceed L1 capacity"
+    ):
+        emit_pypto_region(graph, stale)
+
+
 def test_one_way_c2v_emits_matmul_and_generic_vector_epilogue() -> None:
     graph, result = _solve_module(
         _C2VEpilogue(),
@@ -1993,9 +2034,9 @@ def test_cvc_replays_frozen_group_count_controls(
     graph = export_and_normalize(
         StaticAttentionCore(),
         (
-            torch.zeros(768, 64),
-            torch.zeros(64, 64),
-            torch.zeros(64, 128),
+            torch.zeros(384, 32),
+            torch.zeros(32, 32),
+            torch.zeros(32, 64),
         ),
     )
     solved = solve_graph(
@@ -2015,8 +2056,8 @@ def test_cvc_replays_frozen_group_count_controls(
     assert result.problem["require_source_codegen"] is True
     assert plan["m_partition"] == {
         "parts": 12,
-        "small": 64,
-        "big": 64,
+        "small": 32,
+        "big": 32,
         "num_big": 0,
     }
     c2v_ring_bytes = sum(
@@ -2024,9 +2065,9 @@ def test_cvc_replays_frozen_group_count_controls(
         for fifo in plan["fifos"]
         if fifo["direction"] == "cube_to_vector"
     )
-    assert plan["vector_stage_peak_ub_bytes"] == 49280
-    assert c2v_ring_bytes == 65536
-    assert plan["vector_stage_peak_ub_bytes"] + c2v_ring_bytes == 114816
+    assert plan["vector_stage_peak_ub_bytes"] == 20544
+    assert c2v_ring_bytes == 16384
+    assert plan["vector_stage_peak_ub_bytes"] + c2v_ring_bytes == 36928
     plan["active_groups"] = active_groups
     plan["min_trips_per_group"] = trips
     plan["max_trips_per_group"] = trips
@@ -2292,11 +2333,7 @@ def test_multi_round_trip_final_row_reduction_emits_as_a_following_vector_step()
         KernelKind.MIXED,
         KernelKind.VECTOR,
     ]
-    assert can_emit_region(graph, analytic)
-    source = emit_pypto_region(
-        graph, analytic, program_name="attention_row_reduction"
-    ).source
-    ast.parse(source)
+    assert not can_emit_region(graph, analytic)
 
     solved = solve_graph(
         graph,
@@ -2307,6 +2344,10 @@ def test_multi_round_trip_final_row_reduction_emits_as_a_following_vector_step()
     assert solved.regions_solved
     assert solved.regions[0].solution is not None
     assert can_emit_region(graph, solved.regions[0])
+    source = emit_pypto_region(
+        graph, solved.regions[0], program_name="attention_row_reduction"
+    ).source
+    ast.parse(source)
 
 
 def test_column_reduction_round_trip_stops_at_the_static_frontend_boundary() -> None:
@@ -2642,6 +2683,7 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     graph, result = _solve_module(
         _StreamingSoftmaxPv(),
         (torch.zeros(16, 4096), torch.zeros(4096, 64)),
+        require_source_codegen=False,
     )
     step = scheduled_region(result).steps[0]
     assert isinstance(step.plan, MixedKernelPlan)

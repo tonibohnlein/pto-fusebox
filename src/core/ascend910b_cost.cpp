@@ -800,6 +800,77 @@ L0MatmulPlan DeriveL0MatmulPlan(const Problem* p, int64_t m, int64_t n, int64_t 
   return plan;
 }
 
+struct MixedL0OperandFootprint {
+  bool feasible = false;
+  int64_t l0a_bytes = 0;
+  int64_t l0b_bytes = 0;
+};
+
+// Mirror the physical operand allocation performed after AutoTileMatmulL0.
+// The child chooser prices its own ping-pong depth, while an enclosing mixed
+// pipeline may require a deeper rotating family. PyPTO allocates each cube
+// request in an outlined mixed body separately; callers take the maximum
+// across topologically ordered requests because their operand arenas reuse.
+MixedL0OperandFootprint MixedMatmulL0OperandFootprint(
+    const Problem* p, int64_t m, int64_t n, int64_t k, DType lhs_dtype,
+    DType rhs_dtype, int outer_pipeline_depth) {
+  MixedL0OperandFootprint result;
+  if (m <= 0 || n <= 0 || k <= 0 || outer_pipeline_depth <= 0) return result;
+  const DType accumulator_dtype = cube_accumulator_dtype(lhs_dtype);
+  const L0MatmulPlan child = DeriveL0MatmulPlan(
+      p, m, n, k, lhs_dtype, rhs_dtype, accumulator_dtype,
+      /*accumulator_read=*/false, L0OutputTarget::Acc, nullptr);
+  if (!child.feasible || child.m <= 0 || child.n <= 0 || child.k <= 0) {
+    return result;
+  }
+  const auto align_up = [](int64_t value, int64_t alignment) {
+    return alignment <= 1 ? value
+                          : ((value + alignment - 1) / alignment) * alignment;
+  };
+  const int64_t physical_m =
+      align_up(child.m, p->l0_matmul_config.box_align_m);
+  const int64_t physical_n =
+      align_up(child.n, p->l0_matmul_config.box_align_n);
+  result.l0a_bytes =
+      physical_m * child.k * dtype_bytes(lhs_dtype) *
+      std::max<int64_t>(child.buffer_depth_a, outer_pipeline_depth);
+  result.l0b_bytes =
+      child.k * physical_n * dtype_bytes(rhs_dtype) *
+      std::max<int64_t>(child.buffer_depth_b, outer_pipeline_depth);
+  result.feasible = true;
+  return result;
+}
+
+MixedL0OperandFootprint MixedStagesL0OperandFootprint(
+    const Problem* p, const std::vector<MixedStagePlan>& stages,
+    int outer_pipeline_depth) {
+  MixedL0OperandFootprint result;
+  result.feasible = true;
+  for (const MixedStagePlan& stage : stages) {
+    if (stage.engine != MixedEngine::Cube) continue;
+    if (stage.ops.size() != stage.cube_window_k.size()) {
+      return MixedL0OperandFootprint{};
+    }
+    for (size_t index = 0; index < stage.ops.size(); ++index) {
+      const Op& op = p->ops[stage.ops[index]];
+      if (op.type != OpType::MatMul || stage.cube_window_k[index] <= 0) {
+        return MixedL0OperandFootprint{};
+      }
+      const DType lhs_dtype = p->tensors[op.inputs[0]].dtype;
+      const DType rhs_dtype = p->tensors[op.inputs[1]].dtype;
+      const MixedL0OperandFootprint request =
+          MixedMatmulL0OperandFootprint(
+              p, stage.valid_rows, stage.valid_cols,
+              stage.cube_window_k[index], lhs_dtype, rhs_dtype,
+              std::max(1, outer_pipeline_depth));
+      if (!request.feasible) return MixedL0OperandFootprint{};
+      result.l0a_bytes = std::max(result.l0a_bytes, request.l0a_bytes);
+      result.l0b_bytes = std::max(result.l0b_bytes, request.l0b_bytes);
+    }
+  }
+  return result;
+}
+
 // Wave-aware compute makespan. Uniform cube grids are equal-cost; a balanced
 // vector grid totalizes U copies of its maximum valid region work, so this same
 // equation prices the critical task rather than the average 11/10-row task.
@@ -4448,9 +4519,16 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
       if (!streams_boundary) mm.k_loop.pipeline_stages = 1;
       plan.peak_l1_bytes = std::max(plan.peak_l1_bytes, best_peak);
     }
+
     plan.matmuls.push_back(mm);
     plan.execution_order.push_back(node.op);
   }
+  // A homogeneous task's sequential requests and K phases are handled by the
+  // same MemoryReuse scope measured by derive_exec(). Do not sum peeled,
+  // rolled, and tail SSA names: doing so rejects legal large-K kernels whose
+  // phase buffers alias. Whole-program validation sums this task high-water
+  // with the independently outlined tasks in the same source program.
+  plan.source_l1_allocation_bytes = plan.peak_l1_bytes;
 
   if (aiv_seed) {
     int64_t root_count = 0;
@@ -5913,6 +5991,40 @@ Ascend910BCost::derive_feature_round_trip_resources(
   }
   resources.cube_peak_l1_bytes = emitted_pipeline_l1_bytes;
 
+  // Each request is lowered independently, while its own operand buffers are
+  // rotated by the enclosing pipeline. Left/Right allocations can be reused
+  // between topologically ordered requests, so admission takes the maximum
+  // request footprint rather than summing unrelated matmuls.
+  for (size_t producer = 0; producer < feature.producer_matmuls.size();
+       ++producer) {
+    const DType dtype = feature.producer_operand_dtypes[producer];
+    const MixedL0OperandFootprint footprint =
+        MixedMatmulL0OperandFootprint(
+            prob_, mp.big, cfg.k, resources.producer_window_k[producer],
+            dtype, dtype, kFeatureRoundTripPipelineStages);
+    if (!footprint.feasible) return resources;
+    resources.cube_peak_l0a_bytes =
+        std::max(resources.cube_peak_l0a_bytes, footprint.l0a_bytes);
+    resources.cube_peak_l0b_bytes =
+        std::max(resources.cube_peak_l0b_bytes, footprint.l0b_bytes);
+  }
+  const MixedL0OperandFootprint sink_footprint =
+      MixedMatmulL0OperandFootprint(
+          prob_, mp.big, np.big, cfg.k, feature.sink_operand_dtype,
+          feature.sink_operand_dtype, kFeatureRoundTripPipelineStages);
+  if (!sink_footprint.feasible) return resources;
+  resources.cube_peak_l0a_bytes =
+      std::max(resources.cube_peak_l0a_bytes, sink_footprint.l0a_bytes);
+  resources.cube_peak_l0b_bytes =
+      std::max(resources.cube_peak_l0b_bytes, sink_footprint.l0b_bytes);
+
+  // The execution peak excludes the storage reserved by the V2C ring.  PyPTO
+  // lowers that ring and the cube operand panels into the same task-local Mat
+  // arena, so the complete source allocation must carry both families.  The
+  // program-level admission sums this field across outlined tasks.
+  resources.source_l1_allocation_bytes =
+      resources.cube_peak_l1_bytes + v2c_fifo_reserved_bytes;
+
   // Reuse the homogeneous vector lifetime plan for the exact peer-stage DAG.
   // Cross-engine values are boundary inputs to that subgraph, so its live-set
   // accounting naturally prices any number of producers and any supported
@@ -5938,7 +6050,9 @@ Ascend910BCost::derive_feature_round_trip_resources(
       resources.fifo_reserved_bytes + vector_live_bytes;
   resources.feasible =
       c2v_fifo_reserved_bytes + vector_live_bytes <= vec_capacity &&
-      resources.cube_peak_l1_bytes + v2c_fifo_reserved_bytes <= l1_capacity;
+      resources.cube_peak_l1_bytes + v2c_fifo_reserved_bytes <= l1_capacity &&
+      resources.cube_peak_l0a_bytes <= prob_->l0_matmul_config.l0a_bytes &&
+      resources.cube_peak_l0b_bytes <= prob_->l0_matmul_config.l0b_bytes;
   return resources;
 }
 
@@ -5951,6 +6065,8 @@ bool Ascend910BCost::mixed_fits_on_chip(
     diagnostic->closest_config = cfg;
     diagnostic->available_vec_bytes = prob_->vec_capacity;
     diagnostic->available_l1_bytes = prob_->l1_capacity;
+    diagnostic->available_l0a_bytes = prob_->l0_matmul_config.l0a_bytes;
+    diagnostic->available_l0b_bytes = prob_->l0_matmul_config.l0b_bytes;
   }
   if (mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip) {
@@ -5959,7 +6075,10 @@ bool Ascend910BCost::mixed_fits_on_chip(
     if (diagnostic != nullptr) {
       diagnostic->capacity_evaluated = true;
       diagnostic->required_vec_bytes = resources.vector_peak_ub_bytes;
-      diagnostic->required_l1_bytes = resources.cube_peak_l1_bytes;
+      diagnostic->required_l1_bytes =
+          resources.source_l1_allocation_bytes;
+      diagnostic->required_l0a_bytes = resources.cube_peak_l0a_bytes;
+      diagnostic->required_l0b_bytes = resources.cube_peak_l0b_bytes;
     }
     return resources.feasible;
   }
@@ -6200,15 +6319,54 @@ bool Ascend910BCost::mixed_fits_on_chip(
       v2c_fifo_reserved += reserved;
     }
   }
+
+  // Tile feasibility is independent of the later group/trip choice. Use the
+  // child plan's native buffering here; mixed_schedule_plan re-evaluates the
+  // selected group with its actual outer pipeline depth before declaring it
+  // source ready.
+  const int outer_pipeline_depth = 1;
+  int64_t required_l0a_bytes = 0;
+  int64_t required_l0b_bytes = 0;
+  for (const MixedStageTopology& stage : mixed_topology_->stages) {
+    if (stage.engine != MixedEngine::Cube) continue;
+    for (size_t op_index : stage.ops) {
+      const Op& op = prob_->ops[op_index];
+      if (op.type != OpType::MatMul) continue;
+      const Tensor& output = prob_->tensors[op.output()];
+      const int64_t tile_m = output.height == out_H_ ? mp.big : output.height;
+      const int64_t tile_n = output.width == out_W_ ? np.big : output.width;
+      int64_t window = cube_window_k_for_op(cube_windows, op_index);
+      if (streaming_softmax_v2c_chunk > 0 &&
+          op_index == mixed_topology_->stages[1].ops.front()) {
+        window = streaming_softmax_v2c_chunk;
+      }
+      if (window <= 0) window = op_K(op_index);
+      const DType lhs_dtype = prob_->tensors[op.inputs[0]].dtype;
+      const DType rhs_dtype = prob_->tensors[op.inputs[1]].dtype;
+      const MixedL0OperandFootprint footprint =
+          MixedMatmulL0OperandFootprint(
+              prob_, tile_m, tile_n, window, lhs_dtype, rhs_dtype,
+              outer_pipeline_depth);
+      if (!footprint.feasible) return false;
+      required_l0a_bytes =
+          std::max(required_l0a_bytes, footprint.l0a_bytes);
+      required_l0b_bytes =
+          std::max(required_l0b_bytes, footprint.l0b_bytes);
+    }
+  }
   const int64_t required_vec_bytes = c2v_fifo_reserved + vector_stage_peak;
   const int64_t required_l1_bytes = v2c_fifo_reserved + cube_peak_l1_bytes;
   if (diagnostic != nullptr) {
     diagnostic->capacity_evaluated = true;
     diagnostic->required_vec_bytes = required_vec_bytes;
     diagnostic->required_l1_bytes = required_l1_bytes;
+    diagnostic->required_l0a_bytes = required_l0a_bytes;
+    diagnostic->required_l0b_bytes = required_l0b_bytes;
   }
   return required_vec_bytes <= prob_->vec_capacity &&
-         required_l1_bytes <= prob_->l1_capacity;
+         required_l1_bytes <= prob_->l1_capacity &&
+         required_l0a_bytes <= prob_->l0_matmul_config.l0a_bytes &&
+         required_l0b_bytes <= prob_->l0_matmul_config.l0b_bytes;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -7808,6 +7966,10 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
       const FeatureRoundTripResources resources =
           derive_feature_round_trip_resources(cfg);
       plan.cube_stage_peak_l1_bytes = resources.cube_peak_l1_bytes;
+      plan.cube_stage_peak_l0a_bytes = resources.cube_peak_l0a_bytes;
+      plan.cube_stage_peak_l0b_bytes = resources.cube_peak_l0b_bytes;
+      plan.source_l1_allocation_bytes =
+          resources.source_l1_allocation_bytes;
       plan.stages.reserve(mixed_topology_->stages.size());
       size_t producer_index = 0;
       for (size_t stage_idx = 0; stage_idx < mixed_topology_->stages.size(); ++stage_idx) {
@@ -8100,21 +8262,103 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
           v2c_fifo_reserved += fifo.reserved_bytes;
         }
       }
+      const MixedL0OperandFootprint selected_l0 =
+          MixedStagesL0OperandFootprint(
+              prob_, plan.stages, plan.loop.pipeline_stages);
+      plan.cube_stage_peak_l0a_bytes = selected_l0.l0a_bytes;
+      plan.cube_stage_peak_l0b_bytes = selected_l0.l0b_bytes;
+      // PyPTO's split mixed lowering rotates boundary cube operands across
+      // the local pipeline plus its cross-core skew. Operand requests within
+      // one cube stage may be live together; topologically distinct cube
+      // stages reuse the outlined task's Mat arena. Use the execution peak as
+      // a lower bound for resident/internal operands not represented by a
+      // boundary panel.
+      int64_t source_l1_allocation_bytes = 0;
+      bool source_l1_allocation_valid = true;
+      const int64_t boundary_copies =
+          plan.loop.pipeline_stages > 1
+              ? plan.loop.pipeline_stages + plan.loop.requested_skew_depth
+              : 1;
+      for (const MixedStagePlan& stage : plan.stages) {
+        if (stage.engine != MixedEngine::Cube) continue;
+        int64_t stage_source_l1_bytes = 0;
+        for (size_t request = 0; request < stage.ops.size(); ++request) {
+          const Op& op = prob_->ops[stage.ops[request]];
+          if (op.type != OpType::MatMul || op.inputs.size() < 2 ||
+              request >= stage.cube_window_k.size()) {
+            source_l1_allocation_valid = false;
+            break;
+          }
+          const int64_t window = stage.cube_window_k[request];
+          const int64_t panel_bytes[2] = {
+              stage.valid_rows * window *
+                  dtype_bytes(prob_->tensors[op.inputs[0]].dtype),
+              window * stage.valid_cols *
+                  dtype_bytes(prob_->tensors[op.inputs[1]].dtype),
+          };
+          for (size_t operand = 0; operand < 2; ++operand) {
+            const size_t tensor = op.inputs[operand];
+            const auto received = std::find_if(
+                plan.fifos.begin(), plan.fifos.end(),
+                [&](const MixedFifoPlan& fifo) {
+                  return fifo.direction ==
+                             MixedTransferDirection::VectorToCube &&
+                         fifo.tensor == tensor;
+                });
+            if (received != plan.fifos.end()) {
+              // The complete V2C ring is charged once below.  The popped tile
+              // aliases one of those slots; it is not a second Mat family,
+              // even when the same tensor serves both matmul roles.
+              continue;
+            }
+            const int producer = dag_->tensor_producer[tensor];
+            if (producer < 0 ||
+                std::find(ops_.begin(), ops_.end(),
+                          static_cast<size_t>(producer)) == ops_.end()) {
+              stage_source_l1_bytes +=
+                  boundary_copies * panel_bytes[operand];
+            }
+          }
+        }
+        // Topologically distinct cube stages execute sequentially inside one
+        // outlined mixed task, and PyPTO reuses their Mat arena. Requests in
+        // the same stage can be live together, so sum within a stage and take
+        // the maximum across stages. The program-level solution admission
+        // separately sums different outlined task functions, whose Mat
+        // allocation families are not reused by current lowering.
+        source_l1_allocation_bytes =
+            std::max(source_l1_allocation_bytes, stage_source_l1_bytes);
+        if (!source_l1_allocation_valid) break;
+      }
+      plan.source_l1_allocation_bytes =
+          (source_l1_allocation_valid
+               ? std::max(plan.cube_stage_peak_l1_bytes,
+                          source_l1_allocation_bytes)
+               : plan.cube_stage_peak_l1_bytes) +
+          v2c_fifo_reserved;
       const bool source_capacity_ready =
+          selected_l0.feasible &&
           c2v_fifo_reserved <= prob_->vec_capacity &&
           plan.vector_stage_peak_ub_bytes <=
               prob_->vec_capacity - c2v_fifo_reserved &&
           v2c_fifo_reserved <= prob_->l1_capacity &&
           plan.cube_stage_peak_l1_bytes <=
-              prob_->l1_capacity - v2c_fifo_reserved;
+              prob_->l1_capacity - v2c_fifo_reserved &&
+          plan.source_l1_allocation_bytes <= prob_->l1_capacity &&
+          plan.cube_stage_peak_l0a_bytes <=
+              prob_->l0_matmul_config.l0a_bytes &&
+          plan.cube_stage_peak_l0b_bytes <=
+              prob_->l0_matmul_config.l0b_bytes;
       const bool dual_role_source_ready =
           vector_to_cube_mask != 3 ||
           (plan.m_partition.parts == 1 && plan.n_partition.parts == 1 &&
            !has_unrepresentable_vector_to_cube_multi_role());
+      const bool source_protocol_ready =
+          (prob_->require_buildable_mixed || standalone_source_protocol) &&
+          source_capacity_ready;
       plan.source_codegen_ready =
           plan.emit_compatible &&
-          (prob_->require_buildable_mixed ||
-           (standalone_source_protocol && source_capacity_ready)) &&
+          source_protocol_ready &&
           plan.split_k == 1 &&
           plan.stages.size() == mixed_topology_->stages.size() &&
           plan.fifos.size() == mixed_topology_->transfers.size() &&
@@ -8455,13 +8699,17 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   if (breakdown != nullptr) *breakdown = MixedCostBreakdown{};
   result.config = cfg;
   const MixedSchedulePlan schedule =
-      derive_mixed_schedule_plan(cfg, retained_from_prev, retain_these,
-                                 /*parallel_split=*/1, active_groups);
+      mixed_schedule_plan(cfg, retained_from_prev, retain_these,
+                          /*parallel_split=*/1, active_groups);
   // Mixed kernels need BOTH on-chip pools (L1/L0c for the cube stage, UB for the
   // vector stage) — fits_on_chip dispatches to mixed_fits_on_chip here. A large
   // shared tile that overflows UB is infeasible to fuse even when the separate
   // kernels each fit their one pool.
-  if (!schedule.feasible) return result;
+  if (!schedule.feasible ||
+      ((prob_->require_buildable_mixed || prob_->require_source_codegen) &&
+       !schedule.source_codegen_ready)) {
+    return result;
+  }
   if (schedule.algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip) {
     return compute_feature_round_trip_cost(cfg, schedule, breakdown);
   }
@@ -9417,6 +9665,33 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
   MixedSweepFeasibility best;
   int64_t best_excess = std::numeric_limits<int64_t>::max();
   int64_t best_required = std::numeric_limits<int64_t>::max();
+  auto consider = [&](const MixedSweepFeasibility& current) {
+    if (!current.capacity_evaluated) return;
+    const TileConfig& cfg = current.closest_config;
+    const int64_t excess =
+        std::max<int64_t>(0, current.required_vec_bytes -
+                                 current.available_vec_bytes) +
+        std::max<int64_t>(0, current.required_l1_bytes -
+                                 current.available_l1_bytes) +
+        std::max<int64_t>(0, current.required_l0a_bytes -
+                                 current.available_l0a_bytes) +
+        std::max<int64_t>(0, current.required_l0b_bytes -
+                                 current.available_l0b_bytes);
+    const int64_t required = current.required_vec_bytes +
+                             current.required_l1_bytes +
+                             current.required_l0a_bytes +
+                             current.required_l0b_bytes;
+    if (!best.capacity_evaluated ||
+        std::tie(excess, required, cfg.parts_m, cfg.parts_n, cfg.split_k) <
+            std::tie(best_excess, best_required,
+                     best.closest_config.parts_m,
+                     best.closest_config.parts_n,
+                     best.closest_config.split_k)) {
+      best = current;
+      best_excess = excess;
+      best_required = required;
+    }
+  };
   const bool feature_round_trip =
       mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip;
@@ -9436,31 +9711,37 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
         continue;
       MixedSweepFeasibility current;
       const bool fits = mixed_fits_on_chip(cfg, {}, {}, &current);
+      bool recorded_source_rejection = false;
       if (fits) {
         const CostResult cost = compute_cost(cfg, {}, {});
         if (cost.feasible && std::isfinite(cost.latency)) {
           current.feasible_candidate = true;
           return current;
         }
+
+        // Base feasibility prices one child request. Source emission may need
+        // a deeper operand family for a multi-trip mixed pipeline. Preserve
+        // that exact rejected plan in the diagnostic instead of reporting the
+        // shallower preliminary L0 footprint.
+        const MixedSchedulePlan maximal = derive_mixed_schedule_plan(
+            cfg, {}, {}, /*parallel_split=*/1, /*active_groups=*/0);
+        const int64_t max_groups =
+            maximal.feasible
+                ? std::min(maximal.loop.work_items, maximal.group_capacity)
+                : 0;
+        for (int64_t groups = 1; groups <= max_groups; ++groups) {
+          if (maximal.loop.work_items % groups != 0) continue;
+          const MixedSchedulePlan plan = mixed_schedule_plan(
+              cfg, {}, {}, /*parallel_split=*/1, groups);
+          if (!plan.feasible) continue;
+          MixedSweepFeasibility rejected = current;
+          rejected.required_l0a_bytes = plan.cube_stage_peak_l0a_bytes;
+          rejected.required_l0b_bytes = plan.cube_stage_peak_l0b_bytes;
+          consider(rejected);
+          recorded_source_rejection = true;
+        }
       }
-      if (!current.capacity_evaluated)
-        continue;
-      const int64_t excess =
-          std::max<int64_t>(0, current.required_vec_bytes -
-                                   current.available_vec_bytes) +
-          std::max<int64_t>(0, current.required_l1_bytes -
-                                   current.available_l1_bytes);
-      const int64_t required =
-          current.required_vec_bytes + current.required_l1_bytes;
-      if (!best.capacity_evaluated ||
-          std::tie(excess, required, cfg.parts_m, cfg.parts_n, cfg.split_k) <
-              std::tie(best_excess, best_required, best.closest_config.parts_m,
-                       best.closest_config.parts_n,
-                       best.closest_config.split_k)) {
-        best = current;
-        best_excess = excess;
-        best_required = required;
-      }
+      if (!recorded_source_rejection) consider(current);
     }
   }
   return best;

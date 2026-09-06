@@ -71,18 +71,40 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
     const bool l1_capacity_exceeded =
         diagnostic.capacity_evaluated &&
         diagnostic.required_l1_bytes > diagnostic.available_l1_bytes;
+    const bool l0a_capacity_exceeded =
+        diagnostic.capacity_evaluated &&
+        diagnostic.required_l0a_bytes > diagnostic.available_l0a_bytes;
+    const bool l0b_capacity_exceeded =
+        diagnostic.capacity_evaluated &&
+        diagnostic.required_l0b_bytes > diagnostic.available_l0b_bytes;
     std::string code = "whole_region_has_no_feasible_mixed_candidate";
     std::string reason = "the complete op set has no feasible mixed candidate";
-    if (vector_capacity_exceeded || l1_capacity_exceeded) {
-      code = vector_capacity_exceeded && l1_capacity_exceeded
-                 ? "mixed_vector_and_l1_capacity_exceeded"
-                 : (vector_capacity_exceeded ? "mixed_vector_capacity_exceeded"
-                                             : "mixed_l1_capacity_exceeded");
+    if (vector_capacity_exceeded || l1_capacity_exceeded ||
+        l0a_capacity_exceeded || l0b_capacity_exceeded) {
+      code = "mixed_source_memory_capacity_exceeded";
+      if (vector_capacity_exceeded && !l1_capacity_exceeded &&
+          !l0a_capacity_exceeded && !l0b_capacity_exceeded) {
+        code = "mixed_vector_capacity_exceeded";
+      } else if (!vector_capacity_exceeded && l1_capacity_exceeded &&
+                 !l0a_capacity_exceeded && !l0b_capacity_exceeded) {
+        code = "mixed_l1_capacity_exceeded";
+      } else if (!vector_capacity_exceeded && !l1_capacity_exceeded &&
+                 !l0a_capacity_exceeded && l0b_capacity_exceeded) {
+        code = "mixed_l0b_capacity_exceeded";
+      } else if (!vector_capacity_exceeded && !l1_capacity_exceeded &&
+                 l0a_capacity_exceeded && !l0b_capacity_exceeded) {
+        code = "mixed_l0a_capacity_exceeded";
+      }
       reason = "closest legal grid requires vector " +
                std::to_string(diagnostic.required_vec_bytes) + "/" +
                std::to_string(diagnostic.available_vec_bytes) +
                " bytes and L1 " + std::to_string(diagnostic.required_l1_bytes) +
-               "/" + std::to_string(diagnostic.available_l1_bytes) + " bytes";
+               "/" + std::to_string(diagnostic.available_l1_bytes) +
+               " bytes, L0A " + std::to_string(diagnostic.required_l0a_bytes) +
+               "/" + std::to_string(diagnostic.available_l0a_bytes) +
+               " bytes, and L0B " +
+               std::to_string(diagnostic.required_l0b_bytes) + "/" +
+               std::to_string(diagnostic.available_l0b_bytes) + " bytes";
     }
     json unavailable = {
         {"schema_version", "pto_fusebox.mixed_group_sweep_availability.v1"},
@@ -102,6 +124,10 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
       unavailable["available_vec_bytes"] = diagnostic.available_vec_bytes;
       unavailable["required_l1_bytes"] = diagnostic.required_l1_bytes;
       unavailable["available_l1_bytes"] = diagnostic.available_l1_bytes;
+      unavailable["required_l0a_bytes"] = diagnostic.required_l0a_bytes;
+      unavailable["available_l0a_bytes"] = diagnostic.available_l0a_bytes;
+      unavailable["required_l0b_bytes"] = diagnostic.required_l0b_bytes;
+      unavailable["available_l0b_bytes"] = diagnostic.available_l0b_bytes;
     }
     return unavailable.dump(2) + "\n";
   }
@@ -173,6 +199,9 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
          {"pipeline_stages", breakdown.pipeline_stages},
          {"overlap_implementable", breakdown.overlap_implementable},
          {"cube_stage_peak_l1_bytes", plan.cube_stage_peak_l1_bytes},
+         {"cube_stage_peak_l0a_bytes", plan.cube_stage_peak_l0a_bytes},
+         {"cube_stage_peak_l0b_bytes", plan.cube_stage_peak_l0b_bytes},
+         {"source_l1_allocation_bytes", plan.source_l1_allocation_bytes},
          {"vector_stage_peak_ub_bytes", plan.vector_stage_peak_ub_bytes},
          {"model",
           {{"cube_phase_cycles", breakdown.cube_phase_cycles},

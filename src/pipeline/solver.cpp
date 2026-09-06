@@ -15,6 +15,7 @@
 #include "symmetry/merkle_hash.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -135,6 +136,95 @@ Partition MaterializeRecomputedSourceOps(Partition partition) {
     return partition;
 }
 
+std::vector<std::vector<size_t>> SolutionPartitionKey(
+    const Solution& solution) {
+    std::vector<std::vector<size_t>> key;
+    key.reserve(solution.num_steps());
+    for (const ScheduleStep& step : solution.steps()) {
+        key.emplace_back(step.subgraph.ops().begin(),
+                         step.subgraph.ops().end());
+    }
+    std::sort(key.begin(), key.end());
+    return key;
+}
+
+bool SolutionCostThenPartitionLess(const Solution& lhs,
+                                   const Solution& rhs) {
+    if (lhs.total_latency() != rhs.total_latency())
+        return lhs.total_latency() < rhs.total_latency();
+    return SolutionPartitionKey(lhs) < SolutionPartitionKey(rhs);
+}
+
+std::vector<Solution> DeterministicSourceAuditSolutions(
+    const Problem& prob, const DAG& dag, CostCache* cache) {
+    using Init = Partition (*)(const Problem&, const DAG&, CostCache*);
+    constexpr Init strategies[] = {
+        init_trivial,
+        init_chain_then_edge,
+        init_seed_and_grow,
+        init_reverse_topo,
+        init_tensor_aligned,
+    };
+    std::vector<Solution> result;
+
+    // Small regions are common at the native-orchestration boundary and are
+    // also the ones for which selected-versus-runner-up evidence is most
+    // useful. Enumerate their set partitions completely. The previous public
+    // candidate pool reflected however many evolutionary candidates happened
+    // to finish before the wall-clock deadline, so its membership changed
+    // under unrelated host load even when the selected solution did not.
+    constexpr size_t kExhaustiveSourcePartitionLimit = 6;
+    if (prob.num_ops() <= kExhaustiveSourcePartitionLimit) {
+        std::vector<FlatSet<size_t>> blocks;
+        auto enumerate = [&](auto&& self, size_t op) -> void {
+            if (op == prob.num_ops()) {
+                Partition partition;
+                partition.prob = &prob;
+                partition.dag = &dag;
+                partition.cache = cache;
+                for (const auto& block : blocks)
+                    partition.add_group(block, 1e18);
+                partition.rebuild_index();
+                if (!partition.is_acyclic() || partition_has_gap(partition))
+                    return;
+                partition.finalize(cache);
+                Solution candidate =
+                    Solution::from_partition(prob, dag, partition, 8, cache);
+                if (candidate.validate().valid &&
+                    std::isfinite(candidate.total_latency()))
+                    result.push_back(std::move(candidate));
+                return;
+            }
+            const size_t existing_blocks = blocks.size();
+            for (size_t block_index = 0; block_index < existing_blocks;
+                 ++block_index) {
+                blocks[block_index].insert(op);
+                self(self, op + 1);
+                blocks[block_index].erase(op);
+            }
+            blocks.push_back({op});
+            self(self, op + 1);
+            blocks.pop_back();
+        };
+        enumerate(enumerate, 0);
+    }
+
+    result.reserve(result.size() + std::size(strategies));
+    for (Init strategy : strategies) {
+        Partition partition =
+            MaterializeRecomputedSourceOps(strategy(prob, dag, cache));
+        partition.finalize(cache);
+        Solution candidate =
+            Solution::from_partition(prob, dag, partition, 8, cache);
+        if (candidate.validate().valid &&
+            std::isfinite(candidate.total_latency()))
+            result.push_back(std::move(candidate));
+    }
+    std::stable_sort(result.begin(), result.end(),
+                     SolutionCostThenPartitionLess);
+    return result;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -161,7 +251,12 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
         phase1_dl = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 35 / 100);
         phase2_dl = phase1_dl + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 5 / 100);
     } else {
-        phase1_dl = now + std::chrono::duration_cast<SteadyClock::duration>(total_budget * 95 / 100);
+        // Source solves run a deterministic post-search partition audit so
+        // candidate membership does not depend on the wall-clock search.
+        // Reserve enough of the public budget for that audit and JSON output.
+        const int phase1_percent = prob.require_source_codegen ? 85 : 95;
+        phase1_dl = now + std::chrono::duration_cast<SteadyClock::duration>(
+                              total_budget * phase1_percent / 100);
         phase2_dl = now + total_budget;
     }
 
@@ -218,6 +313,7 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
     double after_sol_evo  = after_build;
     Solution final_sol(prob, dag, {});
     std::vector<Solution> source_solution_pool;
+    std::vector<Solution> deterministic_source_audit;
 
     if (!has_retain) {
         // No retainable tensors: ordering has no effect on cost (all groups
@@ -238,19 +334,17 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
                 if (candidate.validate().valid)
                     source_solution_pool.push_back(std::move(candidate));
             }
-            Partition trivial = Partition::trivial(prob, dag);
-            trivial.finalize(&shared_cache);
-            Solution fallback = Solution::from_partition(prob, dag, trivial, 8, &shared_cache);
-            if (fallback.validate().valid)
-                source_solution_pool.push_back(std::move(fallback));
+            deterministic_source_audit =
+                DeterministicSourceAuditSolutions(prob, dag, &shared_cache);
+            source_solution_pool.insert(source_solution_pool.end(),
+                                        deterministic_source_audit.begin(),
+                                        deterministic_source_audit.end());
             if (source_solution_pool.empty())
                 throw std::logic_error(
                     "Source-constrained solve produced no disjoint fallback solution");
-            std::stable_sort(
-                source_solution_pool.begin(), source_solution_pool.end(),
-                [](const Solution& lhs, const Solution& rhs) {
-                    return lhs.total_latency() < rhs.total_latency();
-                });
+            std::stable_sort(source_solution_pool.begin(),
+                             source_solution_pool.end(),
+                             SolutionCostThenPartitionLess);
             final_sol = source_solution_pool.front();
         } else {
             partition_pool[0].rebuild_index();
@@ -433,7 +527,19 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
     if (candidate_solutions != nullptr) {
         candidate_solutions->clear();
         if (prob.require_source_codegen && !source_solution_pool.empty()) {
-            *candidate_solutions = source_solution_pool;
+            // The evolutionary pool is deadline- and host-load-dependent. It
+            // remains useful for finding the selected plan, but it must not
+            // define the public runner-up set. Publish the selected plan plus
+            // the fixed deterministic strategy corpus instead.
+            candidate_solutions->push_back(final_sol);
+            candidate_solutions->insert(candidate_solutions->end(),
+                                        deterministic_source_audit.begin(),
+                                        deterministic_source_audit.end());
+            if (candidate_solutions->size() > 1) {
+                std::stable_sort(candidate_solutions->begin() + 1,
+                                 candidate_solutions->end(),
+                                 SolutionCostThenPartitionLess);
+            }
         } else {
             candidate_solutions->push_back(final_sol);
         }

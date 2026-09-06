@@ -73,6 +73,9 @@ class MixedGroupCandidate:
     pipeline_stages: int
     overlap_implementable: bool
     cube_stage_peak_l1_bytes: int
+    cube_stage_peak_l0a_bytes: int
+    cube_stage_peak_l0b_bytes: int
+    source_l1_allocation_bytes: int
     vector_stage_peak_ub_bytes: int
     breakdown: MixedCostBreakdown
     fifos: tuple[Mapping[str, Any], ...]
@@ -114,6 +117,10 @@ class MixedGroupSweepAvailability:
     available_vec_bytes: int | None = None
     required_l1_bytes: int | None = None
     available_l1_bytes: int | None = None
+    required_l0a_bytes: int | None = None
+    available_l0a_bytes: int | None = None
+    required_l0b_bytes: int | None = None
+    available_l0b_bytes: int | None = None
 
 
 class MixedGroupSweepUnavailable(RuntimeError):
@@ -395,6 +402,10 @@ def _availability_from_payload(
         available_vec_bytes=optional_int("available_vec_bytes"),
         required_l1_bytes=optional_int("required_l1_bytes"),
         available_l1_bytes=optional_int("available_l1_bytes"),
+        required_l0a_bytes=optional_int("required_l0a_bytes"),
+        available_l0a_bytes=optional_int("available_l0a_bytes"),
+        required_l0b_bytes=optional_int("required_l0b_bytes"),
+        available_l0b_bytes=optional_int("available_l0b_bytes"),
     )
 
 
@@ -590,6 +601,18 @@ def _parse_candidate(
         cube_stage_peak_l1_bytes=_nonnegative_int(
             payload.get("cube_stage_peak_l1_bytes"),
             f"{field}.cube_stage_peak_l1_bytes",
+        ),
+        cube_stage_peak_l0a_bytes=_nonnegative_int(
+            payload.get("cube_stage_peak_l0a_bytes"),
+            f"{field}.cube_stage_peak_l0a_bytes",
+        ),
+        cube_stage_peak_l0b_bytes=_nonnegative_int(
+            payload.get("cube_stage_peak_l0b_bytes"),
+            f"{field}.cube_stage_peak_l0b_bytes",
+        ),
+        source_l1_allocation_bytes=_nonnegative_int(
+            payload.get("source_l1_allocation_bytes"),
+            f"{field}.source_l1_allocation_bytes",
         ),
         vector_stage_peak_ub_bytes=_nonnegative_int(
             payload.get("vector_stage_peak_ub_bytes"),

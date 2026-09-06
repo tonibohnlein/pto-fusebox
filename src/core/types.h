@@ -1046,6 +1046,10 @@ struct CubeSchedulePlan {
     int64_t split_k = 1;
     int64_t work_units = 0;
     int64_t peak_l1_bytes = 0;
+    // Total Mat/L1 allocation footprint emitted for this task body. The
+    // homogeneous emitter lowers its sequential requests in one reusable Mat
+    // arena, so this currently equals peak_l1_bytes.
+    int64_t source_l1_allocation_bytes = 0;
     CubeSplitMergePolicy split_merge_policy = CubeSplitMergePolicy::None;
     CubeFirstPartialThenAtomicPlan first_partial_then_atomic;
     CubeAivZeroSeedThenAtomicPlan aiv_zero_seed_then_atomic;
@@ -1287,6 +1291,13 @@ struct MixedSchedulePlan {
   // Peak cube-side L1 operand/resident footprint before V2C consumer rings.
   // Source readiness combines this with every V2C FIFO reservation.
   int64_t cube_stage_peak_l1_bytes = 0;
+  // Lowered operand-buffer high water. These are separate physical pools from
+  // Mat/L1 and must be admitted independently.
+  int64_t cube_stage_peak_l0a_bytes = 0;
+  int64_t cube_stage_peak_l0b_bytes = 0;
+  // Complete Mat/L1 allocation footprint of the outlined mixed task,
+  // including the full ring reserved by every V2C crossing.
+  int64_t source_l1_allocation_bytes = 0;
   VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
   int64_t vector_stage_peak_ub_bytes = 0;
   MixedVectorSplit vector_split = MixedVectorSplit::None;
@@ -1391,4 +1402,8 @@ struct MixedSweepFeasibility {
   int64_t available_vec_bytes = 0;
   int64_t required_l1_bytes = 0;
   int64_t available_l1_bytes = 0;
+  int64_t required_l0a_bytes = 0;
+  int64_t available_l0a_bytes = 0;
+  int64_t required_l0b_bytes = 0;
+  int64_t available_l0b_bytes = 0;
 };

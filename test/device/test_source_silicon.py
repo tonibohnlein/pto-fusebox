@@ -78,6 +78,7 @@ class SiliconCase:
     expected_mixed_groups: int | None = None
     expected_mixed_trips: int | None = None
     expected_steps: tuple[str, ...] | None = None
+    expected_source_l1_bytes: int | None = None
     reference: ReferenceFactory | None = None
 
 
@@ -583,8 +584,8 @@ MIXED_CASES = (
         ),
         rtol=1.0e-3,
         atol=1.0e-3,
-        mixed_contract="feature_round_trip",
-        expected_steps=("mixed", "cube"),
+        expected_steps=("cube", "vector", "cube", "cube"),
+        expected_source_l1_bytes=368_640,
     ),
     SiliconCase(
         "mixed_qk_softmax_pv_residual_96x64x128",
@@ -882,6 +883,13 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
         for plan in plans
     )
     assert step_kinds == (case.expected_steps or (case.kind,))
+    if case.expected_source_l1_bytes is not None:
+        source_l1_bytes = sum(
+            plan.source_l1_allocation_bytes
+            for plan in plans
+            if isinstance(plan, (CubeKernelPlan, MixedKernelPlan))
+        )
+        assert source_l1_bytes == case.expected_source_l1_bytes
     mixed_plans = tuple(plan for plan in plans if isinstance(plan, MixedKernelPlan))
     emitted = emit_pypto_region(graph, region, program_name=case.name)
     if len(plans) == 1:

@@ -1086,14 +1086,14 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v7";
+    j["schema_version"] = "pto_fusebox.solution.v8";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
             throw std::logic_error(
-                "solution.v7 cannot serialize cross-kernel fast-memory retention");
+                "solution.v8 cannot serialize cross-kernel fast-memory retention");
         }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
@@ -1279,6 +1279,7 @@ std::string solution_json(const Solution& sol) {
            {"split_k", cube_plan.split_k},
            {"work_units", cube_plan.work_units},
            {"peak_l1_bytes", cube_plan.peak_l1_bytes},
+           {"source_l1_allocation_bytes", cube_plan.source_l1_allocation_bytes},
            {"split_merge_policy", cube_split_merge_policy_name(cube_plan.split_merge_policy)},
            {"first_partial_then_atomic",
             {{"present", cube_plan.first_partial_then_atomic.present},
@@ -1377,6 +1378,9 @@ std::string solution_json(const Solution& sol) {
            {"group_capacity", mixed_plan.group_capacity},
            {"cube_window_k", mixed_plan.cube_window_k},
            {"cube_stage_peak_l1_bytes", mixed_plan.cube_stage_peak_l1_bytes},
+           {"cube_stage_peak_l0a_bytes", mixed_plan.cube_stage_peak_l0a_bytes},
+           {"cube_stage_peak_l0b_bytes", mixed_plan.cube_stage_peak_l0b_bytes},
+           {"source_l1_allocation_bytes", mixed_plan.source_l1_allocation_bytes},
            {"vector_stage_kind", vector_stream_kind_name(mixed_plan.vector_stage_kind)},
            {"vector_stage_peak_ub_bytes", mixed_plan.vector_stage_peak_ub_bytes},
            {"vector_split", mixed_vector_split_name(mixed_plan.vector_split)},

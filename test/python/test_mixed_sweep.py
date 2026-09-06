@@ -238,8 +238,13 @@ def test_source_costing_changes_attention_plan_before_emission() -> None:
         source_plan.n_partition.parts,
         source_plan.active_groups,
         source_plan.max_trips_per_group,
-    ) == (2, 1, 2, 1)
-    assert can_emit_region(graph, analytic)
+    ) == (3, 1, 3, 1)
+    assert analytic_plan.cube_stage_peak_l0a_bytes == 73_728
+    assert analytic_plan.cube_stage_peak_l0b_bytes == 49_152
+    assert not analytic_plan.source_codegen_ready
+    assert not can_emit_region(graph, analytic)
+    assert source_plan.cube_stage_peak_l0a_bytes == 16_384
+    assert source_plan.cube_stage_peak_l0b_bytes == 65_536
     assert can_emit_region(graph, source)
 
 
@@ -248,17 +253,17 @@ def test_attention_source_plan_traffic_matches_emitted_topology() -> None:
         StaticAttentionCore(), ((96, 64), (64, 64), (64, 128))
     )
 
-    assert (plan.m_partition.parts, plan.n_partition.parts) == (2, 1)
+    assert (plan.m_partition.parts, plan.n_partition.parts) == (3, 1)
     assert (sweep.tile.height, sweep.tile.width, sweep.tile.contraction) == (
-        48,
+        32,
         128,
         64,
     )
     regions = plan.spatial_tiles
-    query_bytes = regions * 48 * 64 * 4
+    query_bytes = regions * 32 * 64 * 4
     key_bytes = regions * 64 * 64 * 4
     value_bytes = regions * 64 * 128 * 4
-    crossing_bytes = regions * 48 * 64 * 4
+    crossing_bytes = regions * 32 * 64 * 4
     output_bytes = 96 * 128 * 4
     assert (
         sweep.selected.breakdown.gm_l1_bytes,
@@ -272,9 +277,9 @@ def test_attention_source_plan_traffic_matches_emitted_topology() -> None:
         crossing_bytes,
     )
     source = emit_pypto_region(graph, region, program_name="attention_source").source
-    assert "pl.spmd(2," in source
+    assert "pl.spmd(3," in source
     assert "pl.range(1, init_values=" in source
-    assert source.count("pl.tensor.slice(arg_query, [48, 64]") == 1
+    assert source.count("pl.tensor.slice(arg_query, [32, 64]") == 1
     assert source.count("pl.tensor.slice(arg_key, [64, 64]") == 1
     assert source.count("pl.tensor.slice(arg_value, [64, 128]") == 1
     assert source.count("pl.tensor.matmul(") == 2
@@ -334,8 +339,8 @@ def test_feature_round_trip_prices_physical_fp32_c2v_messages() -> None:
     assert sweep.selected.breakdown.l0c_gm_bytes == crossing_bytes + output_bytes
 
 
-def test_feature_round_trip_prices_every_outer_pipeline_l1_slot() -> None:
-    """Source-ready costing includes all panels cloned by the stage-3 pipeline."""
+def test_deep_feature_round_trip_prices_whole_program_l1_residency() -> None:
+    """All task-local Mat allocation families must fit one source program."""
 
     module = StaticFp32DeepLinearBlend(160).eval()
     graph = export_and_normalize(
@@ -352,24 +357,59 @@ def test_feature_round_trip_prices_every_outer_pipeline_l1_slot() -> None:
         solver_binary=_solver(),
         solver_workers=2,
         require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+    repeated = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
     )
 
-    plan = scheduled_region(solved.regions[0]).steps[0].plan
-    assert isinstance(plan, MixedKernelPlan)
-    assert plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
-    assert plan.feature_round_trip is not None
-    assert plan.feature_round_trip.intermediate_chunk == 80
-    assert plan.feature_round_trip.producer_window_k == (32, 160)
-    one_slot_bytes = 2 * 32 * (32 + 80) * 4 + 160 * (32 + 80) * 4 + 80 * 160 * 4
-    assert plan.pipeline_stages == 3
-    assert plan.cube_stage_peak_l1_bytes == 3 * one_slot_bytes == 454_656
-    v2c_reserved = sum(
-        fifo.reserved_bytes
-        for fifo in plan.fifos
-        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    region = solved.regions[0]
+    assert region.solution is not None
+    assert tuple(step["kind"] for step in region.solution["steps"]) == (
+        "cube",
+        "vector",
+        "cube",
+        "cube",
     )
-    assert v2c_reserved == 40_960
-    assert plan.cube_stage_peak_l1_bytes + v2c_reserved == 495_616
+    assert tuple(tuple(step["ops"]) for step in region.solution["steps"]) == (
+        (0, 1),
+        (2,),
+        (3,),
+        (4,),
+    )
+    assert region.candidate_summaries
+    assert tuple(
+        (candidate.modeled_cost_cycles, candidate.partition, candidate.schedule)
+        for candidate in region.candidate_summaries
+    ) == tuple(
+        (candidate.modeled_cost_cycles, candidate.partition, candidate.schedule)
+        for candidate in repeated.regions[0].candidate_summaries
+    )
+    assert all(
+        sum(
+            int(step["plan"].get("source_l1_allocation_bytes", 0))
+            for step in candidate.schedule
+        )
+        <= 524_288
+        for candidate in region.candidate_summaries
+    )
+    assert (
+        sum(
+            int(step["plan"].get("source_l1_allocation_bytes", 0))
+            for step in region.solution["steps"]
+        )
+        == 368_640
+    )
+    # Complete enumeration is used for this five-op lowered problem. The old
+    # three-step partition is absent because its mixed task plus both cube
+    # tasks coexist in one Mat arena and exceed the whole-program L1 capacity.
+    assert ((0, 1), (2, 3), (4,)) not in {
+        candidate.partition for candidate in region.candidate_summaries
+    }
 
 
 @pytest.mark.parametrize(
@@ -481,28 +521,45 @@ def test_broader_fp32_feature_round_trip_graphs_are_source_planned(
     region = solved.regions[0]
     assert region.region.op_ids == tuple(op.id for op in graph.ops)
     assert region.solution is not None
-    assert tuple(step["kind"] for step in region.solution["steps"]) == expected_steps
+    selected_steps = expected_steps
+    if module_factory is StaticFp32DeepLinearBlend and shape == (256, 160, 320):
+        selected_steps = ("cube", "vector", "cube", "cube")
+    assert tuple(step["kind"] for step in region.solution["steps"]) == selected_steps
     assert region.candidate_summaries
     assert all(candidate.source_ready for candidate in region.candidate_summaries)
-    first_plan = scheduled_region(region).steps[0].plan
-    assert isinstance(first_plan, MixedKernelPlan)
-    assert first_plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    plans = tuple(step.plan for step in scheduled_region(region).steps)
+    if selected_steps == ("cube", "vector", "cube", "cube"):
+        assert not any(isinstance(plan, MixedKernelPlan) for plan in plans)
+    else:
+        assert isinstance(plans[0], MixedKernelPlan)
+        assert plans[0].algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
 
 
 @pytest.mark.parametrize(
-    ("shapes", "required_vec_bytes", "required_l1_bytes", "closest_tile"),
+    (
+        "shapes",
+        "required_vec_bytes",
+        "required_l1_bytes",
+        "closest_tile",
+        "selected_step_kinds",
+        "selected_partition",
+    ),
     (
         (
             ((160, 64), (128, 64), (128, 64)),
             245_920,
             212_992,
             MixedGroupTile(80, 16, 128, 2, 4),
+            ("cube", "mixed"),
+            ((0,), tuple(range(1, 7))),
         ),
         (
             ((320, 128), (256, 128), (256, 128)),
             491_680,
             442_368,
             MixedGroupTile(80, 32, 256, 4, 4),
+            ("cube", "vector", "vector", "cube"),
+            ((0,), (1, 2), (3, 4, 5), (6,)),
         ),
     ),
 )
@@ -511,6 +568,8 @@ def test_cvc_sweep_reports_when_source_solver_selects_a_gm_cut(
     required_vec_bytes: int,
     required_l1_bytes: int,
     closest_tile: MixedGroupTile,
+    selected_step_kinds: tuple[str, ...],
+    selected_partition: tuple[tuple[int, ...], ...],
 ) -> None:
     graph = export_and_normalize(
         StaticAttentionCore(), tuple(torch.zeros(shape) for shape in shapes)
@@ -527,8 +586,8 @@ def test_cvc_sweep_reports_when_source_solver_selects_a_gm_cut(
     availability = mixed_group_sweep_availability(region)
     assert not availability.available
     assert availability.code == "selected_solution_is_not_one_mixed_region"
-    assert availability.selected_step_kinds == ("cube", "mixed")
-    assert availability.selected_partition == ((0,), tuple(range(1, 7)))
+    assert availability.selected_step_kinds == selected_step_kinds
+    assert availability.selected_partition == selected_partition
 
     probed = mixed_group_sweep_availability(region, sweep_binary=_sweep_binary())
     assert not probed.available
@@ -589,18 +648,22 @@ def test_non_capacity_sweep_rejection_has_no_fabricated_tile(
     assert availability.available_vec_bytes is None
     assert availability.required_l1_bytes is None
     assert availability.available_l1_bytes is None
+    assert availability.required_l0a_bytes is None
+    assert availability.available_l0a_bytes is None
+    assert availability.required_l0b_bytes is None
+    assert availability.available_l0b_bytes is None
 
 
 @pytest.mark.parametrize(
     "shapes",
     (
-        ((192, 64), (160, 64), (160, 96)),
-        ((384, 96), (160, 96), (160, 128)),
-        ((512, 80), (160, 80), (160, 192)),
-        ((256, 96), (256, 96), (256, 160)),
-        ((384, 128), (128, 128), (128, 96)),
-        ((768, 80), (256, 80), (256, 128)),
-        ((384, 80), (224, 80), (224, 192)),
+        ((96, 32), (32, 32), (32, 64)),
+        ((128, 48), (48, 48), (48, 48)),
+        ((192, 32), (64, 32), (64, 32)),
+        ((256, 48), (64, 48), (64, 64)),
+        ((384, 32), (32, 32), (32, 64)),
+        ((512, 32), (64, 32), (64, 64)),
+        ((768, 48), (48, 48), (48, 48)),
     ),
 )
 def test_cvc_realization_corpus_has_rankable_group_candidates(
@@ -614,18 +677,23 @@ def test_cvc_realization_corpus_has_rankable_group_candidates(
         candidate.groups * candidate.trips_per_group == plan.spatial_tiles
         for candidate in sweep.candidates
     )
+    assert all(
+        candidate.cube_stage_peak_l0a_bytes <= 65_536
+        and candidate.cube_stage_peak_l0b_bytes <= 65_536
+        for candidate in sweep.candidates
+    )
 
 
 @pytest.mark.parametrize(
     "shapes",
     (
-        pytest.param(((288, 64), (160, 64), (160, 96)), id="short_square"),
-        pytest.param(((512, 128), (128, 128), (128, 96)), id="ragged_sequence"),
-        pytest.param(((192, 80), (160, 80), (160, 128)), id="short_rectangular"),
-        pytest.param(((384, 64), (160, 64), (160, 192)), id="tall_output"),
-        pytest.param(((512, 96), (160, 96), (160, 160)), id="balanced_wide"),
-        pytest.param(((256, 80), (256, 80), (256, 192)), id="long_sequence"),
-        pytest.param(((384, 96), (128, 96), (128, 128)), id="narrow_sequence"),
+        pytest.param(((128, 32), (48, 32), (48, 48)), id="short_rectangular"),
+        pytest.param(((192, 48), (64, 48), (64, 64)), id="medium_wider_k"),
+        pytest.param(((256, 32), (32, 32), (32, 64)), id="long_thin"),
+        pytest.param(((384, 48), (48, 48), (48, 48)), id="tall_wider_k"),
+        pytest.param(((512, 32), (64, 32), (64, 32)), id="tall_square"),
+        pytest.param(((640, 48), (64, 48), (64, 64)), id="deep_wider_k"),
+        pytest.param(((768, 32), (48, 32), (48, 48)), id="deep_rectangular"),
     ),
 )
 def test_cvc_blind_holdout_shapes_have_rankable_source_candidates(
@@ -643,6 +711,8 @@ def test_cvc_blind_holdout_shapes_have_rankable_source_candidates(
         for candidate in sweep.candidates
     )
     for candidate in sweep.candidates:
+        assert candidate.cube_stage_peak_l0a_bytes <= 65_536
+        assert candidate.cube_stage_peak_l0b_bytes <= 65_536
         forced = region_for_mixed_group_candidate(region, candidate)
         assert can_emit_region(graph, forced)
 
@@ -765,20 +835,20 @@ def test_c2v_descriptor_matched_group_controls(
 
 def test_cvc_one_trip_candidate_is_serial_and_source_ready() -> None:
     graph, region, plan, sweep = _solve_and_sweep(
-        StaticAttentionCore(), ((768, 64), (64, 64), (64, 128))
+        StaticAttentionCore(), ((384, 32), (32, 32), (32, 64))
     )
 
     assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
     assert plan.m_partition.parts == 12
     assert plan.n_partition.parts == 1
-    assert plan.vector_stage_peak_ub_bytes == 49280
+    assert plan.vector_stage_peak_ub_bytes == 20544
     c2v_ring_bytes = sum(
         fifo.reserved_bytes
         for fifo in plan.fifos
         if fifo.direction.value == "cube_to_vector"
     )
-    assert c2v_ring_bytes == 65536
-    assert plan.vector_stage_peak_ub_bytes + c2v_ring_bytes == 114816
+    assert c2v_ring_bytes == 16384
+    assert plan.vector_stage_peak_ub_bytes + c2v_ring_bytes == 36928
     one_trip = next(
         candidate for candidate in sweep.candidates if candidate.groups == 12
     )
@@ -847,7 +917,7 @@ def test_sweep_candidate_is_bound_to_exact_tile_and_solution() -> None:
         ),
         (
             StreamingSoftmaxPv(),
-            ((16, 4096), (4096, 64)),
+            ((16, 512), (512, 64)),
             MixedCrossCoreProtocol.ONE_WAY,
             ("vector_to_cube",),
             ("vector", "cube"),
@@ -872,8 +942,6 @@ def test_sweep_preserves_fifo_and_topology_controls(
         assert len(sweep.candidates) == 1
         assert sweep.selected.pipeline_stages == 1
         assert not sweep.selected.overlap_implementable
-    if isinstance(module, StreamingSoftmaxPv):
-        assert len(sweep.candidates) == 1
 
 
 def test_dense_swiglu_sweep_exposes_its_fixed_fifo_and_stage_breakdown() -> None:

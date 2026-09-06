@@ -130,6 +130,35 @@ def _validate_common(context: EmissionContext, plan: MixedKernelPlan) -> None:
             "mixed cube stage and V2C FIFO rings exceed L1 capacity: "
             f"{required_l1_bytes} > {l1_capacity} bytes"
         )
+    if plan.source_l1_allocation_bytes > l1_capacity:
+        raise SourceEmissionError(
+            "mixed source allocation families exceed L1 capacity: "
+            f"{plan.source_l1_allocation_bytes} > {l1_capacity} bytes"
+        )
+    raw_l0 = context.problem.get("l0_matmul_config")
+    if not isinstance(raw_l0, Mapping):
+        raise SourceEmissionError("mixed source requires an L0 matmul target profile")
+    l0a_capacity = raw_l0.get("l0a_bytes")
+    l0b_capacity = raw_l0.get("l0b_bytes")
+    if (
+        not isinstance(l0a_capacity, int)
+        or isinstance(l0a_capacity, bool)
+        or l0a_capacity <= 0
+        or not isinstance(l0b_capacity, int)
+        or isinstance(l0b_capacity, bool)
+        or l0b_capacity <= 0
+    ):
+        raise SourceEmissionError("mixed source received invalid L0 capacities")
+    if plan.cube_stage_peak_l0a_bytes > l0a_capacity:
+        raise SourceEmissionError(
+            "mixed cube stage exceeds lowered L0A capacity: "
+            f"{plan.cube_stage_peak_l0a_bytes} > {l0a_capacity} bytes"
+        )
+    if plan.cube_stage_peak_l0b_bytes > l0b_capacity:
+        raise SourceEmissionError(
+            "mixed cube stage exceeds lowered L0B capacity: "
+            f"{plan.cube_stage_peak_l0b_bytes} > {l0b_capacity} bytes"
+        )
     for stage in plan.stages:
         if stage.vector_stream is not None:
             validate_source_cast_frames(context, stage.vector_stream)

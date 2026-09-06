@@ -283,6 +283,36 @@ Solution::ValidationResult Solution::validate() const {
         }
     }
 
+    // A source region is emitted as one PyPTO program. Its outlined task
+    // functions share one physical Mat arena, so request families from
+    // different solution steps remain simultaneously allocated even though
+    // the orchestration submits those steps in topological order. Per-step
+    // peak checks cannot see that program-wide residency.
+    if (prob_->require_source_codegen && prob_->l1_capacity > 0) {
+        int64_t source_program_l1_bytes = 0;
+        for (size_t i = 0; i < steps_.size(); ++i) {
+            const auto& step = steps_[i];
+            const CostResult& cost = step_costs_[i];
+            if (step.subgraph.is_mixed()) {
+                const MixedSchedulePlan plan = step.subgraph.mixed_schedule_plan(
+                    step.config, retained_entering_[i], step.retain_these,
+                    cost.parallel_split, cost.mixed_active_groups);
+                source_program_l1_bytes += plan.source_l1_allocation_bytes;
+            } else if (step.subgraph.has_matmul()) {
+                const CubeSchedulePlan plan = step.subgraph.cube_schedule_plan(
+                    step.config, retained_entering_[i], step.retain_these,
+                    cost.parallel_split, cost.cube_split_merge_policy);
+                source_program_l1_bytes += plan.source_l1_allocation_bytes;
+            }
+        }
+        if (source_program_l1_bytes > prob_->l1_capacity) {
+            fail("Source program requires Mat/L1 allocation " +
+                 std::to_string(source_program_l1_bytes) + "/" +
+                 std::to_string(prob_->l1_capacity) + " bytes across all steps");
+            return vr;
+        }
+    }
+
     // Topological order
     FlatSet<size_t> available(dag_->graph_inputs.begin(), dag_->graph_inputs.end());
     for (size_t i = 0; i < steps_.size(); i++) {

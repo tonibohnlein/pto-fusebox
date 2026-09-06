@@ -38,13 +38,13 @@ if os.environ.get("PTO_FUSEBOX_RUN_DEVICE_TESTS") != "1":
 
 
 HOLDOUT_SHAPES = (
-    pytest.param(((288, 64), (160, 64), (160, 96)), id="short_square"),
-    pytest.param(((512, 128), (128, 128), (128, 96)), id="ragged_sequence"),
-    pytest.param(((192, 80), (160, 80), (160, 128)), id="short_rectangular"),
-    pytest.param(((384, 64), (160, 64), (160, 192)), id="tall_output"),
-    pytest.param(((512, 96), (160, 96), (160, 160)), id="balanced_wide"),
-    pytest.param(((256, 80), (256, 80), (256, 192)), id="long_sequence"),
-    pytest.param(((384, 96), (128, 96), (128, 128)), id="narrow_sequence"),
+    pytest.param(((128, 32), (48, 32), (48, 48)), id="short_rectangular"),
+    pytest.param(((192, 48), (64, 48), (64, 64)), id="medium_wider_k"),
+    pytest.param(((256, 32), (32, 32), (32, 64)), id="long_thin"),
+    pytest.param(((384, 48), (48, 48), (48, 48)), id="tall_wider_k"),
+    pytest.param(((512, 32), (64, 32), (64, 32)), id="tall_square"),
+    pytest.param(((640, 48), (64, 48), (64, 64)), id="deep_wider_k"),
+    pytest.param(((768, 32), (48, 32), (48, 48)), id="deep_rectangular"),
 )
 
 
@@ -161,6 +161,9 @@ def test_every_source_ready_cvc_candidate_on_silicon(
                 "groups": plan.active_groups,
                 "trips_per_group": plan.max_trips_per_group,
                 "pipeline_stages": plan.pipeline_stages,
+                "cube_stage_peak_l0a_bytes": plan.cube_stage_peak_l0a_bytes,
+                "cube_stage_peak_l0b_bytes": plan.cube_stage_peak_l0b_bytes,
+                "source_l1_allocation_bytes": plan.source_l1_allocation_bytes,
                 "median_device_wall_us": statistics.median(device_wall),
                 "min_device_wall_us": min(device_wall),
                 "max_device_wall_us": max(device_wall),
