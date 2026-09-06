@@ -14,6 +14,9 @@ from examples.torch_frontend.static_mixed import (
     StaticAttentionResidual,
     StaticC2VEpilogue,
     StaticDenseSwiGlu,
+    StaticFp32DeepLinearBlend,
+    StaticFp32DenseSwiGlu,
+    StaticFp32FeatureBlend,
     build_examples as build_static_mixed_examples,
 )
 from pto_fusebox import (
@@ -398,6 +401,57 @@ def test_feature_round_trip_is_selected_as_one_maximal_static_region(
 
 
 @pytest.mark.parametrize(
+    ("module_factory", "expected_steps"),
+    (
+        (StaticFp32DenseSwiGlu, ("mixed",)),
+        (StaticFp32FeatureBlend, ("mixed",)),
+        (StaticFp32DeepLinearBlend, ("mixed", "cube")),
+    ),
+)
+@pytest.mark.parametrize(
+    "shape",
+    ((64, 96, 192), (128, 128, 256), (256, 160, 320)),
+)
+def test_broader_fp32_feature_round_trip_graphs_are_source_planned(
+    module_factory: type[nn.Module],
+    expected_steps: tuple[str, ...],
+    shape: tuple[int, int, int],
+) -> None:
+    rows, hidden_size, intermediate_size = shape
+    module = (
+        module_factory(hidden_size)
+        if module_factory is StaticFp32DeepLinearBlend
+        else module_factory()
+    )
+    args = (
+        torch.zeros(rows, hidden_size),
+        torch.zeros(hidden_size, intermediate_size),
+        torch.zeros(hidden_size, intermediate_size),
+        torch.zeros(intermediate_size, hidden_size),
+    )
+    graph = export_and_normalize(module.eval(), args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+
+    assert solved.regions_solved
+    assert len(solved.regions) == 1
+    region = solved.regions[0]
+    assert region.region.op_ids == tuple(op.id for op in graph.ops)
+    assert region.solution is not None
+    assert tuple(step["kind"] for step in region.solution["steps"]) == expected_steps
+    assert region.candidate_summaries
+    assert all(candidate.source_ready for candidate in region.candidate_summaries)
+    first_plan = scheduled_region(region).steps[0].plan
+    assert isinstance(first_plan, MixedKernelPlan)
+    assert first_plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+
+
+@pytest.mark.parametrize(
     ("shapes", "required_vec_bytes", "required_l1_bytes", "closest_tile"),
     (
         (
@@ -522,6 +576,37 @@ def test_cvc_realization_corpus_has_rankable_group_candidates(
         candidate.groups * candidate.trips_per_group == plan.spatial_tiles
         for candidate in sweep.candidates
     )
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    (
+        pytest.param(((288, 64), (160, 64), (160, 96)), id="short_square"),
+        pytest.param(((512, 128), (128, 128), (128, 96)), id="ragged_sequence"),
+        pytest.param(((192, 80), (160, 80), (160, 128)), id="short_rectangular"),
+        pytest.param(((384, 64), (160, 64), (160, 192)), id="tall_output"),
+        pytest.param(((512, 96), (160, 96), (160, 160)), id="balanced_wide"),
+        pytest.param(((256, 80), (256, 80), (256, 192)), id="long_sequence"),
+        pytest.param(((384, 96), (128, 96), (128, 128)), id="narrow_sequence"),
+    ),
+)
+def test_cvc_blind_holdout_shapes_have_rankable_source_candidates(
+    shapes: tuple[tuple[int, ...], ...],
+) -> None:
+    """Freeze unseen CVC geometries before using their silicon timings."""
+
+    graph, region, plan, sweep = _solve_and_sweep(StaticAttentionCore(), shapes)
+
+    assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
+    assert len(sweep.candidates) >= 3
+    assert all(candidate.breakdown.total_cycles > 0 for candidate in sweep.candidates)
+    assert all(
+        candidate.groups * candidate.trips_per_group == plan.spatial_tiles
+        for candidate in sweep.candidates
+    )
+    for candidate in sweep.candidates:
+        forced = region_for_mixed_group_candidate(region, candidate)
+        assert can_emit_region(graph, forced)
 
 
 @pytest.mark.parametrize(

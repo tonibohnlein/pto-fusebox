@@ -262,13 +262,26 @@ Solution::ValidationResult Solution::validate() const {
         if (!covered.count(i)) { fail("Op " + std::to_string(i) + " not covered"); return vr; }
 
     // Per-subgraph feasibility
-    for (size_t i = 0; i < steps_.size(); i++)
-        if (!steps_[i].subgraph.is_feasible(steps_[i].config,
-                                             retained_entering_[i],
-                                             steps_[i].retain_these)) {
+    for (size_t i = 0; i < steps_.size(); i++) {
+        const auto& step = steps_[i];
+        if (!step.subgraph.is_feasible(step.config,
+                                       retained_entering_[i],
+                                       step.retain_these)) {
             fail("Step " + std::to_string(i) + ": working set exceeds fast memory");
             return vr;
         }
+        if (prob_->require_source_codegen && step.subgraph.is_mixed()) {
+            const CostResult& cost = step_costs_[i];
+            const MixedSchedulePlan plan = step.subgraph.mixed_schedule_plan(
+                step.config, retained_entering_[i], step.retain_these,
+                cost.parallel_split, cost.mixed_active_groups);
+            if (!plan.feasible || !plan.source_codegen_ready) {
+                fail("Step " + std::to_string(i) +
+                     ": mixed schedule is not source-codegen ready");
+                return vr;
+            }
+        }
+    }
 
     // Topological order
     FlatSet<size_t> available(dag_->graph_inputs.begin(), dag_->graph_inputs.end());

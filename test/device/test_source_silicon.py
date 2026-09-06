@@ -28,6 +28,9 @@ from examples.torch_frontend.static_mixed import (
     StaticAttentionCore,
     StaticAttentionResidual,
     StaticDenseSwiGlu,
+    StaticFp32DeepLinearBlend,
+    StaticFp32DenseSwiGlu,
+    StaticFp32FeatureBlend,
 )
 from torch import nn
 
@@ -74,6 +77,7 @@ class SiliconCase:
     forced_mixed_groups: int | None = None
     expected_mixed_groups: int | None = None
     expected_mixed_trips: int | None = None
+    expected_steps: tuple[str, ...] | None = None
     reference: ReferenceFactory | None = None
 
 
@@ -187,6 +191,16 @@ def _static_dense_swiglu() -> StaticDenseSwiGlu:
                 ).to(torch.bfloat16)
                 * 0.25
             )
+    return module
+
+
+def _fp32_deep_linear_blend() -> StaticFp32DeepLinearBlend:
+    module = StaticFp32DeepLinearBlend(hidden_size=160)
+    generator = _generator(0)
+    with torch.no_grad():
+        module.sink.weight.copy_(
+            torch.randn(module.sink.weight.shape, generator=generator) * 0.1
+        )
     return module
 
 
@@ -525,6 +539,54 @@ MIXED_CASES = (
         reference=_dense_swiglu_reference,
     ),
     SiliconCase(
+        "mixed_fp32_dense_swiglu_64x96x192x96",
+        "mixed",
+        StaticFp32DenseSwiGlu(),
+        _random_args(
+            (64, 96),
+            (96, 192),
+            (96, 192),
+            (192, 96),
+            scale=0.1,
+        ),
+        rtol=1.0e-3,
+        atol=1.0e-3,
+        mixed_contract="feature_round_trip",
+        expected_steps=("mixed",),
+    ),
+    SiliconCase(
+        "mixed_fp32_feature_blend_128x128x256x128",
+        "mixed",
+        StaticFp32FeatureBlend(),
+        _random_args(
+            (128, 128),
+            (128, 256),
+            (128, 256),
+            (256, 128),
+            scale=0.1,
+        ),
+        rtol=1.0e-3,
+        atol=1.0e-3,
+        mixed_contract="feature_round_trip",
+        expected_steps=("mixed",),
+    ),
+    SiliconCase(
+        "mixed_fp32_deep_linear_blend_256x160x320x160",
+        "composed",
+        _fp32_deep_linear_blend(),
+        _random_args(
+            (256, 160),
+            (160, 320),
+            (160, 320),
+            (320, 160),
+            scale=0.1,
+        ),
+        rtol=1.0e-3,
+        atol=1.0e-3,
+        mixed_contract="feature_round_trip",
+        expected_steps=("mixed", "cube"),
+    ),
+    SiliconCase(
         "mixed_qk_softmax_pv_residual_96x64x128",
         "mixed",
         StaticAttentionResidual(),
@@ -573,49 +635,52 @@ def _device_id() -> int:
 
 def _assert_static_artifact(
     compiled: object,
-    case: SiliconCase,
-    plan: CubeKernelPlan | MixedKernelPlan | VectorKernelPlan,
+    plans: tuple[CubeKernelPlan | MixedKernelPlan | VectorKernelPlan, ...],
 ) -> None:
-    work_units = (
-        plan.active_groups if isinstance(plan, MixedKernelPlan) else plan.work_units
-    )
     output_dir = Path(getattr(compiled, "output_dir"))
-    pto_files = list(output_dir.rglob("*.pto"))
-    assert len(pto_files) == 1
-    pto = pto_files[0].read_text(encoding="utf-8")
-    if case.kind == "mixed":
-        assert isinstance(plan, MixedKernelPlan)
-        assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
-        assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
-        directions = {fifo.direction for fifo in plan.fifos}
-        if MixedTransferDirection.CUBE_TO_VECTOR in directions:
-            assert "pto.tpush_to_aiv" in pto
-            assert "pto.tpop_from_aic" in pto
-            assert "pto.tfree_from_aic" in pto
-        if MixedTransferDirection.VECTOR_TO_CUBE in directions:
-            assert "pto.tpush_to_aic" in pto
-            assert "pto.tpop_from_aiv" in pto
-            assert "pto.tfree_from_aiv" in pto
-    else:
+    pto_files = sorted(output_dir.rglob("*.pto"))
+    assert len(pto_files) == len(plans)
+    pto_sources = [path.read_text(encoding="utf-8") for path in pto_files]
+    for plan, pto in zip(plans, pto_sources, strict=True):
+        if isinstance(plan, MixedKernelPlan):
+            assert pto.count("pto.kernel_kind = #pto.kernel_kind<cube>") == 1
+            assert pto.count("pto.kernel_kind = #pto.kernel_kind<vector>") == 1
+            directions = {fifo.direction for fifo in plan.fifos}
+            if MixedTransferDirection.CUBE_TO_VECTOR in directions:
+                assert "pto.tpush_to_aiv" in pto
+                assert "pto.tpop_from_aic" in pto
+                assert "pto.tfree_from_aic" in pto
+            if MixedTransferDirection.VECTOR_TO_CUBE in directions:
+                assert "pto.tpush_to_aic" in pto
+                assert "pto.tpop_from_aiv" in pto
+                assert "pto.tfree_from_aiv" in pto
+            continue
         assert "pto.tpush" not in pto
         assert "pto.tpop" not in pto
         assert "pto.tfree" not in pto
-    if case.kind == "vector":
-        assert "pto.tmatmul" not in pto
-        assert re.search(r"partition_tensor_view<[^>]*\?", pto) is None
-        assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
-    elif case.kind == "cube":
-        assert "pto.tmatmul" in pto
+        if isinstance(plan, VectorKernelPlan):
+            assert "pto.tmatmul" not in pto
+            assert re.search(r"partition_tensor_view<[^>]*\?", pto) is None
+            assert re.search(r"valid_(?:row|col) = %arg[0-9]+", pto) is None
+        else:
+            assert isinstance(plan, CubeKernelPlan)
+            assert "pto.tmatmul" in pto
 
     orchestration_files = list((output_dir / "orchestration").glob("*.cpp"))
     assert len(orchestration_files) == 1
     orchestration = orchestration_files[0].read_text(encoding="utf-8")
-    if case.kind == "mixed":
-        assert orchestration.count("rt_submit_task(") == 1
-    else:
-        assert len(re.findall(r"\brt_submit_ai[cv]_task\(", orchestration)) == 1
-    assert orchestration.count("launch_spec.set_block_num(") == 1
-    assert f"launch_spec.set_block_num({work_units});" in orchestration
+    assert orchestration.count("rt_submit_task(") == sum(
+        isinstance(plan, MixedKernelPlan) for plan in plans
+    )
+    assert len(re.findall(r"\brt_submit_ai[cv]_task\(", orchestration)) == sum(
+        not isinstance(plan, MixedKernelPlan) for plan in plans
+    )
+    assert orchestration.count("launch_spec.set_block_num(") == len(plans)
+    for plan in plans:
+        work_units = (
+            plan.active_groups if isinstance(plan, MixedKernelPlan) else plan.work_units
+        )
+        assert f"launch_spec.set_block_num({work_units});" in orchestration
     assert "region_index" not in orchestration
 
 
@@ -628,6 +693,13 @@ def _assert_mixed_contract(
         return
     assert isinstance(plan, MixedKernelPlan)
     assert plan.source_codegen_ready
+    if case.mixed_contract == "feature_round_trip":
+        assert plan.algorithm.value == "feature_chunk_round_trip"
+        assert any(
+            fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+            for fifo in plan.fifos
+        )
+        return
     if case.mixed_contract == "cvc_streamed_groups":
         assert len(plan.fifos) == 2
         assert plan.spatial_tiles == 4
@@ -794,14 +866,34 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
             case.forced_mixed_groups,
         )
     assert can_emit_region(graph, region)
-    plan = scheduled_region(region).steps[0].plan
-    assert isinstance(plan, (CubeKernelPlan, MixedKernelPlan, VectorKernelPlan))
+    scheduled = scheduled_region(region)
+    plans = tuple(step.plan for step in scheduled.steps)
+    assert plans
+    assert all(
+        isinstance(plan, (CubeKernelPlan, MixedKernelPlan, VectorKernelPlan))
+        for plan in plans
+    )
+    step_kinds = tuple(
+        "mixed"
+        if isinstance(plan, MixedKernelPlan)
+        else "cube"
+        if isinstance(plan, CubeKernelPlan)
+        else "vector"
+        for plan in plans
+    )
+    assert step_kinds == (case.expected_steps or (case.kind,))
+    mixed_plans = tuple(plan for plan in plans if isinstance(plan, MixedKernelPlan))
     emitted = emit_pypto_region(graph, region, program_name=case.name)
-    assert emitted.kind is not None
-    assert emitted.kind.value == case.kind
+    if len(plans) == 1:
+        assert emitted.kind is not None
+        assert emitted.kind.value == case.kind
+    else:
+        assert emitted.kind is None
     assert "auto_fuse" not in emitted.source
     assert "auto_tile" not in emitted.source
-    _assert_mixed_contract(case, plan, emitted.source)
+    if case.mixed_contract is not None:
+        assert len(mixed_plans) == 1
+        _assert_mixed_contract(case, mixed_plans[0], emitted.source)
 
     program = pl.parse_program(emitted.source)
     config = runtime.RunConfig(
@@ -815,7 +907,7 @@ def _run_case(case: SiliconCase, tmp_path: Path) -> None:
     assert seed_count > 0
 
     compiled = ir.compile(program, **config.compile_kwargs())
-    _assert_static_artifact(compiled, case, plan)
+    _assert_static_artifact(compiled, plans)
     for seed in range(seed_count):
         args = case.make_args(seed)
         with torch.no_grad():

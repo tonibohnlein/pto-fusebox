@@ -4,6 +4,7 @@ import ast
 import math
 import os
 import re
+import runpy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,59 @@ from pto_fusebox.ir import normalized_graph_sha256
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
+
+
+def test_production_device_controls_call_native_pypto_lib_symbols_only() -> None:
+    """Production performance controls are wrappers, not copied schedules."""
+
+    control_module = runpy.run_path(
+        str(Path(__file__).parents[1] / "device" / "pypto_lib_native_controls.py")
+    )
+    controls = control_module["NATIVE_CONTROLS"]
+    assert [control.model_name for control in controls] == [
+        "deepseek_v4_flash_dspark",
+        "deepseek_v4_flash_mtp",
+        "deepseek_v4_pro",
+        "qwen3_14b",
+    ]
+    assert [
+        control.model_name for control in controls if not control.expected_lowerable
+    ] == ["deepseek_v4_pro"]
+
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    for control in controls:
+        tree = ast.parse(control.source)
+        program = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == control.program_name
+        )
+        returned = program.body[-1]
+        assert isinstance(returned, ast.Return)
+        assert isinstance(returned.value, ast.Call)
+        assert isinstance(returned.value.func, ast.Name)
+        assert returned.value.func.id == control.callable_name
+
+        if pypto_lib_root is None:
+            continue
+        native_path = (
+            Path(pypto_lib_root)
+            / "models"
+            / control.model_name
+            / f"{control.module_name}.py"
+        )
+        native_tree = ast.parse(
+            native_path.read_text(encoding="utf-8"), filename=str(native_path)
+        )
+        native_symbols = {
+            node.name for node in native_tree.body if isinstance(node, ast.FunctionDef)
+        }
+        required = {control.callable_name}
+        if control.tensor_specs_name is not None:
+            required.add(control.tensor_specs_name)
+        if control.golden_name is not None:
+            required.add(control.golden_name)
+        assert required <= native_symbols
 
 
 class _MetadataViewIntoNativeBoundary(nn.Module):

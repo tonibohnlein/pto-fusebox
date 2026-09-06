@@ -196,6 +196,8 @@ uniform non-split spatial plans, nested matmul DAGs, sequential outer-K windows,
 on-chip produced values, solver-selected retained boundary panels, and
 single-sink split-K through dependency-linked PyPTO tasks. Other
 schedules raise a precise `SourceEmissionError` rather than being approximated.
+Native Torch SiLU is normalized to its ordinary pointwise DAG, allowing mixed
+feature-round-trip planning without a SwiGLU or model-specific recognizer.
 Each maximal supported region is one solver input DAG, not one mandatory fused
 kernel: when the solver selects several homogeneous steps, source emission
 materializes their cut edges through explicit GM tensors and emits the steps as

@@ -181,6 +181,9 @@ class _ExportNormalizer:
         if target in _POINTWISE:
             self._pointwise(node, _POINTWISE[target], target)
             return
+        if target == "aten.silu.default":
+            self._silu(node)
+            return
         if target == "aten.reciprocal.default":
             self._reciprocal(node)
             return
@@ -329,6 +332,48 @@ class _ExportNormalizer:
                 "scalars": [{"position": 0, "value": 1}],
             },
         )
+
+    def _silu(self, node: Any) -> None:
+        """Expand SiLU into the generic pointwise DAG consumed by the solver."""
+
+        tensor_inputs = self._tensor_inputs(node.args[:1])
+        if len(tensor_inputs) != 1 or len(node.args) != 1 or node.kwargs:
+            self._opaque(node, "aten.silu.default requires one tensor input")
+            return
+        source = self._value(tensor_inputs[0])
+        output_meta = _metadata_outputs(node.meta.get("val"))[0]
+        output_dtype = _dtype_from_meta(output_meta)
+        if output_dtype != source.dtype:
+            self._opaque(node, "dtype-changing SiLU is unsupported")
+            return
+
+        intermediates = [
+            self._add_value_from_shape(
+                f"{node.name}_{suffix}", source.shape, source.dtype, role="intermediate"
+            )
+            for suffix in ("neg", "exp", "denominator", "reciprocal")
+        ]
+        output_id = self._add_value(node.name, output_meta, role="intermediate")
+        op_ids = (
+            self._add_op("neg", (source.id,), (intermediates[0],), {}),
+            self._add_op("exp", (intermediates[0],), (intermediates[1],), {}),
+            self._add_op(
+                "add",
+                (intermediates[1],),
+                (intermediates[2],),
+                {"scalars": [{"position": 1, "value": 1}]},
+            ),
+            self._add_op(
+                "div",
+                (intermediates[2],),
+                (intermediates[3],),
+                {"scalars": [{"position": 0, "value": 1}]},
+            ),
+            self._add_op("mul", (source.id, intermediates[3]), (output_id,), {}),
+        )
+        for value_id, op_id in zip((*intermediates, output_id), op_ids):
+            self._set_producer(value_id, op_id)
+        self.node_values[node] = (output_id,)
 
     def _round_for_integer_cast(self, node: Any) -> None:
         """Fold Torch round into its immediately consuming integer cast.

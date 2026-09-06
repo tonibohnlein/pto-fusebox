@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import os
 import re
+import runpy
 import sys
 from collections.abc import Callable
 from dataclasses import replace
@@ -40,6 +41,7 @@ from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
+from examples.torch_frontend.static_mixed import StaticFp32DeepLinearBlend
 from pto_fusebox import (
     EmittedPyPTOCallable,
     KernelKind,
@@ -75,6 +77,65 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("PTO_FUSEBOX_PYPTO_INTEGRATION") != "1",
     reason="set PTO_FUSEBOX_PYPTO_INTEGRATION=1 with PyPTO and PTOAS configured",
 )
+
+
+def test_production_pypto_lib_native_controls_lower_without_copied_schedules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every production comparator is the real PyPTO-lib static callable."""
+
+    pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
+    if pypto_lib_root is None:
+        pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+    assert pypto_lib_root is not None
+    control_module = runpy.run_path(
+        str(Path(__file__).parents[1] / "device" / "pypto_lib_native_controls.py")
+    )
+    runtime = importlib.import_module("pypto.runtime")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+
+    for control in control_module["NATIVE_CONTROLS"]:
+        model_dir = Path(pypto_lib_root) / "models" / control.model_name
+        case_dir = tmp_path / control.model_name
+        case_dir.mkdir()
+        caller_path = case_dir / "native_control.py"
+        caller_path.write_text(control.source, encoding="utf-8")
+        monkeypatch.syspath_prepend(str(model_dir))
+        for module_name in (
+            "config",
+            "rmsnorm",
+            "dspark_proj",
+            "mtp_projection",
+            "rms_lm_head",
+        ):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+        importlib.invalidate_caches()
+        spec = importlib.util.spec_from_file_location(
+            f"native_control_{control.model_name}", caller_path
+        )
+        assert spec is not None and spec.loader is not None
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        program = getattr(loaded, control.program_name)
+        config = runtime.RunConfig(
+            platform=os.environ.get("PTO_FUSEBOX_PLATFORM", "a2a3"),
+            dump_passes=False,
+        )
+        scalar_args = (
+            {"row_offset": 0, "valid_rows": 16}
+            if control.model_name == "qwen3_14b"
+            else {}
+        )
+        if control.expected_lowerable:
+            lowered = program.lower(config=config, **scalar_args)
+            assert lowered.functions
+        else:
+            assert control.expected_failure_substring is not None
+            with pytest.raises(
+                ValueError, match=re.escape(control.expected_failure_substring)
+            ):
+                program.lower(config=config, **scalar_args)
 
 
 class _PointwiseChain(nn.Module):
@@ -1636,6 +1697,48 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert plan.requested_skew_depth == 0
         assert not plan.overlap_implementable
         assert "pl.range(1, init_values=" in source
+
+
+def test_large_fp32_linear_sink_nested_accumulator_lowers_through_pypto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The largest feature-round-trip fixture exercises nested sink accumulators."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    module = StaticFp32DeepLinearBlend(160).eval()
+    args = (
+        torch.zeros(256, 160),
+        torch.zeros(160, 320),
+        torch.zeros(160, 320),
+        torch.zeros(320, 160),
+    )
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    assert solved.regions_solved
+    assert len(solved.regions) == 1
+    region = solved.regions[0]
+    assert region.solution is not None
+    assert [step["kind"] for step in region.solution["steps"]] == ["mixed", "cube"]
+    source = emit_pypto_region(
+        graph, region, program_name="large_fp32_linear_sink"
+    ).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "large_fp32_linear_sink"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    assert len(pto_files) == 2
 
 
 def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(

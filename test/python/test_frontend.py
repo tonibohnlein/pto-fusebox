@@ -250,6 +250,19 @@ def test_softmax_is_generic_dag_with_exact_p4_descriptor() -> None:
     ]
 
 
+def test_silu_is_expanded_into_generic_pointwise_operations() -> None:
+    class Silu(nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.nn.functional.silu(value)
+
+    graph = export_and_normalize(Silu(), (torch.randn(32, 64),))
+
+    assert [op.kind for op in graph.ops] == ["neg", "exp", "add", "div", "mul"]
+    assert all(op.supported for op in graph.ops)
+    assert graph.ops[2].attributes["scalars"] == [{"position": 1, "value": 1}]
+    assert graph.ops[3].attributes["scalars"] == [{"position": 0, "value": 1}]
+
+
 @pytest.mark.parametrize("rank", [2, 3])
 def test_linear_lowers_to_matmul_bias_and_preserves_transposed_weight(
     rank: int,

@@ -89,6 +89,56 @@ class StaticDenseSwiGlu(nn.Module):
         return torch.mm(activation, self.down_weight, out_dtype=torch.float32)
 
 
+class StaticFp32DenseSwiGlu(nn.Module):
+    """Generic FP32 SwiGLU expressed with the native Torch SiLU operator."""
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        gate = torch.mm(value, gate_weight)
+        up = torch.mm(value, up_weight)
+        return torch.mm(torch.nn.functional.silu(gate) * up, down_weight)
+
+
+class StaticFp32FeatureBlend(nn.Module):
+    """Two FP32 projections blended before a feature-chunk sink matmul."""
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(value, first_weight)
+        second = torch.mm(value, second_weight)
+        return torch.mm(first + second, down_weight)
+
+
+class StaticFp32DeepLinearBlend(nn.Module):
+    """Feature blend followed by a down projection and transposed Linear sink."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.sink = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        first_weight: torch.Tensor,
+        second_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        first = torch.mm(value, first_weight)
+        second = torch.mm(value, second_weight)
+        blended = torch.mm(first + second, down_weight)
+        return self.sink(blended)
+
+
 def build_examples() -> dict[str, Example]:
     """Return deterministic static attention and dense SwiGLU examples."""
 
