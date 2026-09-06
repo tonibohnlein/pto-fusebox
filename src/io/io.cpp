@@ -1139,7 +1139,27 @@ std::string solution_json(const Solution& sol) {
             // Per-op single-core k-tile, in execution order (cube-910B only). An
             // op's seq_k = its full K means it ran the contraction in one pass.
             const auto& prob = step.subgraph.problem();
-            if (cube_plan.feasible) {
+            if (mixed_plan.feasible) {
+                std::map<size_t, int64_t> mixed_windows;
+                for (const auto& stage : mixed_plan.stages) {
+                    if (stage.engine != MixedEngine::Cube) continue;
+                    if (stage.ops.size() != stage.cube_window_k.size()) {
+                        throw std::logic_error(
+                            "mixed cube stage does not cover its operation windows");
+                    }
+                    for (size_t index = 0; index < stage.ops.size(); ++index) {
+                        mixed_windows.emplace(stage.ops[index],
+                                              stage.cube_window_k[index]);
+                    }
+                }
+                std::vector<int64_t> ks;
+                for (auto op : order) {
+                    const auto window = mixed_windows.find(op);
+                    ks.push_back(window != mixed_windows.end() ? window->second
+                                                               : 0);
+                }
+                serialized_step["sequential_tiles"] = ks;
+            } else if (cube_plan.feasible) {
                 std::vector<int64_t> ks;
                 for (auto op : order) {
                     const auto request = std::find_if(

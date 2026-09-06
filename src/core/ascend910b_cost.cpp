@@ -38,6 +38,8 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // (per-direction bandwidths, core clock, L0/vector-register sizes).
 namespace {
 
+constexpr int64_t kFeatureRoundTripPipelineStages = 3;
+
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
 // Mixed-group totals combine fitted instruction formulas and a group overhead
@@ -5785,48 +5787,6 @@ Ascend910BCost::derive_feature_round_trip_resources(
     return resources;
   }
 
-  // Producer stages execute serially and reuse the same two-stage L1 banks.
-  // Derive each contraction window from its own dtype and input extent.
-  int64_t producer_peak_l1_bytes = 0;
-  int64_t producer_peak_acc_bytes = 0;
-  for (size_t index = 0; index < feature.producer_matmuls.size(); ++index) {
-    const int64_t input_extent = feature.producer_input_extents[index];
-    const DType operand_dtype = feature.producer_operand_dtypes[index];
-    const int64_t operand_bytes = dtype_bytes(operand_dtype);
-    int64_t selected_window = 0;
-    for (int64_t window : all_divisors(input_extent)) {
-      if (window % 16 != 0) continue;
-      const int64_t two_stage_bytes =
-          2 * window * (mp.big + cfg.k) * operand_bytes;
-      if (two_stage_bytes <= l1_capacity) selected_window = window;
-    }
-    if (selected_window <= 0) return resources;
-    resources.producer_window_k.push_back(selected_window);
-    producer_peak_l1_bytes =
-        std::max(producer_peak_l1_bytes,
-                 2 * selected_window * (mp.big + cfg.k) * operand_bytes);
-    producer_peak_acc_bytes = std::max(
-        producer_peak_acc_bytes,
-        mp.big * cfg.k *
-            dtype_bytes(cube_accumulator_dtype(operand_dtype)));
-  }
-
-  // The sink projection consumes one complete feature chunk. Its operand
-  // feed reuses the same serial L1 banks after all producers have pushed their
-  // results; only the sink accumulator persists across feature chunks.
-  const int64_t sink_operand_bytes = dtype_bytes(feature.sink_operand_dtype);
-  const int64_t sink_two_stage_bytes =
-      2 * cfg.k * (mp.big + np.big) * sink_operand_bytes;
-  const int64_t sink_acc_bytes =
-      mp.big * np.big *
-      dtype_bytes(cube_accumulator_dtype(feature.sink_operand_dtype));
-  if (sink_two_stage_bytes > l1_capacity ||
-      std::max(producer_peak_acc_bytes, sink_acc_bytes) > cube_capacity) {
-    return resources;
-  }
-  resources.cube_peak_l1_bytes =
-      std::max(producer_peak_l1_bytes, sink_two_stage_bytes);
-
   constexpr int64_t kFifoSlots = 4;
   int64_t c2v_fifo_reserved_bytes = 0;
   for (size_t index = 0; index < feature.producer_tensors.size(); ++index) {
@@ -5840,6 +5800,118 @@ Ascend910BCost::derive_feature_round_trip_resources(
       kFifoSlots * mp.big * cfg.k *
       dtype_bytes(prob_->tensors[feature.reply_tensor].dtype);
   resources.fifo_reserved_bytes = c2v_fifo_reserved_bytes + v2c_fifo_reserved_bytes;
+
+  // The source emitter places every producer operand panel and the sink RHS
+  // inside one outer stage-3 feature pipeline. LowerPipelineLoops therefore
+  // keeps one complete set of those panels live per pipeline slot; they do not
+  // reuse one serial producer bank. Select child windows jointly: windows that
+  // fit separately can overflow the complete outer pipeline, while smaller
+  // windows can keep the same fused candidate source-ready.
+  const int64_t sink_operand_bytes = dtype_bytes(feature.sink_operand_dtype);
+  const int64_t sink_pipeline_l1_bytes =
+      kFeatureRoundTripPipelineStages * cfg.k * np.big *
+      sink_operand_bytes;
+  const int64_t producer_l1_budget =
+      l1_capacity - v2c_fifo_reserved_bytes - sink_pipeline_l1_bytes;
+  if (producer_l1_budget < 0) return resources;
+
+  struct WindowOption {
+    int64_t window = 0;
+    int64_t bytes = 0;
+    int64_t chunks = 0;
+  };
+  std::vector<std::vector<WindowOption>> producer_options;
+  std::vector<size_t> selected_options;
+  int64_t selected_producer_bytes = 0;
+  int64_t producer_peak_acc_bytes = 0;
+  for (size_t index = 0; index < feature.producer_matmuls.size(); ++index) {
+    const int64_t input_extent = feature.producer_input_extents[index];
+    const DType operand_dtype = feature.producer_operand_dtypes[index];
+    const int64_t operand_bytes = dtype_bytes(operand_dtype);
+    std::vector<WindowOption> options;
+    for (int64_t window : all_divisors(input_extent)) {
+      if (window % 16 != 0) continue;
+      const int64_t full_chunks = input_extent / window;
+      // BuildTileMatmul emits exactly two windows through serial pl.range, but
+      // its peeled seed and loop body are still distinct physical operand
+      // panels after lowering. Three or more windows use the same two panel
+      // copies as a stage-2 child pipeline.
+      const int64_t panel_copies = full_chunks >= 2 ? 2 : 1;
+      const int64_t window_bytes =
+          kFeatureRoundTripPipelineStages * panel_copies * window *
+          (mp.big + cfg.k) * operand_bytes;
+      options.push_back({window, window_bytes, full_chunks});
+    }
+    if (options.empty()) return resources;
+    std::sort(options.begin(), options.end(),
+              [](const WindowOption& lhs, const WindowOption& rhs) {
+                if (lhs.chunks != rhs.chunks)
+                  return lhs.chunks < rhs.chunks;
+                if (lhs.bytes != rhs.bytes) return lhs.bytes < rhs.bytes;
+                return lhs.window > rhs.window;
+              });
+    selected_producer_bytes += options.front().bytes;
+    producer_options.push_back(std::move(options));
+    selected_options.push_back(0);
+    producer_peak_acc_bytes = std::max(
+        producer_peak_acc_bytes,
+        mp.big * cfg.k *
+            dtype_bytes(cube_accumulator_dtype(operand_dtype)));
+  }
+
+  // Start with the fewest child windows for every producer. If their shared
+  // footprint is too large, shrink the producer that adds the fewest loop
+  // iterations, breaking ties by bytes released. This considers the aggregate
+  // physical budget without putting a Cartesian-product search in the solver's
+  // hot feasibility path.
+  while (selected_producer_bytes > producer_l1_budget) {
+    size_t best_producer = producer_options.size();
+    size_t best_option = 0;
+    int64_t best_added_chunks = INT64_MAX;
+    int64_t best_saved_bytes = 0;
+    for (size_t producer = 0; producer < producer_options.size(); ++producer) {
+      const WindowOption& current =
+          producer_options[producer][selected_options[producer]];
+      for (size_t option = 0; option < producer_options[producer].size();
+           ++option) {
+        const WindowOption& candidate = producer_options[producer][option];
+        if (candidate.bytes >= current.bytes ||
+            candidate.chunks < current.chunks) {
+          continue;
+        }
+        const int64_t added_chunks = candidate.chunks - current.chunks;
+        const int64_t saved_bytes = current.bytes - candidate.bytes;
+        if (added_chunks < best_added_chunks ||
+            (added_chunks == best_added_chunks &&
+             saved_bytes > best_saved_bytes)) {
+          best_producer = producer;
+          best_option = option;
+          best_added_chunks = added_chunks;
+          best_saved_bytes = saved_bytes;
+        }
+      }
+    }
+    if (best_producer == producer_options.size()) return resources;
+    selected_producer_bytes -= best_saved_bytes;
+    selected_options[best_producer] = best_option;
+  }
+  for (size_t producer = 0; producer < producer_options.size(); ++producer) {
+    resources.producer_window_k.push_back(
+        producer_options[producer][selected_options[producer]].window);
+  }
+
+  // The sink projection consumes one complete feature chunk. Its RHS panel is
+  // part of each outer pipeline slot; only its L0C accumulator persists across
+  // feature chunks.
+  const int64_t emitted_pipeline_l1_bytes =
+      selected_producer_bytes + sink_pipeline_l1_bytes;
+  const int64_t sink_acc_bytes =
+      mp.big * np.big *
+      dtype_bytes(cube_accumulator_dtype(feature.sink_operand_dtype));
+  if (std::max(producer_peak_acc_bytes, sink_acc_bytes) > cube_capacity) {
+    return resources;
+  }
+  resources.cube_peak_l1_bytes = emitted_pipeline_l1_bytes;
 
   // Reuse the homogeneous vector lifetime plan for the exact peer-stage DAG.
   // Cross-engine values are boundary inputs to that subgraph, so its live-set
@@ -7471,8 +7543,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     plan.loop.active_groups = plan.spatial_tiles;
     plan.loop.min_trips_per_group = chunks;
     plan.loop.max_trips_per_group = chunks;
-    plan.loop.pipeline_stages = 3;
-    plan.loop.requested_skew_depth = 2;
+    plan.loop.pipeline_stages = kFeatureRoundTripPipelineStages;
+    plan.loop.requested_skew_depth = kFeatureRoundTripPipelineStages - 1;
     plan.overlap_implementable = plan.emit_compatible && chunks >= 2;
     plan.model_overlap_granted = plan.overlap_implementable;
     plan.pipeline_fill_absorbed = false;

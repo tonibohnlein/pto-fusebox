@@ -472,6 +472,19 @@ solver-op index. Counting the four solver ops against five normalized graph
 nodes can therefore look like a split, but the extracted region still owns all
 five nodes and emits one mixed step. Tests assert both mappings explicitly.
 
+Source admission prices the physical L1 lifetime created by that emitted
+schedule. The outer feature loop has three pipeline slots; each slot contains
+the sink RHS panel and every producer's current operand panels. A producer with
+multiple outer-K windows contributes its one- or two-stage child window, not
+its complete contraction extent. Exactly two child windows execute serially;
+their peeled seed and loop body nevertheless lower to two physical panel
+copies. Three or more use those copies as the emitter's stage-2 child
+pipeline. Producer windows are chosen jointly against the three-slot total
+plus the V2C ring, so an individually legal large window cannot incorrectly
+reject a fused candidate that fits with smaller child windows. This keeps
+source-first solving aligned with LowerPipelineLoops without either assuming
+serial panel reuse or permanently reserving a full producer operand.
+
 If the selected source solution contains a GM cut, the Python availability API
 can probe the complete op set through the same diagnostic binary. It reports a
 stable rejection code and the closest legal grid's required and available

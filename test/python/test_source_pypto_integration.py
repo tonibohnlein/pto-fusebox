@@ -79,6 +79,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _clear_loaded_pypto_lib_model_modules(
+    pypto_lib_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remove model-local top-level imports before switching model directories."""
+
+    models_root = (pypto_lib_root / "models").resolve()
+    for module_name, module in tuple(sys.modules.items()):
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        try:
+            in_models = Path(module_file).resolve().is_relative_to(models_root)
+        except (OSError, RuntimeError):
+            in_models = False
+        if in_models:
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+
 def test_production_pypto_lib_native_controls_lower_without_copied_schedules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -102,14 +120,7 @@ def test_production_pypto_lib_native_controls_lower_without_copied_schedules(
         caller_path = case_dir / "native_control.py"
         caller_path.write_text(control.source, encoding="utf-8")
         monkeypatch.syspath_prepend(str(model_dir))
-        for module_name in (
-            "config",
-            "rmsnorm",
-            "dspark_proj",
-            "mtp_projection",
-            "rms_lm_head",
-        ):
-            monkeypatch.delitem(sys.modules, module_name, raising=False)
+        _clear_loaded_pypto_lib_model_modules(Path(pypto_lib_root), monkeypatch)
         importlib.invalidate_caches()
         spec = importlib.util.spec_from_file_location(
             f"native_control_{control.model_name}", caller_path
@@ -251,6 +262,7 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
 
     monkeypatch.syspath_prepend(str(model_dir))
     monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_loaded_pypto_lib_model_modules(Path(pypto_lib_root), monkeypatch)
     importlib.invalidate_caches()
 
     caller_path = tmp_path / "flash_mtp_overlay_probe.py"
@@ -1734,11 +1746,36 @@ def test_large_fp32_linear_sink_nested_accumulator_lowers_through_pypto(
     compiled = ir.compile(
         pl.parse_program(source),
         output_dir=str(tmp_path / "large_fp32_linear_sink"),
-        dump_passes=False,
+        dump_passes=True,
         skip_ptoas=True,
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
     assert len(pto_files) == 2
+    plan = scheduled_region(region).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    memory_reuse = next(
+        text
+        for path in sorted(
+            (compiled.output_dir / "passes_dump").glob("*_after_MemoryReuse.py")
+        )
+        if "def region0000_mixed_aic(" in (text := path.read_text(encoding="utf-8"))
+    )
+    mixed_aic = memory_reuse.split("def region0000_mixed_aic(", maxsplit=1)[1]
+    mixed_aic = mixed_aic.split("\n    @pl.function", maxsplit=1)[0]
+    emitted_mat_bytes = sum(
+        int(size)
+        for size in re.findall(r"pl\.tile\.alloc\(pl\.Mem\.Mat, ([0-9]+)\)", mixed_aic)
+    )
+    # The source-first model is intentionally conservative across PyPTO memory
+    # planners: MemoryReuse may alias an inner producer panel onto a later
+    # outer-slot panel, but the emitted high water must never exceed the model.
+    assert emitted_mat_bytes <= plan.cube_stage_peak_l1_bytes
+    v2c_reserved = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    )
+    assert plan.cube_stage_peak_l1_bytes + v2c_reserved <= 512 * 1024
 
 
 def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(

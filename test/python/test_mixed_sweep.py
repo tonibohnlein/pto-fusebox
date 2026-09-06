@@ -334,6 +334,44 @@ def test_feature_round_trip_prices_physical_fp32_c2v_messages() -> None:
     assert sweep.selected.breakdown.l0c_gm_bytes == crossing_bytes + output_bytes
 
 
+def test_feature_round_trip_prices_every_outer_pipeline_l1_slot() -> None:
+    """Source-ready costing includes all panels cloned by the stage-3 pipeline."""
+
+    module = StaticFp32DeepLinearBlend(160).eval()
+    graph = export_and_normalize(
+        module,
+        (
+            torch.zeros(256, 160),
+            torch.zeros(160, 320),
+            torch.zeros(160, 320),
+            torch.zeros(320, 160),
+        ),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+
+    plan = scheduled_region(solved.regions[0]).steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+    assert plan.feature_round_trip is not None
+    assert plan.feature_round_trip.intermediate_chunk == 80
+    assert plan.feature_round_trip.producer_window_k == (32, 160)
+    one_slot_bytes = 2 * 32 * (32 + 80) * 4 + 160 * (32 + 80) * 4 + 80 * 160 * 4
+    assert plan.pipeline_stages == 3
+    assert plan.cube_stage_peak_l1_bytes == 3 * one_slot_bytes == 454_656
+    v2c_reserved = sum(
+        fifo.reserved_bytes
+        for fifo in plan.fifos
+        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
+    )
+    assert v2c_reserved == 40_960
+    assert plan.cube_stage_peak_l1_bytes + v2c_reserved == 495_616
+
+
 @pytest.mark.parametrize(
     "variant",
     ("swiglu", "blend", "linear_sink"),

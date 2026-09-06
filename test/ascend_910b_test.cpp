@@ -2051,7 +2051,7 @@ static void test_mixed_schedule_plan() {
                 plan.feature_round_trip.producer_window_k ==
                     std::vector<int64_t>({64, 64}) &&
                 plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
-                plan.cube_stage_peak_l1_bytes == 12288 &&
+                plan.cube_stage_peak_l1_bytes == 49152 &&
                 plan.topology->protocol.skew_pass_compatible &&
                 plan.topology->protocol.producer_stages == std::vector<size_t>({0, 1}) &&
                 plan.topology->protocol.peer_stage == 2 && plan.topology->protocol.sink_stage == 3 &&
@@ -2157,6 +2157,93 @@ static void test_mixed_schedule_plan() {
                       ->mixed_schedule_plan(TileConfig{64, 16, 32, 2, 1, 1})
                       .algorithm ==
                   MixedAlgorithmKind::FeatureChunkRoundTrip);
+  }
+
+  // When a projection needs several outer-K windows, source feasibility prices
+  // only the two child-pipeline panels live in each outer feature slot. It must
+  // not treat the complete contraction as resident in every slot.
+  {
+    Problem p;
+    p.tensors = {
+        {592, 32},                        // 0 x [M,D] FP32
+        {448, 592},                       // 1 first weight [D,H]
+        {448, 592},                       // 2 second weight [D,H]
+        {64, 448},                        // 3 sink weight [H,N]
+        {448, 32}, {448, 32}, {448, 32}, // 4,5 projections; 6 product
+        {64, 32},                         // 7 output
+    };
+    for (Tensor &tensor : p.tensors) tensor.dtype = DType::FP32;
+    p.ops = {{OT::MatMul, {0, 1}, {4}},
+             {OT::MatMul, {0, 2}, {5}},
+             {OT::Pointwise, {4, 5}, {6}},
+             {OT::MatMul, {6, 3}, {7}}};
+    p.ops[2].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[2].vector_geometry = VectorOpGeometry::Flat;
+    p.ops[2].vector_primitive = VectorPrimitiveFamily::Mul;
+    p.ops[2].mixed_vector_semantic = MixedVectorSemantic::Mul;
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+    CHECK("MIXPLAN: multi-window feature round trip is admitted", (bool)mixed);
+    if (mixed) {
+      const MixedSchedulePlan plan =
+          mixed->mixed_schedule_plan(TileConfig{64, 16, 224, 2, 1, 1});
+      const int64_t producer_panels = 2 * 2 * 16 * (16 + 224) * 4;
+      const int64_t sink_panel = 224 * 64 * 4;
+      CHECK("MIXPLAN: multi-window feature L1 prices child panels per outer slot",
+            plan.feasible && plan.emit_compatible &&
+                plan.algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip &&
+                plan.feature_round_trip.producer_window_k ==
+                    std::vector<int64_t>({16, 16}) &&
+                plan.cube_stage_peak_l1_bytes ==
+                    3 * (producer_panels + sink_panel));
+    }
+  }
+
+  // Producer windows share the outer pipeline's physical L1 budget. The two
+  // individually largest windows overflow together, but a smaller stage-2
+  // child keeps the same fused candidate feasible. A serial two-window child
+  // still has two physical panels and therefore does not release capacity.
+  {
+    Problem p;
+    p.tensors = {
+        {256, 32},                        // 0 x [M,D]
+        {128, 256},                       // 1 first weight [D,H]
+        {128, 256},                       // 2 second weight [D,H]
+        {64, 128},                        // 3 sink weight [H,N]
+        {128, 32}, {128, 32}, {128, 32}, // 4,5 projections; 6 product
+        {64, 32},                         // 7 output
+    };
+    for (Tensor& tensor : p.tensors) tensor.dtype = DType::FP32;
+    p.ops = {{OT::MatMul, {0, 1}, {4}},
+             {OT::MatMul, {0, 2}, {5}},
+             {OT::Pointwise, {4, 5}, {6}},
+             {OT::MatMul, {6, 3}, {7}}};
+    p.ops[2].vector_capability = VectorOpCapability::Elementwise;
+    p.ops[2].vector_geometry = VectorOpGeometry::Flat;
+    p.ops[2].vector_primitive = VectorPrimitiveFamily::Mul;
+    p.ops[2].mixed_vector_semantic = MixedVectorSemantic::Mul;
+    p.fast_memory_capacity = 1 << 26;
+    p.fuse_cube_vector = true;
+    p.require_buildable_mixed = true;
+    set_910b(p);
+    DAG dag = DAG::build(p);
+    auto mixed = Ascend910BMixed::create(p, dag, {0, 1, 2, 3});
+    CHECK("MIXPLAN: joint feature-window discriminator is recognized",
+          (bool)mixed);
+    if (mixed) {
+      const MixedSchedulePlan plan =
+          mixed->mixed_schedule_plan(TileConfig{64, 16, 64, 2, 1, 1});
+      CHECK("MIXPLAN: producer windows are selected against joint L1",
+            plan.feasible && plan.emit_compatible &&
+                plan.feature_round_trip.producer_window_k ==
+                    std::vector<int64_t>({64, 256}) &&
+                plan.cube_stage_peak_l1_bytes == 417792 &&
+                plan.cube_stage_peak_l1_bytes + 16384 <= 512 * 1024);
+    }
   }
 
   // Analytic V->C vector-input traffic is request-role aware. A value
