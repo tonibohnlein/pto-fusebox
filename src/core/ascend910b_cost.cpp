@@ -1,6 +1,7 @@
 #include "core/ascend910b_cost.h"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <limits>
@@ -805,6 +806,58 @@ struct MixedL0OperandFootprint {
   int64_t l0a_bytes = 0;
   int64_t l0b_bytes = 0;
 };
+
+// AutoTileMatmulL0 normally reuses the child plan's ping-pong operand family
+// across an enclosing GM->L1 K loop. There is one important exception: when
+// both loops are stage-2 pipelines and the child loop ends a rolled phase with
+// a partially occupied slot (its full-trip count is not a multiple of the
+// child stage count), MemoryReuse must keep one child family for every outer
+// slot. Treating the two depths as max(child, outer) then under-prices the
+// physical Left/Right allocation. This is the 16x4096 softmax->PV failure:
+// four 17,408-byte Right panels, not two.
+//
+// Keep this predicate deliberately narrower than "nested pipelines multiply":
+// even child trip counts reuse the same family. In particular the established
+// 128x8192 deep-K schedule has two nested stage-2 loops but needs only two
+// 32,768-byte Right panels and exactly fills the 64 KiB target.
+int64_t NestedCubeOperandDepth(const L0MatmulPlan &child,
+                               const CubeKLoopPlan &outer,
+                               int64_t child_depth) {
+  const int64_t outer_depth = std::max<int64_t>(1, outer.pipeline_stages);
+  const int64_t native_depth = std::max<int64_t>(1, child_depth);
+  const bool has_nested_partial_slot =
+      outer_depth > 1 && child.k_loop.pipeline_stages > 1 &&
+      child.k_loop.full_chunks % child.k_loop.pipeline_stages != 0;
+  return has_nested_partial_slot ? native_depth * outer_depth
+                                 : std::max(native_depth, outer_depth);
+}
+
+MixedL0OperandFootprint
+CubeChildL0OperandFootprint(const Problem *p, const L0MatmulPlan &child,
+                            const CubeKLoopPlan &outer, bool nested_outer_loop,
+                            DType lhs_dtype, DType rhs_dtype) {
+  MixedL0OperandFootprint result;
+  if (!child.feasible || child.m <= 0 || child.n <= 0 || child.k <= 0) {
+    return result;
+  }
+  const auto align_up = [](int64_t value, int64_t alignment) {
+    return alignment <= 1 ? value
+                          : ((value + alignment - 1) / alignment) * alignment;
+  };
+  const int64_t physical_m = align_up(child.m, p->l0_matmul_config.box_align_m);
+  const int64_t physical_n = align_up(child.n, p->l0_matmul_config.box_align_n);
+  const CubeKLoopPlan serial_outer = {};
+  const CubeKLoopPlan &physical_outer =
+      nested_outer_loop ? outer : serial_outer;
+  result.l0a_bytes =
+      physical_m * child.k * dtype_bytes(lhs_dtype) *
+      NestedCubeOperandDepth(child, physical_outer, child.buffer_depth_a);
+  result.l0b_bytes =
+      child.k * physical_n * dtype_bytes(rhs_dtype) *
+      NestedCubeOperandDepth(child, physical_outer, child.buffer_depth_b);
+  result.feasible = true;
+  return result;
+}
 
 // Mirror the physical operand allocation performed after AutoTileMatmulL0.
 // The child chooser prices its own ping-pong depth, while an enclosing mixed
@@ -4396,6 +4449,33 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     add_variant(tail_m, tile_n, full_n);
     add_variant(tile_m, tail_n, full_m);
     add_variant(tail_m, tail_n, 1);
+
+    // Source-constrained search must reject a schedule before partition search
+    // ranks it when the nested pipeline's physical operand family exceeds L0.
+    // Analytic search intentionally keeps its historical surface.
+    if (prob_->require_source_codegen && plan.emit_compatible) {
+      for (const CubeOutputTileVariant &variant : mm.output_variants) {
+        const std::array<std::pair<const L0MatmulPlan *, bool>, 3> children = {
+            std::pair{&variant.l0_init, false},
+            std::pair{&variant.l0_rolled, true},
+            std::pair{&variant.l0_tail, false}};
+        for (const auto &[child, nested_outer_loop] : children) {
+          if (!child->feasible)
+            continue;
+          const MixedL0OperandFootprint footprint = CubeChildL0OperandFootprint(
+              prob_, *child, mm.k_loop, nested_outer_loop, lhs_dtype,
+              rhs_dtype);
+          if (!footprint.feasible ||
+              footprint.l0a_bytes > prob_->l0_matmul_config.l0a_bytes ||
+              footprint.l0b_bytes > prob_->l0_matmul_config.l0b_bytes) {
+            plan.emit_compatible = false;
+            break;
+          }
+        }
+        if (!plan.emit_compatible)
+          break;
+      }
+    }
 
     // Every output tile has one and only one post-K-loop drain. Internal
     // request values drain Acc->Mat and live in L1; roots drain Acc->GM. For

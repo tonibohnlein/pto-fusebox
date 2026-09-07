@@ -1316,13 +1316,31 @@ def _validate_lowered_l0_capacity(
     def align_up(value: int, alignment: int) -> int:
         return (value + alignment - 1) // alignment * alignment
 
-    def validate_child(label: str, child: L0MatmulPlan, outer_depth: int) -> None:
+    def validate_child(
+        label: str,
+        child: L0MatmulPlan,
+        *,
+        nested_outer_loop: bool,
+    ) -> None:
         tile = child.tile
         depths = child.buffer_depths
         physical_m = align_up(tile[0], box_align_m)
         physical_n = align_up(tile[1], box_align_n)
-        l0a_bytes = physical_m * tile[2] * lhs_bytes * max(depths[0], outer_depth)
-        l0b_bytes = tile[2] * physical_n * rhs_bytes * max(depths[1], outer_depth)
+        outer_depth = matmul.k_loop.pipeline_stages if nested_outer_loop else 1
+        has_nested_partial_slot = (
+            nested_outer_loop
+            and outer_depth > 1
+            and child.k_loop.pipeline_stages > 1
+            and child.k_loop.full_chunks % child.k_loop.pipeline_stages != 0
+        )
+
+        def physical_depth(child_depth: int) -> int:
+            if has_nested_partial_slot:
+                return child_depth * outer_depth
+            return max(child_depth, outer_depth)
+
+        l0a_bytes = physical_m * tile[2] * lhs_bytes * physical_depth(depths[0])
+        l0b_bytes = tile[2] * physical_n * rhs_bytes * physical_depth(depths[1])
         if l0a_bytes > l0a_capacity or l0b_bytes > l0b_capacity:
             raise SourceEmissionError(
                 f"{label} exceeds lowered L0 operand capacity: "
@@ -1332,12 +1350,20 @@ def _validate_lowered_l0_capacity(
 
     for variant in matmul.output_variants:
         label = f"cube output variant {variant.shape}"
-        validate_child(f"{label} initial L0 plan", variant.l0_init, 1)
+        validate_child(
+            f"{label} initial L0 plan",
+            variant.l0_init,
+            nested_outer_loop=False,
+        )
         if variant.l0_rolled is not None:
             validate_child(
                 f"{label} outer K pipeline",
                 variant.l0_rolled,
-                matmul.k_loop.pipeline_stages,
+                nested_outer_loop=True,
             )
         if variant.l0_tail is not None:
-            validate_child(f"{label} tail L0 plan", variant.l0_tail, 1)
+            validate_child(
+                f"{label} tail L0 plan",
+                variant.l0_tail,
+                nested_outer_loop=False,
+            )

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The integration revision contains the public explicit-pipe contract that
+  # Fusebox emits. Keep this immutable: updating PyPTO is a reviewed dependency
+  # change, while every Fusebox pull request is checked against the same compiler.
+  PYPTO_REPOSITORY: tonibohnlein/pypto
+  PYPTO_REVISION: f3b4520cd122f38f01341579010acc11661cbf6a
+
+jobs:
+  pypto-integration:
+    name: PyPTO source integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/hw-native-sys/pypto/github-ci:latest
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
+      PYPTO_CODEGEN_MAX_WORKERS: "2"
+    steps:
+      - name: Checkout Fusebox
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned PyPTO integration revision
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PYPTO_REPOSITORY }}
+          ref: ${{ env.PYPTO_REVISION }}
+          path: _deps/pypto
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install system dependency
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends nlohmann-json3-dev
+
+      - name: Install PyPTO and runtime
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/_deps/pypto/build-constraints.txt
+          PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/_deps/pypto/build-constraints.txt
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: |
+          python -m pip install -v ./_deps/pypto
+          python -m pip install -v ./_deps/pypto/runtime
+          python -c "import pypto, simpler; print(pypto.__file__)"
+
+      - name: Install PyPTO-pinned PTOAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          source _deps/pypto/toolchain/versions.env
+          package_version="${PTOAS_VERSION#v}"
+          wheel_name="ptoas-${package_version}-cp310-cp310-manylinux_2_34_x86_64.whl"
+          wheel_path="$RUNNER_TEMP/$wheel_name"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/${wheel_name}" \
+            --output "$wheel_path"
+          echo "${PTOAS_SHA256_X86_64}  $wheel_path" | sha256sum -c -
+          python -m venv "$PTOAS_ROOT" --system-site-packages
+          "$PTOAS_ROOT/bin/python" -m pip install "$wheel_path"
+          "$PTOAS_ROOT/bin/ptoas" --version
+
+      - name: Build Fusebox
+        run: |
+          python -m pip install -e ".[test]"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+
+      - name: Run PyPTO source integration gate
+        env:
+          PTO_FUSEBOX_PYPTO_INTEGRATION: "1"
+          PTO_FUSEBOX_TEST_SOLVER: ${{ github.workspace }}/build/mlsys_mixed
+          PTO_FUSEBOX_CUBE_SWEEP: ${{ github.workspace }}/build/cube_plan_sweep
+          PTO_FUSEBOX_MIXED_SWEEP: ${{ github.workspace }}/build/mixed_group_sweep
+        run: python -m pytest test/python/test_source_pypto_integration.py -q

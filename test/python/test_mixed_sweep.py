@@ -526,7 +526,12 @@ def test_broader_fp32_feature_round_trip_graphs_are_source_planned(
         selected_steps = ("cube", "vector", "cube", "cube")
     assert tuple(step["kind"] for step in region.solution["steps"]) == selected_steps
     assert region.candidate_summaries
-    assert all(candidate.source_ready for candidate in region.candidate_summaries)
+    assert region.candidate_summaries[0].selected
+    assert region.candidate_summaries[0].source_ready
+    assert all(
+        candidate.source_ready or candidate.rejection_reason
+        for candidate in region.candidate_summaries
+    )
     plans = tuple(step.plan for step in scheduled_region(region).steps)
     if selected_steps == ("cube", "vector", "cube", "cube"):
         assert not any(isinstance(plan, MixedKernelPlan) for plan in plans)

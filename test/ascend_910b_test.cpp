@@ -3435,6 +3435,69 @@ static void test_cube_schedule_plan() {
             static_cast<bool>(analytic_sg) && analytic_no_retention);
     }
 
+    // Nested stage-2 loops do not universally multiply their operand-buffer
+    // depths. An odd child trip count leaves a partial slot live across the
+    // outer roll and requires one child family per outer slot; an even child
+    // trip count reuses the native family. Source-first admission must reject
+    // the former 16x4096 case without excluding the established 128x8192 case.
+    {
+      auto unsafe = mk_mm(16, 64, 4096, 1000);
+      unsafe.use_hierarchical_cube_cost = true;
+      unsafe.require_source_codegen = true;
+      DAG unsafe_dag = DAG::build(unsafe);
+      auto unsafe_sg = Subgraph::create(unsafe, unsafe_dag, {0});
+      TileConfig unsafe_cfg;
+      unsafe_cfg.w = 16;
+      unsafe_cfg.h = 16;
+      unsafe_cfg.k = 1360;
+      unsafe_cfg.parts_m = 1;
+      unsafe_cfg.parts_n = 4;
+      unsafe_cfg.split_k = 1;
+      const auto unsafe_cost =
+          unsafe_sg ? unsafe_sg->compute_cost(unsafe_cfg) : CostResult{};
+      const auto unsafe_plan = unsafe_sg
+                                   ? unsafe_sg->cube_schedule_plan(unsafe_cfg)
+                                   : CubeSchedulePlan{};
+      CHECK("CUBEPLAN/nested-l0: odd inner stage-2 trips fail source admission",
+            unsafe_sg && !std::isfinite(unsafe_cost.latency) &&
+                unsafe_plan.feasible && !unsafe_plan.emit_compatible &&
+                unsafe_plan.matmuls.size() == 1 &&
+                unsafe_plan.matmuls[0].k_loop.pipeline_stages == 2 &&
+                unsafe_plan.matmuls[0].output_variants.size() == 1 &&
+                unsafe_plan.matmuls[0]
+                            .output_variants[0]
+                            .l0_rolled.k_loop.full_chunks %
+                        2 ==
+                    1);
+
+      auto safe = mk_mm(128, 128, 8192, 1000);
+      safe.use_hierarchical_cube_cost = true;
+      safe.require_source_codegen = true;
+      DAG safe_dag = DAG::build(safe);
+      auto safe_sg = Subgraph::create(safe, safe_dag, {0});
+      TileConfig safe_cfg;
+      safe_cfg.w = 128;
+      safe_cfg.h = 128;
+      safe_cfg.k = 256;
+      safe_cfg.parts_m = 1;
+      safe_cfg.parts_n = 1;
+      safe_cfg.split_k = 1;
+      const auto safe_cost =
+          safe_sg ? safe_sg->compute_cost(safe_cfg) : CostResult{};
+      const auto safe_plan =
+          safe_sg ? safe_sg->cube_schedule_plan(safe_cfg) : CubeSchedulePlan{};
+      CHECK("CUBEPLAN/nested-l0: even inner stage-2 trips retain native depth",
+            safe_sg && safe_cost.feasible && safe_plan.feasible &&
+                safe_plan.emit_compatible && safe_plan.matmuls.size() == 1 &&
+                safe_plan.matmuls[0].k_loop.pipeline_stages == 2 &&
+                safe_plan.matmuls[0].output_variants.size() == 1 &&
+                safe_plan.matmuls[0]
+                            .output_variants[0]
+                            .l0_rolled.k_loop.full_chunks %
+                        2 ==
+                    0);
+    }
+
     // The symmetric M-split case retains the RHS column panel across every
     // output-row tile.
     {

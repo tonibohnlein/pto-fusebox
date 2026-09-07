@@ -1360,6 +1360,7 @@ def _compile_mixed_source(
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
     region = solved.regions[0]
+    assert region.region.op_ids == tuple(op.id for op in graph.ops)
     if forced_active_groups is not None:
         assert region.solution is not None
         solution = copy.deepcopy(region.solution)
@@ -1456,9 +1457,9 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
         "mixed_attention_one_trip",
         _AttentionCore(),
         (
-            torch.zeros(768, 64),
-            torch.zeros(64, 64),
-            torch.zeros(64, 128),
+            torch.zeros(384, 32),
+            torch.zeros(32, 32),
+            torch.zeros(32, 64),
         ),
         tmp_path,
         monkeypatch,
@@ -1477,15 +1478,15 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
         for fifo in plan.fifos
         if fifo.direction.value == "cube_to_vector"
     )
-    assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 114816
+    assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 36928
     assert plan.vector_stage_peak_ub_bytes + fifo_bytes <= 188416
 
 
-def test_wide_cvc_group_candidates_lower_through_memory_reuse(
+def test_wide_cvc_physical_admission_excludes_unsafe_group_plans(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A8 is a realization discriminator, not merely a model-only sweep row."""
+    """Source solving must replace the analytically cheaper over-capacity grid."""
 
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
@@ -1498,6 +1499,20 @@ def test_wide_cvc_group_candidates_lower_through_memory_reuse(
             torch.zeros(224, 192),
         ),
     )
+    analytic = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=False,
+    )
+    analytic_region = analytic.regions[0]
+    analytic_plan = scheduled_region(analytic_region).steps[0].plan
+    assert isinstance(analytic_plan, MixedKernelPlan)
+    assert analytic_plan.active_groups == 6
+    assert analytic_plan.cube_stage_peak_l0a_bytes == 98_304
+    assert analytic_plan.cube_stage_peak_l0b_bytes == 86_016
+    assert not analytic_plan.source_codegen_ready
+
     solved = solve_graph(
         graph,
         solver_binary=_solver(),
@@ -1507,12 +1522,63 @@ def test_wide_cvc_group_candidates_lower_through_memory_reuse(
     assert solved.regions_solved == len(solved.regions) == 1
     region = solved.regions[0]
     sweep = enumerate_mixed_group_plans(region, sweep_binary=_mixed_sweep_solver())
-    assert len(sweep.candidates) >= 3
+    assert [
+        (candidate.groups, candidate.trips_per_group) for candidate in sweep.candidates
+    ] == [(12, 1)]
+    selected = sweep.selected
+    assert selected.cube_stage_peak_l0a_bytes == 57_344
+    assert selected.cube_stage_peak_l0b_bytes == 57_344
+
+    forced = region_for_mixed_group_candidate(region, selected)
+    source = emit_pypto_region(graph, forced, program_name="wide_cvc_admitted").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / selected.id),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
+
+
+def test_rankable_cvc_group_candidates_lower_through_memory_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A physically legal fixture preserves the multi-candidate discriminator."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _AttentionCore(),
+        (
+            torch.zeros(512, 32),
+            torch.zeros(64, 32),
+            torch.zeros(64, 64),
+        ),
+    )
+    region = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    ).regions[0]
+    sweep = enumerate_mixed_group_plans(region, sweep_binary=_mixed_sweep_solver())
+    assert [
+        (candidate.groups, candidate.trips_per_group) for candidate in sweep.candidates
+    ] == [
+        (1, 8),
+        (2, 4),
+        (4, 2),
+        (8, 1),
+    ]
 
     for candidate in sweep.candidates:
+        assert candidate.cube_stage_peak_l0a_bytes <= 65_536
+        assert candidate.cube_stage_peak_l0b_bytes <= 65_536
         forced = region_for_mixed_group_candidate(region, candidate)
         source = emit_pypto_region(
-            graph, forced, program_name=f"wide_cvc_{candidate.id}"
+            graph, forced, program_name=f"rankable_cvc_{candidate.id}"
         ).source
         compiled = ir.compile(
             pl.parse_program(source),
@@ -1701,9 +1767,17 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert plan.requested_skew_depth == 1
         assert plan.overlap_implementable
         assert "pl.pipeline(4, stage=2" in source
+    if name == "mixed_streaming_softmax_pv":
+        # The cheaper vector+cube partition has an odd nested child-loop trip
+        # count and physically requires four L0 operand banks. Source-first
+        # solving must skip it and retain the buildable whole-graph V2C plan.
+        assert plan.protocol.value == "one_way"
+        assert plan.cube_stage_peak_l0a_bytes <= 65_536
+        assert plan.cube_stage_peak_l0b_bytes <= 65_536
+        assert source.count("pl.cross_core_pipe(") == 1
     if name == "mixed_attention_streamed_groups":
-        assert plan.spatial_tiles == 4
-        assert plan.active_groups == 4
+        assert plan.spatial_tiles == 6
+        assert plan.active_groups == 6
         assert plan.max_trips_per_group == 1
         assert plan.pipeline_stages == 1
         assert plan.requested_skew_depth == 0
@@ -1711,11 +1785,11 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert "pl.range(1, init_values=" in source
 
 
-def test_large_fp32_linear_sink_nested_accumulator_lowers_through_pypto(
+def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The largest feature-round-trip fixture exercises nested sink accumulators."""
+    """The source-safe whole-program partition lowers through MemoryReuse."""
 
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
@@ -1739,7 +1813,21 @@ def test_large_fp32_linear_sink_nested_accumulator_lowers_through_pypto(
     assert len(solved.regions) == 1
     region = solved.regions[0]
     assert region.solution is not None
-    assert [step["kind"] for step in region.solution["steps"]] == ["mixed", "cube"]
+    assert [step["kind"] for step in region.solution["steps"]] == [
+        "cube",
+        "vector",
+        "cube",
+        "cube",
+    ]
+    scheduled = scheduled_region(region)
+    assert (
+        sum(
+            plan.source_l1_allocation_bytes
+            for step in scheduled.steps
+            if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
+        )
+        == 368_640
+    )
     source = emit_pypto_region(
         graph, region, program_name="large_fp32_linear_sink"
     ).source
@@ -1750,32 +1838,11 @@ def test_large_fp32_linear_sink_nested_accumulator_lowers_through_pypto(
         skip_ptoas=True,
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
-    assert len(pto_files) == 2
-    plan = scheduled_region(region).steps[0].plan
-    assert isinstance(plan, MixedKernelPlan)
-    memory_reuse = next(
-        text
-        for path in sorted(
-            (compiled.output_dir / "passes_dump").glob("*_after_MemoryReuse.py")
-        )
-        if "def region0000_mixed_aic(" in (text := path.read_text(encoding="utf-8"))
+    assert len(pto_files) == 4
+    assert (
+        len(list((compiled.output_dir / "passes_dump").glob("*_after_MemoryReuse.py")))
+        == 1
     )
-    mixed_aic = memory_reuse.split("def region0000_mixed_aic(", maxsplit=1)[1]
-    mixed_aic = mixed_aic.split("\n    @pl.function", maxsplit=1)[0]
-    emitted_mat_bytes = sum(
-        int(size)
-        for size in re.findall(r"pl\.tile\.alloc\(pl\.Mem\.Mat, ([0-9]+)\)", mixed_aic)
-    )
-    # The source-first model is intentionally conservative across PyPTO memory
-    # planners: MemoryReuse may alias an inner producer panel onto a later
-    # outer-slot panel, but the emitted high water must never exceed the model.
-    assert emitted_mat_bytes <= plan.cube_stage_peak_l1_bytes
-    v2c_reserved = sum(
-        fifo.reserved_bytes
-        for fifo in plan.fifos
-        if fifo.direction is MixedTransferDirection.VECTOR_TO_CUBE
-    )
-    assert plan.cube_stage_peak_l1_bytes + v2c_reserved <= 512 * 1024
 
 
 def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(

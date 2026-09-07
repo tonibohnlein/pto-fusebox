@@ -248,8 +248,11 @@ Reference checks use three levels:
 - opt-in source integration tests parse the DSL with an independently selected
   PyPTO checkout and compile it through PTOAS.
 
-The integration gate is deliberately outside the default unit-test dependency
-set. Run it in the target validation environment with a built Fusebox solver,
+The integration gate remains outside the default Python dependency set, but it
+is part of normal pull-request CI. CI builds Fusebox against the immutable
+PyPTO integration revision declared in `.github/workflows/ci.yml`, installs
+that revision's pinned PTOAS, and runs the complete opt-in file. Run the same
+gate locally in a target validation environment with a built Fusebox solver,
 the intended PyPTO import on `PYTHONPATH`, and a valid `PTOAS_ROOT`:
 
 ```bash
