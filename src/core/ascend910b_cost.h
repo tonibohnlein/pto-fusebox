@@ -229,7 +229,8 @@ public:
   // axis/chunk view for existing callers.
   VectorStreamPlan vector_stream_plan(const TileConfig &cfg,
                                       const FlatSet<size_t> &retained_from_prev = {},
-                                      const FlatSet<size_t> &retain_these = {}) const;
+                                      const FlatSet<size_t> &retain_these = {},
+                                      int64_t stream_reserved_bytes_per_column = 0) const;
 
   // Reuse the homogeneous phase model when a mixed source schedule embeds one
   // lane-local vector configuration. Traffic stays owned by the enclosing
@@ -342,6 +343,11 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   int vector_to_cube_operand_mask() const;
   VectorStreamPlan vector_to_cube_stream_plan(const TileConfig& sink_cfg,
                                                int64_t vector_lanes) const;
+  std::optional<size_t> streamed_vector_to_cube_transfer(
+      std::string* rejection_code = nullptr) const;
+  VectorStreamPlan streamed_vector_to_cube_plan(const TileConfig& sink_cfg,
+                                                 int64_t vector_lanes,
+                                                 std::string* rejection_code = nullptr) const;
   bool has_unrepresentable_vector_to_cube_multi_role() const;
   TileConfig vector_to_cube_stage_config(const TileConfig& sink_cfg) const;
 

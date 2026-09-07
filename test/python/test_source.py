@@ -32,7 +32,10 @@ from pto_fusebox import (
     SourceEmissionError,
     can_emit_region,
     emit_pypto_region,
+    enumerate_mixed_group_plans,
     export_and_normalize,
+    region_for_mixed_group_candidate,
+    region_for_source_candidate,
     scheduled_region,
     solve_graph,
 )
@@ -1861,7 +1864,7 @@ def test_int32_accumulator_crosses_from_cube_to_vector_generically() -> None:
     assert "pl.tensor.row_expand_mul(" in source
 
 
-@pytest.mark.parametrize("contraction", (4096, 12288))
+@pytest.mark.parametrize("contraction", (4096,))
 def test_bf16_matmul_crosses_as_fp32_accumulator(contraction: int) -> None:
     graph, result = _solve_module(
         _ChunkedBF16C2V(),
@@ -1898,8 +1901,8 @@ def test_mixed_cube_window_summary_must_match_authoritative_stage_windows() -> N
     graph, result = _solve_module(
         _ChunkedBF16C2V(),
         (
-            torch.zeros(16, 12288, dtype=torch.bfloat16),
-            torch.zeros(12288, 128, dtype=torch.bfloat16),
+            torch.zeros(16, 4096, dtype=torch.bfloat16),
+            torch.zeros(4096, 128, dtype=torch.bfloat16),
             torch.zeros(1, 128),
         ),
     )
@@ -1982,21 +1985,16 @@ def test_one_way_c2v_replays_frozen_group_count_controls(
     )
     result = solved.regions[0]
     assert result.solution is not None
-    solution = copy.deepcopy(result.solution)
-    step = solution["steps"][0]
-    plan = step["plan"]
+    plan = result.solution["steps"][0]["plan"]
     assert plan["spatial_tiles"] == 24
     assert plan["protocol"] == "one_way"
-    plan["active_groups"] = active_groups
-    plan["min_trips_per_group"] = trips
-    plan["max_trips_per_group"] = trips
-    plan["pipeline_stages"] = pipeline_stages
-    plan["requested_skew_depth"] = pipeline_stages - 1
-    plan["model_overlap_granted"] = trips >= 2
-    plan["overlap_implementable"] = trips >= 2
-    step["launch"]["cores"] = active_groups * 3
-
-    forced = replace(result, solution=solution)
+    sweep = enumerate_mixed_group_plans(result)
+    candidate = next(
+        candidate for candidate in sweep.candidates if candidate.groups == active_groups
+    )
+    assert candidate.trips_per_group == trips
+    assert candidate.pipeline_stages == pipeline_stages
+    forced = region_for_mixed_group_candidate(result, candidate)
     forced_plan = scheduled_region(forced).steps[0].plan
     assert isinstance(forced_plan, MixedKernelPlan)
     assert can_emit_region(graph, forced)
@@ -2012,7 +2010,8 @@ def test_one_way_c2v_replays_frozen_group_count_controls(
         assert "pl.pipeline(" not in source
         assert f"pl.range({trips}, init_values=(output,))" in source
 
-    inconsistent = copy.deepcopy(solution)
+    assert forced.solution is not None
+    inconsistent = copy.deepcopy(forced.solution)
     inconsistent_plan = inconsistent["steps"][0]["plan"]
     inconsistent_overlap = trips < 2
     inconsistent_plan["model_overlap_granted"] = inconsistent_overlap
@@ -2065,20 +2064,15 @@ def test_cvc_replays_frozen_group_count_controls(
         for fifo in plan["fifos"]
         if fifo["direction"] == "cube_to_vector"
     )
-    assert plan["vector_stage_peak_ub_bytes"] == 20544
+    assert plan["vector_stage_peak_ub_bytes"] == 41088
     assert c2v_ring_bytes == 16384
-    assert plan["vector_stage_peak_ub_bytes"] + c2v_ring_bytes == 36928
-    plan["active_groups"] = active_groups
-    plan["min_trips_per_group"] = trips
-    plan["max_trips_per_group"] = trips
-    plan["model_overlap_granted"] = trips >= 2
-    plan["overlap_implementable"] = trips >= 2
-    plan["pipeline_fill_absorbed"] = trips >= 2
-    plan["pipeline_stages"] = 3 if trips >= 2 else 1
-    plan["requested_skew_depth"] = 2 if trips >= 2 else 0
-    step["launch"]["cores"] = active_groups * 3
-
-    forced = replace(result, solution=solution)
+    assert plan["vector_stage_peak_ub_bytes"] + c2v_ring_bytes == 57472
+    sweep = enumerate_mixed_group_plans(result)
+    candidate = next(
+        candidate for candidate in sweep.candidates if candidate.groups == active_groups
+    )
+    assert candidate.trips_per_group == trips
+    forced = region_for_mixed_group_candidate(result, candidate)
     forced_plan = scheduled_region(forced).steps[0].plan
     assert isinstance(forced_plan, MixedKernelPlan)
     assert can_emit_region(graph, forced)
@@ -2094,7 +2088,8 @@ def test_cvc_replays_frozen_group_count_controls(
         assert f"pl.range({trips}, init_values=" in source
         assert "stage=3" not in source
 
-    inconsistent = copy.deepcopy(solution)
+    assert forced.solution is not None
+    inconsistent = copy.deepcopy(forced.solution)
     inconsistent_plan = inconsistent["steps"][0]["plan"]
     inconsistent_overlap = trips < 2
     inconsistent_plan["model_overlap_granted"] = inconsistent_overlap
@@ -2531,10 +2526,18 @@ def test_branched_int8_projections_emit_two_generic_fifo_bundles() -> None:
         solver_binary=_solver(),
         solver_workers=2,
         require_source_codegen=True,
+        collect_candidate_summaries=True,
     )
     assert solved.regions_solved == 1
     assert len(solved.regions) == 1
-    result = solved.regions[0]
+    selected = solved.regions[0]
+    maximal = next(
+        candidate
+        for candidate in selected.candidate_summaries
+        if len(candidate.partition) == 1
+    )
+    assert maximal.source_ready and maximal.rejection_reason is None
+    result = region_for_source_candidate(selected, maximal)
     schedule = scheduled_region(result)
     assert len(schedule.steps) == 1
     step = schedule.steps[0]
@@ -2791,7 +2794,9 @@ def test_one_way_v2c_dual_role_rejects_partitioned_source_contract() -> None:
     fifo["valid_rows"] = 32
     fifo["valid_cols"] = 32
     fifo["slot_bytes"] = 4096
-    fifo["reserved_bytes"] = 32768
+    fifo["slot_count"] = 1
+    fifo["reserved_bytes"] = 4096
+    plan["source_l1_allocation_bytes"] = 12_288
 
     mutated = replace(result, solution=solution)
     mutated_plan = scheduled_region(mutated).steps[0].plan

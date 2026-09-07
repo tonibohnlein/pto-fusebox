@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 from ..ir import NormalizedOp
 from ..lowered import LoweredOperation
@@ -16,7 +17,10 @@ from ..schedule.schema import (
     MixedStagePlan,
     MixedTransferDirection,
     MixedVectorSplit,
+    VectorReplayPassKind,
+    VectorReplayPassPlan,
     VectorReplayPhase,
+    VectorSerialPhasePlan,
     VectorStreamKind,
 )
 from .common import (
@@ -33,10 +37,15 @@ from .common import (
     solver_tensor_for_value,
 )
 from .vector import (
+    _emit_loop_header,
+    _emit_reduction_merge,
+    _emit_reduction_phase_chunk,
     _softmax_semantic_ops,
+    _tensor_producers,
     _validate_softmax_frames,
     _validate_softmax_generated_work,
     _validate_softmax_loops,
+    _vector_expression,
     validate_source_cast_frames,
 )
 
@@ -233,7 +242,7 @@ def _emit_one_way_c2v(
         or len(plan.transfers) != 1
         or len(plan.fifos) != 1
         or plan.fifos[0].direction is not MixedTransferDirection.CUBE_TO_VECTOR
-        or plan.fifos[0].slot_count != 8
+        or plan.fifos[0].slot_count <= 0
     ):
         raise SourceEmissionError(
             "mixed plan is not the supported one-way C->V topology"
@@ -319,7 +328,7 @@ def _emit_one_way_v2c(
         or len(plan.transfers) != 1
         or len(plan.fifos) != 1
         or plan.fifos[0].direction is not MixedTransferDirection.VECTOR_TO_CUBE
-        or plan.fifos[0].slot_count != 8
+        or plan.fifos[0].slot_count <= 0
     ):
         raise SourceEmissionError(
             "mixed plan is not the supported one-way V->C topology"
@@ -346,6 +355,8 @@ def _emit_one_way_v2c(
         return _emit_streaming_softmax_v2c(
             context, program_name, plan, vector_stage, cube_stage, crossing
         )
+    if plan.streamed_v2c is not None:
+        return _emit_streamed_vector_v2c(context, program_name, plan)
     _require_in_memory_vector_stage(vector_stage)
     crossing_roles = sink.inputs.count(crossing)
     if crossing_roles == 1 and fifo.spatial_m == fifo.spatial_n:
@@ -793,6 +804,452 @@ def _emit_tensor_softmax_apply_chunk(  # noqa: PLR0913
         ) from error
 
 
+def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
+    context: EmissionContext,
+    program_name: str,
+    plan: MixedKernelPlan,
+) -> str:
+    """Feed a generic vector APPLY pass into one persistent cube accumulator."""
+
+    descriptor = plan.streamed_v2c
+    if descriptor is None:
+        raise SourceEmissionError("streamed V->C plan omits its typed descriptor")
+    if (
+        descriptor.producer_stage >= len(plan.stages)
+        or descriptor.sink_stage >= len(plan.stages)
+        or descriptor.transfer >= len(plan.transfers)
+    ):
+        raise SourceEmissionError("streamed V->C descriptor has invalid indices")
+    producer = plan.stages[descriptor.producer_stage]
+    sink_stage = plan.stages[descriptor.sink_stage]
+    transfer = plan.transfers[descriptor.transfer]
+    fifo = plan.fifos[descriptor.transfer]
+    stream = producer.vector_stream
+    if (
+        descriptor.producer_stage != 0
+        or descriptor.sink_stage != 1
+        or len(plan.stages) not in {2, 3}
+        or producer.engine is not MixedEngine.VECTOR
+        or sink_stage.engine is not MixedEngine.CUBE
+        or (len(plan.stages) == 3 and plan.stages[2].engine is not MixedEngine.VECTOR)
+        or len(sink_stage.ops) != 1
+        or stream is None
+        or stream.kind
+        not in {
+            VectorStreamKind.REDUCTION_SPANNING,
+            VectorStreamKind.MULTI_PASS,
+        }
+        or transfer.tensor != descriptor.crossing_tensor
+        or transfer.producer_stage != descriptor.producer_stage
+        or transfer.consumer_stage != descriptor.sink_stage
+        or fifo.direction is not MixedTransferDirection.VECTOR_TO_CUBE
+        or fifo.valid_rows != descriptor.accumulator_rows
+        or fifo.valid_cols != descriptor.chunk
+        or descriptor.row_chunk != stream.free_tile * plan.vector_lanes
+        or descriptor.row_chunk * descriptor.row_chunks != plan.m_partition.big
+        or descriptor.row_chunks != plan.items_per_spatial_tile
+        or descriptor.full_chunks * descriptor.chunk + descriptor.tail
+        != descriptor.contraction_extent
+        or sink_stage.cube_window_k != (descriptor.chunk,)
+        or sink_stage.valid_rows != descriptor.row_chunk
+        or plan.pipeline_stages != 1
+        or plan.overlap_implementable
+    ):
+        raise SourceEmissionError("streamed V->C descriptor is inconsistent")
+    sink_op = sink_stage.ops[0]
+    sink = context.lowered.operation(sink_op)
+    crossing_producer = _tensor_producers(context.lowered)[descriptor.crossing_tensor]
+    if (
+        sink.inputs[0] != descriptor.crossing_tensor
+        or sink.inputs.count(descriptor.crossing_tensor) != 1
+        or crossing_producer not in producer.ops
+    ):
+        raise SourceEmissionError("streamed V->C value is not the sink LHS")
+
+    writer = _mixed_header(context, program_name, plan)
+    output = context.interface.output_argument
+    writer.line(
+        3,
+        f"for mixed_trip, (output_iter,) in pl.range({plan.max_trips_per_group}, "
+        f"init_values=({output},)):",
+    )
+    row, col = _emit_spatial_coordinates(writer, 4, context, plan, "mixed_trip")
+    state: dict[int, str] = {}
+    graph_ops = context.graph.op_map()
+    producers = _tensor_producers(context.lowered)
+
+    def emit_reduction_pass(replay, prefix: str) -> None:
+        inherited = {tensor: state[tensor] for tensor in replay.state_inputs}
+        initial = _emit_reduction_phase_chunk(
+            writer,
+            4,
+            context,
+            replay,
+            prefix=f"{prefix}_initial",
+            row_offset=row,
+            col_offset="0",
+            valid_cols=replay.init.extent,
+            frame_cols=stream.chunk,
+            initial_values=inherited,
+            stream_plan=stream,
+            row_scale=plan.vector_lanes,
+        )
+        running = {tensor: initial[tensor] for tensor in replay.state_outputs}
+        if replay.loop.trip_count:
+            iter_names = tuple(
+                f"{prefix}_iter_state_{tensor}" for tensor in replay.state_outputs
+            )
+            result_names = tuple(
+                f"{prefix}_result_state_{tensor}" for tensor in replay.state_outputs
+            )
+            _emit_loop_header(
+                writer,
+                4,
+                f"{prefix}_chunk",
+                replay.loop,
+                iter_values=iter_names,
+                init_values=tuple(running[tensor] for tensor in replay.state_outputs),
+            )
+            writer.line(5, f"{prefix}_col = {prefix}_chunk * {stream.chunk}")
+            values = _emit_reduction_phase_chunk(
+                writer,
+                5,
+                context,
+                replay,
+                prefix=prefix,
+                row_offset=row,
+                col_offset=f"{prefix}_col",
+                valid_cols=stream.chunk,
+                frame_cols=stream.chunk,
+                initial_values=inherited,
+                stream_plan=stream,
+                row_scale=plan.vector_lanes,
+            )
+            merged: list[str] = []
+            for tensor, previous in zip(replay.state_outputs, iter_names, strict=True):
+                producer_op = producers[tensor]
+                if producer_op is None:
+                    raise SourceEmissionError(
+                        f"streamed V->C state {tensor} has no producer"
+                    )
+                kind = graph_ops[
+                    context.lowered.operation(producer_op).graph_op_id
+                ].kind
+                merged.append(
+                    _emit_reduction_merge(
+                        writer,
+                        5,
+                        kind,
+                        previous,
+                        values[tensor],
+                        f"{prefix}_merged_{tensor}",
+                    )
+                )
+            lhs = ", ".join(result_names) + ("," if len(result_names) == 1 else "")
+            writer.line(5, f"{lhs} = pl.yield_({', '.join(merged)})")
+            running = dict(zip(replay.state_outputs, result_names, strict=True))
+        if replay.tail.present:
+            tail_values = _emit_reduction_phase_chunk(
+                writer,
+                4,
+                context,
+                replay,
+                prefix=f"{prefix}_tail",
+                row_offset=row,
+                col_offset=str(replay.tail.chunk_index * stream.chunk),
+                valid_cols=replay.tail.extent,
+                frame_cols=stream.chunk,
+                initial_values=inherited,
+                stream_plan=stream,
+                row_scale=plan.vector_lanes,
+            )
+            for tensor in replay.state_outputs:
+                producer_op = producers[tensor]
+                if producer_op is None:
+                    raise SourceEmissionError(
+                        f"streamed V->C state {tensor} has no producer"
+                    )
+                kind = graph_ops[
+                    context.lowered.operation(producer_op).graph_op_id
+                ].kind
+                running[tensor] = _emit_reduction_merge(
+                    writer,
+                    4,
+                    kind,
+                    running[tensor],
+                    tail_values[tensor],
+                    f"{prefix}_tail_state_{tensor}",
+                )
+        state.update(running)
+
+    if stream.kind is VectorStreamKind.REDUCTION_SPANNING:
+        stats = stream.phase(VectorReplayPhase.STATS)
+        apply = stream.phase(VectorReplayPhase.APPLY)
+        reduction_ops = [
+            op
+            for op in stats.ops
+            if graph_ops[context.lowered.operation(op).graph_op_id].kind
+            in {"sum", "max"}
+        ]
+        if len(reduction_ops) != 1 or stats.init is None or stats.loop is None:
+            raise SourceEmissionError("streamed reduction descriptor is incomplete")
+        reduction_tensor = context.lowered.operation(reduction_ops[0]).outputs[0]
+        # Adapt the compatibility phase to the typed replay-pass contract used
+        # by the generic multi-pass emitter.  An absent tail is represented by
+        # the same explicit inactive descriptor serialized for replay passes.
+        replay = VectorReplayPassPlan(
+            index=0,
+            kind=VectorReplayPassKind.REDUCTION,
+            ops=stats.ops,
+            state_inputs=(),
+            state_outputs=(reduction_tensor,),
+            output_tensors=(),
+            input_lifetimes=stats.input_lifetimes,
+            tensor_frames=stats.tensor_frames,
+            workspaces=stats.workspaces,
+            loop=stats.loop,
+            init=stats.init,
+            tail=stats.tail or VectorSerialPhasePlan(False, 0, 0),
+        )
+        emit_reduction_pass(replay, "stats")
+        apply_state = {reduction_tensor: state[reduction_tensor]}
+    else:
+        if not stream.replay_passes:
+            raise SourceEmissionError("streamed multi-pass descriptor is empty")
+        for replay in stream.replay_passes[:-1]:
+            if replay.kind is not VectorReplayPassKind.REDUCTION:
+                raise SourceEmissionError(
+                    "streamed multi-pass has a non-final APPLY pass"
+                )
+            emit_reduction_pass(replay, f"pass_{replay.index}")
+        apply = stream.replay_passes[-1]
+        if apply.kind is not VectorReplayPassKind.APPLY:
+            raise SourceEmissionError("streamed multi-pass does not end in APPLY")
+        apply_state = {tensor: state[tensor] for tensor in apply.state_inputs}
+
+    output_dtype = pypto_dtype(context.lowered.tensor(sink.outputs[0]).dtype)
+    operand_dtype = context.lowered.tensor(sink.inputs[0]).dtype.lower()
+    accumulator_dtype = pypto_dtype(
+        "fp32" if operand_dtype in {"fp32", "fp16", "bf16"} else "int32"
+    )
+    graph_sink = graph_ops[sink.graph_op_id]
+    rhs_transposed = graph_sink.attributes.get("rhs_transposed") is True
+    if apply.loop is None:
+        raise SourceEmissionError("streamed V->C APPLY loop is absent")
+    if apply.loop.first_chunk != 0 or apply.loop.trip_count != stream.full_chunks:
+        raise SourceEmissionError("streamed V->C APPLY loop does not cover full chunks")
+    apply_carried = tuple(
+        tensor
+        for tensor in descriptor.carried_tensors
+        if producers[tensor] in apply.ops
+    )
+    resident_carried = {
+        tensor: state[tensor]
+        for tensor in descriptor.carried_tensors
+        if tensor not in apply_carried and tensor in state
+    }
+    if len(apply_carried) + len(resident_carried) != len(descriptor.carried_tensors):
+        raise SourceEmissionError(
+            "streamed V->C carried value is not published by replay"
+        )
+    if apply_carried:
+        # Values carried around the cube stage must be invariant across the K
+        # replay. Hoist their apply-local dependency cone once instead of
+        # introducing a dummy full-width AIV loop initializer. A chunk-varying
+        # source in this cone would make the value non-resident by definition.
+        apply_ops = set(apply.ops)
+        needed_ops: set[int] = set()
+        pending = list(apply_carried)
+        while pending:
+            tensor = pending.pop()
+            producer_op = producers[tensor]
+            if producer_op is None or producer_op not in apply_ops:
+                if tensor not in apply_state:
+                    descriptor_tensor = context.lowered.tensor(tensor)
+                    if descriptor_tensor.width != 1:
+                        raise SourceEmissionError(
+                            "streamed V->C carried value depends on a K-varying input"
+                        )
+                continue
+            if producer_op in needed_ops:
+                continue
+            needed_ops.add(producer_op)
+            pending.extend(context.lowered.operation(producer_op).inputs)
+        ordered_ops = tuple(op for op in apply.ops if op in needed_ops)
+        carried_phase = replace(
+            apply,
+            ops=ordered_ops,
+            workspaces=tuple(
+                workspace
+                for workspace in apply.workspaces
+                if workspace.op in needed_ops
+            ),
+        )
+        hoisted = _emit_reduction_phase_chunk(
+            writer,
+            4,
+            context,
+            carried_phase,
+            prefix="apply_resident",
+            row_offset=row,
+            col_offset="0",
+            valid_cols=1,
+            frame_cols=1,
+            initial_values=apply_state,
+            stream_plan=stream,
+            row_scale=plan.vector_lanes,
+        )
+        missing_carried = set(apply_carried) - set(hoisted)
+        if missing_carried:
+            raise SourceEmissionError(
+                "streamed V->C carried values are not hoistable: "
+                + ", ".join(str(tensor) for tensor in sorted(missing_carried))
+            )
+        resident_carried.update((tensor, hoisted[tensor]) for tensor in apply_carried)
+    writer.line(
+        4,
+        f"sink_acc_storage = pl.tile.create([{descriptor.accumulator_rows}, "
+        f"{plan.n_partition.big}], dtype={accumulator_dtype}, "
+        "target_memory=pl.Mem.Acc, compact=True)",
+    )
+    writer.line(
+        4,
+        f"sink_acc_init = pl.tile.set_validshape(sink_acc_storage, "
+        f"{descriptor.row_chunk}, {plan.n_partition.big})",
+    )
+    _emit_loop_header(
+        writer,
+        4,
+        "apply_chunk",
+        apply.loop,
+        iter_values=("sink_acc",),
+        init_values=("sink_acc_init",),
+    )
+    writer.line(5, f"apply_col = apply_chunk * {stream.chunk}")
+    apply_values = _emit_reduction_phase_chunk(
+        writer,
+        5,
+        context,
+        apply,
+        prefix="apply",
+        row_offset=row,
+        col_offset="apply_col",
+        valid_cols=stream.chunk,
+        frame_cols=stream.chunk,
+        initial_values=apply_state,
+        stream_plan=stream,
+        row_scale=plan.vector_lanes,
+    )
+    crossing_value = apply_values.get(descriptor.crossing_tensor)
+    if crossing_value is None:
+        raise SourceEmissionError("streamed APPLY pass does not produce its crossing")
+    writer.line(
+        5,
+        f"sink_lhs_mat = pl.tile.move({crossing_value}, target_memory=pl.Mem.Mat)",
+    )
+    rhs = _emit_streamed_sink_rhs_tile(
+        writer,
+        5,
+        context,
+        sink.inputs[1],
+        rows=stream.chunk,
+        valid_rows=stream.chunk,
+        cols=plan.n_partition.big,
+        row_offset="apply_col",
+        col_offset=col,
+        prefix="sink_rhs",
+        transposed=rhs_transposed,
+    )
+    writer.line(5, "if apply_chunk == 0:")
+    writer.line(6, f"sink_first = pl.matmul(sink_lhs_mat, {rhs})")
+    writer.line(6, "sink_next = pl.yield_(sink_first)")
+    writer.line(5, "else:")
+    writer.line(
+        6,
+        f"sink_later = pl.matmul_acc(sink_acc, sink_lhs_mat, {rhs})",
+    )
+    writer.line(6, "sink_next = pl.yield_(sink_later)")
+    writer.line(5, "sink_acc_result, = pl.yield_(sink_next)")
+    accumulator = "sink_acc_result"
+    if stream.tail:
+        if apply.tail is None or not apply.tail.present:
+            raise SourceEmissionError("streamed V->C APPLY tail is absent")
+        tail_col = apply.tail.chunk_index * stream.chunk
+        tail_values = _emit_reduction_phase_chunk(
+            writer,
+            4,
+            context,
+            apply,
+            prefix="apply_tail",
+            row_offset=row,
+            col_offset=str(tail_col),
+            valid_cols=apply.tail.extent,
+            frame_cols=stream.chunk,
+            initial_values=apply_state,
+            stream_plan=stream,
+            row_scale=plan.vector_lanes,
+        )
+        crossing_value = tail_values[descriptor.crossing_tensor]
+        writer.line(
+            4,
+            f"sink_lhs_tail_mat = pl.tile.move({crossing_value}, "
+            "target_memory=pl.Mem.Mat)",
+        )
+        rhs = _emit_streamed_sink_rhs_tile(
+            writer,
+            4,
+            context,
+            sink.inputs[1],
+            rows=stream.chunk,
+            valid_rows=apply.tail.extent,
+            cols=plan.n_partition.big,
+            row_offset=str(tail_col),
+            col_offset=col,
+            prefix="sink_rhs_tail",
+            transposed=rhs_transposed,
+        )
+        writer.line(
+            4,
+            f"sink_tail = pl.matmul_acc({accumulator}, sink_lhs_tail_mat, {rhs})",
+        )
+        accumulator = "sink_tail"
+    if output_dtype != accumulator_dtype:
+        writer.line(
+            4,
+            f"sink_stored = pl.cast({accumulator}, "
+            f"target_type={output_dtype}, mode='rint')",
+        )
+        accumulator = "sink_stored"
+
+    if descriptor.sink_stage + 1 == len(plan.stages):
+        result = accumulator
+    else:
+        final_stage = plan.stages[descriptor.sink_stage + 1]
+        _require_in_memory_vector_stage(final_stage)
+        writer.line(
+            4,
+            f"sink_vector_mat = pl.tile.move({accumulator}, target_memory=pl.Mem.Mat)",
+        )
+        result = _emit_tile_vector_stage(
+            writer,
+            4,
+            context,
+            final_stage,
+            {sink.outputs[0]: "sink_vector_mat", **resident_carried},
+            frame_rows=descriptor.row_chunk,
+            frame_cols=plan.n_partition.big,
+            row_offset=row,
+            col_offset=col,
+        )
+    writer.line(
+        4,
+        f"next_output = pl.store({result}, [{row}, {col}], output_iter)",
+    )
+    writer.line(4, f"{output} = pl.yield_(next_output)")
+    emit_return(writer, context.interface)
+    return writer.render()
+
+
 def _emit_streaming_sink_rhs(
     writer: SourceWriter,
     indent: int,
@@ -821,6 +1278,8 @@ def _emit_single_round_trip(
     program_name: str,
     plan: MixedKernelPlan,
 ) -> str:
+    if plan.streamed_v2c is not None:
+        return _emit_streamed_vector_v2c(context, program_name, plan)
     engines = tuple(stage.engine for stage in plan.stages)
     supported_engines = {
         (MixedEngine.CUBE, MixedEngine.VECTOR, MixedEngine.CUBE),
@@ -840,7 +1299,7 @@ def _emit_single_round_trip(
             transfer.producer_stage != index or transfer.consumer_stage != index + 1
             for index, transfer in enumerate(plan.transfers)
         )
-        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+        or any(fifo.slot_count <= 0 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
             "mixed plan is not a supported generic three-stage round trip"
@@ -1001,7 +1460,7 @@ def _emit_multi_round_trip_sequential(
             MixedTransferDirection.VECTOR_TO_CUBE,
             MixedTransferDirection.CUBE_TO_VECTOR,
         )
-        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+        or any(fifo.slot_count <= 0 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
             "mixed plan is not the supported sequential C->V->C->V topology"
@@ -1132,7 +1591,7 @@ def _emit_branched_round_trip(
         or sink_stage is None
         or sink_stage != len(plan.stages) - 1
         or plan.protocol_peer_stage is not None
-        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+        or any(fifo.slot_count <= 0 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
             "mixed plan is not a supported generic branched round trip"
@@ -1305,7 +1764,7 @@ def _emit_feature_chunk_round_trip(
         )
         or plan.fifos[plan.protocol_reply_bundle[0]].direction
         is not MixedTransferDirection.VECTOR_TO_CUBE
-        or any(fifo.slot_count != 4 for fifo in plan.fifos)
+        or any(fifo.slot_count <= 0 for fifo in plan.fifos)
     ):
         raise SourceEmissionError(
             "mixed plan is not a supported feature-chunk round trip"
@@ -1493,12 +1952,24 @@ def _emit_spatial_coordinates(
     trip: str | None,
 ) -> tuple[str, str]:
     item = "region_index"
-    if trip is not None and (plan.m_partition.parts > 1 or plan.n_partition.parts > 1):
+    if trip is not None and plan.pipeline_work_items > plan.active_groups:
         writer.line(
             indent,
             f"mixed_item = region_index * {plan.max_trips_per_group} + {trip}",
         )
         item = "mixed_item"
+    row_within_tile: str | None = None
+    if plan.streamed_v2c is not None:
+        writer.line(
+            indent,
+            f"mixed_spatial_item = {item} // {plan.streamed_v2c.row_chunks}",
+        )
+        writer.line(
+            indent,
+            f"mixed_row_item = {item} % {plan.streamed_v2c.row_chunks}",
+        )
+        item = "mixed_spatial_item"
+        row_within_tile = f"mixed_row_item * {plan.streamed_v2c.row_chunk}"
     output_tensor = solver_tensor_for_value(
         context.lowered, context.interface.output_allocation_owner
     )
@@ -1511,7 +1982,13 @@ def _emit_spatial_coordinates(
         clamped_overlap_extents=(output.height, output.width),
         linear_index=item,
     )
-    return coordinates.row, coordinates.col
+    if row_within_tile is None:
+        return coordinates.row, coordinates.col
+    writer.line(
+        indent,
+        f"mixed_stream_row = {coordinates.row} + {row_within_tile}",
+    )
+    return "mixed_stream_row", coordinates.col
 
 
 def _emit_matmul_tile(  # noqa: PLR0913
@@ -1675,6 +2152,104 @@ def _emit_matmul_tile(  # noqa: PLR0913
         )
         return stored
     return accumulator
+
+
+def _emit_streamed_sink_rhs_tile(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    tensor: int,
+    *,
+    rows: int,
+    valid_rows: int,
+    cols: int,
+    row_offset: str,
+    col_offset: str,
+    prefix: str,
+    transposed: bool,
+) -> str:
+    """Load one streamed sink RHS window into its tile-level cube memories."""
+
+    argument = _argument_for_tensor(context, tensor)
+    physical = (cols, rows) if transposed else (rows, cols)
+    valid = (cols, valid_rows) if transposed else (valid_rows, cols)
+    offsets = (col_offset, row_offset) if transposed else (row_offset, col_offset)
+    natural = f"{prefix}_mat"
+    writer.line(
+        indent,
+        f"{natural} = pl.tile.load({argument}, [{offsets[0]}, {offsets[1]}], "
+        f"[{physical[0]}, {physical[1]}], [{valid[0]}, {valid[1]}], "
+        "target_memory=pl.Mem.Mat)",
+    )
+    view = natural
+    if transposed:
+        view = f"{prefix}_view"
+        writer.line(indent, f"{view} = pl.tile.transpose_view({natural})")
+    # Keep the full RHS panel in Mat. Passing it directly to matmul lets
+    # AutoTileMatmulL0 select legal Right fragments; eagerly moving a wide
+    # panel to Right would turn the source tile into an unbuildable L0B
+    # allocation and prevent compiler retile.
+    return view
+
+
+def _emit_tile_vector_stage(  # noqa: PLR0913
+    writer: SourceWriter,
+    indent: int,
+    context: EmissionContext,
+    stage: MixedStagePlan,
+    local: dict[int, str],
+    *,
+    frame_rows: int,
+    frame_cols: int,
+    row_offset: str,
+    col_offset: str,
+) -> str:
+    """Replay an in-memory vector epilogue over tile-level mixed values."""
+
+    graph_ops = context.graph.op_map()
+    for solver_op in stage.ops:
+        operation = context.lowered.operation(solver_op)
+        if len(operation.outputs) != 1:
+            raise SourceEmissionError(
+                f"mixed tile-vector op {solver_op} must have one output"
+            )
+        operands: list[str] = []
+        for tensor in operation.inputs:
+            if tensor not in local:
+                descriptor = context.lowered.tensor(tensor)
+                rows = 1 if descriptor.height == 1 else frame_rows
+                cols = 1 if descriptor.width == 1 else frame_cols
+                row = "0" if descriptor.height == 1 else row_offset
+                col = "0" if descriptor.width == 1 else col_offset
+                name = f"vector_input_{tensor}"
+                writer.line(
+                    indent,
+                    f"{name} = pl.load({_argument_for_tensor(context, tensor)}, "
+                    f"[{row}, {col}], [{rows}, {cols}], [{rows}, {cols}], "
+                    "target_memory=pl.Mem.Vec)",
+                )
+                local[tensor] = name
+            operands.append(local[tensor])
+        output = operation.outputs[0]
+        expression = _vector_expression(
+            writer,
+            indent,
+            graph_ops[operation.graph_op_id],
+            operands,
+            list(operation.inputs),
+            output,
+            context.lowered,
+            frame_rows,
+            frame_cols,
+            solver_op,
+            None,
+        )
+        name = f"vector_{output}"
+        writer.line(indent, f"{name} = {expression}")
+        local[output] = name
+    if not stage.ops:
+        raise SourceEmissionError("mixed tile-vector stage is empty")
+    return local[context.lowered.operation(stage.ops[-1]).outputs[0]]
 
 
 def _emit_matrix_operand(  # noqa: PLR0913

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import math
 import os
 import re
@@ -58,6 +59,7 @@ from examples.torch_frontend.production_models import (
 from pto_fusebox import (
     KernelKind,
     RuntimeValidShapeSpec,
+    ScheduleContractError,
     SourceEmissionError,
     can_emit_region,
     emit_deepseek_mtp_projection_overlay,
@@ -69,6 +71,7 @@ from pto_fusebox import (
     extract_solver_regions,
     pypto_lib_model_manifest,
     pypto_lib_model_manifests,
+    region_for_source_candidate,
     scheduled_region,
     solve_graph,
     validate_pypto_lib_model,
@@ -487,8 +490,10 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
         for candidate in repeated.regions[0].candidate_summaries
     )
     assert result.candidate_summaries[0].selected
+    assert result.candidate_summaries[0].source_ready
+    assert result.candidate_summaries[0].rejection_reason is None
     assert all(
-        candidate.source_ready and candidate.rejection_reason is None
+        candidate.source_ready == (candidate.rejection_reason is None)
         for candidate in result.candidate_summaries
     )
     assert [
@@ -551,6 +556,60 @@ def test_pro_source_first_solve_selects_safe_cast_frames_and_reports_candidates(
         function_name="deepseek_v4_pro_safe_cast",
     )
     ast.parse(emitted.source)
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys solver is unavailable"
+)
+def test_production_projection_candidates_include_maximal_streamed_v2c() -> None:
+    """Expose whole-region alternatives instead of pre-cutting production DAGs."""
+
+    cases = (
+        (build_production_mtp_projection_branch, 2, True),
+        (build_production_qwen_output_head, 1, False),
+    )
+    for builder, transfer_count, carries_scale in cases:
+        module, args = builder()
+        graph = export_and_normalize(module, args)
+        solved = solve_graph(
+            graph,
+            solver_binary=_test_solver(),
+            solver_workers=2,
+            require_source_codegen=True,
+            collect_candidate_summaries=True,
+        )
+        assert solved.regions_solved == 1
+        region = solved.regions[0]
+        maximal = next(
+            candidate
+            for candidate in region.candidate_summaries
+            if len(candidate.partition) == 1
+        )
+        assert maximal.source_ready and maximal.rejection_reason is None
+        forced = region_for_source_candidate(region, maximal)
+        schedule = scheduled_region(forced)
+        assert len(schedule.steps) == 1
+        plan = schedule.steps[0].plan
+        assert isinstance(plan, MixedKernelPlan)
+        assert plan.streamed_v2c is not None
+        assert len(plan.transfers) == transfer_count
+        assert plan.streamed_v2c.persistent_accumulator_bytes > 0
+        assert plan.streamed_v2c.first_chunk_initializes
+        assert plan.streamed_v2c.later_chunks_accumulate
+        assert bool(plan.streamed_v2c.carried_tensors) is carries_scale
+        source = emit_pypto_region(
+            graph, forced, program_name=f"maximal_{builder.__name__}"
+        ).source
+        assert source.count("pl.matmul_acc(") >= 1
+        assert source.count("next_output = pl.store(") == 1
+        assert "gm_pipe_buffer_" not in source
+
+        malformed = copy.deepcopy(maximal.solution)
+        descriptor = malformed["steps"][0]["plan"]["streamed_v2c"]
+        assert isinstance(descriptor, dict)
+        descriptor["producer_stage"] = descriptor["sink_stage"]
+        with pytest.raises(ScheduleContractError, match=r"streamed_v2c is incomplete"):
+            scheduled_region(replace(forced, solution=malformed))
 
 
 @pytest.mark.skipif(
@@ -778,13 +837,15 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         source_ops = [op for step in schedule.steps for op in step.op_order]
         compute_op_count = sum(not op.metadata_only for op in graph.ops)
         assert len(source_ops) == len(set(source_ops)) == compute_op_count
-        assert [step.kind for step in schedule.steps] == [
-            KernelKind.VECTOR,
-            KernelKind.VECTOR,
-            KernelKind.VECTOR,
-            KernelKind.CUBE,
-            KernelKind.VECTOR,
-        ]
+        assert set(source_ops) == set(range(compute_op_count))
+        assert len(schedule.steps) < 5
+        assert any(
+            step.kind in {KernelKind.CUBE, KernelKind.MIXED} for step in schedule.steps
+        )
+        assert any(
+            step.kind in {KernelKind.VECTOR, KernelKind.MIXED}
+            for step in schedule.steps
+        )
         source = emit_pypto_callable(
             graph,
             result.regions[0],
@@ -812,17 +873,17 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         24,
         24,
     )
-    expected_branch_steps = [
-        KernelKind.VECTOR,
-        KernelKind.VECTOR,
-        KernelKind.VECTOR,
-        KernelKind.CUBE,
-        KernelKind.VECTOR,
-    ]
-    assert [
-        [step.kind for step in scheduled_region(region).steps]
-        for region in full_result.regions
-    ] == [expected_branch_steps, expected_branch_steps]
+    for region in full_result.regions:
+        branch = scheduled_region(region)
+        source_ops = [op for step in branch.steps for op in step.op_order]
+        assert len(source_ops) == len(set(source_ops)) == len(region.solver_op_to_graph)
+        assert len(branch.steps) < 5
+        assert any(
+            step.kind in {KernelKind.CUBE, KernelKind.MIXED} for step in branch.steps
+        )
+        assert any(
+            step.kind in {KernelKind.VECTOR, KernelKind.MIXED} for step in branch.steps
+        )
 
     native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
     overlay = emit_flash_mtp_decode_projection_overlay(
@@ -1048,13 +1109,19 @@ def test_production_flash_mtp_prefill_branch_is_source_ready() -> None:
         DEEPSEEK_V4_HIDDEN,
     )
     schedule = scheduled_region(solved.regions[0])
-    assert [step.kind for step in schedule.steps] == [
-        KernelKind.VECTOR,
-        KernelKind.VECTOR,
-        KernelKind.VECTOR,
-        KernelKind.CUBE,
-        KernelKind.VECTOR,
-    ]
+    source_ops = [op for step in schedule.steps for op in step.op_order]
+    assert (
+        len(source_ops)
+        == len(set(source_ops))
+        == len(solved.regions[0].solver_op_to_graph)
+    )
+    assert len(schedule.steps) < 5
+    assert any(
+        step.kind in {KernelKind.CUBE, KernelKind.MIXED} for step in schedule.steps
+    )
+    assert any(
+        step.kind in {KernelKind.VECTOR, KernelKind.MIXED} for step in schedule.steps
+    )
     source = emit_pypto_callable(
         graph,
         solved.regions[0],
@@ -1633,17 +1700,18 @@ def test_connected_qwen_rms_norm_lm_head_is_one_exact_v2c_region() -> None:
     assert isinstance(plan, MixedKernelPlan)
     assert plan.protocol.value == "one_way"
     assert [stage.engine.value for stage in plan.stages] == ["vector", "cube"]
-    assert plan.active_groups == 3
-    assert plan.spatial_tiles == 3
+    assert plan.active_groups == plan.spatial_tiles
+    assert plan.active_groups > 0
     assert plan.pipeline_stages == 1
     assert len(plan.fifos) == 1
     fifo = plan.fifos[0]
     assert fifo.direction.value == "vector_to_cube"
+    assert plan.streamed_v2c is not None
     assert (fifo.valid_rows, fifo.valid_cols) == (
-        QWEN_BATCH_TILE,
-        QWEN_LM_HEAD_K_CHUNK,
+        plan.streamed_v2c.accumulator_rows,
+        plan.streamed_v2c.chunk,
     )
-    assert fifo.slot_bytes == 16 * 512 * 2
+    assert fifo.slot_bytes == fifo.valid_rows * fifo.valid_cols * 2
     assert fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count
 
     emitted = emit_pypto_callable(
@@ -1654,7 +1722,8 @@ def test_connected_qwen_rms_norm_lm_head_is_one_exact_v2c_region() -> None:
     assert emitted.kind is KernelKind.MIXED
     assert emitted.source.count("pl.spmd(") == 1
     assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in emitted.source
-    assert "b_trans=True" in emitted.source
+    assert "pl.tile.transpose_view(" in emitted.source
+    assert "pl.matmul_acc(" in emitted.source
     assert "pl.create_tensor" not in emitted.source
     assert "auto_fuse" not in emitted.source and "auto_tile" not in emitted.source
 

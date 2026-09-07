@@ -67,6 +67,7 @@ from .solver import (
     RegionSolveResult,
     SolveResult,
     SourceCandidateSummary,
+    region_for_source_candidate,
     solve_graph,
 )
 from .source import (
@@ -123,6 +124,7 @@ __all__ = [
     "SolverRegion",
     "SourceEmissionError",
     "SourceCandidateSummary",
+    "region_for_source_candidate",
     "StaticRegionOwnership",
     "TargetProfile",
     "ValidatedPyPTOLibModel",

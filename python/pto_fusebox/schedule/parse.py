@@ -37,6 +37,7 @@ from .schema import (
     MixedAlgorithm,
     MixedCrossCoreProtocol,
     MixedFeatureRoundTripPlan,
+    MixedStreamedV2CPlan,
     MixedEngine,
     MixedFifoPlan,
     MixedKernelPlan,
@@ -1352,6 +1353,7 @@ def _parse_mixed_plan(
         "transfers",
         "fifos",
         "feature_round_trip",
+        "streamed_v2c",
     }
     _expect_keys(item, required=required, field=field)
     raw_stages = _sequence(item.get("stages"), f"{field}.stages")
@@ -1522,6 +1524,13 @@ def _parse_mixed_plan(
         ),
         feature_round_trip=_parse_mixed_feature_round_trip(
             item.get("feature_round_trip"), field=f"{field}.feature_round_trip"
+        ),
+        streamed_v2c=_parse_mixed_streamed_v2c(
+            item.get("streamed_v2c"),
+            field=f"{field}.streamed_v2c",
+            stage_bound=len(stages),
+            transfer_bound=len(transfers),
+            tensor_bound=tensor_bound,
         ),
     )
 
@@ -1716,6 +1725,81 @@ def _parse_mixed_feature_round_trip(
     )
 
 
+def _parse_mixed_streamed_v2c(
+    value: Any,
+    *,
+    field: str,
+    stage_bound: int,
+    transfer_bound: int,
+    tensor_bound: int,
+) -> MixedStreamedV2CPlan | None:
+    if value is None:
+        return None
+    item = _mapping(value, field)
+    _expect_keys(
+        item,
+        required={
+            "producer_stage",
+            "sink_stage",
+            "transfer",
+            "crossing_tensor",
+            "carried_tensors",
+            "contraction_extent",
+            "row_chunk",
+            "row_chunks",
+            "accumulator_rows",
+            "chunk",
+            "full_chunks",
+            "tail",
+            "persistent_accumulator_bytes",
+            "first_chunk_initializes",
+            "later_chunks_accumulate",
+        },
+        field=field,
+    )
+    return MixedStreamedV2CPlan(
+        producer_stage=_bounded_int(
+            item.get("producer_stage"), f"{field}.producer_stage", stage_bound
+        ),
+        sink_stage=_bounded_int(
+            item.get("sink_stage"), f"{field}.sink_stage", stage_bound
+        ),
+        transfer=_bounded_int(
+            item.get("transfer"), f"{field}.transfer", transfer_bound
+        ),
+        crossing_tensor=_bounded_int(
+            item.get("crossing_tensor"), f"{field}.crossing_tensor", tensor_bound
+        ),
+        carried_tensors=tuple(
+            _bounded_int(tensor, f"{field}.carried_tensors[{index}]", tensor_bound)
+            for index, tensor in enumerate(
+                _sequence(item.get("carried_tensors"), f"{field}.carried_tensors")
+            )
+        ),
+        contraction_extent=_positive_int(
+            item.get("contraction_extent"), f"{field}.contraction_extent"
+        ),
+        row_chunk=_positive_int(item.get("row_chunk"), f"{field}.row_chunk"),
+        row_chunks=_positive_int(item.get("row_chunks"), f"{field}.row_chunks"),
+        accumulator_rows=_positive_int(
+            item.get("accumulator_rows"), f"{field}.accumulator_rows"
+        ),
+        chunk=_positive_int(item.get("chunk"), f"{field}.chunk"),
+        full_chunks=_positive_int(item.get("full_chunks"), f"{field}.full_chunks"),
+        tail=_nonnegative_int(item.get("tail"), f"{field}.tail"),
+        persistent_accumulator_bytes=_positive_int(
+            item.get("persistent_accumulator_bytes"),
+            f"{field}.persistent_accumulator_bytes",
+        ),
+        first_chunk_initializes=_bool(
+            item.get("first_chunk_initializes"), f"{field}.first_chunk_initializes"
+        ),
+        later_chunks_accumulate=_bool(
+            item.get("later_chunks_accumulate"), f"{field}.later_chunks_accumulate"
+        ),
+    )
+
+
 def _mixed_indices(value: Any, bound: int, field: str) -> tuple[int, ...]:
     indices = tuple(
         _bounded_int(index, field, bound) for index in _sequence(value, field)
@@ -1827,12 +1911,7 @@ def _validate_mixed_contract(  # noqa: PLR0913
         )
     if len(plan.stages) != len(plan.topology_stages) or not plan.stages:
         raise ScheduleContractError(f"{field} stage descriptors are incomplete")
-    phase_local_vector_pipeline = (
-        plan.protocol is MixedCrossCoreProtocol.ONE_WAY
-        and plan.stages[0].engine is MixedEngine.VECTOR
-        and plan.stages[0].vector_stream is not None
-        and plan.stages[0].vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
-    )
+    phase_local_vector_pipeline = plan.streamed_v2c is not None
     successor_overlap = plan.max_trips_per_group >= 2
     if plan.protocol is MixedCrossCoreProtocol.ONE_WAY:
         expected_overlap = successor_overlap and not phase_local_vector_pipeline
@@ -1851,17 +1930,18 @@ def _validate_mixed_contract(  # noqa: PLR0913
         MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE,
         MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE,
     }:
+        expected_overlap = successor_overlap and not phase_local_vector_pipeline
         expected_fill_absorbed = (
-            successor_overlap
+            expected_overlap
             and plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
         )
-        expected_stages = 3 if successor_overlap else 1
-        expected_skew = 2 if successor_overlap else 0
+        expected_stages = 3 if expected_overlap else 1
+        expected_skew = 2 if expected_overlap else 0
         if (
             plan.pipeline_stages != expected_stages
             or plan.requested_skew_depth != expected_skew
-            or plan.model_overlap_granted != successor_overlap
-            or plan.overlap_implementable != successor_overlap
+            or plan.model_overlap_granted != expected_overlap
+            or plan.overlap_implementable != expected_overlap
             or plan.pipeline_fill_absorbed != expected_fill_absorbed
         ):
             raise ScheduleContractError(
@@ -1913,7 +1993,13 @@ def _validate_mixed_contract(  # noqa: PLR0913
                 )
             realized_peak = (
                 stage.vector_stream.chunk_peak_ub_bytes
-                if stage.vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
+                if stage.vector_stream.kind
+                in {
+                    VectorStreamKind.REDUCTION_FOLDED,
+                    VectorStreamKind.REDUCTION_SPANNING,
+                    VectorStreamKind.SOFTMAX_FLASH,
+                    VectorStreamKind.MULTI_PASS,
+                }
                 else _mixed_materialized_source_peak(
                     stage.vector_stream, lowered=lowered
                 )
@@ -1939,13 +2025,8 @@ def _validate_mixed_contract(  # noqa: PLR0913
         raise ScheduleContractError(
             f"{field}.cube_window_k differs from its authoritative stage windows"
         )
-    if (
-        not vector_stage_peaks
-        or max(vector_stage_peaks) != plan.vector_stage_peak_ub_bytes
-    ):
-        raise ScheduleContractError(
-            f"{field} aggregate Vec peak differs from its vector stages"
-        )
+    if not vector_stage_peaks:
+        raise ScheduleContractError(f"{field} omits an authoritative vector-stage peak")
     if (
         next(
             stage.vector_stream.kind
@@ -1964,47 +2045,38 @@ def _validate_mixed_contract(  # noqa: PLR0913
         raise ScheduleContractError(
             f"{field}.stages do not preserve the selected operation order"
         )
-    if plan.protocol is MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE:
-        order_position = {op: position for position, op in enumerate(step_order)}
-        stage_by_op = {
-            op: stage_index
-            for stage_index, stage in enumerate(plan.stages)
-            for op in stage.ops
-        }
-        producer_by_tensor = {
-            tensor: op for op in step_ops for tensor in lowered.operation(op).outputs
-        }
-        for stage_index, stage in enumerate(plan.stages):
-            if tuple(sorted(stage.ops, key=order_position.__getitem__)) != stage.ops:
-                raise ScheduleContractError(
-                    f"{field}.stages[{stage_index}].ops do not preserve the "
-                    "selected operation order"
-                )
-            for op in stage.ops:
-                for tensor in lowered.operation(op).inputs:
-                    producer = producer_by_tensor.get(tensor)
-                    if producer is None:
-                        continue
-                    producer_stage = stage_by_op[producer]
-                    if producer_stage > stage_index:
-                        raise ScheduleContractError(
-                            f"{field}.stages contain a backward data dependency"
-                        )
-                    if (
-                        producer_stage == stage_index
-                        and order_position[producer] >= order_position[op]
-                    ):
-                        raise ScheduleContractError(
-                            f"{field}.stages[{stage_index}].ops reorder a data "
-                            "dependency"
-                        )
-    elif (
-        plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
-        and flattened_ops != step_order
-    ):
-        raise ScheduleContractError(
-            f"{field}.stages do not preserve the selected operation order"
-        )
+    order_position = {op: position for position, op in enumerate(step_order)}
+    stage_by_op = {
+        op: stage_index
+        for stage_index, stage in enumerate(plan.stages)
+        for op in stage.ops
+    }
+    producer_by_tensor = {
+        tensor: op for op in step_ops for tensor in lowered.operation(op).outputs
+    }
+    for stage_index, stage in enumerate(plan.stages):
+        if tuple(sorted(stage.ops, key=order_position.__getitem__)) != stage.ops:
+            raise ScheduleContractError(
+                f"{field}.stages[{stage_index}].ops do not preserve the selected "
+                "operation order"
+            )
+        for op in stage.ops:
+            for tensor in lowered.operation(op).inputs:
+                producer = producer_by_tensor.get(tensor)
+                if producer is None:
+                    continue
+                producer_stage = stage_by_op[producer]
+                if producer_stage > stage_index:
+                    raise ScheduleContractError(
+                        f"{field}.stages contain a backward data dependency"
+                    )
+                if (
+                    producer_stage == stage_index
+                    and order_position[producer] >= order_position[op]
+                ):
+                    raise ScheduleContractError(
+                        f"{field}.stages[{stage_index}].ops reorder a data dependency"
+                    )
     if sequential_tiles is None:
         raise ScheduleContractError(f"{field} omits per-operation sequential tiles")
     sequential_by_op = dict(zip(step_order, sequential_tiles, strict=True))
@@ -2082,15 +2154,15 @@ def _validate_mixed_contract(  # noqa: PLR0913
         spatial_frame = plan.pipeline_axis is MixedPipelineAxis.SPATIAL_REGION
         expected_rows = plan.m_partition.big if fifo.spatial_m else tensor.height
         expected_cols = plan.n_partition.big if fifo.spatial_n else tensor.width
-        if (
-            direction is MixedTransferDirection.VECTOR_TO_CUBE
-            and producer.vector_stream is not None
-            and producer.vector_stream.kind is VectorStreamKind.SOFTMAX_FLASH
-            and fifo.spatial_m
-            and not fifo.spatial_n
-            and producer.vector_stream.extent == tensor.width
+        if plan.streamed_v2c is not None and plan.streamed_v2c.transfer == index:
+            expected_rows = plan.streamed_v2c.accumulator_rows
+            expected_cols = plan.streamed_v2c.chunk
+        elif (
+            plan.streamed_v2c is not None
+            and direction is MixedTransferDirection.CUBE_TO_VECTOR
+            and transfer.producer_stage == plan.streamed_v2c.sink_stage
         ):
-            expected_cols = producer.vector_stream.chunk
+            expected_rows = plan.streamed_v2c.accumulator_rows
         if (
             fifo.tensor != transfer.tensor
             or fifo.direction is not direction
@@ -2282,6 +2354,69 @@ def _validate_mixed_contract(  # noqa: PLR0913
         raise ScheduleContractError(
             f"{field} generic plan carries feature-round-trip state"
         )
+    streamed = plan.streamed_v2c
+    if streamed is not None:
+        producer_stream = plan.stages[streamed.producer_stage].vector_stream
+        stage_by_op = {
+            op: stage_index
+            for stage_index, stage in enumerate(plan.stages)
+            for op in stage.ops
+        }
+        producer_ops = set(plan.stages[streamed.producer_stage].ops)
+        expected_carried = {
+            tensor
+            for op in producer_ops
+            for tensor in lowered.operation(op).outputs
+            if tensor != streamed.crossing_tensor
+            and any(
+                stage_by_op.get(consumer, -1) > streamed.sink_stage
+                and plan.stages[stage_by_op[consumer]].engine is MixedEngine.VECTOR
+                for consumer in (
+                    candidate.index
+                    for candidate in lowered.operations
+                    if tensor in candidate.inputs
+                )
+            )
+        }
+        if (
+            plan.algorithm is not MixedAlgorithm.GENERIC
+            or streamed.producer_stage != 0
+            or streamed.sink_stage != 1
+            or len(plan.stages) not in {2, 3}
+            or plan.stages[streamed.producer_stage].engine is not MixedEngine.VECTOR
+            or plan.stages[streamed.sink_stage].engine is not MixedEngine.CUBE
+            or (
+                len(plan.stages) == 3
+                and plan.stages[2].engine is not MixedEngine.VECTOR
+            )
+            or plan.transfers[streamed.transfer].producer_stage
+            != streamed.producer_stage
+            or plan.transfers[streamed.transfer].consumer_stage != streamed.sink_stage
+            or plan.transfers[streamed.transfer].tensor != streamed.crossing_tensor
+            or streamed.full_chunks * streamed.chunk + streamed.tail
+            != streamed.contraction_extent
+            or streamed.row_chunk * streamed.row_chunks != plan.m_partition.big
+            or streamed.accumulator_rows < streamed.row_chunk
+            or streamed.persistent_accumulator_bytes
+            != streamed.accumulator_rows * plan.n_partition.big * 4
+            or streamed.row_chunks != plan.items_per_spatial_tile
+            or producer_stream is None
+            or streamed.row_chunk
+            != (producer_stream.free_tile if producer_stream is not None else 0)
+            * plan.vector_lanes
+            or (producer_stream.extent if producer_stream is not None else 0)
+            != streamed.contraction_extent
+            or (producer_stream.chunk if producer_stream is not None else 0)
+            != streamed.chunk
+            or plan.stages[streamed.sink_stage].cube_window_k != (streamed.chunk,)
+            or plan.stages[streamed.sink_stage].valid_rows != streamed.row_chunk
+            or not streamed.first_chunk_initializes
+            or not streamed.later_chunks_accumulate
+            or tuple(sorted(set(streamed.carried_tensors))) != streamed.carried_tensors
+            or set(streamed.carried_tensors) != expected_carried
+            or streamed.crossing_tensor in streamed.carried_tensors
+        ):
+            raise ScheduleContractError(f"{field}.streamed_v2c is incomplete")
 
 
 def _mixed_materialized_source_peak(

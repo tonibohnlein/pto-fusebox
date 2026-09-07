@@ -540,6 +540,27 @@ class MixedFeatureRoundTripPlan:
 
 
 @dataclass(frozen=True)
+class MixedStreamedV2CPlan:
+    """Vector APPLY chunks feeding one persistent cube accumulator."""
+
+    producer_stage: int
+    sink_stage: int
+    transfer: int
+    crossing_tensor: int
+    carried_tensors: tuple[int, ...]
+    contraction_extent: int
+    row_chunk: int
+    row_chunks: int
+    accumulator_rows: int
+    chunk: int
+    full_chunks: int
+    tail: int
+    persistent_accumulator_bytes: int
+    first_chunk_initializes: bool
+    later_chunks_accumulate: bool
+
+
+@dataclass(frozen=True)
 class MixedKernelPlan:
     """Solver-owned cross-engine topology, geometry, loop, and FIFO contract."""
 
@@ -588,6 +609,7 @@ class MixedKernelPlan:
     transfers: tuple[MixedTransferPlan, ...]
     fifos: tuple[MixedFifoPlan, ...]
     feature_round_trip: MixedFeatureRoundTripPlan | None
+    streamed_v2c: MixedStreamedV2CPlan | None
 
     @property
     def pipeline_work_items(self) -> int:

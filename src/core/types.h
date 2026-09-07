@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1264,6 +1265,33 @@ struct MixedFeatureRoundTripPlan {
   bool later_chunks_accumulate = false;
 };
 
+// A general streamed vector producer whose APPLY pass publishes disjoint K
+// chunks directly into one cube matmul.  The cube side retains one hardware
+// accumulator across those chunks and publishes/stores it only after complete
+// K coverage.  This is shared by one-way V->C and V->C->V topologies; it is
+// derived from the vector replay plan rather than from a workload recognizer.
+struct MixedStreamedV2CPlan {
+  bool present = false;
+  size_t producer_stage = std::numeric_limits<size_t>::max();
+  size_t sink_stage = std::numeric_limits<size_t>::max();
+  size_t transfer = std::numeric_limits<size_t>::max();
+  size_t crossing_tensor = std::numeric_limits<size_t>::max();
+  // Vector values produced by the producer stage and consumed again by a
+  // later vector stage. They remain resident on AIV across the intervening
+  // cube stage; they are neither FIFO payloads nor GM boundaries.
+  std::vector<size_t> carried_tensors;
+  int64_t contraction_extent = 0;
+  int64_t row_chunk = 0;
+  int64_t row_chunks = 0;
+  int64_t accumulator_rows = 0;
+  int64_t chunk = 0;
+  int64_t full_chunks = 0;
+  int64_t tail = 0;
+  int64_t persistent_accumulator_bytes = 0;
+  bool first_chunk_initializes = false;
+  bool later_chunks_accumulate = false;
+};
+
 // Solver-owned cross-engine algorithm for one fixed mixed candidate. The hot
 // path constructs only its scalar fields for costing; final/forced consumers
 // re-derive it once and attach the immutable topology, like the homogeneous
@@ -1299,6 +1327,8 @@ struct MixedSchedulePlan {
   // including the full ring reserved by every V2C crossing.
   int64_t source_l1_allocation_bytes = 0;
   VectorStreamKind vector_stage_kind = VectorStreamKind::Materialized;
+  // Source-constrained plans report the full pre-split PyPTO tensor-frame
+  // allocation. It may exceed each lane-local stage descriptor's peak.
   int64_t vector_stage_peak_ub_bytes = 0;
   MixedVectorSplit vector_split = MixedVectorSplit::None;
   int64_t vector_lanes = 1;
@@ -1307,6 +1337,7 @@ struct MixedSchedulePlan {
   std::vector<MixedFifoPlan> fifos;
   std::vector<MixedStagePlan> stages;
   MixedFeatureRoundTripPlan feature_round_trip;
+  MixedStreamedV2CPlan streamed_v2c;
   // Kept separate during migration: the first bit records what the legacy
   // scalar cost grants, while the second mirrors what the existing PyPTO
   // pipeline passes can actually construct for this exact topology/loop.
@@ -1397,6 +1428,13 @@ struct MixedGroupCostCandidate {
 struct MixedSweepFeasibility {
   bool feasible_candidate = false;
   bool capacity_evaluated = false;
+  std::string rejection_code;
+  std::string protocol;
+  int64_t topology_stages = 0;
+  int64_t transfers = 0;
+  int64_t vector_to_cube_transfers = 0;
+  int64_t cube_to_vector_transfers = 0;
+  std::map<std::string, int64_t> rejection_counts;
   TileConfig closest_config;
   int64_t required_vec_bytes = 0;
   int64_t available_vec_bytes = 0;

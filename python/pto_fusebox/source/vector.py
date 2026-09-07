@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 from ..ir import NormalizedGraph, NormalizedOp
 from ..lowered import LoweredRegion
@@ -763,14 +764,17 @@ def _emit_replay_outputs(
         )
         if owner not in allowed or owner not in values:
             continue
+        output_row, output_col = _output_store_offsets(
+            lowered, owner, row_offset, col_offset
+        )
         _emit_output_store(
             writer,
             indent,
             io,
             output_value,
             values[owner],
-            row_offset,
-            col_offset,
+            output_row,
+            output_col,
         )
         stored.add(output_value)
 
@@ -845,13 +849,17 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
     valid_cols: int,
     frame_cols: int,
     initial_values: Mapping[int, str] | None = None,
+    stream_plan: VectorKernelPlan | None = None,
+    row_scale: int = 1,
 ) -> dict[int, str]:
     """Emit one phase chunk in the solver-provided operation order."""
 
     lowered = context.lowered
-    plan = context.step.plan
+    plan = stream_plan if stream_plan is not None else context.step.plan
     if not isinstance(plan, VectorKernelPlan):
         raise SourceEmissionError("stream phase does not carry a vector plan")
+    if row_scale <= 0:
+        raise SourceEmissionError("stream phase row scale must be positive")
     graph_ops = context.graph.op_map()
     producers = _tensor_producers(lowered)
     frames = {frame.tensor: frame for frame in phase.tensor_frames}
@@ -884,14 +892,17 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
             raise SourceEmissionError(
                 f"stream phase frame for tensor {tensor_index} differs from its role"
             )
-        valid_rows = 1 if tensor.height == 1 else plan.free_tile
+        physical = frame.physical
+        valid_rows = 1 if tensor.height == 1 else plan.free_tile * row_scale
+        if tensor.height != 1 and row_scale != 1:
+            physical = (physical[0] * row_scale, physical[1])
         cols = 1 if tensor.width == 1 else valid_cols
         input_row = "0" if tensor.height == 1 else row_offset
         input_col = "0" if tensor.width == 1 else col_offset
         name = f"{prefix}_tensor_{tensor_index}"
         writer.line(
             indent,
-            f"{name} = {_static_vector_load(argument, input_row, input_col, frame.physical, (str(valid_rows), str(cols)))}",
+            f"{name} = {_static_vector_load(argument, input_row, input_col, physical, (str(valid_rows), str(cols)))}",
         )
         local[tensor_index] = name
         return name
@@ -904,6 +915,13 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
             )
         operands = [ensure_loaded(tensor) for tensor in operation.inputs]
         output = operation.outputs[0]
+        workspace = workspaces.get(solver_op)
+        if workspace is not None and row_scale != 1:
+            workspace = replace(
+                workspace,
+                logical=(workspace.logical[0] * row_scale, workspace.logical[1]),
+                physical=(workspace.physical[0] * row_scale, workspace.physical[1]),
+            )
         expression = _vector_expression(
             writer,
             indent,
@@ -912,10 +930,10 @@ def _emit_reduction_phase_chunk(  # noqa: PLR0913
             list(operation.inputs),
             output,
             lowered,
-            plan.free_tile,
+            plan.free_tile * row_scale,
             frame_cols,
             solver_op,
-            workspaces.get(solver_op),
+            workspace,
         )
         name = f"{prefix}_tensor_{output}"
         writer.line(indent, f"{name} = {expression}")
@@ -952,6 +970,21 @@ def _emit_output_store(
     )
 
 
+def _output_store_offsets(
+    lowered: LoweredRegion,
+    owner: int,
+    row_offset: str,
+    col_offset: str,
+) -> tuple[str, str]:
+    """Project streamed coordinates onto the output tensor's logical axes."""
+
+    tensor = lowered.tensor(owner)
+    return (
+        "0" if tensor.height == 1 else row_offset,
+        "0" if tensor.width == 1 else col_offset,
+    )
+
+
 def _emit_streamed_outputs(
     writer: SourceWriter,
     indent: int,
@@ -973,14 +1006,17 @@ def _emit_streamed_outputs(
         tile = local.get(owner)
         if tile is None:
             continue
+        output_row, output_col = _output_store_offsets(
+            lowered, owner, row_offset, col_offset
+        )
         _emit_output_store(
             writer,
             indent,
             io,
             output_value,
             tile,
-            row_offset,
-            col_offset,
+            output_row,
+            output_col,
         )
         # A streamed output is written on every chunk; the set records that its
         # production contract was found, not that only one store is emitted.

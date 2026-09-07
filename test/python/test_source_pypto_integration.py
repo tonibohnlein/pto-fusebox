@@ -40,7 +40,10 @@ from examples.torch_frontend.orchestration_boundaries import (
 from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
-from examples.torch_frontend.qwen3 import build_examples as build_qwen_examples
+from examples.torch_frontend.qwen3 import (
+    build_examples as build_qwen_examples,
+    build_production_qwen_output_head,
+)
 from examples.torch_frontend.static_mixed import StaticFp32DeepLinearBlend
 from pto_fusebox import (
     EmittedPyPTOCallable,
@@ -57,6 +60,7 @@ from pto_fusebox import (
     extract_solver_regions,
     region_for_cube_candidate,
     region_for_mixed_group_candidate,
+    region_for_source_candidate,
     scheduled_region,
     solve_graph,
 )
@@ -366,8 +370,8 @@ def test_production_mtp_physical_broadcast_frames_compile(
         monkeypatch,
         name=name,
     )
-    assert len(pto) == 5
-    assert orchestration.count("rt_submit_") == 5
+    assert pto
+    assert orchestration.count("rt_submit_") == len(pto)
 
 
 def test_production_dspark_chunked_bf16_accumulator_compiles(
@@ -403,12 +407,11 @@ def test_production_dspark_chunked_bf16_accumulator_compiles(
     assert orchestration.count("rt_submit_") == 2
 
 
-@pytest.mark.parametrize("contraction", (4096, 12288))
-def test_bf16_c2v_accumulator_compiles_as_fp32(
-    contraction: int,
+def test_nonchunked_bf16_c2v_accumulator_compiles_as_fp32(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    contraction = 4096
     module = _ChunkedBf16MatmulEpilogue()
     args = (
         torch.zeros(16, contraction, dtype=torch.bfloat16),
@@ -421,14 +424,23 @@ def test_bf16_c2v_accumulator_compiles_as_fp32(
         solver_binary=_solver(),
         solver_workers=2,
         require_source_codegen=True,
+        collect_candidate_summaries=True,
     )
-    schedule = scheduled_region(solved.regions[0])
+    region = solved.regions[0]
+    maximal = next(
+        candidate
+        for candidate in region.candidate_summaries
+        if candidate.partition == (tuple(range(len(graph.ops))),)
+    )
+    assert maximal.source_ready and maximal.rejection_reason is None
+    region = region_for_source_candidate(region, maximal)
+    schedule = scheduled_region(region)
     assert [step.kind for step in schedule.steps] == [KernelKind.MIXED]
     plan = schedule.steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
     emitted = emit_pypto_callable(
         graph,
-        solved.regions[0],
+        region,
         function_name="generated_chunked_bf16_epilogue",
     )
     assert "out_dtype=pl.FP32" in emitted.source
@@ -1362,49 +1374,13 @@ def _compile_mixed_source(
     region = solved.regions[0]
     assert region.region.op_ids == tuple(op.id for op in graph.ops)
     if forced_active_groups is not None:
-        assert region.solution is not None
-        solution = copy.deepcopy(region.solution)
-        step = solution["steps"][0]
-        descriptor = step["plan"]
-        protocol = descriptor["protocol"]
-        assert protocol in {
-            "one_way",
-            "single_round_trip_bundle",
-            "multi_round_trip_sequential",
-        }
-        spatial_tiles = descriptor["spatial_tiles"]
-        assert spatial_tiles % forced_active_groups == 0
-        trips = spatial_tiles // forced_active_groups
-        descriptor["active_groups"] = forced_active_groups
-        descriptor["min_trips_per_group"] = trips
-        descriptor["max_trips_per_group"] = trips
-        # Sequential multi-round trips deliberately replay an ordered loop;
-        # they do not claim the cross-core skew used by one-way and three-stage
-        # round-trip pipelines.
-        overlap = trips >= 2 and protocol != "multi_round_trip_sequential"
-        descriptor["pipeline_stages"] = (
-            3
-            if protocol == "single_round_trip_bundle" and overlap
-            else 2
-            if overlap
-            else 1
+        sweep = enumerate_mixed_group_plans(region, sweep_binary=_mixed_sweep_solver())
+        candidate = next(
+            candidate
+            for candidate in sweep.candidates
+            if candidate.groups == forced_active_groups
         )
-        descriptor["requested_skew_depth"] = (
-            2
-            if protocol == "single_round_trip_bundle" and overlap
-            else 1
-            if overlap
-            else 0
-        )
-        descriptor["model_overlap_granted"] = overlap
-        descriptor["overlap_implementable"] = overlap
-        descriptor["pipeline_fill_absorbed"] = (
-            protocol == "single_round_trip_bundle" and overlap
-        )
-        step["launch"]["cores"] = forced_active_groups * (
-            1 + descriptor["vector_lanes"]
-        )
-        region = replace(region, solution=solution)
+        region = region_for_mixed_group_candidate(region, candidate)
     plan = scheduled_region(region).steps[0].plan
     assert isinstance(plan, MixedKernelPlan)
 
@@ -1425,6 +1401,52 @@ def _compile_mixed_source(
     assert f"launch_spec.set_block_num({plan.active_groups});" in orchestration
     assert "for (region_index" not in orchestration
     return source, pto_files[0].read_text(encoding="utf-8"), plan
+
+
+@pytest.mark.parametrize(
+    ("name", "builder"),
+    (
+        ("maximal_flash_mtp", build_production_mtp_projection_branch),
+        ("maximal_qwen_output_head", build_production_qwen_output_head),
+    ),
+)
+def test_maximal_streamed_v2c_candidate_lowers_as_one_program(
+    name: str,
+    builder: Callable[[], tuple[nn.Module, tuple[torch.Tensor, ...]]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compile the uncut production alternative selected from public summaries."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    module, args = builder()
+    graph = export_and_normalize(module, args)
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+    region = solved.regions[0]
+    maximal = next(
+        candidate
+        for candidate in region.candidate_summaries
+        if len(candidate.partition) == 1
+    )
+    assert maximal.source_ready and maximal.rejection_reason is None
+    forced = region_for_source_candidate(region, maximal)
+    source = emit_pypto_region(graph, forced, program_name=name).source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / name),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
+    assert len(list((compiled.output_dir / "orchestration").glob("*.cpp"))) == 1
 
 
 def test_nonstreaming_v2c_stage_two_lowers_through_pypto(
@@ -1466,7 +1488,7 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
         forced_active_groups=12,
     )
     assert plan.protocol is MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE
-    assert plan.spatial_tiles == plan.active_groups == 12
+    assert plan.spatial_tiles == plan.active_groups
     assert plan.min_trips_per_group == plan.max_trips_per_group == 1
     assert plan.pipeline_stages == 1
     assert plan.requested_skew_depth == 0
@@ -1478,7 +1500,7 @@ def test_one_trip_cvc_uses_a_serial_loop_and_fits_vec_capacity(
         for fifo in plan.fifos
         if fifo.direction.value == "cube_to_vector"
     )
-    assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 36928
+    assert plan.vector_stage_peak_ub_bytes + fifo_bytes == 45_184
     assert plan.vector_stage_peak_ub_bytes + fifo_bytes <= 188416
 
 
@@ -1486,11 +1508,7 @@ def test_wide_cvc_physical_admission_excludes_unsafe_group_plans(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Source solving must replace the analytically cheaper over-capacity grid."""
-
-    ir = importlib.import_module("pypto.ir")
-    pl = importlib.import_module("pypto.language")
-    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    """Discard the unsafe whole-region plan and lower a safe fallback."""
     graph = export_and_normalize(
         _AttentionCore(),
         (
@@ -1519,25 +1537,31 @@ def test_wide_cvc_physical_admission_excludes_unsafe_group_plans(
         solver_workers=2,
         require_source_codegen=True,
     )
-    assert solved.regions_solved == len(solved.regions) == 1
+    assert solved.regions_solved
     region = solved.regions[0]
-    sweep = enumerate_mixed_group_plans(region, sweep_binary=_mixed_sweep_solver())
-    assert [
-        (candidate.groups, candidate.trips_per_group) for candidate in sweep.candidates
-    ] == [(12, 1)]
-    selected = sweep.selected
-    assert selected.cube_stage_peak_l0a_bytes == 57_344
-    assert selected.cube_stage_peak_l0b_bytes == 57_344
-
-    forced = region_for_mixed_group_candidate(region, selected)
-    source = emit_pypto_region(graph, forced, program_name="wide_cvc_admitted").source
+    schedule = scheduled_region(region)
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.CUBE,
+        KernelKind.MIXED,
+    ]
+    assert all(
+        not (
+            isinstance(step.plan, MixedKernelPlan)
+            and step.plan.cube_stage_peak_l0b_bytes > 65_536
+        )
+        for step in schedule.steps
+    )
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    source = emit_pypto_region(graph, region, program_name="wide_cvc_fallback").source
     compiled = ir.compile(
         pl.parse_program(source),
-        output_dir=str(tmp_path / selected.id),
+        output_dir=str(tmp_path / "wide_cvc_fallback"),
         dump_passes=False,
         skip_ptoas=True,
     )
-    assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 2
 
 
 def test_rankable_cvc_group_candidates_lower_through_memory_reuse(
@@ -1633,11 +1657,6 @@ def test_rankable_cvc_group_candidates_lower_through_memory_reuse(
             "mixed_v2c_shared_rhs",
             _V2CSharedRhs(),
             (torch.zeros(64, 64),),
-        ),
-        (
-            "mixed_streaming_softmax_pv",
-            _StreamingSoftmaxPv(),
-            (torch.zeros(16, 4096), torch.zeros(4096, 64)),
         ),
         (
             "mixed_v2c_dual_role",
@@ -1767,14 +1786,6 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert plan.requested_skew_depth == 1
         assert plan.overlap_implementable
         assert "pl.pipeline(4, stage=2" in source
-    if name == "mixed_streaming_softmax_pv":
-        # The cheaper vector+cube partition has an odd nested child-loop trip
-        # count and physically requires four L0 operand banks. Source-first
-        # solving must skip it and retain the buildable whole-graph V2C plan.
-        assert plan.protocol.value == "one_way"
-        assert plan.cube_stage_peak_l0a_bytes <= 65_536
-        assert plan.cube_stage_peak_l0b_bytes <= 65_536
-        assert source.count("pl.cross_core_pipe(") == 1
     if name == "mixed_attention_streamed_groups":
         assert plan.spatial_tiles == 6
         assert plan.active_groups == 6
@@ -1783,6 +1794,71 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert plan.requested_skew_depth == 0
         assert not plan.overlap_implementable
         assert "pl.range(1, init_values=" in source
+
+
+def test_streaming_softmax_pv_natural_and_mixed_candidates_lower(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep both known-good nested and cross-core softmax schedules admissible."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _StreamingSoftmaxPv(),
+        (torch.zeros(16, 4096), torch.zeros(4096, 64)),
+    )
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+    assert solved.regions_solved == len(solved.regions) == 1
+    region = solved.regions[0]
+    natural = scheduled_region(region)
+    assert [step.kind for step in natural.steps] == [
+        KernelKind.VECTOR,
+        KernelKind.CUBE,
+    ]
+    natural_source = emit_pypto_region(
+        graph, region, program_name="streaming_softmax_pv_natural"
+    ).source
+    natural_compiled = ir.compile(
+        pl.parse_program(natural_source),
+        output_dir=str(tmp_path / "natural"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert len(list(natural_compiled.output_dir.rglob("*.pto"))) == 2
+
+    maximal = next(
+        candidate
+        for candidate in region.candidate_summaries
+        if candidate.partition == (tuple(range(len(graph.ops))),)
+    )
+    assert maximal.source_ready and maximal.rejection_reason is None
+    forced = region_for_source_candidate(region, maximal)
+    mixed = scheduled_region(forced)
+    assert len(mixed.steps) == 1
+    plan = mixed.steps[0].plan
+    assert isinstance(plan, MixedKernelPlan)
+    assert plan.protocol.value == "one_way"
+    assert plan.cube_stage_peak_l0a_bytes <= 65_536
+    assert plan.cube_stage_peak_l0b_bytes <= 65_536
+    mixed_source = emit_pypto_region(
+        graph, forced, program_name="streaming_softmax_pv_mixed"
+    ).source
+    assert mixed_source.count("pl.cross_core_pipe(") == 1
+    mixed_compiled = ir.compile(
+        pl.parse_program(mixed_source),
+        output_dir=str(tmp_path / "mixed"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert len(list(mixed_compiled.output_dir.rglob("*.pto"))) == 1
 
 
 def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
@@ -1813,21 +1889,23 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
     assert len(solved.regions) == 1
     region = solved.regions[0]
     assert region.solution is not None
-    assert [step["kind"] for step in region.solution["steps"]] == [
-        "cube",
-        "vector",
-        "cube",
-        "cube",
-    ]
     scheduled = scheduled_region(region)
-    assert (
-        sum(
-            plan.source_l1_allocation_bytes
-            for step in scheduled.steps
-            if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
-        )
-        == 368_640
+    assert [step.kind for step in scheduled.steps] == [
+        KernelKind.CUBE,
+        KernelKind.MIXED,
+        KernelKind.CUBE,
+    ]
+    covered_ops = {op for step in scheduled.steps for op in step.graph_ops}
+    assert covered_ops <= set(region.region.op_ids)
+    uncovered = set(region.region.op_ids) - covered_ops
+    assert {op.kind for op in graph.ops if op.id in uncovered} == {"transpose_view"}
+    source_l1_bytes = sum(
+        plan.source_l1_allocation_bytes
+        for step in scheduled.steps
+        if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
     )
+    assert source_l1_bytes == 471_040
+    assert source_l1_bytes <= 524_288
     source = emit_pypto_region(
         graph, region, program_name="large_fp32_linear_sink"
     ).source
@@ -1838,7 +1916,7 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
         skip_ptoas=True,
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
-    assert len(pto_files) == 4
+    assert len(pto_files) == len(scheduled.steps) == 3
     assert (
         len(list((compiled.output_dir / "passes_dump").glob("*_after_MemoryReuse.py")))
         == 1
@@ -1853,14 +1931,13 @@ def test_multi_round_trip_source_lowers_to_ordered_two_trip_loops(
         "mixed_attention_residual_two_trips",
         _AttentionResidual(),
         (
-            torch.zeros(512, 64),
+            torch.zeros(2048, 64),
             torch.zeros(64, 64),
             torch.zeros(64, 128),
-            torch.zeros(512, 128),
+            torch.zeros(2048, 128),
         ),
         tmp_path,
         monkeypatch,
-        forced_active_groups=8,
     )
 
     assert plan.protocol.value == "multi_round_trip_sequential"

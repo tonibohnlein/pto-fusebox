@@ -894,6 +894,17 @@ MixedL0OperandFootprint MixedMatmulL0OperandFootprint(
   return result;
 }
 
+bool MixedMatmulNeedsSpatialL0Tiling(const Problem* p, int64_t m, int64_t n,
+                                     int64_t k, DType lhs_dtype,
+                                     DType rhs_dtype) {
+  if (m <= 0 || n <= 0 || k <= 0) return false;
+  const L0MatmulPlan child = DeriveL0MatmulPlan(
+      p, m, n, k, lhs_dtype, rhs_dtype,
+      cube_accumulator_dtype(lhs_dtype), /*accumulator_read=*/false,
+      L0OutputTarget::Acc, nullptr);
+  return child.feasible && (child.m < m || child.n < n);
+}
+
 MixedL0OperandFootprint MixedStagesL0OperandFootprint(
     const Problem* p, const std::vector<MixedStagePlan>& stages,
     int outer_pipeline_depth) {
@@ -1926,15 +1937,35 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     for (auto s : sink_ops)
       sg.is_sink_op_vec_[s] = true;
     // sink_ops is non-empty: structure.valid() ⇒ ≥1 boundary output ⇒ ≥1 sink.
+    // A vector replay may publish one full data tile and one or more reduced
+    // states that a later phase consumes (for example [M,N] plus [M,1]). The
+    // largest live-out defines the physical grid; broadcast-compatible
+    // auxiliary live-outs follow that grid on their non-unit axes. Cube sinks
+    // retain the stricter equal-output contract.
+    std::stable_sort(sink_ops.begin(), sink_ops.end(), [&](size_t lhs, size_t rhs) {
+      const Tensor& lhs_out = prob.tensors[prob.ops[lhs].output()];
+      const Tensor& rhs_out = prob.tensors[prob.ops[rhs].output()];
+      const int64_t lhs_area = lhs_out.height * lhs_out.width;
+      const int64_t rhs_area = rhs_out.height * rhs_out.width;
+      return lhs_area != rhs_area ? lhs_area > rhs_area : lhs < rhs;
+    });
     size_t first_sink_out = prob.ops[sink_ops[0]].output();
     sg.out_W_ = prob.tensors[first_sink_out].width;
     sg.out_H_ = prob.tensors[first_sink_out].height;
-    
+
     for (size_t si = 1; si < sink_ops.size(); si++) {
       size_t out = prob.ops[sink_ops[si]].output();
-      if (prob.tensors[out].width != sg.out_W_ ||
-          prob.tensors[out].height != sg.out_H_)
+      const Tensor& tensor = prob.tensors[out];
+      const bool both_vector =
+          prob.ops[sink_ops[0]].type != OpType::MatMul &&
+          prob.ops[sink_ops[si]].type != OpType::MatMul;
+      const bool broadcast_compatible =
+          (tensor.width == sg.out_W_ || tensor.width == 1) &&
+          (tensor.height == sg.out_H_ || tensor.height == 1);
+      if ((!both_vector || !broadcast_compatible) &&
+          (tensor.width != sg.out_W_ || tensor.height != sg.out_H_)) {
         return std::nullopt;
+      }
       if (prob.ops[sink_ops[si]].type == OpType::MatMul &&
           prob.ops[sink_ops[0]].type == OpType::MatMul) {
         if (prob.tensors[prob.ops[sink_ops[si]].inputs[0]].width !=
@@ -2139,8 +2170,14 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     for (auto i : sg.ops_) {
       if (!sg.is_sink_op_vec_[i]) continue;
       { size_t t = prob.ops[i].output();
-        tsrc[t] = {TS::FROM_NTW, TS::FROM_NTH, true};
-        push_role(t, TS::FROM_NTW, TS::FROM_NTH); }
+        const TS h_source = prob.tensors[t].width == 1 && sg.out_W_ > 1
+                                ? TS::FIXED_1
+                                : TS::FROM_NTW;
+        const TS v_source = prob.tensors[t].height == 1 && sg.out_H_ > 1
+                                ? TS::FIXED_1
+                                : TS::FROM_NTH;
+        tsrc[t] = {h_source, v_source, true};
+        push_role(t, h_source, v_source); }
     }
 
     auto merge_source = [](TS existing, TS incoming) -> TS {
@@ -2386,8 +2423,18 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         matmul_910b &&
         ((cube_op_count > 1 && prob.require_uniform_cube_dag_grid) ||
          (sg.has_matmul_ && sg.has_vector_ && prob.require_buildable_mixed));
-    std::set<int64_t> region_counts;  // balanced P*Q: divisors of {C, 2C} (incl. 1)
-    for (int64_t R : {C, 2 * C})
+    // Include several complete scheduling waves. Very wide projections can
+    // require a smaller physical N panel for L1/L0 admission even though only
+    // C groups execute concurrently; the excess regions become ordinary
+    // trips per group. Restricting the grid to {C,2C} made those valid source
+    // schedules undiscoverable and forced premature GM cuts.
+    std::vector<int64_t> region_wave_counts{C, 2 * C};
+    if (sg.has_matmul_ && sg.has_vector_ && prob.require_source_codegen) {
+      region_wave_counts = {C,       2 * C,  4 * C,  8 * C,  16 * C,
+                            32 * C,  40 * C, 48 * C, 64 * C};
+    }
+    std::set<int64_t> region_counts;
+    for (int64_t R : region_wave_counts)
       for (int64_t d = 1; d * d <= R; ++d)
         if (R % d == 0) {
           region_counts.insert(d);
@@ -2433,9 +2480,46 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
     // output. In a compiler-supported C->V->C round trip the vector reduction
     // belongs to an intermediate [M,S] request while the common sink grid is
     // [M,N]; S remains whole inside each item, but N may still be partitioned.
+    bool leading_vector_reduction_to_cube = false;
+    for (size_t op_idx : sg.ops_) {
+      const Op& op = prob.ops[op_idx];
+      if (op.type != OpType::MatMul || op.inputs.empty()) continue;
+      const int lhs_producer = dag.tensor_producer[op.inputs.front()];
+      if (lhs_producer < 0 ||
+          !is_in_sg[static_cast<size_t>(lhs_producer)] ||
+          prob.ops[static_cast<size_t>(lhs_producer)].type == OpType::MatMul) {
+        continue;
+      }
+      bool has_reduction = false;
+      bool has_cube_ancestor = false;
+      std::vector<size_t> pending{static_cast<size_t>(lhs_producer)};
+      std::vector<bool> seen(num_ops, false);
+      while (!pending.empty()) {
+        const size_t ancestor = pending.back();
+        pending.pop_back();
+        if (seen[ancestor]) continue;
+        seen[ancestor] = true;
+        if (prob.ops[ancestor].type == OpType::MatMul) {
+          has_cube_ancestor = true;
+          continue;
+        }
+        has_reduction =
+            has_reduction || prob.ops[ancestor].type == OpType::Reduction;
+        for (size_t input : prob.ops[ancestor].inputs) {
+          const int producer = dag.tensor_producer[input];
+          if (producer >= 0 && is_in_sg[static_cast<size_t>(producer)])
+            pending.push_back(static_cast<size_t>(producer));
+        }
+      }
+      if (has_reduction && !has_cube_ancestor) {
+        leading_vector_reduction_to_cube = true;
+        break;
+      }
+    }
     const bool internal_round_trip_reduction =
         sg.has_matmul_ && sg.has_vector_ && sg.has_reduction_ &&
-        sg.sink_mm_op_ >= 0 && !sg.has_pw_sink_;
+        ((sg.sink_mm_op_ >= 0 && !sg.has_pw_sink_) ||
+         leading_vector_reduction_to_cube);
     const int64_t pm =
         (!internal_round_trip_reduction && sg.reduced_axis_ == 2) ? 1 : Fm;
     const int64_t pn =
@@ -3027,17 +3111,42 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   }
 
   // Build the mixed stage DAG once. Same-engine dependency edges form maximal
-  // components; unlike-engine edges become explicit GM transfers. Every
+  // components at one engine-alternation depth; unlike-engine edges become
+  // explicit transfers.  The depth qualifier is load-bearing for a bypass
+  // carried around an opposite-engine stage:
+  //
+  //   vector producer --+--> cube --> vector consumer
+  //                     +------------^
+  //
+  // Merging the bypass edge would collapse the two vector phases into one
+  // component and make the V->C->V protocol unrepresentable.  Assigning each
+  // op its maximum engine-transition depth first keeps ordinary connected
+  // same-engine DAGs together while separating the post-reply phase. Every
   // candidate MixedSchedulePlan shares this immutable topology instead of
   // allocating and rescanning the op DAG in the local-search hot path.
   if (sg.has_matmul_ && sg.has_vector_) {
     auto topology = std::make_shared<MixedScheduleTopology>();
     std::vector<size_t> parent(num_ops, std::numeric_limits<size_t>::max());
+    std::vector<int> alternation_depth(num_ops, 0);
     for (size_t op : sg.ops_) parent[op] = op;
     auto root = [&](size_t op) {
       while (parent[op] != op) op = parent[op];
       return op;
     };
+    for (size_t consumer : dag.topological_order()) {
+      if (!is_in_sg[consumer]) continue;
+      const bool consumer_cube = prob.ops[consumer].type == OpType::MatMul;
+      for (size_t tensor : prob.ops[consumer].inputs) {
+        const int producer = dag.tensor_producer[tensor];
+        if (producer < 0 || !is_in_sg[static_cast<size_t>(producer)]) continue;
+        const size_t producer_op = static_cast<size_t>(producer);
+        const bool producer_cube = prob.ops[producer_op].type == OpType::MatMul;
+        alternation_depth[consumer] = std::max(
+            alternation_depth[consumer],
+            alternation_depth[producer_op] +
+                static_cast<int>(producer_cube != consumer_cube));
+      }
+    }
     for (size_t consumer : sg.ops_) {
       const bool consumer_cube = prob.ops[consumer].type == OpType::MatMul;
       for (size_t tensor : prob.ops[consumer].inputs) {
@@ -3045,7 +3154,10 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         if (producer < 0 || !is_in_sg[static_cast<size_t>(producer)]) continue;
         const size_t producer_op = static_cast<size_t>(producer);
         const bool producer_cube = prob.ops[producer_op].type == OpType::MatMul;
-        if (producer_cube != consumer_cube) continue;
+        if (producer_cube != consumer_cube ||
+            alternation_depth[producer_op] != alternation_depth[consumer]) {
+          continue;
+        }
         const size_t producer_root = root(producer_op);
         const size_t consumer_root = root(consumer);
         if (producer_root != consumer_root) parent[consumer_root] = producer_root;
@@ -3078,6 +3190,14 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
         const size_t producer_stage = op_to_stage[producer_op];
         const size_t consumer_stage = op_to_stage[consumer];
         if (producer_stage == consumer_stage) continue;
+        // A same-engine value may intentionally bypass an intervening
+        // opposite-engine phase. It remains a local carried value in that
+        // engine's generated function; only cross-engine edges consume a
+        // physical FIFO descriptor.
+        if (topology->stages[producer_stage].engine ==
+            topology->stages[consumer_stage].engine) {
+          continue;
+        }
         const auto key = std::make_tuple(tensor, producer_stage, consumer_stage);
         if (!seen_transfers.insert(key).second) continue;
         topology->transfers.push_back(
@@ -3553,6 +3673,140 @@ VectorStreamPlan Ascend910BCost::vector_to_cube_stream_plan(
   lane_cfg.h /= std::max<int64_t>(1, vector_lanes);
   if (lane_cfg.h <= 0) return plan;
   return stage_cost->vector_stream_plan(lane_cfg);
+}
+
+std::optional<size_t> Ascend910BCost::streamed_vector_to_cube_transfer(
+    std::string* rejection_code) const {
+  auto fail = [&](const char* code) -> std::optional<size_t> {
+    if (rejection_code != nullptr) *rejection_code = code;
+    return std::nullopt;
+  };
+  if (!mixed_topology_)
+    return fail("mixed_streamed_v2c_topology_missing");
+  std::optional<size_t> selected;
+  for (size_t index = 0; index < mixed_topology_->transfers.size(); ++index) {
+    const MixedTransferTopology& transfer = mixed_topology_->transfers[index];
+    if (transfer.producer_engine != MixedEngine::Vector ||
+        transfer.consumer_engine != MixedEngine::Cube) {
+      continue;
+    }
+    if (selected.has_value())
+      return fail("mixed_streamed_v2c_multiple_transfers");
+    if (transfer.producer_stage >= mixed_topology_->stages.size() ||
+        transfer.consumer_stage >= mixed_topology_->stages.size())
+      return fail("mixed_streamed_v2c_stage_out_of_range");
+    const MixedStageTopology& producer =
+        mixed_topology_->stages[transfer.producer_stage];
+    const MixedStageTopology& sink =
+        mixed_topology_->stages[transfer.consumer_stage];
+    // The current generic replay renderer owns a leading vector producer,
+    // its cube sink, and an optional vector epilogue. A V2C edge reached only
+    // after an earlier cube stage is an ordinary CVC round trip and must keep
+    // using the cross-core skew path; treating it as a leading replay would
+    // silently omit that upstream cube stage from the emitted source.
+    if (transfer.producer_stage != 0 || transfer.consumer_stage != 1 ||
+        producer.engine != MixedEngine::Vector || sink.engine != MixedEngine::Cube)
+      return fail("mixed_streamed_v2c_not_leading_producer");
+    if (producer.ops.empty())
+      return fail("mixed_streamed_v2c_producer_empty");
+    if (sink.ops.size() != 1)
+      return fail("mixed_streamed_v2c_sink_not_single_matmul");
+    const Op& matmul = prob_->ops[sink.ops.front()];
+    if (matmul.type != OpType::MatMul)
+      return fail("mixed_streamed_v2c_sink_not_matmul");
+    if (matmul.inputs.size() != 2)
+      return fail("mixed_streamed_v2c_sink_arity");
+    if (matmul.inputs.front() != transfer.tensor)
+      return fail("mixed_streamed_v2c_not_sink_lhs");
+    if (matmul.inputs.back() == transfer.tensor)
+      return fail("mixed_streamed_v2c_dual_role_sink");
+    selected = index;
+  }
+  if (!selected.has_value())
+    return fail("mixed_streamed_v2c_transfer_missing");
+  if (rejection_code != nullptr) rejection_code->clear();
+  return selected;
+}
+
+VectorStreamPlan Ascend910BCost::streamed_vector_to_cube_plan(
+    const TileConfig& sink_cfg, int64_t vector_lanes,
+    std::string* rejection_code) const {
+  auto fail = [&](const char* code) {
+    if (rejection_code != nullptr) *rejection_code = code;
+    return VectorStreamPlan{};
+  };
+  const std::optional<size_t> transfer_index =
+      streamed_vector_to_cube_transfer(rejection_code);
+  if (!transfer_index.has_value())
+    return fail("mixed_streamed_v2c_transfer_unrepresentable");
+  const MixedTransferTopology& transfer =
+      mixed_topology_->transfers[*transfer_index];
+  const MixedStageTopology& producer =
+      mixed_topology_->stages[transfer.producer_stage];
+  auto stage_cost = Ascend910BCost::create(
+      *prob_, *dag_, producer.ops, /*allow_mixed=*/false);
+  if (!stage_cost)
+    return fail("mixed_streamed_v2c_producer_unrepresentable");
+  const auto [spatial_m, spatial_n] =
+      MixedTransferSpatialAxes(*prob_, *mixed_topology_, transfer);
+  const auto [rows, cols] = MixedTensorRegion(
+      prob_->tensors[transfer.tensor],
+      partition_axis(out_H_, std::max<int64_t>(1, sink_cfg.parts_m),
+                     grid_gran_h_),
+      partition_axis(out_W_, std::max<int64_t>(1, sink_cfg.parts_n),
+                     grid_gran_w_),
+      spatial_m, spatial_n);
+  if (rows % std::max<int64_t>(1, vector_lanes) != 0)
+    return fail("mixed_streamed_v2c_rows_unrepresentable");
+  const int64_t lanes = std::max<int64_t>(1, vector_lanes);
+  const int64_t fifo_slots =
+      mixed_topology_->transfers.size() == 1 ? 8 : 4;
+  const int64_t wire_bytes =
+      dtype_bytes(prob_->tensors[transfer.tensor].dtype);
+  VectorStreamPlan plan;
+  for (int64_t lane_rows = rows / lanes; lane_rows >= 1; --lane_rows) {
+    const int64_t row_chunk = lane_rows * lanes;
+    if (rows % row_chunk != 0) continue;
+    const int64_t fifo_reserved_per_column =
+        row_chunk * wire_bytes * fifo_slots;
+    TileConfig lane_cfg{cols, lane_rows, cols, 0, 0, 1};
+    VectorStreamPlan trial = stage_cost->vector_stream_plan(
+        lane_cfg, {}, {}, fifo_reserved_per_column);
+    if (!trial.feasible || trial.free_tile != lane_rows ||
+        trial.extent != cols || trial.chunk <= 0 ||
+        trial.full_chunks <= 0 ||
+        trial.full_chunks * trial.chunk + trial.tail != trial.extent) {
+      continue;
+    }
+    plan = std::move(trial);
+    break;
+  }
+  if (!plan.feasible)
+    return fail("mixed_streamed_v2c_no_feasible_vector_chunk");
+  const size_t crossing = transfer.tensor;
+  bool publishes_crossing = false;
+  if (plan.kind == VectorStreamKind::ReductionSpanning ||
+      plan.kind == VectorStreamKind::SoftmaxFlash) {
+    if (!plan.input_lifetimes)
+      return fail("mixed_streamed_v2c_missing_input_lifetimes");
+    const auto& apply_ops = plan.input_lifetimes->ops[
+        vector_replay_phase_index(VectorReplayPhase::Apply)];
+    publishes_crossing = dag_->tensor_producer[crossing] >= 0 &&
+        std::find(apply_ops.begin(), apply_ops.end(),
+                  static_cast<size_t>(dag_->tensor_producer[crossing])) !=
+            apply_ops.end();
+  } else if (plan.kind == VectorStreamKind::MultiPass &&
+             plan.replay_topology && !plan.replay_topology->passes.empty()) {
+    const VectorReplayPassTopology& final = plan.replay_topology->passes.back();
+    publishes_crossing =
+        final.kind == VectorReplayPassKind::Apply &&
+        std::find(final.output_tensors.begin(), final.output_tensors.end(),
+                  crossing) != final.output_tensors.end();
+  }
+  if (!publishes_crossing)
+    return fail("mixed_streamed_v2c_crossing_not_published");
+  if (rejection_code != nullptr) rejection_code->clear();
+  return plan;
 }
 
 bool Ascend910BCost::has_unrepresentable_vector_to_cube_multi_role() const {
@@ -5219,7 +5473,8 @@ double Ascend910BCost::vector_plan_compute_cycles(
 // O(|ops|+|edges|) pebbling sweep.
 VectorStreamPlan Ascend910BCost::vector_stream_plan(
     const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
-    const FlatSet<size_t> &retain_these) const {
+    const FlatSet<size_t> &retain_these,
+    int64_t stream_reserved_bytes_per_column) const {
   VectorStreamPlan plan;
   plan.coordinate_transform = prob_->vector_coordinate_transform;
   // The cost below charges every work unit at the maximum region/strip shape.
@@ -5236,6 +5491,11 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   plan.input_lifetimes = vector_input_lifetime_topology_;
   if (!plan.input_lifetimes) return plan;
   const int64_t budget = (int64_t)prob_->vec_capacity;
+  if (stream_reserved_bytes_per_column < 0) return plan;
+  auto stream_fits_budget = [&](int64_t peak, int64_t chunk) {
+    return budget <= 0 ||
+           peak + stream_reserved_bytes_per_column * chunk <= budget;
+  };
   const int64_t output_dtb = boundary_outputs_.empty()
                                  ? vector_min_dtype_bytes_
                                  : dtype_bytes(prob_->tensors[*boundary_outputs_.begin()].dtype);
@@ -5333,7 +5593,9 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
   plan.workspace_free_peak_ub_bytes = vector_peak_ub(
       logical_cfg, retained_from_prev, retain_these, INT64_MAX,
       /*stream_axis=*/0, /*include_reduction_workspaces=*/false);
-  const bool materializes = budget <= 0 || plan.full_peak_ub_bytes <= budget;
+  const bool materializes =
+      stream_reserved_bytes_per_column == 0 &&
+      (budget <= 0 || plan.full_peak_ub_bytes <= budget);
 
   const auto all_phase_lifetimes = plan.input_lifetimes;
   auto body_only_lifetimes = [&]() {
@@ -5694,7 +5956,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       trial.chunk_peak_ub_bytes =
           source_peak + 2 * carried_state_bytes +
           (rolled_stages == 2 ? next_iteration_inputs : 0);
-      if (budget > 0 && trial.chunk_peak_ub_bytes > budget) continue;
+      if (!stream_fits_budget(trial.chunk_peak_ub_bytes, trial.chunk)) continue;
       trial.stream_band_count =
           static_cast<int64_t>(ops_.size()) +
           2 * static_cast<int64_t>(reduction_count_) +
@@ -5823,7 +6085,7 @@ VectorStreamPlan Ascend910BCost::vector_stream_plan(
       trial.chunk_peak_ub_bytes =
           std::max(trial.chunk_peak_ub_bytes, stats_peak);
     }
-    if (budget > 0 && trial.chunk_peak_ub_bytes > budget)
+    if (!stream_fits_budget(trial.chunk_peak_ub_bytes, trial.chunk))
       continue;
 
     trial.stream_band_count =
@@ -6147,7 +6409,43 @@ bool Ascend910BCost::mixed_fits_on_chip(
     diagnostic->available_l1_bytes = prob_->l1_capacity;
     diagnostic->available_l0a_bytes = prob_->l0_matmul_config.l0a_bytes;
     diagnostic->available_l0b_bytes = prob_->l0_matmul_config.l0b_bytes;
+    if (mixed_topology_ != nullptr) {
+      diagnostic->topology_stages =
+          static_cast<int64_t>(mixed_topology_->stages.size());
+      diagnostic->transfers =
+          static_cast<int64_t>(mixed_topology_->transfers.size());
+      for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
+        if (transfer.producer_engine == MixedEngine::Vector) {
+          ++diagnostic->vector_to_cube_transfers;
+        } else {
+          ++diagnostic->cube_to_vector_transfers;
+        }
+      }
+      switch (mixed_topology_->protocol.kind) {
+        case MixedCrossCoreProtocol::OneWay:
+          diagnostic->protocol = "one_way";
+          break;
+        case MixedCrossCoreProtocol::SingleRoundTripBundle:
+          diagnostic->protocol = "single_round_trip_bundle";
+          break;
+        case MixedCrossCoreProtocol::BranchedRoundTripBundle:
+          diagnostic->protocol = "branched_round_trip_bundle";
+          break;
+        case MixedCrossCoreProtocol::MultiRoundTripSequential:
+          diagnostic->protocol = "multi_round_trip_sequential";
+          break;
+        case MixedCrossCoreProtocol::Unsupported:
+          diagnostic->protocol = "unsupported";
+          break;
+      }
+    }
   }
+  auto reject = [&](const char* code) {
+    if (diagnostic != nullptr && diagnostic->rejection_code.empty()) {
+      diagnostic->rejection_code = code;
+    }
+    return false;
+  };
   if (mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip) {
     const FeatureRoundTripResources resources =
@@ -6187,7 +6485,7 @@ bool Ascend910BCost::mixed_fits_on_chip(
           : derive_exec(cfg, output_K_, retained_from_prev, retain_these,
                         &cube_windows);
   if (cube_peak_l1_bytes == INT64_MAX) {
-    return false;
+    return reject("mixed_cube_execution_unrepresentable");
   }
 
   // Source readiness is an additional constraint on the analytic surface, not
@@ -6199,19 +6497,19 @@ bool Ascend910BCost::mixed_fits_on_chip(
   if (!prob_->require_buildable_mixed) {
     const TileConfig vector_cfg = vector_to_cube_stage_config(cfg);
     if (vector_stream(vector_cfg, retained_from_prev, retain_these).chunk <= 0) {
-      return false;
+      return reject("mixed_vector_stream_unrepresentable");
     }
     if (!prob_->require_source_codegen) {
       return true;
     }
   }
-  if (!mixed_topology_) return false;
+  if (!mixed_topology_) return reject("mixed_topology_missing");
   const bool exact_protocol =
       prob_->require_buildable_mixed
           ? mixed_topology_->compiler_emit_compatible
           : mixed_topology_->emit_compatible;
   if (!exact_protocol) {
-    return false;
+    return reject("mixed_protocol_not_emit_compatible");
   }
   const bool one_way =
       mixed_topology_->protocol.kind == MixedCrossCoreProtocol::OneWay &&
@@ -6239,7 +6537,7 @@ bool Ascend910BCost::mixed_fits_on_chip(
       mixed_topology_->transfers.size() == 3;
   if (!one_way && !single_round_trip && !branched_round_trip &&
       !sequential_multi_round_trip)
-    return false;
+    return reject("mixed_protocol_unsupported");
   if (prob_->require_source_codegen) {
     const bool standalone_one_way =
         one_way && mixed_topology_->stages.size() == 2 &&
@@ -6260,7 +6558,7 @@ bool Ascend910BCost::mixed_fits_on_chip(
             mixed_topology_->stages.size();
     if (!standalone_one_way && !standalone_single_round_trip &&
         !standalone_branched_round_trip && !sequential_multi_round_trip) {
-      return false;
+      return reject("mixed_source_protocol_unsupported");
     }
   }
   const int64_t parts_m = cfg.parts_m > 0
@@ -6273,12 +6571,40 @@ bool Ascend910BCost::mixed_fits_on_chip(
   const AxisPartition np = partition_axis(out_W_, parts_n, grid_gran_w_);
   if (mp.big > out_H_ || np.big > out_W_ || mp.big < 2 ||
       mp.big % 2 != 0) {
-    return false;
+    return reject("mixed_spatial_rows_unrepresentable");
   }
 
   int64_t vector_stage_peak = 0;
-  int64_t streaming_softmax_v2c_chunk = 0;
-  int64_t streaming_softmax_v2c_rhs_panels = 1;
+  const std::optional<size_t> streamed_v2c_transfer =
+      streamed_vector_to_cube_transfer();
+  std::string streamed_v2c_rejection;
+  const VectorStreamPlan streamed_v2c =
+      streamed_vector_to_cube_plan(cfg, /*vector_lanes=*/2,
+                                   &streamed_v2c_rejection);
+  const bool has_streamed_v2c =
+      prob_->require_source_codegen && streamed_v2c_transfer.has_value() &&
+      streamed_v2c.feasible;
+  bool streamed_v2c_producer_has_reduction = false;
+  if (streamed_v2c_transfer.has_value()) {
+    const size_t producer_stage =
+        mixed_topology_->transfers[*streamed_v2c_transfer].producer_stage;
+    if (producer_stage < mixed_topology_->stages.size()) {
+      const auto& producer_ops = mixed_topology_->stages[producer_stage].ops;
+      streamed_v2c_producer_has_reduction = std::any_of(
+          producer_ops.begin(), producer_ops.end(), [&](size_t op) {
+            return prob_->ops[op].type == OpType::Reduction;
+          });
+    }
+  }
+  const bool expects_streamed_v2c =
+      single_round_trip && !mixed_topology_->stages.empty() &&
+      mixed_topology_->stages.front().engine == MixedEngine::Vector &&
+      streamed_v2c_producer_has_reduction;
+  if (prob_->require_source_codegen && expects_streamed_v2c &&
+      !has_streamed_v2c && !streamed_v2c_rejection.empty()) {
+    return reject(streamed_v2c_rejection.c_str());
+  }
+  int64_t streamed_v2c_rhs_panels = 1;
   for (size_t stage_index = 0; stage_index < mixed_topology_->stages.size();
        ++stage_index) {
     const MixedStageTopology& stage = mixed_topology_->stages[stage_index];
@@ -6301,7 +6627,8 @@ bool Ascend910BCost::mixed_fits_on_chip(
           prob_->tensors[transfer.tensor], mp, np, spatial_m, spatial_n);
       break;
     }
-    if (rows < 2 || rows % 2 != 0 || cols <= 0) return false;
+    if (rows < 2 || rows % 2 != 0 || cols <= 0)
+      return reject("mixed_vector_stage_shape_unrepresentable");
     TileConfig lane_cfg = cfg;
     lane_cfg.h = rows / 2;
     lane_cfg.w = cols;
@@ -6310,52 +6637,84 @@ bool Ascend910BCost::mixed_fits_on_chip(
     lane_cfg.split_k = 1;
     auto stage_cost = Ascend910BCost::create(
         *prob_, *dag_, stage.ops, /*allow_mixed=*/false);
-    if (!stage_cost) return false;
-    const VectorStreamPlan lane_plan = stage_cost->vector_stream_plan(lane_cfg);
-    const bool streaming_softmax_stage =
-        prob_->require_source_codegen && one_way &&
-        vector_to_cube_operand_mask() == 1 && stage_index == 0 &&
-        mixed_topology_->stages.size() == 2 &&
-        mixed_topology_->stages[1].engine == MixedEngine::Cube &&
-        mixed_topology_->stages[1].ops.size() == 1 && lane_plan.feasible &&
-        lane_plan.kind == VectorStreamKind::SoftmaxFlash &&
-        lane_plan.chunk > 0;
+    if (!stage_cost) {
+      const bool publishes_to_cube = std::any_of(
+          mixed_topology_->transfers.begin(), mixed_topology_->transfers.end(),
+          [&](const MixedTransferTopology& transfer) {
+            return transfer.producer_stage == stage_index &&
+                   transfer.consumer_engine == MixedEngine::Cube;
+          });
+      return reject(publishes_to_cube
+                        ? "mixed_vector_producer_stage_unrepresentable"
+                        : "mixed_vector_reply_stage_unrepresentable");
+    }
+    const bool streamed_producer =
+        has_streamed_v2c &&
+        mixed_topology_->transfers[*streamed_v2c_transfer].producer_stage ==
+            stage_index;
+    const VectorStreamPlan lane_plan =
+        streamed_producer ? streamed_v2c
+                          : stage_cost->vector_stream_plan(lane_cfg);
     if (!lane_plan.feasible ||
         (lane_plan.kind != VectorStreamKind::Materialized &&
          lane_plan.kind != VectorStreamKind::Pointwise &&
-         !streaming_softmax_stage)) {
-      return false;
+         !streamed_producer)) {
+      return reject("mixed_vector_stage_stream_unrepresentable");
     }
     if (prob_->require_source_codegen &&
-        (single_round_trip || branched_round_trip) &&
+        (single_round_trip || branched_round_trip) && !streamed_producer &&
         lane_plan.kind != VectorStreamKind::Materialized &&
         lane_plan.kind != VectorStreamKind::Pointwise) {
-      return false;
+      return reject("mixed_round_trip_vector_stage_not_materialized");
     }
-    if (streaming_softmax_stage) {
-      streaming_softmax_v2c_chunk = lane_plan.chunk;
-      streaming_softmax_v2c_rhs_panels =
-          std::max<int64_t>(1, lane_plan.apply.pipeline_stages);
+    if (streamed_producer) {
+      streamed_v2c_rhs_panels =
+          lane_plan.kind == VectorStreamKind::MultiPass &&
+                  !lane_plan.replay_passes.empty()
+              ? std::max<int64_t>(
+                    1, lane_plan.replay_passes.back().loop.pipeline_stages)
+              : std::max<int64_t>(1, lane_plan.apply.pipeline_stages);
       vector_stage_peak =
           std::max(vector_stage_peak, lane_plan.chunk_peak_ub_bytes);
     } else {
+      int64_t realized_peak = lane_plan.full_peak_ub_bytes;
+      if (prob_->require_source_codegen) {
+        TileConfig source_cfg = cfg;
+        source_cfg.h = rows;
+        source_cfg.w = cols;
+        source_cfg.parts_m = 0;
+        source_cfg.parts_n = 0;
+        source_cfg.split_k = 1;
+        const VectorStreamPlan source_plan =
+            stage_cost->vector_stream_plan(source_cfg);
+        if (!source_plan.feasible ||
+            (source_plan.kind != VectorStreamKind::Materialized &&
+             source_plan.kind != VectorStreamKind::Pointwise)) {
+          return reject("mixed_vector_source_frame_unrepresentable");
+        }
+        realized_peak = MixedMaterializedSourcePeak(*prob_, source_plan);
+      }
       vector_stage_peak =
-          std::max(vector_stage_peak,
-                   prob_->require_source_codegen
-                       ? MixedMaterializedSourcePeak(*prob_, lane_plan)
-                       : lane_plan.full_peak_ub_bytes);
+          std::max(vector_stage_peak, realized_peak);
     }
   }
-  if (vector_stage_peak <= 0) return false;
-  if (streaming_softmax_v2c_chunk > 0) {
-    const Op& sink = prob_->ops[mixed_topology_->stages[1].ops.front()];
+  if (vector_stage_peak <= 0)
+    return reject("mixed_vector_stage_peak_missing");
+  if (has_streamed_v2c) {
+    const MixedTransferTopology& transfer =
+        mixed_topology_->transfers[*streamed_v2c_transfer];
+    const Op& sink =
+        prob_->ops[mixed_topology_->stages[transfer.consumer_stage].ops.front()];
     const Tensor& rhs = prob_->tensors[sink.inputs[1]];
-    cube_peak_l1_bytes = streaming_softmax_v2c_chunk * np.big *
+    cube_peak_l1_bytes = streamed_v2c.chunk * np.big *
                          dtype_bytes(rhs.dtype) *
-                         streaming_softmax_v2c_rhs_panels;
+                         streamed_v2c_rhs_panels;
   }
 
-  const int64_t slot_count = one_way ? 8 : 4;
+  // Feasibility runs before active-group selection. A one-trip realization
+  // needs only one slot; the fully derived schedule below raises the depth
+  // when it actually grants cross-core overlap.
+  const int64_t slot_count = 1;
   int64_t c2v_fifo_reserved = 0;
   int64_t v2c_fifo_reserved = 0;
   for (const MixedTransferTopology& transfer : mixed_topology_->transfers) {
@@ -6369,13 +6728,14 @@ bool Ascend910BCost::mixed_fits_on_chip(
     }
     auto [rows, cols] = MixedTensorRegion(
         prob_->tensors[transfer.tensor], mp, np, spatial_m, spatial_n);
-    if (streaming_softmax_v2c_chunk > 0 && transfer.producer_stage == 0 &&
-        transfer.consumer_stage == 1 &&
-        transfer.producer_engine == MixedEngine::Vector && spatial_m &&
-        !spatial_n) {
-      cols = streaming_softmax_v2c_chunk;
+    if (has_streamed_v2c &&
+        *streamed_v2c_transfer < mixed_topology_->transfers.size() &&
+        &transfer == &mixed_topology_->transfers[*streamed_v2c_transfer]) {
+      rows = streamed_v2c.free_tile * 2;
+      cols = streamed_v2c.chunk;
     }
-    if (rows <= 0 || cols <= 0) return false;
+    if (rows <= 0 || cols <= 0)
+      return reject("mixed_fifo_shape_unrepresentable");
     DType wire_dtype = prob_->tensors[transfer.tensor].dtype;
     if (transfer.producer_engine == MixedEngine::Cube) {
       const MixedStageTopology& producer_stage =
@@ -6413,12 +6773,17 @@ bool Ascend910BCost::mixed_fits_on_chip(
       const Op& op = prob_->ops[op_index];
       if (op.type != OpType::MatMul) continue;
       const Tensor& output = prob_->tensors[op.output()];
-      const int64_t tile_m = output.height == out_H_ ? mp.big : output.height;
+      int64_t tile_m = output.height == out_H_ ? mp.big : output.height;
       const int64_t tile_n = output.width == out_W_ ? np.big : output.width;
       int64_t window = cube_window_k_for_op(cube_windows, op_index);
-      if (streaming_softmax_v2c_chunk > 0 &&
-          op_index == mixed_topology_->stages[1].ops.front()) {
-        window = streaming_softmax_v2c_chunk;
+      if (has_streamed_v2c &&
+          op_index ==
+              mixed_topology_->stages[mixed_topology_
+                                          ->transfers[*streamed_v2c_transfer]
+                                          .consumer_stage]
+                  .ops.front()) {
+        window = streamed_v2c.chunk;
+        tile_m = streamed_v2c.free_tile * 2;
       }
       if (window <= 0) window = op_K(op_index);
       const DType lhs_dtype = prob_->tensors[op.inputs[0]].dtype;
@@ -6427,7 +6792,8 @@ bool Ascend910BCost::mixed_fits_on_chip(
           MixedMatmulL0OperandFootprint(
               prob_, tile_m, tile_n, window, lhs_dtype, rhs_dtype,
               outer_pipeline_depth);
-      if (!footprint.feasible) return false;
+      if (!footprint.feasible)
+        return reject("mixed_l0_operand_unrepresentable");
       required_l0a_bytes =
           std::max(required_l0a_bytes, footprint.l0a_bytes);
       required_l0b_bytes =
@@ -6443,10 +6809,12 @@ bool Ascend910BCost::mixed_fits_on_chip(
     diagnostic->required_l0a_bytes = required_l0a_bytes;
     diagnostic->required_l0b_bytes = required_l0b_bytes;
   }
-  return required_vec_bytes <= prob_->vec_capacity &&
-         required_l1_bytes <= prob_->l1_capacity &&
-         required_l0a_bytes <= prob_->l0_matmul_config.l0a_bytes &&
-         required_l0b_bytes <= prob_->l0_matmul_config.l0b_bytes;
+  const bool fits = required_vec_bytes <= prob_->vec_capacity &&
+                    required_l1_bytes <= prob_->l1_capacity &&
+                    required_l0a_bytes <= prob_->l0_matmul_config.l0a_bytes &&
+                    required_l0b_bytes <= prob_->l0_matmul_config.l0b_bytes;
+  if (!fits) return reject("mixed_source_memory_capacity_exceeded");
+  return true;
 }
 
 bool Ascend910BCost::is_feasible(const TileConfig &cfg,
@@ -7865,6 +8233,30 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     plan.vector_lanes = 2;
   }
 
+  const std::optional<size_t> streamed_v2c_transfer =
+      streamed_vector_to_cube_transfer();
+  const VectorStreamPlan streamed_v2c =
+      streamed_vector_to_cube_plan(cfg, plan.vector_lanes);
+  int64_t streamed_row_chunk = 0;
+  int64_t streamed_row_chunks = 1;
+  if (streamed_v2c.feasible && streamed_v2c_transfer.has_value()) {
+    const MixedTransferTopology& transfer =
+        mixed_topology_->transfers[*streamed_v2c_transfer];
+    const auto [spatial_m, spatial_n] =
+        MixedTransferSpatialAxes(*prob_, *mixed_topology_, transfer);
+    const auto [rows, cols] = MixedTensorRegion(
+        prob_->tensors[transfer.tensor], plan.m_partition, plan.n_partition,
+        spatial_m, spatial_n);
+    streamed_row_chunk =
+        streamed_v2c.free_tile * std::max<int64_t>(1, plan.vector_lanes);
+    if (cols != streamed_v2c.extent || streamed_row_chunk <= 0 ||
+        streamed_row_chunk > rows || rows % streamed_row_chunk != 0) {
+      plan.feasible = false;
+      return plan;
+    }
+    streamed_row_chunks = rows / streamed_row_chunk;
+  }
+
   // A spatial tile is one complete cross-engine pipeline item.  The selected
   // number of 1-AIC + 2-AIV groups is independent of the tile grid: assigning
   // several tiles to one group creates the successor items required for
@@ -7872,11 +8264,12 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   // mapping for direct plan inspection; compute_mixed_cost() evaluates every
   // uniform group count and records its winner in CostResult.
   plan.loop.axis = MixedPipelineAxis::SpatialRegion;
-  plan.loop.extent = plan.spatial_tiles;
+  plan.loop.extent = plan.spatial_tiles * streamed_row_chunks;
   plan.loop.chunk = 1;
-  plan.loop.items_per_spatial_tile = 1;
-  plan.loop.work_items = plan.spatial_tiles;
-  const int64_t max_groups = std::min(plan.spatial_tiles, plan.group_capacity);
+  plan.loop.items_per_spatial_tile = streamed_row_chunks;
+  plan.loop.work_items = plan.spatial_tiles * streamed_row_chunks;
+  const int64_t max_groups =
+      std::min(plan.loop.work_items, plan.group_capacity);
   if (active_groups < 0 || active_groups > max_groups ||
       (active_groups > 0 && plan.loop.work_items % active_groups != 0)) {
     plan.feasible = false;
@@ -7905,13 +8298,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
       plan.algorithm == MixedAlgorithmKind::Generic &&
       plan.protocol == MixedCrossCoreProtocol::OneWay;
   const bool vector_to_cube = vector_to_cube_mask != 0;
-  const VectorStreamPlan vector_to_cube_stream =
-      vector_to_cube_mask == 1
-          ? vector_to_cube_stream_plan(cfg, plan.vector_lanes)
-          : VectorStreamPlan{};
-  const bool phase_local_vector_pipeline =
-      vector_to_cube_stream.feasible &&
-      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const bool phase_local_vector_pipeline = streamed_v2c.feasible;
   const bool uniform_successors =
       plan.emit_compatible && !sequential_multi_round_trip &&
       !phase_local_vector_pipeline &&
@@ -7936,14 +8323,10 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   // contraction dimension remains whole. Thus a QK-like first stage carries
   // [M_tile,S] even when the final PV-like output is [M_tile,N_tile].
   if (plan.emit_compatible) {
-    const VectorStreamPlan vector_to_cube_stream =
-        vector_to_cube ? vector_to_cube_stream_plan(cfg, plan.vector_lanes)
-                       : VectorStreamPlan{};
-    const bool streamed_softmax_to_cube =
-        vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
-        vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash &&
-        vector_to_cube_stream.chunk > 0;
-    const int64_t slot_count = mixed_topology_->transfers.size() == 1 ? 8 : 4;
+    const int64_t slot_count =
+        plan.loop.pipeline_stages > 1
+            ? (mixed_topology_->transfers.size() == 1 ? 8 : 4)
+            : 1;
     std::vector<int64_t> fifo_cube_windows;
     const bool has_c2v = std::any_of(
         mixed_topology_->transfers.begin(), mixed_topology_->transfers.end(),
@@ -7987,9 +8370,27 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
       }
       auto [rows, cols] = MixedTensorRegion(
           tensor, plan.m_partition, plan.n_partition, spatial_m, spatial_n);
-      if (streamed_softmax_to_cube &&
-          transfer.producer_engine == MixedEngine::Vector) {
-        cols = vector_to_cube_stream.chunk;
+      int64_t transfer_slot_count = slot_count;
+      if (streamed_v2c.feasible && streamed_v2c_transfer == transfer_index) {
+        // Explicit pipe descriptors describe the physical boundary before
+        // LowerAutoVectorSplit halves it into AIV lanes. Keep row_chunk as the
+        // logical work-item coverage, but reserve and declare the aligned
+        // physical frame emitted by the vector replay.
+        rows = streamed_v2c.free_tile_alloc *
+               std::max<int64_t>(1, plan.vector_lanes);
+        cols = streamed_v2c.chunk;
+      } else if (streamed_v2c.feasible &&
+                 streamed_v2c_transfer.has_value() &&
+                 transfer.producer_engine == MixedEngine::Cube &&
+                 transfer.producer_stage ==
+                     mixed_topology_->transfers[*streamed_v2c_transfer]
+                         .consumer_stage) {
+        // The completed accumulator is published once after all K chunks.
+        // Its boundary carries the same aligned physical rows as the V2C
+        // input, but it needs no multi-slot streaming ring.
+        rows = streamed_v2c.free_tile_alloc *
+               std::max<int64_t>(1, plan.vector_lanes);
+        transfer_slot_count = 1;
       }
       DType wire_dtype = tensor.dtype;
       if (transfer.producer_engine == MixedEngine::Cube) {
@@ -8023,8 +8424,9 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
            transfer.producer_engine == MixedEngine::Cube
                ? MixedTransferDirection::CubeToVector
                : MixedTransferDirection::VectorToCube,
-           wire_dtype, spatial_m, spatial_n, rows, cols, slot_bytes, slot_count,
-           slot_bytes * slot_count,
+           wire_dtype, spatial_m, spatial_n, rows, cols, slot_bytes,
+           transfer_slot_count,
+           slot_bytes * transfer_slot_count,
            static_cast<int>(transfer_index), bundle});
     }
   }
@@ -8106,6 +8508,10 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         plan.protocol == MixedCrossCoreProtocol::MultiRoundTripSequential;
     const int vector_to_cube_mask = vector_to_cube_operand_mask();
     const bool vector_to_cube = vector_to_cube_mask != 0;
+    const std::optional<size_t> streamed_v2c_transfer =
+        streamed_vector_to_cube_transfer();
+    const VectorStreamPlan streamed_v2c =
+        streamed_vector_to_cube_plan(cfg, plan.vector_lanes);
     std::vector<int64_t> cube_windows;
     plan.cube_stage_peak_l1_bytes =
         vector_to_cube_mask == 3
@@ -8193,6 +8599,14 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         auto [rows, cols] = MixedTensorRegion(
             prob_->tensors[region_tensor], plan.m_partition, plan.n_partition,
             spatial_m, spatial_n);
+        if (streamed_v2c.feasible && streamed_v2c_transfer.has_value()) {
+          const MixedTransferTopology& streamed_transfer =
+              mixed_topology_->transfers[*streamed_v2c_transfer];
+          if (stage_index >= streamed_transfer.producer_stage) {
+            rows = streamed_v2c.free_tile *
+                   std::max<int64_t>(1, plan.vector_lanes);
+          }
+        }
         stage.valid_rows = rows;
         stage.valid_cols = cols;
         if (stage.engine == MixedEngine::Cube) {
@@ -8201,6 +8615,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
                 op < perop_k.size() ? perop_k[op] : 0);
           }
         } else {
+          const int64_t source_rows = stage.valid_rows;
+          const int64_t source_cols = stage.valid_cols;
           if (plan.vector_split == MixedVectorSplit::Rows) {
             stage.valid_rows /= std::max<int64_t>(1, plan.vector_lanes);
           } else if (plan.vector_split == MixedVectorSplit::Columns) {
@@ -8222,34 +8638,60 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             plan.feasible = false;
             return plan;
           }
-          stage.vector_stream = stage_cost->vector_stream_plan(lane_cfg);
+          stage.vector_stream =
+              streamed_v2c.feasible && streamed_v2c_transfer.has_value() &&
+                      mixed_topology_->transfers[*streamed_v2c_transfer]
+                              .producer_stage == stage_index
+                  ? streamed_v2c
+                  : stage_cost->vector_stream_plan(lane_cfg);
           if (plan.vector_stage_peak_ub_bytes == 0) {
             // v7 keeps this compatibility summary as the first vector-stage
             // kind; each stage carries its authoritative stream descriptor.
             plan.vector_stage_kind = stage.vector_stream.kind;
           }
-          const int64_t realized_peak =
+          int64_t realized_peak =
               stage.vector_stream.streamed()
                   ? stage.vector_stream.chunk_peak_ub_bytes
-                  : MixedMaterializedSourcePeak(*prob_, stage.vector_stream);
+                  : stage.vector_stream.full_peak_ub_bytes;
+          if (prob_->require_source_codegen &&
+              !stage.vector_stream.streamed()) {
+            TileConfig source_cfg = cfg;
+            source_cfg.h = source_rows;
+            source_cfg.w = source_cols;
+            source_cfg.parts_m = 0;
+            source_cfg.parts_n = 0;
+            source_cfg.split_k = 1;
+            const VectorStreamPlan source_plan =
+                stage_cost->vector_stream_plan(source_cfg);
+            if (!source_plan.feasible ||
+                (source_plan.kind != VectorStreamKind::Materialized &&
+                 source_plan.kind != VectorStreamKind::Pointwise)) {
+              plan.feasible = false;
+              return plan;
+            }
+            realized_peak = MixedMaterializedSourcePeak(*prob_, source_plan);
+          }
           plan.vector_stage_peak_ub_bytes =
               std::max(plan.vector_stage_peak_ub_bytes, realized_peak);
         }
         plan.stages.push_back(std::move(stage));
       }
-      const bool streaming_softmax_to_cube =
-          plan.stages.size() == 2 && vector_to_cube_mask == 1 &&
-          plan.stages[0].engine == MixedEngine::Vector &&
-          plan.stages[0].vector_stream.kind == VectorStreamKind::SoftmaxFlash &&
-          plan.stages[0].vector_stream.feasible &&
-          plan.stages[0].vector_stream.chunk > 0 &&
-          plan.stages[1].engine == MixedEngine::Cube &&
-          plan.stages[1].ops.size() == 1;
-      if (streaming_softmax_to_cube) {
-        const int64_t chunk = plan.stages[0].vector_stream.chunk;
-        const int64_t rhs_panels = std::max<int64_t>(
-            1, plan.stages[0].vector_stream.apply.pipeline_stages);
-        MixedStagePlan& sink_stage = plan.stages[1];
+      const bool streaming_vector_to_cube =
+          streamed_v2c.feasible && streamed_v2c_transfer.has_value();
+      if (streaming_vector_to_cube) {
+        const MixedTransferTopology& transfer =
+            mixed_topology_->transfers[*streamed_v2c_transfer];
+        const int64_t chunk = streamed_v2c.chunk;
+        int64_t rhs_panels = 1;
+        if (streamed_v2c.kind == VectorStreamKind::MultiPass &&
+            !streamed_v2c.replay_passes.empty()) {
+          rhs_panels = std::max<int64_t>(
+              1, streamed_v2c.replay_passes.back().loop.pipeline_stages);
+        } else {
+          rhs_panels =
+              std::max<int64_t>(1, streamed_v2c.apply.pipeline_stages);
+        }
+        MixedStagePlan& sink_stage = plan.stages[transfer.consumer_stage];
         sink_stage.cube_window_k.assign(sink_stage.ops.size(), chunk);
         plan.cube_window_k = chunk;
         plan.config.k = chunk;
@@ -8257,6 +8699,103 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
         const Tensor& rhs = prob_->tensors[sink.inputs[1]];
         plan.cube_stage_peak_l1_bytes =
             chunk * plan.n_partition.big * dtype_bytes(rhs.dtype) * rhs_panels;
+        plan.streamed_v2c.present = true;
+        plan.streamed_v2c.producer_stage = transfer.producer_stage;
+        plan.streamed_v2c.sink_stage = transfer.consumer_stage;
+        plan.streamed_v2c.transfer = *streamed_v2c_transfer;
+        plan.streamed_v2c.crossing_tensor = transfer.tensor;
+        // A vector value may bypass the cube stage and feed a later vector
+        // epilogue (for example a per-row dequantization scale).  It remains
+        // resident in the AIV function; unlike a topology transfer it must not
+        // acquire either a FIFO or a GM materialization.  Publish it from the
+        // replay pass that defines it so the typed source contract can carry
+        // it out of that lexical loop.
+        FlatSet<size_t> carried_tensors;
+        const MixedStageTopology& producer_topology =
+            mixed_topology_->stages[transfer.producer_stage];
+        for (size_t producer_op : producer_topology.ops) {
+          for (size_t tensor : prob_->ops[producer_op].outputs) {
+            if (tensor == transfer.tensor) continue;
+            bool consumed_after_cube = false;
+            for (size_t consumer : dag_->tensor_consumers[tensor]) {
+              for (size_t later = transfer.consumer_stage + 1;
+                   later < mixed_topology_->stages.size(); ++later) {
+                const MixedStageTopology& later_stage =
+                    mixed_topology_->stages[later];
+                if (later_stage.engine == MixedEngine::Vector &&
+                    std::find(later_stage.ops.begin(), later_stage.ops.end(),
+                              consumer) != later_stage.ops.end()) {
+                  consumed_after_cube = true;
+                  break;
+                }
+              }
+              if (consumed_after_cube) break;
+            }
+            if (consumed_after_cube) carried_tensors.insert(tensor);
+          }
+        }
+        if (!carried_tensors.empty()) {
+          MixedStagePlan& producer_stage =
+              plan.stages[transfer.producer_stage];
+          if (!producer_stage.vector_stream.replay_topology) {
+            plan.feasible = false;
+            return plan;
+          }
+          auto replay = std::make_shared<VectorReplayTopology>(
+              *producer_stage.vector_stream.replay_topology);
+          for (size_t tensor : carried_tensors) {
+            const int producer = dag_->tensor_producer[tensor];
+            bool published = false;
+            for (VectorReplayPassTopology& pass : replay->passes) {
+              if (producer < 0 ||
+                  std::find(pass.ops.begin(), pass.ops.end(),
+                            static_cast<size_t>(producer)) == pass.ops.end()) {
+                continue;
+              }
+              const bool stable_reduction_state =
+                  std::find(pass.state_outputs.begin(), pass.state_outputs.end(),
+                            tensor) != pass.state_outputs.end();
+              if (pass.kind != VectorReplayPassKind::Apply &&
+                  !stable_reduction_state) {
+                plan.feasible = false;
+                return plan;
+              }
+              if (std::find(pass.output_tensors.begin(),
+                            pass.output_tensors.end(), tensor) ==
+                  pass.output_tensors.end()) {
+                pass.output_tensors.push_back(tensor);
+                std::sort(pass.output_tensors.begin(),
+                          pass.output_tensors.end());
+              }
+              published = true;
+              break;
+            }
+            if (!published) {
+              plan.feasible = false;
+              return plan;
+            }
+          }
+          producer_stage.vector_stream.replay_topology = std::move(replay);
+          plan.streamed_v2c.carried_tensors.assign(carried_tensors.begin(),
+                                                   carried_tensors.end());
+        }
+        plan.streamed_v2c.contraction_extent = streamed_v2c.extent;
+        plan.streamed_v2c.row_chunk =
+            streamed_v2c.free_tile *
+            std::max<int64_t>(1, plan.vector_lanes);
+        plan.streamed_v2c.row_chunks = plan.loop.items_per_spatial_tile;
+        plan.streamed_v2c.accumulator_rows =
+            streamed_v2c.free_tile_alloc *
+            std::max<int64_t>(1, plan.vector_lanes);
+        plan.streamed_v2c.chunk = chunk;
+        plan.streamed_v2c.full_chunks = streamed_v2c.full_chunks;
+        plan.streamed_v2c.tail = streamed_v2c.tail;
+        plan.streamed_v2c.persistent_accumulator_bytes =
+            plan.streamed_v2c.accumulator_rows * plan.n_partition.big *
+            dtype_bytes(cube_accumulator_dtype(
+                prob_->tensors[sink.inputs.front()].dtype));
+        plan.streamed_v2c.first_chunk_initializes = true;
+        plan.streamed_v2c.later_chunks_accumulate = true;
       }
       auto in_memory_vector = [](const MixedStagePlan& stage) {
         return stage.engine == MixedEngine::Vector &&
@@ -8271,7 +8810,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             plan.stages[0].ops.size() == 1 &&
             in_memory_vector(plan.stages[1]);
         const bool vector_to_cube =
-            (in_memory_vector(plan.stages[0]) || streaming_softmax_to_cube) &&
+            (in_memory_vector(plan.stages[0]) || streaming_vector_to_cube) &&
             plan.stages[1].engine == MixedEngine::Cube &&
             plan.stages[1].ops.size() == 1 &&
             vector_to_cube_mask != 0;
@@ -8286,7 +8825,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             plan.stages[2].engine == MixedEngine::Cube &&
             plan.stages[2].ops.size() == 1;
         const bool vcv =
-            in_memory_vector(plan.stages[0]) &&
+            (in_memory_vector(plan.stages[0]) || streaming_vector_to_cube) &&
             plan.stages[1].engine == MixedEngine::Cube &&
             plan.stages[1].ops.size() == 1 &&
             in_memory_vector(plan.stages[2]);
@@ -8347,6 +8886,66 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
               prob_, plan.stages, plan.loop.pipeline_stages);
       plan.cube_stage_peak_l0a_bytes = selected_l0.l0a_bytes;
       plan.cube_stage_peak_l0b_bytes = selected_l0.l0b_bytes;
+      if (prob_->require_source_codegen) {
+        // AutoTileMatmulL0 cannot spatially fragment a matmul whose result is
+        // consumed on chip: there is no direct GM store into which fragments
+        // can be assembled.  Such a request keeps its complete source-level
+        // operands in Left/Right even when the analytic child plan chose a
+        // smaller N tile.  Account that emitted allocation before declaring
+        // the source candidate ready.  Direct-store sinks continue to use the
+        // exact child-plan footprint above.
+        for (const MixedStagePlan& stage : plan.stages) {
+          if (stage.engine != MixedEngine::Cube) continue;
+          for (size_t request = 0; request < stage.ops.size(); ++request) {
+            const size_t op_index = stage.ops[request];
+            const Op& op = prob_->ops[op_index];
+            if (op.type != OpType::MatMul ||
+                request >= stage.cube_window_k.size()) {
+              continue;
+            }
+            const bool output_crosses_to_vector = std::any_of(
+                plan.fifos.begin(), plan.fifos.end(),
+                [&](const MixedFifoPlan& fifo) {
+                  return fifo.direction ==
+                             MixedTransferDirection::CubeToVector &&
+                         fifo.tensor == op.output();
+                });
+            const int64_t window = stage.cube_window_k[request];
+            if (!output_crosses_to_vector ||
+                !MixedMatmulNeedsSpatialL0Tiling(
+                    prob_, stage.valid_rows, stage.valid_cols, window,
+                    prob_->tensors[op.inputs[0]].dtype,
+                    prob_->tensors[op.inputs[1]].dtype)) {
+              continue;
+            }
+            plan.cube_stage_peak_l0a_bytes = std::max(
+                plan.cube_stage_peak_l0a_bytes,
+                stage.valid_rows * window *
+                    dtype_bytes(prob_->tensors[op.inputs[0]].dtype));
+            plan.cube_stage_peak_l0b_bytes = std::max(
+                plan.cube_stage_peak_l0b_bytes,
+                window * stage.valid_cols *
+                    dtype_bytes(prob_->tensors[op.inputs[1]].dtype));
+          }
+        }
+      }
+      if (streaming_vector_to_cube) {
+        const MixedStagePlan& streamed_sink =
+            plan.stages[plan.streamed_v2c.sink_stage];
+        const Op& sink = prob_->ops[streamed_sink.ops.front()];
+        // The current generic source keeps one complete output-N accumulator
+        // and replays K chunks into it. Its V2C LHS and GM-backed RHS are moved
+        // into L0 as complete per-chunk panels; a smaller hypothetical child
+        // L0 tile is not source-realizable without another nested N loop.
+        plan.cube_stage_peak_l0a_bytes = std::max(
+            plan.cube_stage_peak_l0a_bytes,
+            plan.streamed_v2c.accumulator_rows * plan.streamed_v2c.chunk *
+                dtype_bytes(prob_->tensors[sink.inputs[0]].dtype));
+        plan.cube_stage_peak_l0b_bytes = std::max(
+            plan.cube_stage_peak_l0b_bytes,
+            plan.streamed_v2c.chunk * plan.n_partition.big *
+                dtype_bytes(prob_->tensors[sink.inputs[1]].dtype));
+      }
       // PyPTO's split mixed lowering rotates boundary cube operands across
       // the local pipeline plus its cross-core skew. Operand requests within
       // one cube stage may be live together; topologically distinct cube
@@ -8355,7 +8954,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
       // boundary panel.
       int64_t source_l1_allocation_bytes = 0;
       bool source_l1_allocation_valid = true;
-      const int64_t boundary_copies =
+      const int64_t mixed_boundary_copies =
           plan.loop.pipeline_stages > 1
               ? plan.loop.pipeline_stages + plan.loop.requested_skew_depth
               : 1;
@@ -8370,6 +8969,13 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             break;
           }
           const int64_t window = stage.cube_window_k[request];
+          // The emitted cube request owns a nested stage-2 K loop whenever
+          // its window is smaller than the contraction.  That loop rotates
+          // boundary panels even when the enclosing mixed loop has one trip;
+          // use the deepest emitted rotation, not a blanket depth for every
+          // cube request.
+          const int64_t request_boundary_copies = std::max<int64_t>(
+              mixed_boundary_copies, op_K(stage.ops[request]) > window ? 2 : 1);
           const int64_t panel_bytes[2] = {
               stage.valid_rows * window *
                   dtype_bytes(prob_->tensors[op.inputs[0]].dtype),
@@ -8396,7 +9002,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
                 std::find(ops_.begin(), ops_.end(),
                           static_cast<size_t>(producer)) == ops_.end()) {
               stage_source_l1_bytes +=
-                  boundary_copies * panel_bytes[operand];
+                  request_boundary_copies * panel_bytes[operand];
             }
           }
         }
@@ -8671,16 +9277,10 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
     return compute_feature_round_trip_cost(cfg, maximal);
   }
 
-  const int vector_to_cube_mask = vector_to_cube_operand_mask();
-  const VectorStreamPlan vector_to_cube_stream =
-      vector_to_cube_mask != 0
-          ? vector_to_cube_stream_plan(cfg, maximal.vector_lanes)
-          : VectorStreamPlan{};
-  const bool streamed_vector_to_cube =
-      vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
-      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const VectorStreamPlan streamed_vector_to_cube =
+      streamed_vector_to_cube_plan(cfg, maximal.vector_lanes);
   const bool group_tunable =
-      !streamed_vector_to_cube &&
+      !streamed_vector_to_cube.feasible &&
       (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
        maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle ||
        maximal.protocol == MixedCrossCoreProtocol::BranchedRoundTripBundle);
@@ -8728,17 +9328,11 @@ Ascend910BCost::enumerate_mixed_group_costs(
     return candidates;
   }
 
-  const int vector_to_cube_mask = vector_to_cube_operand_mask();
-  const VectorStreamPlan vector_to_cube_stream =
-      vector_to_cube_mask != 0
-          ? vector_to_cube_stream_plan(cfg, maximal.vector_lanes)
-          : VectorStreamPlan{};
-  const bool streamed_vector_to_cube =
-      vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
-      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash;
+  const VectorStreamPlan streamed_vector_to_cube =
+      streamed_vector_to_cube_plan(cfg, maximal.vector_lanes);
   const bool group_tunable =
       maximal.algorithm != MixedAlgorithmKind::FeatureChunkRoundTrip &&
-      !streamed_vector_to_cube &&
+      !streamed_vector_to_cube.feasible &&
       (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
        maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle ||
        maximal.protocol == MixedCrossCoreProtocol::BranchedRoundTripBundle);
@@ -8802,18 +9396,15 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     breakdown->overlap_implementable = schedule.overlap_implementable;
   }
   const int vector_to_cube_mask = vector_to_cube_operand_mask();
-  const bool vector_to_cube = vector_to_cube_mask != 0;
   const VectorStreamPlan vector_to_cube_stream =
-      vector_to_cube ? vector_to_cube_stream_plan(cfg, schedule.vector_lanes)
-                     : VectorStreamPlan{};
-  const bool streamed_softmax_to_cube =
-      vector_to_cube_mask == 1 && vector_to_cube_stream.feasible &&
-      vector_to_cube_stream.kind == VectorStreamKind::SoftmaxFlash &&
-      vector_to_cube_stream.chunk > 0;
+      streamed_vector_to_cube_plan(cfg, schedule.vector_lanes);
+  const bool streamed_vector_to_cube = vector_to_cube_stream.feasible;
+  const bool vector_to_cube =
+      vector_to_cube_mask != 0 || streamed_vector_to_cube;
   const bool exact_source_mixed =
       prob_->require_buildable_mixed || prob_->require_source_codegen;
   const TileConfig vector_stage_cfg =
-      vector_to_cube ? vector_to_cube_stage_config(cfg) : cfg;
+      vector_to_cube_mask != 0 ? vector_to_cube_stage_config(cfg) : cfg;
   result.feasible = true;
   const ByteCost bc = MakeByteCost(prob_);  // per-direction cycles/byte (grounded)
   // Grid mode (parts_m/parts_n > 0) fixes the tile count directly: cfg.w/cfg.h are
@@ -8872,13 +9463,18 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   // grid), so the stage times divide by 1 and 2 cores per unit.
   const double n_units = (double)prob_->num_cube_cores;  // 1:2 physical capacity
   const double eff_units = (double)std::max<int64_t>(1, schedule.loop.active_groups);
-  const double vector_replay = vector_to_cube
-      ? static_cast<double>(vector_to_cube_mask == 1
-                                ? schedule.n_partition.parts
-                                : (vector_to_cube_mask == 2
-                                       ? schedule.m_partition.parts
-                                       : 1))
-      : 1.0;
+  double vector_replay = 1.0;
+  if (streamed_vector_to_cube) {
+    const size_t transfer_index = *streamed_vector_to_cube_transfer();
+    const auto [spatial_m, spatial_n] = MixedTransferSpatialAxes(
+        *prob_, *mixed_topology_, mixed_topology_->transfers[transfer_index]);
+    if (!spatial_m) vector_replay *= schedule.m_partition.parts;
+    if (!spatial_n) vector_replay *= schedule.n_partition.parts;
+  } else if (vector_to_cube_mask == 1) {
+    vector_replay = static_cast<double>(schedule.n_partition.parts);
+  } else if (vector_to_cube_mask == 2) {
+    vector_replay = static_cast<double>(schedule.m_partition.parts);
+  }
 
   // DDR traffic. CRITICAL: fusion on 910B does NOT reduce DDR — the matmul still
   // reloads its operands and the intermediate still round-trips DDR (only 950's
@@ -8906,6 +9502,34 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   FlatSet<size_t> in_sg(ops_.begin(), ops_.end());
   FlatSet<size_t> cube_operands;
   FlatSet<size_t> vector_boundary_loads;
+  auto streamed_pass_uses = [&](size_t tensor) {
+    if (!streamed_vector_to_cube) return int64_t{1};
+    int64_t uses = 0;
+    if (vector_to_cube_stream.kind == VectorStreamKind::MultiPass &&
+        vector_to_cube_stream.replay_topology) {
+      for (const VectorReplayPassTopology& pass :
+           vector_to_cube_stream.replay_topology->passes) {
+        uses += std::any_of(
+                    pass.input_lifetimes.begin(), pass.input_lifetimes.end(),
+                    [&](const VectorInputLifetimePlan& input) {
+                      return input.tensor == tensor;
+                    })
+                    ? 1
+                    : 0;
+      }
+    } else if (vector_to_cube_stream.input_lifetimes) {
+      for (const auto& phase : vector_to_cube_stream.input_lifetimes->phases) {
+        uses += std::any_of(
+                    phase.begin(), phase.end(),
+                    [&](const VectorInputLifetimePlan& input) {
+                      return input.tensor == tensor;
+                    })
+                    ? 1
+                    : 0;
+      }
+    }
+    return std::max<int64_t>(1, uses);
+  };
   for (auto i : ops_)
     if (prob_->ops[i].type == OpType::MatMul)
       for (auto t : prob_->ops[i].inputs) cube_operands.insert(t);
@@ -8938,8 +9562,13 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
         vector_boundary_loads.insert(info.id).second) {
       double request_multiplicity = vector_replay;
       if (vector_to_cube) {
-        const Tensor& crossing =
-            prob_->tensors[mixed_topology_->transfers.front().tensor];
+        const size_t crossing_tensor =
+            streamed_vector_to_cube
+                ? mixed_topology_
+                      ->transfers[*streamed_vector_to_cube_transfer()]
+                      .tensor
+                : mixed_topology_->transfers.front().tensor;
+        const Tensor& crossing = prob_->tensors[crossing_tensor];
         // A row-broadcast input is loaded independently by each row-split AIV
         // lane. This is distinct from output-grid replay: even a single
         // spatial M partition issues one load per physical vector lane.
@@ -8948,6 +9577,9 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
             schedule.vector_lanes > 1 && tensor.height == 1 &&
             crossing.height > 1) {
           request_multiplicity *= schedule.vector_lanes;
+        }
+        if (streamed_vector_to_cube && has_vector_consumer) {
+          request_multiplicity *= streamed_pass_uses(info.id);
         }
         // A broadcast along the vector stage's partitioned axis is reloaded
         // by every partition. The orthogonal sink partition is already the
@@ -8988,18 +9620,6 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
               : bytes;
       (info.is_mm_out ? l0c_gm_bytes : ub_gm_bytes) += output_bytes;
     }
-  }
-  if (streamed_softmax_to_cube &&
-      vector_to_cube_stream.p4_recipe) {
-    // The ordinary boundary-load loop accounts for one pass. Online softmax
-    // reloads its source for the APPLY pass after STATS has produced the
-    // persistent row state; the generated source publishes probabilities to
-    // the FIFO instead of storing them as a homogeneous boundary output.
-    const Tensor& input = prob_->tensors[
-        vector_to_cube_stream.p4_recipe->input_tensor];
-    gm_ub_bytes +=
-        static_cast<double>(input.height * input.width) *
-        static_cast<double>(dtype_bytes(input.dtype)) * vector_replay;
   }
   for (auto t : ephemeral_) {
     if (exact_source_mixed) continue;  // exact plan FIFOs below
@@ -9078,8 +9698,9 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
     }
     for (const MixedFifoPlan& fifo : schedule.fifos) {
       const int64_t stream_messages =
-          streamed_softmax_to_cube &&
-                  fifo.direction == MixedTransferDirection::VectorToCube
+          streamed_vector_to_cube &&
+                  fifo.pipe_id ==
+                      static_cast<int>(*streamed_vector_to_cube_transfer())
               ? vector_to_cube_stream.full_chunks +
                     (vector_to_cube_stream.tail > 0 ? 1 : 0)
               : 1;
@@ -9311,7 +9932,7 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
                 &buildable_cube_windows);
   }
   const int64_t buildable_cube_window =
-      streamed_softmax_to_cube
+      streamed_vector_to_cube
           ? vector_to_cube_stream.chunk
           : (sink_mm_op_ >= 0 &&
                      static_cast<size_t>(sink_mm_op_) <
@@ -9546,7 +10167,7 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   if (pk.empty()) {
     derive_exec(cfg, output_K_, retained_from_prev, retain_these, &pk);
   }
-  if (streamed_softmax_to_cube) {
+  if (streamed_vector_to_cube) {
     result.config.k = vector_to_cube_stream.chunk;
     result.num_k_passes = static_cast<int>(
         vector_to_cube_stream.full_chunks +
@@ -9743,10 +10364,19 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
 
 MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
   MixedSweepFeasibility best;
+  std::map<std::string, int64_t> rejection_counts;
   int64_t best_excess = std::numeric_limits<int64_t>::max();
   int64_t best_required = std::numeric_limits<int64_t>::max();
   auto consider = [&](const MixedSweepFeasibility& current) {
-    if (!current.capacity_evaluated) return;
+    if (!current.rejection_code.empty())
+      ++rejection_counts[current.rejection_code];
+    if (!current.capacity_evaluated) {
+      if (!best.capacity_evaluated && best.rejection_code.empty() &&
+          !current.rejection_code.empty()) {
+        best = current;
+      }
+      return;
+    }
     const TileConfig& cfg = current.closest_config;
     const int64_t excess =
         std::max<int64_t>(0, current.required_vec_bytes -
@@ -9824,5 +10454,6 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
       if (!recorded_source_rejection) consider(current);
     }
   }
+  best.rejection_counts = std::move(rejection_counts);
   return best;
 }

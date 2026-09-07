@@ -1185,10 +1185,10 @@ static void test_mixed_mm_pw_variants() {
     {
         Problem p = mk(256, 256, 128, 1);
         DAG dag = DAG::build(p);
-        auto fr = Ascend910BMixed::create(p, dag, {0, 1})->best_cost();
+        auto mixed = Ascend910BMixed::create(p, dag, {0, 1});
+        auto fr = mixed->best_cost();
         auto mm = Subgraph::create(p, dag, {0})->best_cost();
         auto pw = Subgraph::create(p, dag, {1})->best_cost();
-        const int rounds = (fr.num_spatial_tiles + p.num_cube_cores - 1) / p.num_cube_cores;
         // Grounded DDR is charged at the GM->L1 feed bandwidth (the mixed model lumps
         // all ddr bytes onto bc.reload); cost-per-byte = freq / (2^30 * bw_gm_l1).
         auto cpb = [&](double bw) { return p.cube_freq_hz / (1024.0 * 1024.0 * 1024.0 * bw); };
@@ -1198,8 +1198,22 @@ static void test_mixed_mm_pw_variants() {
                   << " ddr=" << fr.ddr_traffic << " tiles=" << fr.num_spatial_tiles
                   << "  | separated mm.ddr=" << mm.ddr_traffic << " pw.ddr=" << pw.ddr_traffic << "\n";
         CHECK("MIXVAR: memory-bound MM->PW is DDR-bound", !fr.compute_bound);
-        CHECK("MIXVAR: DDR-bound latency = ddr + rounds*fill (compute hidden)",
-              std::abs(fr.latency - (fr.ddr_traffic + rounds * (double)p.kernel_fill_cost)) < 1.0);
+        const auto candidates = mixed->enumerate_mixed_group_costs(fr.config);
+        const auto selected = std::find_if(
+            candidates.begin(), candidates.end(), [&](const auto& candidate) {
+              return candidate.breakdown.active_groups ==
+                     fr.mixed_active_groups;
+            });
+        CHECK("MIXVAR: typed breakdown closes the selected mixed latency",
+              selected != candidates.end() && selected->cost.feasible &&
+                  selected->breakdown.feasible &&
+                  std::abs(selected->cost.latency - fr.latency) < 1.0 &&
+                  std::abs(selected->breakdown.total_cycles - fr.latency) <
+                      1.0 &&
+                  std::abs(selected->breakdown.total_cycles -
+                           (selected->breakdown.pipeline_wall_cycles +
+                            selected->breakdown.kernel_fill_cycles +
+                            selected->breakdown.group_overhead_cycles)) < 1.0);
         // Under the grounded port-split the crossing roundtrip does NOT sum onto one ddr
         // port: the C write (L0C->GM) and C read (GM->UB) ride SEPARATE overlapping pipes,
         // and ddr_traffic is the MAX over the four ports — so it stays BELOW both the old
@@ -1588,7 +1602,8 @@ static void test_mixed_schedule_plan() {
                 plan.fifos[0].valid_cols > 0 &&
                 plan.fifos[0].slot_bytes ==
                     plan.fifos[0].valid_rows * plan.fifos[0].valid_cols * 4 &&
-                plan.fifos[0].slot_count == 8);
+                plan.fifos[0].slot_count ==
+                    (plan.loop.pipeline_stages > 1 ? 8 : 1));
     }
   }
 
@@ -1659,8 +1674,16 @@ static void test_mixed_schedule_plan() {
     too_wide.tensors = {{64, 128}, {128, 64}, {128, 1}, {128, 128}, {128, 128}};
     DAG too_wide_dag = DAG::build(too_wide);
     auto too_wide_mixed = Ascend910BMixed::create(too_wide, too_wide_dag, {0, 1});
-    CHECK("MIXPLAN: oversized eight-slot FIFO candidate is rejected",
-          too_wide_mixed && !too_wide_mixed->mixed_schedule_plan(TileConfig{128, 64, 64, 2, 1, 1}).feasible);
+    const auto too_wide_plan =
+        too_wide_mixed
+            ? too_wide_mixed->mixed_schedule_plan(
+                  TileConfig{128, 64, 64, 2, 1, 1})
+            : MixedSchedulePlan{};
+    CHECK("MIXPLAN: one-trip C->V avoids an unused deep FIFO ring",
+          too_wide_mixed && too_wide_plan.feasible &&
+              too_wide_plan.loop.pipeline_stages == 1 &&
+              too_wide_plan.fifos.size() == 1 &&
+              too_wide_plan.fifos[0].slot_count == 1);
 
     Problem large_k = p;
     large_k.tensors = {{8192, 192}, {256, 8192}, {256, 1}, {256, 192}, {256, 192}};
@@ -1904,7 +1927,7 @@ static void test_mixed_schedule_plan() {
     if (mixed) {
       auto plan = mixed->mixed_schedule_plan(
           TileConfig{64, 64, 128, 2, 2, 1});
-      CHECK("MIXPLAN: branched round trip serializes both typed FIFO bundles",
+      CHECK("MIXPLAN: branched round trip records both bundles in stage order",
             plan.feasible && plan.emit_compatible &&
                 plan.source_codegen_ready &&
                 plan.protocol ==

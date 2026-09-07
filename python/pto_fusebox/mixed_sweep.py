@@ -112,6 +112,12 @@ class MixedGroupSweepAvailability:
     reason: str | None
     selected_step_kinds: tuple[str, ...]
     selected_partition: tuple[tuple[int, ...], ...]
+    protocol: str | None = None
+    topology_stages: int | None = None
+    transfers: int | None = None
+    vector_to_cube_transfers: int | None = None
+    cube_to_vector_transfers: int | None = None
+    rejection_counts: Mapping[str, int] | None = None
     closest_tile: MixedGroupTile | None = None
     required_vec_bytes: int | None = None
     available_vec_bytes: int | None = None
@@ -391,12 +397,34 @@ def _availability_from_payload(
             raise ValueError(f"unavailable mixed sweep has invalid {field}")
         return value
 
+    raw_rejection_counts = payload.get("rejection_counts")
+    rejection_counts = (
+        {
+            str(key): int(value)
+            for key, value in raw_rejection_counts.items()
+            if isinstance(key, str)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+        if isinstance(raw_rejection_counts, Mapping)
+        else None
+    )
+
     return MixedGroupSweepAvailability(
         available=False,
         code=code,
         reason=reason,
         selected_step_kinds=selected_step_kinds,
         selected_partition=selected_partition,
+        protocol=payload.get("protocol")
+        if isinstance(payload.get("protocol"), str)
+        else None,
+        topology_stages=optional_int("topology_stages"),
+        transfers=optional_int("transfers"),
+        vector_to_cube_transfers=optional_int("vector_to_cube_transfers"),
+        cube_to_vector_transfers=optional_int("cube_to_vector_transfers"),
+        rejection_counts=rejection_counts,
         closest_tile=closest_tile,
         required_vec_bytes=optional_int("required_vec_bytes"),
         available_vec_bytes=optional_int("available_vec_bytes"),
@@ -459,7 +487,16 @@ def region_for_mixed_group_candidate(
         and candidate.overlap_implementable
         and plan.get("algorithm") == "generic"
     )
-    launch["cores"] = candidate.groups * 3
+    plan["cube_stage_peak_l1_bytes"] = candidate.cube_stage_peak_l1_bytes
+    plan["cube_stage_peak_l0a_bytes"] = candidate.cube_stage_peak_l0a_bytes
+    plan["cube_stage_peak_l0b_bytes"] = candidate.cube_stage_peak_l0b_bytes
+    plan["source_l1_allocation_bytes"] = candidate.source_l1_allocation_bytes
+    plan["vector_stage_peak_ub_bytes"] = candidate.vector_stage_peak_ub_bytes
+    plan["fifos"] = [dict(fifo) for fifo in candidate.fifos]
+    vector_lanes = plan.get("vector_lanes")
+    if not isinstance(vector_lanes, int) or isinstance(vector_lanes, bool):
+        raise ValueError("mixed candidate solution has no vector lane count")
+    launch["cores"] = candidate.groups * (1 + vector_lanes)
     step["latency_cycles"] = candidate.breakdown.total_cycles
     return replace(
         region,
@@ -798,6 +835,16 @@ def _validate_sweep_against_region(
         }
         for stage in plan.stages
     )
+    if sweep.selected.fifos != expected_fifos:
+        raise ValueError("mixed sweep selected candidate has stale FIFO provenance")
+    expected_fifo_frames = tuple(
+        {
+            key: value
+            for key, value in fifo.items()
+            if key not in {"slot_count", "reserved_bytes"}
+        }
+        for fifo in expected_fifos
+    )
     for candidate in sweep.candidates:
         if candidate.tile != expected_tile:
             raise ValueError(
@@ -810,7 +857,18 @@ def _validate_sweep_against_region(
             raise ValueError(
                 f"mixed candidate {candidate.id} has stale memory provenance"
             )
-        if candidate.fifos != expected_fifos:
+        candidate_fifo_frames = tuple(
+            {
+                key: value
+                for key, value in fifo.items()
+                if key not in {"slot_count", "reserved_bytes"}
+            }
+            for fifo in candidate.fifos
+        )
+        if candidate_fifo_frames != expected_fifo_frames or any(
+            fifo["reserved_bytes"] != fifo["slot_bytes"] * fifo["slot_count"]
+            for fifo in candidate.fifos
+        ):
             raise ValueError(
                 f"mixed candidate {candidate.id} has stale FIFO provenance"
             )

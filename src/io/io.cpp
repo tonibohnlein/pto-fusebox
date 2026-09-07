@@ -1360,6 +1360,29 @@ std::string solution_json(const Solution& sol) {
              {"later_chunks_accumulate",
               mixed_plan.feature_round_trip.later_chunks_accumulate}};
       }
+      json streamed_v2c = nullptr;
+      if (mixed_plan.streamed_v2c.present) {
+        streamed_v2c =
+            {{"producer_stage", mixed_plan.streamed_v2c.producer_stage},
+             {"sink_stage", mixed_plan.streamed_v2c.sink_stage},
+             {"transfer", mixed_plan.streamed_v2c.transfer},
+             {"crossing_tensor", mixed_plan.streamed_v2c.crossing_tensor},
+             {"carried_tensors", mixed_plan.streamed_v2c.carried_tensors},
+             {"contraction_extent",
+              mixed_plan.streamed_v2c.contraction_extent},
+             {"row_chunk", mixed_plan.streamed_v2c.row_chunk},
+             {"row_chunks", mixed_plan.streamed_v2c.row_chunks},
+             {"accumulator_rows", mixed_plan.streamed_v2c.accumulator_rows},
+             {"chunk", mixed_plan.streamed_v2c.chunk},
+             {"full_chunks", mixed_plan.streamed_v2c.full_chunks},
+             {"tail", mixed_plan.streamed_v2c.tail},
+             {"persistent_accumulator_bytes",
+              mixed_plan.streamed_v2c.persistent_accumulator_bytes},
+             {"first_chunk_initializes",
+              mixed_plan.streamed_v2c.first_chunk_initializes},
+             {"later_chunks_accumulate",
+              mixed_plan.streamed_v2c.later_chunks_accumulate}};
+      }
       auto protocol_stage = [](size_t stage) {
         return stage == std::numeric_limits<size_t>::max() ? json(nullptr) : json(stage);
       };
@@ -1409,7 +1432,8 @@ std::string solution_json(const Solution& sol) {
            {"stages", stages},
            {"transfers", transfers},
            {"fifos", fifos},
-           {"feature_round_trip", feature_round_trip}};
+           {"feature_round_trip", feature_round_trip},
+           {"streamed_v2c", streamed_v2c}};
         }
         serialized_step["latency_cycles"] = sol.step_latency(i);
         j["steps"].push_back(std::move(serialized_step));

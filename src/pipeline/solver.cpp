@@ -167,6 +167,31 @@ std::vector<Solution> DeterministicSourceAuditSolutions(
     };
     std::vector<Solution> result;
 
+    // Always audit the maximal static region explicitly. Search is free to
+    // prefer GM cuts, but source users need the buildable whole-region plan in
+    // the public candidate set so they can compare that choice against the
+    // selected partition on silicon. This is deterministic and linear in the
+    // graph size; it does not depend on the evolutionary deadline.
+    {
+        Partition partition;
+        partition.prob = &prob;
+        partition.dag = &dag;
+        partition.cache = cache;
+        FlatSet<size_t> all_ops;
+        for (size_t op = 0; op < prob.num_ops(); ++op) all_ops.insert(op);
+        partition.add_group(all_ops, 1e18);
+        partition.rebuild_index();
+        if (partition.is_acyclic() && !partition_has_gap(partition)) {
+            partition.finalize(cache);
+            Solution candidate =
+                Solution::from_partition(prob, dag, partition, 8, cache);
+            if (candidate.validate().valid &&
+                std::isfinite(candidate.total_latency())) {
+                result.push_back(std::move(candidate));
+            }
+        }
+    }
+
     // Small regions are common at the native-orchestration boundary and are
     // also the ones for which selected-versus-runner-up evidence is most
     // useful. Enumerate their set partitions completely. The previous public
@@ -222,6 +247,13 @@ std::vector<Solution> DeterministicSourceAuditSolutions(
     }
     std::stable_sort(result.begin(), result.end(),
                      SolutionCostThenPartitionLess);
+    result.erase(
+        std::unique(result.begin(), result.end(),
+                    [](const Solution& lhs, const Solution& rhs) {
+                        return SolutionPartitionKey(lhs) ==
+                               SolutionPartitionKey(rhs);
+                    }),
+        result.end());
     return result;
 }
 
@@ -532,9 +564,11 @@ Solution solve(const Problem& prob, const DAG& dag, TimePoint deadline,
             // define the public runner-up set. Publish the selected plan plus
             // the fixed deterministic strategy corpus instead.
             candidate_solutions->push_back(final_sol);
-            candidate_solutions->insert(candidate_solutions->end(),
-                                        deterministic_source_audit.begin(),
-                                        deterministic_source_audit.end());
+            const auto selected_key = SolutionPartitionKey(final_sol);
+            for (const Solution& candidate : deterministic_source_audit) {
+                if (SolutionPartitionKey(candidate) != selected_key)
+                    candidate_solutions->push_back(candidate);
+            }
             if (candidate_solutions->size() > 1) {
                 std::stable_sort(candidate_solutions->begin() + 1,
                                  candidate_solutions->end(),

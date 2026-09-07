@@ -79,6 +79,11 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
         diagnostic.required_l0b_bytes > diagnostic.available_l0b_bytes;
     std::string code = "whole_region_has_no_feasible_mixed_candidate";
     std::string reason = "the complete op set has no feasible mixed candidate";
+    if (!diagnostic.rejection_code.empty()) {
+      code = diagnostic.rejection_code;
+      reason = "the closest legal grid was rejected by " +
+               diagnostic.rejection_code;
+    }
     if (vector_capacity_exceeded || l1_capacity_exceeded ||
         l0a_capacity_exceeded || l0b_capacity_exceeded) {
       code = "mixed_source_memory_capacity_exceeded";
@@ -111,6 +116,12 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
         {"available", false},
         {"code", code},
         {"reason", reason},
+        {"protocol", diagnostic.protocol},
+        {"topology_stages", diagnostic.topology_stages},
+        {"transfers", diagnostic.transfers},
+        {"vector_to_cube_transfers", diagnostic.vector_to_cube_transfers},
+        {"cube_to_vector_transfers", diagnostic.cube_to_vector_transfers},
+        {"rejection_counts", diagnostic.rejection_counts},
     };
     if (diagnostic.capacity_evaluated) {
       unavailable["closest_tile"] = {

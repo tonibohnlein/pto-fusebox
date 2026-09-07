@@ -40,6 +40,39 @@ class SourceCandidateSummary:
     rejection_reason: str | None
 
 
+def region_for_source_candidate(
+    region: RegionSolveResult,
+    candidate: SourceCandidateSummary,
+) -> RegionSolveResult:
+    """Bind one frozen source candidate without invoking the solver again."""
+
+    matching = tuple(
+        item
+        for item in region.candidate_summaries
+        if item.id == candidate.id and item.solution == candidate.solution
+    )
+    if len(matching) != 1:
+        raise ValueError(
+            f"source candidate {candidate.id!r} does not belong to region "
+            f"{region.region.id!r}"
+        )
+    if not candidate.source_ready:
+        raise ValueError(
+            f"source candidate {candidate.id!r} is not source-ready: "
+            f"{candidate.rejection_reason}"
+        )
+    return replace(
+        region,
+        status="solved",
+        solution=candidate.solution,
+        candidate_summaries=(),
+        diagnostics=region.region.diagnostics,
+        stdout="",
+        stderr="",
+        returncode=0,
+    )
+
+
 @dataclass(frozen=True)
 class RegionSolveResult:
     region: SolverRegion
