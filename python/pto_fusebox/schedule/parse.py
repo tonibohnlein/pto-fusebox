@@ -1930,11 +1930,21 @@ def _validate_mixed_contract(  # noqa: PLR0913
         MixedCrossCoreProtocol.SINGLE_ROUND_TRIP_BUNDLE,
         MixedCrossCoreProtocol.BRANCHED_ROUND_TRIP_BUNDLE,
     }:
-        expected_overlap = successor_overlap and not phase_local_vector_pipeline
-        expected_fill_absorbed = (
-            expected_overlap
-            and plan.algorithm is not MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+        # The feature-chunk mechanism publishes two or more independent C2V
+        # values before receiving one V2C reply.  PyPTO's skew transform does
+        # not currently provide an executable overlap contract for that
+        # asymmetric bundle, so source-first plans must keep it sequential.
+        asymmetric_feature_bundle = (
+            plan.algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
+            and len(plan.protocol_producer_bundle) > 1
+            and len(plan.protocol_reply_bundle) == 1
         )
+        expected_overlap = (
+            successor_overlap
+            and not phase_local_vector_pipeline
+            and not asymmetric_feature_bundle
+        )
+        expected_fill_absorbed = expected_overlap
         expected_stages = 3 if expected_overlap else 1
         expected_skew = 2 if expected_overlap else 0
         if (

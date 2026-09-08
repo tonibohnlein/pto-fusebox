@@ -320,9 +320,21 @@ class FlashMtpOverlayProbe:
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
     orchestration_files = list((compiled.output_dir / "orchestration").glob("*.cpp"))
-    assert len(pto_files) == 13
+    assert {path.stem for path in pto_files} == {
+        "fusebox_mtp_combine",
+        "fusebox_mtp_hidden_copy",
+        "fusebox_mtp_hidden_zero",
+        "region0000_cube",
+        "region0000_vector",
+        "region0000_vector_0",
+        "region0001_cube",
+        "region0001_vector",
+        "region0001_vector_0",
+    }
     assert len(orchestration_files) == 1
-    assert orchestration_files[0].read_text(encoding="utf-8").count("rt_submit_") == 13
+    assert orchestration_files[0].read_text(encoding="utf-8").count(
+        "rt_submit_"
+    ) == len(pto_files)
 
     spec = importlib.util.spec_from_file_location("decode_mtp_fusebox", decode_path)
     assert spec is not None and spec.loader is not None
@@ -947,9 +959,10 @@ class ProductionQwenOutputHead:
     orchestration = next(
         (compiled.output_dir / "orchestration").glob("*.cpp")
     ).read_text(encoding="utf-8")
-    assert len(pto_files) == 3
-    assert orchestration.count("rt_submit_aiv_task") == 2
+    assert len(pto_files) == 2
+    assert orchestration.count("rt_submit_aiv_task") == 1
     assert orchestration.count("rt_submit_aic_task") == 1
+    assert "fusebox_qwen_output_window" not in orchestration
     assert "gm_pipe_buffer_" not in orchestration
 
 
@@ -1794,6 +1807,13 @@ def test_mixed_source_lowers_through_the_pypto_split_pipeline(
         assert plan.requested_skew_depth == 0
         assert not plan.overlap_implementable
         assert "pl.range(1, init_values=" in source
+    if name == "mixed_generic_feature_blend":
+        assert plan.pipeline_stages == 1
+        assert plan.requested_skew_depth == 0
+        assert not plan.overlap_implementable
+        assert "pl.pipeline(" not in source
+        assert "for feature, (sink_acc,) in pl.range(" in source
+        assert "init_values=(sink_acc_init,)):" in source
 
 
 def test_streaming_softmax_pv_natural_and_mixed_candidates_lower(
@@ -1891,7 +1911,6 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
     assert region.solution is not None
     scheduled = scheduled_region(region)
     assert [step.kind for step in scheduled.steps] == [
-        KernelKind.CUBE,
         KernelKind.MIXED,
         KernelKind.CUBE,
     ]
@@ -1904,7 +1923,7 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
         for step in scheduled.steps
         if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
     )
-    assert source_l1_bytes == 471_040
+    assert source_l1_bytes == 327_680
     assert source_l1_bytes <= 524_288
     source = emit_pypto_region(
         graph, region, program_name="large_fp32_linear_sink"
@@ -1916,7 +1935,7 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
         skip_ptoas=True,
     )
     pto_files = list(compiled.output_dir.rglob("*.pto"))
-    assert len(pto_files) == len(scheduled.steps) == 3
+    assert len(pto_files) == len(scheduled.steps) == 2
     assert (
         len(list((compiled.output_dir / "passes_dump").glob("*_after_MemoryReuse.py")))
         == 1

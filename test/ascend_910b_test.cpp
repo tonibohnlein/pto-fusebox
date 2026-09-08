@@ -2080,7 +2080,7 @@ static void test_mixed_schedule_plan() {
                 plan.feature_round_trip.producer_window_k ==
                     std::vector<int64_t>({64, 64}) &&
                 plan.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle &&
-                plan.cube_stage_peak_l1_bytes == 49152 &&
+                plan.cube_stage_peak_l1_bytes == 16384 &&
                 plan.topology->protocol.skew_pass_compatible &&
                 plan.topology->protocol.producer_stages == std::vector<size_t>({0, 1}) &&
                 plan.topology->protocol.peer_stage == 2 && plan.topology->protocol.sink_stage == 3 &&
@@ -2088,13 +2088,14 @@ static void test_mixed_schedule_plan() {
                 plan.topology->protocol.reply_bundle_transfers.size() == 1 &&
                 plan.loop.axis == MixedPipelineAxis::IntermediateFeatureChunk && plan.loop.chunk == 32 &&
                 plan.loop.items_per_spatial_tile == 4 && plan.loop.active_groups == 2 &&
-                plan.loop.pipeline_stages == 3 && plan.fifos.size() == 3 && plan.fifos[0].bundle == 0 &&
+                plan.loop.pipeline_stages == 1 && plan.loop.requested_skew_depth == 0 &&
+                plan.fifos.size() == 3 && plan.fifos[0].bundle == 0 &&
                 plan.fifos[1].bundle == 0 && plan.fifos[2].bundle == 1 &&
                 plan.fifos[0].direction == MixedTransferDirection::CubeToVector &&
                 plan.fifos[2].direction == MixedTransferDirection::VectorToCube);
       CHECK("MIXPLAN: feature cost is finite and grants only realizable overlap",
-            cost.feasible && std::isfinite(cost.latency) && plan.model_overlap_granted &&
-                plan.model_overlap_granted == plan.overlap_implementable);
+            cost.feasible && std::isfinite(cost.latency) && !plan.model_overlap_granted &&
+                !plan.overlap_implementable);
 
       // Enumerate every set partition of the four homogeneous stage atoms.
       // Invalid/disconnected groups are discarded by Subgraph::create; every
@@ -2159,7 +2160,7 @@ static void test_mixed_schedule_plan() {
                 std::abs(best_partition_cost - best_fused_cost.latency) < 1e-6);
 
       Problem tight_l1 = p;
-      tight_l1.l1_capacity = 14 * 1024;
+      tight_l1.l1_capacity = plan.fifos.back().reserved_bytes - 1;
       DAG tight_l1_dag = DAG::build(tight_l1);
       auto tight_l1_mixed =
           Ascend910BMixed::create(tight_l1, tight_l1_dag,
@@ -2232,14 +2233,13 @@ static void test_mixed_schedule_plan() {
                 plan.feature_round_trip.producer_window_k ==
                     std::vector<int64_t>({16, 16}) &&
                 plan.cube_stage_peak_l1_bytes ==
-                    3 * (producer_panels + sink_panel));
+                    producer_panels + sink_panel);
       CHECK("MIXPLAN: feature source plan publishes lowered L0 operand peaks",
             plan.cube_stage_peak_l0a_bytes > 0 &&
                 plan.cube_stage_peak_l0b_bytes > 64 * 1024);
 
       Problem target_l0 = p;
-      target_l0.l0_matmul_config.l0a_bytes = 64 * 1024;
-      target_l0.l0_matmul_config.l0b_bytes = 64 * 1024;
+      target_l0.l0_matmul_config.l0b_bytes = 1;
       DAG target_l0_dag = DAG::build(target_l0);
       auto target_l0_mixed = Ascend910BMixed::create(
           target_l0, target_l0_dag, {0, 1, 2, 3});
@@ -2279,7 +2279,9 @@ static void test_mixed_schedule_plan() {
     p.fuse_cube_vector = true;
     p.require_buildable_mixed = true;
     set_910b(p);
-    // This discriminator isolates joint L1 window selection.
+    // This discriminator isolates joint L1 window selection even though the
+    // cross-core feature loop itself is serial.
+    p.l1_capacity = 160 * 1024;
     p.l0_matmul_config.l0a_bytes = 512 * 1024;
     p.l0_matmul_config.l0b_bytes = 512 * 1024;
     DAG dag = DAG::build(p);
@@ -2293,8 +2295,8 @@ static void test_mixed_schedule_plan() {
             plan.feasible && plan.emit_compatible &&
                 plan.feature_round_trip.producer_window_k ==
                     std::vector<int64_t>({64, 256}) &&
-                plan.cube_stage_peak_l1_bytes == 417792 &&
-                plan.cube_stage_peak_l1_bytes + 16384 <= 512 * 1024);
+                plan.cube_stage_peak_l1_bytes == 139264 &&
+                plan.cube_stage_peak_l1_bytes + 16384 <= 160 * 1024);
     }
   }
 

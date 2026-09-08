@@ -39,7 +39,12 @@ static std::vector<int64_t> all_divisors(int64_t n) {
 // (per-direction bandwidths, core clock, L0/vector-register sizes).
 namespace {
 
-constexpr int64_t kFeatureRoundTripPipelineStages = 3;
+// PyPTO's cross-core skew pass only pipelines a loop with one push and one
+// pop.  A feature round trip has a producer bundle (two or more C2V pushes)
+// plus one V2C reply, so PyPTO deliberately lowers it sequentially.  Model and
+// emit that executable contract instead of pricing overlap that cannot be
+// realized.
+constexpr int64_t kFeatureRoundTripPipelineStages = 1;
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
@@ -6222,11 +6227,10 @@ Ascend910BCost::derive_feature_round_trip_resources(
   resources.fifo_reserved_bytes = c2v_fifo_reserved_bytes + v2c_fifo_reserved_bytes;
 
   // The source emitter places every producer operand panel and the sink RHS
-  // inside one outer stage-3 feature pipeline. LowerPipelineLoops therefore
-  // keeps one complete set of those panels live per pipeline slot; they do not
-  // reuse one serial producer bank. Select child windows jointly: windows that
-  // fit separately can overflow the complete outer pipeline, while smaller
-  // windows can keep the same fused candidate source-ready.
+  // inside one serial feature iteration. Select child windows jointly: panels
+  // from the two producer requests and the sink request share the same AIC
+  // arena, so windows that fit separately can still overflow the complete
+  // fused iteration.
   const int64_t sink_operand_bytes = dtype_bytes(feature.sink_operand_dtype);
   const int64_t sink_pipeline_l1_bytes =
       kFeatureRoundTripPipelineStages * cfg.k * np.big *
@@ -6321,8 +6325,8 @@ Ascend910BCost::derive_feature_round_trip_resources(
   }
 
   // The sink projection consumes one complete feature chunk. Its RHS panel is
-  // part of each outer pipeline slot; only its L0C accumulator persists across
-  // feature chunks.
+  // live in the outer serial iteration; only its L0C accumulator persists
+  // across feature chunks.
   const int64_t emitted_pipeline_l1_bytes =
       selected_producer_bytes + sink_pipeline_l1_bytes;
   const int64_t sink_acc_bytes =
@@ -6333,10 +6337,10 @@ Ascend910BCost::derive_feature_round_trip_resources(
   }
   resources.cube_peak_l1_bytes = emitted_pipeline_l1_bytes;
 
-  // Each request is lowered independently, while its own operand buffers are
-  // rotated by the enclosing pipeline. Left/Right allocations can be reused
-  // between topologically ordered requests, so admission takes the maximum
-  // request footprint rather than summing unrelated matmuls.
+  // Each request is lowered independently. Its child K loop may still rotate
+  // operand buffers, while Left/Right allocations can be reused between the
+  // topologically ordered producer and sink requests. Admission therefore
+  // takes the maximum request footprint rather than summing unrelated matmuls.
   for (size_t producer = 0; producer < feature.producer_matmuls.size();
        ++producer) {
     const DType dtype = feature.producer_operand_dtypes[producer];
@@ -8150,8 +8154,8 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     plan.loop.min_trips_per_group = chunks;
     plan.loop.max_trips_per_group = chunks;
     plan.loop.pipeline_stages = kFeatureRoundTripPipelineStages;
-    plan.loop.requested_skew_depth = kFeatureRoundTripPipelineStages - 1;
-    plan.overlap_implementable = plan.emit_compatible && chunks >= 2;
+    plan.loop.requested_skew_depth = 0;
+    plan.overlap_implementable = false;
     plan.model_overlap_granted = plan.overlap_implementable;
     plan.pipeline_fill_absorbed = false;
     plan.vector_stage_kind = resources.vector_kind;
@@ -9207,9 +9211,9 @@ CostResult Ascend910BCost::compute_feature_round_trip_cost(
   const double ub_gm = ub_gm_bytes * bc.ub_out / ub_gm_parallelism;
 
   // Producer/sink matmuls are serial on one AIC, but each ordinary GM->L1
-  // feed overlaps its local Matrix/MTE1 work.  The AIV side is a blocking
-  // pop/compute/push chain. Across feature chunks, the ordered producer bundle
-  // and one reply form the standard successor-item wavefront.
+  // feed overlaps its local Matrix/MTE1 work. The AIV side is a blocking
+  // pop/compute/push chain. PyPTO cannot skew a producer bundle with multiple
+  // pushes, so feature chunks execute in order without cross-chunk overlap.
   const double cube_phase = std::max(cube_compute, gm_l1) + l0c_gm;
   const double vector_phase = gm_ub + vector_compute + ub_gm;
   const double pipeline_wall =

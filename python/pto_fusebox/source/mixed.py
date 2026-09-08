@@ -556,7 +556,13 @@ def _emit_streaming_softmax_v2c(  # noqa: PLR0915 -- typed phase replay.
             input_argument=input_argument,
             prefix="stats_tail",
             rows=fifo.valid_rows,
-            cols=stream.chunk,
+            # Statistics must be reduced over the physical tail itself.  A
+            # full-chunk tensor with only a narrow valid_shape reaches tensor
+            # row-reduction lowering with padded lanes and can corrupt the
+            # online normalizer.  The APPLY publication below deliberately
+            # remains full-width: its padded probability lanes multiply a
+            # zero-padded RHS before entering the cube accumulator.
+            cols=stream.tail,
             row_offset=row,
             col_offset=str(stream.full_chunks * stream.chunk),
             valid_cols=stream.tail,
@@ -1765,6 +1771,10 @@ def _emit_feature_chunk_round_trip(
         or plan.fifos[plan.protocol_reply_bundle[0]].direction
         is not MixedTransferDirection.VECTOR_TO_CUBE
         or any(fifo.slot_count <= 0 for fifo in plan.fifos)
+        or plan.pipeline_stages != 1
+        or plan.requested_skew_depth != 0
+        or plan.overlap_implementable
+        or plan.model_overlap_granted
     ):
         raise SourceEmissionError(
             "mixed plan is not a supported feature-chunk round trip"
@@ -1858,9 +1868,9 @@ def _emit_feature_chunk_round_trip(
     )
     writer.line(
         3,
-        "for feature, (sink_acc,) in pl.pipeline("
+        "for feature, (sink_acc,) in pl.range("
         f"0, {feature.intermediate_extent}, {feature.intermediate_chunk}, "
-        f"stage={plan.pipeline_stages}, init_values=(sink_acc_init,)):",
+        "init_values=(sink_acc_init,)):",
     )
     local: dict[int, str] = {}
     for index, (producer_op, producer) in enumerate(producers):

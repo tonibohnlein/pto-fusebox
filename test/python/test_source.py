@@ -2154,7 +2154,9 @@ def test_feature_round_trip_emits_two_producers_vector_dag_and_sink_accumulator(
     ast.parse(source)
     _assert_single_spmd_grid(source, step.plan.active_groups)
     _assert_pypto_main_mixed_scope(source, step.plan)
-    assert "pl.pipeline(0, 128, 64, stage=3" in source
+    assert "pl.range(0, 128, 64, init_values=(sink_acc_init,))" in source
+    assert step.plan.pipeline_stages == 1
+    assert not step.plan.overlap_implementable
     assert source.count("pl.tensor.matmul(") == 3
     assert source.count("pl.tensor.matmul_acc(") == 1
     assert "pl.tensor.recip(" in source
@@ -2719,6 +2721,10 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     assert source.count("pl.tensor.matmul_acc(") == 2
     assert "apply_tail" in source
     assert f"valid_shape=[16, {apply_phase.tail.extent}]" in source
+    assert (
+        f"stats_tail_input = pl.tensor.slice(arg_scores, [16, {apply_phase.tail.extent}]"
+        in source
+    )
     assert "stats_result_max = stats_tail_next_max" not in source
     assert "stats_result_sum = stats_tail_next_sum" not in source
     assert "pl.tensor.row_expand_sub(apply_input, stats_tail_next_max)" in source

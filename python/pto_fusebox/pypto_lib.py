@@ -9,12 +9,14 @@ access and routing remain owned by PyPTO-lib.
 from __future__ import annotations
 
 import ast
+import copy
 import keyword
 import math
 from dataclasses import dataclass
 
 from .ir import Dimension, NormalizedGraph, NormalizedOp
 from .solver import SolveResult
+from .schedule import CubeKernelPlan, KernelKind, scheduled_region
 from .source import (
     EmittedPyPTOCallable,
     SourceEmissionError,
@@ -215,10 +217,10 @@ def emit_qwen_output_head_overlay(
 
     Fusebox receives one production-size static graph and owns every fusion,
     tiling, and cut decision inside it. The wrapper preserves PyPTO-lib's
-    dynamic row-window ABI by copying only ``valid_rows`` from the static
-    physical frame into the caller-owned output tensor. Rows outside that
-    logical prefix are outside the callable's result contract; native
-    orchestration may reuse, ignore, or populate them independently.
+    dynamic row-window ABI by draining the persistent cube accumulator directly
+    into the caller-owned output tensor. Only ``valid_rows`` belong to the
+    callable's result contract; native orchestration may reuse, ignore, or
+    populate rows outside that logical prefix independently.
     """
 
     if not module_name or any(
@@ -244,12 +246,31 @@ def emit_qwen_output_head_overlay(
         )
     output_head = bundle.callables[0]
     bindings = _qwen_output_head_bindings(graph, output_head)
+    schedule = scheduled_region(result.regions[0])
+    cube_plans = tuple(
+        step.plan
+        for step in schedule.steps
+        if step.kind is KernelKind.CUBE and isinstance(step.plan, CubeKernelPlan)
+    )
+    if len(cube_plans) != 1:
+        raise SourceEmissionError(
+            "Qwen output-head overlay requires one cube execution plan"
+        )
+    sink_matmuls = tuple(matmul for matmul in cube_plans[0].matmuls if matmul.is_sink)
+    if len(sink_matmuls) != 1:
+        raise SourceEmissionError("Qwen output-head overlay requires one sink matmul")
+    sink = sink_matmuls[0]
     functions = [
-        _callable_function(output_head),
+        _qwen_output_window_function(
+            output_head,
+            output_cols=152064,
+            tile_cols=sink.final_drain.valid_cols,
+            expected_drains=sink.final_drain.tile_count,
+        ),
         ast.parse(
             _qwen_output_head_wrapper_source(
                 output_head.function_name,
-                bindings,
+                (*bindings, "out", "row_offset", "valid_rows"),
             )
         ).body[0],
     ]
@@ -649,7 +670,7 @@ def _qwen_output_head_bindings(
     output = values[emitted.output_arguments[0].value_id]
     if tuple(output.shape) != (16, 152064) or output.dtype != "float32":
         raise SourceEmissionError("Qwen output-head output must be FP32[16,152064]")
-    return tuple([*arguments, "static_output"])
+    return tuple(arguments)
 
 
 def _callable_function(emitted: EmittedPyPTOCallable) -> ast.FunctionDef:
@@ -658,6 +679,99 @@ def _callable_function(emitted: EmittedPyPTOCallable) -> ast.FunctionDef:
     if len(functions) != 1:
         raise SourceEmissionError("generated callable module must define one function")
     return functions[0]
+
+
+def _qwen_output_window_function(
+    emitted: EmittedPyPTOCallable,
+    *,
+    output_cols: int,
+    tile_cols: int,
+    expected_drains: int,
+) -> ast.FunctionDef:
+    """Retarget one static output frame to a native runtime row window."""
+
+    if len(emitted.output_arguments) != 1 or tile_cols <= 0 or expected_drains <= 0:
+        raise SourceEmissionError("Qwen output window has an invalid drain contract")
+    output_name = emitted.output_arguments[0].name
+    function = _callable_function(emitted)
+    template = ast.parse(
+        "def f(\n"
+        f"    output: pl.Tensor[[D.batch, {output_cols}], pl.FP32],\n"
+        "    row_offset: pl.Scalar[pl.INDEX],\n"
+        "    valid_rows: pl.Scalar[pl.INDEX],\n"
+        f") -> pl.Tensor[[D.batch, {output_cols}], pl.FP32]:\n"
+        "    pass\n"
+    ).body[0]
+    if not isinstance(template, ast.FunctionDef):
+        raise SourceEmissionError("failed to construct the Qwen output-window ABI")
+    output_parameters = [arg for arg in function.args.args if arg.arg == output_name]
+    if len(output_parameters) != 1:
+        raise SourceEmissionError(
+            "Qwen output callable does not expose its declared output parameter"
+        )
+    output_parameters[0].annotation = copy.deepcopy(template.args.args[0].annotation)
+    function.args.args.extend(copy.deepcopy(template.args.args[1:]))
+    function.returns = copy.deepcopy(template.returns)
+
+    class OutputWindowRewriter(ast.NodeTransformer):
+        def __init__(self) -> None:
+            self.drains = 0
+
+        def visit_Assign(self, node: ast.Assign) -> ast.Assign | list[ast.Assign]:
+            self.generic_visit(node)
+            call = node.value
+            if (
+                not isinstance(call, ast.Call)
+                or ast.unparse(call.func) != "pl.assemble"
+            ):
+                return node
+            if (
+                len(call.args) < 3
+                or not isinstance(call.args[0], ast.Name)
+                or call.args[0].id != output_name
+                or not isinstance(call.args[1], ast.Name)
+                or not isinstance(call.args[2], ast.List)
+                or len(call.args[2].elts) != 2
+                or not isinstance(call.args[2].elts[0], ast.Constant)
+                or call.args[2].elts[0].value != 0
+            ):
+                raise SourceEmissionError(
+                    "Qwen output drain is not relative to its static row frame"
+                )
+            accumulator = call.args[1]
+            trimmed_name = f"{accumulator.id}_valid_rows"
+            trim = ast.Assign(
+                targets=[ast.Name(id=trimmed_name, ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="pl", ctx=ast.Load()),
+                        attr="set_validshape",
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        copy.deepcopy(accumulator),
+                        ast.Name(id="valid_rows", ctx=ast.Load()),
+                        ast.Constant(value=tile_cols),
+                    ],
+                    keywords=[],
+                ),
+            )
+            call.args[1] = ast.Name(id=trimmed_name, ctx=ast.Load())
+            call.args[2].elts[0] = ast.Name(id="row_offset", ctx=ast.Load())
+            self.drains += 1
+            return [ast.copy_location(trim, node), node]
+
+    rewriter = OutputWindowRewriter()
+    function = rewriter.visit(function)
+    if not isinstance(function, ast.FunctionDef):
+        raise SourceEmissionError(
+            "Qwen output-window rewrite changed the callable kind"
+        )
+    if rewriter.drains != expected_drains:
+        raise SourceEmissionError(
+            "Qwen output callable drain count differs from its cube schedule"
+        )
+    return function
 
 
 def _flash_mtp_wrapper_source(
@@ -747,19 +861,7 @@ def rms_lm_head_fp32(
     row_offset: pl.Scalar[pl.INDEX],
     valid_rows: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor[[D.batch, 152064], pl.FP32]:
-    static_output = pl.create_tensor([16, 152064], dtype=pl.FP32)
-    static_output = {generated_name}({generated_call})
-    for output_core in pl.spmd(24, name_hint="fusebox_qwen_output_window"):
-        for output_chunk in pl.range(output_core, 792, 24):
-            output_col = output_chunk * 192
-            output_tile = pl.load(
-                static_output,
-                [0, output_col],
-                [16, 192],
-                valid_shape=[valid_rows, 192],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            pl.store(output_tile, [row_offset, output_col], out)
+    out = {generated_name}({generated_call})
     return out
 """
 

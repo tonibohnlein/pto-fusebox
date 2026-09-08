@@ -323,6 +323,7 @@ def test_feature_round_trip_prices_physical_fp32_c2v_messages() -> None:
     )
     assert len(c2v_fifos) == 2
     assert all(fifo.wire_dtype == "fp32" for fifo in c2v_fifos)
+    assert all(fifo.slot_count == 4 for fifo in plan.fifos)
     crossing_bytes = (
         sum(fifo.slot_bytes for fifo in c2v_fifos)
         * plan.spatial_tiles
@@ -369,13 +370,11 @@ def test_deep_feature_round_trip_prices_whole_program_l1_residency() -> None:
     region = solved.regions[0]
     assert region.solution is not None
     assert tuple(step["kind"] for step in region.solution["steps"]) == (
-        "cube",
         "mixed",
         "cube",
     )
     assert tuple(tuple(step["ops"]) for step in region.solution["steps"]) == (
-        (0, 1),
-        (2, 3),
+        (0, 1, 2, 3),
         (4,),
     )
     assert region.candidate_summaries
@@ -399,9 +398,9 @@ def test_deep_feature_round_trip_prices_whole_program_l1_residency() -> None:
             int(step["plan"].get("source_l1_allocation_bytes", 0))
             for step in region.solution["steps"]
         )
-        == 471_040
+        == 327_680
     )
-    assert ((0, 1), (2, 3), (4,)) in {
+    assert ((0, 1, 2, 3), (4,)) in {
         candidate.partition for candidate in region.candidate_summaries
     }
 
@@ -517,7 +516,7 @@ def test_broader_fp32_feature_round_trip_graphs_are_source_planned(
     assert region.solution is not None
     selected_steps = expected_steps
     if module_factory is StaticFp32DeepLinearBlend and shape == (256, 160, 320):
-        selected_steps = ("cube", "mixed", "cube")
+        selected_steps = ("mixed", "cube")
     assert tuple(step["kind"] for step in region.solution["steps"]) == selected_steps
     assert region.candidate_summaries
     assert region.candidate_summaries[0].selected
@@ -529,12 +528,7 @@ def test_broader_fp32_feature_round_trip_graphs_are_source_planned(
     plans = tuple(step.plan for step in scheduled_region(region).steps)
     mixed_plans = tuple(plan for plan in plans if isinstance(plan, MixedKernelPlan))
     assert len(mixed_plans) == 1
-    expected_algorithm = (
-        MixedAlgorithm.GENERIC
-        if module_factory is StaticFp32DeepLinearBlend and shape == (256, 160, 320)
-        else MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
-    )
-    assert mixed_plans[0].algorithm is expected_algorithm
+    assert mixed_plans[0].algorithm is MixedAlgorithm.FEATURE_CHUNK_ROUND_TRIP
 
 
 @pytest.mark.parametrize(
