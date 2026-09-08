@@ -121,6 +121,9 @@ std::string mixed_group_sweep_json(const Problem& problem, const DAG& dag) {
         {"transfers", diagnostic.transfers},
         {"vector_to_cube_transfers", diagnostic.vector_to_cube_transfers},
         {"cube_to_vector_transfers", diagnostic.cube_to_vector_transfers},
+        {"active_groups", diagnostic.active_groups},
+        {"trips_per_group", diagnostic.trips_per_group},
+        {"pipeline_stages", diagnostic.pipeline_stages},
         {"rejection_counts", diagnostic.rejection_counts},
     };
     if (diagnostic.capacity_evaluated) {

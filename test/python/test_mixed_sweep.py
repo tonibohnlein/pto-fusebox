@@ -26,6 +26,7 @@ from pto_fusebox import (
     MixedGroupSweepUnavailable,
     NormalizedGraph,
     RegionSolveResult,
+    ScheduleContractError,
     can_emit_region,
     emit_pypto_region,
     enumerate_mixed_group_plans,
@@ -393,16 +394,56 @@ def test_deep_feature_round_trip_prices_whole_program_l1_residency() -> None:
         <= 524_288
         for candidate in region.candidate_summaries
     )
-    assert (
-        sum(
-            int(step["plan"].get("source_l1_allocation_bytes", 0))
-            for step in region.solution["steps"]
-        )
-        == 327_680
+    selected_l1_by_step = tuple(
+        int(step["plan"].get("source_l1_allocation_bytes", 0))
+        for step in region.solution["steps"]
     )
+    assert selected_l1_by_step == (235_520, 14_336)
+    assert sum(selected_l1_by_step) == 249_856
     assert ((0, 1, 2, 3), (4,)) in {
         candidate.partition for candidate in region.candidate_summaries
     }
+
+
+def test_mixed_cost_breakdown_rejects_stale_or_impossible_evidence() -> None:
+    _, region, _, _ = _solve_and_sweep(
+        StaticC2VEpilogue(), ((192, 64), (64, 256), (1, 256))
+    )
+    assert region.solution is not None
+
+    stale_groups = copy.deepcopy(region.solution)
+    stale_groups["steps"][0]["plan"]["cost_breakdown"]["active_groups"] += 1
+    with pytest.raises(
+        ScheduleContractError,
+        match="cost_breakdown.active_groups differs from its mixed plan",
+    ):
+        scheduled_region(replace(region, solution=stale_groups))
+
+    negative_bytes = copy.deepcopy(region.solution)
+    negative_bytes["steps"][0]["plan"]["cost_breakdown"]["traffic_bytes"]["gm_l1"] = -1
+    with pytest.raises(
+        ScheduleContractError,
+        match=r"cost_breakdown.traffic_bytes.gm_l1 must be nonnegative",
+    ):
+        scheduled_region(replace(region, solution=negative_bytes))
+
+    stale_total = copy.deepcopy(region.solution)
+    stale_total["steps"][0]["plan"]["cost_breakdown"]["total_cycles"] += 1
+    with pytest.raises(
+        ScheduleContractError,
+        match=r"cost_breakdown.total_cycles differs from",
+    ):
+        scheduled_region(replace(region, solution=stale_total))
+
+    impossible_pipeline_wall = copy.deepcopy(region.solution)
+    breakdown = impossible_pipeline_wall["steps"][0]["plan"]["cost_breakdown"]
+    assert breakdown["ddr_wall_cycles"] > 0
+    breakdown["pipeline_wall_cycles"] = breakdown["ddr_wall_cycles"] - 1
+    with pytest.raises(
+        ScheduleContractError,
+        match=r"cost_breakdown.pipeline_wall_cycles is below its DDR wall",
+    ):
+        scheduled_region(replace(region, solution=impossible_pipeline_wall))
 
 
 @pytest.mark.parametrize(
@@ -853,6 +894,18 @@ def test_cvc_one_trip_candidate_is_serial_and_source_ready() -> None:
     forced_plan = scheduled_region(forced).steps[0].plan
     assert isinstance(forced_plan, MixedKernelPlan)
     assert forced_plan.pipeline_stages == 1
+    forced_breakdown = forced_plan.cost_breakdown
+    assert forced_breakdown.active_groups == one_trip.groups
+    assert forced_breakdown.trips_per_group == one_trip.trips_per_group
+    assert forced_breakdown.pipeline_stages == one_trip.pipeline_stages
+    assert forced_breakdown.overlap_implementable is one_trip.overlap_implementable
+    assert forced_breakdown.total_cycles == one_trip.breakdown.total_cycles
+    assert dict(forced_breakdown.traffic_bytes) == {
+        "gm_l1": one_trip.breakdown.gm_l1_bytes,
+        "gm_ub": one_trip.breakdown.gm_ub_bytes,
+        "l0c_gm": one_trip.breakdown.l0c_gm_bytes,
+        "ub_gm": one_trip.breakdown.ub_gm_bytes,
+    }
     assert can_emit_region(graph, forced)
     source = emit_pypto_region(graph, forced, program_name="mixed_cvc_one_trip").source
     assert "pl.range(1, init_values=" in source

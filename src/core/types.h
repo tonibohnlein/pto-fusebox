@@ -1030,6 +1030,17 @@ enum class CubeSpatialPolicy {
     ClampedOverlap,
 };
 
+// A logical output grid may contain more regions than physical AICs.  Rather
+// than requesting one hardware task per region, replay the disjoint regions
+// grid-stride over a bounded physical launch.  This separates output-tile
+// granularity from core allocation and lets search consider narrow drains
+// without pretending the target has hundreds of cube cores.
+struct CubeSpatialReplayPlan {
+  bool present = false;
+  int64_t active_tasks = 0;
+  int64_t trips_per_task = 0;
+};
+
 // The solver-owned algorithm descriptor for a homogeneous cube subgraph at one
 // fixed TileConfig and split-K factor. Like VectorStreamPlan, this is rebuilt
 // only for a winning/forced solution; it is deliberately absent from
@@ -1046,6 +1057,7 @@ struct CubeSchedulePlan {
     int64_t spatial_tiles = 0;
     int64_t split_k = 1;
     int64_t work_units = 0;
+    CubeSpatialReplayPlan spatial_replay;
     int64_t peak_l1_bytes = 0;
     // Total Mat/L1 allocation footprint emitted for this task body. The
     // homogeneous emitter lowers its sequential requests in one reusable Mat
@@ -1298,6 +1310,9 @@ struct MixedStreamedV2CPlan {
 // vector and cube plans.
 struct MixedSchedulePlan {
   bool feasible = false;
+  // First stable reason recorded when a concrete schedule cannot be formed.
+  // Kept out of hot-path selection; developer sweeps surface it verbatim.
+  std::string rejection_code;
   bool emit_compatible = false;
   // True only when this selected analytic plan carries a complete stage/FIFO
   // contract that a source backend can consume without re-planning. Analytic
@@ -1384,12 +1399,24 @@ struct CostResult {
                                  // base lone-matmul or mixed cube-sink) — NOT yet emittable.
 };
 
+// Diagnostic-only record for one enumerated homogeneous cube point.  The
+// solver hot path keeps using CostResult; sweeps retain rejected points so a
+// missing realization is observable instead of looking like a ranking choice.
+struct CubePlanCandidateDiagnostic {
+  TileConfig config;
+  CostResult cost;
+  std::string rejection_code;
+};
+
 // Developer-facing mixed-candidate decomposition. This stays out of
 // CostResult because that value occupies the million-entry local-search cache.
 // Every field is reconstructed by the production cost path; the diagnostic
 // sweep never re-prices a candidate in Python.
 struct MixedCostBreakdown {
     bool feasible = false;
+    // Empty for a priced candidate. Diagnostic callers retain the first
+    // candidate-local reason when costing cannot be completed.
+    std::string rejection_code;
     int64_t active_groups = 0;
     int64_t trips_per_group = 0;
     int64_t pipeline_stages = 0;
@@ -1434,6 +1461,9 @@ struct MixedSweepFeasibility {
   int64_t transfers = 0;
   int64_t vector_to_cube_transfers = 0;
   int64_t cube_to_vector_transfers = 0;
+  int64_t active_groups = 0;
+  int64_t trips_per_group = 0;
+  int64_t pipeline_stages = 0;
   std::map<std::string, int64_t> rejection_counts;
   TileConfig closest_config;
   int64_t required_vec_bytes = 0;

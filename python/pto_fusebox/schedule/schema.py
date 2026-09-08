@@ -471,6 +471,13 @@ class CubeAivZeroSeedThenAtomicPlan:
 
 
 @dataclass(frozen=True)
+class CubeSpatialReplayPlan:
+    present: bool
+    active_tasks: int
+    trips_per_task: int
+
+
+@dataclass(frozen=True)
 class CubeKernelPlan:
     emit_compatible: bool
     spatial_policy: CubeSpatialPolicy
@@ -479,6 +486,7 @@ class CubeKernelPlan:
     spatial_tiles: int
     split_k: int
     work_units: int
+    spatial_replay: CubeSpatialReplayPlan
     peak_l1_bytes: int
     source_l1_allocation_bytes: int
     split_merge_policy: CubeSplitMergePolicy
@@ -561,6 +569,26 @@ class MixedStreamedV2CPlan:
 
 
 @dataclass(frozen=True)
+class MixedCostBreakdownPlan:
+    """Exact production-model explanation for one selected mixed candidate."""
+
+    active_groups: int
+    trips_per_group: int
+    pipeline_stages: int
+    overlap_implementable: bool
+    cube_phase_cycles: float
+    vector_phase_cycles: float
+    traffic_bytes: tuple[tuple[str, float], ...]
+    effective_parallelism: tuple[tuple[str, float], ...]
+    traffic_cycles: tuple[tuple[str, float], ...]
+    ddr_wall_cycles: float
+    pipeline_wall_cycles: float
+    kernel_fill_cycles: float
+    group_overhead_cycles: float
+    total_cycles: float
+
+
+@dataclass(frozen=True)
 class MixedKernelPlan:
     """Solver-owned cross-engine topology, geometry, loop, and FIFO contract."""
 
@@ -608,6 +636,7 @@ class MixedKernelPlan:
     stages: tuple[MixedStagePlan, ...]
     transfers: tuple[MixedTransferPlan, ...]
     fifos: tuple[MixedFifoPlan, ...]
+    cost_breakdown: MixedCostBreakdownPlan
     feature_round_trip: MixedFeatureRoundTripPlan | None
     streamed_v2c: MixedStreamedV2CPlan | None
 

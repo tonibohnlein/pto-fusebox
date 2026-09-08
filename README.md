@@ -51,7 +51,7 @@ The primary targets are:
 - `mlsys`: standalone solver using the homogeneous 910B model;
 - `mlsys_mixed`: standalone solver using the experimental mixed model;
 - `cube_plan_sweep`: enumerate every finite, fixed homogeneous cube-DAG candidate
-  with its modeled cost and ordinary `solution.v8` replay payload; and
+  with its modeled cost and ordinary `solution.v9` replay payload; and
 - `mixed_group_sweep`: enumerate every uniform active-group assignment for the
   model-selected mixed tile with its production pipe/stage cycles, issued bytes,
   and effective-port-parallelism breakdown, or report the exact whole-region
@@ -297,7 +297,7 @@ explicit fan-out, lifetime, and per-consumer FIFO ownership and must not be
 inferred by the emitter.
 
 The C++/Python boundary combines the typed problem descriptor with
-`pto_fusebox.solution.v8`: C++ owns the selected launch, order, loops, physical
+`pto_fusebox.solution.v9`: C++ owns the selected launch, order, loops, physical
 frames, lifetimes, and memory policy, while the problem retains the region ABI
 and output-allocation lineage. Python builds one typed emission context from
 both halves and renders it without searching again. The same graph-aware path

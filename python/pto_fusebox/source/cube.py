@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 from ..schedule import CubeKernelPlan
 from ..schedule.schema import (
@@ -16,6 +17,7 @@ from ..schedule.schema import (
 )
 from .common import (
     EmissionContext,
+    Interface,
     SourceEmissionError,
     SourceWriter,
     emit_partition_indices,
@@ -51,13 +53,23 @@ def emit_cube(
         )
     if step.split != plan.split_k:
         raise SourceEmissionError("cube launch split differs from its plan")
+    if (
+        plan.split_k == 1
+        and plan.spatial_tiles > step.cores
+        and not plan.spatial_replay.present
+    ):
+        raise SourceEmissionError(
+            "cube spatial replay is required when the logical grid exceeds "
+            "the physical launch"
+        )
     if plan.split_k > 1:
         return _emit_split_cube_dag(context, program_name, plan)
     if plan.split_merge_policy is not CubeSplitMergePolicy.NONE:
         raise SourceEmissionError("non-split cube plan carries a merge policy")
     matmuls = plan.matmuls
     if (
-        len(matmuls) > 1
+        plan.spatial_replay.present
+        or len(matmuls) > 1
         or plan.resident_boundaries
         or any(
             matmul.output_grid != (1, 1)
@@ -569,22 +581,69 @@ def _emit_full_window_cube_dag(
     each child L0 matmul realization.
     """
 
-    writer = program_header(
-        program_name,
-        context.interface,
-        context.graph,
-        plan.work_units,
-        kernel_name_hint=context.region_id + "_cube",
-    )
+    if plan.spatial_replay.present:
+        replay = plan.spatial_replay
+        if (
+            plan.split_k != 1
+            or replay.active_tasks != context.step.cores
+            or replay.active_tasks * replay.trips_per_task != plan.spatial_tiles
+        ):
+            raise SourceEmissionError(
+                "cube spatial replay does not cover its logical output grid"
+            )
+        writer = program_preamble(program_name, context.interface, context.graph)
+        writer.line(
+            2,
+            f"for cube_task in pl.spmd({replay.active_tasks}, "
+            f"name_hint={context.region_id + '_cube'!r}):",
+        )
+        output_arguments = tuple(context.interface.output_arguments.values())
+        loop_arguments = tuple(f"{argument}_iter" for argument in output_arguments)
+        writer.line(
+            3,
+            f"for cube_trip, ({', '.join(loop_arguments)},) in "
+            f"pl.range({replay.trips_per_task}, "
+            f"init_values=({', '.join(output_arguments)},)):",
+        )
+        writer.line(
+            4,
+            f"region_index = cube_task + cube_trip * {replay.active_tasks}",
+        )
+        loop_interface = Interface(
+            input_arguments=context.interface.input_arguments,
+            output_arguments=dict(
+                zip(context.interface.output_values, loop_arguments, strict=True)
+            ),
+            output_allocation_owners=context.interface.output_allocation_owners,
+        )
+        body_context = replace(context, interface=loop_interface)
+        body_indent = 4
+    else:
+        writer = program_header(
+            program_name,
+            context.interface,
+            context.graph,
+            plan.work_units,
+            kernel_name_hint=context.region_id + "_cube",
+        )
+        body_context = context
+        body_indent = 3
     _emit_cube_dag_body(
         writer,
-        3,
-        context,
+        body_indent,
+        body_context,
         plan,
         split_index="0",
         atomic_sink=False,
         split_sink=None,
     )
+    if plan.spatial_replay.present:
+        output_arguments = tuple(context.interface.output_arguments.values())
+        loop_arguments = tuple(body_context.interface.output_arguments.values())
+        writer.line(
+            body_indent,
+            f"{', '.join(output_arguments)} = pl.yield_({', '.join(loop_arguments)})",
+        )
     emit_return(writer, context.interface)
     return writer.render()
 

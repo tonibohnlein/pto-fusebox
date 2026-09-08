@@ -46,10 +46,11 @@ class FeatureCase:
     name: str
     module: nn.Module
     shapes: tuple[tuple[int, int], ...]
+    corpus: str
 
 
-def _deep_blend() -> StaticFp32DeepLinearBlend:
-    module = StaticFp32DeepLinearBlend(hidden_size=160).eval()
+def _deep_blend(hidden_size: int = 160) -> StaticFp32DeepLinearBlend:
+    module = StaticFp32DeepLinearBlend(hidden_size=hidden_size).eval()
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         module.sink.weight.copy_(
@@ -63,16 +64,40 @@ CASES = (
         "dense_swiglu_64x96x192",
         StaticFp32DenseSwiGlu().eval(),
         ((64, 96), (96, 192), (96, 192), (192, 96)),
+        "calibration",
     ),
     FeatureCase(
         "feature_blend_128x128x256",
         StaticFp32FeatureBlend().eval(),
         ((128, 128), (128, 256), (128, 256), (256, 128)),
+        "calibration",
     ),
     FeatureCase(
         "deep_linear_blend_256x160x320",
         _deep_blend(),
         ((256, 160), (160, 320), (160, 320), (320, 160)),
+        "calibration",
+    ),
+    # Frozen before the next silicon run.  These shapes deliberately change
+    # row work, hidden width, and feature expansion independently; they are
+    # held out from any future coefficient choice.
+    FeatureCase(
+        "dense_swiglu_holdout_96x128x256",
+        StaticFp32DenseSwiGlu().eval(),
+        ((96, 128), (128, 256), (128, 256), (256, 128)),
+        "holdout",
+    ),
+    FeatureCase(
+        "feature_blend_holdout_192x96x288",
+        StaticFp32FeatureBlend().eval(),
+        ((192, 96), (96, 288), (96, 288), (288, 96)),
+        "holdout",
+    ),
+    FeatureCase(
+        "deep_linear_blend_holdout_128x192x384",
+        _deep_blend(192),
+        ((128, 192), (192, 384), (192, 384), (384, 192)),
+        "holdout",
     ),
 )
 
@@ -238,6 +263,7 @@ def test_selected_feature_plan_against_best_alternative(
             {
                 "device": _device_id(),
                 "case": case.name,
+                "corpus": case.corpus,
                 "selected_candidate": candidates[0].id,
                 "selected_partition": candidates[0].partition,
                 "selected_modeled_cycles": candidates[0].modeled_cost_cycles,

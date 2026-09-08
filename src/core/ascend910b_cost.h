@@ -275,11 +275,25 @@ public:
   // hot path.
   std::vector<std::pair<TileConfig, CostResult>> enumerate_plans() const;
 
+  // Enumerate the same homogeneous-cube grid while retaining rejected points
+  // and a stable first-failure code. This is a reporting API, not a search
+  // input, and therefore cannot affect candidate selection.
+  std::vector<CubePlanCandidateDiagnostic> diagnose_cube_plans() const;
+
   // Enumerate every uniform active-group divisor for one concrete mixed tile
   // configuration, including the production per-pipe and launch breakdown.
   // This is diagnostic/model-grounding API and is never used by local search.
   std::vector<MixedGroupCostCandidate> enumerate_mixed_group_costs(
       const TileConfig &cfg,
+      const FlatSet<size_t> &retained_from_prev = {},
+      const FlatSet<size_t> &retain_these = {}) const;
+
+  // Reconstruct the exact four-port and phase breakdown for one concrete
+  // mixed candidate.  Candidate-summary serialization uses this diagnostic
+  // path after search; keeping it here avoids adding wide traffic fields to
+  // CostResult, which is stored in the local-search hot cache.
+  std::optional<MixedCostBreakdown> mixed_cost_breakdown(
+      const TileConfig &cfg, int64_t active_groups,
       const FlatSet<size_t> &retained_from_prev = {},
       const FlatSet<size_t> &retain_these = {}) const;
 

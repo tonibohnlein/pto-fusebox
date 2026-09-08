@@ -432,11 +432,18 @@ def test_cube_solution_emits_exact_spatial_and_k_window_schedule() -> None:
     _assert_single_spmd_grid(source, 12)
     assert "region_row = m_index * 32" in source
     assert "region_col = n_index * 64" in source
-    assert "for k_window in pl.pipeline(1, 3, stage=2):" in source
+    k_loop = step.plan.matmuls[0].k_loop
+    assert k_loop.full_chunks * k_loop.chunk + k_loop.tail == 256
+    assert k_loop.pipeline_stages == 2
+    assert f"for k_window in pl.pipeline(1, {k_loop.full_chunks}, stage=2):" in source
     assert source.count("pl.tile.matmul(") == 1
-    assert source.count("pl.tile.matmul_acc(") == 2
-    assert "[region_row, 240], [32, 16]" in source
-    assert "[240, region_col], [16, 64]" in source
+    expected_accumulate_sites = int(k_loop.full_chunks > 1) + int(k_loop.tail > 0)
+    assert source.count("pl.tile.matmul_acc(") == expected_accumulate_sites
+    assert f"k_window * {k_loop.chunk}" in source
+    if k_loop.tail:
+        tail_offset = k_loop.full_chunks * k_loop.chunk
+        assert f"[region_row, {tail_offset}]" in source
+        assert f"[{tail_offset}, region_col]" in source
     assert source.count("pl.store(") == 1
     assert "auto_fuse" not in source and "auto_tile" not in source
 
@@ -2018,6 +2025,9 @@ def test_one_way_c2v_replays_frozen_group_count_controls(
     inconsistent_plan["overlap_implementable"] = inconsistent_overlap
     inconsistent_plan["pipeline_stages"] = 2 if inconsistent_overlap else 1
     inconsistent_plan["requested_skew_depth"] = 1 if inconsistent_overlap else 0
+    inconsistent_breakdown = inconsistent_plan["cost_breakdown"]
+    inconsistent_breakdown["overlap_implementable"] = inconsistent_overlap
+    inconsistent_breakdown["pipeline_stages"] = inconsistent_plan["pipeline_stages"]
     with pytest.raises(
         ScheduleContractError,
         match="one-way pipeline depth differs from its successor loop",
@@ -2095,6 +2105,7 @@ def test_cvc_replays_frozen_group_count_controls(
     inconsistent_plan["model_overlap_granted"] = inconsistent_overlap
     inconsistent_plan["overlap_implementable"] = inconsistent_overlap
     inconsistent_plan["pipeline_fill_absorbed"] = inconsistent_overlap
+    inconsistent_plan["cost_breakdown"]["overlap_implementable"] = inconsistent_overlap
     with pytest.raises(
         ScheduleContractError,
         match="round-trip pipeline differs from its successor loop",
@@ -2651,6 +2662,11 @@ def test_one_way_v2c_replays_a_frozen_stage_two_group_loop() -> None:
     plan["requested_skew_depth"] = 1
     plan["model_overlap_granted"] = True
     plan["overlap_implementable"] = True
+    breakdown = plan["cost_breakdown"]
+    breakdown["active_groups"] = 1
+    breakdown["trips_per_group"] = 2
+    breakdown["pipeline_stages"] = 2
+    breakdown["overlap_implementable"] = True
     step["launch"]["cores"] = 3
 
     forced = replace(result, solution=solution)
@@ -2729,6 +2745,18 @@ def test_streaming_softmax_to_pv_replays_one_typed_publication_loop() -> None:
     assert "stats_result_sum = stats_tail_next_sum" not in source
     assert "pl.tensor.row_expand_sub(apply_input, stats_tail_next_max)" in source
     assert "pl.tensor.row_expand_div(apply_tensor_3, stats_tail_next_sum)" in source
+    assert (
+        "apply_tail_probability_padded = pl.tensor.fillpad(apply_tail_tensor_5, "
+        "pad_value=pl.PadValue.zero)"
+    ) in source
+    assert (
+        "pl.tensor.matmul_acc(sink_acc_next, apply_tail_probability_published, "
+        "sink_rhs_tail"
+    ) in source
+    assert (
+        "apply_tail_probability_published = pl.tensor.set_validshape("
+        "apply_tail_probability_padded, 16, 64)"
+    ) in source
 
 
 def test_streaming_softmax_to_pv_keeps_phase_local_pipeline_separate() -> None:
@@ -2792,6 +2820,7 @@ def test_one_way_v2c_dual_role_rejects_partitioned_source_contract() -> None:
     plan["spatial_tiles"] = 4
     plan["work_units"] = 4
     plan["active_groups"] = 4
+    plan["cost_breakdown"]["active_groups"] = 4
     plan["pipeline_extent"] = 4
     step["launch"]["parts"] = [2, 2]
     step["launch"]["tile"] = [32, 32, 64]
@@ -3123,6 +3152,7 @@ def _solve_multi_pass_reduction_chain(
         solver_binary=_solver(),
         solver_workers=2,
         require_source_codegen=require_source_codegen,
+        collect_candidate_summaries=require_source_codegen,
     )
     assert solved.regions_solved
     assert len(solved.regions) == 1
@@ -3162,6 +3192,14 @@ def test_general_multi_pass_vector_plan_and_source_replay() -> None:
         (),
     )
     assert plan.full_chunks * plan.chunk + plan.tail == plan.extent
+    assert result.candidate_summaries
+    execution = result.candidate_summaries[0].execution
+    apply = plan.replay_passes[-1]
+    apply_segments = apply.loop.trip_count + int(apply.tail.present)
+    assert execution.drain_sites == len(apply.output_tensors) == 1
+    assert execution.drain_executions == (
+        plan.work_units * apply_segments * len(apply.output_tensors)
+    )
 
     source = emit_pypto_region(
         graph, result, program_name="general_multi_pass_vector"

@@ -24,6 +24,7 @@ from .schema import (
     CubeResidentBoundaryPlan,
     CubeRetainedPanelPlan,
     CubeSpatialPolicy,
+    CubeSpatialReplayPlan,
     CubeSplitMergePolicy,
     CubeTensorRegionPlan,
     KernelKind,
@@ -36,6 +37,7 @@ from .schema import (
     LaunchPlan,
     MixedAlgorithm,
     MixedCrossCoreProtocol,
+    MixedCostBreakdownPlan,
     MixedFeatureRoundTripPlan,
     MixedStreamedV2CPlan,
     MixedEngine,
@@ -207,6 +209,12 @@ def scheduled_region(result: RegionSolveResult) -> ScheduledRegion:
         latency = _finite_number(
             item.get("latency_cycles"), f"steps[{index}].latency_cycles"
         )
+        if isinstance(plan, MixedKernelPlan):
+            _validate_mixed_cost_breakdown_contract(
+                plan,
+                latency=latency,
+                field=f"steps[{index}].plan.cost_breakdown",
+            )
         steps.append(
             KernelStep(
                 index=index,
@@ -1352,6 +1360,7 @@ def _parse_mixed_plan(
         "stages",
         "transfers",
         "fifos",
+        "cost_breakdown",
         "feature_round_trip",
         "streamed_v2c",
     }
@@ -1389,7 +1398,10 @@ def _parse_mixed_plan(
             _sequence(item.get("transfers"), f"{field}.transfers")
         )
     )
-    return MixedKernelPlan(
+    cost_breakdown = _parse_mixed_cost_breakdown(
+        item.get("cost_breakdown"), field=f"{field}.cost_breakdown"
+    )
+    plan = MixedKernelPlan(
         emit_compatible=_bool(item.get("emit_compatible"), f"{field}.emit_compatible"),
         source_codegen_ready=_bool(
             item.get("source_codegen_ready"), f"{field}.source_codegen_ready"
@@ -1522,6 +1534,7 @@ def _parse_mixed_plan(
             )
             for index, fifo in enumerate(_sequence(item.get("fifos"), f"{field}.fifos"))
         ),
+        cost_breakdown=cost_breakdown,
         feature_round_trip=_parse_mixed_feature_round_trip(
             item.get("feature_round_trip"), field=f"{field}.feature_round_trip"
         ),
@@ -1533,6 +1546,153 @@ def _parse_mixed_plan(
             tensor_bound=tensor_bound,
         ),
     )
+    _validate_mixed_cost_breakdown_contract(
+        plan, latency=None, field=f"{field}.cost_breakdown"
+    )
+    return plan
+
+
+def _parse_mixed_cost_breakdown(value: Any, *, field: str) -> MixedCostBreakdownPlan:
+    item = _mapping(value, field)
+    required = {
+        "active_groups",
+        "trips_per_group",
+        "pipeline_stages",
+        "overlap_implementable",
+        "cube_phase_cycles",
+        "vector_phase_cycles",
+        "traffic_bytes",
+        "effective_parallelism",
+        "traffic_cycles",
+        "ddr_wall_cycles",
+        "pipeline_wall_cycles",
+        "kernel_fill_cycles",
+        "group_overhead_cycles",
+        "total_cycles",
+    }
+    _expect_keys(item, required=required, field=field)
+
+    def ports(name: str) -> tuple[tuple[str, float], ...]:
+        values = _mapping(item.get(name), f"{field}.{name}")
+        names = {"gm_l1", "gm_ub", "l0c_gm", "ub_gm"}
+        _expect_keys(values, required=names, field=f"{field}.{name}")
+        return tuple(
+            (port, _finite_number(values.get(port), f"{field}.{name}.{port}"))
+            for port in sorted(names)
+        )
+
+    return MixedCostBreakdownPlan(
+        active_groups=_positive_int(
+            item.get("active_groups"), f"{field}.active_groups"
+        ),
+        trips_per_group=_positive_int(
+            item.get("trips_per_group"), f"{field}.trips_per_group"
+        ),
+        pipeline_stages=_positive_int(
+            item.get("pipeline_stages"), f"{field}.pipeline_stages"
+        ),
+        overlap_implementable=_bool(
+            item.get("overlap_implementable"), f"{field}.overlap_implementable"
+        ),
+        cube_phase_cycles=_finite_number(
+            item.get("cube_phase_cycles"), f"{field}.cube_phase_cycles"
+        ),
+        vector_phase_cycles=_finite_number(
+            item.get("vector_phase_cycles"), f"{field}.vector_phase_cycles"
+        ),
+        traffic_bytes=ports("traffic_bytes"),
+        effective_parallelism=ports("effective_parallelism"),
+        traffic_cycles=ports("traffic_cycles"),
+        ddr_wall_cycles=_finite_number(
+            item.get("ddr_wall_cycles"), f"{field}.ddr_wall_cycles"
+        ),
+        pipeline_wall_cycles=_finite_number(
+            item.get("pipeline_wall_cycles"), f"{field}.pipeline_wall_cycles"
+        ),
+        kernel_fill_cycles=_finite_number(
+            item.get("kernel_fill_cycles"), f"{field}.kernel_fill_cycles"
+        ),
+        group_overhead_cycles=_finite_number(
+            item.get("group_overhead_cycles"), f"{field}.group_overhead_cycles"
+        ),
+        total_cycles=_finite_number(item.get("total_cycles"), f"{field}.total_cycles"),
+    )
+
+
+def _validate_mixed_cost_breakdown_contract(
+    plan: MixedKernelPlan,
+    *,
+    latency: float | None,
+    field: str,
+) -> None:
+    breakdown = plan.cost_breakdown
+    expected_identity = (
+        ("active_groups", breakdown.active_groups, plan.active_groups),
+        ("trips_per_group", breakdown.trips_per_group, plan.max_trips_per_group),
+        ("pipeline_stages", breakdown.pipeline_stages, plan.pipeline_stages),
+        (
+            "overlap_implementable",
+            breakdown.overlap_implementable,
+            plan.overlap_implementable,
+        ),
+    )
+    for name, actual, expected in expected_identity:
+        if actual != expected:
+            raise ScheduleContractError(f"{field}.{name} differs from its mixed plan")
+
+    for name, value in (
+        ("cube_phase_cycles", breakdown.cube_phase_cycles),
+        ("vector_phase_cycles", breakdown.vector_phase_cycles),
+        ("ddr_wall_cycles", breakdown.ddr_wall_cycles),
+        ("pipeline_wall_cycles", breakdown.pipeline_wall_cycles),
+        ("kernel_fill_cycles", breakdown.kernel_fill_cycles),
+        ("group_overhead_cycles", breakdown.group_overhead_cycles),
+        ("total_cycles", breakdown.total_cycles),
+        *tuple(
+            (f"traffic_bytes.{name}", value) for name, value in breakdown.traffic_bytes
+        ),
+        *tuple(
+            (f"traffic_cycles.{name}", value)
+            for name, value in breakdown.traffic_cycles
+        ),
+    ):
+        if value < 0:
+            raise ScheduleContractError(f"{field}.{name} must be nonnegative")
+    for name, value in breakdown.effective_parallelism:
+        if value <= 0:
+            raise ScheduleContractError(
+                f"{field}.effective_parallelism.{name} must be positive"
+            )
+
+    traffic_cycles = dict(breakdown.traffic_cycles)
+    expected_ddr_wall = max(traffic_cycles.values())
+    if not math.isclose(
+        breakdown.ddr_wall_cycles, expected_ddr_wall, rel_tol=1e-12, abs_tol=1e-9
+    ):
+        raise ScheduleContractError(
+            f"{field}.ddr_wall_cycles differs from its port maximum"
+        )
+    if breakdown.pipeline_wall_cycles + 1e-9 < breakdown.ddr_wall_cycles:
+        raise ScheduleContractError(
+            f"{field}.pipeline_wall_cycles is below its DDR wall"
+        )
+    expected_total = (
+        breakdown.pipeline_wall_cycles
+        + breakdown.kernel_fill_cycles
+        + breakdown.group_overhead_cycles
+    )
+    if not math.isclose(
+        breakdown.total_cycles, expected_total, rel_tol=1e-12, abs_tol=1e-9
+    ):
+        raise ScheduleContractError(
+            f"{field}.total_cycles differs from its component sum"
+        )
+    if latency is not None and not math.isclose(
+        breakdown.total_cycles, latency, rel_tol=1e-12, abs_tol=1e-9
+    ):
+        raise ScheduleContractError(
+            f"{field}.total_cycles differs from its step latency"
+        )
 
 
 def _parse_mixed_stage(
@@ -2466,6 +2626,7 @@ def _parse_cube_plan(
             "spatial_tiles",
             "split_k",
             "work_units",
+            "spatial_replay",
             "peak_l1_bytes",
             "source_l1_allocation_bytes",
             "split_merge_policy",
@@ -2535,6 +2696,12 @@ def _parse_cube_plan(
         },
         field=f"{field}.aiv_zero_seed_then_atomic",
     )
+    spatial_replay = _mapping(item.get("spatial_replay"), f"{field}.spatial_replay")
+    _expect_keys(
+        spatial_replay,
+        required={"present", "active_tasks", "trips_per_task"},
+        field=f"{field}.spatial_replay",
+    )
     result = CubeKernelPlan(
         emit_compatible=_bool(item.get("emit_compatible"), f"{field}.emit_compatible"),
         spatial_policy=_enum(
@@ -2551,6 +2718,19 @@ def _parse_cube_plan(
         ),
         split_k=_positive_int(item.get("split_k"), f"{field}.split_k"),
         work_units=_positive_int(item.get("work_units"), f"{field}.work_units"),
+        spatial_replay=CubeSpatialReplayPlan(
+            present=_bool(
+                spatial_replay.get("present"), f"{field}.spatial_replay.present"
+            ),
+            active_tasks=_nonnegative_int(
+                spatial_replay.get("active_tasks"),
+                f"{field}.spatial_replay.active_tasks",
+            ),
+            trips_per_task=_nonnegative_int(
+                spatial_replay.get("trips_per_task"),
+                f"{field}.spatial_replay.trips_per_task",
+            ),
+        ),
         peak_l1_bytes=_nonnegative_int(
             item.get("peak_l1_bytes"), f"{field}.peak_l1_bytes"
         ),
@@ -2995,6 +3175,30 @@ def _validate_cube_contract(
         raise ScheduleContractError(f"{field}.work_units differs from grid times split")
     if launch.cores > plan.work_units:
         raise ScheduleContractError(f"{field} uses more cores than work units")
+    replay = plan.spatial_replay
+    replay_empty = (
+        not replay.present and replay.active_tasks == 0 and replay.trips_per_task == 0
+    )
+    if replay.present:
+        if (
+            plan.split_k != 1
+            or replay.active_tasks != launch.cores
+            or replay.active_tasks <= 0
+            or replay.trips_per_task <= 1
+            or replay.active_tasks * replay.trips_per_task != spatial_tiles
+        ):
+            raise ScheduleContractError(
+                f"{field}.spatial_replay does not cover its logical grid"
+            )
+    elif plan.split_k == 1 and spatial_tiles > launch.cores:
+        raise ScheduleContractError(
+            f"{field}.spatial_replay is required when the logical grid "
+            "exceeds the physical launch"
+        )
+    elif not replay_empty:
+        raise ScheduleContractError(
+            f"{field}.spatial_replay carries values while disabled"
+        )
 
     split = plan.first_partial_then_atomic
     zero_seed = plan.aiv_zero_seed_then_atomic

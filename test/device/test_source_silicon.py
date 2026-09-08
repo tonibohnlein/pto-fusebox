@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import importlib.util
 import os
 import re
 from collections.abc import Callable
@@ -33,6 +34,9 @@ from examples.torch_frontend.static_mixed import (
     StaticFp32FeatureBlend,
 )
 from torch import nn
+from test.device.pypto_softmax_controls import (
+    independent_three_pass_softmax_pv_source,
+)
 
 from pto_fusebox import (
     RegionSolveResult,
@@ -969,3 +973,52 @@ def test_generated_matmul_source_on_silicon(case: SiliconCase, tmp_path: Path) -
 @pytest.mark.parametrize("case", MIXED_CASES, ids=lambda case: case.name)
 def test_generated_mixed_source_on_silicon(case: SiliconCase, tmp_path: Path) -> None:
     _run_case(case, tmp_path)
+
+
+def test_independent_ragged_softmax_control_on_silicon(tmp_path: Path) -> None:
+    """Ground the maximal-softmax discriminator without its online recipe."""
+
+    ir = importlib.import_module("pypto.ir")
+    runtime = importlib.import_module("pypto.runtime")
+    source = independent_three_pass_softmax_pv_source()
+    control_path = tmp_path / "independent_softmax_control.py"
+    control_path.write_text(source)
+    spec = importlib.util.spec_from_file_location(
+        "fusebox_independent_softmax_control", control_path
+    )
+    assert spec is not None and spec.loader is not None
+    control_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control_module)
+    config = runtime.RunConfig(
+        platform=os.environ.get("PTO_FUSEBOX_PLATFORM", "a2a3"),
+        device_id=_device_id(),
+        save_kernels=True,
+        save_kernels_dir=str(tmp_path / "independent_softmax_control"),
+        dump_passes=True,
+    )
+    signatures: set[str] = set()
+    seed_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_SEEDS", "5"))
+    repeat_count = int(os.environ.get("PTO_FUSEBOX_DEVICE_REPEATS", "1"))
+    assert seed_count > 0
+    compiled = None
+    for seed in range(seed_count):
+        scores, value = _random_args((16, 4096), (4096, 64))(seed)
+        expected = torch.mm(torch.softmax(scores, dim=-1), value)
+        output = torch.full((16, 64), torch.nan, dtype=torch.float32)
+        if seed == 0:
+            program = control_module.independent_softmax_pv.specialize(
+                scores, value, output
+            )
+            compiled = ir.compile(program, **config.compile_kwargs())
+        assert compiled is not None
+        compiled(scores, value, output, config=config)
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, rtol=1.0e-4, atol=1.0e-4)
+        if seed == 0:
+            signatures.add(_output_signature(output))
+            for _ in range(repeat_count - 1):
+                repeated = torch.full_like(output, torch.nan)
+                compiled(scores, value, repeated, config=config)
+                torch.testing.assert_close(repeated, expected, rtol=1.0e-4, atol=1.0e-4)
+                signatures.add(_output_signature(repeated))
+    assert len(signatures) == 1

@@ -41,6 +41,11 @@ from examples.torch_frontend.pr2335_vector import (
     build_examples as build_pr2335_examples,
 )
 from examples.torch_frontend.qwen3 import (
+    QWEN_BATCH_TILE,
+    QWEN_PRODUCTION_HIDDEN,
+    QWEN_PRODUCTION_VOCAB,
+    QWEN_VOCAB_CHUNK,
+    Qwen3LmHeadChunk,
     build_examples as build_qwen_examples,
     build_production_qwen_output_head,
 )
@@ -1878,7 +1883,109 @@ def test_streaming_softmax_pv_natural_and_mixed_candidates_lower(
         dump_passes=False,
         skip_ptoas=True,
     )
-    assert len(list(mixed_compiled.output_dir.rglob("*.pto"))) == 1
+    mixed_pto_files = list(mixed_compiled.output_dir.rglob("*.pto"))
+    assert len(mixed_pto_files) == 1
+    mixed_pto = mixed_pto_files[0].read_text()
+    tail_fill = mixed_pto.index("pto.tfillpad")
+    tail_push = mixed_pto.index("pto.tpush_to_aic", tail_fill)
+    tail_publication = mixed_pto[tail_fill:tail_push]
+    assert tail_publication.count("pto.set_validshape") == 2
+    assert "%c64_index" in tail_publication
+    assert "%c192_index" in tail_publication
+
+
+def test_independent_ragged_softmax_control_lowers_through_pypto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the final-PTO discriminator independent of the online emitter."""
+
+    from test.device.pypto_softmax_controls import (
+        independent_three_pass_softmax_pv_source,
+    )
+
+    ir = importlib.import_module("pypto.ir")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    source = independent_three_pass_softmax_pv_source()
+    assert source.count("pl.tensor.row_max(") == 3
+    assert source.count("pl.tensor.row_sum(") == 3
+    assert "valid_shape=[16, 96]" in source
+    control_path = tmp_path / "independent_softmax_control.py"
+    control_path.write_text(source)
+    spec = importlib.util.spec_from_file_location(
+        "fusebox_independent_softmax_control", control_path
+    )
+    assert spec is not None and spec.loader is not None
+    control_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control_module)
+    scores = torch.zeros((16, 4096), dtype=torch.float32)
+    value = torch.zeros((4096, 64), dtype=torch.float32)
+    output = torch.empty((16, 64), dtype=torch.float32)
+    program = control_module.independent_softmax_pv.specialize(scores, value, output)
+    compiled = ir.compile(
+        program,
+        output_dir=str(tmp_path / "independent_softmax_control"),
+        dump_passes=True,
+        skip_ptoas=False,
+    )
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    assert len(pto_files) == 1
+    control_pto = pto_files[0].read_text()
+    tail_fill = control_pto.index("pto.tfillpad")
+    tail_push = control_pto.index("pto.tpush_to_aic", tail_fill)
+    tail_publication = control_pto[tail_fill:tail_push]
+    assert tail_publication.count("pto.set_validshape") == 2
+    assert "%c96_index" in tail_publication
+    assert "%c160_index" in tail_publication
+
+
+def test_qwen_grid_stride_low_drain_candidate_lowers_through_ptoas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compile the native-like logical grid over a bounded AIC launch."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    with torch.device("meta"):
+        module = Qwen3LmHeadChunk(QWEN_PRODUCTION_HIDDEN, QWEN_PRODUCTION_VOCAB)
+        normalized = torch.empty(
+            QWEN_BATCH_TILE, QWEN_PRODUCTION_HIDDEN, dtype=torch.bfloat16
+        )
+    graph = export_and_normalize(module, (normalized,))
+    solved = solve_graph(
+        graph,
+        solver_binary=_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    sweep = enumerate_cube_plans(
+        solved.regions[0], sweep_binary=_solver().parent / "cube_plan_sweep"
+    )
+    candidate = next(
+        item
+        for item in sweep.candidates
+        if (
+            item.grid.parts_m,
+            item.grid.parts_n,
+            item.grid.split_k,
+            item.grid.realized_sequential_k,
+        )
+        == (1, QWEN_PRODUCTION_VOCAB // QWEN_VOCAB_CHUNK, 1, 32)
+    )
+    forced = region_for_cube_candidate(solved.regions[0], candidate)
+    source = emit_pypto_region(graph, forced, program_name="qwen_low_drain").source
+    assert "for cube_task in pl.spmd(24" in source
+    assert "pl.range(33, init_values=(output,))" in source
+    assert "output = pl.yield_(output_iter)" in source
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "qwen_low_drain"),
+        dump_passes=True,
+        skip_ptoas=False,
+    )
+    assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
 
 
 def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
@@ -2556,7 +2663,14 @@ def test_deep_k_no_split_candidate_compiles_through_pypto_and_ptoas(
         sweep_binary=_solver().parent / "cube_plan_sweep",
     )
     no_split = next(
-        candidate for candidate in sweep.candidates if candidate.id == "p1_q1_s1"
+        candidate
+        for candidate in sweep.candidates
+        if (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+        )
+        == (1, 1, 1)
     )
     region = region_for_cube_candidate(unsolved, no_split)
     typed = scheduled_region(region).steps[0]
@@ -2614,7 +2728,11 @@ def test_split_cube_dag_lowers_upstream_and_sink_into_each_atomic_share(
         unsolved,
         sweep_binary=_solver().parent / "cube_plan_sweep",
     )
-    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    candidate = next(
+        item
+        for item in sweep.candidates
+        if (item.grid.parts_m, item.grid.parts_n, item.grid.split_k) == (1, 1, 2)
+    )
     region = region_for_cube_candidate(unsolved, candidate)
     source = emit_pypto_region(graph, region, program_name="split_cube_chain").source
     compiled = ir.compile(

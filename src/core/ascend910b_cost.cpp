@@ -2403,8 +2403,17 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
   // to a single sentinel (cfg.k = output_K_). This is design B: per-op k costs
   // no search (vs ~Dk^(m-1) for a searched per-op k). compute_cost overwrites
   // result.config.k with the derived per-core k for display/emit.
-  if (matmul_910b)
-    sg.ks_cand_ = std::vector<int64_t>{std::max(sg.output_K_, (int64_t)1)};
+  if (matmul_910b) {
+    // Source-first homogeneous cube search co-enumerates an explicit upper
+    // bound for the sequential L1 K window.  Greedily maximizing K can force a
+    // narrow output region into many tiny L0C drains; a smaller legal K window
+    // can keep the same FP32 accumulator while realizing one wider output
+    // tile.  Analytic and mixed search retain their historical single sentinel.
+    sg.ks_cand_ = prob.require_source_codegen && !sg.has_vector_
+                       ? valid_candidates(sg.k_divides_)
+                       : std::vector<int64_t>{
+                             std::max(sg.output_K_, (int64_t)1)};
+  }
 
   // SpatialSchedule grid candidates: balanced ~C-region partitions the uniform
   // exact-divisor tiles cannot express (powers of two only yield power-of-two tile
@@ -2445,6 +2454,24 @@ std::optional<Ascend910BCost> Ascend910BCost::create(const Problem &prob, const 
           region_counts.insert(d);
           region_counts.insert(R / d);
         }
+    // Source-oriented cube search also admits exact multi-wave output grids.
+    // These are logical output regions, not simultaneously active cores: the
+    // source backend replays them grid-stride over at most C physical AICs.
+    // Enumerating products of axis divisors keeps coverage exact and bounded
+    // while exposing native-like narrow output tiles (for example a wide
+    // vocabulary projection) that {C,2C,4C,...} alone cannot represent.
+    if (matmul_910b && prob.require_source_codegen) {
+      const std::vector<int64_t> p_values = all_divisors(maxP);
+      const std::vector<int64_t> q_values = all_divisors(maxQ);
+      for (int64_t P : p_values) {
+        for (int64_t Q : q_values) {
+          const int64_t regions = P * Q;
+          if (regions > 0 && regions <= 64 * C && regions % C == 0) {
+            region_counts.insert(regions);
+          }
+        }
+      }
+    }
     for (int64_t PQ : region_counts) {
       for (int64_t P = 1; P <= PQ; ++P) {
         if (PQ % P != 0) continue;
@@ -4491,6 +4518,14 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
   plan.spatial_tiles = parts_m * parts_n;
   plan.split_k = split;
   plan.work_units = plan.spatial_tiles * split;
+  if (split == 1 && plan.spatial_tiles > prob_->num_cube_cores) {
+    plan.spatial_replay.active_tasks = prob_->num_cube_cores;
+    if (plan.spatial_tiles % plan.spatial_replay.active_tasks == 0) {
+      plan.spatial_replay.present = true;
+      plan.spatial_replay.trips_per_task =
+          plan.spatial_tiles / plan.spatial_replay.active_tasks;
+    }
+  }
   plan.peak_l1_bytes = prob_->use_hierarchical_cube_cost ? 0 : peak;
   if (split <= 1) {
     plan.split_merge_policy = CubeSplitMergePolicy::None;
@@ -4601,6 +4636,14 @@ CubeSchedulePlan Ascend910BCost::derive_cube_schedule_plan(
     if (lone_matmul && node.parallel_sink) {
       window = CappedSinkWindow(mm.contraction, window, split);
       if (window == 0) return CubeSchedulePlan{};
+    }
+    if (lone_matmul && prob_->require_source_codegen && cfg.k > 0) {
+      // Search only publishes exact-divisor caps. Direct diagnostic callers
+      // may still pass the older derived-window sentinel; preserve that
+      // schedule so its precise source-readiness failure remains observable.
+      if (mm.effective_contraction % cfg.k == 0) {
+        window = std::min(window, cfg.k);
+      }
     }
     window = std::min(window, mm.effective_contraction);
     mm.k_loop.l1_window_k = window;
@@ -7771,11 +7814,18 @@ CostResult Ascend910BCost::compute_cost_impl(const TileConfig &cfg,
         const int64_t derive_sink_k = lone_matmul ? output_K_ : output_K_ / chosen_S;
         derive_exec(cfg, derive_sink_k, retained_from_prev, retain_these, &chosen_windows);
       }
-      const int64_t l1_k = (cube_sink_request_node_ >= 0 &&
+      int64_t l1_k = (cube_sink_request_node_ >= 0 &&
                             static_cast<size_t>(cube_sink_request_node_) < chosen_windows.size() &&
                             chosen_windows[static_cast<size_t>(cube_sink_request_node_)] > 0)
                                ? chosen_windows[static_cast<size_t>(cube_sink_request_node_)]
                                : output_K_;
+      // Source-first homogeneous cube search may deliberately cap the
+      // sequential window below the greedy L1 maximum. Preserve that chosen
+      // design variable in CostResult so forced reconstruction and emission
+      // see the same loop that exact hierarchical costing evaluated.
+      if (lone_matmul && prob_->require_source_codegen && cfg.k > 0) {
+        l1_k = std::min(l1_k, cfg.k);
+      }
       if (chosen_S > 1) {
         const int64_t share_k = ((kfrac + chosen_S - 1) / chosen_S) * 16;
         int64_t per_core_k = 16;
@@ -8093,7 +8143,10 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     int64_t active_groups) const {
   MixedSchedulePlan plan;
   plan.config = cfg;
-  if (!(has_matmul_ && has_vector_) || !mixed_topology_) return plan;
+  if (!(has_matmul_ && has_vector_) || !mixed_topology_) {
+    plan.rejection_code = "mixed_topology_missing";
+    return plan;
+  }
   plan.algorithm = mixed_topology_->algorithm;
   plan.protocol = mixed_topology_->protocol.kind;
   plan.mode = mixed_topology_->mode;
@@ -8106,6 +8159,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   if (!is_valid_tiling(cfg) || output_K_ % split != 0 ||
       (vector_to_cube_mask != 0 && split != 1) ||
       !fits_on_chip(cfg, retained_from_prev, retain_these)) {
+    plan.rejection_code = "mixed_base_feasibility_rejected";
     return plan;
   }
 
@@ -8128,6 +8182,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
       (plan.m_partition.parts != 1 || plan.n_partition.parts != 1 ||
        has_unrepresentable_vector_to_cube_multi_role())) {
     plan.feasible = false;
+    plan.rejection_code = "mixed_v2c_dual_role_unrepresentable";
     return plan;
   }
 
@@ -8138,6 +8193,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
         plan.spatial_tiles > plan.group_capacity ||
         (active_groups > 0 && active_groups != plan.spatial_tiles)) {
       plan.feasible = false;
+      plan.rejection_code = "mixed_feature_round_trip_resources_infeasible";
       return plan;
     }
     const MixedFeatureRoundTripTopology& feature =
@@ -8256,6 +8312,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
     if (cols != streamed_v2c.extent || streamed_row_chunk <= 0 ||
         streamed_row_chunk > rows || rows % streamed_row_chunk != 0) {
       plan.feasible = false;
+      plan.rejection_code = "mixed_streamed_row_partition_inexact";
       return plan;
     }
     streamed_row_chunks = rows / streamed_row_chunk;
@@ -8277,6 +8334,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
   if (active_groups < 0 || active_groups > max_groups ||
       (active_groups > 0 && plan.loop.work_items % active_groups != 0)) {
     plan.feasible = false;
+    plan.rejection_code = "mixed_active_groups_do_not_cover_work";
     return plan;
   }
   plan.loop.active_groups = active_groups > 0 ? active_groups : max_groups;
@@ -8341,6 +8399,7 @@ MixedSchedulePlan Ascend910BCost::derive_mixed_schedule_plan(
         derive_exec(cfg, output_K_, retained_from_prev, retain_these,
                     &fifo_cube_windows) == INT64_MAX) {
       plan.feasible = false;
+      plan.rejection_code = "mixed_fifo_cube_execution_unrepresentable";
       return plan;
     }
     for (size_t transfer_index = 0;
@@ -8477,6 +8536,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
                 resources.producer_window_k[producer_index++]);
           } else {
             plan.feasible = false;
+            plan.rejection_code =
+                "mixed_feature_round_trip_cube_stage_unmatched";
             return plan;
           }
         } else {
@@ -8484,6 +8545,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
               *prob_, *dag_, topology_stage.ops, /*allow_mixed=*/false);
           if (!stage_cost) {
             plan.feasible = false;
+            plan.rejection_code =
+                "mixed_feature_round_trip_vector_stage_unrepresentable";
             return plan;
           }
           const TileConfig lane_cfg{cfg.k, stage.valid_rows, cfg.k, 0, 0, 1};
@@ -8540,6 +8603,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
     }
     if (plan.cube_stage_peak_l1_bytes == INT64_MAX) {
       plan.feasible = false;
+      plan.rejection_code = "mixed_cube_execution_unrepresentable";
       return plan;
     }
     if (sink_mm_op_ >= 0 && static_cast<size_t>(sink_mm_op_) < perop_k.size() &&
@@ -8640,6 +8704,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
               *prob_, *dag_, topology_stage.ops, /*allow_mixed=*/false);
           if (!stage_cost) {
             plan.feasible = false;
+            plan.rejection_code = "mixed_vector_stage_unrepresentable";
             return plan;
           }
           stage.vector_stream =
@@ -8671,6 +8736,8 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
                 (source_plan.kind != VectorStreamKind::Materialized &&
                  source_plan.kind != VectorStreamKind::Pointwise)) {
               plan.feasible = false;
+              plan.rejection_code =
+                  "mixed_vector_source_frame_unrepresentable";
               return plan;
             }
             realized_peak = MixedMaterializedSourcePeak(*prob_, source_plan);
@@ -8743,6 +8810,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
               plan.stages[transfer.producer_stage];
           if (!producer_stage.vector_stream.replay_topology) {
             plan.feasible = false;
+            plan.rejection_code = "mixed_carried_replay_topology_missing";
             return plan;
           }
           auto replay = std::make_shared<VectorReplayTopology>(
@@ -8762,6 +8830,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
               if (pass.kind != VectorReplayPassKind::Apply &&
                   !stable_reduction_state) {
                 plan.feasible = false;
+                plan.rejection_code = "mixed_carried_value_not_stable";
                 return plan;
               }
               if (std::find(pass.output_tensors.begin(),
@@ -8776,6 +8845,7 @@ MixedSchedulePlan Ascend910BCost::mixed_schedule_plan(
             }
             if (!published) {
               plan.feasible = false;
+              plan.rejection_code = "mixed_carried_value_not_published";
               return plan;
             }
           }
@@ -9283,8 +9353,10 @@ CostResult Ascend910BCost::compute_mixed_cost(const TileConfig& cfg,
 
   const VectorStreamPlan streamed_vector_to_cube =
       streamed_vector_to_cube_plan(cfg, maximal.vector_lanes);
+  const bool source_oriented =
+      prob_->require_buildable_mixed || prob_->require_source_codegen;
   const bool group_tunable =
-      !streamed_vector_to_cube.feasible &&
+      (!streamed_vector_to_cube.feasible || source_oriented) &&
       (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
        maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle ||
        maximal.protocol == MixedCrossCoreProtocol::BranchedRoundTripBundle);
@@ -9334,9 +9406,11 @@ Ascend910BCost::enumerate_mixed_group_costs(
 
   const VectorStreamPlan streamed_vector_to_cube =
       streamed_vector_to_cube_plan(cfg, maximal.vector_lanes);
+  const bool source_oriented =
+      prob_->require_buildable_mixed || prob_->require_source_codegen;
   const bool group_tunable =
       maximal.algorithm != MixedAlgorithmKind::FeatureChunkRoundTrip &&
-      !streamed_vector_to_cube.feasible &&
+      (!streamed_vector_to_cube.feasible || source_oriented) &&
       (maximal.protocol == MixedCrossCoreProtocol::OneWay ||
        maximal.protocol == MixedCrossCoreProtocol::SingleRoundTripBundle ||
        maximal.protocol == MixedCrossCoreProtocol::BranchedRoundTripBundle);
@@ -9353,6 +9427,21 @@ Ascend910BCost::enumerate_mixed_group_costs(
     }
   }
   return candidates;
+}
+
+std::optional<MixedCostBreakdown> Ascend910BCost::mixed_cost_breakdown(
+    const TileConfig& cfg, int64_t active_groups,
+    const FlatSet<size_t>& retained_from_prev,
+    const FlatSet<size_t>& retain_these) const {
+  if (!is_mixed() || active_groups <= 0) return std::nullopt;
+  MixedCostBreakdown breakdown;
+  const CostResult cost = compute_mixed_cost_for_groups(
+      cfg, retained_from_prev, retain_these, active_groups, &breakdown);
+  if (!breakdown.feasible || !cost.feasible ||
+      !std::isfinite(breakdown.total_cycles)) {
+    return std::nullopt;
+  }
+  return breakdown;
 }
 
 CostResult Ascend910BCost::compute_mixed_cost_for_groups(
@@ -9386,6 +9475,11 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
   if (!schedule.feasible ||
       ((prob_->require_buildable_mixed || prob_->require_source_codegen) &&
        !schedule.source_codegen_ready)) {
+    if (breakdown != nullptr) {
+      breakdown->rejection_code = !schedule.feasible
+                                      ? "mixed_schedule_infeasible"
+                                      : "mixed_source_schedule_not_ready";
+    }
     return result;
   }
   if (schedule.algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip) {
@@ -9850,6 +9944,10 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
       auto stage_cost = Ascend910BCost::create(
           *prob_, *dag_, stage.ops, /*allow_mixed=*/false);
       if (!stage_cost || !stage.vector_stream.feasible) {
+        if (breakdown != nullptr) {
+          breakdown->rejection_code =
+              "mixed_vector_stage_cost_unrepresentable";
+        }
         result.feasible = false;
         result.latency = std::numeric_limits<double>::infinity();
         return result;
@@ -9863,6 +9961,9 @@ CostResult Ascend910BCost::compute_mixed_cost_for_groups(
       const double stage_compute =
           stage_cost->vector_plan_compute_cycles(stage_cfg);
       if (!std::isfinite(stage_compute) || stage_compute <= 0.0) {
+        if (breakdown != nullptr) {
+          breakdown->rejection_code = "mixed_vector_stage_cost_invalid";
+        }
         result.feasible = false;
         result.latency = std::numeric_limits<double>::infinity();
         return result;
@@ -10306,8 +10407,10 @@ CostResult Ascend910BCost::best_cost(const FlatSet<size_t>& retained_from_prev,
   const bool feature_round_trip =
       mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip;
+  const bool enumerate_cube_windows =
+      has_matmul_ && !has_vector_ && prob_->require_source_codegen;
   const std::vector<int64_t> grid_ks =
-      feature_round_trip
+      feature_round_trip || enumerate_cube_windows
           ? ks_cand_
           : std::vector<int64_t>{ks_cand_.empty()
                                      ? std::max<int64_t>(output_K_, 1)
@@ -10342,8 +10445,10 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
   const bool feature_round_trip =
       mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip;
+  const bool enumerate_cube_windows =
+      has_matmul_ && !has_vector_ && prob_->require_source_codegen;
   const std::vector<int64_t> grid_ks =
-      feature_round_trip
+      feature_round_trip || enumerate_cube_windows
           ? ks_cand_
           : std::vector<int64_t>{ks_cand_.empty()
                                      ? std::max<int64_t>(output_K_, 1)
@@ -10366,14 +10471,69 @@ std::vector<std::pair<TileConfig, CostResult>> Ascend910BCost::enumerate_plans()
   return out;
 }
 
+std::vector<CubePlanCandidateDiagnostic>
+Ascend910BCost::diagnose_cube_plans() const {
+  std::vector<CubePlanCandidateDiagnostic> out;
+  if (!has_matmul_ || has_vector_) return out;
+  L0PlanMemo l0_memo;
+  const std::vector<int64_t> grid_ks =
+      prob_->require_source_codegen
+          ? ks_cand_
+          : std::vector<int64_t>{ks_cand_.empty()
+                                     ? std::max<int64_t>(output_K_, 1)
+                                     : ks_cand_.back()};
+  for (const auto &grid : grid_cand_) {
+    const AxisPartition pm =
+        partition_axis(out_H_, grid.parts_m, grid_gran_h_);
+    const AxisPartition pn =
+        partition_axis(out_W_, grid.parts_n, grid_gran_w_);
+    for (int64_t grid_k : grid_ks) {
+      CubePlanCandidateDiagnostic diagnostic;
+      diagnostic.config = TileConfig{pn.big, pm.big, grid_k, pm.parts,
+                                     pn.parts, grid.split_k};
+      if (!is_valid_tiling(diagnostic.config)) {
+        diagnostic.rejection_code = "invalid_tiling";
+        out.push_back(std::move(diagnostic));
+        continue;
+      }
+      const int64_t split = std::max<int64_t>(1, grid.split_k);
+      const bool lone_matmul = cube_request_nodes_.size() == 1;
+      const int64_t derive_sink_k =
+          lone_matmul ? output_K_ : output_K_ / split;
+      if (output_K_ % split != 0 ||
+          derive_exec(diagnostic.config, derive_sink_k, {}, {}, nullptr) ==
+              INT64_MAX) {
+        diagnostic.rejection_code = "cube_l1_or_k_window_infeasible";
+        out.push_back(std::move(diagnostic));
+        continue;
+      }
+      diagnostic.cost = prob_->use_hierarchical_cube_cost
+                            ? compute_cost_impl(diagnostic.config, {}, {},
+                                                &l0_memo)
+                            : compute_cost(diagnostic.config, {}, {});
+      if (!diagnostic.cost.feasible ||
+          !std::isfinite(diagnostic.cost.latency)) {
+        const CubeSchedulePlan schedule = derive_cube_schedule_plan(
+            diagnostic.config, {}, {}, split, &l0_memo,
+            CubeSplitMergePolicy::FirstPartialThenAtomic);
+        diagnostic.rejection_code =
+            !schedule.feasible
+                ? "cube_schedule_infeasible"
+                : (!schedule.emit_compatible ? "cube_schedule_not_source_ready"
+                                             : "cube_cost_infeasible");
+      }
+      out.push_back(std::move(diagnostic));
+    }
+  }
+  return out;
+}
+
 MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
   MixedSweepFeasibility best;
   std::map<std::string, int64_t> rejection_counts;
   int64_t best_excess = std::numeric_limits<int64_t>::max();
   int64_t best_required = std::numeric_limits<int64_t>::max();
   auto consider = [&](const MixedSweepFeasibility& current) {
-    if (!current.rejection_code.empty())
-      ++rejection_counts[current.rejection_code];
     if (!current.capacity_evaluated) {
       if (!best.capacity_evaluated && best.rejection_code.empty() &&
           !current.rejection_code.empty()) {
@@ -10406,11 +10566,19 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
       best_required = required;
     }
   };
+  auto record = [&](const MixedSweepFeasibility& current) {
+    if (!current.rejection_code.empty()) {
+      ++rejection_counts[current.rejection_code];
+    }
+    consider(current);
+  };
   const bool feature_round_trip =
       mixed_topology_ &&
       mixed_topology_->algorithm == MixedAlgorithmKind::FeatureChunkRoundTrip;
+  const bool enumerate_cube_windows =
+      has_matmul_ && !has_vector_ && prob_->require_source_codegen;
   const std::vector<int64_t> grid_ks =
-      feature_round_trip
+      feature_round_trip || enumerate_cube_windows
           ? ks_cand_
           : std::vector<int64_t>{ks_cand_.empty()
                                      ? std::max<int64_t>(output_K_, 1)
@@ -10427,12 +10595,6 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
       const bool fits = mixed_fits_on_chip(cfg, {}, {}, &current);
       bool recorded_source_rejection = false;
       if (fits) {
-        const CostResult cost = compute_cost(cfg, {}, {});
-        if (cost.feasible && std::isfinite(cost.latency)) {
-          current.feasible_candidate = true;
-          return current;
-        }
-
         // Base feasibility prices one child request. Source emission may need
         // a deeper operand family for a multi-trip mixed pipeline. Preserve
         // that exact rejected plan in the diagnostic instead of reporting the
@@ -10443,19 +10605,77 @@ MixedSweepFeasibility Ascend910BCost::diagnose_mixed_sweep_feasibility() const {
             maximal.feasible
                 ? std::min(maximal.loop.work_items, maximal.group_capacity)
                 : 0;
+        if (!maximal.feasible) {
+          current.rejection_code =
+              maximal.rejection_code.empty()
+                  ? "mixed_schedule_infeasible"
+                  : maximal.rejection_code;
+        } else if (max_groups == 0) {
+          current.rejection_code = "mixed_schedule_has_no_groupable_work";
+        }
         for (int64_t groups = 1; groups <= max_groups; ++groups) {
           if (maximal.loop.work_items % groups != 0) continue;
           const MixedSchedulePlan plan = mixed_schedule_plan(
               cfg, {}, {}, /*parallel_split=*/1, groups);
-          if (!plan.feasible) continue;
+          if (!plan.feasible) {
+            MixedSweepFeasibility rejected = current;
+            rejected.active_groups = groups;
+            rejected.rejection_code =
+                plan.rejection_code.empty()
+                    ? "mixed_schedule_infeasible"
+                    : plan.rejection_code;
+            record(rejected);
+            recorded_source_rejection = true;
+            continue;
+          }
+          MixedCostBreakdown breakdown;
+          const CostResult cost = compute_mixed_cost_for_groups(
+              cfg, {}, {}, groups, &breakdown);
+          if (cost.feasible && std::isfinite(cost.latency)) {
+            current.feasible_candidate = true;
+            current.active_groups = groups;
+            current.trips_per_group = plan.loop.max_trips_per_group;
+            current.pipeline_stages = plan.loop.pipeline_stages;
+            return current;
+          }
           MixedSweepFeasibility rejected = current;
+          rejected.active_groups = plan.loop.active_groups;
+          rejected.trips_per_group = plan.loop.max_trips_per_group;
+          rejected.pipeline_stages = plan.loop.pipeline_stages;
+          int64_t c2v_reserved = 0;
+          for (const MixedFifoPlan& fifo : plan.fifos) {
+            if (fifo.direction == MixedTransferDirection::CubeToVector) {
+              c2v_reserved += fifo.reserved_bytes;
+            }
+          }
+          rejected.required_vec_bytes =
+              c2v_reserved + plan.vector_stage_peak_ub_bytes;
+          rejected.required_l1_bytes = plan.source_l1_allocation_bytes;
           rejected.required_l0a_bytes = plan.cube_stage_peak_l0a_bytes;
           rejected.required_l0b_bytes = plan.cube_stage_peak_l0b_bytes;
-          consider(rejected);
+          const bool source_capacity_ready =
+              rejected.required_vec_bytes <= rejected.available_vec_bytes &&
+              rejected.required_l1_bytes <= rejected.available_l1_bytes &&
+              rejected.required_l0a_bytes <= rejected.available_l0a_bytes &&
+              rejected.required_l0b_bytes <= rejected.available_l0b_bytes;
+          if (!source_capacity_ready) {
+            rejected.rejection_code =
+                "mixed_source_memory_capacity_exceeded";
+          } else if (!plan.emit_compatible) {
+            rejected.rejection_code =
+                "mixed_protocol_not_emit_compatible";
+          } else if (!plan.source_codegen_ready) {
+            rejected.rejection_code = "mixed_source_schedule_not_ready";
+          } else if (!breakdown.rejection_code.empty()) {
+            rejected.rejection_code = breakdown.rejection_code;
+          } else {
+            rejected.rejection_code = "mixed_cost_infeasible";
+          }
+          record(rejected);
           recorded_source_rejection = true;
         }
       }
-      if (!recorded_source_rejection) consider(current);
+      if (!recorded_source_rejection) record(current);
     }
   }
   best.rejection_counts = std::move(rejection_counts);

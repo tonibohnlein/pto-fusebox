@@ -668,6 +668,24 @@ def _emit_streaming_softmax_v2c(  # noqa: PLR0915 -- typed phase replay.
             cols=stream.chunk,
             valid_cols=apply.tail.extent,
         )
+        # Cross-core pipes publish a fixed physical frame.  PyPTO widens the
+        # ragged probability view to that frame before the push, so define the
+        # otherwise-invalid lanes explicitly before they cross the boundary.
+        # The matching RHS load is zero padded, making the added lanes neutral
+        # for the sink matmul without changing the logical tail extent.
+        padded_probability = "apply_tail_probability_padded"
+        writer.line(
+            4,
+            f"{padded_probability} = pl.tensor.fillpad({probability}, "
+            "pad_value=pl.PadValue.zero)",
+        )
+        published_probability = "apply_tail_probability_published"
+        writer.line(
+            4,
+            f"{published_probability} = pl.tensor.set_validshape("
+            f"{padded_probability}, {fifo.valid_rows}, {apply.tail.extent})",
+        )
+        probability = published_probability
         rhs = _emit_streaming_sink_rhs(
             writer,
             4,

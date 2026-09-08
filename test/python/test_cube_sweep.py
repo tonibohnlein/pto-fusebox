@@ -9,6 +9,8 @@ import torch
 from torch import nn
 
 from pto_fusebox import (
+    CubePlanCandidate,
+    CubePlanSweep,
     NormalizedGraph,
     RegionSolveResult,
     ScheduleContractError,
@@ -20,6 +22,7 @@ from pto_fusebox import (
     extract_solver_regions,
     region_for_cube_candidate,
     scheduled_region,
+    solve_graph,
 )
 from pto_fusebox.schedule import CubeKernelPlan
 
@@ -71,6 +74,23 @@ def _sweep_binary() -> Path:
     if not path.is_file():
         pytest.fail(f"cube plan sweep binary does not exist: {path}")
     return path
+
+
+def _candidate_for_grid(
+    sweep: CubePlanSweep, *, parts_m: int, parts_n: int, split_k: int
+) -> CubePlanCandidate:
+    matches = tuple(
+        candidate
+        for candidate in sweep.candidates
+        if (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+        )
+        == (parts_m, parts_n, split_k)
+    )
+    assert len(matches) == 1
+    return matches[0]
 
 
 def _lowered_region(
@@ -163,6 +183,60 @@ def test_cube_model_surface_enumerates_replayable_forced_solutions(
     assert bool(source_ready) is source_replay_expected
 
 
+def test_cube_grid_stride_replay_bounds_a_large_logical_grid() -> None:
+    graph = export_and_normalize(
+        Matmul(),
+        (
+            torch.empty(16, 5120, device="meta"),
+            torch.empty(5120, 6144, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    result = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+    sweep = enumerate_cube_plans(result, sweep_binary=_sweep_binary())
+    candidate = next(
+        item
+        for item in sweep.candidates
+        if (item.grid.parts_m, item.grid.parts_n, item.grid.split_k) == (1, 48, 1)
+    )
+    forced = region_for_cube_candidate(result, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.spatial_tiles == 48
+    assert plan.spatial_replay.present
+    assert (plan.spatial_replay.active_tasks, plan.spatial_replay.trips_per_task) == (
+        24,
+        2,
+    )
+    source = emit_pypto_region(graph, forced, program_name="cube_grid_stride").source
+    assert "for cube_task in pl.spmd(24" in source
+    assert "pl.range(2, init_values=" in source
+    assert "region_index = cube_task + cube_trip * 24" in source
+
+    assert forced.solution is not None
+    missing_replay = copy.deepcopy(forced.solution)
+    missing_replay["steps"][0]["plan"]["spatial_replay"] = {
+        "present": False,
+        "active_tasks": 0,
+        "trips_per_task": 0,
+    }
+    with pytest.raises(
+        ScheduleContractError,
+        match="spatial_replay is required when the logical grid exceeds",
+    ):
+        scheduled_region(replace(forced, solution=missing_replay))
+
+
 def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     graph, region = _lowered_region(128, 8192, 128)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
@@ -187,9 +261,7 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
                 policy == "aiv_zero_seed_then_atomic"
             )
 
-    no_split = next(
-        candidate for candidate in sweep.candidates if candidate.id == "p1_q1_s1"
-    )
+    no_split = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=1)
     forced = region_for_cube_candidate(region, no_split)
     typed = scheduled_region(forced).steps[0]
     plan = typed.plan
@@ -217,7 +289,7 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
 def test_split_cube_dag_replays_upstream_then_unique_atomic_sink() -> None:
     graph, region = _lowered_split_chain()
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
-    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    candidate = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=2)
     forced = region_for_cube_candidate(region, candidate)
     plan = scheduled_region(forced).steps[0].plan
     assert isinstance(plan, CubeKernelPlan)
@@ -272,10 +344,65 @@ def test_split_cube_dag_replays_upstream_then_unique_atomic_sink() -> None:
     assert "pl.full(" not in first_partial
 
 
+def test_split_cube_dag_diagnostics_and_execution_summary_are_consistent() -> None:
+    """Keep public sweep and source-candidate evidence on one cube contract."""
+
+    graph, region = _lowered_split_chain(m=512, inner=2048, n=512)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate_keys = {
+        (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+            candidate.grid.sequential_k_limit,
+        )
+        for candidate in sweep.candidates
+    }
+    rejection_keys = {
+        (
+            rejection.parts_m,
+            rejection.parts_n,
+            rejection.split_k,
+            rejection.sequential_k_limit,
+        )
+        for rejection in sweep.rejections
+    }
+    assert candidate_keys.isdisjoint(rejection_keys)
+    assert (1, 1, 8, 2048) in candidate_keys
+
+    solved = solve_graph(
+        graph,
+        solver_binary=_sweep_binary().parent / "mlsys",
+        solver_workers=1,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+    assert len(solved.regions) == 1
+    maximal = next(
+        candidate
+        for candidate in solved.regions[0].candidate_summaries
+        if candidate.partition == ((0, 1),)
+    )
+    step = maximal.schedule[0]
+    parts_m, parts_n = step["launch"]["parts"]
+    split_k = step["launch"]["split"]
+    matching = _candidate_for_grid(
+        sweep,
+        parts_m=parts_m,
+        parts_n=parts_n,
+        split_k=split_k,
+    )
+    source_execution = maximal.execution.steps[0]
+    sweep_execution = matching.execution
+    assert source_execution.drain_sites == sweep_execution.drain_sites == 2
+    assert source_execution.drain_executions == sweep_execution.drain_executions
+    assert source_execution.drain_bytes == sweep_execution.drain_bytes
+
+
 def test_split_cube_dag_retains_a_boundary_panel_inside_each_share() -> None:
     graph, region = _lowered_split_chain(m=512, n=512)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
-    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s8")
+    candidate = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=8)
     forced = region_for_cube_candidate(region, candidate)
     plan = scheduled_region(forced).steps[0].plan
     assert isinstance(plan, CubeKernelPlan)
@@ -309,7 +436,7 @@ def test_split_cube_dag_materializes_a_resident_operand_once_per_share() -> None
         diagnostics=regions[0].diagnostics,
     )
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
-    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    candidate = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=2)
     forced = region_for_cube_candidate(region, candidate)
     plan = scheduled_region(forced).steps[0].plan
     assert isinstance(plan, CubeKernelPlan)
@@ -329,7 +456,7 @@ def test_split_cube_dag_materializes_a_resident_operand_once_per_share() -> None
 def test_split_cube_dag_rejects_a_second_split_accumulator() -> None:
     graph, region = _lowered_split_chain()
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
-    candidate = next(item for item in sweep.candidates if item.id == "p1_q1_s2")
+    candidate = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=2)
     forced = region_for_cube_candidate(region, candidate)
     assert forced.solution is not None
     solution = copy.deepcopy(forced.solution)
@@ -447,24 +574,35 @@ def test_deep_k_split_contract_rejects_malformed_policy_descriptors() -> None:
 def test_balanced_surface_excludes_outer_pipeline_l0_overflow() -> None:
     graph, region = _lowered_region(256, 256, 256)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
-    candidates = {candidate.id: candidate for candidate in sweep.candidates}
+    candidates = {
+        (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+        ): candidate
+        for candidate in sweep.candidates
+    }
 
     # These grids require a 40,960-byte stationary operand frame. PyPTO's
     # stage-2 outer K loop rotates that frame twice, so the lowered 81,920-byte
     # L0A/L0B allocation exceeds the 64-KiB hardware capacity. Keep the
     # analytic candidates, but reject them at the exact source-readiness
     # boundary before PyPTO compilation.
-    for candidate_id in ("p2_q4_s1", "p4_q2_s1"):
-        forced = region_for_cube_candidate(region, candidates[candidate_id])
+    for grid in ((2, 4, 1), (4, 2, 1)):
+        forced = region_for_cube_candidate(region, candidates[grid])
         assert not can_emit_region(graph, forced)
         with pytest.raises(
             SourceEmissionError, match="exceeds lowered L0 operand capacity"
         ):
             emit_pypto_region(graph, forced)
-    assert "p4_q4_s1" in candidates
-    assert sweep.selected.id == "p4_q4_s1"
+    assert (4, 4, 1) in candidates
+    assert (
+        sweep.selected.grid.parts_m,
+        sweep.selected.grid.parts_n,
+        sweep.selected.grid.split_k,
+    ) == (4, 4, 1)
     assert can_emit_region(
-        graph, region_for_cube_candidate(region, candidates["p4_q4_s1"])
+        graph, region_for_cube_candidate(region, candidates[(4, 4, 1)])
     )
 
 
@@ -484,7 +622,7 @@ def test_selected_marker_disagreement_fails_closed(tmp_path: Path) -> None:
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({\n"
-        " 'schema_version':'pto_fusebox.cube_plan_sweep.v1',\n"
+        " 'schema_version':'pto_fusebox.cube_plan_sweep.v2',\n"
         " 'selected_candidate_id':'p1_q1_s1',\n"
         " 'candidates':[]\n"
         "}))\n",

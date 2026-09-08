@@ -45,6 +45,7 @@ from examples.torch_frontend.qwen3 import (
     QWEN_PRODUCTION_VOCAB,
     QWEN_REFERENCE_RMS_K_CHUNK,
     QWEN_VOCAB_CHUNK,
+    Qwen3LmHeadChunk,
     build_production_qwen_output_head,
 )
 from examples.torch_frontend.static_mixed import (
@@ -62,6 +63,7 @@ from pto_fusebox import (
     ScheduleContractError,
     SourceEmissionError,
     can_emit_region,
+    enumerate_cube_plans,
     emit_deepseek_mtp_projection_overlay,
     emit_pypto_callable,
     emit_flash_mtp_decode_projection_overlay,
@@ -72,6 +74,7 @@ from pto_fusebox import (
     pypto_lib_model_manifest,
     pypto_lib_model_manifests,
     region_for_source_candidate,
+    region_for_cube_candidate,
     scheduled_region,
     solve_graph,
     validate_pypto_lib_model,
@@ -566,6 +569,7 @@ def test_production_projection_candidates_include_maximal_streamed_v2c() -> None
 
     cases = (
         (build_production_mtp_projection_branch, 2, True),
+        (build_production_mtp_history_projection_branch, 2, True),
         (build_production_qwen_output_head, 1, False),
     )
     for builder, transfer_count, carries_scale in cases:
@@ -580,12 +584,28 @@ def test_production_projection_candidates_include_maximal_streamed_v2c() -> None
         )
         assert solved.regions_solved == 1
         region = solved.regions[0]
+        selected = region.candidate_summaries[0]
         maximal = next(
             candidate
             for candidate in region.candidate_summaries
             if len(candidate.partition) == 1
         )
+        assert selected.selected
+        assert all(step.traffic_bytes for step in selected.execution.steps)
+        assert selected.execution.submissions > maximal.execution.submissions
+        assert selected.execution.device_programs >= selected.execution.submissions
+        assert selected.execution.cuts
+        assert selected.execution.cut_bytes > 0
+        assert selected.execution.drain_sites > maximal.execution.drain_sites
+        assert selected.modeled_cost_cycles < maximal.modeled_cost_cycles
         assert maximal.source_ready and maximal.rejection_reason is None
+        assert maximal.execution.submissions == 1
+        assert maximal.execution.device_programs == 2
+        assert maximal.execution.cut_bytes == 0
+        assert not maximal.execution.cuts
+        assert maximal.execution.drain_sites == 1
+        assert maximal.execution.drain_bytes > 0
+        assert maximal.execution.steps[0].traffic_bytes
         forced = region_for_source_candidate(region, maximal)
         schedule = scheduled_region(forced)
         assert len(schedule.steps) == 1
@@ -610,6 +630,96 @@ def test_production_projection_candidates_include_maximal_streamed_v2c() -> None
         descriptor["producer_stage"] = descriptor["sink_stage"]
         with pytest.raises(ScheduleContractError, match=r"streamed_v2c is incomplete"):
             scheduled_region(replace(forced, solution=malformed))
+
+
+@pytest.mark.skipif(
+    not _test_solver().is_file(), reason="built mlsys_mixed solver is unavailable"
+)
+def test_qwen_lm_head_exposes_grid_stride_low_drain_candidate() -> None:
+    """Expose the native-like cube realization before calibrating its score."""
+
+    with torch.device("meta"):
+        module = Qwen3LmHeadChunk(QWEN_PRODUCTION_HIDDEN, QWEN_PRODUCTION_VOCAB)
+        normalized = torch.empty(
+            QWEN_BATCH_TILE, QWEN_PRODUCTION_HIDDEN, dtype=torch.bfloat16
+        )
+    graph = export_and_normalize(module, (normalized,))
+    solved = solve_graph(
+        graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+    )
+    assert solved.regions_solved and len(solved.regions) == 1
+    sweep = enumerate_cube_plans(
+        solved.regions[0], sweep_binary=_test_solver().parent / "cube_plan_sweep"
+    )
+    assert sweep.rejections
+    assert "cube_l1_or_k_window_infeasible" in {
+        rejection.reason for rejection in sweep.rejections
+    }
+    low_drain = next(
+        candidate
+        for candidate in sweep.candidates
+        if (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+            candidate.grid.realized_sequential_k,
+        )
+        == (1, QWEN_PRODUCTION_VOCAB // QWEN_VOCAB_CHUNK, 1, 32)
+    )
+    assert not low_drain.selected
+    assert sweep.selected.latency_cycles < low_drain.latency_cycles
+    assert sweep.selected.execution.submissions == 1
+    assert low_drain.execution.submissions == 1
+    assert sweep.selected.execution.cuts == low_drain.execution.cuts == 0
+    output_bytes = QWEN_BATCH_TILE * QWEN_PRODUCTION_VOCAB * 4
+    assert sweep.selected.execution.drain_bytes == output_bytes
+    assert low_drain.execution.drain_bytes == output_bytes
+    assert sweep.selected.execution.traffic_bytes == {
+        "gm_l1": 1_561_067_520,
+        "gm_ub": 0,
+        "l0c_gm": output_bytes,
+        "ub_gm": 0,
+    }
+    assert low_drain.execution.traffic_bytes == {
+        "gm_l1": 1_686_896_640,
+        "gm_ub": 0,
+        "l0c_gm": output_bytes,
+        "ub_gm": 0,
+    }
+    forced = region_for_cube_candidate(solved.regions[0], low_drain)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.spatial_replay.present
+    assert (plan.spatial_replay.active_tasks, plan.spatial_replay.trips_per_task) == (
+        24,
+        33,
+    )
+    matmul = plan.matmuls[0]
+    assert matmul.accumulator_dtype == "fp32"
+    assert tuple(matmul.output_tile) == (16, QWEN_VOCAB_CHUNK)
+    assert tuple(matmul.output_grid) == (1, 1)
+    assert matmul.final_drain.tile_count == 1
+    source = emit_pypto_region(graph, forced, program_name="qwen_low_drain").source
+    assert "for cube_task in pl.spmd(24" in source
+    assert "pl.range(33, init_values=(output,))" in source
+    assert "output = pl.yield_(output_iter)" in source
+    assert source.count("pl.assemble(output_iter,") == 1
+
+    assert forced.solution is not None
+    missing_replay = copy.deepcopy(forced.solution)
+    missing_replay["steps"][0]["plan"]["spatial_replay"] = {
+        "present": False,
+        "active_tasks": 0,
+        "trips_per_task": 0,
+    }
+    with pytest.raises(
+        ScheduleContractError,
+        match="spatial_replay is required when the logical grid exceeds",
+    ):
+        scheduled_region(replace(forced, solution=missing_replay))
 
 
 @pytest.mark.skipif(
@@ -885,6 +995,33 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         assert any(
             step.kind in {KernelKind.VECTOR, KernelKind.MIXED} for step in branch.steps
         )
+
+    # Both projection branches expose a one-region alternative. The ordinary
+    # solve remains free to retain GM cuts until silicon compares the choices.
+    full_candidates = solve_graph(
+        full_graph,
+        solver_binary=_test_solver(),
+        solver_workers=2,
+        require_source_codegen=True,
+        collect_candidate_summaries=True,
+    )
+    assert len(full_candidates.regions) == 2
+    for region in full_candidates.regions:
+        selected = region.candidate_summaries[0]
+        maximal = next(
+            candidate
+            for candidate in region.candidate_summaries
+            if len(candidate.partition) == 1
+        )
+        assert selected.execution.submissions == 3
+        assert selected.execution.cuts
+        assert selected.execution.cut_bytes > 0
+        assert selected.modeled_cost_cycles < maximal.modeled_cost_cycles
+        assert maximal.source_ready
+        assert maximal.execution.submissions == 1
+        assert maximal.execution.device_programs == 2
+        assert maximal.execution.cut_bytes == 0
+        assert maximal.execution.drain_sites == 1
 
     native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
     overlay = emit_flash_mtp_decode_projection_overlay(

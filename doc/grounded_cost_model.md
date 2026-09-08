@@ -398,6 +398,13 @@ trips     = num_tiles / groups                            # uniform successor it
 groups    = selected divisor of num_tiles, at most 24     # each group = 1 cube : 2 vector cores
 ```
 
+Every selected mixed plan serializes this calculation as a typed cost
+breakdown: cube/vector phases, four-port bytes, effective pipe parallelism,
+per-port cycles, DDR wall, pipeline wall, fill, group reference, and total.
+Candidate summaries attach those fields to the exact emitted partition so
+ranking work can compare model and silicon without reconstructing the score in
+a separate script. No coefficient is changed by enabling this observability.
+
 Grounded by pto-isa **`mixed_tile_study`** (7 experiments; the study is the *evidence*, this
 section the *model*).
 

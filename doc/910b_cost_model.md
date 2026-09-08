@@ -354,16 +354,31 @@ Other explicitly deferred research directions are:
 
 ## 10. Candidate ranking validation
 
-`cube_plan_sweep` exposes the exact finite candidate set considered for a
+`cube_plan_sweep` v2 exposes the exact finite candidate set considered for a
 homogeneous cube DAG. It reuses `enumerate_plans()` and reconstructs each
 candidate through `fixed_cost()`, the same configured hierarchical evaluator
 used by `best_cost()`. This prevents validation from accidentally pricing a
 forced candidate with the older flat cube path.
 
-Each sweep entry embeds an ordinary `pto_fusebox.solution.v8` payload. The
+For source-oriented one-matmul regions, the sweep co-enumerates the sequential
+L1 K-window cap with the spatial grid and split factor. A logical output grid
+larger than the physical AIC pool may be emitted as a bounded SPMD launch plus
+a grid-stride trip loop; this exposes narrow-output, persistent-accumulator
+realizations without claiming additional physical cores. The v2 envelope
+records both the requested and realized K window and retains rejected grid/K
+points with a stable first-failure reason.
+
+Each sweep entry embeds an ordinary `pto_fusebox.solution.v9` payload. The
 Python `enumerate_cube_plans()` adapter validates the envelope and
 `region_for_cube_candidate()` binds one candidate back to the exact lowered
 problem for source replay. The adapter never re-plans or changes a cost.
+Every Python candidate also carries an execution summary: submission and
+device-program counts, cut count, loop-weighted drain sites/executions/bytes,
+and four-port GM traffic. For cube-only schedules the meaningful ports are
+GM-to-L1 boundary loads and L0C-to-GM final drains (plus an AIV seed store for
+that split-K policy). Boundary retention and the orthogonal child-output grid
+are applied before multiplying by logical work units, so these values describe
+the emitted loops rather than static statement counts.
 
 The initial validation matrix is fixed before silicon timing and covers:
 

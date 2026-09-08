@@ -438,6 +438,37 @@ static const char* cube_operand_role_name(CubeOperandRole role) {
     return "unknown";
 }
 
+static json mixed_cost_breakdown_json(const MixedCostBreakdown& breakdown) {
+    return {
+        {"active_groups", breakdown.active_groups},
+        {"trips_per_group", breakdown.trips_per_group},
+        {"pipeline_stages", breakdown.pipeline_stages},
+        {"overlap_implementable", breakdown.overlap_implementable},
+        {"cube_phase_cycles", breakdown.cube_phase_cycles},
+        {"vector_phase_cycles", breakdown.vector_phase_cycles},
+        {"traffic_bytes",
+         {{"gm_l1", breakdown.gm_l1_bytes},
+          {"gm_ub", breakdown.gm_ub_bytes},
+          {"l0c_gm", breakdown.l0c_gm_bytes},
+          {"ub_gm", breakdown.ub_gm_bytes}}},
+        {"effective_parallelism",
+         {{"gm_l1", breakdown.gm_l1_effective_parallelism},
+          {"gm_ub", breakdown.gm_ub_effective_parallelism},
+          {"l0c_gm", breakdown.l0c_gm_effective_parallelism},
+          {"ub_gm", breakdown.ub_gm_effective_parallelism}}},
+        {"traffic_cycles",
+         {{"gm_l1", breakdown.gm_l1_cycles},
+          {"gm_ub", breakdown.gm_ub_cycles},
+          {"l0c_gm", breakdown.l0c_gm_cycles},
+          {"ub_gm", breakdown.ub_gm_cycles}}},
+        {"ddr_wall_cycles", breakdown.ddr_wall_cycles},
+        {"pipeline_wall_cycles", breakdown.pipeline_wall_cycles},
+        {"kernel_fill_cycles", breakdown.kernel_fill_cycles},
+        {"group_overhead_cycles", breakdown.group_overhead_cycles},
+        {"total_cycles", breakdown.total_cycles},
+    };
+}
+
 static json cube_region_json(const CubeTensorRegionPlan& region) {
     return {{"tensor", region.tensor},
             {"height_binding", cube_axis_binding_name(region.height_binding)},
@@ -1086,14 +1117,14 @@ Problem read_problem(const std::string& filename) {
 
 std::string solution_json(const Solution& sol) {
     json j;
-    j["schema_version"] = "pto_fusebox.solution.v8";
+    j["schema_version"] = "pto_fusebox.solution.v9";
     j["steps"] = json::array();
 
     for (size_t i = 0; i < sol.num_steps(); i++) {
         const auto& step = sol.step(i);
         if (!sol.retained_entering(i).empty() || !step.retain_these.empty()) {
             throw std::logic_error(
-                "solution.v8 cannot serialize cross-kernel fast-memory retention");
+                "solution.v9 cannot serialize cross-kernel fast-memory retention");
         }
         const auto& cfg  = step.config;
         const auto& cost = sol.step_cost(i);
@@ -1116,6 +1147,12 @@ std::string solution_json(const Solution& sol) {
                       cfg, sol.retained_entering(i), step.retain_these,
                       cost.parallel_split, cost.mixed_active_groups)
                 : MixedSchedulePlan{};
+        const std::optional<MixedCostBreakdown> mixed_breakdown =
+            mixed_plan.feasible
+                ? step.subgraph.mixed_cost_breakdown(
+                      cfg, cost.mixed_active_groups, sol.retained_entering(i),
+                      step.retain_these)
+                : std::nullopt;
 
         json serialized_step;
         serialized_step["ops"] = step.subgraph.ops();
@@ -1278,6 +1315,10 @@ std::string solution_json(const Solution& sol) {
            {"spatial_tiles", cube_plan.spatial_tiles},
            {"split_k", cube_plan.split_k},
            {"work_units", cube_plan.work_units},
+           {"spatial_replay",
+            {{"present", cube_plan.spatial_replay.present},
+             {"active_tasks", cube_plan.spatial_replay.active_tasks},
+             {"trips_per_task", cube_plan.spatial_replay.trips_per_task}}},
            {"peak_l1_bytes", cube_plan.peak_l1_bytes},
            {"source_l1_allocation_bytes", cube_plan.source_l1_allocation_bytes},
            {"split_merge_policy", cube_split_merge_policy_name(cube_plan.split_merge_policy)},
@@ -1432,6 +1473,10 @@ std::string solution_json(const Solution& sol) {
            {"stages", stages},
            {"transfers", transfers},
            {"fifos", fifos},
+           {"cost_breakdown",
+            mixed_breakdown
+                ? mixed_cost_breakdown_json(*mixed_breakdown)
+                : json(nullptr)},
            {"feature_round_trip", feature_round_trip},
            {"streamed_v2c", streamed_v2c}};
         }

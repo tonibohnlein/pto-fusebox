@@ -74,7 +74,7 @@ int main() {
       nlohmann::json::parse(cube_plan_sweep_json(problem, dag));
 
   check("sweep schema is versioned",
-        sweep.at("schema_version") == "pto_fusebox.cube_plan_sweep.v1");
+        sweep.at("schema_version") == "pto_fusebox.cube_plan_sweep.v2");
   check("sweep has candidates", !sweep.at("candidates").empty());
   check("sweep identifies its selected candidate",
         sweep.at("selected_candidate_id").is_string());
@@ -102,7 +102,7 @@ int main() {
         std::isfinite(solution.at("steps").front().at("latency_cycles").get<double>());
     all_forced_solutions =
         all_forced_solutions &&
-        solution.at("schema_version") == "pto_fusebox.solution.v8" &&
+        solution.at("schema_version") == "pto_fusebox.solution.v9" &&
         solution.at("steps").size() == 1 &&
         solution.at("steps").front().at("launch").at("split") == split;
     if (split > 1) {

@@ -268,7 +268,7 @@ The frontend publishes three schemas:
 
 - `pto_fusebox.normalized_graph.v1`: semantics-preserving normalized capture data;
 - `pto_fusebox.problem.v1`: a statically lowered solver region; and
-- `pto_fusebox.solution.v8`: the C++ schedule response. Cross-kernel values are
+- `pto_fusebox.solution.v9`: the C++ schedule response. Cross-kernel values are
   always materialized through GM. Fast-memory residence and retained panels are
   cube-step-local policies, not promises spanning separate launches.
 
@@ -309,7 +309,7 @@ resident-boundary lifetimes, K/L0 loops, retained panels, drains, and split
 policy. These fields are solver output, not choices rediscovered by Python
 emission.
 
-The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v8`
+The Python boundary decodes `problem.v1` into `LoweredRegion` and `solution.v9`
 into immutable `ScheduledRegion`/`KernelStep` types before rendering. The
 lowered half owns region inputs, outputs, and output-allocation lineage; the
 scheduled half owns execution. Together with the normalized graph they form a
@@ -405,7 +405,21 @@ alternative solver results in modeled-cost order. Each
 typed memory plans, modeled cycles, source-readiness result, and an explicit
 rejection reason when emission fails. This is an observability interface only:
 candidate collection does not change selection. It is the required evidence
-for later selected-versus-runner-up performance work.
+for later selected-versus-runner-up performance work. Its `execution` record
+also reports submissions, generated device programs, solver-owned GM cuts,
+logical cut bytes, drain sites/executions/bytes, and the mixed model's exact
+four-port traffic. Compiler-injected `gm_pipe_buffer_*` storage is deliberately
+not counted as a solver cut.
+Pointwise and multi-pass vector steps and homogeneous cube steps also report
+their loop-weighted four-port traffic, so a selected multi-kernel partition can
+be compared with a maximal mixed alternative without relying on static source
+statement counts.
+Homogeneous cube alternatives expose the same execution evidence through
+`CubePlanCandidate.execution`. Its GM-to-L1 volume is reconstructed from the
+plan's boundary ownership, retained panels, child output grid, and logical
+work-unit count; its L0C-to-GM volume is the loop-weighted final drain. This
+makes compact grid-stride candidates comparable without confusing a small
+per-trip drain with a smaller total output tensor.
 The Python backend separately admits generic one-way `C -> V`, generic one-way
 `V -> C` with an in-memory or online-softmax vector producer, generic
 `C -> V -> C`, dense
@@ -668,6 +682,10 @@ pipe protocol rather than creating extra logical FIFOs. Source readiness
 charges the serialized cube-stage L1 peak together
 with every V2C consumer ring, and the vector-stage peak together with every
 C2V consumer ring; neither direction can hide its physical FIFO reservation.
+When a ragged producer is published through a fixed-width FIFO, source first
+fills the invalid physical lanes with the algebraic neutral value and then
+restores the logical `valid_shape`. PyPTO may widen that defined frame for the
+push, while the cube consumer continues to contract only the logical tail.
 No attention or SwiGLU recognizer is involved in this transport contract.
 
 ### Mixed-source silicon status

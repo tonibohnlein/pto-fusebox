@@ -117,6 +117,9 @@ class MixedGroupSweepAvailability:
     transfers: int | None = None
     vector_to_cube_transfers: int | None = None
     cube_to_vector_transfers: int | None = None
+    active_groups: int | None = None
+    trips_per_group: int | None = None
+    pipeline_stages: int | None = None
     rejection_counts: Mapping[str, int] | None = None
     closest_tile: MixedGroupTile | None = None
     required_vec_bytes: int | None = None
@@ -141,6 +144,43 @@ class MixedGroupSweepUnavailable(RuntimeError):
             raise ValueError("an unavailable mixed sweep requires a code and reason")
         super().__init__(f"{availability.code}: {availability.reason}")
         self.availability = availability
+
+
+def _cost_breakdown_payload(candidate: MixedGroupCandidate) -> dict[str, Any]:
+    """Serialize one swept candidate in the ordinary solution shape."""
+
+    breakdown = candidate.breakdown
+    return {
+        "active_groups": candidate.groups,
+        "trips_per_group": candidate.trips_per_group,
+        "pipeline_stages": candidate.pipeline_stages,
+        "overlap_implementable": candidate.overlap_implementable,
+        "cube_phase_cycles": breakdown.cube_phase_cycles,
+        "vector_phase_cycles": breakdown.vector_phase_cycles,
+        "traffic_bytes": {
+            "gm_l1": breakdown.gm_l1_bytes,
+            "gm_ub": breakdown.gm_ub_bytes,
+            "l0c_gm": breakdown.l0c_gm_bytes,
+            "ub_gm": breakdown.ub_gm_bytes,
+        },
+        "effective_parallelism": {
+            "gm_l1": breakdown.gm_l1_effective_parallelism,
+            "gm_ub": breakdown.gm_ub_effective_parallelism,
+            "l0c_gm": breakdown.l0c_gm_effective_parallelism,
+            "ub_gm": breakdown.ub_gm_effective_parallelism,
+        },
+        "traffic_cycles": {
+            "gm_l1": breakdown.gm_l1_cycles,
+            "gm_ub": breakdown.gm_ub_cycles,
+            "l0c_gm": breakdown.l0c_gm_cycles,
+            "ub_gm": breakdown.ub_gm_cycles,
+        },
+        "ddr_wall_cycles": breakdown.ddr_wall_cycles,
+        "pipeline_wall_cycles": breakdown.pipeline_wall_cycles,
+        "kernel_fill_cycles": breakdown.kernel_fill_cycles,
+        "group_overhead_cycles": breakdown.group_overhead_cycles,
+        "total_cycles": breakdown.total_cycles,
+    }
 
 
 def mixed_group_sweep_availability(
@@ -424,6 +464,9 @@ def _availability_from_payload(
         transfers=optional_int("transfers"),
         vector_to_cube_transfers=optional_int("vector_to_cube_transfers"),
         cube_to_vector_transfers=optional_int("cube_to_vector_transfers"),
+        active_groups=optional_int("active_groups"),
+        trips_per_group=optional_int("trips_per_group"),
+        pipeline_stages=optional_int("pipeline_stages"),
         rejection_counts=rejection_counts,
         closest_tile=closest_tile,
         required_vec_bytes=optional_int("required_vec_bytes"),
@@ -493,6 +536,7 @@ def region_for_mixed_group_candidate(
     plan["source_l1_allocation_bytes"] = candidate.source_l1_allocation_bytes
     plan["vector_stage_peak_ub_bytes"] = candidate.vector_stage_peak_ub_bytes
     plan["fifos"] = [dict(fifo) for fifo in candidate.fifos]
+    plan["cost_breakdown"] = _cost_breakdown_payload(candidate)
     vector_lanes = plan.get("vector_lanes")
     if not isinstance(vector_lanes, int) or isinstance(vector_lanes, bool):
         raise ValueError("mixed candidate solution has no vector lane count")
