@@ -821,9 +821,24 @@ def test_callable_qwen_static_components_lower_inside_native_orchestration(
     assert len(pto) == 1
     assert orchestration.count(expected_submit) == 1
     if name == "qwen3_lm_head_chunk":
+        scheduled = scheduled_region(solved.regions[0])
+        assert len(scheduled.steps) == 1
+        plan = scheduled.steps[0].plan
+        assert isinstance(plan, CubeKernelPlan)
+        assert len(plan.matmuls) == 1
+        matmul = plan.matmuls[0]
+        assert (
+            matmul.k_loop.full_chunks * matmul.k_loop.chunk + matmul.k_loop.tail
+            == matmul.contraction
+        )
         assert "pto.tmatmul" in pto[0]
-        assert re.search(r"loc=right, dtype=bf16, rows=160, cols=32", pto[0])
-        assert re.search(r"loc=right, dtype=bf16, rows=32, cols=32", pto[0])
+        right_tiles = {
+            (int(rows), int(cols))
+            for rows, cols in re.findall(
+                r"loc=right, dtype=bf16, rows=(\d+), cols=(\d+)", pto[0]
+            )
+        }
+        assert right_tiles == {(matmul.k_loop.chunk, matmul.output_tile[1])}
 
 
 def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
@@ -2025,12 +2040,14 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
     assert covered_ops <= set(region.region.op_ids)
     uncovered = set(region.region.op_ids) - covered_ops
     assert {op.kind for op in graph.ops if op.id in uncovered} == {"transpose_view"}
-    source_l1_bytes = sum(
+    source_l1_by_step = tuple(
         plan.source_l1_allocation_bytes
         for step in scheduled.steps
         if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
     )
-    assert source_l1_bytes == 327_680
+    assert source_l1_by_step == (235_520, 14_336)
+    source_l1_bytes = sum(source_l1_by_step)
+    assert source_l1_bytes == 249_856
     assert source_l1_bytes <= 524_288
     source = emit_pypto_region(
         graph, region, program_name="large_fp32_linear_sink"
