@@ -152,7 +152,7 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
                 PyPTOLibNativeBoundary(
                     "context_parallel_exchange",
                     (
-                        "decode_cp_token_allgather.py",
+                        "decode_cp_allgather.py",
                         "prefill_cp_token_allgather.py",
                     ),
                     NativeBoundaryKind.COMMUNICATION,
