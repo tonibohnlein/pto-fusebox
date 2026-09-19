@@ -111,6 +111,7 @@ def enumerate_cube_plans(
     region: RegionSolveResult,
     *,
     sweep_binary: str | os.PathLike[str] | None = None,
+    source_oriented: bool = False,
 ) -> CubePlanSweep:
     """Enumerate every feasible cube plan for one lowered homogeneous cube region.
 
@@ -121,6 +122,10 @@ def enumerate_cube_plans(
     Args:
         region: A region result that carries the exact lowered problem.
         sweep_binary: An explicitly built ``cube_plan_sweep`` executable.
+        source_oriented: Enumerate the larger source-first surface, including
+            grid-stride replay and explicit sequential-K limits.  The returned
+            candidates remain bound to the caller's original lowered problem;
+            this flag changes search only, not graph semantics.
 
     Returns:
         The validated candidate sweep.
@@ -138,11 +143,17 @@ def enumerate_cube_plans(
         region.problem, sort_keys=True, separators=(",", ":")
     )
     problem_sha256 = hashlib.sha256(canonical_problem.encode()).hexdigest()
+    sweep_problem = dict(region.problem)
+    if source_oriented:
+        sweep_problem["require_source_codegen"] = True
+    canonical_sweep_problem = json.dumps(
+        sweep_problem, sort_keys=True, separators=(",", ":")
+    )
     with tempfile.TemporaryDirectory(prefix="pto-fusebox-cube-sweep-") as directory:
         root = Path(directory)
         problem_path = root / "problem.json"
         output_path = root / "sweep.json"
-        problem_path.write_text(canonical_problem + "\n", encoding="utf-8")
+        problem_path.write_text(canonical_sweep_problem + "\n", encoding="utf-8")
         process = subprocess.run(
             [str(executable), str(problem_path), str(output_path)],
             check=False,
@@ -159,7 +170,7 @@ def enumerate_cube_plans(
         payload = json.loads(output_path.read_text(encoding="utf-8"))
     return _parse_sweep(
         payload,
-        problem=region.problem,
+        problem=sweep_problem,
         problem_sha256=problem_sha256,
         stdout=process.stdout,
         stderr=process.stderr,

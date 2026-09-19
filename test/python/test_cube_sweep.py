@@ -32,6 +32,11 @@ class Matmul(nn.Module):
         return torch.mm(lhs, rhs)
 
 
+class Int8Matmul(nn.Module):
+    def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        return torch.ops.aten._int_mm.default(lhs, rhs)
+
+
 class SplitCubeChain(nn.Module):
     def forward(
         self,
@@ -113,6 +118,54 @@ def _lowered_region(
         diagnostics=regions[0].diagnostics,
     )
     return graph, result
+
+
+def _lowered_int8_region(
+    m: int, k: int, n: int
+) -> tuple[NormalizedGraph, RegionSolveResult]:
+    graph = export_and_normalize(
+        Int8Matmul(),
+        (
+            torch.empty((m, k), dtype=torch.int8, device="meta"),
+            torch.empty((k, n), dtype=torch.int8, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    return graph, RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+
+
+def _lowered_bf16_region(
+    m: int, k: int, n: int
+) -> tuple[NormalizedGraph, RegionSolveResult]:
+    graph = export_and_normalize(
+        Matmul(),
+        (
+            torch.empty((m, k), dtype=torch.bfloat16, device="meta"),
+            torch.empty((k, n), dtype=torch.bfloat16, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    return graph, RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
 
 
 def _lowered_split_chain(
@@ -237,6 +290,68 @@ def test_cube_grid_stride_replay_bounds_a_large_logical_grid() -> None:
         scheduled_region(replace(forced, solution=missing_replay))
 
 
+def test_source_oriented_sweep_exposes_qwen_scale_sequential_k_replay() -> None:
+    graph, region = _lowered_bf16_region(16, 5120, 152064)
+
+    analytic = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    assert all(candidate.grid.parts_n != 792 for candidate in analytic.candidates)
+
+    source = enumerate_cube_plans(
+        region,
+        sweep_binary=_sweep_binary(),
+        source_oriented=True,
+    )
+    candidate = next(
+        item
+        for item in source.candidates
+        if (
+            item.grid.parts_m,
+            item.grid.parts_n,
+            item.grid.split_k,
+            item.grid.realized_sequential_k,
+        )
+        == (1, 792, 1, 512)
+    )
+    forced = region_for_cube_candidate(region, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.n_partition.big == plan.n_partition.small == 192
+    assert plan.spatial_replay.present
+    assert (
+        plan.spatial_replay.active_tasks,
+        plan.spatial_replay.trips_per_task,
+    ) == (24, 33)
+    assert plan.matmuls[0].k_loop.l1_window_k == 512
+    assert can_emit_region(graph, forced)
+
+    emitted = emit_pypto_region(graph, forced, program_name="qwen_grid_stride_k512")
+    assert "for cube_task in pl.spmd(24" in emitted.source
+    assert "pl.range(33, init_values=" in emitted.source
+
+
+def test_small_m_source_surface_uses_one_padded_physical_row_box() -> None:
+    graph, region = _lowered_bf16_region(8, 12288, 6144)
+    sweep = enumerate_cube_plans(
+        region,
+        sweep_binary=_sweep_binary(),
+        source_oriented=True,
+    )
+    forced = region_for_cube_candidate(region, sweep.selected)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.m_partition.big == plan.m_partition.small == 16
+    assert plan.matmuls[0].output.height == 8
+    assert plan.matmuls[0].output_tile[0] == 8
+    assert all(
+        variant.l0_init.tile[0] == 8 for variant in plan.matmuls[0].output_variants
+    )
+    assert can_emit_region(graph, forced)
+
+    source = emit_pypto_region(graph, forced, program_name="small_m_cube").source
+    assert "pl.Tensor[[8, 12288], pl.BF16]" in source
+    assert "out_dtype=pl.FP32" in source
+
+
 def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     graph, region = _lowered_region(128, 8192, 128)
     sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
@@ -284,6 +399,28 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     assert matmul.output_variants[0].l0_init.tile[2] == 64
     l0_loop = matmul.output_variants[0].l0_init.k_loop
     assert l0_loop.full_chunks * l0_loop.chunk + l0_loop.tail == 160
+
+
+def test_int8_parallel_split_k_emits_int32_accumulator_merge() -> None:
+    graph, region = _lowered_int8_region(16, 2048, 2048)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidate = next(
+        item
+        for item in sweep.candidates
+        if item.grid.split_k == 2 and item.grid.parts_m == item.grid.parts_n == 1
+    )
+    forced = region_for_cube_candidate(region, candidate)
+    plan = scheduled_region(forced).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    assert plan.split_k == 2
+    assert plan.matmuls[-1].accumulator_dtype == "int32"
+    assert plan.matmuls[-1].storage_dtype == "int32"
+    assert can_emit_region(graph, forced)
+
+    source = emit_pypto_region(graph, forced, program_name="int8_split_k").source
+    assert source.count("pl.spmd(") == 2
+    assert "dtype=pl.INT32, value=0" in source
+    assert "atomic=pl.AtomicType.Add" in source
 
 
 def test_split_cube_dag_replays_upstream_then_unique_atomic_sink() -> None:
@@ -604,6 +741,61 @@ def test_balanced_surface_excludes_outer_pipeline_l0_overflow() -> None:
     assert can_emit_region(
         graph, region_for_cube_candidate(region, candidates[(4, 4, 1)])
     )
+
+
+@pytest.mark.parametrize(
+    ("m", "k", "n", "grids"),
+    (
+        # A 16-column tail is logical work, but the INT8 Right operand occupies
+        # a complete 16x32 box.  The old plan admitted this candidate and
+        # PyPTO later rejected matmul_acc's N=32 product against its N=16 Acc.
+        (16, 6144, 6144, ((1, 48, 1),)),
+        # These maximum-split grids used a logical accumulator footprint.  The
+        # physical INT32 L0C allocation rounds M to 32 and exceeds 128 KiB.
+        (16, 8192, 8192, ((1, 1, 1),)),
+        (32, 8192, 8192, ((1, 1, 1), (2, 1, 1))),
+    ),
+)
+def test_int8_source_admission_retiles_physical_l0c_and_fractal_overflow(
+    m: int,
+    k: int,
+    n: int,
+    grids: tuple[tuple[int, int, int], ...],
+) -> None:
+    graph, region = _lowered_int8_region(m, k, n)
+    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    candidates = {
+        (
+            candidate.grid.parts_m,
+            candidate.grid.parts_n,
+            candidate.grid.split_k,
+        ): candidate
+        for candidate in sweep.candidates
+    }
+    for grid in grids:
+        candidate = candidates[grid]
+        forced = region_for_cube_candidate(region, candidate)
+        assert can_emit_region(graph, forced)
+        plan = scheduled_region(forced).steps[0].plan
+        assert isinstance(plan, CubeKernelPlan)
+        matmul = plan.matmuls[0]
+        assert matmul.output_tile[0] % 16 == 0
+        assert matmul.output_tile[1] % 32 == 0
+        for variant in matmul.output_variants:
+            for child in (
+                variant.l0_init,
+                variant.l0_rolled,
+                variant.l0_tail,
+            ):
+                if child is None:
+                    continue
+                physical_m = (child.tile[0] + 31) // 32 * 32
+                physical_n = (child.tile[1] + 31) // 32 * 32
+                assert (
+                    physical_m * physical_n * 4 * child.buffer_depths[2] <= 128 * 1024
+                )
+        source = emit_pypto_region(graph, forced).source
+        assert "out_dtype=pl.INT32" in source
 
 
 def test_candidate_cannot_be_rebound_to_a_different_problem() -> None:

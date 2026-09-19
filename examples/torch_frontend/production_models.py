@@ -218,9 +218,9 @@ def _solve_complete_projection(
         solver_workers=solver_workers,
         require_source_codegen=True,
     )
-    if not solved.successful or not solved.regions_solved or len(solved.regions) != 2:
+    if not solved.successful or not solved.regions_solved or len(solved.regions) != 1:
         raise SourceEmissionError(
-            "DeepSeek MTP projection must expose two solved maximal regions"
+            "DeepSeek MTP projection must expose one combined static producer region"
         )
     return graph, solved
 

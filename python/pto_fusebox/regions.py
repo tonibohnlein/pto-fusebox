@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .ir import (
@@ -148,7 +148,111 @@ def extract_solver_regions(  # noqa: PLR0912 -- each branch is one explicit regi
                 diagnostics=diagnostics,
             )
         )
-    return regions
+    return _coalesce_static_producer_branches(graph, regions)
+
+
+_STATIC_COMPOSITION_OPERATORS = {
+    "aten.add.Tensor",
+    "aten.reshape.default",
+    "aten.slice.Tensor",
+    "aten.unsqueeze.default",
+    "aten.view.default",
+}
+
+
+def _coalesce_static_producer_branches(
+    graph: NormalizedGraph, regions: list[SolverRegion]
+) -> list[SolverRegion]:
+    """Join independent static producers that converge at a static native tail.
+
+    A shape-only tail can separate otherwise independent static branches even
+    though the solver and source backend can schedule a disconnected multi-output
+    DAG.  Keep the tail native, but give the solver the complete producer forest
+    so it may compare one combined schedule with ordinary per-step GM cuts.  The
+    rule is deliberately structural: every path from a region output to the
+    shared graph output must contain only fixed-shape aliases/slices and
+    pointwise composition.  No model name or tensor extent participates.
+    """
+
+    if len(regions) < 2:
+        return regions
+    operations = graph.op_map()
+    consumers = _consumers(graph)
+    graph_outputs = set(graph.outputs)
+    region_ops = {op_id for region in regions for op_id in region.op_ids}
+
+    def static_sinks(region: SolverRegion) -> frozenset[str] | None:
+        pending = list(region.output_values)
+        visited_values: set[str] = set()
+        sinks: set[str] = set()
+        while pending:
+            value_id = pending.pop()
+            if value_id in visited_values:
+                continue
+            visited_values.add(value_id)
+            if value_id in graph_outputs:
+                sinks.add(value_id)
+            for consumer_id in consumers[value_id]:
+                if consumer_id in region_ops:
+                    return None
+                consumer = operations[consumer_id]
+                source_operator = consumer.attributes.get("source_operator")
+                if source_operator not in _STATIC_COMPOSITION_OPERATORS:
+                    return None
+                pending.extend(consumer.outputs)
+        return frozenset(sinks) if sinks else None
+
+    groups: dict[frozenset[str], list[int]] = {}
+    for index, region in enumerate(regions):
+        sinks = static_sinks(region)
+        if sinks is not None:
+            groups.setdefault(sinks, []).append(index)
+
+    merged_indices: set[int] = set()
+    replacements: dict[int, SolverRegion] = {}
+    op_index = {op.id: index for index, op in enumerate(graph.ops)}
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        members = [regions[index] for index in indices]
+        first = indices[0]
+        replacements[first] = SolverRegion(
+            id=members[0].id,
+            op_ids=tuple(
+                sorted(
+                    (op_id for member in members for op_id in member.op_ids),
+                    key=op_index.__getitem__,
+                )
+            ),
+            input_values=tuple(
+                dict.fromkeys(
+                    value_id for member in members for value_id in member.input_values
+                )
+            ),
+            output_values=tuple(
+                dict.fromkeys(
+                    value_id for member in members for value_id in member.output_values
+                )
+            ),
+            target=members[0].target,
+            diagnostics=tuple(
+                dict.fromkeys(
+                    diagnostic
+                    for member in members
+                    for diagnostic in member.diagnostics
+                )
+            ),
+        )
+        merged_indices.update(indices[1:])
+
+    result = [
+        replacements.get(index, region)
+        for index, region in enumerate(regions)
+        if index not in merged_indices
+    ]
+    return [
+        replace(region, id=f"region{index:04d}") for index, region in enumerate(result)
+    ]
 
 
 def lower_solver_region(

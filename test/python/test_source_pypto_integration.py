@@ -257,7 +257,7 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
     )
     assert solved.regions_solved
     assert not solved.whole_graph_supported
-    assert len(solved.regions) == 2
+    assert len(solved.regions) == 1
 
     overlay = emit_flash_mtp_decode_projection_overlay(
         graph,
@@ -330,11 +330,11 @@ class FlashMtpOverlayProbe:
         "fusebox_mtp_hidden_copy",
         "fusebox_mtp_hidden_zero",
         "region0000_cube",
+        "region0000_cube_0",
         "region0000_vector",
         "region0000_vector_0",
-        "region0001_cube",
-        "region0001_vector",
-        "region0001_vector_0",
+        "region0000_vector_1",
+        "region0000_vector_2",
     }
     assert len(orchestration_files) == 1
     assert orchestration_files[0].read_text(encoding="utf-8").count(
@@ -2266,6 +2266,11 @@ class _Int8ProjectionBranch(nn.Module):
         return accumulator.float() * scale
 
 
+class _Int8Matmul(nn.Module):
+    def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        return torch.ops.aten._int_mm.default(lhs, rhs)
+
+
 class _BranchedInt8Projection(nn.Module):
     def forward(
         self,
@@ -2712,6 +2717,61 @@ def test_deep_k_no_split_candidate_compiles_through_pypto_and_ptoas(
     assert orchestration.count("rt_submit_aic_task(") == 1
     assert "launch_spec.set_block_num(1);" in orchestration
     assert "set_dependencies(" not in orchestration
+
+
+def test_int8_parallel_split_k_lowers_through_pypto_and_ptoas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the generic INT32 partial-accumulator merge source-realizable."""
+
+    ir = importlib.import_module("pypto.ir")
+    pl = importlib.import_module("pypto.language")
+    monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
+    graph = export_and_normalize(
+        _Int8Matmul(),
+        (
+            torch.empty(16, 2048, dtype=torch.int8, device="meta"),
+            torch.empty(2048, 2048, dtype=torch.int8, device="meta"),
+        ),
+    )
+    regions = extract_solver_regions(graph)
+    assert len(regions) == 1
+    lowered = regions[0].lower(graph)
+    unsolved = RegionSolveResult(
+        region=regions[0],
+        status="lowered",
+        problem=lowered.problem,
+        solution=None,
+        solver_op_to_graph=lowered.solver_op_to_graph,
+        solver_tensor_to_value=lowered.solver_tensor_to_value,
+        diagnostics=regions[0].diagnostics,
+    )
+    sweep = enumerate_cube_plans(
+        unsolved,
+        sweep_binary=_solver().parent / "cube_plan_sweep",
+    )
+    candidate = next(
+        item
+        for item in sweep.candidates
+        if (item.grid.parts_m, item.grid.parts_n, item.grid.split_k) == (1, 1, 2)
+    )
+    region = region_for_cube_candidate(unsolved, candidate)
+    source = emit_pypto_region(graph, region, program_name="int8_split_k").source
+    compiled = ir.compile(
+        pl.parse_program(source),
+        output_dir=str(tmp_path / "int8_split_k"),
+        dump_passes=False,
+        skip_ptoas=False,
+    )
+
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    generated_cpp = list((compiled.output_dir / "ptoas").glob("*.cpp"))
+    assert len(pto_files) == len(generated_cpp) == 2
+    assert any(
+        "atomicType = #pto<atomic_type atomic_add>" in path.read_text(encoding="utf-8")
+        for path in pto_files
+    )
 
 
 def test_split_cube_dag_lowers_upstream_and_sink_into_each_atomic_share(

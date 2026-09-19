@@ -140,43 +140,57 @@ def emit_deepseek_mtp_projection_overlay(
         geometry=geometry,
     )
 
-    hidden_bindings = _projection_bindings(
-        graph,
-        hidden,
-        semantic_bindings={
-            "hidden_padded": "hidden_padded",
-            "enorm_weight": "enorm_2d",
-            "e_smooth": "e_smooth_2d",
-            "e_projection_weight": "e_proj_w",
-            "e_projection_scale": "e_scale_2d",
-        },
-        output="hidden_projected",
-    )
-    history_bindings = _projection_bindings(
-        graph,
-        history,
-        semantic_bindings={
-            "history_flat": "history_flat",
-            "hnorm_weight": "hnorm_2d",
-            "h_smooth": "h_smooth_2d",
-            "h_projection_weight": "h_proj_w",
-            "h_projection_scale": "h_scale_2d",
-        },
-        output="history_projected",
-    )
+    semantic_bindings = {
+        "hidden_padded": "hidden_padded",
+        "enorm_weight": "enorm_2d",
+        "e_smooth": "e_smooth_2d",
+        "e_projection_weight": "e_proj_w",
+        "e_projection_scale": "e_scale_2d",
+        "history_flat": "history_flat",
+        "hnorm_weight": "hnorm_2d",
+        "h_smooth": "h_smooth_2d",
+        "h_projection_weight": "h_proj_w",
+        "h_projection_scale": "h_scale_2d",
+    }
+    if hidden is history:
+        combined_bindings, combined_outputs = _combined_projection_bindings(
+            graph,
+            hidden,
+            semantic_bindings=semantic_bindings,
+            geometry=geometry,
+        )
+        projection_calls = (
+            f"    {', '.join(combined_outputs)} = {hidden.function_name}"
+            f"({', '.join(combined_bindings)})\n"
+        )
+        callable_functions = [_callable_function(hidden)]
+    else:
+        hidden_bindings = _projection_bindings(
+            graph,
+            hidden,
+            semantic_bindings=semantic_bindings,
+            output="hidden_projected",
+        )
+        history_bindings = _projection_bindings(
+            graph,
+            history,
+            semantic_bindings=semantic_bindings,
+            output="history_projected",
+        )
+        projection_calls = (
+            f"    hidden_projected = {hidden.function_name}"
+            f"({', '.join(hidden_bindings)})\n"
+            f"    history_projected = {history.function_name}"
+            f"({', '.join(history_bindings)})\n"
+        )
+        callable_functions = [
+            _callable_function(hidden),
+            _callable_function(history),
+        ]
 
     functions = [
-        _callable_function(hidden),
-        _callable_function(history),
-        ast.parse(
-            _flash_mtp_wrapper_source(
-                hidden.function_name,
-                hidden_bindings,
-                history.function_name,
-                history_bindings,
-                geometry,
-            )
-        ).body[0],
+        *callable_functions,
+        ast.parse(_flash_mtp_wrapper_source(projection_calls, geometry)).body[0],
     ]
     module = ast.Module(
         body=[
@@ -403,10 +417,14 @@ def _projection_callables(
             "complete production projection must expose exactly one maximal "
             "hidden region and one maximal history region"
         )
-    if len(callables) != 2:
+    if len(callables) not in {1, 2}:
         raise SourceEmissionError(
             f"complete production projection emitted {len(callables)} static "
-            "regions; expected 2"
+            "regions; expected one combined producer or two branches"
+        )
+    if len(callables) == 1 and len(set(by_value_input.values())) != 1:
+        raise SourceEmissionError(
+            "combined production projection must consume both branch roots"
         )
     return by_value_input["hidden_padded"], by_value_input["history_flat"]
 
@@ -432,13 +450,14 @@ def _validate_projection_callable(
         f"{prefix}_projection_weight": ((hidden, hidden), "int8"),
         f"{prefix}_projection_scale": ((1, hidden), "float32"),
     }
-    if len(input_values) != 5 or len({value.name for value in input_values}) != 5:
+    branch_inputs = [value for value in input_values if value.name in expected_inputs]
+    if len(branch_inputs) != 5 or len({value.name for value in branch_inputs}) != 5:
         raise SourceEmissionError(
             f"production projection region for {value_name!r} requires five "
             "uniquely named inputs"
         )
     actual_inputs = {
-        value.name: (tuple(value.shape), value.dtype) for value in input_values
+        value.name: (tuple(value.shape), value.dtype) for value in branch_inputs
     }
     if actual_inputs != expected_inputs:
         raise SourceEmissionError(
@@ -456,16 +475,17 @@ def _validate_projection_callable(
             f"production projection input {value_name!r} is stale: "
             f"shape={value.shape!r}, dtype={value.dtype!r}"
         )
-    if len(emitted.output_value_ids) != 1:
-        raise SourceEmissionError("production projection region requires one output")
-    output = values[emitted.output_value_ids[0]]
-    output_shape = tuple(output.shape)
-    if output_shape != (rows, hidden):
+    matching_outputs = [
+        values[value_id]
+        for value_id in emitted.output_value_ids
+        if tuple(values[value_id].shape) == (rows, hidden)
+        and values[value_id].dtype == "float32"
+    ]
+    if len(matching_outputs) != 1:
         raise SourceEmissionError(
-            f"production projection output shape is stale: {output_shape!r}"
+            f"production projection region for {value_name!r} requires one "
+            "matching FP32 output"
         )
-    if output.dtype != "float32":
-        raise SourceEmissionError("production projection output must remain FP32")
 
 
 def _validate_native_projection_ops(
@@ -499,8 +519,20 @@ def _validate_native_projection_ops(
             f"production projection native shape boundaries are stale: {reasons!r}"
         )
 
-    hidden_output = _single_callable_output(hidden, "hidden")
-    history_output = _single_callable_output(history, "history")
+    hidden_output = _projection_output(
+        graph,
+        hidden,
+        rows=geometry.linear_rows,
+        hidden=geometry.hidden_size,
+        label="hidden",
+    )
+    history_output = _projection_output(
+        graph,
+        history,
+        rows=geometry.history_rows,
+        hidden=geometry.hidden_size,
+        label="history",
+    )
     hidden_slice, hidden_view, history_reshape, grouped_add = native
     if hidden_slice.inputs != (hidden_output,) or history_reshape.inputs != (
         history_output,
@@ -583,15 +615,26 @@ def _validate_native_projection_ops(
         )
 
 
-def _single_callable_output(
+def _projection_output(
+    graph: NormalizedGraph,
     emitted: EmittedPyPTOCallable,
+    *,
+    rows: int,
+    hidden: int,
     label: str,
 ) -> str:
-    if len(emitted.output_value_ids) != 1:
+    values = graph.value_map()
+    matches = [
+        value_id
+        for value_id in emitted.output_value_ids
+        if tuple(values[value_id].shape) == (rows, hidden)
+        and values[value_id].dtype == "float32"
+    ]
+    if len(matches) != 1:
         raise SourceEmissionError(
-            f"production projection {label} callable requires one output"
+            f"production projection {label} callable requires one matching output"
         )
-    return emitted.output_value_ids[0]
+    return matches[0]
 
 
 def _single_op_output(op: NormalizedOp, label: str) -> str:
@@ -623,6 +666,58 @@ def _projection_bindings(
         raise SourceEmissionError("production projection binding requires one output")
     arguments.extend(output for _argument in emitted.output_arguments)
     return tuple(arguments)
+
+
+def _combined_projection_bindings(
+    graph: NormalizedGraph,
+    emitted: EmittedPyPTOCallable,
+    *,
+    semantic_bindings: dict[str, str],
+    geometry: _MtpProjectionGeometry,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bind a generic multi-output producer callable in emitted ABI order."""
+
+    values = graph.value_map()
+    try:
+        arguments = tuple(
+            semantic_bindings[values[argument.value_id].name]
+            for argument in emitted.input_arguments
+        )
+    except KeyError as error:
+        raise SourceEmissionError(
+            f"combined production projection binding is missing {error.args[0]!r}"
+        ) from error
+    hidden_output = _projection_output(
+        graph,
+        emitted,
+        rows=geometry.linear_rows,
+        hidden=geometry.hidden_size,
+        label="hidden",
+    )
+    history_output = _projection_output(
+        graph,
+        emitted,
+        rows=geometry.history_rows,
+        hidden=geometry.hidden_size,
+        label="history",
+    )
+    output_names = {
+        hidden_output: "hidden_projected",
+        history_output: "history_projected",
+    }
+    try:
+        ordered_outputs = tuple(
+            output_names[argument.value_id] for argument in emitted.output_arguments
+        )
+    except KeyError as error:
+        raise SourceEmissionError(
+            f"combined production projection has an unexpected output {error.args[0]!r}"
+        ) from error
+    if len(ordered_outputs) != 2:
+        raise SourceEmissionError(
+            "combined production projection requires exactly two outputs"
+        )
+    return (*arguments, *ordered_outputs), ordered_outputs
 
 
 def _qwen_output_head_bindings(
@@ -775,14 +870,9 @@ def _qwen_output_window_function(
 
 
 def _flash_mtp_wrapper_source(
-    hidden_name: str,
-    hidden_arguments: tuple[str, ...],
-    history_name: str,
-    history_arguments: tuple[str, ...],
+    projection_calls: str,
     geometry: _MtpProjectionGeometry,
 ) -> str:
-    hidden_call = ", ".join(hidden_arguments)
-    history_call = ", ".join(history_arguments)
     decode_rows = geometry.decode_rows
     linear_rows = geometry.linear_rows
     history_rows = geometry.history_rows
@@ -828,8 +918,7 @@ def mtp_projection(
     h_scale_2d = pl.reshape(h_proj_w_scale, [1, {hidden}])
     hidden_projected = pl.create_tensor([{linear_rows}, {hidden}], dtype=pl.FP32)
     history_projected = pl.create_tensor([{history_rows}, {hidden}], dtype=pl.FP32)
-    hidden_projected = {hidden_name}({hidden_call})
-    history_projected = {history_name}({history_call})
+{projection_calls.rstrip()}
 
     output_flat = pl.reshape(hidden_states_out, [{decode_rows}, {output_cols}])
     for combine_index in pl.spmd({combine_work}, name_hint="fusebox_mtp_combine"):

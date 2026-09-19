@@ -249,9 +249,12 @@ def _emit_split_cube_dag(
     matmul = sinks[0]
     if len(io.output_values) != 1:
         raise SourceEmissionError("split-K source requires exactly one output")
-    if matmul.accumulator_dtype != "fp32" or matmul.storage_dtype != "fp32":
+    if (
+        matmul.accumulator_dtype not in {"fp32", "int32"}
+        or matmul.storage_dtype != matmul.accumulator_dtype
+    ):
         raise SourceEmissionError(
-            "split-K source currently requires FP32 accumulation and storage"
+            "split-K source requires FP32 or INT32 accumulator-width storage"
         )
     if plan.spatial_policy is not CubeSpatialPolicy.UNIFORM:
         raise SourceEmissionError("split-K source requires a uniform spatial grid")
@@ -1355,6 +1358,8 @@ def _validate_lowered_l0_capacity(
         raise SourceEmissionError("cube source requires an L0 matmul target profile")
     l0a_capacity = raw_config.get("l0a_bytes")
     l0b_capacity = raw_config.get("l0b_bytes")
+    l0c_capacity = raw_config.get("l0c_bytes")
+    l0c_align_m = raw_config.get("l0c_align_m", 16)
     box_align_m = raw_config.get("box_align_m", 1)
     box_align_n = raw_config.get("box_align_n", 1)
     if (
@@ -1362,6 +1367,10 @@ def _validate_lowered_l0_capacity(
         or l0a_capacity <= 0
         or not isinstance(l0b_capacity, int)
         or l0b_capacity <= 0
+        or not isinstance(l0c_capacity, int)
+        or l0c_capacity <= 0
+        or not isinstance(l0c_align_m, int)
+        or l0c_align_m <= 0
         or not isinstance(box_align_m, int)
         or box_align_m <= 0
         or not isinstance(box_align_n, int)
@@ -1371,6 +1380,11 @@ def _validate_lowered_l0_capacity(
 
     lhs_bytes = context.lowered.tensor(matmul.lhs.tensor).byte_width
     rhs_bytes = context.lowered.tensor(matmul.rhs.tensor).byte_width
+    int8_operands = lhs_bytes == 1 and rhs_bytes == 1
+    if int8_operands:
+        l0c_align_m = max(l0c_align_m, 32)
+        box_align_m = max(box_align_m, 16)
+        box_align_n = max(box_align_n, 32)
 
     def align_up(value: int, alignment: int) -> int:
         return (value + alignment - 1) // alignment * alignment
@@ -1400,11 +1414,18 @@ def _validate_lowered_l0_capacity(
 
         l0a_bytes = physical_m * tile[2] * lhs_bytes * physical_depth(depths[0])
         l0b_bytes = tile[2] * physical_n * rhs_bytes * physical_depth(depths[1])
-        if l0a_bytes > l0a_capacity or l0b_bytes > l0b_capacity:
+        physical_l0c_m = align_up(physical_m, l0c_align_m)
+        l0c_bytes = physical_l0c_m * physical_n * 4 * depths[2]
+        if (
+            l0a_bytes > l0a_capacity
+            or l0b_bytes > l0b_capacity
+            or l0c_bytes > l0c_capacity
+        ):
             raise SourceEmissionError(
                 f"{label} exceeds lowered L0 operand capacity: "
                 f"L0A {l0a_bytes}/{l0a_capacity} bytes, "
-                f"L0B {l0b_bytes}/{l0b_capacity} bytes"
+                f"L0B {l0b_bytes}/{l0b_capacity} bytes, "
+                f"L0C {l0c_bytes}/{l0c_capacity} bytes"
             )
 
     for variant in matmul.output_variants:

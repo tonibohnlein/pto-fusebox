@@ -1136,11 +1136,75 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         f"{plan.n_partition.big}], dtype={accumulator_dtype}, "
         "target_memory=pl.Mem.Acc, compact=True)",
     )
+    crosses_back_to_vector = descriptor.sink_stage + 1 < len(plan.stages)
+    accumulator_valid_rows = (
+        descriptor.accumulator_rows if crosses_back_to_vector else descriptor.row_chunk
+    )
     writer.line(
         4,
         f"sink_acc_init = pl.tile.set_validshape(sink_acc_storage, "
-        f"{descriptor.row_chunk}, {plan.n_partition.big})",
+        f"{accumulator_valid_rows}, {plan.n_partition.big})",
     )
+
+    crossing_dtype = pypto_dtype(
+        context.lowered.tensor(descriptor.crossing_tensor).dtype
+    )
+
+    def emit_sink_lhs(
+        indent: int,
+        crossing_value: str,
+        prefix: str,
+        valid_cols: int | str,
+    ) -> str:
+        """Materialize a cube lhs whose frame matches a following C2V crossing."""
+
+        if (
+            not crosses_back_to_vector
+            or descriptor.accumulator_rows == descriptor.row_chunk
+        ):
+            lhs = f"{prefix}_mat"
+            writer.line(
+                indent,
+                f"{lhs} = pl.tile.move({crossing_value}, target_memory=pl.Mem.Mat)",
+            )
+            return lhs
+
+        # A split C2V crossing transports the full accumulator frame.  Keep the
+        # logical rows from the vector producer, zero the physical-only rows,
+        # and make the matmul itself produce that full frame.  Merely widening
+        # valid_shape would expose undefined vector storage; moving the narrow
+        # result into Acc first instead creates a row-narrowed accumulator that
+        # PyPTO correctly refuses to transport.
+        logical = f"{prefix}_logical"
+        storage = f"{prefix}_storage"
+        assembled = f"{prefix}_assembled"
+        padded = f"{prefix}_padded"
+        lhs = f"{prefix}_mat"
+        writer.line(
+            indent,
+            f"{logical} = pl.tile.slice({crossing_value}, "
+            f"[{descriptor.row_chunk}, {stream.chunk}], [0, 0])",
+        )
+        writer.line(
+            indent,
+            f"{storage} = pl.tile.full([{descriptor.accumulator_rows}, {stream.chunk}], "
+            f"dtype={crossing_dtype}, value=0)",
+        )
+        writer.line(
+            indent,
+            f"{assembled} = pl.tile.assemble({storage}, {logical}, [0, 0])",
+        )
+        writer.line(
+            indent,
+            f"{padded} = pl.tile.set_validshape({assembled}, "
+            f"{descriptor.accumulator_rows}, {valid_cols})",
+        )
+        writer.line(
+            indent,
+            f"{lhs} = pl.tile.move({padded}, target_memory=pl.Mem.Mat)",
+        )
+        return lhs
+
     _emit_loop_header(
         writer,
         4,
@@ -1167,10 +1231,7 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
     crossing_value = apply_values.get(descriptor.crossing_tensor)
     if crossing_value is None:
         raise SourceEmissionError("streamed APPLY pass does not produce its crossing")
-    writer.line(
-        5,
-        f"sink_lhs_mat = pl.tile.move({crossing_value}, target_memory=pl.Mem.Mat)",
-    )
+    sink_lhs = emit_sink_lhs(5, crossing_value, "sink_lhs", stream.chunk)
     rhs = _emit_streamed_sink_rhs_tile(
         writer,
         5,
@@ -1185,12 +1246,12 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         transposed=rhs_transposed,
     )
     writer.line(5, "if apply_chunk == 0:")
-    writer.line(6, f"sink_first = pl.matmul(sink_lhs_mat, {rhs})")
+    writer.line(6, f"sink_first = pl.matmul({sink_lhs}, {rhs})")
     writer.line(6, "sink_next = pl.yield_(sink_first)")
     writer.line(5, "else:")
     writer.line(
         6,
-        f"sink_later = pl.matmul_acc(sink_acc, sink_lhs_mat, {rhs})",
+        f"sink_later = pl.matmul_acc(sink_acc, {sink_lhs}, {rhs})",
     )
     writer.line(6, "sink_next = pl.yield_(sink_later)")
     writer.line(5, "sink_acc_result, = pl.yield_(sink_next)")
@@ -1214,10 +1275,11 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
             row_scale=plan.vector_lanes,
         )
         crossing_value = tail_values[descriptor.crossing_tensor]
-        writer.line(
+        sink_lhs_tail = emit_sink_lhs(
             4,
-            f"sink_lhs_tail_mat = pl.tile.move({crossing_value}, "
-            "target_memory=pl.Mem.Mat)",
+            crossing_value,
+            "sink_lhs_tail",
+            apply.tail.extent,
         )
         rhs = _emit_streamed_sink_rhs_tile(
             writer,
@@ -1234,7 +1296,7 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         )
         writer.line(
             4,
-            f"sink_tail = pl.matmul_acc({accumulator}, sink_lhs_tail_mat, {rhs})",
+            f"sink_tail = pl.matmul_acc({accumulator}, {sink_lhs_tail}, {rhs})",
         )
         accumulator = "sink_tail"
     if output_dtype != accumulator_dtype:
@@ -1245,21 +1307,22 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         )
         accumulator = "sink_stored"
 
-    if descriptor.sink_stage + 1 == len(plan.stages):
+    if not crosses_back_to_vector:
         result = accumulator
     else:
         final_stage = plan.stages[descriptor.sink_stage + 1]
         _require_in_memory_vector_stage(final_stage)
-        writer.line(
-            4,
-            f"sink_vector_mat = pl.tile.move({accumulator}, target_memory=pl.Mem.Mat)",
-        )
+        # Keep the cube result in Acc at the engine boundary.  PyPTO's split
+        # lowering recognizes the vector consumer and materializes the C2V
+        # shard from Acc.  Moving it to Mat first creates an unsupported
+        # Mat->AIV boundary and makes an otherwise source-ready round trip fail
+        # verification after LowerAutoVectorSplit.
         result = _emit_tile_vector_stage(
             writer,
             4,
             context,
             final_stage,
-            {sink.outputs[0]: "sink_vector_mat", **resident_carried},
+            {sink.outputs[0]: accumulator, **resident_carried},
             frame_rows=descriptor.row_chunk,
             frame_cols=plan.n_partition.big,
             row_offset=row,

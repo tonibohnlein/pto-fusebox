@@ -792,6 +792,27 @@ L0MatmulPlan DeriveL0MatmulPlan(const Problem* p, int64_t m, int64_t n, int64_t 
   config.bytes_a = dtype_bytes(lhs_dtype);
   config.bytes_b = dtype_bytes(rhs_dtype);
   config.bytes_c = dtype_bytes(output_dtype);
+  // A2/A3's INT8 matrix operands occupy complete 16x32 fractal boxes and
+  // their INT32 accumulator allocation rounds M to 32 rows.  These are
+  // physical layout constraints, not logical work-shape restrictions: keep
+  // 16-row/16-column logical tails legal, but price the storage box that
+  // PyPTO will allocate for them.  Without this adjustment Fusebox admits
+  // candidates that later fail in AutoTileMatmulL0/AllocateMemoryAddr (or
+  // whose 16-column tail disagrees with matmul_acc's 32-column product).
+  if (lhs_dtype == DType::INT8 && rhs_dtype == DType::INT8) {
+    config.l0c_align_m = std::max<int64_t>(config.l0c_align_m, 32);
+    config.box_align_m = std::max<int64_t>(config.box_align_m, 16);
+    config.box_align_n = std::max<int64_t>(config.box_align_n, 32);
+  }
+  const bool padded_small_m = m < config.min_m;
+  if (padded_small_m) {
+    // Small decode batches are legal cube work: PyPTO carries an M-valid
+    // extent over one physical 16-row Mat/L0C box.  Let the shared chooser
+    // price that box, while the serialized schedule keeps the caller's
+    // logical M so source replay neither invents rows nor changes ownership.
+    config.allow_padding = true;
+    config.box_align_m = std::max<int64_t>(config.box_align_m, 16);
+  }
   config.accumulator_read = accumulator_read;
   config.output_target = output_target;
   // AutoTileMatmulL0's Mat-scratch placement currently forces an internal
@@ -802,6 +823,7 @@ L0MatmulPlan DeriveL0MatmulPlan(const Problem* p, int64_t m, int64_t n, int64_t 
     config.allow_b_stationary = false;
   }
   L0MatmulPlan plan = choose_l0_matmul_plan(config);
+  if (padded_small_m && plan.feasible) plan.m = m;
   if (memo != nullptr) memo->emplace(key, plan);
   return plan;
 }

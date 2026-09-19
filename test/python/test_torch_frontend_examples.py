@@ -623,6 +623,11 @@ def test_production_projection_candidates_include_maximal_streamed_v2c() -> None
         assert source.count("pl.matmul_acc(") >= 1
         assert source.count("next_output = pl.store(") == 1
         assert "gm_pipe_buffer_" not in source
+        if transfer_count == 2:
+            assert "sink_vector_mat" not in source
+            assert "pl.tile.full(" in source
+            assert "pl.tile.assemble(" in source
+            assert "sink_lhs_padded = pl.tile.set_validshape(" in source
 
         malformed = copy.deepcopy(maximal.solution)
         descriptor = malformed["steps"][0]["plan"]["streamed_v2c"]
@@ -841,14 +846,14 @@ def test_production_qwen_lm_head_accumulator_and_traffic_parity() -> None:
         (
             "deepseek_v4_flash_mtp",
             "mtp_projection",
-            2,
+            1,
             "decode_mtp.py",
             DEEPSEEK_V4_FLASH_MTP_GEOMETRY,
         ),
         (
             "deepseek_v4_pro",
             "mtp_projection",
-            2,
+            1,
             "decode_mtp.py",
             DEEPSEEK_V4_PRO_MTP_GEOMETRY,
         ),
@@ -979,16 +984,13 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
     )
     assert full_result.regions_solved
     assert not full_result.whole_graph_supported
-    assert len(full_result.regions) == 2
-    assert tuple(len(region.region.op_ids) for region in full_result.regions) == (
-        24,
-        24,
-    )
+    assert len(full_result.regions) == 1
+    assert tuple(len(region.region.op_ids) for region in full_result.regions) == (48,)
     for region in full_result.regions:
         branch = scheduled_region(region)
         source_ops = [op for step in branch.steps for op in step.op_order]
         assert len(source_ops) == len(set(source_ops)) == len(region.solver_op_to_graph)
-        assert len(branch.steps) < 5
+        assert len(branch.steps) < 7
         assert any(
             step.kind in {KernelKind.CUBE, KernelKind.MIXED} for step in branch.steps
         )
@@ -996,8 +998,9 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
             step.kind in {KernelKind.VECTOR, KernelKind.MIXED} for step in branch.steps
         )
 
-    # Both projection branches expose a one-region alternative. The ordinary
-    # solve remains free to retain GM cuts until silicon compares the choices.
+    # Both disconnected projection branches belong to one generic static
+    # producer region. The solver remains free to retain GM cuts between its
+    # vector/cube stages until silicon compares the choices.
     full_candidates = solve_graph(
         full_graph,
         solver_binary=_test_solver(),
@@ -1005,23 +1008,17 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         require_source_codegen=True,
         collect_candidate_summaries=True,
     )
-    assert len(full_candidates.regions) == 2
+    assert len(full_candidates.regions) == 1
     for region in full_candidates.regions:
         selected = region.candidate_summaries[0]
-        maximal = next(
-            candidate
-            for candidate in region.candidate_summaries
-            if len(candidate.partition) == 1
-        )
-        assert selected.execution.submissions == 3
+        assert selected.execution.submissions == 6
         assert selected.execution.cuts
         assert selected.execution.cut_bytes > 0
-        assert selected.modeled_cost_cycles < maximal.modeled_cost_cycles
-        assert maximal.source_ready
-        assert maximal.execution.submissions == 1
-        assert maximal.execution.device_programs == 2
-        assert maximal.execution.cut_bytes == 0
-        assert maximal.execution.drain_sites == 1
+        assert (
+            selected.modeled_cost_cycles
+            < region.candidate_summaries[1].modeled_cost_cycles
+        )
+        assert all(candidate.partition for candidate in region.candidate_summaries)
 
     native = "from mtp_projection import golden_mtp_projection, mtp_projection\n"
     overlay = emit_flash_mtp_decode_projection_overlay(
@@ -1030,11 +1027,11 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         native_decode_source=native,
     )
     compile(overlay.source, "<fusebox_mtp_projection>", "exec")
-    assert overlay.source.count("@pl.inline") == 3
+    assert overlay.source.count("@pl.inline") == 2
     assert "pl.create_tensor([16, 4096], dtype=pl.BF16)" in overlay.source
     assert "pl.reshape(prev_hidden_states, [32, 4096])" in overlay.source
     assert "pl.spmd(128, name_hint='fusebox_mtp_combine')" in overlay.source
-    assert len(overlay.static_callables) == 2
+    assert len(overlay.static_callables) == 1
     assert overlay.native_op_ids == ("op0048", "op0049", "op0050", "op0051")
     assert "auto_tile" not in overlay.source and "auto_fuse" not in overlay.source
     assert overlay.decode_source == (
@@ -1803,8 +1800,8 @@ def test_model_examples_expose_maximal_static_graphs_before_solving() -> None:
     graph = export_and_normalize(module, args)
     regions = extract_solver_regions(graph)
     static_op_ids = {op_id for region in regions for op_id in region.op_ids}
-    assert len(regions) == 2
-    assert tuple(len(region.op_ids) for region in regions) == (24, 24)
+    assert len(regions) == 1
+    assert tuple(len(region.op_ids) for region in regions) == (48,)
     assert tuple(op.kind for op in graph.ops if op.id not in static_op_ids) == (
         "opaque",
         "view",
