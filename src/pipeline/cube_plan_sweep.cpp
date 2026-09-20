@@ -19,25 +19,26 @@ namespace {
 
 using json = nlohmann::json;
 
-std::string candidate_id(const TileConfig& config) {
+std::string candidate_id(const TileConfig &config) {
   return "p" + std::to_string(config.parts_m) + "_q" +
          std::to_string(config.parts_n) + "_s" +
-         std::to_string(config.split_k) + "_k" + std::to_string(config.k);
+         std::to_string(config.split_k) + "_k" + std::to_string(config.k) +
+         "_i" + std::to_string(config.inner_k);
 }
 
-bool same_grid(const TileConfig& left, const TileConfig& right,
-               int left_split, int right_split) {
-  return left.parts_m == right.parts_m &&
-         left.parts_n == right.parts_n && left_split == right_split &&
-         left.k == right.k;
+bool same_grid(const TileConfig &left, const TileConfig &right, int left_split,
+               int right_split) {
+  return left.parts_m == right.parts_m && left.parts_n == right.parts_n &&
+         left_split == right_split && left.k == right.k &&
+         left.inner_k == right.inner_k;
 }
 
-}  // namespace
+} // namespace
 
-std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
+std::string cube_plan_sweep_json(const Problem &problem, const DAG &dag) {
   if (problem.num_ops() == 0 ||
       std::any_of(problem.ops.begin(), problem.ops.end(),
-                  [](const Op& op) { return op.type != OpType::MatMul; })) {
+                  [](const Op &op) { return op.type != OpType::MatMul; })) {
     throw std::invalid_argument(
         "cube plan sweep requires a non-empty homogeneous MatMul DAG");
   }
@@ -52,18 +53,17 @@ std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
 
   auto candidates = subgraph->enumerate_plans();
   if (candidates.empty()) {
-    throw std::invalid_argument(
-        "cube plan sweep found no feasible candidates");
+    throw std::invalid_argument("cube plan sweep found no feasible candidates");
   }
-  std::sort(candidates.begin(), candidates.end(), [](const auto& left,
-                                                     const auto& right) {
-    return std::tie(left.first.parts_m, left.first.parts_n,
-                    left.first.split_k, left.first.w, left.first.h,
-                    left.first.k) <
-           std::tie(right.first.parts_m, right.first.parts_n,
-                    right.first.split_k, right.first.w, right.first.h,
-                    right.first.k);
-  });
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.first.parts_m, left.first.parts_n,
+                              left.first.split_k, left.first.w, left.first.h,
+                              left.first.k, left.first.inner_k) <
+                     std::tie(right.first.parts_m, right.first.parts_n,
+                              right.first.split_k, right.first.w, right.first.h,
+                              right.first.k, right.first.inner_k);
+            });
 
   const CostResult selected = subgraph->best_cost();
   if (!selected.feasible) {
@@ -72,40 +72,49 @@ std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
   }
 
   json output = {
-      {"schema_version", "pto_fusebox.cube_plan_sweep.v2"},
+      {"schema_version", "pto_fusebox.cube_plan_sweep.v3"},
       {"selected_candidate_id", nullptr},
       {"candidates", json::array()},
       {"rejections", json::array()},
   };
   for (const CubePlanCandidateDiagnostic &diagnostic :
        subgraph->diagnose_cube_plans()) {
-    if (diagnostic.rejection_code.empty()) continue;
+    if (diagnostic.rejection_code.empty())
+      continue;
     output["rejections"].push_back(
         {{"grid",
           {{"parts_m", diagnostic.config.parts_m},
            {"parts_n", diagnostic.config.parts_n},
            {"split_k", diagnostic.config.split_k},
-           {"sequential_k_limit", diagnostic.config.k}}},
+           {"sequential_k_limit", diagnostic.config.k},
+           {"inner_k", diagnostic.config.inner_k}}},
          {"reason", diagnostic.rejection_code}});
   }
   bool found_selected = false;
   std::set<std::string> emitted_ids;
-  for (const auto& [enumerated_config, enumerated_cost] : candidates) {
-    Solution forced(problem, dag,
-                    {{Subgraph(*subgraph), enumerated_config, {}}});
+  for (const auto &[enumerated_config, enumerated_cost] : candidates) {
+    // A search cap is not itself a forceable schedule for a multi-request DAG:
+    // each request derives its own legal L1 window and compute_cost records the
+    // realized representative in CostResult::config.  Preserve the search cap
+    // in the public grid, but reconstruct the embedded solution from the exact
+    // realized configuration that source emission consumes.
+    const TileConfig &realized_config = enumerated_cost.config;
+    Solution forced(problem, dag, {{Subgraph(*subgraph), realized_config, {}}});
     const auto validation = forced.validate();
     if (!validation.valid || forced.num_steps() != 1 ||
         !forced.step_cost(0).feasible) {
       throw std::logic_error(
           "enumerated cube candidate did not reconstruct a valid solution");
     }
-    const CostResult& cost = forced.step_cost(0);
+    const CostResult &cost = forced.step_cost(0);
     if (!std::isfinite(enumerated_cost.latency) ||
         !std::isfinite(cost.latency) ||
-        enumerated_config.parts_m != cost.config.parts_m ||
-        enumerated_config.parts_n != cost.config.parts_n ||
-        static_cast<int>(enumerated_cost.parallel_split) != cost.parallel_split ||
-        cost.config.k > enumerated_config.k ||
+        realized_config.parts_m != cost.config.parts_m ||
+        realized_config.parts_n != cost.config.parts_n ||
+        static_cast<int>(enumerated_cost.parallel_split) !=
+            cost.parallel_split ||
+        realized_config.k != cost.config.k ||
+        realized_config.inner_k != cost.config.inner_k ||
         std::abs(enumerated_cost.latency - cost.latency) >
             1e-9 * std::max(1.0, std::abs(cost.latency))) {
       throw std::logic_error(
@@ -114,20 +123,20 @@ std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
           std::to_string(enumerated_cost.latency) +
           ", forced latency=" + std::to_string(cost.latency) +
           ", enumerated grid=" + std::to_string(enumerated_config.parts_m) +
-          "x" + std::to_string(enumerated_config.parts_n) + " k<=" +
-          std::to_string(enumerated_config.k) + ", forced grid=" +
-          std::to_string(cost.config.parts_m) + "x" +
-          std::to_string(cost.config.parts_n) + " k=" +
-          std::to_string(cost.config.k) + ", split=" +
-          std::to_string(enumerated_cost.parallel_split) + "/" +
+          "x" + std::to_string(enumerated_config.parts_n) +
+          " k<=" + std::to_string(enumerated_config.k) +
+          ", forced grid=" + std::to_string(cost.config.parts_m) + "x" +
+          std::to_string(cost.config.parts_n) +
+          " k=" + std::to_string(cost.config.k) +
+          ", split=" + std::to_string(enumerated_cost.parallel_split) + "/" +
           std::to_string(cost.parallel_split));
     }
 
     const std::string id = candidate_id(cost.config);
-    if (!emitted_ids.insert(id).second) continue;
+    if (!emitted_ids.insert(id).second)
+      continue;
     const bool is_selected =
-        same_grid(cost.config, selected.config,
-                  cost.parallel_split,
+        same_grid(cost.config, selected.config, cost.parallel_split,
                   selected.parallel_split);
     if (is_selected) {
       if (found_selected) {
@@ -146,7 +155,8 @@ std::string cube_plan_sweep_json(const Problem& problem, const DAG& dag) {
            {"parts_n", enumerated_config.parts_n},
            {"split_k", enumerated_config.split_k},
            {"sequential_k_limit", enumerated_config.k},
-           {"realized_sequential_k", cost.config.k}}},
+           {"realized_sequential_k", cost.config.k},
+           {"inner_k", cost.config.inner_k}}},
          {"model",
           {{"latency_cycles", cost.latency},
            {"cores_used", cost.cores_used},

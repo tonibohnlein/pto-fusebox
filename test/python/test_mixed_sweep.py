@@ -398,8 +398,8 @@ def test_deep_feature_round_trip_prices_whole_program_l1_residency() -> None:
         int(step["plan"].get("source_l1_allocation_bytes", 0))
         for step in region.solution["steps"]
     )
-    assert selected_l1_by_step == (235_520, 14_336)
-    assert sum(selected_l1_by_step) == 249_856
+    assert selected_l1_by_step == (235_520, 46_080)
+    assert sum(selected_l1_by_step) == 281_600
     assert ((0, 1, 2, 3), (4,)) in {
         candidate.partition for candidate in region.candidate_summaries
     }

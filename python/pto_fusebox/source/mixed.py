@@ -1146,8 +1146,13 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         f"{accumulator_valid_rows}, {plan.n_partition.big})",
     )
 
-    crossing_dtype = pypto_dtype(
-        context.lowered.tensor(descriptor.crossing_tensor).dtype
+    crossing_tensor = context.lowered.tensor(descriptor.crossing_tensor)
+    crossing_dtype_name = crossing_tensor.dtype.lower()
+    crossing_dtype = pypto_dtype(crossing_tensor.dtype)
+    physical_k = (
+        (stream.chunk + 31) // 32 * 32
+        if crossing_dtype_name == "int8"
+        else stream.chunk
     )
 
     def emit_sink_lhs(
@@ -1158,10 +1163,12 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
     ) -> str:
         """Materialize a cube lhs whose frame matches a following C2V crossing."""
 
-        if (
-            not crosses_back_to_vector
-            or descriptor.accumulator_rows == descriptor.row_chunk
-        ):
+        physical_rows = (
+            descriptor.accumulator_rows
+            if crosses_back_to_vector
+            else descriptor.row_chunk
+        )
+        if physical_rows == descriptor.row_chunk and physical_k == stream.chunk:
             lhs = f"{prefix}_mat"
             writer.line(
                 indent,
@@ -1175,29 +1182,36 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         # valid_shape would expose undefined vector storage; moving the narrow
         # result into Acc first instead creates a row-narrowed accumulator that
         # PyPTO correctly refuses to transport.
-        logical = f"{prefix}_logical"
         storage = f"{prefix}_storage"
         assembled = f"{prefix}_assembled"
         padded = f"{prefix}_padded"
         lhs = f"{prefix}_mat"
+        if crossing_dtype_name == "int8":
+            wide_storage = f"{prefix}_wide_storage"
+            writer.line(
+                indent,
+                f"{wide_storage} = pl.tile.full([{physical_rows}, {physical_k}], "
+                "dtype=pl.INT32, value=0)",
+            )
+            writer.line(
+                indent,
+                f"{storage} = pl.cast({wide_storage}, "
+                "target_type=pl.INT8, mode='trunc')",
+            )
+        else:
+            writer.line(
+                indent,
+                f"{storage} = pl.tile.full([{physical_rows}, {physical_k}], "
+                f"dtype={crossing_dtype}, value=0)",
+            )
         writer.line(
             indent,
-            f"{logical} = pl.tile.slice({crossing_value}, "
-            f"[{descriptor.row_chunk}, {stream.chunk}], [0, 0])",
-        )
-        writer.line(
-            indent,
-            f"{storage} = pl.tile.full([{descriptor.accumulator_rows}, {stream.chunk}], "
-            f"dtype={crossing_dtype}, value=0)",
-        )
-        writer.line(
-            indent,
-            f"{assembled} = pl.tile.assemble({storage}, {logical}, [0, 0])",
+            f"{assembled} = pl.tile.assemble({storage}, {crossing_value}, [0, 0])",
         )
         writer.line(
             indent,
             f"{padded} = pl.tile.set_validshape({assembled}, "
-            f"{descriptor.accumulator_rows}, {valid_cols})",
+            f"{physical_rows}, {valid_cols})",
         )
         writer.line(
             indent,
@@ -1237,7 +1251,7 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
         5,
         context,
         sink.inputs[1],
-        rows=stream.chunk,
+        rows=physical_k,
         valid_rows=stream.chunk,
         cols=plan.n_partition.big,
         row_offset="apply_col",
@@ -1286,7 +1300,7 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
             4,
             context,
             sink.inputs[1],
-            rows=stream.chunk,
+            rows=physical_k,
             valid_rows=apply.tail.extent,
             cols=plan.n_partition.big,
             row_offset=str(tail_col),
@@ -1328,6 +1342,13 @@ def _emit_streamed_vector_v2c(  # noqa: PLR0915 -- typed replay and sink carry.
             row_offset=row,
             col_offset=col,
         )
+        logical_result = "sink_vector_result"
+        writer.line(
+            4,
+            f"{logical_result} = pl.tile.set_validshape({result}, "
+            f"{descriptor.row_chunk}, {plan.n_partition.big})",
+        )
+        result = logical_result
     writer.line(
         4,
         f"next_output = pl.store({result}, [{row}, {col}], output_iter)",

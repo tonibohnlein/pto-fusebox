@@ -40,6 +40,7 @@ from pto_fusebox import (
     solve_graph,
 )
 from pto_fusebox.ir import NormalizedGraph, normalized_graph_sha256
+from pto_fusebox.lowered import LoweredRegion
 from pto_fusebox.schedule.schema import (
     AxisPartition,
     CubeKernelPlan,
@@ -49,6 +50,7 @@ from pto_fusebox.schedule.schema import (
     MixedKernelPlan,
     MixedPipelineMode,
     MixedTransferDirection,
+    ScheduledRegion,
     VectorKernelPlan,
     VectorReplayPassKind,
     VectorReplayPhase,
@@ -416,10 +418,10 @@ def test_cube_solution_emits_exact_spatial_and_k_window_schedule() -> None:
     step = schedule.steps[0]
     assert step.kind is KernelKind.CUBE
     assert isinstance(step.plan, CubeKernelPlan)
-    assert step.plan.m_partition.big == 32
-    assert step.plan.m_partition.small == 32
+    assert step.plan.m_partition.big == 64
+    assert step.plan.m_partition.small == 64
     assert step.plan.m_partition.num_big == 0
-    assert step.plan.m_partition.parts == 4
+    assert step.plan.m_partition.parts == 2
     assert step.plan.n_partition.big == 64
     assert step.plan.n_partition.small == 64
     assert step.plan.n_partition.num_big == 0
@@ -429,21 +431,29 @@ def test_cube_solution_emits_exact_spatial_and_k_window_schedule() -> None:
 
     source = emit_pypto_region(graph, result, program_name="matmul_fused").source
     ast.parse(source)
-    _assert_single_spmd_grid(source, 12)
-    assert "region_row = m_index * 32" in source
+    _assert_single_spmd_grid(source, step.plan.work_units)
+    assert "region_row = m_index * 64" in source
     assert "region_col = n_index * 64" in source
     k_loop = step.plan.matmuls[0].k_loop
     assert k_loop.full_chunks * k_loop.chunk + k_loop.tail == 256
     assert k_loop.pipeline_stages == 2
-    assert f"for k_window in pl.pipeline(1, {k_loop.full_chunks}, stage=2):" in source
+    assert (
+        f"for matmul_0_tile_0_outer_k in pl.pipeline(1, {k_loop.full_chunks}, stage=2):"
+    ) in source
     assert source.count("pl.tile.matmul(") == 1
-    expected_accumulate_sites = int(k_loop.full_chunks > 1) + int(k_loop.tail > 0)
+    variant = step.plan.matmuls[0].output_variants[0]
+    expected_accumulate_sites = variant.l0_init.k_loop.full_chunks - 1
+    if k_loop.full_chunks > 1:
+        assert variant.l0_rolled is not None
+        expected_accumulate_sites += variant.l0_rolled.k_loop.full_chunks
+    if k_loop.tail:
+        assert variant.l0_tail is not None
+        expected_accumulate_sites += variant.l0_tail.k_loop.full_chunks
     assert source.count("pl.tile.matmul_acc(") == expected_accumulate_sites
-    assert f"k_window * {k_loop.chunk}" in source
+    assert f"matmul_0_tile_0_outer_k * {k_loop.chunk}" in source
     if k_loop.tail:
         tail_offset = k_loop.full_chunks * k_loop.chunk
-        assert f"[region_row, {tail_offset}]" in source
-        assert f"[{tail_offset}, region_col]" in source
+        assert f"+ {tail_offset}]" in source
     assert source.count("pl.store(") == 1
     assert "auto_fuse" not in source and "auto_tile" not in source
 
@@ -551,10 +561,18 @@ def test_cube_emission_is_generic_over_shape_and_k_tail() -> None:
     graph, result = _solve_module(
         MatmulWithTail(), (torch.zeros(64, 272), torch.zeros(272, 80))
     )
+    plan = scheduled_region(result).steps[0].plan
+    assert isinstance(plan, CubeKernelPlan)
+    matmul = plan.matmuls[0]
     source = emit_pypto_region(graph, result, program_name="matmul_with_tail").source
 
-    assert "[region_row, 240], [16, 32]" in source
-    assert "[240, 0], [32, 80]" in source
+    tail_offset = matmul.k_loop.full_chunks * matmul.k_loop.chunk
+    assert tail_offset == 240
+    assert f"+ {tail_offset}]" in source
+    assert matmul.output_variants[0].l0_tail is not None
+    assert source.count("_lhs_mat_tail_") == 2 * (
+        matmul.output_variants[0].l0_tail.k_loop.full_chunks
+    )
     assert "region_col =" not in source
     assert "pl.tile.matmul_acc" in source
     assert source.count("pl.store(") == 1
@@ -578,8 +596,8 @@ def test_cube_singleton_partition_axis_uses_literal_zero_coordinate() -> None:
 
     ast.parse(source)
     assert "region_row =" not in source
-    assert "pl.tile.load(arg_lhs, [0, 0]" in source
-    assert "pl.store(accumulator, [0, region_col], output)" in source
+    assert "pl.tile.load(arg_lhs, [0, 0 * 272]" in source
+    assert "pl.store(matmul_0_tile_0_accumulator, [0, region_col], output)" in source
 
 
 def test_single_bf16_matmul_uses_fp32_accumulator_and_bf16_drain() -> None:
@@ -602,9 +620,9 @@ def test_single_bf16_matmul_uses_fp32_accumulator_and_bf16_drain() -> None:
 
     ast.parse(source)
     _assert_single_spmd_grid(source, plan.work_units)
-    assert "out_dtype=pl.FP32" in source
-    assert "pl.assemble(output, matmul_0_tile_0_accumulator" in source
-    assert "pl.cast(" not in source
+    assert "pl.tile.matmul(" in source
+    assert "target_type=pl.BF16, mode='rint'" in source
+    assert "pl.store(stored_output" in source
 
 
 def test_cube_chain_replays_outer_k_and_l1_intermediate_in_plan_order() -> None:
@@ -643,8 +661,8 @@ def test_cube_chain_replays_outer_k_and_l1_intermediate_in_plan_order() -> None:
         "matmul_1_tile_0_accumulator"
     )
     assert "pl.cast(" not in source
-    assert "pl.assemble(matmul_0_l1" in source
-    assert "pl.assemble(output, matmul_1_tile_0_accumulator" in source
+    assert "pl.tensor.assemble(matmul_0_l1" in source
+    assert "pl.tensor.assemble(output, matmul_1_tile_0_accumulator" in source
     assert source.count("pl.store(") == 0
 
 
@@ -675,7 +693,7 @@ def test_cube_retained_panel_is_sliced_once_outside_output_tile_replay() -> None
     )
     assert source.count("pl.matmul(") == 2
     assert source.count("pl.matmul_acc(") == 2
-    assert source.count("pl.assemble(output,") == 2
+    assert source.count("pl.tensor.assemble(output,") == 2
 
 
 def test_cube_retained_transposed_rhs_uses_physical_owner_coordinates() -> None:
@@ -761,7 +779,7 @@ def test_cube_diamond_replays_three_requests_in_selected_topological_order() -> 
     )
     assert "pl.slice(matmul_0_l1_0" in source
     assert "pl.slice(matmul_1_l1_0" in source
-    assert source.count("pl.assemble(output,") == 1
+    assert source.count("pl.tensor.assemble(output,") == 1
 
 
 def test_two_cube_steps_materialize_one_dependency_linked_intermediate() -> None:
@@ -860,8 +878,8 @@ def test_fanout_cube_step_uses_op_order_for_sparse_ids_and_two_outputs() -> None
     assert source.count("pl.create_tensor(") == 1
     assert "step_1_resident_0_lhs = pl.slice(intermediate_tensor_2" in source
     assert source.count("pl.matmul(") == 2
-    assert "output_0 = pl.assemble(" in source
-    assert "output_1 = pl.assemble(" in source
+    assert "output_0 = pl.tensor.assemble(" in source
+    assert "output_1 = pl.tensor.assemble(" in source
     assert "return output_0, output_1" in source
 
 
@@ -1544,7 +1562,11 @@ def test_callable_completion_rejects_an_independent_earlier_step() -> None:
         SourceEmissionError,
         match="requires every step to reach the final output",
     ):
-        _validate_completion_task_contract(lowered, schedule, region_interface)
+        _validate_completion_task_contract(
+            cast(LoweredRegion, lowered),
+            cast(ScheduledRegion, schedule),
+            region_interface,
+        )
 
 
 def test_callable_extraction_rejects_unexpected_program_members() -> None:

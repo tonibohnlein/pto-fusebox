@@ -3612,8 +3612,10 @@ def _validate_l0_contract(
     expected_contraction: int,
     field: str,
 ) -> None:
-    if plan.tile[:2] != expected_shape:
-        raise ScheduleContractError(f"{field}.tile differs from its output variant")
+    if plan.tile[0] < expected_shape[0] or plan.tile[1] < expected_shape[1]:
+        raise ScheduleContractError(
+            f"{field}.physical tile does not cover its logical output variant"
+        )
     if any(depth <= 0 for depth in plan.buffer_depths):
         raise ScheduleContractError(f"{field}.buffer_depths must be positive")
     loop = plan.k_loop

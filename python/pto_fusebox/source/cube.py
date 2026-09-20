@@ -75,7 +75,6 @@ def emit_cube(
             matmul.output_grid != (1, 1)
             or matmul.retained_panels.lhs
             or matmul.retained_panels.rhs
-            or matmul.storage_dtype != "fp32"
             or any(
                 variant.l0_init.tile[2] != matmul.k_loop.chunk
                 for variant in matmul.output_variants
@@ -100,12 +99,9 @@ def emit_cube(
         raise SourceEmissionError(
             "cube source v1 requires one L0 output tile per region"
         )
-    if (
-        matmul.accumulator_dtype not in {"fp32", "int32"}
-        or matmul.storage_dtype != matmul.accumulator_dtype
-    ):
+    if matmul.accumulator_dtype not in {"fp32", "int32"}:
         raise SourceEmissionError(
-            "cube source v1 requires FP32 or INT32 accumulator-width storage"
+            "cube source v1 requires an FP32 or INT32 accumulator"
         )
 
     m_partition = plan.m_partition
@@ -129,8 +125,8 @@ def emit_cube(
     output_rows, output_cols = static_shape(
         graph.value_map()[io.output_value], field="cube output"
     )
-    validate_partition_extent(m_partition, output_rows, "cube.m_partition")
-    validate_partition_extent(n_partition, output_cols, "cube.n_partition")
+    _validate_cube_partition_extent(m_partition, output_rows, "cube.m_partition")
+    _validate_cube_partition_extent(n_partition, output_cols, "cube.n_partition")
     lhs_arg = _argument_for_cube_tensor(context, op_inputs[0])
     rhs_arg = _argument_for_cube_tensor(context, op_inputs[1])
     if solver_tensor_for_value(lowered, io.output_allocation_owner) != op_outputs[0]:
@@ -158,9 +154,13 @@ def emit_cube(
     if tail >= chunk:
         raise SourceEmissionError("cube K-window tail must be smaller than its chunk")
     output_tile = list(matmul.output_tile)
-    if output_tile != [m_partition.big, n_partition.big]:
+    logical_partition_tile = [
+        min(m_partition.big, output_rows),
+        min(n_partition.big, output_cols),
+    ]
+    if output_tile != logical_partition_tile:
         raise SourceEmissionError(
-            "cube output tile does not match its spatial partition"
+            "cube output tile does not match its logical spatial partition"
         )
     _validate_l0_variant(matmul, output_tile, chunk, tail, full_chunks)
     _validate_lowered_l0_capacity(context, matmul)
@@ -182,6 +182,7 @@ def emit_cube(
         coordinates.row,
         coordinates.col,
         output_tile,
+        matmul.output_variants[0].l0_init.tile,
         chunk,
         "0",
         first=True,
@@ -189,6 +190,9 @@ def emit_cube(
         rhs_transposed=rhs_transposed,
     )
     if full_chunks > 1:
+        rolled_plan = matmul.output_variants[0].l0_rolled
+        if rolled_plan is None:
+            raise SourceEmissionError("cube rolled K window omits its L0 plan")
         loop = "pl.pipeline" if stages > 1 else "pl.range"
         stage = f", stage={stages}" if stages > 1 else ""
         writer.line(indent, f"for k_window in {loop}(1, {full_chunks}{stage}):")
@@ -200,6 +204,7 @@ def emit_cube(
             coordinates.row,
             coordinates.col,
             output_tile,
+            rolled_plan.tile,
             chunk,
             f"k_window * {chunk}",
             first=False,
@@ -207,6 +212,9 @@ def emit_cube(
             rhs_transposed=rhs_transposed,
         )
     if tail:
+        tail_plan = matmul.output_variants[0].l0_tail
+        if tail_plan is None:
+            raise SourceEmissionError("cube tail K window omits its L0 plan")
         _emit_cube_window(
             writer,
             indent,
@@ -215,6 +223,7 @@ def emit_cube(
             coordinates.row,
             coordinates.col,
             output_tile,
+            tail_plan.tile,
             tail,
             str(full_chunks * chunk),
             first=False,
@@ -222,9 +231,17 @@ def emit_cube(
             lhs_transposed=lhs_transposed,
             rhs_transposed=rhs_transposed,
         )
+    stored_value = "accumulator"
+    if matmul.storage_dtype != matmul.accumulator_dtype:
+        stored_value = "stored_output"
+        writer.line(
+            indent,
+            f"{stored_value} = pl.cast(accumulator, "
+            f"target_type={pypto_dtype(matmul.storage_dtype)}, mode='rint')",
+        )
     writer.line(
         indent,
-        f"{io.output_argument} = pl.store(accumulator, "
+        f"{io.output_argument} = pl.store({stored_value}, "
         f"[{coordinates.row}, {coordinates.col}], "
         f"{io.output_argument})",
     )
@@ -299,8 +316,8 @@ def _emit_split_cube_dag(
     output_rows, output_cols = static_shape(
         graph.value_map()[output_value], field="split-K output"
     )
-    validate_partition_extent(plan.m_partition, output_rows, "cube.m_partition")
-    validate_partition_extent(plan.n_partition, output_cols, "cube.n_partition")
+    _validate_cube_partition_extent(plan.m_partition, output_rows, "cube.m_partition")
+    _validate_cube_partition_extent(plan.n_partition, output_cols, "cube.n_partition")
     for request in plan.matmuls:
         _validate_lowered_l0_capacity(context, request)
 
@@ -419,7 +436,7 @@ def _emit_split_cube_zero_seed(
             tile_width = min(matmul.output_tile[1], matmul.output.width - local_col)
             writer.line(
                 indent,
-                f"{output_argument} = pl.assemble({output_argument}, "
+                f"{output_argument} = pl.tensor.assemble({output_argument}, "
                 f"pl.full([{tile_height}, {tile_width}], "
                 f"dtype={pypto_dtype(matmul.storage_dtype)}, value={zero_literal}), "
                 f"[{_add_offset(output_row, local_row)}, "
@@ -427,7 +444,7 @@ def _emit_split_cube_zero_seed(
             )
 
 
-def _emit_split_cube_output_tile(  # noqa: PLR0913
+def _emit_nested_cube_output_tile(  # noqa: PLR0913
     writer: SourceWriter,
     indent: int,
     matmul: CubeMatmulPlan,
@@ -475,7 +492,7 @@ def _emit_split_cube_output_tile(  # noqa: PLR0913
         child_loop = child.k_loop
         if (
             child_loop.chunk <= 0
-            or child_loop.full_chunks <= 0
+            or (child_loop.full_chunks <= 0 and child_loop.tail <= 0)
             or child_loop.full_chunks * child_loop.chunk + child_loop.tail
             != outer_extent
             or child_loop.tail >= child_loop.chunk
@@ -489,46 +506,89 @@ def _emit_split_cube_output_tile(  # noqa: PLR0913
             child_offset = child_index * child_loop.chunk
             k_offset = _add_expression(outer_offset, str(child_offset))
             child_suffix = f"{suffix}_{child_index}"
-            lhs_shape, lhs_offsets = _physical_operand_slice(
-                output_height,
-                child_extent,
-                _add_offset(lhs_row, output_row),
-                _add_expression(lhs_col, k_offset),
-                transposed=lhs_transposed,
+            physical_m, physical_n, physical_k = child.tile
+            if (
+                physical_m < output_height
+                or physical_n < output_width
+                or physical_k < child_extent
+            ):
+                raise SourceEmissionError(
+                    f"cube request {matmul.instance} child tile does not cover "
+                    "its logical window"
+                )
+            lhs_shape = (
+                (physical_k, physical_m) if lhs_transposed else (physical_m, physical_k)
             )
-            rhs_shape, rhs_offsets = _physical_operand_slice(
-                child_extent,
-                output_width,
-                _add_expression(rhs_row, k_offset),
-                _add_offset(rhs_col, output_col),
-                transposed=rhs_transposed,
+            lhs_valid = (
+                (child_extent, output_height)
+                if lhs_transposed
+                else (output_height, child_extent)
+            )
+            lhs_offsets = (
+                (_add_expression(lhs_col, k_offset), _add_offset(lhs_row, output_row))
+                if lhs_transposed
+                else (
+                    _add_offset(lhs_row, output_row),
+                    _add_expression(lhs_col, k_offset),
+                )
+            )
+            rhs_shape = (
+                (physical_n, physical_k) if rhs_transposed else (physical_k, physical_n)
+            )
+            rhs_valid = (
+                (output_width, child_extent)
+                if rhs_transposed
+                else (child_extent, output_width)
+            )
+            rhs_offsets = (
+                (_add_offset(rhs_col, output_col), _add_expression(rhs_row, k_offset))
+                if rhs_transposed
+                else (
+                    _add_expression(rhs_row, k_offset),
+                    _add_offset(rhs_col, output_col),
+                )
             )
             writer.line(
                 level,
-                f"{prefix}_lhs_{child_suffix} = pl.slice({lhs}, "
+                f"{prefix}_lhs_mat_{child_suffix} = pl.tile.load({lhs}, "
+                f"[{lhs_offsets[0]}, {lhs_offsets[1]}], "
                 f"[{lhs_shape[0]}, {lhs_shape[1]}], "
-                f"[{lhs_offsets[0]}, {lhs_offsets[1]}])",
+                f"[{lhs_valid[0]}, {lhs_valid[1]}], target_memory=pl.Mem.Mat)",
             )
             writer.line(
                 level,
-                f"{prefix}_rhs_{child_suffix} = pl.slice({rhs}, "
+                f"{prefix}_rhs_mat_{child_suffix} = pl.tile.load({rhs}, "
+                f"[{rhs_offsets[0]}, {rhs_offsets[1]}], "
                 f"[{rhs_shape[0]}, {rhs_shape[1]}], "
-                f"[{rhs_offsets[0]}, {rhs_offsets[1]}])",
+                f"[{rhs_valid[0]}, {rhs_valid[1]}], target_memory=pl.Mem.Mat)",
+            )
+            lhs_mat = f"{prefix}_lhs_mat_{child_suffix}"
+            rhs_mat = f"{prefix}_rhs_mat_{child_suffix}"
+            if lhs_transposed:
+                lhs_mat = f"pl.tile.transpose_view({lhs_mat})"
+            if rhs_transposed:
+                rhs_mat = f"pl.tile.transpose_view({rhs_mat})"
+            writer.line(
+                level,
+                f"{prefix}_lhs_{child_suffix} = pl.tile.move({lhs_mat}, "
+                "target_memory=pl.Mem.Left)",
+            )
+            writer.line(
+                level,
+                f"{prefix}_rhs_{child_suffix} = pl.tile.move({rhs_mat}, "
+                "target_memory=pl.Mem.Right)",
             )
             if first_outer and child_index == 0:
                 writer.line(
                     level,
-                    f"{accumulator} = pl.matmul({prefix}_lhs_{child_suffix}, "
-                    f"{prefix}_rhs_{child_suffix}, "
-                    f"a_trans={lhs_transposed}, b_trans={rhs_transposed}, "
-                    f"out_dtype={pypto_dtype(matmul.accumulator_dtype)})",
+                    f"{accumulator} = pl.tile.matmul("
+                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix})",
                 )
             else:
                 writer.line(
                     level,
-                    f"{accumulator} = pl.matmul_acc({accumulator}, "
-                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix}, "
-                    f"a_trans={lhs_transposed}, b_trans={rhs_transposed})",
+                    f"{accumulator} = pl.tile.matmul_acc({accumulator}, "
+                    f"{prefix}_lhs_{child_suffix}, {prefix}_rhs_{child_suffix})",
                 )
 
         for child_index in range(child_loop.full_chunks):
@@ -661,6 +721,16 @@ def _emit_cube_dag_body(  # noqa: PLR0913
     atomic_sink: bool,
     split_sink: CubeMatmulPlan | None,
 ) -> None:
+    direct_tile_dag = all(
+        matmul.is_sink
+        and matmul.lhs_producer == -1
+        and matmul.rhs_producer == -1
+        and matmul.lhs_resident_boundary == -1
+        and matmul.rhs_resident_boundary == -1
+        and not matmul.retained_panels.lhs
+        and not matmul.retained_panels.rhs
+        for matmul in plan.matmuls
+    )
     """Replay one spatial region and one optional split share of a cube DAG."""
 
     graph = context.graph
@@ -867,8 +937,13 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                     )
                 variant_counts[shape] += 1
                 tile_index = tile_m * output_tiles_n + tile_n
-                if matmul is split_sink:
-                    accumulator = _emit_split_cube_output_tile(
+                use_direct_tiles = direct_tile_dag or (
+                    matmul is split_sink
+                    and matmul.lhs_producer == -1
+                    and matmul.rhs_producer == -1
+                )
+                if use_direct_tiles:
+                    accumulator = _emit_nested_cube_output_tile(
                         writer,
                         indent,
                         matmul,
@@ -909,20 +984,30 @@ def _emit_cube_dag_body(  # noqa: PLR0913
                 if matmul.is_sink:
                     atomic_suffix = ", atomic=pl.AtomicType.Add" if atomic_sink else ""
                     for output_value, output_argument in output_targets.items():
-                        writer.line(
-                            indent,
-                            f"{output_argument} = pl.assemble("
-                            f"{output_argument}, {accumulator}, "
-                            f"[{_add_offset(output_row, local_row)}, "
-                            f"{_add_offset(output_col, local_col)}]"
-                            f"{atomic_suffix})",
-                        )
+                        if use_direct_tiles:
+                            writer.line(
+                                indent,
+                                f"{output_argument} = pl.store("
+                                f"{accumulator}, "
+                                f"[{_add_offset(output_row, local_row)}, "
+                                f"{_add_offset(output_col, local_col)}], "
+                                f"{output_argument}{atomic_suffix})",
+                            )
+                        else:
+                            writer.line(
+                                indent,
+                                f"{output_argument} = pl.tensor.assemble("
+                                f"{output_argument}, {accumulator}, "
+                                f"[{_add_offset(output_row, local_row)}, "
+                                f"{_add_offset(output_col, local_col)}]"
+                                f"{atomic_suffix})",
+                            )
                         stored_outputs.add(output_value)
                 else:
                     next_state = f"matmul_{matmul.instance}_l1_{tile_index}"
                     writer.line(
                         indent,
-                        f"{next_state} = pl.assemble({state}, {accumulator}, "
+                        f"{next_state} = pl.tensor.assemble({state}, {accumulator}, "
                         f"[{local_row}, {local_col}])",
                     )
                     state = next_state
@@ -1230,6 +1315,18 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _validate_cube_partition_extent(partition, extent: int, field: str) -> None:
+    """Accept an exact logical grid or one padded single-box cube region."""
+
+    if (
+        partition.parts == 1
+        and partition.big == partition.small
+        and partition.big >= extent
+    ):
+        return
+    validate_partition_extent(partition, extent, field)
+
+
 def _add_offset(base: str, offset: int) -> str:
     if offset == 0:
         return base
@@ -1254,6 +1351,7 @@ def _emit_cube_window(
     row_offset: str,
     col_offset: str,
     output_tile: list[int],
+    physical_tile: tuple[int, int, int],
     k_extent: int,
     k_offset: str,
     *,
@@ -1263,21 +1361,30 @@ def _emit_cube_window(
     suffix: str = "",
 ) -> None:
     m_extent, n_extent = output_tile
-    lhs_shape = (k_extent, m_extent) if lhs_transposed else (m_extent, k_extent)
+    physical_m, physical_n, physical_k = physical_tile
+    if physical_m < m_extent or physical_n < n_extent or physical_k < k_extent:
+        raise SourceEmissionError(
+            "cube physical L0 tile does not cover its logical window"
+        )
+    lhs_shape = (physical_k, physical_m) if lhs_transposed else (physical_m, physical_k)
+    lhs_valid = (k_extent, m_extent) if lhs_transposed else (m_extent, k_extent)
     lhs_offset = (k_offset, row_offset) if lhs_transposed else (row_offset, k_offset)
-    rhs_shape = (n_extent, k_extent) if rhs_transposed else (k_extent, n_extent)
+    rhs_shape = (physical_n, physical_k) if rhs_transposed else (physical_k, physical_n)
+    rhs_valid = (n_extent, k_extent) if rhs_transposed else (k_extent, n_extent)
     rhs_offset = (col_offset, k_offset) if rhs_transposed else (k_offset, col_offset)
     writer.line(
         indent,
         f"lhs_mat_natural{suffix} = pl.tile.load({lhs}, "
         f"[{lhs_offset[0]}, {lhs_offset[1]}], "
-        f"[{lhs_shape[0]}, {lhs_shape[1]}], target_memory=pl.Mem.Mat)",
+        f"[{lhs_shape[0]}, {lhs_shape[1]}], "
+        f"[{lhs_valid[0]}, {lhs_valid[1]}], target_memory=pl.Mem.Mat)",
     )
     writer.line(
         indent,
         f"rhs_mat_natural{suffix} = pl.tile.load({rhs}, "
         f"[{rhs_offset[0]}, {rhs_offset[1]}], "
-        f"[{rhs_shape[0]}, {rhs_shape[1]}], target_memory=pl.Mem.Mat)",
+        f"[{rhs_shape[0]}, {rhs_shape[1]}], "
+        f"[{rhs_valid[0]}, {rhs_valid[1]}], target_memory=pl.Mem.Mat)",
     )
     lhs_mat = f"lhs_mat_natural{suffix}"
     rhs_mat = f"rhs_mat_natural{suffix}"
@@ -1331,20 +1438,28 @@ def _validate_l0_variant(
     variant = variants[0]
     if variant.count != 1 or variant.shape != tuple(output_tile):
         raise SourceEmissionError("cube output variant does not match one region tile")
-    expected = (output_tile[0], output_tile[1], chunk)
-    if variant.l0_init.tile != expected:
+
+    def covers(child: L0MatmulPlan, logical_k: int) -> bool:
+        return (
+            child.tile[0] >= output_tile[0]
+            and child.tile[1] >= output_tile[1]
+            and child.tile[2] >= logical_k
+        )
+
+    if not covers(variant.l0_init, chunk):
         raise SourceEmissionError(
-            "cube initial L0 tile differs from the emitted K window"
+            "cube initial physical L0 tile does not cover the emitted K window"
         )
     if full_chunks > 1:
-        if variant.l0_rolled is None or variant.l0_rolled.tile != expected:
+        if variant.l0_rolled is None or not covers(variant.l0_rolled, chunk):
             raise SourceEmissionError(
-                "cube rolled L0 tile differs from the emitted K window"
+                "cube rolled physical L0 tile does not cover the emitted K window"
             )
     if tail:
-        expected_tail = (output_tile[0], output_tile[1], tail)
-        if variant.l0_tail is None or variant.l0_tail.tile != expected_tail:
-            raise SourceEmissionError("cube tail L0 tile differs from the emitted tail")
+        if variant.l0_tail is None or not covers(variant.l0_tail, tail):
+            raise SourceEmissionError(
+                "cube tail physical L0 tile does not cover the emitted tail"
+            )
 
 
 def _validate_lowered_l0_capacity(

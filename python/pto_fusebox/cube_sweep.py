@@ -17,7 +17,7 @@ from .ir import SOLUTION_SCHEMA
 from .solver import RegionSolveResult
 
 
-CUBE_PLAN_SWEEP_SCHEMA = "pto_fusebox.cube_plan_sweep.v2"
+CUBE_PLAN_SWEEP_SCHEMA = "pto_fusebox.cube_plan_sweep.v3"
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,7 @@ class CubeCandidateGrid:
     split_k: int
     sequential_k_limit: int
     realized_sequential_k: int
+    inner_k: int
 
     @property
     def work_units(self) -> int:
@@ -51,6 +52,7 @@ class CubePlanCandidate:
     ddr_traffic_cycles: float
     l1_l0_extract_cycles: float
     uses_model_ahead_split_k: bool
+    geometry: CubeCandidateGeometry
     execution: CubeCandidateExecution
     solution: Mapping[str, Any]
 
@@ -75,6 +77,34 @@ class CubeCandidateExecution:
 
 
 @dataclass(frozen=True)
+class CubeCandidateGeometry:
+    """Physical dimensions that distinguish executable cube candidates."""
+
+    matmuls: tuple[CubeMatmulGeometry, ...]
+    sequential_k_window: int
+    inner_k: int
+    spatial_n_tile: int
+    active_tasks: int
+    trips_per_task: int
+    physical_l0_tile: tuple[int, int, int]
+    contiguous_request_bytes: Mapping[str, int]
+    physical_constraints: Mapping[str, bool]
+
+
+@dataclass(frozen=True)
+class CubeMatmulGeometry:
+    """Per-request physical geometry retained inside one cube candidate."""
+
+    solver_op: int
+    is_sink: bool
+    sequential_k_window: int
+    inner_k: int
+    physical_l0_tile: tuple[int, int, int]
+    contiguous_request_bytes: Mapping[str, int]
+    physical_constraints: Mapping[str, bool]
+
+
+@dataclass(frozen=True)
 class CubePlanRejection:
     """One enumerated cube point rejected before source emission."""
 
@@ -82,6 +112,7 @@ class CubePlanRejection:
     parts_n: int
     split_k: int
     sequential_k_limit: int
+    inner_k: int
     reason: str
 
 
@@ -290,6 +321,7 @@ def _parse_rejection(payload: Any, *, index: int) -> CubePlanRejection:
         sequential_k_limit=_positive_int(
             grid.get("sequential_k_limit"), f"{field}.sequential_k_limit"
         ),
+        inner_k=_nonnegative_int(grid.get("inner_k"), f"{field}.inner_k"),
         reason=reason,
     )
 
@@ -325,6 +357,7 @@ def _parse_candidate(
         realized_sequential_k=_positive_int(
             grid.get("realized_sequential_k"), f"{field}.realized_sequential_k"
         ),
+        inner_k=_nonnegative_int(grid.get("inner_k"), f"{field}.inner_k"),
     )
     if (
         not isinstance(solution, Mapping)
@@ -355,8 +388,151 @@ def _parse_candidate(
             model.get("uses_model_ahead_split_k"),
             f"{field}.uses_model_ahead_split_k",
         ),
+        geometry=_cube_candidate_geometry(solution, problem, field=field),
         execution=_cube_execution_summary(solution, problem, field=field),
         solution=solution,
+    )
+
+
+def _cube_candidate_geometry(
+    solution: Mapping[str, Any],
+    problem: Mapping[str, Any],
+    *,
+    field: str,
+) -> CubeCandidateGeometry:
+    """Recompute layout, replay, and physical-admission facts from the plan."""
+
+    step = solution["steps"][0]
+    plan = step.get("plan") if isinstance(step, Mapping) else None
+    if not isinstance(plan, Mapping):
+        raise ValueError(f"{field}.plan is malformed")
+    matmuls = plan.get("matmuls")
+    if not isinstance(matmuls, list) or not matmuls:
+        raise ValueError(f"{field}.matmuls must contain cube requests")
+    n_partition = plan.get("n_partition")
+    if not isinstance(n_partition, Mapping):
+        raise ValueError(f"{field}.n_partition is malformed")
+    spatial_n = _positive_int(n_partition.get("big"), f"{field}.spatial_n_tile")
+    replay = plan.get("spatial_replay")
+    work_units = _positive_int(plan.get("work_units"), f"{field}.work_units")
+    if not isinstance(replay, Mapping):
+        raise ValueError(f"{field}.spatial_replay is missing")
+    if replay.get("present") is True:
+        active_tasks = _positive_int(
+            replay.get("active_tasks"), f"{field}.active_tasks"
+        )
+        trips = _positive_int(replay.get("trips_per_task"), f"{field}.trips_per_task")
+    else:
+        active_tasks, trips = work_units, 1
+
+    dtypes = problem.get("dtypes")
+    inputs = problem.get("inputs")
+    lhs_flags = problem.get("matmul_lhs_k_contiguous")
+    rhs_flags = problem.get("matmul_rhs_k_contiguous")
+    if (
+        not isinstance(dtypes, list)
+        or not isinstance(inputs, list)
+        or not isinstance(lhs_flags, list)
+        or not isinstance(rhs_flags, list)
+    ):
+        raise ValueError(f"{field}.problem layout metadata is malformed")
+    element_bytes = {
+        "int8": 1,
+        "fp16": 2,
+        "float16": 2,
+        "bf16": 2,
+        "bfloat16": 2,
+        "int32": 4,
+        "fp32": 4,
+        "float32": 4,
+    }
+    geometries: list[CubeMatmulGeometry] = []
+    for request_index, matmul in enumerate(matmuls):
+        request_field = f"{field}.matmuls[{request_index}]"
+        if not isinstance(matmul, Mapping):
+            raise ValueError(f"{request_field} is not an object")
+        op_index = matmul.get("op")
+        variants = matmul.get("output_variants")
+        k_loop = matmul.get("k_loop")
+        if (
+            not isinstance(op_index, int)
+            or isinstance(op_index, bool)
+            or op_index < 0
+            or op_index >= len(inputs)
+            or not isinstance(inputs[op_index], list)
+            or len(inputs[op_index]) != 2
+            or op_index >= len(lhs_flags)
+            or op_index >= len(rhs_flags)
+            or not isinstance(variants, list)
+            or not variants
+            or not isinstance(k_loop, Mapping)
+        ):
+            raise ValueError(f"{request_field} geometry is malformed")
+        first = variants[0]
+        init = first.get("l0_init") if isinstance(first, Mapping) else None
+        tile = init.get("tile") if isinstance(init, Mapping) else None
+        if (
+            not isinstance(tile, list)
+            or len(tile) != 3
+            or any(not isinstance(item, int) or isinstance(item, bool) for item in tile)
+        ):
+            raise ValueError(f"{request_field}.l0_init.tile is malformed")
+        physical_m, physical_n, inner_k = (
+            _positive_int(item, f"{request_field}.l0_tile") for item in tile
+        )
+        sequential_k = _positive_int(
+            k_loop.get("l1_window_k"), f"{request_field}.sequential_k_window"
+        )
+        lhs_tensor, rhs_tensor = inputs[op_index]
+        try:
+            lhs_bytes = element_bytes[str(dtypes[lhs_tensor]).lower()]
+            rhs_bytes = element_bytes[str(dtypes[rhs_tensor]).lower()]
+        except (IndexError, KeyError, TypeError) as error:
+            raise ValueError(f"{request_field} operand dtype is unsupported") from error
+        lhs_k_contiguous = _bool(
+            lhs_flags[op_index], f"{request_field}.lhs_k_contiguous"
+        )
+        rhs_k_contiguous = _bool(
+            rhs_flags[op_index], f"{request_field}.rhs_k_contiguous"
+        )
+        lhs_dtype = str(dtypes[lhs_tensor]).lower()
+        rhs_dtype = str(dtypes[rhs_tensor]).lower()
+        int8 = lhs_dtype == rhs_dtype == "int8"
+        geometries.append(
+            CubeMatmulGeometry(
+                solver_op=op_index,
+                is_sink=_bool(matmul.get("is_sink"), f"{request_field}.is_sink"),
+                sequential_k_window=sequential_k,
+                inner_k=inner_k,
+                physical_l0_tile=(physical_m, physical_n, inner_k),
+                contiguous_request_bytes={
+                    "lhs": (inner_k if lhs_k_contiguous else physical_m) * lhs_bytes,
+                    "rhs": (inner_k if rhs_k_contiguous else physical_n) * rhs_bytes,
+                },
+                physical_constraints={
+                    "bf16_m_box_16": lhs_dtype != "bf16" or physical_m % 16 == 0,
+                    "int8_k_box_32": not int8 or inner_k % 32 == 0,
+                    "int8_n_box_32": not int8 or physical_n % 32 == 0,
+                },
+            )
+        )
+    sinks = [geometry for geometry in geometries if geometry.is_sink]
+    if len(sinks) != 1:
+        raise ValueError(f"{field}.matmuls must contain one sink request")
+    sink = sinks[0]
+    return CubeCandidateGeometry(
+        matmuls=tuple(geometries),
+        sequential_k_window=sink.sequential_k_window,
+        inner_k=sink.inner_k,
+        spatial_n_tile=spatial_n,
+        active_tasks=active_tasks,
+        trips_per_task=trips,
+        physical_l0_tile=sink.physical_l0_tile,
+        contiguous_request_bytes=sink.contiguous_request_bytes,
+        physical_constraints={
+            key: all(geometry.physical_constraints[key] for geometry in geometries)
+            for key in sink.physical_constraints
+        },
     )
 
 
@@ -512,6 +688,12 @@ def _cube_execution_summary(
 def _positive_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
     return value
 
 

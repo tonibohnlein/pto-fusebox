@@ -82,7 +82,13 @@ def _sweep_binary() -> Path:
 
 
 def _candidate_for_grid(
-    sweep: CubePlanSweep, *, parts_m: int, parts_n: int, split_k: int
+    sweep: CubePlanSweep,
+    *,
+    parts_m: int,
+    parts_n: int,
+    split_k: int,
+    inner_k: int | None = None,
+    sequential_k_limit: int | None = None,
 ) -> CubePlanCandidate:
     matches = tuple(
         candidate
@@ -93,17 +99,22 @@ def _candidate_for_grid(
             candidate.grid.split_k,
         )
         == (parts_m, parts_n, split_k)
+        and (inner_k is None or candidate.grid.inner_k == inner_k)
+        and (
+            sequential_k_limit is None
+            or candidate.grid.sequential_k_limit == sequential_k_limit
+        )
     )
-    assert len(matches) == 1
-    return matches[0]
+    assert matches
+    return min(matches, key=lambda candidate: candidate.grid.inner_k)
 
 
 def _lowered_region(
-    m: int, k: int, n: int
+    m: int, k: int, n: int, *, dtype: torch.dtype = torch.float32
 ) -> tuple[NormalizedGraph, RegionSolveResult]:
     graph = export_and_normalize(
         Matmul(),
-        (torch.zeros((m, k)), torch.zeros((k, n))),
+        (torch.zeros((m, k), dtype=dtype), torch.zeros((k, n), dtype=dtype)),
     )
     regions = extract_solver_regions(graph)
     assert len(regions) == 1
@@ -118,6 +129,13 @@ def _lowered_region(
         diagnostics=regions[0].diagnostics,
     )
     return graph, result
+
+
+def test_lowered_matmul_records_physical_k_contiguity() -> None:
+    _, ordinary = _lowered_region(16, 512, 192)
+    assert ordinary.problem is not None
+    assert ordinary.problem["matmul_lhs_k_contiguous"] == [True]
+    assert ordinary.problem["matmul_rhs_k_contiguous"] == [False]
 
 
 def _lowered_int8_region(
@@ -209,7 +227,9 @@ def test_cube_model_surface_enumerates_replayable_forced_solutions(
     m: int, k: int, n: int, source_replay_expected: bool
 ) -> None:
     graph, region = _lowered_region(m, k, n)
-    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    sweep = enumerate_cube_plans(
+        region, sweep_binary=_sweep_binary(), source_oriented=True
+    )
 
     assert sweep.selected.selected
     assert sweep.selected.latency_cycles == min(
@@ -343,18 +363,22 @@ def test_small_m_source_surface_uses_one_padded_physical_row_box() -> None:
     assert plan.matmuls[0].output.height == 8
     assert plan.matmuls[0].output_tile[0] == 8
     assert all(
-        variant.l0_init.tile[0] == 8 for variant in plan.matmuls[0].output_variants
+        variant.l0_init.tile[0] == 16 for variant in plan.matmuls[0].output_variants
     )
     assert can_emit_region(graph, forced)
 
     source = emit_pypto_region(graph, forced, program_name="small_m_cube").source
     assert "pl.Tensor[[8, 12288], pl.BF16]" in source
-    assert "out_dtype=pl.FP32" in source
+    assert "[16, 16], [8, 16], target_memory=pl.Mem.Mat" in source
+    assert "pl.tile.matmul(" in source
+    assert "target_type=pl.BF16, mode='rint'" in source
 
 
 def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     graph, region = _lowered_region(128, 8192, 128)
-    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    sweep = enumerate_cube_plans(
+        region, sweep_binary=_sweep_binary(), source_oriented=True
+    )
 
     assert sweep.selected.grid.split_k == 16
     split_factors = {candidate.grid.split_k for candidate in sweep.candidates}
@@ -376,7 +400,14 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
                 policy == "aiv_zero_seed_then_atomic"
             )
 
-    no_split = _candidate_for_grid(sweep, parts_m=1, parts_n=1, split_k=1)
+    no_split = _candidate_for_grid(
+        sweep,
+        parts_m=1,
+        parts_n=1,
+        split_k=1,
+        inner_k=64,
+        sequential_k_limit=512,
+    )
     forced = region_for_cube_candidate(region, no_split)
     typed = scheduled_region(forced).steps[0]
     plan = typed.plan
@@ -387,18 +418,28 @@ def test_deep_k_surface_carries_split_and_no_split_candidates() -> None:
     assert "pl.spmd(1," in source
     assert "atomic=pl.AtomicType.Add" not in source
 
-    # The outer L1 window and nested L0 loop are different hierarchy levels.
-    # The selected S=16 plan covers a 160-wide L1 window with two 64-wide L0
-    # iterations plus a 32-wide L0 tail; typed parsing must preserve that
-    # decomposition rather than compare the L0 tile directly with 160.
-    selected = region_for_cube_candidate(region, sweep.selected)
-    plan = scheduled_region(selected).steps[0].plan
-    assert isinstance(plan, CubeKernelPlan)
+    # The outer L1 window and nested L0 loop are independent hierarchy levels.
+    # This candidate replays a 512-wide L1 window with a real 64-wide inner
+    # TMATMUL tile; typed parsing must preserve both dimensions.
     matmul = plan.matmuls[0]
-    assert matmul.k_loop.chunk == 160
+    assert matmul.k_loop.l1_window_k == 512
     assert matmul.output_variants[0].l0_init.tile[2] == 64
     l0_loop = matmul.output_variants[0].l0_init.k_loop
-    assert l0_loop.full_chunks * l0_loop.chunk + l0_loop.tail == 160
+    assert l0_loop.chunk == 64
+    assert l0_loop.full_chunks == 4
+    assert l0_loop.tail == 0
+
+
+def test_bf16_split_k_reports_missing_accumulator_width_merge() -> None:
+    _, region = _lowered_region(16, 2048, 2048, dtype=torch.bfloat16)
+    sweep = enumerate_cube_plans(
+        region, sweep_binary=_sweep_binary(), source_oriented=True
+    )
+
+    assert {candidate.grid.split_k for candidate in sweep.candidates} == {1}
+    assert "cube_split_requires_accumulator_width_storage" in {
+        rejection.reason for rejection in sweep.rejections
+    }
 
 
 def test_int8_parallel_split_k_emits_int32_accumulator_merge() -> None:
@@ -449,7 +490,7 @@ def test_split_cube_dag_replays_upstream_then_unique_atomic_sink() -> None:
     assert "[0, split_index * 1024]" in source
     assert "[split_index * 1024, 0]" in source
     assert source.count("atomic=pl.AtomicType.Add") == 1
-    assert "pl.assemble(matmul_0_l1" in source
+    assert "pl.tensor.assemble(matmul_0_l1" in source
 
     assert forced.solution is not None
     solution = copy.deepcopy(forced.solution)
@@ -485,13 +526,16 @@ def test_split_cube_dag_diagnostics_and_execution_summary_are_consistent() -> No
     """Keep public sweep and source-candidate evidence on one cube contract."""
 
     graph, region = _lowered_split_chain(m=512, inner=2048, n=512)
-    sweep = enumerate_cube_plans(region, sweep_binary=_sweep_binary())
+    sweep = enumerate_cube_plans(
+        region, sweep_binary=_sweep_binary(), source_oriented=True
+    )
     candidate_keys = {
         (
             candidate.grid.parts_m,
             candidate.grid.parts_n,
             candidate.grid.split_k,
             candidate.grid.sequential_k_limit,
+            candidate.grid.inner_k,
         )
         for candidate in sweep.candidates
     }
@@ -501,11 +545,12 @@ def test_split_cube_dag_diagnostics_and_execution_summary_are_consistent() -> No
             rejection.parts_n,
             rejection.split_k,
             rejection.sequential_k_limit,
+            rejection.inner_k,
         )
         for rejection in sweep.rejections
     }
     assert candidate_keys.isdisjoint(rejection_keys)
-    assert (1, 1, 8, 2048) in candidate_keys
+    assert any(key[:3] == (1, 1, 8) for key in candidate_keys)
 
     solved = solve_graph(
         graph,
@@ -523,11 +568,14 @@ def test_split_cube_dag_diagnostics_and_execution_summary_are_consistent() -> No
     step = maximal.schedule[0]
     parts_m, parts_n = step["launch"]["parts"]
     split_k = step["launch"]["split"]
+    sink = next(request for request in step["plan"]["matmuls"] if request["is_sink"])
+    inner_k = sink["output_variants"][0]["l0_init"]["tile"][2]
     matching = _candidate_for_grid(
         sweep,
         parts_m=parts_m,
         parts_n=parts_n,
         split_k=split_k,
+        inner_k=inner_k,
     )
     source_execution = maximal.execution.steps[0]
     sweep_execution = matching.execution
@@ -549,7 +597,7 @@ def test_split_cube_dag_retains_a_boundary_panel_inside_each_share() -> None:
     source = emit_pypto_region(graph, forced, program_name="split_retained_rhs").source
 
     retained = "matmul_1_rhs_retained = pl.slice("
-    first_output_tile = "matmul_1_tile_0_rhs_init_0 = pl.slice("
+    first_output_tile = "matmul_1_tile_0_rhs_init = pl.slice("
     assert source.count(retained) == 1
     assert source.index(retained) < source.index(first_output_tile)
     assert "split_index * 256" in source
@@ -789,13 +837,15 @@ def test_int8_source_admission_retiles_physical_l0c_and_fractal_overflow(
             ):
                 if child is None:
                     continue
+                assert child.tile[1] % 32 == 0
+                assert child.tile[2] % 32 == 0
                 physical_m = (child.tile[0] + 31) // 32 * 32
                 physical_n = (child.tile[1] + 31) // 32 * 32
                 assert (
                     physical_m * physical_n * 4 * child.buffer_depths[2] <= 128 * 1024
                 )
         source = emit_pypto_region(graph, forced).source
-        assert "out_dtype=pl.INT32" in source
+        assert "pl.tile.matmul(" in source
 
 
 def test_candidate_cannot_be_rebound_to_a_different_problem() -> None:
@@ -814,7 +864,7 @@ def test_selected_marker_disagreement_fails_closed(tmp_path: Path) -> None:
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({\n"
-        " 'schema_version':'pto_fusebox.cube_plan_sweep.v2',\n"
+        " 'schema_version':'pto_fusebox.cube_plan_sweep.v3',\n"
         " 'selected_candidate_id':'p1_q1_s1',\n"
         " 'candidates':[]\n"
         "}))\n",

@@ -18,7 +18,8 @@
 // Exact formula-table widths reproduce PTO-ISA's rounded cycle result;
 // AutoFuse-only widths are interpolated between adjacent grounded entries.
 // Returns -1 when the family/dtype has no fit-backend grounding, allowing the
-// caller to retain the legacy structural reduction tree as an explicit fallback.
+// caller to retain the legacy structural reduction tree as an explicit
+// fallback.
 double GroundedRowReductionCycles(VectorPrimitiveFamily family, DType dtype,
                                   int64_t valid_rows, int64_t valid_cols);
 
@@ -37,24 +38,24 @@ double GroundedVectorFillCycles(int64_t valid_rows, int64_t valid_cols);
 // serialization. Keeping them outside VectorStreamPlan avoids per-tensor
 // allocations in candidate enumeration's hot path.
 std::array<std::vector<VectorTensorFramePlan>, 4>
-BuildVectorTensorFrames(const Problem& problem, const VectorStreamPlan& plan);
+BuildVectorTensorFrames(const Problem &problem, const VectorStreamPlan &plan);
 std::array<std::vector<VectorWorkspaceFramePlan>, 4>
-BuildVectorWorkspaceFrames(const Problem& problem,
-                           const VectorStreamPlan& plan);
+BuildVectorWorkspaceFrames(const Problem &problem,
+                           const VectorStreamPlan &plan);
 std::vector<std::vector<VectorTensorFramePlan>>
-BuildVectorReplayPassTensorFrames(const Problem& problem,
-                                  const VectorStreamPlan& plan);
+BuildVectorReplayPassTensorFrames(const Problem &problem,
+                                  const VectorStreamPlan &plan);
 std::vector<std::vector<VectorWorkspaceFramePlan>>
-BuildVectorReplayPassWorkspaceFrames(const Problem& problem,
-                                     const VectorStreamPlan& plan);
+BuildVectorReplayPassWorkspaceFrames(const Problem &problem,
+                                     const VectorStreamPlan &plan);
 
 // Ephemeral memo for one best_cost()/enumerate_plans() call. It is deliberately
 // absent from CostResult and CostCache: exact L0 costing may revisit the same
-// local shape across many outer grids, but global search cache entries must stay
-// scalar and compact. The Problem/backend configuration is constant during one
-// evaluation, so the key needs only request-specific fields.
-using L0PlanMemoKey =
-    std::tuple<int64_t, int64_t, int64_t, DType, DType, DType, bool, L0OutputTarget>;
+// local shape across many outer grids, but global search cache entries must
+// stay scalar and compact. The Problem/backend configuration is constant during
+// one evaluation, so the key needs only request-specific fields.
+using L0PlanMemoKey = std::tuple<int64_t, int64_t, int64_t, int64_t, DType,
+                                 DType, DType, bool, L0OutputTarget>;
 using L0PlanMemo = std::map<L0PlanMemoKey, L0MatmulPlan>;
 
 // ============================================================================
@@ -93,7 +94,8 @@ public:
   // allow_mixed relaxes unit-homogeneity to permit a fused CUBE+VECTOR group.
   // Ascend910BMixed passes true; the production model can instead set
   // Problem::fuse_cube_vector. Both reach the same mixed plan/cost branch.
-  static std::optional<Ascend910BCost> create(const Problem &prob, const DAG &dag,
+  static std::optional<Ascend910BCost> create(const Problem &prob,
+                                              const DAG &dag,
                                               std::vector<size_t> op_indices,
                                               bool allow_mixed = false);
 
@@ -120,7 +122,8 @@ public:
   // Returns 0 for non-boundary tensors. Multi-role tensors
   // return >1. Mainly for tests and diagnostics.
   size_t boundary_entries_for(size_t tensor_id) const {
-    if (tensor_id >= tensor_id_to_infos_.size()) return 0;
+    if (tensor_id >= tensor_id_to_infos_.size())
+      return 0;
     return tensor_id_to_infos_[tensor_id].size();
   }
 
@@ -145,7 +148,7 @@ public:
   // along it, and it is emitted with the solution because the peak depends on
   // it. DFS remains default; dependency-constrained Gorder is experimental.
   // Empty until create() populates it.
-  const std::vector<size_t>& execution_order() const { return dfs_order_; }
+  const std::vector<size_t> &execution_order() const { return dfs_order_; }
 
   // Op id of the boundary-output MatMul (the sink whose contraction may be
   // parallel-split across cores), or -1 if the subgraph has none. Its emitted
@@ -161,10 +164,11 @@ public:
   // 910B cube peak L1 working set (bytes) along the fixed execution order: the
   // red-blue pebble peak over the per-output-tile schedule, with each matmul's
   // single-core k-tile derived greedily (largest 16-aligned divisor of its K
-  // whose boundary operand strip fits the headroom left by the live intermediate
-  // bands). Returns INT64_MAX if infeasible at cfg. Optionally returns the
-  // derived per-op k (indexed by op id; 0 for non-matmul / non-participating).
-  // This is the dynamic peak that replaces the old static operand-strip SUM.
+  // whose boundary operand strip fits the headroom left by the live
+  // intermediate bands). Returns INT64_MAX if infeasible at cfg. Optionally
+  // returns the derived per-op k (indexed by op id; 0 for non-matmul /
+  // non-participating). This is the dynamic peak that replaces the old static
+  // operand-strip SUM.
   int64_t cube_peak_l1(const TileConfig &cfg,
                        std::vector<int64_t> *perop_k = nullptr) const;
 
@@ -173,19 +177,18 @@ public:
   // windows it needs. Exact/co-optimized costing derives this hierarchy with an
   // ephemeral per-best_cost L0 memo; final/forced-solution consumers re-run the
   // same derivation once to obtain the full emit descriptor. `parallel_split`
-  // is the CostResult::parallel_split selected for the candidate (1 = spatial only).
-  CubeSchedulePlan cube_schedule_plan(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev = {},
-      const FlatSet<size_t> &retain_these = {}) const;
+  // is the CostResult::parallel_split selected for the candidate (1 = spatial
+  // only).
+  CubeSchedulePlan
+  cube_schedule_plan(const TileConfig &cfg,
+                     const FlatSet<size_t> &retained_from_prev = {},
+                     const FlatSet<size_t> &retain_these = {}) const;
 
   // Reconstruct one selected split schedule. The merge policy is mandatory:
   // split count alone does not identify the algorithm selected by the model.
   CubeSchedulePlan cube_schedule_plan(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev,
-      const FlatSet<size_t> &retain_these,
-      int64_t parallel_split,
+      const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these, int64_t parallel_split,
       CubeSplitMergePolicy split_merge_policy) const;
 
   // Solver-owned mixed algorithm for one fixed candidate. Candidate-invariant
@@ -193,54 +196,56 @@ public:
   // facts are derived here. CostResult remains compact and final/forced
   // consumers re-run this method once for the selected configuration.
   MixedSchedulePlan mixed_schedule_plan(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev = {},
-      const FlatSet<size_t> &retain_these = {},
-      int64_t parallel_split = 1,
+      const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev = {},
+      const FlatSet<size_t> &retain_these = {}, int64_t parallel_split = 1,
       int64_t active_groups = 0) const;
 
   // Vector (UB) pebble peak — the dynamic on-chip working set of a vector
   // subgraph, the analog of cube_peak_l1 for the cube. Each tensor's tile
-  // footprint is [min(cfg.w,W), min(cfg.h,H)]; the reduced axis is coupled to its
-  // full extent (cfg forces it), so a reduction input spans the whole row/col
-  // band. Ephemeral tensors are resident across [producer, last consumer];
-  // boundary tiles are transient. Returns the peak UB bytes. (No W-axis streaming
-  // yet — a reduction band spans its FULL reduced extent; the streaming
-  // single-core reduction that would shrink it is the next increment.)
-  // reduce_chunk caps the reduced axis at a single-core STREAMING granularity:
-  // the reduction is accumulated chunk-by-chunk on one core, so a reused ephemeral
-  // (softmax's e) is held only a chunk at a time (recomputed past the reduction)
-  // rather than as a full [reduced_extent, h] band. INT64_MAX = no streaming
-  // (materialize the full band). Lets a large-W reduction fit UB.
-  // stream_axis selects which axis reduce_chunk caps: 0 => the reduced axis (a
-  // reduction's coupled online accumulation); 1/2 => width/height, used to stream
-  // a pure-pointwise tile (which has no coupled axis — the single-core k-stream).
+  // footprint is [min(cfg.w,W), min(cfg.h,H)]; the reduced axis is coupled to
+  // its full extent (cfg forces it), so a reduction input spans the whole
+  // row/col band. Ephemeral tensors are resident across [producer, last
+  // consumer]; boundary tiles are transient. Returns the peak UB bytes. (No
+  // W-axis streaming yet — a reduction band spans its FULL reduced extent; the
+  // streaming single-core reduction that would shrink it is the next
+  // increment.) reduce_chunk caps the reduced axis at a single-core STREAMING
+  // granularity: the reduction is accumulated chunk-by-chunk on one core, so a
+  // reused ephemeral (softmax's e) is held only a chunk at a time (recomputed
+  // past the reduction) rather than as a full [reduced_extent, h] band.
+  // INT64_MAX = no streaming (materialize the full band). Lets a large-W
+  // reduction fit UB. stream_axis selects which axis reduce_chunk caps: 0 =>
+  // the reduced axis (a reduction's coupled online accumulation); 1/2 =>
+  // width/height, used to stream a pure-pointwise tile (which has no coupled
+  // axis — the single-core k-stream).
   int64_t vector_peak_ub(const TileConfig &cfg,
                          const FlatSet<size_t> &retained_from_prev = {},
                          const FlatSet<size_t> &retain_these = {},
-                         int64_t reduce_chunk = INT64_MAX,
-                         int stream_axis = 0,
+                         int64_t reduce_chunk = INT64_MAX, int stream_axis = 0,
                          bool include_reduction_workspaces = true) const;
 
   // Solver-owned vector sub-stream specification. Candidate costing derives it
-  // as a stack-local value; final-solution/forced-plan consumers call this again
-  // for the winning config. It is intentionally absent from CostResult so the
-  // local-search cache stays compact. vector_stream() remains a compatibility
-  // axis/chunk view for existing callers.
-  VectorStreamPlan vector_stream_plan(const TileConfig &cfg,
-                                      const FlatSet<size_t> &retained_from_prev = {},
-                                      const FlatSet<size_t> &retain_these = {},
-                                      int64_t stream_reserved_bytes_per_column = 0) const;
+  // as a stack-local value; final-solution/forced-plan consumers call this
+  // again for the winning config. It is intentionally absent from CostResult so
+  // the local-search cache stays compact. vector_stream() remains a
+  // compatibility axis/chunk view for existing callers.
+  VectorStreamPlan
+  vector_stream_plan(const TileConfig &cfg,
+                     const FlatSet<size_t> &retained_from_prev = {},
+                     const FlatSet<size_t> &retain_these = {},
+                     int64_t stream_reserved_bytes_per_column = 0) const;
 
   // Reuse the homogeneous phase model when a mixed source schedule embeds one
   // lane-local vector configuration. Traffic stays owned by the enclosing
   // mixed model, which replaces the homogeneous GM output with an explicit
   // FIFO transfer.
-  double vector_plan_compute_cycles(const TileConfig& cfg) const;
+  double vector_plan_compute_cycles(const TileConfig &cfg) const;
 
   // Compatibility view: axis 0 + chunk INT64_MAX means materialized; chunk 0
   // means infeasible, matching the historical API.
-  struct VecStream { int axis = 0; int64_t chunk = 0; };
+  struct VecStream {
+    int axis = 0;
+    int64_t chunk = 0;
+  };
   VecStream vector_stream(const TileConfig &cfg,
                           const FlatSet<size_t> &retained_from_prev = {},
                           const FlatSet<size_t> &retain_these = {}) const;
@@ -252,10 +257,12 @@ public:
   // --- Cost evaluation ---
 
   // Cost of one (cube-only or vector-only) subgraph. virtual so Ascend910BMixed
-  // can add the third (mixed cube+vector) type; best_cost dispatches through it.
-  virtual CostResult compute_cost(const TileConfig &cfg,
-                                  const FlatSet<size_t> &retained_from_prev = {},
-                                  const FlatSet<size_t> &retain_these = {}) const;
+  // can add the third (mixed cube+vector) type; best_cost dispatches through
+  // it.
+  virtual CostResult
+  compute_cost(const TileConfig &cfg,
+               const FlatSet<size_t> &retained_from_prev = {},
+               const FlatSet<size_t> &retain_these = {}) const;
 
   // --- Parameter enumeration ---
 
@@ -269,11 +276,16 @@ public:
                         const FlatSet<size_t> &retained_from_prev = {},
                         const FlatSet<size_t> &retain_these = {}) const;
 
-  // Enumerate every FEASIBLE (config, cost) candidate for this subgraph (the same grid the
-  // argmin best_cost picks from). Used by the cost-vs-wall-time validation: dump the plans + their
-  // modeled costs, then force one for the device emit and measure its latency. Not on the solver
-  // hot path.
+  // Enumerate every FEASIBLE (config, cost) candidate for this subgraph (the
+  // same grid the argmin best_cost picks from). Used by the cost-vs-wall-time
+  // validation: dump the plans + their modeled costs, then force one for the
+  // device emit and measure its latency. Not on the solver hot path.
   std::vector<std::pair<TileConfig, CostResult>> enumerate_plans() const;
+
+  // Explicit source-oriented inner-K choices. Analytic solving keeps the
+  // historical zero sentinel so its candidate surface and behavior remain
+  // unchanged.
+  std::vector<int64_t> source_inner_k_candidates(int64_t l1_window_k) const;
 
   // Enumerate the same homogeneous-cube grid while retaining rejected points
   // and a stable first-failure code. This is a reporting API, not a search
@@ -283,19 +295,19 @@ public:
   // Enumerate every uniform active-group divisor for one concrete mixed tile
   // configuration, including the production per-pipe and launch breakdown.
   // This is diagnostic/model-grounding API and is never used by local search.
-  std::vector<MixedGroupCostCandidate> enumerate_mixed_group_costs(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev = {},
-      const FlatSet<size_t> &retain_these = {}) const;
+  std::vector<MixedGroupCostCandidate>
+  enumerate_mixed_group_costs(const TileConfig &cfg,
+                              const FlatSet<size_t> &retained_from_prev = {},
+                              const FlatSet<size_t> &retain_these = {}) const;
 
   // Reconstruct the exact four-port and phase breakdown for one concrete
   // mixed candidate.  Candidate-summary serialization uses this diagnostic
   // path after search; keeping it here avoids adding wide traffic fields to
   // CostResult, which is stored in the local-search hot cache.
-  std::optional<MixedCostBreakdown> mixed_cost_breakdown(
-      const TileConfig &cfg, int64_t active_groups,
-      const FlatSet<size_t> &retained_from_prev = {},
-      const FlatSet<size_t> &retain_these = {}) const;
+  std::optional<MixedCostBreakdown>
+  mixed_cost_breakdown(const TileConfig &cfg, int64_t active_groups,
+                       const FlatSet<size_t> &retained_from_prev = {},
+                       const FlatSet<size_t> &retain_these = {}) const;
 
   // Explain why the complete op set cannot form a rankable mixed sweep.  This
   // walks the same grid as best_cost() and reports the closest capacity-tested
@@ -312,7 +324,7 @@ public:
   // (stored by value in ScheduleStep, never deleted via a base pointer), so no
   // virtual destructor is needed; the implicit copy/move carry the vptr.
 
-protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
+protected: // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   struct VectorPlanCost {
     double latency = std::numeric_limits<double>::infinity();
     double compute = 0.0;
@@ -333,57 +345,49 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                                L0PlanMemo *l0_memo) const;
 
   CubeSchedulePlan derive_cube_schedule_plan(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev,
-      const FlatSet<size_t> &retain_these,
-      int64_t parallel_split,
-      L0PlanMemo *l0_memo,
-      CubeSplitMergePolicy split_merge_policy) const;
+      const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these, int64_t parallel_split,
+      L0PlanMemo *l0_memo, CubeSplitMergePolicy split_merge_policy) const;
 
   // Hot mixed candidate derivation. It leaves MixedSchedulePlan::topology empty
   // so every enumerated configuration avoids a shared_ptr reference-count
   // update; mixed_schedule_plan() attaches the owner only for an explicit
   // final-plan request.
   MixedSchedulePlan derive_mixed_schedule_plan(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev,
-      const FlatSet<size_t> &retain_these,
-      int64_t parallel_split,
+      const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these, int64_t parallel_split,
       int64_t active_groups) const;
 
   // Analytic one-way V->C contract in which the vector stage produces one or
   // both sink-matmul operands. Bit 0 denotes LHS ([spatial-M, full-K]); bit 1
   // denotes RHS ([full-K, spatial-N]); zero is not this contract.
   int vector_to_cube_operand_mask() const;
-  VectorStreamPlan vector_to_cube_stream_plan(const TileConfig& sink_cfg,
-                                               int64_t vector_lanes) const;
-  std::optional<size_t> streamed_vector_to_cube_transfer(
-      std::string* rejection_code = nullptr) const;
-  VectorStreamPlan streamed_vector_to_cube_plan(const TileConfig& sink_cfg,
-                                                 int64_t vector_lanes,
-                                                 std::string* rejection_code = nullptr) const;
+  VectorStreamPlan vector_to_cube_stream_plan(const TileConfig &sink_cfg,
+                                              int64_t vector_lanes) const;
+  std::optional<size_t>
+  streamed_vector_to_cube_transfer(std::string *rejection_code = nullptr) const;
+  VectorStreamPlan
+  streamed_vector_to_cube_plan(const TileConfig &sink_cfg, int64_t vector_lanes,
+                               std::string *rejection_code = nullptr) const;
   bool has_unrepresentable_vector_to_cube_multi_role() const;
-  TileConfig vector_to_cube_stage_config(const TileConfig& sink_cfg) const;
+  TileConfig vector_to_cube_stage_config(const TileConfig &sink_cfg) const;
 
-  CostResult compute_mixed_cost(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev,
-      const FlatSet<size_t> &retain_these) const;
+  CostResult compute_mixed_cost(const TileConfig &cfg,
+                                const FlatSet<size_t> &retained_from_prev,
+                                const FlatSet<size_t> &retain_these) const;
 
   CostResult compute_mixed_cost_for_groups(
-      const TileConfig &cfg,
-      const FlatSet<size_t> &retained_from_prev,
-      const FlatSet<size_t> &retain_these,
-      int64_t active_groups,
+      const TileConfig &cfg, const FlatSet<size_t> &retained_from_prev,
+      const FlatSet<size_t> &retain_these, int64_t active_groups,
       MixedCostBreakdown *breakdown = nullptr) const;
 
   CostResult compute_feature_round_trip_cost(
-      const TileConfig& cfg, const MixedSchedulePlan& schedule,
-      MixedCostBreakdown* breakdown = nullptr) const;
+      const TileConfig &cfg, const MixedSchedulePlan &schedule,
+      MixedCostBreakdown *breakdown = nullptr) const;
 
   // 910B per-core, byte-based, two-pool feasibility. Forks on cube-vs-vector:
-  //   cube  : operand strips fit L1 (l1_capacity), output fits L0c (cube_capacity)
-  //   vector: tile + ephemerals fit UB (vec_capacity)
+  //   cube  : operand strips fit L1 (l1_capacity), output fits L0c
+  //   (cube_capacity) vector: tile + ephemerals fit UB (vec_capacity)
   // Always double-buffered, but the pools are NOT halved: the two ping-pong
   // buffers together ARE the L1/UB, so feasibility uses the full capacity and
   // the emit halves the per-load k instead. When the relevant 910B pool budgets
@@ -394,13 +398,14 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
                     const FlatSet<size_t> &retain_these) const;
 
   // Two-pool feasibility for a MIXED cube+vector kernel (used by
-  // Ascend910BMixed). A fused mixed kernel needs BOTH on-chip pools live at once:
-  // the cube stage's matmul operand strips fit L1 and its output tile fits L0c,
-  // AND the vector stage's tile working set fits UB. (The crossing intermediate
-  // lives in L0c on the cube side and UB on the vector side, joined by the
-  // off-chip GM ring — it is not an L1/UB resident band.) This is the constraint
-  // that can make a fusion infeasible at a large shared tile where the separate
-  // kernels — each tiling for its own single pool — both fit.
+  // Ascend910BMixed). A fused mixed kernel needs BOTH on-chip pools live at
+  // once: the cube stage's matmul operand strips fit L1 and its output tile
+  // fits L0c, AND the vector stage's tile working set fits UB. (The crossing
+  // intermediate lives in L0c on the cube side and UB on the vector side,
+  // joined by the off-chip GM ring — it is not an L1/UB resident band.) This is
+  // the constraint that can make a fusion infeasible at a large shared tile
+  // where the separate kernels — each tiling for its own single pool — both
+  // fit.
   bool mixed_fits_on_chip(const TileConfig &cfg,
                           const FlatSet<size_t> &retained_from_prev,
                           const FlatSet<size_t> &retain_these,
@@ -423,8 +428,8 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // sees a final-output tile, while this mechanism streams an intermediate
   // feature chunk and keeps the sink accumulator across chunks. The vector
   // stage itself is still priced by its homogeneous vector planner.
-  FeatureRoundTripResources derive_feature_round_trip_resources(
-      const TileConfig& cfg) const;
+  FeatureRoundTripResources
+  derive_feature_round_trip_resources(const TileConfig &cfg) const;
 
   // Engine behind cube_peak_l1(): sweep the request-instance execution order,
   // accumulate live intermediate-region bytes, derive each matmul instance's k
@@ -433,14 +438,17 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // matmul's per-core contraction share (= output_K_ for S=1 feasibility; =
   // output_K_/S when evaluating/emitting a known parallel split). The optional
   // vector is indexed by cube_request_nodes_, not global op id.
-  int64_t derive_exec(const TileConfig& cfg, int64_t sink_K_eff, const FlatSet<size_t>& retained_from_prev,
-                      const FlatSet<size_t>& retain_these, std::vector<int64_t>* pernode_k_out,
-                      std::vector<int64_t>* pernode_live_bytes_out = nullptr) const;
+  int64_t
+  derive_exec(const TileConfig &cfg, int64_t sink_K_eff,
+              const FlatSet<size_t> &retained_from_prev,
+              const FlatSet<size_t> &retain_these,
+              std::vector<int64_t> *pernode_k_out,
+              std::vector<int64_t> *pernode_live_bytes_out = nullptr) const;
 
   // Resolve a derive_exec() K-window result for a normalized op. Request-DAG
   // plans index the vector by request node; legacy plans index it directly by
   // op. A repeated op uses the narrowest window required by any request.
-  int64_t cube_window_k_for_op(const std::vector<int64_t>& windows,
+  int64_t cube_window_k_for_op(const std::vector<int64_t> &windows,
                                size_t op) const;
 
   struct CubeRequest {
@@ -474,21 +482,25 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
     [[nodiscard]] bool resident() const { return first_use < last_use; }
   };
 
-  [[nodiscard]] int64_t cube_binding_extent(CubeAxisBinding binding, int64_t full_extent, int64_t m_extent,
-                                            int64_t n_extent, int64_t split) const;
+  [[nodiscard]] int64_t cube_binding_extent(CubeAxisBinding binding,
+                                            int64_t full_extent,
+                                            int64_t m_extent, int64_t n_extent,
+                                            int64_t split) const;
 
-  double cube_request_reload(const TileConfig& cfg, int64_t split, double* lhs_bytes_out = nullptr,
-                             double* rhs_bytes_out = nullptr) const;
+  double cube_request_reload(const TileConfig &cfg, int64_t split,
+                             double *lhs_bytes_out = nullptr,
+                             double *rhs_bytes_out = nullptr) const;
 
-  // Matmul boundary-operand reload (BYTES) at this tiling: the distribution-aware
-  // M*N*K*(1/w + 1/h) term, deduped per (tensor, role). Shared by the cube cost
-  // and the mixed cost so fusion does not silently drop the operand reload.
-  // matmul_at_output_grid=true treats every matmul as tiled at the output grid
-  // (w_i = min(cfg.w, N)) — correct for a feed-forward mixed kernel whose matmul
-  // output is consumed elementwise by the vector stage (it is the effective sink),
-  // vs the cube path's chained-intermediate default (full-width band, w_i = N).
-  // Optionally splits the reload BYTES per port (lhs via L0A, rhs via L0B) into the
-  // out-params — used to derive the L1->L0 extract (MTE1) tiebreaker in best_cost.
+  // Matmul boundary-operand reload (BYTES) at this tiling: the
+  // distribution-aware M*N*K*(1/w + 1/h) term, deduped per (tensor, role).
+  // Shared by the cube cost and the mixed cost so fusion does not silently drop
+  // the operand reload. matmul_at_output_grid=true treats every matmul as tiled
+  // at the output grid (w_i = min(cfg.w, N)) — correct for a feed-forward mixed
+  // kernel whose matmul output is consumed elementwise by the vector stage (it
+  // is the effective sink), vs the cube path's chained-intermediate default
+  // (full-width band, w_i = N). Optionally splits the reload BYTES per port
+  // (lhs via L0A, rhs via L0B) into the out-params — used to derive the L1->L0
+  // extract (MTE1) tiebreaker in best_cost.
   double cube_operand_reload(const TileConfig &cfg,
                              bool matmul_at_output_grid = false,
                              double *lhs_bytes_out = nullptr,
@@ -508,15 +520,16 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<size_t> pw_produced_ephemerals_;
 
   int64_t out_W_ = 0, out_H_ = 0;
-  bool has_matmul_ = false;   // group has ≥1 CUBE (matmul) op
-  bool has_vector_ = false;   // group has ≥1 VECTOR (pointwise/reduction) op.
-                              // has_matmul_ && has_vector_ ⇒ a MIXED kernel
-                              // (allowed only when Problem::fuse_cube_vector).
+  bool has_matmul_ = false; // group has ≥1 CUBE (matmul) op
+  bool has_vector_ = false; // group has ≥1 VECTOR (pointwise/reduction) op.
+                            // has_matmul_ && has_vector_ ⇒ a MIXED kernel
+                            // (allowed only when Problem::fuse_cube_vector).
   // Max cube↔vector unit ALTERNATIONS along any dependency path in the group.
   // The mixed model grants `max` overlap only for an exact one-way or single-
   // round-trip topology. Deeper/multi-message FIFOs are represented and priced
   // as a serial stage sum in analytic mode; compiler mode rejects them through
-  // Problem::allow_model_ahead_mixed_multi_roundtrip. 0 for a homogeneous group.
+  // Problem::allow_model_ahead_mixed_multi_roundtrip. 0 for a homogeneous
+  // group.
   int mixed_round_trip_depth_ = 0;
   // Candidate-invariant same-engine components and cube/vector GM crossings.
   // Hot candidates reference this owner without copying it; final plans attach
@@ -561,8 +574,9 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   // free-axis partitions before VectorStreamPlan enables the split.
   VectorReductionSplitKind vector_reduction_split_kind_ =
       VectorReductionSplitKind::None;
-  // Exact P4 algorithm implemented for this complete candidate op set. None means a streamed
-  // multi-reduction is buildable only under the analytic model-ahead override.
+  // Exact P4 algorithm implemented for this complete candidate op set. None
+  // means a streamed multi-reduction is buildable only under the analytic
+  // model-ahead override.
   P4PatternKind p4_pattern_kind_ = P4PatternKind::None;
   FlatSet<size_t> p4_apply_substitutions_;
   std::vector<P4ApplyBinding> p4_apply_bindings_;
@@ -589,18 +603,19 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   std::vector<size_t> vector_ub_transient_offsets_;
   std::array<std::vector<size_t>, 4> vector_phase_ops_;
   std::array<std::vector<size_t>, 4> vector_phase_inputs_;
-  std::shared_ptr<const VectorInputLifetimeTopology> vector_input_lifetime_topology_;
+  std::shared_ptr<const VectorInputLifetimeTopology>
+      vector_input_lifetime_topology_;
   std::shared_ptr<const VectorReplayTopology> vector_replay_topology_;
   // Full extent of the reduced axis (the un-reduced data width/height the tile
   // must span). May exceed out_W_/out_H_ when the reduction output IS the sink
   // (e.g. a bare rowmax: out is [1,H] but the tile must cover the full W).
   int64_t reduced_extent_ = 0;
   bool has_pw_sink_ = false;
-  bool has_simple_epilogue_ = false;  // MM→PW(chain) epilogue pattern detected
+  bool has_simple_epilogue_ = false; // MM→PW(chain) epilogue pattern detected
   int64_t max_K_ = 1;
-  int64_t output_K_ = 1;   // K of the boundary-output-producing MatMul
-  int64_t sink_mm_op_ = -1;  // op id of the boundary-output MatMul (-1 if none);
-                             // its derived per-op k is the displayed config.k
+  int64_t output_K_ = 1;    // K of the boundary-output-producing MatMul
+  int64_t sink_mm_op_ = -1; // op id of the boundary-output MatMul (-1 if none);
+                            // its derived per-op k is the displayed config.k
 
   // Prologue-PW geometric condition (Rules 2/3):
   //   Pointwise feeding a matmul's LHS → require cfg.w ≥ matmul.K
@@ -662,21 +677,21 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
   //   FROM_NK → position changes every k-step
   struct BoundaryTensorInfo {
     size_t id;
-    int64_t full_size;               // width * height (precomputed)
+    int64_t full_size; // width * height (precomputed)
 
     // How this tensor's tiling is determined
     enum TileSource : uint8_t {
-      FIXED_1  = 0,  // h_tiles or v_tiles = 1 (full extent in this dim)
-      FROM_NTW = 1,  // = W_out / w (output column tiling)
-      FROM_NTH = 2,  // = H_out / h (output row tiling)
-      FROM_NK  = 3   // = output_K / k (depth tiling for sink split-K)
+      FIXED_1 = 0,  // h_tiles or v_tiles = 1 (full extent in this dim)
+      FROM_NTW = 1, // = W_out / w (output column tiling)
+      FROM_NTH = 2, // = H_out / h (output row tiling)
+      FROM_NK = 3   // = output_K / k (depth tiling for sink split-K)
     };
-    TileSource h_source = FROM_NTW;  // determines h_tiles
-    TileSource v_source = FROM_NTH;  // determines v_tiles
+    TileSource h_source = FROM_NTW; // determines h_tiles
+    TileSource v_source = FROM_NTH; // determines v_tiles
 
     // Output roles
-    bool is_boundary_out = false;    // h×w evicted per tile
-    bool is_mm_out = false;          // MatMul accumulator (h×w, resident)
+    bool is_boundary_out = false; // h×w evicted per tile
+    bool is_mm_out = false;       // MatMul accumulator (h×w, resident)
 
     // Internal production flag (no mem_in cost)
     bool is_internally_produced = false;
@@ -684,19 +699,27 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
     // Evaluate h_tiles for a given config
     int64_t eval_h_tiles(int64_t ntw, int64_t nk) const {
       switch (h_source) {
-        case FIXED_1:  return 1;
-        case FROM_NTW: return ntw;
-        case FROM_NTH: return 1; // shouldn't happen, but safe
-        case FROM_NK:  return nk;
+      case FIXED_1:
+        return 1;
+      case FROM_NTW:
+        return ntw;
+      case FROM_NTH:
+        return 1; // shouldn't happen, but safe
+      case FROM_NK:
+        return nk;
       }
       return 1;
     }
     int64_t eval_v_tiles(int64_t nth, int64_t nk) const {
       switch (v_source) {
-        case FIXED_1:  return 1;
-        case FROM_NTW: return 1; // shouldn't happen, but safe
-        case FROM_NTH: return nth;
-        case FROM_NK:  return nk;
+      case FIXED_1:
+        return 1;
+      case FROM_NTW:
+        return 1; // shouldn't happen, but safe
+      case FROM_NTH:
+        return nth;
+      case FROM_NK:
+        return nk;
       }
       return 1;
     }
@@ -714,14 +737,17 @@ protected:  // Ascend910BMixed::compute_cost reads these to cost the mixed type.
 
   std::vector<int64_t> ks_cand_;
   // SpatialSchedule (parts_m, parts_n, split_k) TRIPLES for the cube path. Each
-  // lands parts_m*parts_n*split_k WORK UNITS targeting the core count (n_cores) or
-  // 2*n_cores (a 2-wave grid): P*Q is the balanced 16-aligned spatial partition,
-  // S=split_k splits the sink K across cores to fill what the spatial grid alone
-  // can't (a power-of-two shape that can't form C spatial regions still fills the
-  // cores via split-K). One enumeration of all three core-fill levers; the
-  // single-core seq-k is NOT here (derive_exec sets it greedily). Empty for
-  // vector / legacy subgraphs (the uniform divisor tiles cover those).
-  struct SpatialTriple { int64_t parts_m, parts_n, split_k; };
+  // lands parts_m*parts_n*split_k WORK UNITS targeting the core count (n_cores)
+  // or 2*n_cores (a 2-wave grid): P*Q is the balanced 16-aligned spatial
+  // partition, S=split_k splits the sink K across cores to fill what the
+  // spatial grid alone can't (a power-of-two shape that can't form C spatial
+  // regions still fills the cores via split-K). One enumeration of all three
+  // core-fill levers; the single-core seq-k is NOT here (derive_exec sets it
+  // greedily). Empty for vector / legacy subgraphs (the uniform divisor tiles
+  // cover those).
+  struct SpatialTriple {
+    int64_t parts_m, parts_n, split_k;
+  };
   std::vector<SpatialTriple> grid_cand_;
   // Per-axis logical region granularity for partition_axis. Cube uses the 16x16
   // MAC fractal. Vector uses one element on both axes; dtype-specific DMA
@@ -756,29 +782,33 @@ static_assert(CostModel<Ascend910BCost>,
 // `mlsys_mixed` executable.
 // ============================================================================
 class Ascend910BMixed : public Ascend910BCost {
- public:
-  static std::optional<Ascend910BMixed> create(const Problem &prob, const DAG &dag,
-                                               std::vector<size_t> op_indices) {
+public:
+  static std::optional<Ascend910BMixed>
+  create(const Problem &prob, const DAG &dag, std::vector<size_t> op_indices) {
     auto base = Ascend910BCost::create(prob, dag, std::move(op_indices),
                                        /*allow_mixed=*/true);
-    if (!base) return std::nullopt;
+    if (!base)
+      return std::nullopt;
     return Ascend910BMixed(std::move(*base));
   }
 
-  // Default-constructible like the base (ScheduleStep default-inits its subgraph
-  // member); the user-declared private ctor below otherwise suppresses it.
+  // Default-constructible like the base (ScheduleStep default-inits its
+  // subgraph member); the user-declared private ctor below otherwise suppresses
+  // it.
   Ascend910BMixed() = default;
 
   // The third subgraph type: a fused cube+vector mixed kernel. Cube-only and
   // vector-only groups delegate to the (shared, unchanged) base cost.
-  CostResult compute_cost(const TileConfig &cfg,
-                          const FlatSet<size_t> &retained_from_prev = {},
-                          const FlatSet<size_t> &retain_these = {}) const override;
+  CostResult
+  compute_cost(const TileConfig &cfg,
+               const FlatSet<size_t> &retained_from_prev = {},
+               const FlatSet<size_t> &retain_these = {}) const override;
 
- private:
+private:
   // Mixed state lives in the base so slicing a fully-built admitted model keeps
   // the same candidate-invariant topology used by feasibility and costing.
-  explicit Ascend910BMixed(Ascend910BCost base) : Ascend910BCost(std::move(base)) {}
+  explicit Ascend910BMixed(Ascend910BCost base)
+      : Ascend910BCost(std::move(base)) {}
 };
 
 static_assert(CostModel<Ascend910BMixed>,

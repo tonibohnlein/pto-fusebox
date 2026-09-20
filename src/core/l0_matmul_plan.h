@@ -16,6 +16,11 @@ struct L0MatmulConfig {
   int64_t m = 0;
   int64_t n = 0;
   int64_t k = 0;
+  // Optional candidate-owned innermost TMATMUL contraction tile.  Zero keeps
+  // the historical local argmin; a positive value makes this physical choice
+  // part of the outer solver candidate instead of hiding it inside the L0
+  // planner.
+  int64_t forced_k = 0;
 
   int64_t l0a_bytes = 64 * 1024;
   int64_t l0b_bytes = 64 * 1024;
@@ -99,7 +104,8 @@ struct L0MatmulPlan {
   std::string diagnostic;
 };
 
-L0MatmulPlan choose_l0_matmul_plan(const L0MatmulConfig& config);
+L0MatmulPlan choose_l0_matmul_plan(const L0MatmulConfig &config);
 
-double estimate_l0_output_drain_cycles(int64_t m, int64_t n, const L0MatmulConfig& config,
+double estimate_l0_output_drain_cycles(int64_t m, int64_t n,
+                                       const L0MatmulConfig &config,
                                        L0OutputTarget target);

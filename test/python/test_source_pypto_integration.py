@@ -23,6 +23,7 @@ import pytest
 import torch
 from examples.torch_frontend._runner import Example
 from examples.torch_frontend.deepseek_v4 import (
+    DEEPSEEK_V4_PRO_MTP_GEOMETRY,
     build_examples as build_deepseek_examples,
     build_production_dspark_projection,
     build_production_mtp_decode_projection,
@@ -406,13 +407,23 @@ def test_production_dspark_chunked_bf16_accumulator_compiles(
         require_source_codegen=True,
     )
     assert solved.whole_graph_codegen_ready and len(solved.regions) == 1
+    schedule = scheduled_region(solved.regions[0])
+    assert [step.kind for step in schedule.steps] == [
+        KernelKind.CUBE,
+        KernelKind.VECTOR,
+    ]
+    cube_plan = schedule.steps[0].plan
+    assert isinstance(cube_plan, CubeKernelPlan)
+    assert cube_plan.matmuls[0].accumulator_dtype == "fp32"
+    assert cube_plan.matmuls[0].storage_dtype == "bf16"
     emitted = emit_pypto_callable(
         graph,
         solved.regions[0],
         function_name="generated_dspark_projection",
     )
-    assert "out_dtype=pl.FP32" in emitted.source
-    assert "pl.matmul_acc(" in emitted.source
+    assert "pl.tile.matmul(" in emitted.source
+    assert "pl.tile.matmul_acc(" in emitted.source
+    assert "target_type=pl.BF16, mode='rint'" in emitted.source
 
     pto, orchestration = _compile_callable_in_native_orchestration(
         emitted,
@@ -838,7 +849,11 @@ def test_callable_qwen_static_components_lower_inside_native_orchestration(
                 r"loc=right, dtype=bf16, rows=(\d+), cols=(\d+)", pto[0]
             )
         }
-        assert right_tiles == {(matmul.k_loop.chunk, matmul.output_tile[1])}
+        expected_right_tiles = {
+            (variant.l0_init.tile[2], variant.l0_init.tile[1])
+            for variant in matmul.output_variants
+        }
+        assert right_tiles == expected_right_tiles
 
 
 def test_callable_connected_qwen_v2c_lowers_as_one_mixed_task(
@@ -1437,15 +1452,31 @@ def _compile_mixed_source(
 
 
 @pytest.mark.parametrize(
-    ("name", "builder"),
+    ("name", "builder", "geometry"),
     (
-        ("maximal_flash_mtp", build_production_mtp_projection_branch),
-        ("maximal_qwen_output_head", build_production_qwen_output_head),
+        ("maximal_flash_mtp", build_production_mtp_projection_branch, None),
+        (
+            "maximal_flash_mtp_history",
+            build_production_mtp_history_projection_branch,
+            None,
+        ),
+        (
+            "maximal_pro_mtp",
+            build_production_mtp_projection_branch,
+            DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+        ),
+        (
+            "maximal_pro_mtp_history",
+            build_production_mtp_history_projection_branch,
+            DEEPSEEK_V4_PRO_MTP_GEOMETRY,
+        ),
+        ("maximal_qwen_output_head", build_production_qwen_output_head, None),
     ),
 )
 def test_maximal_streamed_v2c_candidate_lowers_as_one_program(
     name: str,
-    builder: Callable[[], tuple[nn.Module, tuple[torch.Tensor, ...]]],
+    builder: Callable[..., tuple[nn.Module, tuple[torch.Tensor, ...]]],
+    geometry: object | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1454,7 +1485,7 @@ def test_maximal_streamed_v2c_candidate_lowers_as_one_program(
     ir = importlib.import_module("pypto.ir")
     pl = importlib.import_module("pypto.language")
     monkeypatch.setenv("PYPTO_CODEGEN_MAX_WORKERS", "2")
-    module, args = builder()
+    module, args = builder() if geometry is None else builder(geometry)
     graph = export_and_normalize(module, args)
     solved = solve_graph(
         graph,
@@ -1476,7 +1507,7 @@ def test_maximal_streamed_v2c_candidate_lowers_as_one_program(
         pl.parse_program(source),
         output_dir=str(tmp_path / name),
         dump_passes=False,
-        skip_ptoas=True,
+        skip_ptoas=False,
     )
     assert len(list(compiled.output_dir.rglob("*.pto"))) == 1
     assert len(list((compiled.output_dir / "orchestration").glob("*.cpp"))) == 1
@@ -2045,9 +2076,11 @@ def test_large_fp32_linear_sink_physical_memory_partition_lowers_through_pypto(
         for step in scheduled.steps
         if isinstance((plan := step.plan), (CubeKernelPlan, MixedKernelPlan))
     )
-    assert source_l1_by_step == (235_520, 14_336)
+    # The cube step now prices the physical inner-K operand buffers selected by
+    # the source plan, rather than only its logical output footprint.
+    assert source_l1_by_step == (235_520, 46_080)
     source_l1_bytes = sum(source_l1_by_step)
-    assert source_l1_bytes == 249_856
+    assert source_l1_bytes == 281_600
     assert source_l1_bytes <= 524_288
     source = emit_pypto_region(
         graph, region, program_name="large_fp32_linear_sink"

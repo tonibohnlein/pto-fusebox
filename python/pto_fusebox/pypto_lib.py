@@ -815,26 +815,40 @@ def _qwen_output_window_function(
         def visit_Assign(self, node: ast.Assign) -> ast.Assign | list[ast.Assign]:
             self.generic_visit(node)
             call = node.value
-            if (
-                not isinstance(call, ast.Call)
-                or ast.unparse(call.func) != "pl.assemble"
-            ):
+            if not isinstance(call, ast.Call):
                 return node
+            function = ast.unparse(call.func)
+            if function in {"pl.assemble", "pl.tensor.assemble"}:
+                target_index, source_index, offset_index = 0, 1, 2
+            elif function == "pl.store":
+                source_index, offset_index, target_index = 0, 1, 2
+            else:
+                return node
+            if len(call.args) < 3:
+                return node
+            target = call.args[target_index]
+            if not isinstance(target, ast.Name):
+                return node
+            if target.id not in {
+                output_name,
+                f"{output_name}_iter",
+            }:
+                return node
+            source = call.args[source_index]
+            offset = call.args[offset_index]
             if (
-                len(call.args) < 3
-                or not isinstance(call.args[0], ast.Name)
-                or call.args[0].id != output_name
-                or not isinstance(call.args[1], ast.Name)
-                or not isinstance(call.args[2], ast.List)
-                or len(call.args[2].elts) != 2
-                or not isinstance(call.args[2].elts[0], ast.Constant)
-                or call.args[2].elts[0].value != 0
+                not isinstance(source, ast.Name)
+                or not isinstance(offset, ast.List)
+                or len(offset.elts) != 2
+                or not isinstance(offset.elts[0], ast.Constant)
+                or offset.elts[0].value != 0
             ):
                 raise SourceEmissionError(
-                    "Qwen output drain is not relative to its static row frame"
+                    "Qwen output drain is not relative to its static row frame: "
+                    + ast.unparse(call)
                 )
-            accumulator = call.args[1]
-            trimmed_name = f"{accumulator.id}_valid_rows"
+            accumulator = source
+            trimmed_name = f"{source.id}_valid_rows"
             trim = ast.Assign(
                 targets=[ast.Name(id=trimmed_name, ctx=ast.Store())],
                 value=ast.Call(
@@ -851,8 +865,8 @@ def _qwen_output_window_function(
                     keywords=[],
                 ),
             )
-            call.args[1] = ast.Name(id=trimmed_name, ctx=ast.Load())
-            call.args[2].elts[0] = ast.Name(id="row_offset", ctx=ast.Load())
+            call.args[source_index] = ast.Name(id=trimmed_name, ctx=ast.Load())
+            offset.elts[0] = ast.Name(id="row_offset", ctx=ast.Load())
             self.drains += 1
             return [ast.copy_location(trim, node), node]
 

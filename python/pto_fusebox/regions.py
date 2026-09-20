@@ -334,6 +334,12 @@ def lower_solver_region(
             "vector_op_capabilities": [_vector_capability(op) for op in compute_ops],
             "mixed_vector_semantics": [_mixed_semantic(op) for op in compute_ops],
             "mixed_emit_compatible": [True for _ in compute_ops],
+            "matmul_lhs_k_contiguous": [
+                _matmul_k_contiguity(op, values)[0] for op in compute_ops
+            ],
+            "matmul_rhs_k_contiguous": [
+                _matmul_k_contiguity(op, values)[1] for op in compute_ops
+            ],
             "required_outputs": [
                 tensor_index[value_id]
                 for value_id in dict.fromkeys(required_value_ids)
@@ -389,6 +395,26 @@ def lower_solver_region(
         solver_op_to_graph=solver_op_to_graph,
         solver_tensor_to_value=tuple(value.id for value in ordered_values),
     )
+
+
+def _matmul_k_contiguity(
+    op: NormalizedOp,
+    values: Mapping[str, NormalizedValue],
+) -> tuple[bool, bool]:
+    """Return whether each logical matmul operand is contiguous along K."""
+
+    if op.kind != "matmul" or len(op.inputs) != 2:
+        return False, False
+    lhs = values[op.inputs[0]]
+    rhs = values[op.inputs[1]]
+    lhs_strides = lhs.strides
+    rhs_strides = rhs.strides
+    lhs_k_contiguous = lhs_strides is None or lhs_strides[-1] == 1
+    # The normalized rhs is logically [K,N].  A row-major [K,N] tensor is
+    # contiguous in N, while the zero-copy alias of a stored [N,K] linear
+    # weight has reversed strides and is contiguous in logical K.
+    rhs_k_contiguous = rhs_strides is not None and rhs_strides[-2] == 1
+    return lhs_k_contiguous, rhs_k_contiguous
 
 
 def _allocation_owner(

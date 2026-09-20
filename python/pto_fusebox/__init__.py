@@ -5,6 +5,8 @@ from .bindings import InputBindingError, bind_emitted_call, bind_emitted_inputs
 from .cube_sweep import (
     CUBE_PLAN_SWEEP_SCHEMA,
     CubeCandidateExecution,
+    CubeCandidateGeometry,
+    CubeMatmulGeometry,
     CubeCandidateGrid,
     CubePlanCandidate,
     CubePlanRejection,
@@ -100,6 +102,8 @@ __all__ = [
     "CUBE_PLAN_SWEEP_SCHEMA",
     "CubeCandidateGrid",
     "CubeCandidateExecution",
+    "CubeCandidateGeometry",
+    "CubeMatmulGeometry",
     "CubePlanCandidate",
     "CubePlanRejection",
     "CubePlanSweep",

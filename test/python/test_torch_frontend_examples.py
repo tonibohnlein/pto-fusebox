@@ -623,11 +623,38 @@ def test_production_projection_candidates_include_maximal_streamed_v2c() -> None
         assert source.count("pl.matmul_acc(") >= 1
         assert source.count("next_output = pl.store(") == 1
         assert "gm_pipe_buffer_" not in source
+        if builder is build_production_qwen_output_head:
+            # Device measurements show this maximal realization is 1.75x
+            # faster even though the model ranks it last.  Freeze the
+            # structural terms before changing any coefficient.
+            assert selected.execution.submissions == 2
+            assert selected.execution.cut_bytes == 163_840
+            assert selected.execution.drain_executions == 232
+            assert selected.execution.drain_bytes == 9_895_936
+            assert maximal.execution.submissions == 1
+            assert maximal.execution.cut_bytes == 0
+            assert maximal.execution.drain_executions == 960
+            assert maximal.execution.drain_bytes == 9_732_096
+            assert plan.cube_window_k == 192
+            assert plan.active_groups == 24
+            assert plan.max_trips_per_group == 40
+            # Both operands are K-contiguous for the transposed production
+            # weight, so the maximal plan issues a 384-byte contiguous request.
+            problem = region.problem
+            assert problem is not None
+            matmul_index = problem["op_types"].index("MatMul")
+            assert problem["matmul_lhs_k_contiguous"][matmul_index] is True
+            assert problem["matmul_rhs_k_contiguous"][matmul_index] is True
+            assert plan.cube_window_k * 2 == 384
         if transfer_count == 2:
             assert "sink_vector_mat" not in source
             assert "pl.tile.full(" in source
+            assert "dtype=pl.INT32, value=0" in source
+            assert "target_type=pl.INT8, mode='trunc'" in source
             assert "pl.tile.assemble(" in source
             assert "sink_lhs_padded = pl.tile.set_validshape(" in source
+            assert "sink_vector_result = pl.tile.set_validshape(" in source
+            assert "sink_lhs_logical = pl.tile.slice(" not in source
 
         malformed = copy.deepcopy(maximal.solution)
         descriptor = malformed["steps"][0]["plan"]["streamed_v2c"]
@@ -656,6 +683,11 @@ def test_qwen_lm_head_exposes_grid_stride_low_drain_candidate() -> None:
         require_source_codegen=True,
     )
     assert solved.regions_solved and len(solved.regions) == 1
+    problem = solved.regions[0].problem
+    assert problem is not None
+    matmul_index = problem["op_types"].index("MatMul")
+    assert problem["matmul_lhs_k_contiguous"][matmul_index] is True
+    assert problem["matmul_rhs_k_contiguous"][matmul_index] is True
     sweep = enumerate_cube_plans(
         solved.regions[0], sweep_binary=_test_solver().parent / "cube_plan_sweep"
     )
@@ -670,9 +702,14 @@ def test_qwen_lm_head_exposes_grid_stride_low_drain_candidate() -> None:
             candidate.grid.parts_m,
             candidate.grid.parts_n,
             candidate.grid.split_k,
-            candidate.grid.realized_sequential_k,
+            candidate.grid.inner_k,
         )
-        == (1, QWEN_PRODUCTION_VOCAB // QWEN_VOCAB_CHUNK, 1, 32)
+        == (
+            1,
+            QWEN_PRODUCTION_VOCAB // QWEN_VOCAB_CHUNK,
+            1,
+            QWEN_LM_HEAD_K_CHUNK,
+        )
     )
     assert not low_drain.selected
     assert sweep.selected.latency_cycles < low_drain.latency_cycles
@@ -694,6 +731,14 @@ def test_qwen_lm_head_exposes_grid_stride_low_drain_candidate() -> None:
         "l0c_gm": output_bytes,
         "ub_gm": 0,
     }
+    assert low_drain.geometry.sequential_k_window >= QWEN_LM_HEAD_K_CHUNK
+    assert low_drain.geometry.inner_k == QWEN_LM_HEAD_K_CHUNK
+    assert low_drain.geometry.spatial_n_tile == QWEN_VOCAB_CHUNK
+    assert low_drain.geometry.contiguous_request_bytes == {
+        "lhs": QWEN_LM_HEAD_K_CHUNK * 2,
+        "rhs": QWEN_LM_HEAD_K_CHUNK * 2,
+    }
+    assert all(low_drain.geometry.physical_constraints.values())
     forced = region_for_cube_candidate(solved.regions[0], low_drain)
     plan = scheduled_region(forced).steps[0].plan
     assert isinstance(plan, CubeKernelPlan)
@@ -703,15 +748,18 @@ def test_qwen_lm_head_exposes_grid_stride_low_drain_candidate() -> None:
         33,
     )
     matmul = plan.matmuls[0]
+    assert matmul.output_variants[0].l0_init.tile[2] == QWEN_LM_HEAD_K_CHUNK
     assert matmul.accumulator_dtype == "fp32"
-    assert tuple(matmul.output_tile) == (16, QWEN_VOCAB_CHUNK)
-    assert tuple(matmul.output_grid) == (1, 1)
-    assert matmul.final_drain.tile_count == 1
+    # The solver-owned spatial/L1 region is 16x192. Its legal L0 child uses six
+    # 16x32 output tiles so K=512 fits the 64 KiB Right pool.
+    assert tuple(matmul.output_tile) == (16, 32)
+    assert tuple(matmul.output_grid) == (1, 6)
+    assert matmul.final_drain.tile_count == 6
     source = emit_pypto_region(graph, forced, program_name="qwen_low_drain").source
     assert "for cube_task in pl.spmd(24" in source
     assert "pl.range(33, init_values=(output,))" in source
     assert "output = pl.yield_(output_iter)" in source
-    assert source.count("pl.assemble(output_iter,") == 1
+    assert source.count("pl.tensor.assemble(output_iter,") == 6
 
     assert forced.solution is not None
     missing_replay = copy.deepcopy(forced.solution)
@@ -962,6 +1010,14 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
             step.kind in {KernelKind.VECTOR, KernelKind.MIXED}
             for step in schedule.steps
         )
+        cube_requests = [
+            matmul
+            for step in schedule.steps
+            if isinstance(step.plan, CubeKernelPlan)
+            for matmul in step.plan.matmuls
+        ]
+        assert cube_requests
+        assert all(matmul.accumulator_dtype == "int32" for matmul in cube_requests)
         source = emit_pypto_callable(
             graph,
             result.regions[0],
@@ -970,8 +1026,8 @@ def test_production_flash_mtp_branches_emit_static_decode_callables() -> None:
         assert "mode='rint'" in source
         assert "mode='round'" in source
         assert "mode='trunc'" in source
-        assert "b_trans=True" in source
-        assert "out_dtype=pl.INT32" in source
+        assert "pl.tile.transpose_view(" in source
+        assert "pl.tile.matmul(" in source
         solved.append((graph, result.regions[0]))
 
     full_module, full_args = build_production_mtp_decode_projection()
@@ -1257,14 +1313,22 @@ def test_production_flash_mtp_prefill_branch_is_source_ready() -> None:
     assert any(
         step.kind in {KernelKind.VECTOR, KernelKind.MIXED} for step in schedule.steps
     )
+    cube_requests = [
+        matmul
+        for step in schedule.steps
+        if isinstance(step.plan, CubeKernelPlan)
+        for matmul in step.plan.matmuls
+    ]
+    assert cube_requests
+    assert all(matmul.accumulator_dtype == "int32" for matmul in cube_requests)
     source = emit_pypto_callable(
         graph,
         solved.regions[0],
         function_name="fusebox_mtp_prefill_projection",
     ).source
     ast.parse(source)
-    assert "b_trans=True" in source
-    assert "out_dtype=pl.INT32" in source
+    assert "pl.tile.transpose_view(" in source
+    assert "pl.tile.matmul(" in source
 
 
 @pytest.mark.parametrize(
