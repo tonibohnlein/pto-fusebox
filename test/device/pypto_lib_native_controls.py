@@ -30,12 +30,14 @@ class NativeControl:
 def _dspark() -> NativeControl:
     return NativeControl(
         model_name="deepseek_v4_flash_dspark",
-        module_name="dspark_proj",
+        module_name="dspark_drafter",
         callable_name="dspark_proj",
         program_name="native_dspark_projection",
-        tensor_specs_name="build_tensor_specs",
-        golden_name="golden_dspark_proj",
-        source="""from dspark_proj import dspark_proj
+        # The consolidated module's fixtures exercise the entire drafter, not
+        # this projection. They must not be used for a projection comparison.
+        tensor_specs_name=None,
+        golden_name=None,
+        source="""from dspark_drafter import dspark_proj
 import pypto.language as pl
 
 
@@ -51,7 +53,10 @@ def native_dspark_projection(
     )
 
 
-def _mtp(model_name: str, hidden: int) -> NativeControl:
+def _mtp(model_name: str, hidden: int, *, weight_layout: str) -> NativeControl:
+    if weight_layout not in {"ND", "NZ"}:
+        raise ValueError(f"unsupported native weight layout {weight_layout!r}")
+    layout_annotation = "" if weight_layout == "ND" else ", pl.NZ"
     class_suffix = "FlashMtp" if hidden == 4096 else "Pro"
     program_name = f"native_{class_suffix.lower()}_projection"
     return NativeControl(
@@ -75,10 +80,10 @@ def {program_name}(
     prev_hidden_states: pl.Tensor[[8, 4, {hidden}], pl.FP32],
     enorm_w: pl.Tensor[[{hidden}], pl.FP32],
     hnorm_w: pl.Tensor[[{hidden}], pl.FP32],
-    e_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8],
+    e_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8{layout_annotation}],
     e_proj_w_scale: pl.Tensor[[{hidden}], pl.FP32],
     e_proj_smooth: pl.Tensor[[{hidden}], pl.FP32],
-    h_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8],
+    h_proj_w: pl.Tensor[[{hidden}, {hidden}], pl.INT8{layout_annotation}],
     h_proj_w_scale: pl.Tensor[[{hidden}], pl.FP32],
     h_proj_smooth: pl.Tensor[[{hidden}], pl.FP32],
     hidden_states_out: pl.Out[pl.Tensor[[8, 4, {hidden}], pl.FP32]],
@@ -137,8 +142,8 @@ def native_qwen_output_head(
 
 NATIVE_CONTROLS = (
     _dspark(),
-    _mtp("deepseek_v4_flash_mtp", 4096),
-    _mtp("deepseek_v4_pro", 7168),
+    _mtp("deepseek_v4_flash_mtp", 4096, weight_layout="NZ"),
+    _mtp("deepseek_v4_pro", 7168, weight_layout="ND"),
     _qwen(),
 )
 

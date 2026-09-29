@@ -56,6 +56,7 @@ from pto_fusebox import (
     KernelKind,
     RegionSolveResult,
     RuntimeValidShapeSpec,
+    SourceEmissionError,
     emit_pypto_callable,
     emit_flash_mtp_decode_projection_overlay,
     emit_pypto_region,
@@ -80,6 +81,7 @@ from pto_fusebox.schedule.schema import (
     VectorStreamKind,
 )
 from pto_fusebox.target import Ascend910BTarget
+from pto_fusebox.model import native_tensor_layouts
 from torch import nn
 
 
@@ -234,10 +236,10 @@ def test_callable_region_expands_inside_native_orchestration(
     )
 
 
-def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
+def test_flash_mtp_overlay_checks_real_decode_storage_abi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The generated static callables replace only the native projection import."""
+    """Check storage compatibility before replacing a native projection import."""
 
     pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
     if pypto_lib_root is None:
@@ -247,6 +249,18 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
     native_decode = model_dir / "decode_mtp.py"
     if not native_decode.is_file():
         pytest.skip("current pypto-lib checkout has no Flash-MTP decode entry point")
+    projection_source = (model_dir / "mtp_projection.py").read_text(encoding="utf-8")
+    layouts = native_tensor_layouts(projection_source, "mtp_projection")
+    if any(layouts.get(name) != "ND" for name in ("e_proj_w", "h_proj_w")):
+        # This is an explicit unsupported-layout refusal, not an import/compile pass.
+        with pytest.raises(SourceEmissionError, match="layout=.*ND storage"):
+            emit_flash_mtp_decode_projection_overlay(
+                None,  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                native_decode_source=native_decode.read_text(encoding="utf-8"),
+                native_projection_source=projection_source,
+            )
+        return
 
     module, args = build_production_mtp_decode_projection()
     graph = export_and_normalize(module, args)
@@ -264,6 +278,7 @@ def test_flash_mtp_overlay_imports_inside_real_decode_entry_point(
         graph,
         solved,
         native_decode_source=native_decode.read_text(encoding="utf-8"),
+        native_projection_source=projection_source,
     )
     overlay_path = tmp_path / f"{overlay.module_name}.py"
     decode_path = tmp_path / "decode_mtp_fusebox.py"

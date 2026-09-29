@@ -10,7 +10,7 @@ back to disconnected microbenchmarks.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -112,15 +112,21 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
             ("cube", "vector"),
         ),
     )
+    flash_common = tuple(
+        replace(region, symbols=("expert_routed_tile",))
+        if region.name == "routed_expert"
+        else region
+        for region in deepseek_common
+    )
     return (
         PyPTOLibModelManifest(
             name="deepseek_v4_flash_dspark",
             entry_points=("decode_fwd.py", "prefill_fwd.py"),
             static_regions=(
-                *deepseek_common,
+                *flash_common,
                 PyPTOLibStaticRegion(
                     "dspark_projection",
-                    "dspark_proj.py",
+                    "dspark_drafter.py",
                     ("dspark_proj",),
                     StaticRegionOwnership.WHOLE_CALLABLE,
                     ("cube", "vector", "mixed"),
@@ -137,9 +143,9 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
                 PyPTOLibNativeBoundary(
                     "sparse_attention",
                     (
-                        "decode_sparse_attn_csa.py",
-                        "decode_sparse_attn_hca.py",
-                        "decode_sparse_attn_swa.py",
+                        "decode_csa.py",
+                        "decode_hca.py",
+                        "decode_swa.py",
                         "prefill_sparse_attn.py",
                     ),
                     NativeBoundaryKind.INDIRECT_ACCESS,
@@ -159,7 +165,7 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
                 ),
                 PyPTOLibNativeBoundary(
                     "decode_metadata",
-                    ("decode_metadata.py", "prefill_metadata.py"),
+                    ("decode_prepare.py", "prefill_metadata.py"),
                     NativeBoundaryKind.METADATA,
                 ),
             ),
@@ -175,7 +181,7 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
                     StaticRegionOwnership.WHOLE_CALLABLE,
                     ("vector", "cube", "mixed"),
                 ),
-                *deepseek_common,
+                *flash_common,
             ),
             native_boundaries=(
                 PyPTOLibNativeBoundary(
@@ -190,13 +196,13 @@ def pypto_lib_model_manifests() -> tuple[PyPTOLibModelManifest, ...]:
                 ),
                 PyPTOLibNativeBoundary(
                     "moe_routing",
-                    ("moe.py", "gate.py"),
+                    ("decode_moe.py", "prefill_moe.py", "gate.py"),
                     NativeBoundaryKind.ROUTING,
                 ),
                 PyPTOLibNativeBoundary(
                     "distributed_prefill",
                     (
-                        "prefill_cp_fwd_draft.py",
+                        "prefill_cp_exchange.py",
                         "prefill_cp_zigzag.py",
                     ),
                     NativeBoundaryKind.COMMUNICATION,
@@ -335,10 +341,8 @@ def validate_pypto_lib_model(
     for region in manifest.static_regions:
         path = model_dir / region.module
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        definitions = {
-            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
-        }
-        missing = set(region.symbols) - definitions
+        definitions = native_callable_definitions(tree)
+        missing = set(region.symbols) - definitions.keys()
         if missing:
             raise ValueError(
                 f"PyPTO-lib model {manifest.name!r} static region {region.name!r} "
@@ -349,3 +353,75 @@ def validate_pypto_lib_model(
         model_dir=model_dir,
         files=tuple(files),
     )
+
+
+def native_callable_definitions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    """Resolve local function bodies and explicit ``pl.jit`` exports, without import.
+
+    Native modules may export a shared body as both ``pl.jit.inline(body)``
+    and ``pl.jit(options)(body)``. Arbitrary assignments and external bodies
+    are not evidence that a callable exists.
+    """
+
+    definitions: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            definitions[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            body = None
+            call = node.value
+            if (
+                isinstance(call, ast.Call)
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Name)
+            ):
+                factory = call.func
+                if isinstance(factory, ast.Call) and not factory.args:
+                    factory = factory.func
+                if ast.unparse(factory) in {"pl.jit", "pl.jit.inline"}:
+                    body = definitions.get(call.args[0].id)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    if body is None:
+                        definitions.pop(target.id, None)
+                    else:
+                        definitions[target.id] = body
+    return definitions
+
+
+def native_tensor_layouts(source: str, symbol: str) -> dict[str, str]:
+    """Read physical tensor layouts from a native callable's named ABI."""
+
+    function = native_callable_definitions(ast.parse(source)).get(symbol)
+    if function is None:
+        raise ValueError(f"native callable {symbol!r} has no local function body")
+    layouts: dict[str, str] = {}
+    for argument in function.args.args:
+        annotation = argument.annotation
+        if (
+            isinstance(annotation, ast.Subscript)
+            and ast.unparse(annotation.value) == "pl.Out"
+        ):
+            annotation = annotation.slice
+        if (
+            not isinstance(annotation, ast.Subscript)
+            or ast.unparse(annotation.value) != "pl.Tensor"
+        ):
+            continue
+        fields = annotation.slice
+        if not isinstance(fields, ast.Tuple) or len(fields.elts) not in {2, 3}:
+            raise ValueError(
+                f"native tensor {argument.arg!r} has an unsupported annotation"
+            )
+        layout = "ND" if len(fields.elts) == 2 else ast.unparse(fields.elts[2])
+        if layout in {"pl.ND", "pl.TensorLayout.ND"}:
+            layout = "ND"
+        elif layout in {"pl.NZ", "pl.TensorLayout.NZ"}:
+            layout = "NZ"
+        if layout not in {"ND", "NZ"}:
+            raise ValueError(
+                f"native tensor {argument.arg!r} has unknown layout {layout!r}"
+            )
+        layouts[argument.arg] = layout
+    return layouts

@@ -158,6 +158,9 @@ def _emit_mtp(
         graph,
         solved,
         native_source=(model_dir / "decode_mtp.py").read_text(encoding="utf-8"),
+        native_projection_source=(model_dir / "mtp_projection.py").read_text(
+            encoding="utf-8"
+        ),
         module_name=module_name,
     )
     return ProductionModelIntegration(

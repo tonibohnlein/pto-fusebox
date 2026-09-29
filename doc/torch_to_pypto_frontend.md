@@ -534,6 +534,35 @@ caller may use the returned ID in an ordinary PyPTO dependency.
 
 ### Initial production-model integration surface
 
+#### Native checkout compatibility
+
+The manifests follow the current native module ownership, including DSpark's
+`dspark_drafter.py` projection and Flash-MTP's shared-body `pl.jit.inline(body)`
+exports. The native projection controls call those symbols rather than copying
+their schedules. DSpark's consolidated whole-drafter fixtures are not projection
+fixtures and must not be reused for a projection-only comparison.
+
+Flash-MTP now declares both INT8 projection weights as `pl.NZ`; Pro still uses
+dense ND weights. The native controls preserve that distinction. Concrete MTP
+integration supplies `native_projection_source` to check the weight ABI. The
+current solver graph describes dense storage, so generated integration **rejects
+NZ weights before emission**. This is a declared missing layout contract, not NZ
+source-readiness or silicon closure. Relabelling parameters after solving, or
+silently unpacking weights outside a timed boundary, is not permitted.
+
+The next shared cube/mixed schedule contract must carry physical layout/strides,
+transpose, inner-K versus sequential K, contiguous request width, residency,
+launches, crossings, and merges through admission, costing, and emission. No
+cost coefficient is changed by this adapter refresh.
+
+`test/device/test_selected_wrong_answers.py` fixes the identities and geometry
+of the `41bac5ac` INT8 cube and history-branch wrong-answer candidates, with the
+historically correct history candidate as a control. These remain **dense-layout
+regressions**, independently of the new NZ native ABI. Their compile-only checks
+in `test/python/test_wrong_answer_reproducers.py` do not prove numerical
+correctness or complete the lazy incore build. Only executed, reference-checked
+candidates may enter calibration.
+
 `python/pto_fusebox/model.py` records a checked manifest for the four current
 PyPTO-lib targets. The manifest validates real entry points, static callable
 symbols, and native boundary modules against a concrete checkout before source
@@ -543,7 +572,7 @@ first production-shape static ownership unit for each target:
 | PyPTO-lib model | generated static ownership today | native ownership retained |
 | --- | --- | --- |
 | `deepseek_v4_flash_dspark` | Complete fixed-frame BF16 DSpark projection followed by RMSNorm, emitted as one completion-aware callable. | Dynamic token-frame selection and the call site in the drafter orchestration. |
-| `deepseek_v4_flash_mtp` | Complete production INT8 MTP projection input graph at hidden size 4,096; Fusebox extracts both maximal *source-emittable* branch regions. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus the currently unsupported static view/add tail. |
+| `deepseek_v4_flash_mtp` | Complete dense-weight INT8 MTP projection fixture at hidden size 4,096. Integration with the latest NZ-weight native ABI is blocked pending the physical-layout contract above. | Decode/prefill attention, MoE, communication, sampling, recurrent state, plus unsupported static tail operations. |
 | `deepseek_v4_pro` | The same model-independent INT8 projection algebra at Pro's actual hidden size 7,168. The adapter derives wrapper geometry from the normalized graph rather than reusing Flash constants. | Sparse attention, indexer/TopK, MoE routing, dynamic packing, communication, and state. |
 | `qwen3_14b` | Complete production `16 x 5120` FP32 RMSNorm-to-`152064`-vocabulary LM-head DAG, solved once as one static region. The current source optimum is a vector step followed by a cube step with one solver-selected GM normalization cut. | Dynamic batch/window traversal and placement into the runtime-sized logits output. |
 

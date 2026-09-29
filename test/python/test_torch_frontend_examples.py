@@ -81,6 +81,7 @@ from pto_fusebox import (
 )
 from pto_fusebox.schedule.schema import CubeKernelPlan, MixedKernelPlan
 from pto_fusebox.ir import normalized_graph_sha256
+from pto_fusebox.model import native_callable_definitions, native_tensor_layouts
 from torch import nn
 
 Example = tuple[nn.Module, tuple[torch.Tensor, ...]]
@@ -128,15 +129,60 @@ def test_production_device_controls_call_native_pypto_lib_symbols_only() -> None
         native_tree = ast.parse(
             native_path.read_text(encoding="utf-8"), filename=str(native_path)
         )
-        native_symbols = {
-            node.name for node in native_tree.body if isinstance(node, ast.FunctionDef)
-        }
+        native_symbols = native_callable_definitions(native_tree)
         required = {control.callable_name}
         if control.tensor_specs_name is not None:
             required.add(control.tensor_specs_name)
         if control.golden_name is not None:
             required.add(control.golden_name)
-        assert required <= native_symbols
+        assert required <= native_symbols.keys()
+        native_layouts = native_tensor_layouts(
+            native_path.read_text(encoding="utf-8"), control.callable_name
+        )
+        assert (
+            native_tensor_layouts(control.source, control.program_name)
+            == native_layouts
+        )
+
+
+@pytest.mark.parametrize(
+    "factory", ("pl.jit", "pl.jit.inline", "pl.jit.inline(auto_scope=False)")
+)
+def test_native_callable_contract_resolves_shared_jit_bodies(factory: str) -> None:
+    source = f"""def body(weight: pl.Tensor[[64, 64], pl.INT8, pl.NZ]):
+    return weight
+exported = {factory}(body)
+"""
+    definitions = native_callable_definitions(ast.parse(source))
+    assert definitions["exported"] is definitions["body"]
+    assert native_tensor_layouts(source, "exported") == {"weight": "NZ"}
+
+
+@pytest.mark.parametrize("assignment", ("other(body)", "pl.jit(external)", "42"))
+@pytest.mark.parametrize("target", ("exported", "exported: object"))
+def test_native_callable_contract_rejects_unresolved_exports(
+    assignment: str, target: str
+) -> None:
+    source = (
+        f"def exported():\n    pass\ndef body():\n    pass\n{target} = {assignment}\n"
+    )
+    assert "exported" not in native_callable_definitions(ast.parse(source))
+
+
+def test_projection_adapter_refuses_postsolve_nz_relabelling() -> None:
+    native = """def body(e_proj_w: pl.Tensor[[64, 64], pl.INT8, pl.NZ],
+         h_proj_w: pl.Tensor[[64, 64], pl.INT8, pl.NZ]):
+    pass
+mtp_projection = pl.jit.inline(body)
+"""
+    # Refusal precedes even reading a solve result or emitting a partial bundle.
+    with pytest.raises(SourceEmissionError, match="e_proj_w layout='NZ'.*ND storage"):
+        emit_deepseek_mtp_projection_overlay(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            native_source="from mtp_projection import mtp_projection\n",
+            native_projection_source=native,
+        )
 
 
 class _MetadataViewIntoNativeBoundary(nn.Module):
@@ -908,7 +954,7 @@ def test_production_qwen_lm_head_accumulator_and_traffic_parity() -> None:
         ("qwen3_14b", "output_head", 1, "decode_fwd.py", None),
     ),
 )
-def test_production_model_integration_emits_first_maximal_region(
+def test_production_model_integration_respects_native_storage_contract(
     model_name: str,
     region: str,
     callable_count: int,
@@ -918,6 +964,18 @@ def test_production_model_integration_emits_first_maximal_region(
     pypto_lib_root = os.environ.get("PTO_FUSEBOX_PYPTO_LIB_ROOT")
     if pypto_lib_root is None:
         pytest.skip("set PTO_FUSEBOX_PYPTO_LIB_ROOT to a pypto-lib checkout")
+    if mtp_geometry is not None:
+        native_source = (
+            Path(pypto_lib_root) / "models" / model_name / "mtp_projection.py"
+        ).read_text(encoding="utf-8")
+        layouts = native_tensor_layouts(native_source, "mtp_projection")
+        if any(layouts.get(name) != "ND" for name in ("e_proj_w", "h_proj_w")):
+            # This is a negative ABI test, not generated-NZ realization closure.
+            with pytest.raises(SourceEmissionError, match="layout=.*ND storage"):
+                emit_production_model_integration(
+                    model_name, pypto_lib_root, _test_solver(), solver_workers=2
+                )
+            return
     integration = emit_production_model_integration(
         model_name,
         pypto_lib_root,

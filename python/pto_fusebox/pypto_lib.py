@@ -15,6 +15,7 @@ import math
 from dataclasses import dataclass
 
 from .ir import Dimension, NormalizedGraph, NormalizedOp
+from .model import native_tensor_layouts
 from .solver import SolveResult
 from .schedule import CubeKernelPlan, KernelKind, scheduled_region
 from .source import (
@@ -68,6 +69,7 @@ def emit_flash_mtp_decode_projection_overlay(
     result: SolveResult,
     *,
     native_decode_source: str,
+    native_projection_source: str | None = None,
     module_name: str = "fusebox_mtp_projection",
 ) -> FlashMtpProjectionOverlay:
     """Emit the Flash-MTP production projection and patch ``decode_mtp``.
@@ -80,6 +82,7 @@ def emit_flash_mtp_decode_projection_overlay(
         graph,
         result,
         native_source=native_decode_source,
+        native_projection_source=native_projection_source,
         module_name=module_name,
     )
 
@@ -89,6 +92,7 @@ def emit_deepseek_mtp_projection_overlay(
     result: SolveResult,
     *,
     native_source: str,
+    native_projection_source: str | None = None,
     module_name: str = "fusebox_mtp_projection",
 ) -> FlashMtpProjectionOverlay:
     """Emit a production INT8 projection for a native DeepSeek entry point.
@@ -99,6 +103,11 @@ def emit_deepseek_mtp_projection_overlay(
     only the imported ``mtp_projection`` symbol. It accepts both one-line and
     parenthesized native imports, so the same contract covers Flash-MTP and
     DeepSeek-V4 Pro without a model recognizer.
+
+    When adapting a concrete checkout, supply ``native_projection_source`` to
+    verify its physical weight ABI. The current normalized graph and solver
+    contract describe dense storage only; an NZ ABI must not be relabelled
+    after solving or silently bound to the generated ND parameters.
     """
 
     if not module_name or any(
@@ -108,6 +117,16 @@ def emit_deepseek_mtp_projection_overlay(
         raise SourceEmissionError(
             f"Flash-MTP overlay module name is invalid: {module_name!r}"
         )
+
+    if native_projection_source is not None:
+        layouts = native_tensor_layouts(native_projection_source, "mtp_projection")
+        for name in ("e_proj_w", "h_proj_w"):
+            if layouts.get(name) != "ND":
+                raise SourceEmissionError(
+                    f"native projection {name} layout={layouts.get(name)!r}; "
+                    "the solved graph describes ND storage. Packed weights require "
+                    "a layout-aware graph/schedule contract before source emission"
+                )
 
     bundle = emit_pypto_static_bundle(
         graph,
